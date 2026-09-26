@@ -226,8 +226,8 @@ def _active_display_count():
 def camera():
   cam = mujoco.MjvCamera()
   mujoco.mjv_defaultCamera(cam)
-  cam.lookat[:] = [0, 0, 0]
-  cam.distance, cam.azimuth, cam.elevation = 8.6, 110, 18
+  cam.lookat[:] = [.45, 0, 0]
+  cam.distance, cam.azimuth, cam.elevation = 9.4, 110, 18
   return cam
 
 
