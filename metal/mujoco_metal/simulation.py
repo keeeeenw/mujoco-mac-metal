@@ -74,7 +74,12 @@ class MetalSimulation:
     profile = validate_stepping_profile(model, profile=profile)
     motor_model = (
         ScalarMotorModel.from_model(model)
-        if profile.name.replace("rk4", "euler") == "contact_free_motor_euler_v1"
+        if profile.name.replace("rk4", "euler")
+        in (
+            "contact_free_motor_euler_v1",
+            "contact_free_passive_euler_v1",
+            "contact_free_sensor_euler_v1",
+        )
         else None
     )
     if motor_model is not None:
@@ -130,6 +135,18 @@ class MetalSimulation:
         if motor_model is not None
         else None
     )
+    self._passive = None
+    self._damping_tangent = None
+    if "passive" in profile.name or "sensor" in profile.name:
+      from mujoco_metal.passive import MetalPassiveForces
+
+      self._passive = MetalPassiveForces(model)
+    self._sensors = None
+    self._sensordata = None
+    if "sensor" in profile.name:
+      from mujoco_metal.sensors import SensorProgram
+
+      self._sensors = SensorProgram(model, batch_size)
     self._solver = MetalDenseSolve(descriptor.nv, batch_size)
     self._euler_solver = (
         MetalDenseSolve(descriptor.nv, batch_size)
@@ -149,7 +166,21 @@ class MetalSimulation:
     self._applied_force = (
         torch.zeros_like(self._rhs)
         if profile.name.replace("rk4", "euler")
-        in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
+        in (
+            "contact_free_forces_euler_v1",
+            "contact_free_motor_euler_v1",
+            "contact_free_passive_euler_v1",
+            "contact_free_sensor_euler_v1",
+        )
+        else None
+    )
+    self._body_wrench = (
+        torch.zeros(
+            (batch_size, int(model.nbody), 6),
+            dtype=torch.float32,
+            device=self._state._device,
+        )
+        if self._passive is not None
         else None
     )
     self._control = (
@@ -203,6 +234,24 @@ class MetalSimulation:
     """The owned :class:`DeviceState` lifecycle and checkpoint interface."""
     return self._state
 
+  def sensor_values(self):
+    """Evaluate supported stateless sensors at CURRENT state on MPS.
+
+    This is an explicit forward-stage query, not the pre-integration sample
+    left by MuJoCo mj_step. Re-evaluation makes reset/restore immediately visible.
+    Returned values are detached copies owned by the caller.
+    """
+    if self._sensors is None:
+      raise ValueError("sensor_values requires a sensor stepping profile")
+    state = self._state
+    dynamics = self._smooth.run_device(state._qpos, state._qvel)
+    poses = dict(
+        dynamics["poses"], cvel=dynamics["cvel"], root_com=dynamics["root_com"]
+    )
+    return self._sensors.run_device(
+        state._qpos, state._qvel, state._time, poses
+    ).clone()
+
   def _prepare_force(self, qfrc_applied):
     torch = self._state._torch
     shape = (self._state.batch_size, self._state._model.nv)
@@ -233,6 +282,37 @@ class MetalSimulation:
           "qfrc_applied must be finite and representable as float32"
       )
     self._applied_force.copy_(torch.tensor(array, device=self._state._device))
+
+  def _prepare_wrench(self, xfrc_applied):
+    if self._body_wrench is None:
+      if xfrc_applied is not None:
+        raise ValueError("xfrc_applied requires a passive or sensor profile")
+      return
+    if xfrc_applied is None:
+      self._body_wrench.zero_()
+      return
+    torch = self._state._torch
+    shape = tuple(self._body_wrench.shape)
+    if isinstance(xfrc_applied, torch.Tensor):
+      if (
+          xfrc_applied.device.type != "mps"
+          or xfrc_applied.dtype != torch.float32
+          or not xfrc_applied.is_contiguous()
+          or tuple(xfrc_applied.shape) != shape
+      ):
+        raise ValueError(
+            f"xfrc_applied must be contiguous float32 MPS with shape {shape}"
+        )
+      self._body_wrench.copy_(xfrc_applied)
+    else:
+      array = np.asarray(xfrc_applied)
+      if array.shape != shape or array.dtype.kind not in "fiu":
+        raise ValueError(f"xfrc_applied must be numeric with shape {shape}")
+      with np.errstate(over="ignore", invalid="ignore"):
+        array = np.asarray(array, dtype=np.float32)
+      if not np.all(np.isfinite(array)):
+        raise ValueError("xfrc_applied must be finite float32")
+      self._body_wrench.copy_(torch.tensor(array, device=self._state._device))
 
   def _prepare_control(self, ctrl):
     if self._control is None:
@@ -268,9 +348,18 @@ class MetalSimulation:
     dynamics = self._smooth.run_device(qpos, qvel)
     self._state._torch.neg(dynamics["qfrc_bias"], out=self._rhs)
     if self._applied_force is not None:
-      if self.profile.passive_damping_enabled and self._rhs.numel():
+      if (
+          self._passive is None
+          and self.profile.passive_damping_enabled
+          and self._rhs.numel()
+      ):
         self._rhs.addcmul_(qvel, self._damping.unsqueeze(0), value=-1.0)
       self._rhs.add_(self._applied_force)
+    if self._passive is not None:
+      passive, self._damping_tangent = self._passive.run_device(
+          qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True
+      )
+      self._rhs.add_(passive)
     if self._motor is not None:
       self._rhs.add_(self._motor.run_device(self._control))
     acceleration, status = self._solver.run_device(
@@ -278,7 +367,7 @@ class MetalSimulation:
     )
     return acceleration, status, dynamics
 
-  def step(self, steps=1, *, qfrc_applied=None, ctrl=None):
+  def step(self, steps=1, *, qfrc_applied=None, ctrl=None, xfrc_applied=None):
     """Advance all worlds by a positive number of native contact-free steps.
 
     ``qfrc_applied`` and ``ctrl`` are optional per-call host arrays or
@@ -297,6 +386,7 @@ class MetalSimulation:
       raise TypeError("steps must be a positive integer")
     if steps <= 0:
       raise ValueError("steps must be a positive integer")
+    self._prepare_wrench(xfrc_applied)
     self._prepare_control(ctrl)
     self._prepare_force(qfrc_applied)
     torch = self._state._torch
@@ -325,7 +415,9 @@ class MetalSimulation:
       if self._euler_solver is not None:
         self._effective_mass.copy_(dynamics["mass_matrix"])
         self._effective_mass.diagonal(dim1=1, dim2=2).add_(
-            self._implicit_damping
+            self.profile.timestep * self._damping_tangent
+            if self._passive is not None
+            else self._implicit_damping
         )
         integration_acceleration, euler_status = self._euler_solver.run_device(
             self._effective_mass, self._rhs

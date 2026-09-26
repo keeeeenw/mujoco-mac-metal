@@ -94,6 +94,8 @@ def validate_stepping_profile(
       "contact_free_rk4_v1",
       "contact_free_forces_rk4_v1",
       "contact_free_motor_rk4_v1",
+      "contact_free_passive_rk4_v1",
+      "contact_free_sensor_rk4_v1",
   ):
     if not isinstance(model, mujoco.MjModel):
       raise TypeError("model must be a compiled mujoco.MjModel")
@@ -118,10 +120,23 @@ def validate_stepping_profile(
             for item in result.rejected
         ),
     )
+  with_sensors = profile == "contact_free_sensor_euler_v1"
+  advanced_passive = profile in (
+      "contact_free_passive_euler_v1",
+      "contact_free_sensor_euler_v1",
+  )
+  if advanced_passive:
+    from mujoco_metal.passive import PassiveForceModel
+
+    PassiveForceModel(model)
   if profile not in (
+      "contact_free_passive_euler_v1",
+      "contact_free_sensor_euler_v1",
       "contact_free_euler_v1",
       "contact_free_forces_euler_v1",
       "contact_free_motor_euler_v1",
+      "contact_free_passive_euler_v1",
+      "contact_free_sensor_euler_v1",
   ):
     raise ValueError(f"unsupported stepping profile: {profile!r}")
   if not isinstance(model, mujoco.MjModel):
@@ -181,6 +196,8 @@ def validate_stepping_profile(
     if profile in (
         "contact_free_forces_euler_v1",
         "contact_free_motor_euler_v1",
+        "contact_free_passive_euler_v1",
+        "contact_free_sensor_euler_v1",
     ) and name in (
         "mjDSBL_DAMPER",
         "mjDSBL_EULERDAMP",
@@ -188,7 +205,12 @@ def validate_stepping_profile(
       continue
     irrelevant_disable |= int(getattr(mujoco.mjtDisableBit, name))
   unknown_disable = disable & ~(contact | irrelevant_disable)
-  if profile in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1"):
+  if profile in (
+      "contact_free_forces_euler_v1",
+      "contact_free_motor_euler_v1",
+      "contact_free_passive_euler_v1",
+      "contact_free_sensor_euler_v1",
+  ):
     unknown_disable &= ~(
         int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
         | int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
@@ -216,9 +238,17 @@ def validate_stepping_profile(
     raise ValueError(f"unsupported joint type in {profile}")
 
   motor_supported = ()
-  if model.nu and profile != "contact_free_motor_euler_v1":
+  if model.nu and profile not in (
+      "contact_free_motor_euler_v1",
+      "contact_free_passive_euler_v1",
+      "contact_free_sensor_euler_v1",
+  ):
     raise ValueError(f"actuators are unsupported by {profile}")
-  if profile == "contact_free_motor_euler_v1":
+  if profile in (
+      "contact_free_motor_euler_v1",
+      "contact_free_passive_euler_v1",
+      "contact_free_sensor_euler_v1",
+  ):
     from mujoco_metal.actuation import ScalarMotorModel
 
     ScalarMotorModel.from_model(model)
@@ -245,8 +275,14 @@ def validate_stepping_profile(
   if model.nmocap or np.any(model.body_mocapid >= 0):
     raise ValueError("mocap bodies are unsupported")
   if model.nsensor:
-    raise ValueError("sensors are unsupported by contact_free_euler_v1")
-  if np.any(model.dof_dampingpoly):
+    if not with_sensors:
+      raise ValueError(
+          "sensors are unsupported by this profile; use contact_free_sensor_euler_v1 or RK4"
+      )
+    from mujoco_metal.sensors import lower_sensors
+
+    lower_sensors(model)
+  if np.any(model.dof_dampingpoly) and not advanced_passive:
     raise ValueError("polynomial damping is unsupported")
   damping = np.asarray(model.dof_damping, dtype=np.float64)
   if np.any(~np.isfinite(damping)) or np.any(damping < 0):
@@ -257,7 +293,9 @@ def validate_stepping_profile(
     raise ValueError("linear joint damping must be representable as float32")
   if profile == "contact_free_euler_v1" and np.any(model.dof_damping):
     raise ValueError("joint damping is unsupported by contact_free_euler_v1")
-  if np.any(model.jnt_stiffness) or np.any(model.jnt_stiffnesspoly):
+  if (
+      np.any(model.jnt_stiffness) or np.any(model.jnt_stiffnesspoly)
+  ) and not advanced_passive:
     raise ValueError("joint stiffness and springs are unsupported")
   if np.any(model.tendon_damping) or np.any(model.tendon_dampingpoly):
     raise ValueError("tendon damping is unsupported")
@@ -267,7 +305,7 @@ def validate_stepping_profile(
     raise ValueError("fluid forces are unsupported")
   if np.any(model.geom_fluid):
     raise ValueError("geom fluid interaction is unsupported")
-  if np.any(model.body_gravcomp):
+  if np.any(model.body_gravcomp) and not advanced_passive:
     raise ValueError("body gravity compensation is unsupported")
   if (
       mujoco.get_mjcb_passive() is not None
@@ -288,15 +326,30 @@ def validate_stepping_profile(
           + (
               ("per-call applied generalized forces", "linear joint damping")
               if profile
-              in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
+              in (
+                  "contact_free_forces_euler_v1",
+                  "contact_free_motor_euler_v1",
+                  "contact_free_passive_euler_v1",
+                  "contact_free_sensor_euler_v1",
+              )
               else ()
           )
           + motor_supported
+          + (
+              ("rigid joint linear/polynomial springs and damping",)
+              if advanced_passive
+              else ()
+          )
       ),
       irrelevant=(
           tuple(item for item in _IRRELEVANT if "disable flags" not in item)
           if profile
-          in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
+          in (
+              "contact_free_forces_euler_v1",
+              "contact_free_motor_euler_v1",
+              "contact_free_passive_euler_v1",
+              "contact_free_sensor_euler_v1",
+          )
           else _IRRELEVANT
       ),
       rejected=(
@@ -304,16 +357,28 @@ def validate_stepping_profile(
               item
               for item in _REJECTED
               if not (
-                  "joint damping" in item
+                  (
+                      "joint damping" in item
+                      or (advanced_passive and "stiffness" in item)
+                  )
                   and profile
                   in (
                       "contact_free_forces_euler_v1",
                       "contact_free_motor_euler_v1",
+                      "contact_free_passive_euler_v1",
+                      "contact_free_sensor_euler_v1",
                   )
               )
+              and not (advanced_passive and item == "body gravity compensation")
+              and not (with_sensors and item == "sensors")
               and not (
                   "actuators and actuator state" in item
-                  and profile == "contact_free_motor_euler_v1"
+                  and profile
+                  in (
+                      "contact_free_motor_euler_v1",
+                      "contact_free_passive_euler_v1",
+                      "contact_free_sensor_euler_v1",
+                  )
               )
           )
           + (
@@ -322,21 +387,42 @@ def validate_stepping_profile(
                   "non-fixed gains, biases, dynamics, actuator armature or damping, "
                   "and joint-level actuator force limits",
               )
-              if profile == "contact_free_motor_euler_v1"
+              if profile
+              in (
+                  "contact_free_motor_euler_v1",
+                  "contact_free_passive_euler_v1",
+                  "contact_free_sensor_euler_v1",
+              )
               else ()
           )
       ),
       passive_damping_enabled=(
           profile
-          in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
+          in (
+              "contact_free_forces_euler_v1",
+              "contact_free_motor_euler_v1",
+              "contact_free_passive_euler_v1",
+              "contact_free_sensor_euler_v1",
+          )
           and not disable & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
-          and bool(np.any(damping32 > 0))
+          and bool(
+              np.any(damping32 > 0)
+              or (advanced_passive and np.any(model.dof_dampingpoly))
+          )
       ),
       implicit_euler_damping=(
           profile
-          in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
+          in (
+              "contact_free_forces_euler_v1",
+              "contact_free_motor_euler_v1",
+              "contact_free_passive_euler_v1",
+              "contact_free_sensor_euler_v1",
+          )
           and not disable & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
           and not disable & int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
-          and bool(np.any(damping32 > 0))
+          and bool(
+              np.any(damping32 > 0)
+              or (advanced_passive and np.any(model.dof_dampingpoly))
+          )
       ),
   )

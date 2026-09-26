@@ -96,8 +96,10 @@ class MetalSmoothDynamics:
     )
     self._fk.prepare_workspace(batch_size)
     torch, device = self._torch, self._fk._device
+
     def buffer(size):
       return torch.empty(max(size, 1), dtype=torch.float32, device=device)
+
     self._workspace = {
         "batch_size": batch_size,
         "mass": buffer(batch_size * nv * nv),
@@ -160,31 +162,71 @@ class MetalSmoothDynamics:
     poses = self._fk.run_device(qpos)
     w, arrays = self._workspace, self._arrays
     qvel_flat = qvel.reshape(-1) if self.model.nv else w["qvel"]
-    args = [arrays[name] for name in (
-        "body_parentid", "body_rootid", "body_jntadr", "body_jntnum",
-        "dof_parentid", "dof_bodyid", "jnt_type", "jnt_dofadr",
-        "body_mass", "body_inertia", "dof_armature",
-    )]
-    args.extend([
-        poses["body_quat"].reshape(-1), poses["inertial_pos"].reshape(-1),
-        poses["inertial_quat"].reshape(-1), poses["joint_anchor"].reshape(-1),
-        poses["joint_axis"].reshape(-1), w["mass"], w["root_com"], w["cdof"],
-        w["crb"], w["mass_dims"], w["local_inertia"],
-    ])
+    args = [
+        arrays[name]
+        for name in (
+            "body_parentid",
+            "body_rootid",
+            "body_jntadr",
+            "body_jntnum",
+            "dof_parentid",
+            "dof_bodyid",
+            "jnt_type",
+            "jnt_dofadr",
+            "body_mass",
+            "body_inertia",
+            "dof_armature",
+        )
+    ]
+    args.extend(
+        [
+            poses["body_quat"].reshape(-1),
+            poses["inertial_pos"].reshape(-1),
+            poses["inertial_quat"].reshape(-1),
+            poses["joint_anchor"].reshape(-1),
+            poses["joint_axis"].reshape(-1),
+            w["mass"],
+            w["root_com"],
+            w["cdof"],
+            w["crb"],
+            w["mass_dims"],
+            w["local_inertia"],
+        ]
+    )
     self._kernel(*args, threads=(batch,), group_size=(1,))
     bias_args = [
-        arrays["body_parentid"], arrays["body_dofadr"], arrays["body_dofnum"],
-        arrays["body_jntadr"], arrays["body_jntnum"], arrays["dof_bodyid"],
-        arrays["jnt_type"], arrays["jnt_dofadr"], arrays["gravity"],
-        w["cdof"], w["local_inertia"], w["disableflags"], qvel_flat,
-        w["cvel"], w["cdof_dot"], w["cacc"], w["body_force"], w["bias"],
+        arrays["body_parentid"],
+        arrays["body_dofadr"],
+        arrays["body_dofnum"],
+        arrays["body_jntadr"],
+        arrays["body_jntnum"],
+        arrays["dof_bodyid"],
+        arrays["jnt_type"],
+        arrays["jnt_dofadr"],
+        arrays["gravity"],
+        w["cdof"],
+        w["local_inertia"],
+        w["disableflags"],
+        qvel_flat,
+        w["cvel"],
+        w["cdof_dot"],
+        w["cacc"],
+        w["body_force"],
+        w["bias"],
         w["bias_dims"],
     ]
     self._bias_kernel(*bias_args, threads=(batch,), group_size=(1,))
     nv = self.model.nv
     return {
-        "mass_matrix": w["mass"][:batch * nv * nv].reshape(batch, nv, nv),
-        "qfrc_bias": w["bias"][:batch * nv].reshape(batch, nv),
+        "mass_matrix": w["mass"][: batch * nv * nv].reshape(batch, nv, nv),
+        "qfrc_bias": w["bias"][: batch * nv].reshape(batch, nv),
+        "poses": poses,
+        "cvel": w["cvel"][: batch * self.model.nbody * 6].reshape(
+            batch, self.model.nbody, 6
+        ),
+        "root_com": w["root_com"][: batch * self.model.nbody * 3].reshape(
+            batch, self.model.nbody, 3
+        ),
     }
 
   def _compute_mass_matrix(self, qpos_batch):
