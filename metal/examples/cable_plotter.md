@@ -30,8 +30,9 @@ PYTHONPATH=metal .venv-demo/bin/python metal/examples/cable_plotter.py \
   --mode metal --steps 1200 --record metal/examples/assets/cable_plotter.gif
 ```
 
-The native demo composes the smooth dynamics, stateless transmission force,
-dense solve, and semi-implicit Euler primitives directly. It demonstrates
+The native demo uses the `contact_free_transmission_euler_v1` simulation
+profile, which composes smooth dynamics, stateless transmission forces, the
+dense solve, and semi-implicit Euler. It demonstrates
 fixed-joint tendon transmission and affine-bias servo forces; it does not
 establish support for general actuator models, tendons as passive elements, or
 contact physics.

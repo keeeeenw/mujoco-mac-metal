@@ -22,49 +22,6 @@ def _path(t):
   return .22 * np.sin(.72 * t), .17 * np.sin(1.44 * t + .35)
 
 
-class _NativeStages:
-  """Compose the native primitives for this explicit demo model."""
-
-  def __init__(self, model, qpos, qvel):
-    import torch
-
-    from mujoco_metal.integration import MetalEulerIntegration
-    from mujoco_metal.model import load_model
-    from mujoco_metal.smooth_metal import MetalSmoothDynamics
-    from mujoco_metal.smooth_solve import MetalDenseSolve
-    from mujoco_metal.transmissions import MetalTransmissions
-
-    self.torch = torch
-    self.descriptor = load_model(model)
-    self.dynamics = MetalSmoothDynamics(self.descriptor, batch_size=1)
-    self.transmission = MetalTransmissions(model)
-    self.solve = MetalDenseSolve(model.nv, batch_size=1)
-    self.integrator = MetalEulerIntegration(
-        self.descriptor, batch_size=1, timestep=model.opt.timestep
-    )
-    device = torch.device("mps")
-    self.qpos = torch.tensor(qpos[None, :], dtype=torch.float32, device=device)
-    self.qvel = torch.tensor(qvel[None, :], dtype=torch.float32, device=device)
-    self.control = torch.zeros((1, model.nu), dtype=torch.float32, device=device)
-    self.time = torch.zeros((1,), dtype=torch.float32, device=device)
-    self.status = torch.zeros((1,), dtype=torch.int32, device=device)
-    self.nv = model.nv
-
-  def step(self, control):
-    self.control.copy_(self.torch.tensor(control[None, :], dtype=self.torch.float32, device="mps"))
-    dynamics = self.dynamics.run_device(self.qpos, self.qvel)
-    actuator_force = self.transmission.run_device(self.qpos, self.qvel, self.control)
-    rhs = actuator_force - dynamics["qfrc_bias"]
-    acceleration, solve_status = self.solve.run_device(dynamics["mass_matrix"], rhs)
-    qpos, qvel, time, status = self.integrator.run_device(
-        self.qpos, self.qvel, acceleration, self.time, solve_status
-    )
-    self.qpos, self.qvel, self.time, self.status = qpos, qvel, time, status
-    if int(status[0].item()) != 0:
-      raise RuntimeError(f"native solver/integrator status {int(status[0].item())}")
-    return qpos[0].cpu().numpy().copy(), qvel[0].cpu().numpy().copy()
-
-
 def run(steps=200, mode="metal", check=False, record=None):
   model = mujoco.MjModel.from_xml_path(str(Path(__file__).with_suffix(".xml")))
   if model.nu != 2 or model.ntendon != 2 or model.nq != 2 or model.nv != 2:
@@ -78,7 +35,16 @@ def run(steps=200, mode="metal", check=False, record=None):
   reference = mujoco.MjData(model)
   actual.qpos[:] = reference.qpos[:] = qpos
   actual.qvel[:] = reference.qvel[:] = qvel
-  native = _NativeStages(model, qpos, qvel) if mode == "metal" else None
+  native = None
+  if mode == "metal":
+    from mujoco_metal import MetalSimulation
+
+    native = MetalSimulation(
+        model,
+        qpos=qpos[None, :],
+        qvel=qvel[None, :],
+        profile="contact_free_transmission_euler_v1",
+    )
   recorder = None
   if record:
     from demo_recording import ComparisonRecorder
@@ -105,8 +71,13 @@ def run(steps=200, mode="metal", check=False, record=None):
       if native is None:
         mujoco.mj_step(model, actual)
       else:
-        actual.qpos[:], actual.qvel[:] = native.step(control)
-        actual.time = (index + 1) * dt
+        native.step(ctrl=control[None, :])
+        snapshot = native.state.snapshot()
+        if np.any(snapshot.status):
+          raise RuntimeError(f"native simulation status: {snapshot.status.tolist()}")
+        actual.qpos[:] = snapshot.qpos[0]
+        actual.qvel[:] = snapshot.qvel[0]
+        actual.time = snapshot.time[0]
       max_qpos_error = max(max_qpos_error, float(np.max(np.abs(actual.qpos - reference.qpos))))
       max_qvel_error = max(max_qvel_error, float(np.max(np.abs(actual.qvel - reference.qvel))))
       if recorder:
@@ -120,6 +91,7 @@ def run(steps=200, mode="metal", check=False, record=None):
       "mode": mode,
       "steps": steps,
       "transmissions": ["x + y", "x - y"],
+      "profile": "contact_free_transmission_euler_v1" if native else "MuJoCo CPU",
       "actuators": "stateless fixed-gain affine-bias position servos",
       "max_qpos_error": max_qpos_error,
       "max_qvel_error": max_qvel_error,
