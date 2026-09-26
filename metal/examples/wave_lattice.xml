@@ -1,0 +1,64 @@
+<!-- Copyright 2026 The MuJoCo Metal contributors; Apache-2.0. -->
+<mujoco model="implicit_wave_lattice">
+  <compiler angle="radian" inertiafromgeom="true"/>
+  <option timestep=".004" integrator="implicitfast" gravity="0 0 0">
+    <flag contact="disable"/>
+  </option>
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+    <headlight ambient=".72 .72 .72" diffuse=".92 .92 .92" specular=".32 .32 .32"/>
+  </visual>
+  <default>
+    <joint damping=".06" stiffness=".65"/>
+    <geom contype="0" conaffinity="0" density="360"/>
+  </default>
+  <worldbody>
+    <light pos="0 -2 4" dir="0 0 -1" diffuse="1 .94 .82"/>
+    <geom name="backdrop" type="box" pos="0 .25 1.55" size="2.55 .06 .95" rgba=".055 .09 .15 1"/>
+    <geom name="base" type="box" pos="0 0 .44" size=".6 .4 .14" rgba=".17 .21 .27 1"/>
+    <geom name="mast" type="cylinder" pos="-2 0 .98" size=".085 .4" rgba=".27 .34 .43 1"/>
+    <body name="wave_00" pos="-2 0 1.38">
+      <joint name="drive" type="hinge" axis="0 1 0" damping=".08"/>
+      <geom name="link_00" type="capsule" fromto="0 0 0 .48 0 0" size=".075" rgba="1 .34 .13 1"/>
+      <geom type="sphere" pos=".48 0 0" size=".11" rgba="1 .72 .3 1"/>
+      <body name="wave_01" pos=".48 0 0">
+        <joint name="joint_01" type="ball" damping=".045" stiffness=".72"/>
+        <geom name="link_01" type="capsule" fromto="0 0 0 .48 0 0" size=".065" rgba=".02 .77 .91 1"/>
+        <geom type="sphere" pos=".48 0 0" size=".10" rgba=".38 .94 1 1"/>
+        <body name="wave_02" pos=".48 0 0">
+          <joint name="joint_02" type="hinge" axis="0 1 0" damping=".06" stiffness=".65"/>
+          <geom name="link_02" type="capsule" fromto="0 0 0 .48 0 0" size=".065" rgba=".98 .2 .48 1"/>
+          <geom type="sphere" pos=".48 0 0" size=".10" rgba="1 .52 .68 1"/>
+          <body name="wave_03" pos=".48 0 0">
+            <joint name="joint_03" type="ball" damping=".045" stiffness=".72"/>
+            <geom name="link_03" type="capsule" fromto="0 0 0 .48 0 0" size=".065" rgba=".37 .88 .38 1"/>
+            <geom type="sphere" pos=".48 0 0" size=".10" rgba=".69 1 .49 1"/>
+            <body name="wave_04" pos=".48 0 0">
+              <joint name="joint_04" type="hinge" axis="0 1 0" damping=".06" stiffness=".65"/>
+              <geom name="link_04" type="capsule" fromto="0 0 0 .48 0 0" size=".065" rgba=".98 .67 .12 1"/>
+              <geom type="sphere" pos=".48 0 0" size=".10" rgba="1 .87 .36 1"/>
+              <body name="wave_05" pos=".48 0 0">
+                <joint name="joint_05" type="ball" damping=".045" stiffness=".72"/>
+                <geom name="link_05" type="capsule" fromto="0 0 0 .48 0 0" size=".065" rgba=".59 .34 .96 1"/>
+                <geom type="sphere" pos=".48 0 0" size=".10" rgba=".79 .65 1 1"/>
+                <body name="wave_06" pos=".48 0 0">
+                  <joint name="joint_06" type="hinge" axis="0 1 0" damping=".06" stiffness=".65"/>
+                  <geom name="link_06" type="capsule" fromto="0 0 0 .48 0 0" size=".065" rgba=".04 .78 .52 1"/>
+                  <geom type="sphere" pos=".48 0 0" size=".10" rgba=".38 1 .74 1"/>
+                  <body name="wave_07" pos=".48 0 0">
+                    <joint name="joint_07" type="ball" damping=".045" stiffness=".72"/>
+                    <geom name="link_07" type="capsule" fromto="0 0 0 .48 0 0" size=".065" rgba=".18 .48 .98 1"/>
+                    <geom type="sphere" pos=".48 0 0" size=".10" rgba=".49 .72 1 1"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="wave_driver" joint="drive" gear="5" ctrllimited="true" ctrlrange="-.12 .12"/>
+  </actuator>
+</mujoco>
