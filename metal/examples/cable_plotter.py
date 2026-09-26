@@ -61,10 +61,10 @@ class _PlotterRecorder:
     scene = self.renderer.scene
     # Crossed cable runs terminate at the moving pen carriage; their anchors
     # and end points follow the model state in world coordinates.
-    self._connector(scene, [-.46, -.34, .79], point, [1, .12, .16, 1], 3)
-    self._connector(scene, [.46, -.34, .79], point, [.08, .88, .95, 1], 3)
+    self._connector(scene, [-.46, -.34, .79], point, [1, .12, .16, 1], .003)
+    self._connector(scene, [.46, -.34, .79], point, [.08, .88, .95, 1], .003)
     for previous, current in zip(trail, trail[1:]):
-      self._connector(scene, previous, current, [1, .2, .58, .92], 4)
+      self._connector(scene, previous, current, [1, .2, .58, .92], .004)
     return self.renderer.render().copy()
 
   def frame(self, step, actual, reference):

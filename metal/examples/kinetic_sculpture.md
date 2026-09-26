@@ -37,6 +37,6 @@ constraints.
 PYTHONPATH=metal PYTORCH_ENABLE_MPS_FALLBACK=0 python metal/examples/kinetic_sculpture.py --mode metal --headless --steps 1000 --record metal/examples/assets/kinetic_sculpture.gif
 ```
 
-Recording uses Pillow and MuJoCo OpenGL. The 1,000-step M1 Max native check
-observed maximum qpos error 3.01e-7 and qvel error 1.09e-6 against CPU MuJoCo.
+Recording uses Pillow and MuJoCo OpenGL. The 1,000-step M1 Max native run
+observed maximum qpos error 3.84e-6 and qvel error 1.63e-5 against CPU MuJoCo.
 The animation shows simulation time, not computation speed.

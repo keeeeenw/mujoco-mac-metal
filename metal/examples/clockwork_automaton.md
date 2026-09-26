@@ -28,3 +28,10 @@ Record the actual native and CPU renders:
 ```bash
 PYTHONPATH=metal python metal/examples/clockwork_automaton.py --record metal/examples/assets/clockwork_automaton.gif --steps 1800
 ```
+
+![Native Metal clockwork beside CPU MuJoCo](assets/clockwork_automaton.gif)
+
+The 1,800-step native run covered all four sequencer states. Maximum qpos/qvel
+differences from CPU were `7.23e-6` / `2.63e-5`; the measured gear relation
+residual stayed below `9.60e-6` radians. This is a fixture check, not a general
+constraint accuracy guarantee or speed benchmark.

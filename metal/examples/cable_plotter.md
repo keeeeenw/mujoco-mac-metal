@@ -40,3 +40,9 @@ dense solve, and semi-implicit Euler. It demonstrates
 fixed-joint tendon transmission and affine-bias servo forces; it does not
 establish support for general actuator models, tendons as passive elements, or
 contact physics.
+
+![Native cable plotter with measured pen trails](assets/cable_plotter.gif)
+
+The colored cable lines are a visual schematic of the fixed-joint transmission;
+they do not represent a simulated wrapping cable. The pink trail records actual
+pen-tip positions.

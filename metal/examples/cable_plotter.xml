@@ -13,7 +13,7 @@
   </default>
   <worldbody>
     <light pos="0 -1 2"/>
-    <geom name="base" type="box" pos="0 0 .65" size=".52 .42 .035" rgba=".18 .2 .24 1"/>
+    <geom name="base" type="box" pos="0 0 .43" size=".52 .42 .035" rgba=".18 .2 .24 1"/>
     <geom name="x_rail" type="box" pos="0 0 .76" size=".48 .025 .025" rgba=".58 .63 .68 1"/>
     <body name="x_carriage" pos="0 0 .76">
       <joint name="x_slide" type="slide" axis="1 0 0"/>

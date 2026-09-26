@@ -12,6 +12,7 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Friction laboratory](friction_laboratory.md) | Low, medium, and high friction turn sliding into rolling at different rates | Pyramidal condim-3 contact |
 | [Sensor scanning rig](scanning_rig.md) | A pan/tilt scanner plots its measured pose and direction | Current-state frame, gyro and velocity sensors |
 | [Cable plotter](cable_plotter.md) | Crossed tendons guide an XY pen around a figure eight | Fixed-joint tendon servos |
+| [Clockwork automaton](clockwork_automaton.md) | Counter-rotating gears and a sequenced pawl | Polynomial joint equality, limits and dry joint friction |
 | [Chaotic pendulum](README.md) | Four connected arms swing and tumble | Generalized rigid-body mass and bias |
 
 The development demos may require newer source than the latest PyPI release.
