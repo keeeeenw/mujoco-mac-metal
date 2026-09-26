@@ -228,7 +228,6 @@ kernel void solve_normal_contacts(
   // Four pyramid facets can be strongly coupled near the cone edges. Keep a
   // bounded but generous sweep budget and report status 3 if not converged.
   for (int sweep=0;sweep<256;++sweep) {
-    float max_residual=0.0f;
     for (int row=0;row<nr;++row) {
       int rb=(world*nr+row)*6;
       if (row_data[rb]<0.5f) continue;
@@ -238,13 +237,35 @@ kernel void solve_normal_contacts(
       float diagonal=max(1e-15f,W[row*nr+row]+R[row]);
       float next=max(0.0f,old+(ref-ja-R[row]*old)/diagonal);
       float delta=next-old;
-      // Projected KKT residual in acceleration units, normalized by the
-      // row's reference/current scale. This avoids demanding sub-ULP force
-      // changes when contact forces are large in float32.
-      float row_scale=max(1.0f,max(abs(ref),max(abs(ja),abs(R[row]*old))));
-      max_residual=max(max_residual,abs(delta)*diagonal/row_scale);
       force[world*nr+row]=next;
       for (int k=0;k<nv;++k) qacc[world*nv+k]+=response[row*nv+k]*delta;
+    }
+
+    // Reconstruct qacc from the current multipliers to prevent roundoff drift
+    // from accumulating over many coordinate updates.
+    for (int k=0;k<nv;++k) qacc[world*nv+k]=free_acc[world*nv+k];
+    for (int row=0;row<nr;++row) for (int k=0;k<nv;++k)
+      qacc[world*nv+k]+=response[row*nv+k]*force[world*nr+row];
+
+    // Evaluate the normalized projected KKT residual from the reconstructed
+    // state, including the exact unilateral projection at lambda >= 0.
+    float max_residual=0.0f;
+    for (int row=0;row<nr;++row) {
+      int rb=(world*nr+row)*6;
+      if (row_data[rb]<0.5f) continue;
+      float ja=0.0f; for (int k=0;k<nv;++k) ja+=J[jb+row*nv+k]*qacc[world*nv+k];
+      float old=force[world*nr+row], ref=row_data[rb+3];
+      float diagonal=max(1e-15f,W[row*nr+row]+R[row]);
+      float projected=max(0.0f,old+(ref-ja-R[row]*old)/diagonal);
+      // Normwise backward-error scale: retain the magnitudes of terms that
+      // may cancel in J*qacc, rather than scaling only by the small remainder.
+      float jfree=0.0f;
+      for (int k=0;k<nv;++k) jfree+=J[jb+row*nv+k]*free_acc[world*nv+k];
+      float row_scale=abs(ref)+abs(jfree)+abs(R[row]*old);
+      for (int c=0;c<nr;++c)
+        row_scale+=abs(W[row*nr+c]*force[world*nr+c]);
+      row_scale=max(1.0f,row_scale);
+      max_residual=max(max_residual,abs(projected-old)*diagonal/row_scale);
     }
     diagnostics[world*2]=max_residual;
     diagnostics[world*2+1]=float(sweep+1);

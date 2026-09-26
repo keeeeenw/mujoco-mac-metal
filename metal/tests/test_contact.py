@@ -332,26 +332,36 @@ def test_friction_profile_400_step_sliding_and_separating_batch():
           mass=".3" condim="3" friction=".6 .01 .01"/></body>
     </worldbody></mujoco>"""
   model = mujoco.MjModel.from_xml_string(xml)
-  qpos = np.tile(model.qpos0, (2, 1)).astype(np.float32)
-  qvel = np.zeros((2, model.nv), dtype=np.float32)
+  qpos = np.tile(model.qpos0, (3, 1)).astype(np.float32)
+  qvel = np.zeros((3, model.nv), dtype=np.float32)
   qvel[0, 0] = 0.8
   qvel[1, 0] = 0.8
-  qvel[1, 2] = 2.0  # the second world quickly separates from the floor
+  qvel[1, 2] = 2.0  # rises, then returns to impact within the rollout
+  qvel[2, 0] = 0.8
+  qvel[2, 2] = 5.0  # remains separated for all 400 steps
   simulation = MetalSimulation(
-      model, 2, qpos=qpos, qvel=qvel, profile="friction_contact_euler_v1"
+      model, 3, qpos=qpos, qvel=qvel, profile="friction_contact_euler_v1"
   )
-  references = [mujoco.MjData(model) for _ in range(2)]
+  references = [mujoco.MjData(model) for _ in range(3)]
   for i, data in enumerate(references):
     data.qpos[:] = qpos[i]
     data.qvel[:] = qvel[i]
   errors = np.zeros(2)
-  contact_steps = np.zeros(2, dtype=np.int32)
+  contact_steps = np.zeros(3, dtype=np.int32)
   for _ in range(400):
     simulation.step()
     for data in references:
       mujoco.mj_step(model, data)
     state = simulation.state.snapshot()
-    assert not np.any(state.status), state.status
+    if np.any(state.status):
+      diagnostics = simulation._contact._workspace["solver_diagnostics"].reshape(3, 2)
+      force_rows = simulation._contact._workspace["force"].reshape(3, -1, 5)
+      raise AssertionError(
+          f"step status={state.status.tolist()} diagnostics="
+          f"{diagnostics.cpu().numpy().tolist()} force_rows="
+          f"{force_rows[1].cpu().numpy().tolist()} qvel="
+          f"{state.qvel[1].tolist()}"
+      )
     for i, data in enumerate(references):
       errors = np.maximum(errors, [
           np.max(np.abs(state.qpos[i] - data.qpos)),
@@ -359,5 +369,6 @@ def test_friction_profile_400_step_sliding_and_separating_batch():
       ])
       contact_steps[i] += data.ncon > 0
   assert contact_steps[0] > 300
-  assert contact_steps[1] < 20
+  assert contact_steps[1] > 20
+  assert contact_steps[2] < 20
   assert errors[0] < 0.01 and errors[1] < 0.1, errors
