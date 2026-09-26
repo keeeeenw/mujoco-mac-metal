@@ -1,0 +1,32 @@
+<!-- Copyright 2026 The MuJoCo Metal contributors; Apache-2.0. -->
+<mujoco model="inertia_box_current_buoys">
+  <compiler angle="radian" inertiafromgeom="true"/>
+  <option timestep=".002" integrator="Euler" gravity="0 0 0"
+          density="1.4" viscosity=".055" wind=".38 .04 0">
+    <flag contact="disable"/>
+  </option>
+  <visual><headlight ambient=".55 .55 .55" diffuse=".9 .9 .9" specular=".12 .12 .12"/></visual>
+  <default>
+    <joint limited="false" damping="0" frictionloss="0"/>
+    <geom contype="0" conaffinity="0"/>
+  </default>
+  <worldbody>
+    <light pos="0 -1 3" diffuse=".9 .95 1"/>
+    <geom name="waterline" type="plane" pos="0 0 -.2" size="3 2 .05" rgba=".12 .34 .47 1"/>
+    <body name="ray_buoy" pos="-.7 -.35 .45">
+      <freejoint name="ray_free"/>
+      <geom name="ray_body" type="ellipsoid" size=".22 .12 .07" mass="1.2" rgba=".08 .75 .82 1"/>
+      <geom type="box" pos="-.18 0 0" size=".09 .015 .025" mass=".08" rgba=".96 .7 .19 1"/>
+    </body>
+    <body name="amber_glider" pos="-.2 .25 .65">
+      <freejoint name="amber_free"/>
+      <geom name="amber_body" type="capsule" size=".075 .24" euler="0 1.5708 0" mass="1.1" rgba=".96 .34 .12 1"/>
+      <geom type="box" pos="0 0 .11" size=".13 .018 .045" mass=".07" rgba="1 .72 .21 1"/>
+    </body>
+    <body name="violet_drifter" pos=".55 -.3 .35">
+      <freejoint name="violet_free"/>
+      <geom name="violet_body" type="box" size=".13 .1 .18" mass=".95" rgba=".57 .31 .9 1"/>
+      <geom type="ellipsoid" pos=".15 0 0" size=".09 .035 .035" mass=".06" rgba=".86 .76 1 1"/>
+    </body>
+  </worldbody>
+</mujoco>
