@@ -89,7 +89,11 @@ def validate_stepping_profile(
   separate from ``load_model``: generalized mass and bias queries support a
   broader model set than this stepping profile.
   """
-  if profile not in ("contact_free_euler_v1", "contact_free_forces_euler_v1"):
+  if profile not in (
+      "contact_free_euler_v1",
+      "contact_free_forces_euler_v1",
+      "contact_free_motor_euler_v1",
+  ):
     raise ValueError(f"unsupported stepping profile: {profile!r}")
   if not isinstance(model, mujoco.MjModel):
     raise TypeError("model must be a compiled mujoco.MjModel")
@@ -145,14 +149,17 @@ def validate_stepping_profile(
       "mjDSBL_EULERDAMP",
       "mjDSBL_GRAVITY",
   ):
-    if profile == "contact_free_forces_euler_v1" and name in (
+    if profile in (
+        "contact_free_forces_euler_v1",
+        "contact_free_motor_euler_v1",
+    ) and name in (
         "mjDSBL_DAMPER",
         "mjDSBL_EULERDAMP",
     ):
       continue
     irrelevant_disable |= int(getattr(mujoco.mjtDisableBit, name))
   unknown_disable = disable & ~(contact | irrelevant_disable)
-  if profile == "contact_free_forces_euler_v1":
+  if profile in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1"):
     unknown_disable &= ~(
         int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
         | int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
@@ -179,8 +186,17 @@ def validate_stepping_profile(
   if any(value not in allowed_joints for value in joint_types):
     raise ValueError(f"unsupported joint type in {profile}")
 
-  if model.nu:
+  motor_supported = ()
+  if model.nu and profile != "contact_free_motor_euler_v1":
     raise ValueError(f"actuators are unsupported by {profile}")
+  if profile == "contact_free_motor_euler_v1":
+    from mujoco_metal.actuation import ScalarMotorModel
+
+    ScalarMotorModel.from_model(model)
+    motor_supported = (
+        "fixed-gain hinge and slide joint motors",
+        "per-call controls with MuJoCo control/force clipping and disable flags",
+    )
   if model.ntendon:
     raise ValueError("tendons, including tendon armature, are unsupported")
   if model.neq:
@@ -242,27 +258,54 @@ def validate_stepping_profile(
           _SUPPORTED
           + (
               ("per-call applied generalized forces", "linear joint damping")
-              if profile == "contact_free_forces_euler_v1"
+              if profile
+              in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
               else ()
           )
+          + motor_supported
       ),
       irrelevant=(
           tuple(item for item in _IRRELEVANT if "disable flags" not in item)
-          if profile == "contact_free_forces_euler_v1"
+          if profile
+          in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
           else _IRRELEVANT
       ),
       rejected=(
-          tuple(item for item in _REJECTED if "joint damping" not in item)
-          if profile == "contact_free_forces_euler_v1"
-          else _REJECTED
+          tuple(
+              item
+              for item in _REJECTED
+              if not (
+                  "joint damping" in item
+                  and profile
+                  in (
+                      "contact_free_forces_euler_v1",
+                      "contact_free_motor_euler_v1",
+                  )
+              )
+              and not (
+                  "actuators and actuator state" in item
+                  and profile == "contact_free_motor_euler_v1"
+              )
+          )
+          + (
+              (
+                  "unsupported actuator state, plugins, non-joint transmissions, "
+                  "non-fixed gains, biases, dynamics, actuator armature or damping, "
+                  "and joint-level actuator force limits",
+              )
+              if profile == "contact_free_motor_euler_v1"
+              else ()
+          )
       ),
       passive_damping_enabled=(
-          profile == "contact_free_forces_euler_v1"
+          profile
+          in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
           and not disable & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
           and bool(np.any(damping32 > 0))
       ),
       implicit_euler_damping=(
-          profile == "contact_free_forces_euler_v1"
+          profile
+          in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
           and not disable & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
           and not disable & int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
           and bool(np.any(damping32 > 0))

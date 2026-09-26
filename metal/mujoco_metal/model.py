@@ -98,6 +98,7 @@ class ModelDescriptor:
   body_inertia: np.ndarray
   dof_armature: np.ndarray
   dof_damping: np.ndarray
+  actuator_armature: np.ndarray
   tendon_armature: np.ndarray
   jnt_type: np.ndarray
   jnt_qposadr: np.ndarray
@@ -193,6 +194,7 @@ def snapshot_descriptor(model):
       for name in (
           "nq",
           "nv",
+          "nu",
           "nbody",
           "njnt",
           "ngeom",
@@ -247,6 +249,7 @@ def _validate_lowered(counts, values):
       "body_inertia": (nb, 3),
       "dof_armature": (nv,),
       "dof_damping": (nv,),
+      "actuator_armature": (counts["nu"],),
       "tendon_armature": (counts["ntendon"],),
       "jnt_type": (nj,),
       "jnt_qposadr": (nj,),
@@ -280,6 +283,10 @@ def _validate_lowered(counts, values):
     raise ValueError("body mass and inertia values must be nonnegative")
   if np.any(values["dof_armature"] < 0):
     raise ValueError("dof armature values must be nonnegative")
+  if np.any(values["dof_damping"] < 0):
+    raise ValueError("dof damping values must be nonnegative")
+  if np.any(values["actuator_armature"] < 0):
+    raise ValueError("actuator armature values must be nonnegative")
   if np.any(values["geom_size"] < 0):
     raise ValueError("geometry sizes must be nonnegative")
   valid_geom_types = {
@@ -439,6 +446,7 @@ def load_model(source):
       "body_inertia",
       "dof_armature",
       "dof_damping",
+      "actuator_armature",
       "tendon_armature",
       "jnt_type",
       "jnt_qposadr",

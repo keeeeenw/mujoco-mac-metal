@@ -138,19 +138,28 @@ def _spatial_inertias(model, pose, centers):
 def smooth_dynamics(model: ModelDescriptor, qpos, qvel):
   """Return dense ``M(q)`` and inertial/gravity ``qfrc_bias`` on the CPU.
 
-  Only models without actuators are accepted because MuJoCo actuator-armature
-  contributions are outside this stage. Joint armature and gravity are
-  included. The implementation is a CPU reference, not a Metal execution path.
+  Actuators are accepted only when their actuator-armature contribution is
+  zero. Joint armature and gravity are included. The implementation is a CPU
+  reference, not a Metal execution path.
   """
-  if model.nu:
-    raise ValueError("smooth dynamics reference does not support actuators")
+  if model.nu and np.any(model.actuator_armature != 0):
+    raise ValueError("smooth dynamics reference does not support actuator armature")
   if np.any(model.tendon_armature != 0):
     raise ValueError(
         "smooth dynamics reference does not support tendon armature"
     )
   counts = {
       name: getattr(model, name)
-      for name in ("nq", "nv", "nbody", "njnt", "ngeom", "nsite", "ntendon")
+      for name in (
+          "nq",
+          "nv",
+          "nu",
+          "nbody",
+          "njnt",
+          "ngeom",
+          "nsite",
+          "ntendon",
+      )
   }
   values = {
       item.name: getattr(model, item.name)

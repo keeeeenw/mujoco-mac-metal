@@ -50,6 +50,7 @@ def _prepare_host_arrays(model: ModelDescriptor):
   counts = {
       "nq": model.nq,
       "nv": model.nv,
+      "nu": model.nu,
       "nbody": model.nbody,
       "njnt": model.njnt,
       "ngeom": model.ngeom,
@@ -77,6 +78,7 @@ def _prepare_host_arrays(model: ModelDescriptor):
       "body_inertia",
       "dof_armature",
       "dof_damping",
+      "actuator_armature",
       "tendon_armature",
       "jnt_type",
       "jnt_qposadr",
@@ -160,6 +162,7 @@ class MetalKinematics:
           "body_inertia",
           "dof_armature",
           "dof_damping",
+          "actuator_armature",
           "tendon_armature",
           "geom_type",
           "geom_size",

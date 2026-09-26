@@ -109,6 +109,38 @@ def test_forces_profile_rejects_polynomial_and_invalid_linear_damping():
     validate_stepping_profile(model, profile="contact_free_forces_euler_v1")
 
 
+def test_motor_profile_accepts_only_lowered_scalar_joint_motors():
+  model = mujoco.MjModel.from_xml_string(
+      """<mujoco><option><flag contact='disable'/></option><worldbody>
+      <body><joint name='hinge' type='hinge'/>
+      <geom type='sphere' size='.1'/></body></worldbody>
+      <actuator><general joint='hinge' dyntype='none' gaintype='fixed'
+        biastype='none' gainprm='2'/></actuator></mujoco>"""
+  )
+  with pytest.raises(ValueError, match="actuators"):
+    validate_stepping_profile(model, profile="contact_free_forces_euler_v1")
+  profile = validate_stepping_profile(
+      model, profile="contact_free_motor_euler_v1"
+  )
+  assert "fixed-gain hinge and slide joint motors" in profile.supported
+  assert not any(
+      item == "actuators and actuator state" for item in profile.rejected
+  )
+  assert any("non-joint transmissions" in item for item in profile.rejected)
+
+  unsupported = mujoco.MjModel.from_xml_string(
+      """<mujoco><option><flag contact='disable'/></option><worldbody>
+      <body><joint name='hinge' type='hinge'/>
+      <geom type='sphere' size='.1'/></body></worldbody>
+      <actuator><general joint='hinge' dyntype='none' gaintype='affine'
+        biastype='none' gainprm='1 0 0'/></actuator></mujoco>"""
+  )
+  with pytest.raises(ValueError, match="fixed-gain"):
+    validate_stepping_profile(
+        unsupported, profile="contact_free_motor_euler_v1"
+    )
+
+
 def test_version_contract_and_unavailable_enable_flags(monkeypatch):
   model = _model()
   monkeypatch.setattr(stepping_module.mujoco, "__version__", "3.14.1")

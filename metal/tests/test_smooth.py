@@ -89,15 +89,23 @@ def test_free_body_bias_and_gravity_match_analytic_reference():
   )
 
 
-def test_stage_rejects_actuator_models_and_invalid_state():
+def test_stage_accepts_zero_actuator_armature_and_rejects_nonzero():
   xml = """<mujoco><worldbody><body><joint name="hinge"/>
     <geom type="sphere" size=".1"/></body></worldbody>
     <actuator><motor joint="hinge"/></actuator></mujoco>"""
   descriptor = load_model(xml)
-  with pytest.raises(ValueError, match="actuators"):
-    smooth_dynamics(
-        descriptor, np.zeros(descriptor.nq), np.zeros(descriptor.nv)
-    )
+  model = mujoco.MjModel.from_xml_string(xml)
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  expected_mass = np.empty((model.nv, model.nv))
+  mujoco.mj_fullM(model, data, expected_mass)
+  actual = smooth_dynamics(descriptor, data.qpos, data.qvel)
+  np.testing.assert_allclose(actual["mass_matrix"], expected_mass, atol=1e-12)
+  np.testing.assert_allclose(actual["qfrc_bias"], data.qfrc_bias, atol=1e-12)
+
+  model.actuator_armature[0] = 0.1
+  with pytest.raises(ValueError, match="actuator armature"):
+    smooth_dynamics(load_model(model), data.qpos, data.qvel)
 
   tendon_xml = """<mujoco><worldbody><body>
     <joint name="j"/><geom type="sphere" size=".1"/>
