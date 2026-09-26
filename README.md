@@ -1,3 +1,97 @@
+# MuJoCo Mac Metal
+
+Experimental native Apple GPU physics for MuJoCo, maintained by
+[keeeeenw](https://github.com/keeeeenw). This community project builds on
+[Google DeepMind's MuJoCo](https://github.com/google-deepmind/mujoco) and adds an
+optional [Metal package](metal/README.md). It is not an official MuJoCo release.
+
+**Native contact-free stepping works for a bounded model profile. Full MuJoCo
+Metal support remains a work in progress.** The ordinary MuJoCo build remains
+available alongside the optional package.
+
+## Our contributions
+
+- **Native Metal physics pipeline:** model-derived forward kinematics, dense mass
+  matrices and inertial/gravity bias, a dense Cholesky acceleration solve, and
+  quaternion-aware semi-implicit Euler integration. Hinge, slide, ball and free
+  joints are supported within the explicit `contact_free_euler_v1` profile.
+- **Persistent GPU simulation state:** batched stepping without CPU physics or
+  per-step host state readback, per-world failure handling, selected-row reset,
+  and checkpoint ownership/restore. Host-side lifecycle utilities also cover
+  model-constant recomputation and invalidation.
+- **Validation and reproducible measurements:** 90 tests passed with GPU execution
+  enabled; independent CPU-reference trajectory and solve checks supplement the
+  suite. Benchmarks include actual eight-thread CPU measurements at every tested
+  batch through 524,288 worlds.
+- **Tools and documentation:** a Mac pendulum comparison, capability inventory,
+  runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.
+- **Upstream regression coverage:** an `mj_setConst` inertial-update roundtrip test
+  and documentation clarifying compiled simple-body/sparsity limitations.
+
+These contributions implement and qualify existing dynamics and numerical
+methods on Metal; MuJoCo's physics methods and PPO/RL algorithms are not our
+inventions. See [LICENSE](LICENSE) and [Metal attribution](metal/NOTICE).
+
+## Measured performance on M1 Max
+
+For the contact-free four-DOF pendulum on an **M1 Max with 32 GB unified memory**,
+200 steps at 524,288 environments took **18.905 s on eight-thread CPU rollout
+versus 5.907 s on Metal: 3.20x faster**, reaching **17.75 million world-steps/s**.
+CPU wins at small batches; gains level off at large batches.
+
+This is a short physics API benchmark, not a walking or PPO training result.
+CPU rollout records float64 trajectories; Metal retains float32 device state.
+Those different precision and output costs are included in the comparison.
+[Complete results, raw trials and reproduction commands](metal/benchmarks/README.md)
+explain the measurement boundaries.
+
+## Try the Mac demo
+
+![Hybrid Metal pendulum compared with CPU MuJoCo](metal/examples/assets/pendulum.gif)
+
+The [demo guide](metal/examples/README.md) provides installation and playback
+commands. Select `--mode metal` for native contact-free physics, `--mode metal-hybrid` for Metal mass/bias with CPU solve/integration, or `--mode cpu`.
+**The GIF shows the hybrid mode at a fixed playback rate, not native benchmark
+speed.** Rendering uses MuJoCo's OpenGL visualizer. Native headless/offscreen
+checks passed; native interactive playback still needs qualification with an
+active macOS display.
+
+## Current limits and next steps
+
+The optional package targets Python 3.12, MuJoCo **3.10.0** and Torch **2.9.1**;
+use its isolated installation instructions rather than treating the newer
+surrounding MuJoCo source version as the qualified runtime.
+
+The stepping profile requires contacts disabled, Euler integration and zero
+applied force. General actuation, passive/fluid forces, tendons, contacts and
+constraints, sensors, other integrators, native rendering and training integration
+remain unsupported. Per-environment model randomization is not connected to
+native stepping. Linux/CUDA integration and other Apple hardware/OS combinations
+have not been validated for this Metal package. Full upstream-core and
+single-precision compatibility are not established.
+
+Next milestones are broader force/actuator support, contacts and constraints,
+then broader model/API coverage and sustained application-level qualification.
+See the [support inventory and FAQ](metal/README.md) for precise boundaries.
+
+## Contribute
+
+Community testing, code review and pull requests are welcome—especially numerical
+edge cases, other Apple hardware, better matched CPU/GPU benchmarks, and ideas
+for code structure. Follow [CONTRIBUTING.md](CONTRIBUTING.md) and include the model,
+software versions and reproduction commands with reports.
+
+Upstream proposals: [native Metal support #3626](https://github.com/google-deepmind/mujoco/pull/3626)
+and [inertial-update regression #3624](https://github.com/google-deepmind/mujoco/pull/3624).
+The broader request is [MuJoCo issue #95](https://github.com/google-deepmind/mujoco/issues/95).
+The older robot-specific implementation remains on
+[`archive/metal-microduck-v1`](https://github.com/keeeeenw/mujoco-mac-metal/tree/archive/metal-microduck-v1).
+
+## Upstream MuJoCo
+
+The following documentation describes the underlying upstream project. Its
+installation and feature descriptions do not imply Metal acceleration.
+
 <h1>
   <a href="#"><img alt="MuJoCo" src="banner.png" width="100%"/></a>
 </h1>
@@ -20,7 +114,7 @@ in robotics, biomechanics, graphics and animation, machine learning, and other
 areas which demand fast and accurate simulation of articulated structures
 interacting with their environment.
 
-This repository is maintained by [Google DeepMind](https://www.deepmind.com/).
+Upstream MuJoCo is maintained by [Google DeepMind](https://www.deepmind.com/).
 
 MuJoCo has a C API and is intended for researchers and developers. The runtime
 simulation module is tuned to maximize performance and operates on low-level
