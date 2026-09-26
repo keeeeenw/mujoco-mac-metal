@@ -30,6 +30,10 @@ PYTHONPATH=metal .venv-demo/bin/python metal/examples/cable_plotter.py \
   --mode metal --steps 1200 --record metal/examples/assets/cable_plotter.gif
 ```
 
+The recording uses brighter model lighting, shows both crossed cable paths,
+and leaves a colored world-space trace at the measured pen-tip positions in
+each simulation panel.
+
 The native demo uses the `contact_free_transmission_euler_v1` simulation
 profile, which composes smooth dynamics, stateless transmission forces, the
 dense solve, and semi-implicit Euler. It demonstrates

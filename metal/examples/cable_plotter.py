@@ -17,6 +17,76 @@ import mujoco
 import numpy as np
 
 
+class _PlotterRecorder:
+  """Side-by-side recorder with world-space cable and measured pen trails."""
+
+  def __init__(self, model, path):
+    from PIL import Image, ImageDraw
+
+    self.Image, self.ImageDraw = Image, ImageDraw
+    self.path = Path(path)
+    self.model = model
+    self.renderer = mujoco.Renderer(model, 420, 620)
+    self.camera = mujoco.MjvCamera()
+    self.camera.lookat[:] = [0, 0, .68]
+    self.camera.distance = 1.55
+    self.camera.azimuth = 135
+    self.camera.elevation = -32
+    self.site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "pen_tip")
+    self.trails = [[], []]
+    self.every = max(1, round(1 / (25 * model.opt.timestep)))
+    self.duration = round(1000 * self.every * model.opt.timestep)
+    self.frames = []
+
+  def _connector(self, scene, start, end, color, width):
+    if scene.ngeom >= scene.maxgeom:
+      return
+    geom = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(
+        geom, mujoco.mjtGeom.mjGEOM_CAPSULE, np.zeros(3), np.zeros(3),
+        np.eye(3).reshape(-1), np.asarray(color, dtype=np.float32))
+    mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_CAPSULE, width,
+                         np.asarray(start, dtype=np.float64),
+                         np.asarray(end, dtype=np.float64))
+    scene.ngeom += 1
+
+  def _draw(self, data, panel):
+    mujoco.mj_forward(self.model, data)
+    point = data.site_xpos[self.site_id].copy()
+    trail = self.trails[panel]
+    trail.append(point)
+    if len(trail) > 250:
+      del trail[:-250]
+    self.renderer.update_scene(data, self.camera)
+    scene = self.renderer.scene
+    # Crossed cable runs terminate at the moving pen carriage; their anchors
+    # and end points follow the model state in world coordinates.
+    self._connector(scene, [-.46, -.34, .79], point, [1, .12, .16, 1], 3)
+    self._connector(scene, [.46, -.34, .79], point, [.08, .88, .95, 1], 3)
+    for previous, current in zip(trail, trail[1:]):
+      self._connector(scene, previous, current, [1, .2, .58, .92], 4)
+    return self.renderer.render().copy()
+
+  def frame(self, step, actual, reference):
+    if step % self.every:
+      return
+    panels = [self._draw(actual, 0), self._draw(reference, 1)]
+    image = self.Image.fromarray(np.concatenate(panels, axis=1))
+    draw = self.ImageDraw.Draw(image)
+    draw.rectangle((0, 0, image.width, 28), fill=(20, 26, 36))
+    draw.text((14, 8), "Native Metal | crossed cable paths", fill="white")
+    draw.text((634, 8), "CPU MuJoCo | measured pen trails", fill="white")
+    self.frames.append(image)
+
+  def close(self):
+    self.renderer.close()
+    if self.frames:
+      self.path.parent.mkdir(parents=True, exist_ok=True)
+      self.frames[0].save(self.path, save_all=True,
+                          append_images=self.frames[1:],
+                          duration=self.duration, loop=0)
+
+
 def _path(t):
   """Smooth figure-eight calligraphy command in carriage coordinates."""
   return .22 * np.sin(.72 * t), .17 * np.sin(1.44 * t + .35)
@@ -47,17 +117,7 @@ def run(steps=200, mode="metal", check=False, record=None):
     )
   recorder = None
   if record:
-    from demo_recording import ComparisonRecorder
-
-    recorder = ComparisonRecorder(
-        model,
-        record,
-        "Crossed-cable calligraphy plotter",
-        lookat=[0, 0, .58],
-        distance=1.9,
-        azimuth=135,
-        elevation=-28,
-    )
+    recorder = _PlotterRecorder(model, record)
 
   max_qpos_error = max_qvel_error = 0.0
   dt = float(model.opt.timestep)
@@ -81,7 +141,7 @@ def run(steps=200, mode="metal", check=False, record=None):
       max_qpos_error = max(max_qpos_error, float(np.max(np.abs(actual.qpos - reference.qpos))))
       max_qvel_error = max(max_qvel_error, float(np.max(np.abs(actual.qvel - reference.qvel))))
       if recorder:
-        recorder.frame(index, actual, reference, "Tendon position servos | 1x playback")
+        recorder.frame(index, actual, reference)
   finally:
     if recorder:
       recorder.close()
