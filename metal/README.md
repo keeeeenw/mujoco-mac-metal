@@ -18,9 +18,9 @@ source .venv-metal/bin/activate
 python -m pip install -e '.[metal,test]'
 ```
 
-For CPU-only utilities, replace the install extra with `.[test]`. Importing `mujoco_metal` and running preflight do not import Torch or initialize MPS.
+Torch installs automatically on Apple Silicon macOS. On other platforms, `.[test]` installs CPU utilities without Torch. Importing `mujoco_metal` and running preflight do not import Torch or initialize MPS.
 
-Run `python -m mujoco_metal preflight --model path/to/model.xml --json --inventory` to inspect runtime version, model dimensions, package and all five shader paths/hashes, capability boundaries, and the versioned feature/API inventory. The overall `gpu_qualified` field remains false because the full backend is not qualified. Inventory completeness is explicitly false because the captured enum and Python binding inventory is not exhaustive.
+Run `python -m mujoco_metal preflight --model path/to/model.xml --json --inventory` to inspect runtime version, model dimensions, package and all six shader paths/hashes, capability boundaries, and the versioned feature/API inventory. The overall `gpu_qualified` field remains false because the full backend is not qualified. Inventory completeness is explicitly false because the captured enum and Python binding inventory is not exhaustive.
 
 `load_model(xml_or_path)` returns an immutable, dimension-derived descriptor. `descriptor.forward_kinematics(qpos)` is a CPU reference for body, inertial, geom, site, and joint-anchor/axis world poses across hinge, slide, ball, and free joints. `MetalKinematics(descriptor).run(qpos_batch)` computes the same pose fields through the batched native Metal kinematics kernel. GPU checks have passed on an Apple M1 for empty and fixed worlds, mixed hinge/slide/ball/free models with off-center joints and multiple free roots, world-attached sites/geoms, and a 32-DOF chain. This is a narrow correctness qualification, not a general model-support or performance claim. Constructing `MetalKinematics` initializes MPS and compiles the bundled shader.
 
@@ -41,6 +41,52 @@ results when retaining them beyond the next invocation.
 
 Run the opt-in GPU correctness tests only on an available Apple GPU with the pinned Torch extra installed: `MUJOCO_METAL_RUN_GPU=1 python -m pytest -m gpu`. Ordinary `python -m pytest` runs CPU tests and skips the GPU cases. `preflight` remains CPU-only: shader hashes and stage labels are inventory, not a device probe. The overall GPU-qualified field stays false because contacts and the full backend remain unsupported. The standalone source tree carries the Apache 2.0 license and notices.
 
+## Applied forces, damping and basic motors
+
+Select a profile explicitly; the original `contact_free_euler_v1` remains the
+unforced baseline. All profiles require contacts disabled and Euler integration.
+
+| Profile | Additional supported behavior |
+| --- | --- |
+| `contact_free_forces_euler_v1` | Per-call generalized forces and nonnegative linear joint damping. |
+| `contact_free_motor_euler_v1` | The force profile plus stateless, fixed-gain, no-bias motors transmitted to hinge/slide joints. |
+
+```python
+simulation = MetalSimulation(model, batch_size=B,
+                             profile="contact_free_motor_euler_v1")
+simulation.step(ctrl=controls, qfrc_applied=forces)
+```
+
+Controls have shape `[B, nu]`; generalized forces have shape `[B, nv]`. Supply
+finite host arrays or contiguous float32 MPS tensors. Inputs are held across
+`step(steps=N, ...)` and expire at the next call; omitted values mean zero.
+Inputs are copied and never modified. Host input validation/upload occurs before
+the device loop; device inputs avoid host readback. Active invalid device inputs
+propagate to per-world failure handling. Reset/restore clears sticky failures.
+
+Damping follows MuJoCo's implicit Euler effective-mass solve, including the
+`DAMPER` and `EULERDAMP` disable flags. Stored `qacc` remains physical acceleration;
+Euler uses its separate effective acceleration to advance state. Motors support
+control/actuator force clipping, summed moments and global/group disable. Other
+transmissions, activation dynamics, non-fixed gains/biases, nonzero actuator
+armature/damping and joint-level actuator-force limits are rejected.
+
+Independent M1 checks covered 36 force/damping and 15 motor trajectories of
+1,000 steps against CPU MuJoCo. Maximum observed qpos/qvel/physical-qacc errors
+were approximately 4.83e-6 / 8.75e-6 / 2.54e-4 for force/damping, and
+2.48e-6 / 5.15e-6 / 1.69e-5 for motors. These are fixture-specific results, not
+universal error bounds. Public regressions cover malformed inputs, row failures,
+reset/restore, changing inputs and the device-only stepping path.
+
+Smooth M/bias queries can now accept models with actuators only if their actuator
+armature is zero; they still do not compute actuator forces. Simulation uses the
+stricter motor-profile validation. This distinction prevents unsupported inertia
+terms from silently disappearing.
+
+Try the [spacecraft force-control demo](examples/space_docking.md), or use the
+[installation and diagnostic guide](INSTALL.md) for repository-based pip install
+and `mujoco-metal doctor --gpu`. No PyPI release is available yet.
+
 ## Achievements and measured scaling
 
 The generalized package now has a **native contact-free stepping loop**: persistent
@@ -50,7 +96,7 @@ call CPU MuJoCo, NumPy solves, or read state back to the host. Reset/checkpoint
 ownership and per-world failure handling are covered by tests. These are new
 backend implementations of existing dynamics methods, not new physics algorithms.
 
-Local qualification includes **90 passing tests with GPU execution enabled**, plus
+Local qualification includes **133 passing tests with GPU execution enabled**, plus
 12 independent 1,000-step trajectories against MuJoCo across slide, hinge,
 free-body, and mixed-joint fixtures. The native pendulum also passed headless and
 offscreen checks. Interactive native playback still needs qualification with an
@@ -75,7 +121,7 @@ cross-hardware speedup is claimed.
 | Dense SPD factorization and multiple-RHS solve | Implemented and narrowly GPU-qualified on synthetic scaled/conditioned systems; dense float32 numerical limits remain. |
 | Hinge/slide/ball/free semi-implicit Euler integration | Implemented and narrowly GPU-qualified against MuJoCo 3.10. |
 | `contact_free_euler_v1` native simulation profile | Implemented and narrowly GPU-qualified on the local Apple M1: four rigid-body model fixtures, three initial states, 1,000 steps at 1 ms, and reset/restore resume. The largest observed absolute component differences were `1.26e-5` in position and `7.32e-5` in velocity; quaternion norm error was at most `1.2e-7`. This is not broad model or hardware qualification. |
-| Applied forces, passive forces, actuators and tendon dynamics | Outside the bounded pipeline. Stepping assumes zero applied generalized force; actuator models and all tendons are rejected. |
+| Applied forces, passive forces, actuators and tendon dynamics | Applied generalized forces, linear joint damping and bounded scalar-joint motors are supported in explicit profiles. Cartesian forces, other passive/actuator classes and all tendons remain unsupported. |
 | Collision/contact generation, joint limits, equality constraints, friction and constraint solvers | Unsupported. The qualified profile requires contact disabled and rejects limits and constraints, even when they are inactive in the initial state. |
 | Device reset/checkpoint lifecycle and per-environment model randomization | Persistent MPS state with host reset/checkpoint and row reset is connected; per-environment model randomization is not connected to native stepping. |
 | Sensors, remaining integrators, flexes/plugins, broad API and precision compatibility | Unimplemented or unqualified; full MuJoCo coverage is not established. |
@@ -229,9 +275,10 @@ dependencies of this package. The
 The current validation covers batched kinematics, dense mass matrices,
 inertial/gravity bias, dense SPD solves, joint-coordinate integration, and the
 bounded `contact_free_euler_v1` pipeline on local M1 fixtures compared with
-MuJoCo 3.10. It does not establish contacts, constraints, general actuation,
-rendering, training support, or full-library coverage. Actuators, tendons,
-passive forces and other unsupported features are rejected for stepping.
+MuJoCo 3.10. Explicit additional profiles cover generalized forces, linear damping and
+bounded scalar motors. Contacts, constraints, general actuation, other passive
+forces, tendons, native rendering, training and full-library coverage remain
+unsupported. Features outside the selected profile are rejected.
 Validation of a separate robot-specific backend does not extend this
 generalized package's coverage.
 

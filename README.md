@@ -19,11 +19,14 @@ available alongside the optional package.
   per-step host state readback, per-world failure handling, selected-row reset,
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
-- **Validation and reproducible measurements:** 90 tests passed with GPU execution
+- **Validation and reproducible measurements:** 133 tests passed with GPU execution
   enabled; independent CPU-reference trajectory and solve checks supplement the
   suite. Benchmarks include actual eight-thread CPU measurements at every tested
   batch through 524,288 worlds.
-- **Tools and documentation:** a Mac pendulum comparison, capability inventory,
+- **Forces and controls:** explicit generalized-force and linear-damping support,
+  plus bounded hinge/slide motors with clipping and disable flags. Separate
+  profiles preserve the original unforced baseline.
+- **Tools and documentation:** spacecraft and pendulum comparisons, capability inventory,
   runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.
 - **Upstream regression coverage:** an `mj_setConst` inertial-update roundtrip test
   and documentation clarifying compiled simple-body/sparsity limitations.
@@ -45,7 +48,28 @@ Those different precision and output costs are included in the comparison.
 [Complete results, raw trials and reproduction commands](metal/benchmarks/README.md)
 explain the measurement boundaries.
 
-## Try the Mac demo
+## Install and check
+
+In an isolated Python 3.12 environment, install directly from this repository:
+
+```sh
+python -m pip install "mujoco-mac-metal[metal] @ git+https://github.com/keeeeenw/mujoco-mac-metal.git@main#subdirectory=metal"
+PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal doctor --gpu
+```
+
+The proposed `pip install mujoco-mac-metal` release is not on PyPI yet.
+See [installation and diagnostics](metal/INSTALL.md) for requirements and status.
+
+## Try the Mac demos
+
+![Native Metal spacecraft approach beside CPU MuJoCo](metal/examples/assets/space_docking.gif)
+
+The [spacecraft approach demo](metal/examples/space_docking.md) uses three free
+bodies, applied forces/torques and different damping values, with an independent
+CPU reference. Targets are visual only: no docking contacts or latching are
+modeled. Its controller runs on the host; native physics runs on Metal.
+
+The original pendulum comparison is also available:
 
 ![Hybrid Metal pendulum compared with CPU MuJoCo](metal/examples/assets/pendulum.gif)
 
@@ -62,15 +86,16 @@ The optional package targets Python 3.12, MuJoCo **3.10.0** and Torch **2.9.1**;
 use its isolated installation instructions rather than treating the newer
 surrounding MuJoCo source version as the qualified runtime.
 
-The stepping profile requires contacts disabled, Euler integration and zero
-applied force. General actuation, passive/fluid forces, tendons, contacts and
+All current profiles require contacts disabled and Euler integration. Explicit
+profiles support generalized forces, linear damping and basic scalar-joint motors;
+other actuation, passive/fluid forces, tendons, contacts and
 constraints, sensors, other integrators, native rendering and training integration
 remain unsupported. Per-environment model randomization is not connected to
 native stepping. Linux/CUDA integration and other Apple hardware/OS combinations
 have not been validated for this Metal package. Full upstream-core and
 single-precision compatibility are not established.
 
-Next milestones are broader force/actuator support, contacts and constraints,
+Next milestones are contacts and constraints, broader force/actuator support,
 then broader model/API coverage and sustained application-level qualification.
 See the [support inventory and FAQ](metal/README.md) for precise boundaries.
 

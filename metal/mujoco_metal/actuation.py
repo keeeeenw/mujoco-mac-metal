@@ -20,8 +20,9 @@ joint transmission targeting one hinge or slide DOF. Joint/tendon actuator
 armature and damping, joint-level actuator-force limits, and all other
 transmissions/gains/biases/dynamics are rejected. Control clipping (unless
 ``mjDSBL_CLAMPCTRL`` is set), actuator force clipping, global actuation disable,
-and actuator-group disable are represented. This module is an isolated
-primitive; it does not make ``MetalSimulation`` accept actuators.
+and actuator-group disable are represented. This primitive is connected to the explicit
+``contact_free_motor_euler_v1`` simulation profile. Other simulation profiles
+continue to reject actuators.
 """
 
 from dataclasses import dataclass

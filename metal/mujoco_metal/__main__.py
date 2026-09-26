@@ -36,7 +36,7 @@ from mujoco_metal.registry import INVENTORY_COMPLETE
 from mujoco_metal.registry import TARGET_MUJOCO_VERSION
 
 _INSTALL_COMMAND = (
-    "python -m pip install 'mujoco-metal-experimental[metal] @ git+"
+    "python -m pip install 'mujoco-mac-metal[metal] @ git+"
     "https://github.com/keeeeenw/mujoco-mac-metal.git@main#subdirectory=metal'"
 )
 
@@ -120,8 +120,11 @@ def preflight(model_path=None, include_inventory=False):
               "narrowly GPU-qualified on M1 fixtures; scalar joint force "
               "stage only"
           ),
-          "contact_free_motor_euler_v1": "qualification pending",
-          "full_stepping": "unsupported beyond the bounded contact-free Euler profile",
+          "contact_free_motor_euler_v1": (
+              "narrowly GPU-qualified on M1; scalar hinge/slide motors, "
+              "clipping and disable flags; 15 independent 1000-step trajectories"
+          ),
+          "full_stepping": "unsupported beyond the bounded contact-free Euler profiles",
           "collision": "unsupported",
           "constraints": "unsupported",
           "sensors": "unsupported",

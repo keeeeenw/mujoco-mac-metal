@@ -73,6 +73,6 @@ def test_preflight_command_is_preserved(capsys):
   assert result["stages"]["contact_free_forces_euler_v1"]
   assert result["stages"]["scalar_motor_force"]
   assert (
-      result["stages"]["contact_free_motor_euler_v1"]
-      == "qualification pending"
+      "narrowly GPU-qualified"
+      in result["stages"]["contact_free_motor_euler_v1"]
   )

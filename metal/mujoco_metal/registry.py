@@ -181,7 +181,7 @@ def _inventory():
           Implementation.CPU_REFERENCE,
           Qualification.CPU_ORACLE,
           Execution.HOST,
-          "no actuator/tendon armature or forces, passive forces, contacts, constraints, or stepping",
+          "zero actuator/tendon armature only; no actuator/passive force computation, contacts, constraints, or stepping",
       )
   )
   result.extend(_enum_inventory())
@@ -297,6 +297,22 @@ def _inventory():
               Qualification.GPU_QUALIFIED,
               Execution.DEVICE,
               "narrow M1 qualification: four rigid-body model fixtures, three initial states, and 1,000-step 1 ms rollouts with reset/restore resume; profile requires contact-disabled Euler models with hinge/slide/free/ball joints and zero applied forces; actuators, tendons, limits, passive forces, sensors and other unsupported features are rejected",
+          ),
+          Feature(
+              "contact_free_forces_euler_v1 native force/damping pipeline",
+              Stage.INTEGRATION,
+              Implementation.NATIVE_GPU,
+              Qualification.GPU_QUALIFIED,
+              Execution.DEVICE,
+              "narrow M1 CPU-reference qualification: applied generalized force and linear joint damping, separate physical and Euler-effective acceleration solves; no Cartesian-force projection, springs, polynomial damping, contacts or general actuation",
+          ),
+          Feature(
+              "scalar motor force mapping and contact_free_motor_euler_v1",
+              Stage.INTEGRATION,
+              Implementation.NATIVE_GPU,
+              Qualification.GPU_QUALIFIED,
+              Execution.DEVICE,
+              "narrow M1 qualification: fixed-gain, no-bias, stateless hinge/slide joint motors; control/force clipping and actuator disable flags; no nonzero actuator armature/damping, joint actuator-force limits or other transmissions; host control upload or device controls",
           ),
           Feature(
               "built-in sensors",
