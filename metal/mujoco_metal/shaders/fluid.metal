@@ -33,7 +33,7 @@ kernel void inertia_box_fluid(
     uint world [[thread_position_in_grid]]) {
   int nv=dims[0], nbody=dims[1], njnt=dims[2], batch=dims[3], disabled=dims[4];
   if (world>=uint(batch)) return;
-  uint forcebase=world*uint(nv), bodybase=world*uint(nbody), jointbase=world*uint(njnt);
+  uint forcebase=world*uint(nv), jointbase=world*uint(njnt);
   for (int d=0;d<nv;++d) qfrc[forcebase+uint(d)]=0.0f;
   if (disabled || (fluid[0]<=0.0f && fluid[1]<=0.0f)) return;
   // Reject non-finite native state before any projection.
