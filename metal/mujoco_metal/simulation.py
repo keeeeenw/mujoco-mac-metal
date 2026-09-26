@@ -79,6 +79,7 @@ class MetalSimulation:
             "contact_free_motor_euler_v1",
             "contact_free_passive_euler_v1",
             "contact_free_sensor_euler_v1",
+            "normal_contact_euler_v1",
         )
         else None
     )
@@ -137,7 +138,11 @@ class MetalSimulation:
     )
     self._passive = None
     self._damping_tangent = None
-    if "passive" in profile.name or "sensor" in profile.name:
+    if (
+        "passive" in profile.name
+        or "sensor" in profile.name
+        or profile.name == "normal_contact_euler_v1"
+    ):
       from mujoco_metal.passive import MetalPassiveForces
 
       self._passive = MetalPassiveForces(model)
@@ -147,6 +152,17 @@ class MetalSimulation:
       from mujoco_metal.sensors import SensorProgram
 
       self._sensors = SensorProgram(model, batch_size)
+    self._contact = None
+    if profile.name == "normal_contact_euler_v1" and not (
+        int(model.opt.disableflags)
+        & (
+            int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+            | int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+        )
+    ):
+      from mujoco_metal.contact import MetalContact
+
+      self._contact = MetalContact(model, batch_size)
     self._solver = MetalDenseSolve(descriptor.nv, batch_size)
     self._euler_solver = (
         MetalDenseSolve(descriptor.nv, batch_size)
@@ -171,6 +187,7 @@ class MetalSimulation:
             "contact_free_motor_euler_v1",
             "contact_free_passive_euler_v1",
             "contact_free_sensor_euler_v1",
+            "normal_contact_euler_v1",
         )
         else None
     )
@@ -365,6 +382,18 @@ class MetalSimulation:
     acceleration, status = self._solver.run_device(
         dynamics["mass_matrix"], self._rhs
     )
+    if self._contact is not None:
+      contact = self._contact.run_device(
+          dynamics["poses"], dynamics["mass_matrix"], acceleration, qvel
+      )
+      torch = self._state._torch
+      status = torch.where(status == 0, contact["status"], status)
+      acceleration = contact["qacc"]
+      self._rhs.add_(
+          torch.bmm(
+              contact["jacobian"].transpose(1, 2), contact["force"].unsqueeze(2)
+          ).squeeze(2)
+      )
     return acceleration, status, dynamics
 
   def step(self, steps=1, *, qfrc_applied=None, ctrl=None, xfrc_applied=None):

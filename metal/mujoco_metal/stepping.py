@@ -90,6 +90,32 @@ def validate_stepping_profile(
   separate from ``load_model``: generalized mass and bias queries support a
   broader model set than this stepping profile.
   """
+  if profile == "normal_contact_euler_v1":
+    from mujoco_metal.contact import lower_contacts
+
+    lower_contacts(model)
+    reference = copy.copy(model)
+    reference.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    reference.opt.disableflags &= ~(
+        int(mujoco.mjtDisableBit.mjDSBL_FILTERPARENT)
+        | int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)
+    )
+    base = validate_stepping_profile(
+        reference, timestep, "contact_free_passive_euler_v1"
+    )
+    return replace(
+        base,
+        name=profile,
+        model_fingerprint=_fingerprint(model),
+        descriptor_fingerprint=_fingerprint(load_model(model)),
+        supported=tuple(
+            item for item in base.supported if "contact disabled" not in item
+        )
+        + ("normal-only sphere/plane and sphere/sphere contact",),
+        irrelevant=tuple(
+            item for item in base.irrelevant if "constraint-solver" not in item
+        ),
+    )
   if profile in (
       "contact_free_rk4_v1",
       "contact_free_forces_rk4_v1",
