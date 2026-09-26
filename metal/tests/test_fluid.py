@@ -95,7 +95,8 @@ def test_native_inertia_box_fluid_matches_mujoco():
   stage=MetalInertiaBoxFluid(model,batch_size=len(qpos))
   qpos_device=torch.tensor(qpos,dtype=torch.float32,device="mps")
   qvel_device=torch.tensor(qvel,dtype=torch.float32,device="mps")
+  from mujoco_metal.model import load_model
   from mujoco_metal.smooth_metal import MetalSmoothDynamics
-  dynamics=MetalSmoothDynamics(model,batch_size=len(qpos)).run_device(qpos_device,qvel_device)
+  dynamics=MetalSmoothDynamics(load_model(model),batch_size=len(qpos)).run_device(qpos_device,qvel_device)
   actual=stage.run_device(qpos_device,qvel_device,dynamics)
   np.testing.assert_allclose(actual.cpu().numpy(),_oracle(model,qpos,qvel),rtol=2e-5,atol=2e-5)
