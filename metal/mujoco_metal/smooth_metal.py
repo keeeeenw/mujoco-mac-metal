@@ -54,8 +54,8 @@ class MetalSmoothDynamics:
   """
 
   def __init__(self, model: ModelDescriptor, batch_size: int = 1):
-    if model.nu:
-      raise ValueError("Metal smooth stage does not support actuators")
+    if model.nu and np.any(model.actuator_armature != 0):
+      raise ValueError("Metal smooth stage does not support actuator armature")
     if np.any(model.tendon_armature != 0):
       raise ValueError("Metal smooth stage does not support tendon armature")
     host = _prepare_host_arrays(model)

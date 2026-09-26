@@ -28,8 +28,10 @@ def _xml(extra="", body=None, option="timestep='.002'"):
   if body is None:
     body = """<body><joint name='hinge' type='hinge' armature='.2'/>
       <geom type='sphere' size='.1'/></body>"""
-  worldbody = extra if extra.startswith("<worldbody>") else (
-      f"<worldbody>{body}</worldbody>{extra}"
+  worldbody = (
+      extra
+      if extra.startswith("<worldbody>")
+      else (f"<worldbody>{body}</worldbody>{extra}")
   )
   return f"""<mujoco><option {option}>
     <flag contact='disable'/></option>{worldbody}</mujoco>"""
@@ -69,12 +71,84 @@ def test_accepts_empty_static_world_and_energy_diagnostic_flag():
   assert any("energy diagnostics" in entry for entry in profile.irrelevant)
 
 
+def test_forces_profile_accepts_linear_damping_and_honors_euler_flags():
+  model = _model(body="""<body><joint name='hinge' type='hinge' damping='.2'/>
+    <geom type='sphere' size='.1'/></body>""")
+  profile = validate_stepping_profile(
+      model, profile="contact_free_forces_euler_v1"
+  )
+  assert profile.passive_damping_enabled
+  assert profile.implicit_euler_damping
+  assert "linear joint damping" in profile.supported
+  assert not any("joint damping" in item for item in profile.rejected)
+
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
+  profile = validate_stepping_profile(
+      model, profile="contact_free_forces_euler_v1"
+  )
+  assert profile.passive_damping_enabled
+  assert not profile.implicit_euler_damping
+
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
+  profile = validate_stepping_profile(
+      model, profile="contact_free_forces_euler_v1"
+  )
+  assert not profile.passive_damping_enabled
+  assert not profile.implicit_euler_damping
+
+
+def test_forces_profile_rejects_polynomial_and_invalid_linear_damping():
+  model = _model(body="""<body><joint name='hinge' type='hinge' damping='.2'/>
+    <geom type='sphere' size='.1'/></body>""")
+  model.dof_dampingpoly[0, 0] = 0.1
+  with pytest.raises(ValueError, match="polynomial damping"):
+    validate_stepping_profile(model, profile="contact_free_forces_euler_v1")
+  model.dof_dampingpoly.fill(0)
+  model.dof_damping[0] = -1
+  with pytest.raises(ValueError, match="finite and nonnegative"):
+    validate_stepping_profile(model, profile="contact_free_forces_euler_v1")
+
+
+def test_motor_profile_accepts_only_lowered_scalar_joint_motors():
+  model = mujoco.MjModel.from_xml_string(
+      """<mujoco><option><flag contact='disable'/></option><worldbody>
+      <body><joint name='hinge' type='hinge'/>
+      <geom type='sphere' size='.1'/></body></worldbody>
+      <actuator><general joint='hinge' dyntype='none' gaintype='fixed'
+        biastype='none' gainprm='2'/></actuator></mujoco>"""
+  )
+  with pytest.raises(ValueError, match="actuators"):
+    validate_stepping_profile(model, profile="contact_free_forces_euler_v1")
+  profile = validate_stepping_profile(
+      model, profile="contact_free_motor_euler_v1"
+  )
+  assert "fixed-gain hinge and slide joint motors" in profile.supported
+  assert not any(
+      item == "actuators and actuator state" for item in profile.rejected
+  )
+  assert any("non-joint transmissions" in item for item in profile.rejected)
+
+  unsupported = mujoco.MjModel.from_xml_string(
+      """<mujoco><option><flag contact='disable'/></option><worldbody>
+      <body><joint name='hinge' type='hinge'/>
+      <geom type='sphere' size='.1'/></body></worldbody>
+      <actuator><general joint='hinge' dyntype='none' gaintype='affine'
+        biastype='none' gainprm='1 0 0'/></actuator></mujoco>"""
+  )
+  with pytest.raises(ValueError, match="fixed-gain"):
+    validate_stepping_profile(
+        unsupported, profile="contact_free_motor_euler_v1"
+    )
+
+
 def test_version_contract_and_unavailable_enable_flags(monkeypatch):
   model = _model()
   monkeypatch.setattr(stepping_module.mujoco, "__version__", "3.14.1")
   with pytest.raises(RuntimeError, match=TARGET_MUJOCO_VERSION):
     validate_stepping_profile(model)
-  monkeypatch.setattr(stepping_module.mujoco, "__version__", TARGET_MUJOCO_VERSION)
+  monkeypatch.setattr(
+      stepping_module.mujoco, "__version__", TARGET_MUJOCO_VERSION
+  )
 
   model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_FWDINV)
   with pytest.raises(ValueError, match="unsupported enable flags"):
@@ -102,7 +176,10 @@ def test_profile_requires_contact_disabled_euler_and_valid_timesteps():
 @pytest.mark.parametrize(
     "extra, reason",
     [
-        ("<actuator><motor joint='hinge'/></actuator>", "actuators are unsupported"),
+        (
+            "<actuator><motor joint='hinge'/></actuator>",
+            "actuators are unsupported",
+        ),
         (
             "<tendon><fixed name='t'><joint joint='hinge' coef='1'/>"
             "</fixed></tendon>"
@@ -128,7 +205,10 @@ def test_profile_requires_contact_disabled_euler_and_valid_timesteps():
             "<geom type='sphere' size='.1'/></body></worldbody>",
             "friction loss",
         ),
-        ("<sensor><jointpos joint='hinge'/></sensor>", "sensors are unsupported"),
+        (
+            "<sensor><jointpos joint='hinge'/></sensor>",
+            "sensors are unsupported",
+        ),
         (
             "<worldbody><body gravcomp='1'><joint name='gravcomp'/>"
             "<geom type='sphere' size='.1'/></body></worldbody>",
@@ -210,7 +290,9 @@ def test_callback_rejection_does_not_modify_compiled_model():
   previous_control = mujoco.get_mjcb_control()
   try:
     mujoco.set_mjcb_control(lambda *_: None)
-    with pytest.raises(ValueError, match="global passive and control callbacks"):
+    with pytest.raises(
+        ValueError, match="global passive and control callbacks"
+    ):
       validate_stepping_profile(model)
   finally:
     mujoco.set_mjcb_control(previous_control)

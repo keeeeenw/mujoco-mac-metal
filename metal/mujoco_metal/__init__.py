@@ -14,7 +14,7 @@
 
 """Optional MuJoCo Metal experiments; import does not initialize a GPU."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 def __getattr__(name):
@@ -54,6 +54,10 @@ def __getattr__(name):
     from mujoco_metal.integration import MetalEulerIntegration
 
     return MetalEulerIntegration
+  if name in ("ScalarMotorModel", "MetalScalarMotorForce"):
+    from mujoco_metal import actuation
+
+    return getattr(actuation, name)
   if name == "MetalSimulation":
     from mujoco_metal.simulation import MetalSimulation
 

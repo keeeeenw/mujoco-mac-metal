@@ -1,5 +1,7 @@
 # Mac pendulum backend comparison
 
+For a free-body force-control example, see the [spacecraft approach demo](space_docking.md).
+
 This adapts the four-hinge chaotic pendulum from MuJoCo's
 [Python tutorial](../../python/tutorial.ipynb), Copyright 2021 DeepMind
 Technologies Limited, Apache-2.0. It has no contacts, actuators or passive forces.

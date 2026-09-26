@@ -1,0 +1,43 @@
+name: Publish Metal package to PyPI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build metal distributions
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build metal
+          python -m twine check metal/dist/*
+          sha256sum metal/dist/* | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metal-distributions
+          path: metal/dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mujoco-mac-metal
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: metal-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

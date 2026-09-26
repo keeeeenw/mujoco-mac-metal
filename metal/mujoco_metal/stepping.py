@@ -39,6 +39,8 @@ class SteppingProfile:
   supported: tuple[str, ...]
   irrelevant: tuple[str, ...]
   rejected: tuple[str, ...]
+  passive_damping_enabled: bool = False
+  implicit_euler_damping: bool = False
 
 
 _SUPPORTED = (
@@ -66,7 +68,7 @@ _REJECTED = (
     "flex/deformable elements",
     "MuJoCo plugins",
     "mocap bodies",
-    "joint damping, polynomial damping, stiffness, and springs",
+    "polynomial damping, joint stiffness, and springs",
     "tendon damping and stiffness",
     "fluid forces and nonzero density, viscosity, or wind",
     "body gravity compensation",
@@ -78,14 +80,20 @@ _REJECTED = (
 )
 
 
-def validate_stepping_profile(model, timestep=None, profile="contact_free_euler_v1"):
+def validate_stepping_profile(
+    model, timestep=None, profile="contact_free_euler_v1"
+):
   """Validate a compiled ``MjModel`` without allocating device state.
 
   The model must have contact explicitly disabled. This check is deliberately
   separate from ``load_model``: generalized mass and bias queries support a
   broader model set than this stepping profile.
   """
-  if profile != "contact_free_euler_v1":
+  if profile not in (
+      "contact_free_euler_v1",
+      "contact_free_forces_euler_v1",
+      "contact_free_motor_euler_v1",
+  ):
     raise ValueError(f"unsupported stepping profile: {profile!r}")
   if not isinstance(model, mujoco.MjModel):
     raise TypeError("model must be a compiled mujoco.MjModel")
@@ -104,11 +112,13 @@ def validate_stepping_profile(model, timestep=None, profile="contact_free_euler_
   with np.errstate(over="ignore", under="ignore"):
     native_dt = np.float32(dt)
   if not np.isfinite(native_dt) or native_dt <= 0:
-    raise ValueError("timestep must be representable as a finite positive float32")
+    raise ValueError(
+        "timestep must be representable as a finite positive float32"
+    )
 
   opt = model.opt
   if int(opt.integrator) != int(mujoco.mjtIntegrator.mjINT_EULER):
-    raise ValueError("contact_free_euler_v1 requires the Euler integrator")
+    raise ValueError(f"{profile} requires the Euler integrator")
   if not math.isfinite(float(opt.timestep)) or opt.timestep <= 0:
     raise ValueError("compiled model timestep must be finite and positive")
 
@@ -117,8 +127,7 @@ def validate_stepping_profile(model, timestep=None, profile="contact_free_euler_
   contact = int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
   if not disable & contact:
     raise ValueError(
-        "contact_free_euler_v1 requires contact explicitly disabled "
-        "with mjDSBL_CONTACT"
+        f"{profile} requires contact explicitly disabled " "with mjDSBL_CONTACT"
     )
 
   # These bits affect absent or explicitly rejected subsystems. Gravity is a
@@ -140,8 +149,21 @@ def validate_stepping_profile(model, timestep=None, profile="contact_free_euler_
       "mjDSBL_EULERDAMP",
       "mjDSBL_GRAVITY",
   ):
+    if profile in (
+        "contact_free_forces_euler_v1",
+        "contact_free_motor_euler_v1",
+    ) and name in (
+        "mjDSBL_DAMPER",
+        "mjDSBL_EULERDAMP",
+    ):
+      continue
     irrelevant_disable |= int(getattr(mujoco.mjtDisableBit, name))
   unknown_disable = disable & ~(contact | irrelevant_disable)
+  if profile in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1"):
+    unknown_disable &= ~(
+        int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
+        | int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
+    )
   if unknown_disable:
     raise ValueError(f"unsupported disable flags: 0x{unknown_disable:x}")
 
@@ -149,7 +171,7 @@ def validate_stepping_profile(model, timestep=None, profile="contact_free_euler_
   known_enable = energy
   sleep = int(mujoco.mjtEnableBit.mjENBL_SLEEP)
   if enable & sleep:
-    raise ValueError("sleep mode is unsupported by contact_free_euler_v1")
+    raise ValueError(f"sleep mode is unsupported by {profile}")
   unknown_enable = enable & ~(known_enable | sleep)
   if unknown_enable:
     raise ValueError(f"unsupported enable flags: 0x{unknown_enable:x}")
@@ -162,10 +184,19 @@ def validate_stepping_profile(model, timestep=None, profile="contact_free_euler_
   }
   joint_types = tuple(int(value) for value in model.jnt_type)
   if any(value not in allowed_joints for value in joint_types):
-    raise ValueError("unsupported joint type in contact_free_euler_v1")
+    raise ValueError(f"unsupported joint type in {profile}")
 
-  if model.nu:
-    raise ValueError("actuators are unsupported by contact_free_euler_v1")
+  motor_supported = ()
+  if model.nu and profile != "contact_free_motor_euler_v1":
+    raise ValueError(f"actuators are unsupported by {profile}")
+  if profile == "contact_free_motor_euler_v1":
+    from mujoco_metal.actuation import ScalarMotorModel
+
+    ScalarMotorModel.from_model(model)
+    motor_supported = (
+        "fixed-gain hinge and slide joint motors",
+        "per-call controls with MuJoCo control/force clipping and disable flags",
+    )
   if model.ntendon:
     raise ValueError("tendons, including tendon armature, are unsupported")
   if model.neq:
@@ -176,14 +207,27 @@ def validate_stepping_profile(model, timestep=None, profile="contact_free_euler_
     raise ValueError("friction loss is unsupported")
   if model.nflex or model.nflexvert or model.nflexelem:
     raise ValueError("flex/deformable elements are unsupported")
-  if model.nplugin or np.any(model.body_plugin >= 0) or np.any(model.geom_plugin >= 0):
+  if (
+      model.nplugin
+      or np.any(model.body_plugin >= 0)
+      or np.any(model.geom_plugin >= 0)
+  ):
     raise ValueError("MuJoCo plugins are unsupported")
   if model.nmocap or np.any(model.body_mocapid >= 0):
     raise ValueError("mocap bodies are unsupported")
   if model.nsensor:
     raise ValueError("sensors are unsupported by contact_free_euler_v1")
-  if np.any(model.dof_damping) or np.any(model.dof_dampingpoly):
-    raise ValueError("joint damping, including polynomial damping, is unsupported")
+  if np.any(model.dof_dampingpoly):
+    raise ValueError("polynomial damping is unsupported")
+  damping = np.asarray(model.dof_damping, dtype=np.float64)
+  if np.any(~np.isfinite(damping)) or np.any(damping < 0):
+    raise ValueError("linear joint damping must be finite and nonnegative")
+  with np.errstate(over="ignore", invalid="ignore"):
+    damping32 = np.asarray(damping, dtype=np.float32)
+  if np.any(~np.isfinite(damping32)):
+    raise ValueError("linear joint damping must be representable as float32")
+  if profile == "contact_free_euler_v1" and np.any(model.dof_damping):
+    raise ValueError("joint damping is unsupported by contact_free_euler_v1")
   if np.any(model.jnt_stiffness) or np.any(model.jnt_stiffnesspoly):
     raise ValueError("joint stiffness and springs are unsupported")
   if np.any(model.tendon_damping) or np.any(model.tendon_dampingpoly):
@@ -210,7 +254,60 @@ def validate_stepping_profile(model, timestep=None, profile="contact_free_euler_
       nq=int(model.nq),
       nv=int(model.nv),
       joint_types=joint_types,
-      supported=_SUPPORTED,
-      irrelevant=_IRRELEVANT,
-      rejected=_REJECTED,
+      supported=(
+          _SUPPORTED
+          + (
+              ("per-call applied generalized forces", "linear joint damping")
+              if profile
+              in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
+              else ()
+          )
+          + motor_supported
+      ),
+      irrelevant=(
+          tuple(item for item in _IRRELEVANT if "disable flags" not in item)
+          if profile
+          in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
+          else _IRRELEVANT
+      ),
+      rejected=(
+          tuple(
+              item
+              for item in _REJECTED
+              if not (
+                  "joint damping" in item
+                  and profile
+                  in (
+                      "contact_free_forces_euler_v1",
+                      "contact_free_motor_euler_v1",
+                  )
+              )
+              and not (
+                  "actuators and actuator state" in item
+                  and profile == "contact_free_motor_euler_v1"
+              )
+          )
+          + (
+              (
+                  "unsupported actuator state, plugins, non-joint transmissions, "
+                  "non-fixed gains, biases, dynamics, actuator armature or damping, "
+                  "and joint-level actuator force limits",
+              )
+              if profile == "contact_free_motor_euler_v1"
+              else ()
+          )
+      ),
+      passive_damping_enabled=(
+          profile
+          in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
+          and not disable & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
+          and bool(np.any(damping32 > 0))
+      ),
+      implicit_euler_damping=(
+          profile
+          in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
+          and not disable & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
+          and not disable & int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
+          and bool(np.any(damping32 > 0))
+      ),
   )
