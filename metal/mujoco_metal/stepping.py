@@ -14,7 +14,8 @@
 
 """CPU-only contracts for the supported native stepping profiles."""
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 import math
 
 import mujoco
@@ -89,6 +90,34 @@ def validate_stepping_profile(
   separate from ``load_model``: generalized mass and bias queries support a
   broader model set than this stepping profile.
   """
+  if profile in (
+      "contact_free_rk4_v1",
+      "contact_free_forces_rk4_v1",
+      "contact_free_motor_rk4_v1",
+  ):
+    if not isinstance(model, mujoco.MjModel):
+      raise TypeError("model must be a compiled mujoco.MjModel")
+    if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_RK4):
+      raise ValueError(f"{profile} requires the RK4 integrator")
+    reference = copy.copy(model)
+    reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
+    result = validate_stepping_profile(
+        reference, timestep, profile.replace("rk4", "euler")
+    )
+    return replace(
+        result,
+        name=profile,
+        model_fingerprint=_fingerprint(model),
+        implicit_euler_damping=False,
+        supported=tuple(
+            "four-stage Runge-Kutta" if item == "semi-implicit Euler" else item
+            for item in result.supported
+        ),
+        rejected=tuple(
+            "non-RK4 integrators" if item == "non-Euler integrators" else item
+            for item in result.rejected
+        ),
+    )
   if profile not in (
       "contact_free_euler_v1",
       "contact_free_forces_euler_v1",

@@ -74,7 +74,7 @@ class MetalSimulation:
     profile = validate_stepping_profile(model, profile=profile)
     motor_model = (
         ScalarMotorModel.from_model(model)
-        if profile.name == "contact_free_motor_euler_v1"
+        if profile.name.replace("rk4", "euler") == "contact_free_motor_euler_v1"
         else None
     )
     if motor_model is not None:
@@ -148,7 +148,7 @@ class MetalSimulation:
     )
     self._applied_force = (
         torch.zeros_like(self._rhs)
-        if profile.name
+        if profile.name.replace("rk4", "euler")
         in ("contact_free_forces_euler_v1", "contact_free_motor_euler_v1")
         else None
     )
@@ -191,6 +191,12 @@ class MetalSimulation:
     self._next_qacc = torch.empty_like(self._state._qacc)
     self._next_time = torch.empty_like(self._state._time)
     self._next_status = torch.empty_like(self._state._status)
+    if "rk4" in profile.name:
+      from mujoco_metal.runge_kutta import MetalRungeKutta
+
+      self._rk4 = MetalRungeKutta(descriptor, batch_size, profile.timestep)
+    else:
+      self._rk4 = None
 
   @property
   def state(self):
@@ -258,6 +264,20 @@ class MetalSimulation:
       raise ValueError("ctrl must be finite and representable as float32")
     self._control.copy_(torch.tensor(array, device=self._state._device))
 
+  def _acceleration(self, qpos, qvel):
+    dynamics = self._smooth.run_device(qpos, qvel)
+    self._state._torch.neg(dynamics["qfrc_bias"], out=self._rhs)
+    if self._applied_force is not None:
+      if self.profile.passive_damping_enabled and self._rhs.numel():
+        self._rhs.addcmul_(qvel, self._damping.unsqueeze(0), value=-1.0)
+      self._rhs.add_(self._applied_force)
+    if self._motor is not None:
+      self._rhs.add_(self._motor.run_device(self._control))
+    acceleration, status = self._solver.run_device(
+        dynamics["mass_matrix"], self._rhs
+    )
+    return acceleration, status, dynamics
+
   def step(self, steps=1, *, qfrc_applied=None, ctrl=None):
     """Advance all worlds by a positive number of native contact-free steps.
 
@@ -282,18 +302,24 @@ class MetalSimulation:
     torch = self._state._torch
     state = self._state
     for _ in range(int(steps)):
-      dynamics = self._smooth.run_device(state._qpos, state._qvel)
-      torch.neg(dynamics["qfrc_bias"], out=self._rhs)
-      if self._applied_force is not None:
-        if self.profile.passive_damping_enabled and self._rhs.numel():
-          self._rhs.addcmul_(
-              state._qvel, self._damping.unsqueeze(0), value=-1.0
-          )
-        self._rhs.add_(self._applied_force)
-      if self._motor is not None:
-        self._rhs.add_(self._motor.run_device(self._control))
-      acceleration, solve_status = self._solver.run_device(
-          dynamics["mass_matrix"], self._rhs
+      if self._rk4 is not None:
+        qpos, qvel, acceleration, time, status = self._rk4.run_device(
+            state._qpos,
+            state._qvel,
+            state._time,
+            state._status,
+            lambda q, v: self._acceleration(q, v)[:2],
+        )
+        success = status == 0
+        state._qpos = qpos.clone()
+        state._qvel = qvel.clone()
+        state._qacc = torch.where(success[:, None], acceleration, state._qacc)
+        state._time = time.clone()
+        state._status = status.clone()
+        state._generation += 1
+        continue
+      acceleration, solve_status, dynamics = self._acceleration(
+          state._qpos, state._qvel
       )
       integration_acceleration = acceleration
       if self._euler_solver is not None:
