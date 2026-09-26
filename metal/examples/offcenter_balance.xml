@@ -1,0 +1,31 @@
+<mujoco model="offcenter balance workshop">
+  <compiler angle="radian" autolimits="true"/>
+  <option integrator="implicitfast" timestep="0.002" gravity="0 0 0">
+    <flag contact="disable"/>
+  </option>
+  <visual><headlight diffuse="0.9 0.9 0.9" ambient="0.45 0.45 0.45" specular="0.25 0.25 0.25"/></visual>
+  <worldbody>
+    <geom name="floor" type="plane" pos="0 0 -0.45" size="4 4 .1" rgba=".08 .12 .18 1" contype="0" conaffinity="0"/>
+    <body name="amber_tool" pos="-1.2 0 0">
+      <freejoint/>
+      <inertial pos=".16 .035 .015" mass="1.1" diaginertia=".09 .14 .18" quat=".9659258 0 0 .258819"/>
+      <geom type="box" pos="0 0 0" size=".48 .07 .07" rgba="1 .43 .08 1" mass="0"/>
+      <geom type="box" pos=".32 .28 0" size=".07 .28 .07" rgba="1 .72 .15 1" mass="0"/>
+      <site name="amber_com" pos=".16 .035 .015" size=".045" rgba="1 .95 .25 1"/>
+    </body>
+    <body name="cyan_tool" pos="0 0 0">
+      <freejoint/>
+      <inertial pos="-.13 .08 -.025" mass=".9" diaginertia=".075 .12 .16" quat=".9238795 .3826834 0 0"/>
+      <geom type="box" pos="0 0 0" size=".43 .065 .065" rgba=".05 .8 .95 1" mass="0"/>
+      <geom type="box" pos="-.28 .25 0" size=".065 .25 .065" rgba=".13 .97 .78 1" mass="0"/>
+      <site name="cyan_com" pos="-.13 .08 -.025" size=".045" rgba=".3 1 1 1"/>
+    </body>
+    <body name="violet_tool" pos="1.2 0 0">
+      <freejoint/>
+      <inertial pos=".09 -.10 .045" mass="1.25" diaginertia=".11 .17 .21" quat=".9659258 0 .258819 0"/>
+      <geom type="box" pos="0 0 0" size=".5 .06 .06" rgba=".65 .3 1 1" mass="0"/>
+      <geom type="box" pos=".34 -.25 0" size=".06 .25 .06" rgba=".95 .3 .75 1" mass="0"/>
+      <site name="violet_com" pos=".09 -.10 .045" size=".045" rgba="1 .7 1 1"/>
+    </body>
+  </worldbody>
+</mujoco>
