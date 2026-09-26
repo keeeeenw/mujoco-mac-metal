@@ -1,0 +1,49 @@
+<!-- Copyright 2026 The MuJoCo Metal contributors; Apache-2.0. -->
+<mujoco model="cable_plotter">
+  <compiler angle="radian" inertiafromgeom="true"/>
+  <option timestep=".002" integrator="Euler" gravity="0 0 0">
+    <flag contact="disable"/>
+  </option>
+  <default>
+    <joint damping="0" frictionloss="0" limited="false"/>
+    <geom contype="0" conaffinity="0" density="480"/>
+  </default>
+  <worldbody>
+    <light pos="0 -1 2"/>
+    <geom name="base" type="box" pos="0 0 .65" size=".52 .42 .035" rgba=".18 .2 .24 1"/>
+    <geom name="x_rail" type="box" pos="0 0 .76" size=".48 .025 .025" rgba=".58 .63 .68 1"/>
+    <body name="x_carriage" pos="0 0 .76">
+      <joint name="x_slide" type="slide" axis="1 0 0"/>
+      <geom name="x_block" type="box" size=".07 .055 .045" rgba=".18 .68 .85 1"/>
+      <geom name="y_rail" type="box" pos="0 0 -.09" size=".025 .34 .022" rgba=".72 .75 .78 1"/>
+      <body name="y_carriage" pos="0 0 -.09">
+        <joint name="y_slide" type="slide" axis="0 1 0"/>
+        <geom name="y_block" type="box" size=".055 .06 .04" rgba=".98 .53 .16 1"/>
+        <body name="pen" pos="0 0 -.075">
+          <geom name="stylus" type="cylinder" size=".018 .12" rgba=".18 .18 .2 1"/>
+          <geom name="tip" type="sphere" pos="0 0 -.125" size=".025" rgba=".8 .2 .22 1"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <tendon>
+    <fixed name="cable_diagonal_a">
+      <joint joint="x_slide" coef="1"/>
+      <joint joint="y_slide" coef="1"/>
+    </fixed>
+    <fixed name="cable_diagonal_b">
+      <joint joint="x_slide" coef="1"/>
+      <joint joint="y_slide" coef="-1"/>
+    </fixed>
+  </tendon>
+  <actuator>
+    <general name="cable_a" tendon="cable_diagonal_a" dyntype="none"
+      gaintype="fixed" gainprm="1.8" biastype="affine"
+      biasprm="0 -1.8 -1.15" forcelimited="true" forcerange="-2 2"
+      ctrllimited="true" ctrlrange="-.48 .48"/>
+    <general name="cable_b" tendon="cable_diagonal_b" dyntype="none"
+      gaintype="fixed" gainprm="1.8" biastype="affine"
+      biasprm="0 -1.8 -1.15" forcelimited="true" forcerange="-2 2"
+      ctrllimited="true" ctrlrange="-.48 .48"/>
+  </actuator>
+</mujoco>
