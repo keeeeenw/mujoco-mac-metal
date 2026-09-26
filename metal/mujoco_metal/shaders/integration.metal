@@ -83,6 +83,9 @@ kernel void semi_implicit_euler(
     device int* output_status [[buffer(14)]],
     constant int* dims [[buffer(15)]],
     constant float* timestep [[buffer(16)]],
+    device const float* next_velocity [[buffer(17)]],
+    device const float* position_velocity [[buffer(18)]],
+    constant int* velocity_mode [[buffer(19)]],
     uint world [[thread_position_in_grid]]) {
   uint nq = uint(dims[0]);
   uint nv = uint(dims[1]);
@@ -110,7 +113,9 @@ kernel void semi_implicit_euler(
     }
   }
   for (uint i = 0; i < nv; ++i) {
-    if (!finite_float(qvel[vb + i]) || !finite_float(qacc[vb + i])) {
+    if (!finite_float(qvel[vb + i]) || !finite_float(qacc[vb + i]) ||
+        ((velocity_mode[0] & 1) && !finite_float(next_velocity[vb + i])) ||
+        ((velocity_mode[0] & 2) && !finite_float(position_velocity[vb + i]))) {
       output_status[world] = 10;
       return;
     }
@@ -124,7 +129,8 @@ kernel void semi_implicit_euler(
   for (uint i = 0; i < nq; ++i) candidate_qpos[qb + i] = qpos[qb + i];
   bool valid = true;
   for (uint i = 0; i < nv; ++i) {
-    float velocity = qvel[vb + i] + dt * qacc[vb + i];
+    float velocity = (velocity_mode[0] & 1) ? next_velocity[vb + i] :
+                     qvel[vb + i] + dt * qacc[vb + i];
     if (!finite_float(velocity)) valid = false;
     candidate_qvel[vb + i] = velocity;
   }
@@ -136,7 +142,10 @@ kernel void semi_implicit_euler(
     return;
   }
 
-  // Apply the updated velocity using MuJoCo's joint address conventions.
+  // Position velocity may differ from the committed next velocity (midpoint).
+  device const float* pos_velocity = (velocity_mode[0] & 2) ?
+                                    position_velocity : candidate_qvel;
+  // Apply position velocity using MuJoCo's joint address conventions.
   for (uint j = 0; j < njnt; ++j) {
     int type = joint_type[j];
     uint pa = uint(joint_qposadr[j]);
@@ -144,7 +153,7 @@ kernel void semi_implicit_euler(
     if (type == 0) {
       for (uint k = 0; k < 3; ++k) {
         float value = candidate_qpos[qb + pa + k] +
-                      dt * candidate_qvel[vb + da + k];
+                      dt * pos_velocity[vb + da + k];
         if (!finite_float(value)) valid = false;
         candidate_qpos[qb + pa + k] = value;
       }
@@ -163,9 +172,9 @@ kernel void semi_implicit_euler(
         return;
       }
       float4 normalized = quat_normalize_stable(q);
-      float3 omega = float3(candidate_qvel[vb + da],
-                            candidate_qvel[vb + da + 1],
-                            candidate_qvel[vb + da + 2]);
+      float3 omega = float3(pos_velocity[vb + da],
+                            pos_velocity[vb + da + 1],
+                            pos_velocity[vb + da + 2]);
       float4 increment = quat_increment(omega, dt, valid);
       float4 next_quat = quat_normalize_stable(quat_multiply(normalized, increment));
       for (uint k = 0; k < 4; ++k) {
@@ -173,7 +182,7 @@ kernel void semi_implicit_euler(
         candidate_qpos[qb + pa + k] = next_quat[k];
       }
     } else if (type == 2 || type == 3) {
-      float value = candidate_qpos[qb + pa] + dt * candidate_qvel[vb + da];
+      float value = candidate_qpos[qb + pa] + dt * pos_velocity[vb + da];
       if (!finite_float(value)) valid = false;
       candidate_qpos[qb + pa] = value;
     }

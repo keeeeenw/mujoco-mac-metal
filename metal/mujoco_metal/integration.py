@@ -46,7 +46,10 @@ class MetalEulerIntegration:
 
   The velocity update is ``qvel += dt*qacc``. Position integration follows
   MuJoCo 3.10 for hinge, slide, ball and free joints, using the updated
-  velocity. Construction validates and snapshots model constants, initializes
+  velocity, or an explicit ``position_velocity`` for midpoint integration.
+  An optional ``next_velocity`` supplies the candidate velocity directly. Both
+  overrides receive the same finite-value and per-row commit checks.
+  Construction validates and snapshots model constants, initializes
   MPS, and compiles the shader. It does not read state values back to the host.
   """
 
@@ -116,6 +119,10 @@ class MetalEulerIntegration:
         device=self._device,
     )
     self._dt = torch.tensor([dt], dtype=torch.float32, device=self._device)
+    self._velocity_modes = tuple(
+        torch.tensor([mode], dtype=torch.int32, device=self._device)
+        for mode in range(4)
+    )
     self._empty_input = torch.zeros(1, dtype=torch.float32, device=self._device)
     self._candidate_qpos = torch.empty(
         max(batch_size * self.nq, 1), dtype=torch.float32, device=self._device
@@ -156,7 +163,17 @@ class MetalEulerIntegration:
     if not tensor.is_contiguous():
       raise ValueError(f"{name} must be contiguous")
 
-  def run_device(self, qpos, qvel, qacc, time, solve_status):
+  def run_device(
+      self,
+      qpos,
+      qvel,
+      qacc,
+      time,
+      solve_status,
+      *,
+      next_velocity=None,
+      position_velocity=None,
+  ):
     """Return candidate states, preserving any row that fails validation."""
     batch = self.batch_size
     self._validate_tensor(qpos, "qpos", (batch, self.nq), self._torch.float32)
@@ -165,6 +182,28 @@ class MetalEulerIntegration:
     self._validate_tensor(time, "time", (batch,), self._torch.float32)
     self._validate_tensor(
         solve_status, "solve_status", (batch,), self._torch.int32
+    )
+
+    for name, value in (
+        ("next_velocity", next_velocity),
+        ("position_velocity", position_velocity),
+    ):
+      if value is not None:
+        self._validate_tensor(
+            value, name, (batch, self.nv), self._torch.float32
+        )
+    mode = int(next_velocity is not None) + 2 * int(
+        position_velocity is not None
+    )
+    next_buffer = (
+        next_velocity.reshape(-1)
+        if next_velocity is not None and self.nv
+        else self._empty_input
+    )
+    position_buffer = (
+        position_velocity.reshape(-1)
+        if position_velocity is not None and self.nv
+        else self._empty_input
     )
 
     qpos_buffer = qpos.reshape(-1) if self.nq else self._empty_input
@@ -188,6 +227,9 @@ class MetalEulerIntegration:
         self._output_status,
         self._dims,
         self._dt,
+        next_buffer,
+        position_buffer,
+        self._velocity_modes[mode],
         threads=(batch,),
         group_size=(1,),
     )

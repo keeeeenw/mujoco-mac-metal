@@ -232,3 +232,62 @@ def test_empty_static_world_and_empty_batch_dimensions():
   assert tuple(qvel.shape) == (2, 0)
   np.testing.assert_allclose(time.cpu().numpy(), [1.01, 2.01], atol=1e-6)
   np.testing.assert_array_equal(status.cpu().numpy(), [0, 0])
+
+
+@pytest.mark.skipif(
+    os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
+    reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
+)
+@pytest.mark.parametrize(
+    "override_next,override_position",
+    [(True, False), (False, True), (True, True)],
+)
+def test_native_velocity_overrides_are_distinct_and_atomic(
+    override_next, override_position
+):
+  import torch
+
+  model = mujoco.MjModel.from_xml_string(_MIXED_XML)
+  batch = 3
+  stage = MetalEulerIntegration(load_model(model), batch, 0.003)
+  rng = np.random.default_rng(246)
+  qpos = np.tile(model.qpos0, (batch, 1)).astype(np.float32)
+  qvel = rng.normal(size=(batch, model.nv)).astype(np.float32)
+  qacc = rng.normal(size=qvel.shape).astype(np.float32)
+  next_velocity = rng.normal(size=qvel.shape).astype(np.float32)
+  position_velocity = rng.normal(size=qvel.shape).astype(np.float32)
+  time = np.zeros(batch, np.float32)
+  status = np.array([0, 0, 7], np.int32)
+  # A nonfinite override must fail this row before committing any state.
+  if override_position:
+    position_velocity[1, -1] = np.nan
+  else:
+    next_velocity[1, -1] = np.nan
+
+  def device(value):
+    return torch.from_numpy(value).to("mps")
+
+  outputs = stage.run_device(
+      device(qpos),
+      device(qvel),
+      device(qacc),
+      device(time),
+      device(status),
+      next_velocity=device(next_velocity) if override_next else None,
+      position_velocity=device(position_velocity)
+      if override_position
+      else None,
+  )
+  actual_q, actual_v, actual_t, actual_s = [v.cpu().numpy() for v in outputs]
+  expected_v = next_velocity[0] if override_next else qvel[0] + 0.003 * qacc[0]
+  position_v = position_velocity[0] if override_position else expected_v
+  expected_q = qpos[0].astype(np.float64)
+  mujoco.mj_integratePos(
+      model, expected_q, position_v.astype(np.float64), 0.003
+  )
+  np.testing.assert_allclose(actual_q[0], expected_q, rtol=2e-6, atol=1e-7)
+  np.testing.assert_allclose(actual_v[0], expected_v, rtol=2e-6, atol=1e-7)
+  np.testing.assert_array_equal(actual_q[1:], qpos[1:])
+  np.testing.assert_array_equal(actual_v[1:], qvel[1:])
+  np.testing.assert_array_equal(actual_t[1:], time[1:])
+  assert actual_s.tolist() == [0, 10, 7]
