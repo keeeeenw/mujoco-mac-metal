@@ -35,13 +35,13 @@ it does not qualify every model or MuJoCo feature.
 
 ## Development source
 
-The development branch is **0.4.0.dev0**, not a new PyPI release. Its additional
+The source on `main` is **0.4.0.dev0**, not a new PyPI release. Its additional
 physics profiles and milestone demos require this source. From a fresh clone:
 
 ```sh
 git clone https://github.com/keeeeenw/mujoco-mac-metal.git
 cd mujoco-mac-metal
-git switch develop/metal-physics-coverage
+git switch main
 python3.12 -m venv .venv-demo
 source .venv-demo/bin/activate
 python -m pip install --upgrade pip
@@ -50,7 +50,7 @@ export PYTORCH_ENABLE_MPS_FALLBACK=0
 mujoco-metal doctor --gpu
 ```
 
-For an existing checkout, fetch and select the development branch before the
+For an existing checkout, fetch and update `main` before the
 installation steps. Run demo commands from the repository root with this
 environment active. `PYTHONPATH=metal` explicitly selects the checkout source.
 Pillow is used only for recordings/plots; rendering still needs a working

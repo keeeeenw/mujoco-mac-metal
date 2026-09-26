@@ -10,7 +10,7 @@ Euler integration. Persistent device state, quaternion updates, transactional
 reset/checkpoint ownership, and per-world failure handling complete this bounded
 stepping path. It is an implementation of existing rigid-body dynamics methods,
 not a new physics or learning algorithm. **This measured profile excludes
-contacts and actuation.** The development branch now adds bounded contact,
+contacts and actuation.** The current source on `main` adds bounded contact,
 force and actuator families; their performance has not been measured here.
 
 ## Complete measured CPU8 / Metal comparison

@@ -67,37 +67,92 @@ See [installation and diagnostics](metal/INSTALL.md) for requirements and status
 
 ## Try the Mac demos
 
-We built a few demos to explore Metal physics on the Mac—give them a try!
-The [demo gallery](metal/examples/demo_gallery.md) includes tumbling toys,
-a spring flower, marble collisions, a sensor scanning rig, a cable plotter,
-clockwork gears, a friction laboratory, fluid-driven bodies, a mechanical wave
-lattice and an off-center balance workshop.
-Each major development milestone gets a distinct demonstration with an
-independent CPU reference. New development demos require this source branch,
-rather than the published 0.3.0 package.
+We built these demos to explore Metal physics on the Mac—give them a try!
+Each guide includes runnable commands and an independent CPU MuJoCo comparison.
+Use the [source setup on `main`](metal/INSTALL.md#development-source) for the
+unreleased **0.4.0.dev0** features; installing PyPI 0.3.0 does not include them.
 
-![Free-body midpoint workshop with independently measured orbit plots](metal/examples/assets/offcenter_balance.gif)
+The clips show actual simulation at a presentation playback rate, not measured
+execution speed. Rendering uses MuJoCo OpenGL. Most examples offer headless
+checks and GIF recording; interactive viewing is documented where available.
+The [compact gallery](metal/examples/demo_gallery.md) maps each demo to its
+physics capability.
 
-![Sensor scanning rig with live native measurements](metal/examples/assets/scanning_rig.gif)
+### [Off-center balance workshop](metal/examples/offcenter_balance.md)
 
-![Native Metal spacecraft approach beside CPU MuJoCo](metal/examples/assets/space_docking.gif)
+L-shaped tools spin around nearly stationary centers of mass. Independent orbit plots show free-body midpoint integration with offset inertias.
 
-The [spacecraft approach demo](metal/examples/space_docking.md) uses three free
-bodies, applied forces/torques and different damping values, with an independent
-CPU reference. Targets are visual only: no docking contacts or latching are
-modeled. Its controller runs on the host; native physics runs on Metal.
+![Off-center balance workshop: native Metal beside CPU MuJoCo](metal/examples/assets/offcenter_balance.gif)
 
-**Chaotic pendulum:** watch four connected arms swing and tumble, with Metal
-and CPU MuJoCo shown side by side.
+### [Clockwork automaton](metal/examples/clockwork_automaton.md)
 
-![Hybrid Metal pendulum compared with CPU MuJoCo](metal/examples/assets/pendulum.gif)
+Counter-rotating gears and a sequenced pawl exercise joint equality, limits and dry friction. The gear teeth are visual; contacts are disabled.
 
-The [demo guide](metal/examples/README.md) provides installation and playback
-commands. Select `--mode metal` for native contact-free physics, `--mode metal-hybrid` for Metal mass/bias with CPU solve/integration, or `--mode cpu`.
-**The GIF shows the hybrid mode at a fixed playback rate, not native benchmark
-speed.** Rendering uses MuJoCo's OpenGL visualizer. Native headless/offscreen
-checks passed; native interactive playback still needs qualification with an
-active macOS display.
+![Clockwork automaton: native Metal beside CPU MuJoCo](metal/examples/assets/clockwork_automaton.gif)
+
+### [Crossed-cable plotter](metal/examples/cable_plotter.md)
+
+Two fixed-joint tendon servos guide a pen along a figure-eight path, leaving measured trails. The cable lines illustrate the transmission; they are not wrapping-cable physics.
+
+![Crossed-cable plotter: native Metal beside CPU MuJoCo](metal/examples/assets/cable_plotter.gif)
+
+### [Friction laboratory](metal/examples/friction_laboratory.md)
+
+Three marbles with different friction coefficients transition from sliding to rolling, exercising pyramidal friction contact.
+
+![Friction laboratory: native Metal beside CPU MuJoCo](metal/examples/assets/friction_laboratory.gif)
+
+### [Marble cascade](metal/examples/marble_cascade.md)
+
+Marbles slide and collide on a tilted plane using plane–sphere and sphere–sphere normal contacts.
+
+![Marble cascade: native Metal beside CPU MuJoCo](metal/examples/assets/marble_cascade.gif)
+
+### [Spring flower](metal/examples/kinetic_sculpture.md)
+
+Spring-driven petals fold and sway under damping, gravity compensation and applied body forces.
+
+![Spring flower: native Metal beside CPU MuJoCo](metal/examples/assets/kinetic_sculpture.gif)
+
+### [Mechanical wave lattice](metal/examples/wave_lattice.md)
+
+A motor drives a colorful articulated chain, exercising coupled springs, damping and implicitfast integration.
+
+![Mechanical wave lattice: native Metal beside CPU MuJoCo](metal/examples/assets/wave_lattice.gif)
+
+### [Current-driven bodies](metal/examples/fluid_buoys.md)
+
+Colorful bodies drift and rotate in a current using inertia-box fluid drag and viscosity. This does not model buoyancy or geom-level fluid lift.
+
+![Current-driven bodies: native Metal beside CPU MuJoCo](metal/examples/assets/fluid_buoys.gif)
+
+### [Sensor scanning rig](metal/examples/scanning_rig.md)
+
+A pan/tilt scanner plots current-state pose and velocity measurements. The target is a frame reference; the demo does not ray cast or measure depth.
+
+![Sensor scanning rig: native Metal beside CPU MuJoCo](metal/examples/assets/scanning_rig.gif)
+
+### [Tumbling toys](metal/examples/tumbling_toys.md)
+
+Asymmetric toys spin around different axes, demonstrating quaternion-aware RK4 integration.
+
+![Tumbling toys: native Metal beside CPU MuJoCo](metal/examples/assets/tumbling_toys.gif)
+
+### [Spacecraft approach](metal/examples/space_docking.md)
+
+Three craft chase moving markers under host controls, applied forces and damping. Native Metal advances the physics; docking contacts and latches are not modeled.
+
+![Spacecraft approach: native Metal beside CPU MuJoCo](metal/examples/assets/space_docking.gif)
+
+### [Chaotic pendulum](metal/examples/README.md)
+
+Four connected arms swing and tumble. This recorded clip uses **Metal mass/bias
+with CPU solve and integration** on the left and CPU MuJoCo on the right.
+The same demo also offers fully native contact-free physics with `--mode metal`.
+Native headless/offscreen checks passed; native interactive playback still needs
+qualification with an active macOS display.
+
+![Chaotic pendulum: hybrid Metal physics beside CPU MuJoCo](metal/examples/assets/pendulum.gif)
 
 ## Current limits and next steps
 
@@ -105,8 +160,8 @@ The optional package targets Python 3.12, MuJoCo **3.10.0** and Torch **2.9.1**;
 use its isolated installation instructions rather than treating the newer
 surrounding MuJoCo source version as the qualified runtime.
 
-The published 0.3.0 profiles require contact-free Euler models. This development
-branch adds bounded RK4/implicitfast, passive and fluid forces, fixed-tendon
+The published 0.3.0 profiles require contact-free Euler models. The source on
+`main` adds bounded RK4/implicitfast, passive and fluid forces, fixed-tendon
 servos, sensor queries, sphere contact and joint-constraint profiles, each with
 explicit guards. These are partial implementations:
 remaining contact/constraint families, stateful actuation, spatial tendons,

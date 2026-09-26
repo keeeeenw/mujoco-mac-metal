@@ -1,7 +1,7 @@
 # Contributing to MuJoCo
 
 > **MuJoCo Mac Metal fork:** changes to the optional `metal/` package are
-> developed on `develop/metal-physics-coverage`. See the
+> developed on `main` or feature branches merged back into `main`. See the
 > [source setup](metal/INSTALL.md#development-source) and
 > [qualified feature boundaries](metal/DEVELOPMENT.md). Include a CPU MuJoCo
 > 3.10.0 numerical reference, tests for unsupported inputs, and exact software

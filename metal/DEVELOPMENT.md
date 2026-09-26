@@ -1,6 +1,6 @@
 # Native physics development coverage
 
-This unreleased **0.4.0.dev0** branch extends the published **0.3.0** package. Use the source checkout
+The unreleased **0.4.0.dev0** source on `main` extends the published **0.3.0** package. Use the source checkout
 with `PYTHONPATH=metal` after the [source setup](INSTALL.md#development-source);
 installing 0.3.0 does not provide these new profiles.
 The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch

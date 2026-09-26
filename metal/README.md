@@ -1,6 +1,6 @@
 # Experimental MuJoCo Metal package
 
-> **Development branch:** the published 0.3.0 release has the bounded
+> **Development source on `main`:** the published 0.3.0 release has the bounded
 > contact-free Euler features documented below. New source profiles add RK4,
 > rigid passive forces, stateless joint/tendon servos, current-state sensors,
 > body-fluid drag, bounded implicitfast, sphere contact and joint constraints. See [development coverage](DEVELOPMENT.md) and the
@@ -128,7 +128,7 @@ cross-hardware speedup is claimed.
 
 ## Published 0.3.0 boundaries
 
-For the additional source-branch capabilities, see [DEVELOPMENT.md](DEVELOPMENT.md).
+For the additional source capabilities, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
 | Stage | Status in published 0.3.0 |
 | --- | --- |
