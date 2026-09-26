@@ -149,7 +149,7 @@ class MetalPassiveForces:
     self._kernel = self._lib.passive_joint_force
     self._projection_kernel = self._lib.project_body_wrenches
     def tensor(a, dtype=torch.float32):
-      arr = np.ascontiguousarray(a, dtype=np.int32 if dtype == torch.int32 else np.float32)
+      arr = np.array(a, dtype=np.int32 if dtype == torch.int32 else np.float32, order="C", copy=True)
       if arr.dtype == np.float32 and not np.all(np.isfinite(arr)):
         raise ValueError("passive constants must be finite and float32-representable")
       return torch.as_tensor(arr if arr.size else np.zeros(1, dtype=arr.dtype), dtype=dtype, device=self._device)
