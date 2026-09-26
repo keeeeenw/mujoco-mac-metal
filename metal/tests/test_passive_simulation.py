@@ -69,11 +69,16 @@ def test_passive_rollout(integrator, flags):
 @pytest.mark.skipif(
     os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='opt-in GPU'
 )
-def test_projected_wrench_and_gravity_compensation_trajectory():
+@pytest.mark.parametrize('disable_passive', [False, True])
+def test_projected_wrench_and_gravity_compensation_trajectory(disable_passive):
   m = mujoco.MjModel.from_xml_string(
       """<mujoco><option timestep='.002'><flag contact='disable'/></option>
   <worldbody><body gravcomp='.6' quat='.9 .1 .2 .3'><freejoint/><geom type='box' size='.1 .2 .3' mass='2' pos='.05 -.03 .1'/></body></worldbody></mujoco>"""
   )
+  if disable_passive:
+    m.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_SPRING) | int(
+        mujoco.mjtDisableBit.mjDSBL_DAMPER
+    )
   sim = MetalSimulation(m, 2, profile='contact_free_passive_euler_v1')
   refs = [mujoco.MjData(m) for _ in range(2)]
   for step in range(300):
