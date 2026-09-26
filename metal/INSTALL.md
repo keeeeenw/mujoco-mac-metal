@@ -1,20 +1,22 @@
-# Install the experimental MuJoCo Metal package
+# Install mujoco-mac-metal
 
-The package currently installs from the project repository. It is not yet a
-published PyPI release. Use a fresh Python 3.12 environment on an Apple Silicon
-Mac; the `metal` extra installs the pinned PyTorch dependency:
+The `mujoco-mac-metal` 0.3.0 release is not published on PyPI yet. Until it is
+uploaded, install the current source from GitHub in a fresh Python 3.12
+environment on an Apple Silicon Mac:
 
 ```sh
 python3.12 -m venv .venv-metal
 source .venv-metal/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "mujoco-metal-experimental[metal] @ git+https://github.com/keeeeenw/mujoco-mac-metal.git@main#subdirectory=metal"
+python -m pip install "mujoco-mac-metal[metal] @ git+https://github.com/keeeeenw/mujoco-mac-metal.git@main#subdirectory=metal"
 ```
 
-The first install downloads the project and its pinned dependencies. Native
-Metal shader compilation happens at runtime. Some setups may also need Apple's
-Xcode Command Line Tools and a current macOS Metal runtime. The package does
-not build the MuJoCo core from source.
+On macOS arm64, the default dependencies include PyTorch 2.9.1. The `metal`
+extra is available when installing on another platform. The project pins
+MuJoCo 3.10.0 and requires Python 3.12. Native Metal shader compilation
+happens at runtime. Shader compilation may require Xcode and its separately
+installed Metal Toolchain component; Command Line Tools alone may be
+insufficient. The package does not build the MuJoCo core from source.
 
 Check the environment without importing PyTorch:
 
@@ -32,35 +34,21 @@ Add `--json` to either command for machine-readable diagnostics. The GPU check
 uses a tiny contact-free Euler model and reports only that narrow smoke test;
 it does not qualify every model or MuJoCo feature.
 
-## PyPI status and release path
+## PyPI release
 
-The current distribution name is `mujoco-metal-experimental`. The proposed
-shorter PyPI name `mujoco-mac-metal` has not been published or reserved by this
-project. A PyPI 404 only means no public project record was found at the time
-checked; it does not establish whether a name is available. Until the project
-owner confirms the name and publishes a release, use the repository install
-command above.
+Version 0.3.0 is prepared as the `mujoco-mac-metal` distribution, but remains
+unpublished until the owner uploads it. To publish, configure PyPI Trusted
+Publishing for GitHub owner `keeeeenw`, repository `mujoco-mac-metal`, workflow
+`publish-metal.yml`, and GitHub Actions environment `pypi`. Then run the
+repository's **Publish Metal package to PyPI** workflow manually with
+`workflow_dispatch`. It builds only the distribution under `metal/` and uses
+GitHub Actions OIDC; no PyPI token is needed.
 
-The project already has a `pyproject.toml` entry point and includes Metal
-shader files as package data, so a local wheel can be built and installed for
-packaging checks. The examples currently live outside the installed Python
-package. A release should first verify wheel and source distributions, shader
-inclusion, the `mujoco-metal` command, and the documented demo workflow on a
-clean supported Mac; run an early release through TestPyPI before a PyPI
-release. The distribution name and public versioning policy remain project
-decisions.
-
-Maintainers can check the current wheel build locally from `metal/`:
+Maintainers can build and inspect the distributions locally from `metal/`:
 
 ```sh
-python -m pip wheel --wheel-dir dist .
-python -m pip install --force-reinstall dist/mujoco_metal_experimental-*.whl
+python -m pip install build
+python -m build
+python -m pip install --force-reinstall dist/mujoco_mac_metal-0.3.0-py3-none-any.whl
 mujoco-metal doctor
 ```
-
-For a future automated release, configure PyPI Trusted Publishing for the
-specific GitHub repository and release workflow, then use GitHub Actions OIDC
-to publish. Do not put a PyPI API token in the repository or enable publishing
-until an owner has confirmed the project name and release process. See the
-[Python Packaging User Guide](https://packaging.python.org/en/latest/tutorials/packaging-projects/)
-and [PyPI's Trusted Publisher setup guide](https://docs.pypi.org/trusted-publishers/adding-a-publisher/).

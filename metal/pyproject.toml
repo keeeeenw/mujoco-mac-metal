@@ -3,14 +3,28 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mujoco-metal-experimental"
-version = "0.2.0"
+name = "mujoco-mac-metal"
+version = "0.3.0"
 description = "Experimental generalized MuJoCo Metal contact-free stepping profile"
-readme = "README.md"
+readme = "PYPI_README.md"
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-dependencies = ["mujoco==3.10.0", "numpy>=2,<3"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "mujoco==3.10.0",
+  "numpy>=2,<3",
+  "torch==2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[project.urls]
+Homepage = "https://github.com/keeeeenw/mujoco-mac-metal"
+Repository = "https://github.com/keeeeenw/mujoco-mac-metal"
+Documentation = "https://github.com/keeeeenw/mujoco-mac-metal/blob/main/metal/INSTALL.md"
 
 [project.scripts]
 mujoco-metal = "mujoco_metal.__main__:main"
