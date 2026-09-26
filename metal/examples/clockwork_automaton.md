@@ -1,5 +1,8 @@
 # Clockwork automaton
 
+Use the [shared source setup](../INSTALL.md#development-source), with its Python
+environment active, and run these commands from the repository root.
+
 This compact counter-rotating gear display shows polynomial joint equality, dry
 friction, and bounded slide-joint behavior in the `joint_constraints_euler_v1`
 profile. A four-state host sequencer winds, coasts, reverses, and releases a

@@ -1,6 +1,9 @@
 # Marble cascade
 
-Three free marbles roll down a tilted, frictionless plane. Their staggered
+Use the [shared source setup](../INSTALL.md#development-source), with its Python
+environment active, and run these commands from the repository root.
+
+Three free marbles slide and collide on a tilted, frictionless plane. Their staggered
 initial velocities produce a sequence of sphere-sphere and plane-sphere normal
 contacts. The left render shows `normal_contact_euler_v1`; the right render
 shows an independent CPU MuJoCo `mj_step` reference from the same initial

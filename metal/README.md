@@ -28,7 +28,7 @@ python -m pip install -e '.[metal,test]'
 
 Torch installs automatically on Apple Silicon macOS. On other platforms, `.[test]` installs CPU utilities without Torch. Importing `mujoco_metal` and running preflight do not import Torch or initialize MPS.
 
-Run `python -m mujoco_metal preflight --model path/to/model.xml --json --inventory` to inspect runtime version, model dimensions, package and all six shader paths/hashes, capability boundaries, and the versioned feature/API inventory. The overall `gpu_qualified` field remains false because the full backend is not qualified. Inventory completeness is explicitly false because the captured enum and Python binding inventory is not exhaustive.
+Run `python -m mujoco_metal preflight --model path/to/model.xml --json --inventory` to inspect runtime version, model dimensions, package and all 15 bundled shader paths/hashes, capability boundaries, and the versioned feature/API inventory. The overall `gpu_qualified` field remains false because the full backend is not qualified. Inventory completeness is explicitly false because the captured enum and Python binding inventory is not exhaustive.
 
 `load_model(xml_or_path)` returns an immutable, dimension-derived descriptor. `descriptor.forward_kinematics(qpos)` is a CPU reference for body, inertial, geom, site, and joint-anchor/axis world poses across hinge, slide, ball, and free joints. `MetalKinematics(descriptor).run(qpos_batch)` computes the same pose fields through the batched native Metal kinematics kernel. GPU checks have passed on an Apple M1 for empty and fixed worlds, mixed hinge/slide/ball/free models with off-center joints and multiple free roots, world-attached sites/geoms, and a 32-DOF chain. This is a narrow correctness qualification, not a general model-support or performance claim. Constructing `MetalKinematics` initializes MPS and compiles the bundled shader.
 
@@ -47,7 +47,7 @@ results when retaining them beyond the next invocation.
 
 `simulation.step()` returns a borrowed MPS status vector. Solver and integration failures are per-world; a failed world keeps its state and its first nonzero status remains sticky until reset or restore. State views are copies; snapshots and resets cross the host/device boundary and belong outside the hot step loop. Position, velocity, acceleration, and simulation time use float32 on device. In particular, time's representable increment gets coarser as elapsed time grows.
 
-Run the opt-in GPU correctness tests only on an available Apple GPU with the pinned Torch extra installed: `MUJOCO_METAL_RUN_GPU=1 python -m pytest -m gpu`. Ordinary `python -m pytest` runs CPU tests and skips the GPU cases. `preflight` remains CPU-only: shader hashes and stage labels are inventory, not a device probe. The overall GPU-qualified field stays false because full-library physics coverage remains incomplete. The standalone source tree carries the Apache 2.0 license and notices.
+Run the opt-in GPU correctness tests only on an available Apple GPU with the pinned Torch extra installed: `MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 python -m pytest -m gpu`. Ordinary `python -m pytest` runs CPU tests and skips the GPU cases. `preflight` remains CPU-only: shader hashes and stage labels are inventory, not a device probe. The overall GPU-qualified field stays false because full-library physics coverage remains incomplete. The standalone source tree carries the Apache 2.0 license and notices.
 
 ## Applied forces, damping and basic motors
 
@@ -87,8 +87,8 @@ universal error bounds. Public regressions cover malformed inputs, row failures,
 reset/restore, changing inputs and the device-only stepping path.
 
 Smooth M/bias queries can now accept models with actuators only if their actuator
-armature is zero; they still do not compute actuator forces. Simulation uses the
-stricter motor-profile validation. This distinction prevents unsupported inertia
+armature is zero; they still do not compute actuator forces. Simulation validates the selected profile and actuator family; the published
+motor profile remains limited to fixed-gain scalar motors. This distinction prevents unsupported inertia
 terms from silently disappearing.
 
 Try the [spacecraft force-control demo](examples/space_docking.md), or use the
@@ -104,13 +104,18 @@ call CPU MuJoCo, NumPy solves, or read state back to the host. Reset/checkpoint
 ownership and per-world failure handling are covered by tests. These are new
 backend implementations of existing dynamics methods, not new physics algorithms.
 
-Local qualification includes **133 passing tests with GPU execution enabled**, plus
+The published 0.3.0 baseline included **133 passing tests with GPU execution
+enabled**, plus
 12 independent 1,000-step trajectories against MuJoCo across slide, hinge,
 free-body, and mixed-joint fixtures. The native pendulum also passed headless and
 offscreen checks. Interactive native playback still needs qualification with an
 active macOS display; the earlier hybrid viewer was checked separately.
 
-A short **M1 Max / 32 GB** pendulum benchmark now includes measured eight-thread
+The unreleased 0.4.0.dev0 source checkpoint passed **257 tests with native GPU
+execution enabled**. Its additional profiles and fixture evidence are listed in
+[DEVELOPMENT.md](DEVELOPMENT.md); this does not extend the old timing results.
+
+The earlier **M1 Max / 32 GB** pendulum benchmark includes measured eight-thread
 CPU comparisons at every tested batch through **524,288 worlds**. At that batch,
 Metal measured **3.20x faster** than eight-thread CPU rollout (5.907 s versus
 18.905 s for 200 steps), reaching **17.75 million world-steps/s**. CPU wins at
@@ -125,7 +130,7 @@ cross-hardware speedup is claimed.
 
 For the additional source-branch capabilities, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
-| Stage | Status in this generalized package |
+| Stage | Status in published 0.3.0 |
 | --- | --- |
 | Kinematics, dense mass matrix, inertial/gravity bias | Native Metal; qualified on the documented small fixtures. |
 | Dense SPD factorization and multiple-RHS solve | Implemented and narrowly GPU-qualified on synthetic scaled/conditioned systems; dense float32 numerical limits remain. |
@@ -137,7 +142,14 @@ For the additional source-branch capabilities, see [DEVELOPMENT.md](DEVELOPMENT.
 | Sensors, remaining integrators, flexes/plugins, broad API and precision compatibility | Unimplemented or unqualified; full MuJoCo coverage is not established. |
 | Native rendering and end-to-end training integration | Outside the implemented scope. |
 
-## Runnable Mac demo
+## Runnable Mac demos
+
+Explore the [milestone demo gallery](examples/demo_gallery.md) for the source
+profiles: springs, contacts and friction, tendon servos, joint constraints,
+fluid drag, sensors, RK4, and implicitfast with free-body midpoint. Follow the
+[shared demo setup](INSTALL.md#development-source) before running them.
+
+### Historical hybrid pendulum
 
 ![Metal hybrid pendulum alongside CPU MuJoCo](examples/assets/pendulum.gif)
 
@@ -304,8 +316,9 @@ and these short measurements establish no training-throughput advantage.
 
 Use `python -m mujoco_metal preflight --json --inventory` to record this
 installation's module/shader paths, hashes, version and declared support.
-Preflight is CPU-only; it is not a runtime GPU probe. After the isolated install
-above, run `MUJOCO_METAL_RUN_GPU=1 python -m pytest -q tests/test_gpu.py` from
-`metal/` for the scoped GPU checks. Benchmark separately on idle hardware with
+Preflight is CPU-only; it is not a runtime GPU probe. After the isolated source install
+above, run `MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 python -m pytest -q tests`
+from `metal/` for the full package suite. `tests/test_gpu.py` alone covers only
+the earlier kinematics/mass/bias checks, not all stepping profiles. Benchmark separately on idle hardware with
 matching physics, precision, environment counts and synchronization, including
 state transfers and the full workload being claimed.

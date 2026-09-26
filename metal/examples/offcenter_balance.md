@@ -1,5 +1,8 @@
 # Off-center balance workshop
 
+Use the [shared source setup](../INSTALL.md#development-source), with its Python
+environment active, and run these commands from the repository root.
+
 This scene shows three free rigid tools with different inertial COM offsets.
 They begin with nearly stationary COMs and nonzero angular velocity, so each
 joint origin follows a visible arc while its measured COM stays close to its

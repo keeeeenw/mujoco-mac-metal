@@ -1,5 +1,8 @@
 # Tumbling toys: choose your spin axis
 
+Use the [shared source setup](../INSTALL.md#development-source), with its Python
+environment active, and run these commands from the repository root.
+
 Three colorful asymmetric toys spin freely around different initial axes.
 Their rotations evolve without a controller, showing the orientation dynamics
 of asymmetric rigid bodies and exercising quaternion-aware native RK4.

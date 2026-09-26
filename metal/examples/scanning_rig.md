@@ -1,5 +1,8 @@
 # Sensor scanning rig
 
+Use the [shared source setup](../INSTALL.md#development-source), with its Python
+environment active, and run these commands from the repository root.
+
 The pan/tilt rig sweeps a sensor site across a fixed target marker. Its charts
 plot the measured site position relative to the target frame and the measured
 forward-axis direction. The example also reads gyro, velocimeter, frame linear
@@ -35,7 +38,7 @@ PYTHONPATH=metal PYTORCH_ENABLE_MPS_FALLBACK=0 python metal/examples/scanning_ri
 ```
 
 Offscreen rendering still needs MuJoCo's OpenGL renderer. The interactive mode
-uses the passive MuJoCo viewer; add `--viewer-seconds 10` to end it after ten
+uses the passive MuJoCo viewer; launch with `mjpython` on macOS and add `--viewer-seconds 10` to end it after ten
 seconds. `--mode cpu` runs both sides through CPU MuJoCo for a visual baseline.
 
 ![Native sensor scan beside CPU reference](assets/scanning_rig.gif)

@@ -1,5 +1,17 @@
 # Contributing to MuJoCo
 
+> **MuJoCo Mac Metal fork:** changes to the optional `metal/` package are
+> developed on `develop/metal-physics-coverage`. See the
+> [source setup](metal/INSTALL.md#development-source) and
+> [qualified feature boundaries](metal/DEVELOPMENT.md). Include a CPU MuJoCo
+> 3.10.0 numerical reference, tests for unsupported inputs, and exact software
+> versions. New physics milestones should include a distinct reproducible demo.
+> GPU correctness checks and controlled performance measurements are separate;
+> compilation or a GIF alone is not physics or speed evidence.
+>
+> The guide below is retained from upstream MuJoCo, including its contribution
+> and CLA requirements. This community fork is not an official MuJoCo release.
+
 We intend for MuJoCo to be a true community-driven project and look forward to
 accepting your contributions!
 

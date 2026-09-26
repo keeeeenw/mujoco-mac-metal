@@ -1,5 +1,8 @@
 # Mechanical wave lattice
 
+Use the [shared source setup](../INSTALL.md#development-source), with its Python
+environment active, and run these commands from the repository root.
+
 A fixed-gain motor drives the first colored link of an articulated hinge/ball
 lattice. Joint springs and damping carry the traveling motion through the
 coupled mechanism. The native `contact_free_implicitfast_v1` profile forms

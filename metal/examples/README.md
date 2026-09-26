@@ -1,5 +1,8 @@
 # Mac pendulum backend comparison
 
+Use the [shared source setup](../INSTALL.md#development-source), with its Python
+environment active, and run these commands from the repository root.
+
 For a free-body force-control example, see the [spacecraft approach demo](space_docking.md).
 
 This adapts the four-hinge chaotic pendulum from MuJoCo's

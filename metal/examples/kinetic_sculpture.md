@@ -1,5 +1,8 @@
 # Kinetic sculpture
 
+Use the [shared source setup](../INSTALL.md#development-source), with its Python
+environment active, and run these commands from the repository root.
+
 Four spring-driven petals fold around a fixed stem. Joint stiffness and
 damping set the motion, while body gravity compensation carries most of each
 petal's weight. A gentle alternating force and torque act at two petal centers
@@ -10,7 +13,7 @@ Python 3.12 environment:
 
 ```sh
 PYTHONPATH=metal PYTORCH_ENABLE_MPS_FALLBACK=0 \
-  .venv-demo/bin/python metal/examples/kinetic_sculpture.py \
+  python metal/examples/kinetic_sculpture.py \
   --mode metal --headless --check --steps 200
 ```
 
@@ -19,7 +22,7 @@ reference. It also has a CPU-only run for checking the model and input stream
 without initializing MPS:
 
 ```sh
-PYTHONPATH=metal .venv-demo/bin/python \
+PYTHONPATH=metal python \
   metal/examples/kinetic_sculpture.py --mode cpu --headless --steps 200
 ```
 

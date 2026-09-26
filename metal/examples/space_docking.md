@@ -1,5 +1,8 @@
 # Spacecraft approach and formation flight
 
+Use the [shared source setup](../INSTALL.md#development-source), with its Python
+environment active, and run these commands from the repository root.
+
 Three free-floating craft chase moving targets with different linear damping.
 Applied forces change their paths; body-local torques make them tumble. The
 left panel uses native Metal physics, and the right panel uses CPU MuJoCo with

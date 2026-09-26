@@ -1,12 +1,17 @@
 # Contact-free Metal stepping: achievements and measured CPU comparison
 
-The experimental package now advances a supported model entirely through native
+This report records the earlier contact-free stepping milestone at revision
+`36451fba7c33fd252c90de3b29742940d9027642`. It is a historical measurement, not a
+benchmark of the newer profiles in [development coverage](../DEVELOPMENT.md).
+
+That implementation advances a supported model entirely through native
 Metal physics: forward kinematics, mass/bias, acceleration solve and semi-implicit
 Euler integration. Persistent device state, quaternion updates, transactional
 reset/checkpoint ownership, and per-world failure handling complete this bounded
 stepping path. It is an implementation of existing rigid-body dynamics methods,
-not a new physics or learning algorithm. **Contacts, general actuation and full
-MuJoCo compatibility remain unsupported.**
+not a new physics or learning algorithm. **This measured profile excludes
+contacts and actuation.** The development branch now adds bounded contact,
+force and actuator families; their performance has not been measured here.
 
 ## Complete measured CPU8 / Metal comparison
 
@@ -71,8 +76,9 @@ maximum memory capacity**. CPU wins at small batch sizes.
 - No rendering, policy inference, observations, contacts, PPO, or checkpoint I/O
   is timed. Do not use the batch sizes or speed ratios as robot-training guidance.
   CPU memory figures and Metal memory figures are not interchangeable.
-- Source revision: `36451fba7c33fd252c90de3b29742940d9027642`; later changes
-  document the experiment and add its portable runner without changing physics.
+- Source revision: `36451fba7c33fd252c90de3b29742940d9027642`; the report and portable runner were added afterward. Subsequent development
+  changes physics code and adds profiles, so current-source reruns are new
+  measurements, not exact reproductions of this revision.
   [Raw trial data and model hash](m1-max-pendulum-20260926.json) are included.
 
 ## Correctness qualification accompanying the milestone
@@ -96,7 +102,9 @@ hybrid path, not this native benchmark.
 
 These checks are fixture-specific, not general physics correctness certification.
 Full upstream core tests, single-precision core builds, other Apple hardware/OS
-combinations, and longer or contact-rich trajectories remain unqualified.
+combinations, and longer or contact-rich trajectories were outside this qualification.
+Current bounded contact correctness evidence is recorded separately in
+[DEVELOPMENT.md](../DEVELOPMENT.md).
 
 ## Reproduce
 

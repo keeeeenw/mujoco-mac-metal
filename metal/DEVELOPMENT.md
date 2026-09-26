@@ -1,7 +1,8 @@
 # Native physics development coverage
 
 This unreleased **0.4.0.dev0** branch extends the published **0.3.0** package. Use the source checkout
-with `PYTHONPATH=metal`; installing 0.3.0 does not provide these new profiles.
+with `PYTHONPATH=metal` after the [source setup](INSTALL.md#development-source);
+installing 0.3.0 does not provide these new profiles.
 The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
@@ -10,6 +11,11 @@ The current regression checkpoint passed **257 tests with native GPU execution
 enabled**. A separate environment without Torch passed **138 CPU tests**, with
 116 GPU checks skipped. These counts describe the source snapshot and do not
 establish coverage of every MuJoCo feature.
+
+The source checkpoint is `7577fecf1`; documentation-only revisions do not change
+these results. Tests ran on an M1 Max with 32 GB unified memory. Numerical
+qualification is separate from performance qualification: the older pendulum
+benchmark has not been rerun for the additional profiles.
 
 ## Qualified increments
 

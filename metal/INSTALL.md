@@ -33,6 +33,65 @@ Add `--json` to either command for machine-readable diagnostics. The GPU check
 uses a tiny contact-free Euler model and reports only that narrow smoke test;
 it does not qualify every model or MuJoCo feature.
 
+## Development source
+
+The development branch is **0.4.0.dev0**, not a new PyPI release. Its additional
+physics profiles and milestone demos require this source. From a fresh clone:
+
+```sh
+git clone https://github.com/keeeeenw/mujoco-mac-metal.git
+cd mujoco-mac-metal
+git switch develop/metal-physics-coverage
+python3.12 -m venv .venv-demo
+source .venv-demo/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e './metal[metal,test]' pillow
+export PYTORCH_ENABLE_MPS_FALLBACK=0
+mujoco-metal doctor --gpu
+```
+
+For an existing checkout, fetch and select the development branch before the
+installation steps. Run demo commands from the repository root with this
+environment active. `PYTHONPATH=metal` explicitly selects the checkout source.
+Pillow is used only for recordings/plots; rendering still needs a working
+MuJoCo OpenGL context. Headless physics checks do not need a viewer; offscreen
+GIF recording does need OpenGL. For demos with a passive interactive viewer,
+launch with `mjpython` rather than ordinary `python` on macOS.
+
+The [gallery](examples/demo_gallery.md) links each runnable demo and its scope.
+[Development coverage](DEVELOPMENT.md) is the current feature and qualification
+record. Profiles reject unsupported combinations; installing this package does
+not redirect arbitrary calls to `mujoco.mj_step` to Metal.
+
+From the repository root, run CPU tests or opt into native GPU checks:
+
+```sh
+PYTHONPATH=metal python -m pytest -q metal/tests
+MUJOCO_METAL_RUN_GPU=1 PYTHONPATH=metal python -m pytest -q metal/tests
+```
+
+Keep the GPU idle for qualification. The current source checkpoint passed 257
+tests with GPU execution enabled. A separate environment without Torch passed
+138 CPU tests, with 116 checks skipped. Optional Torch dependencies change
+test collection, so the two totals are not directly additive.
+
+## Local distribution build
+
+From the repository root, build the current development version into a fresh
+output directory and install that exact wheel in an isolated environment:
+
+```sh
+python -m pip install build
+python -m build --outdir /tmp/mujoco-metal-dev-dist metal
+python -m pip install --force-reinstall /tmp/mujoco-metal-dev-dist/mujoco_mac_metal-0.4.0.dev0-py3-none-any.whl
+mujoco-metal doctor
+PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal doctor --gpu
+```
+
+The filename follows `metal/pyproject.toml`; update it when changing versions.
+The locally built development wheel includes all 15 shader resources. Building
+or pushing source does not publish a release.
+
 ## PyPI release
 
 Version 0.3.0 was published with PyPI Trusted Publishing. The publisher uses
@@ -41,12 +100,3 @@ GitHub owner `keeeeenw`, repository `mujoco-mac-metal`, workflow
 built wheel on a supported Mac, then run the repository's **Publish Metal package to PyPI** workflow manually with
 `workflow_dispatch`. It builds only the distribution under `metal/` and uses
 GitHub Actions OIDC; no PyPI token is needed.
-
-Maintainers can build and inspect the distributions locally from `metal/`:
-
-```sh
-python -m pip install build
-python -m build
-python -m pip install --force-reinstall dist/mujoco_mac_metal-0.3.0-py3-none-any.whl
-mujoco-metal doctor
-```

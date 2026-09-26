@@ -19,8 +19,8 @@ available alongside the optional package.
   per-step host state readback, per-world failure handling, selected-row reset,
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
-- **Validation and reproducible measurements:** the 0.3.0 baseline passed 133 tests with GPU execution
-  enabled; independent CPU-reference trajectory and solve checks supplement the
+- **Validation and reproducible measurements:** the development checkpoint passed
+  **257 tests with native GPU execution enabled** (the 0.3.0 baseline passed 133); independent CPU-reference trajectory and solve checks supplement the
   suite. Benchmarks include actual eight-thread CPU measurements at every tested
   batch through 524,288 worlds.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
@@ -61,16 +61,22 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal doctor --gpu
 ```
 
 [Version 0.3.0 is available on PyPI](https://pypi.org/project/mujoco-mac-metal/0.3.0/).
+For the unreleased **0.4.0.dev0** profiles and new demos, use the
+[source installation instructions](metal/INSTALL.md#development-source).
 See [installation and diagnostics](metal/INSTALL.md) for requirements and status.
 
 ## Try the Mac demos
 
 We built a few demos to explore Metal physics on the Mac—give them a try!
 The [demo gallery](metal/examples/demo_gallery.md) includes tumbling toys,
-a spring flower, a marble cascade, a sensor scanning rig and a cable plotter.
+a spring flower, marble collisions, a sensor scanning rig, a cable plotter,
+clockwork gears, a friction laboratory, fluid-driven bodies, a mechanical wave
+lattice and an off-center balance workshop.
 Each major development milestone gets a distinct demonstration with an
 independent CPU reference. New development demos require this source branch,
 rather than the published 0.3.0 package.
+
+![Free-body midpoint workshop with independently measured orbit plots](metal/examples/assets/offcenter_balance.gif)
 
 ![Sensor scanning rig with live native measurements](metal/examples/assets/scanning_rig.gif)
 
@@ -111,8 +117,11 @@ native stepping. Linux/CUDA integration and other Apple hardware/OS combinations
 have not been validated for this Metal package. Full upstream-core and
 single-precision compatibility are not established.
 
-Next milestones are contacts and constraints, broader force/actuator support,
-then broader model/API coverage and sustained application-level qualification.
+Next milestones extend collision geometry and coupled constraints, actuator
+state and spatial tendons, full implicit integration, and remaining sensor and
+model/API behavior. RL integration and broader Mac hardware validation are
+deferred. See the [development coverage](metal/DEVELOPMENT.md) for the current
+qualified subsets; the pendulum timing results do not qualify the new profiles.
 See the [support inventory and FAQ](metal/README.md) for precise boundaries.
 
 ## Contribute
