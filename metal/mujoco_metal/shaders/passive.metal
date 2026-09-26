@@ -91,3 +91,76 @@ kernel void passive_joint_force(
     }
   }
 }
+
+static float3 rotate_vec(float4 q, float3 v) {
+  float3 u = q.yzw;
+  return v + 2.0f * cross(u, cross(u, v) + q.x*v);
+}
+
+kernel void project_body_wrenches(
+    device const int* parent [[buffer(0)]],
+    device const int* body_jntadr [[buffer(1)]],
+    device const int* body_jntnum [[buffer(2)]],
+    device const int* jnt_bodyid [[buffer(3)]],
+    device const int* jnt_type [[buffer(4)]],
+    device const int* jnt_dofadr [[buffer(5)]],
+    device const float* body_quat [[buffer(6)]],
+    device const float* inertial_pos [[buffer(7)]],
+    device const float* joint_anchor [[buffer(8)]],
+    device const float* joint_axis [[buffer(9)]],
+    device const float* body_mass [[buffer(10)]],
+    device const float* body_gravcomp [[buffer(11)]],
+    device const float* gravity [[buffer(12)]],
+    device const float* xfrc_applied [[buffer(13)]],
+    constant int* dims [[buffer(14)]],
+    device float* qfrc [[buffer(15)]],
+    uint world [[thread_position_in_grid]]) {
+  int nbody=dims[0], njnt=dims[1], nv=dims[2], gravity_disabled=dims[3];
+  uint forcebase=world*uint(nv), bodybase=world*uint(nbody), jointbase=world*uint(njnt);
+  for (int i=0;i<nbody*6;++i) {
+    uint wi=world*uint(nbody*6)+uint(i);
+    if ((as_type<uint>(xfrc_applied[wi]) & 0x7f800000u) == 0x7f800000u) {
+      float bad=as_type<float>(0x7fc00000u);
+      for (int d=0;d<nv;++d) qfrc[forcebase+uint(d)]=bad;
+      return;
+    }
+  }
+  for (int body=1; body<nbody; ++body) {
+    uint wi=(world*uint(nbody)+uint(body))*6;
+    float3 force=float3(xfrc_applied[wi],xfrc_applied[wi+1],xfrc_applied[wi+2]);
+    float3 torque=float3(xfrc_applied[wi+3],xfrc_applied[wi+4],xfrc_applied[wi+5]);
+    float3 gravforce=float3(0.0f);
+    if (!gravity_disabled && body_gravcomp[body] != 0.0f) {
+      gravforce=-body_mass[body]*body_gravcomp[body]*float3(gravity[0],gravity[1],gravity[2]);
+    }
+    float3 com=float3(inertial_pos[(bodybase+uint(body))*3],inertial_pos[(bodybase+uint(body))*3+1],inertial_pos[(bodybase+uint(body))*3+2]);
+    int ancestor=body;
+    while (ancestor>0) {
+      int start=body_jntadr[ancestor], count=body_jntnum[ancestor];
+      for (int k=0;k<count;++k) {
+        int j=start+k, typ=jnt_type[j], da=jnt_dofadr[j];
+        uint ai=(jointbase+uint(j))*3;
+        float3 anchor=float3(joint_anchor[ai],joint_anchor[ai+1],joint_anchor[ai+2]);
+        float3 axis=float3(joint_axis[ai],joint_axis[ai+1],joint_axis[ai+2]);
+        if (typ==2) {
+          qfrc[forcebase+uint(da)]+=dot(axis,force+gravforce);
+        } else if (typ==3) {
+          qfrc[forcebase+uint(da)]+=dot(axis,cross(com-anchor,force+gravforce)+torque);
+        } else if (typ==1) {
+          float3 moment=cross(com-anchor,force+gravforce)+torque;
+          float4 q=float4(body_quat[(bodybase+uint(ancestor))*4],body_quat[(bodybase+uint(ancestor))*4+1],body_quat[(bodybase+uint(ancestor))*4+2],body_quat[(bodybase+uint(ancestor))*4+3]);
+          for (int a=0;a<3;++a) {
+            float3 local=float3(a==0 ? 1.0f : 0.0f,a==1 ? 1.0f : 0.0f,a==2 ? 1.0f : 0.0f);
+            qfrc[forcebase+uint(da+a)]+=dot(rotate_vec(q,local),moment);
+          }
+        } else if (typ==0) {
+          float3 moment=cross(com-anchor,force+gravforce)+torque;
+          for (int a=0;a<3;++a) qfrc[forcebase+uint(da+a)]+=force[a]+gravforce[a];
+          float4 q=float4(body_quat[(bodybase+uint(ancestor))*4],body_quat[(bodybase+uint(ancestor))*4+1],body_quat[(bodybase+uint(ancestor))*4+2],body_quat[(bodybase+uint(ancestor))*4+3]);
+          for (int a=0;a<3;++a) qfrc[forcebase+uint(da+3+a)]+=dot(rotate_vec(q,float3(a==0 ? 1.0f : 0.0f,a==1 ? 1.0f : 0.0f,a==2 ? 1.0f : 0.0f)),moment);
+        }
+      }
+      ancestor=parent[ancestor];
+    }
+  }
+}
