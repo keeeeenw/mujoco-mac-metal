@@ -23,4 +23,4 @@ The script checks every step against an independent CPU MuJoCo RK4 trajectory;
 playback, not a speed comparison. The default 1,000-step M1 Max run observed
 maximum qpos error 2.00e-6 and qvel error 7.35e-6. This qualifies this fixture,
 not arbitrary RK4 models. No contacts, gravity, sensors or actuators are used.
-The demo and RK4 profiles are development features after the 0.3.0 release.
+The demo requires the RK4 profiles introduced in version 0.4.0.

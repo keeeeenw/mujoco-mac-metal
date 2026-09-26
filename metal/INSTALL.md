@@ -1,13 +1,13 @@
 # Install mujoco-mac-metal
 
-The experimental [0.3.0 release](https://pypi.org/project/mujoco-mac-metal/0.3.0/)
+The experimental [0.4.0 release](https://pypi.org/project/mujoco-mac-metal/0.4.0/)
 is available on PyPI. Use a fresh Python 3.12 environment on an Apple Silicon Mac:
 
 ```sh
 python3.12 -m venv .venv-metal
 source .venv-metal/bin/activate
 python -m pip install --upgrade pip
-python -m pip install mujoco-mac-metal
+python -m pip install --upgrade mujoco-mac-metal
 ```
 
 On macOS arm64, the default dependencies include PyTorch 2.9.1. The `metal`
@@ -35,8 +35,9 @@ it does not qualify every model or MuJoCo feature.
 
 ## Development source
 
-The source on `main` is **0.4.0.dev0**, not a new PyPI release. Its additional
-physics profiles and milestone demos require this source. From a fresh clone:
+The **0.4.0** wheel contains the physics package and all shaders. Clone the
+repository for the milestone demo scripts, XML models and GIFs, or to modify
+the source. The following installs an editable checkout in an isolated environment:
 
 ```sh
 git clone https://github.com/keeeeenw/mujoco-mac-metal.git
@@ -77,24 +78,28 @@ test collection, so the two totals are not directly additive.
 
 ## Local distribution build
 
-From the repository root, build the current development version into a fresh
+From the repository root, build the current source version into a fresh
 output directory and install that exact wheel in an isolated environment:
 
 ```sh
 python -m pip install build
 python -m build --outdir /tmp/mujoco-metal-dev-dist metal
-python -m pip install --force-reinstall /tmp/mujoco-metal-dev-dist/mujoco_mac_metal-0.4.0.dev0-py3-none-any.whl
+python -m pip install --force-reinstall /tmp/mujoco-metal-dev-dist/mujoco_mac_metal-0.4.0-py3-none-any.whl
 mujoco-metal doctor
 PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal doctor --gpu
 ```
 
 The filename follows `metal/pyproject.toml`; update it when changing versions.
-The locally built development wheel includes all 15 shader resources. Building
+The 0.4.0 wheel was installed in a clean Python 3.12 environment on the M1 Max
+and passed the GPU doctor check plus all 257 package tests with native GPU
+execution enabled and MPS fallback disabled. The installed module path was
+checked to exclude the source checkout. All 39 packaged Python/shader files
+matched the tested installation. The wheel includes all 15 shader resources. Building
 or pushing source does not publish a release.
 
 ## PyPI release
 
-Version 0.3.0 was published with PyPI Trusted Publishing. The publisher uses
+Releases use PyPI Trusted Publishing, first configured for 0.3.0. The publisher uses
 GitHub owner `keeeeenw`, repository `mujoco-mac-metal`, workflow
 `publish-metal.yml`, and GitHub Actions environment `pypi`. For a new version, update the package and module versions, qualify the
 built wheel on a supported Mac, then run the repository's **Publish Metal package to PyPI** workflow manually with

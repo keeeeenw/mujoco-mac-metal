@@ -1,8 +1,8 @@
 # Native physics development coverage
 
-The unreleased **0.4.0.dev0** source on `main` extends the published **0.3.0** package. Use the source checkout
-with `PYTHONPATH=metal` after the [source setup](INSTALL.md#development-source);
-installing 0.3.0 does not provide these new profiles.
+Version **0.4.0** extends the earlier **0.3.0** package with the bounded profiles
+below. Upgrade the installed package, and use the [source setup](INSTALL.md#development-source)
+for demo scripts and assets. Version 0.3.0 does not provide these new profiles.
 The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.

@@ -14,7 +14,7 @@
 
 """Optional MuJoCo Metal experiments; import does not initialize a GPU."""
 
-__version__ = "0.4.0.dev0"
+__version__ = "0.4.0"
 
 
 def __getattr__(name):

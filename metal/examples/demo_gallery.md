@@ -18,7 +18,8 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Off-center balance workshop](offcenter_balance.md) | L-shaped tools spin around stationary centers of mass with measured orbit plots | Free-body implicitfast midpoint, including offset COMs |
 | [Chaotic pendulum](README.md) | Four connected arms swing and tumble | Generalized rigid-body mass and bias |
 
-Use the [development source setup](../INSTALL.md#development-source) for the
-unreleased 0.4.0.dev0 demos; PyPI 0.3.0 does not include the new profiles.
+Use version **0.4.0 or newer** and the [demo/source setup](../INSTALL.md#development-source).
+Demo scripts and assets live in the repository; the wheel supplies the physics
+package. Version 0.3.0 does not include the new profiles.
 Follow the command in each guide. Most new demos produce numerical reports
 and optional GIFs; an interactive viewer is available only where documented. Rendering currently uses MuJoCo OpenGL.

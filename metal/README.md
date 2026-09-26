@@ -1,7 +1,6 @@
 # Experimental MuJoCo Metal package
 
-> **Development source on `main`:** the published 0.3.0 release has the bounded
-> contact-free Euler features documented below. New source profiles add RK4,
+> **Version 0.4.0:** extends the earlier 0.3.0 contact-free Euler profiles with RK4,
 > rigid passive forces, stateless joint/tendon servos, current-state sensors,
 > body-fluid drag, bounded implicitfast, sphere contact and joint constraints. See [development coverage](DEVELOPMENT.md) and the
 > [creative demo gallery](examples/demo_gallery.md) for scope and evidence.
@@ -93,7 +92,7 @@ terms from silently disappearing.
 
 Try the [spacecraft force-control demo](examples/space_docking.md), or use the
 [installation and diagnostic guide](INSTALL.md) for `pip install mujoco-mac-metal`
-and `mujoco-metal doctor --gpu`. The experimental 0.3.0 release is on PyPI.
+and `mujoco-metal doctor --gpu`. Install version 0.4.0 for the additional bounded profiles.
 
 ## Achievements and measured scaling
 
@@ -111,7 +110,7 @@ free-body, and mixed-joint fixtures. The native pendulum also passed headless an
 offscreen checks. Interactive native playback still needs qualification with an
 active macOS display; the earlier hybrid viewer was checked separately.
 
-The unreleased 0.4.0.dev0 source checkpoint passed **257 tests with native GPU
+The 0.4.0 physics source checkpoint passed **257 tests with native GPU
 execution enabled**. Its additional profiles and fixture evidence are listed in
 [DEVELOPMENT.md](DEVELOPMENT.md); this does not extend the old timing results.
 
@@ -126,9 +125,9 @@ CPU rollout writes float64 trajectories while Metal retains float32 device state
 that difference is included in the reported comparison. No full-library or
 cross-hardware speedup is claimed.
 
-## Published 0.3.0 boundaries
+## Historical 0.3.0 boundaries
 
-For the additional source capabilities, see [DEVELOPMENT.md](DEVELOPMENT.md).
+For the additional 0.4.0 capabilities, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
 | Stage | Status in published 0.3.0 |
 | --- | --- |

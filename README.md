@@ -60,17 +60,19 @@ python -m pip install mujoco-mac-metal
 PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal doctor --gpu
 ```
 
-[Version 0.3.0 is available on PyPI](https://pypi.org/project/mujoco-mac-metal/0.3.0/).
-For the unreleased **0.4.0.dev0** profiles and new demos, use the
-[source installation instructions](metal/INSTALL.md#development-source).
+[Version 0.4.0](https://pypi.org/project/mujoco-mac-metal/0.4.0/) includes the
+new bounded physics profiles. Existing installations can upgrade with
+`python -m pip install --upgrade mujoco-mac-metal`. Clone the repository for
+the demo scripts and assets using the [source setup](metal/INSTALL.md#development-source).
 See [installation and diagnostics](metal/INSTALL.md) for requirements and status.
 
 ## Try the Mac demos
 
 We built these demos to explore Metal physics on the Mac—give them a try!
 Each guide includes runnable commands and an independent CPU MuJoCo comparison.
-Use the [source setup on `main`](metal/INSTALL.md#development-source) for the
-unreleased **0.4.0.dev0** features; installing PyPI 0.3.0 does not include them.
+Use **0.4.0 or newer** and the [demo/source setup](metal/INSTALL.md#development-source).
+The repository contains the scripts, models and GIFs; the wheel contains the
+physics package and its shaders.
 
 The clips show actual simulation at a presentation playback rate, not measured
 execution speed. Rendering uses MuJoCo OpenGL. Most examples offer headless
@@ -160,8 +162,7 @@ The optional package targets Python 3.12, MuJoCo **3.10.0** and Torch **2.9.1**;
 use its isolated installation instructions rather than treating the newer
 surrounding MuJoCo source version as the qualified runtime.
 
-The published 0.3.0 profiles require contact-free Euler models. The source on
-`main` adds bounded RK4/implicitfast, passive and fluid forces, fixed-tendon
+The earlier 0.3.0 profiles required contact-free Euler models. Version 0.4.0 adds bounded RK4/implicitfast, passive and fluid forces, fixed-tendon
 servos, sensor queries, sphere contact and joint-constraint profiles, each with
 explicit guards. These are partial implementations:
 remaining contact/constraint families, stateful actuation, spatial tendons,

@@ -1,4 +1,4 @@
-include INSTALL.md
+include INSTALL.md DEVELOPMENT.md
 include LICENSE NOTICE PYPI_README.md README.md
 recursive-include examples *.py *.xml *.md
 recursive-include examples/assets *.gif
