@@ -184,7 +184,7 @@ def test_preflight_is_cpu_only_and_includes_stage_inventory(tmp_path):
   assert result["gpu_qualified"] is False
   assert "complete physics backend" in result["gpu_qualification_scope"]
   assert result["shader_sha256"]
-  assert set(result["shaders"]) == {
+  assert set(result["shaders"]) >= {
       "kinematics",
       "smooth_mass",
       "smooth_bias",

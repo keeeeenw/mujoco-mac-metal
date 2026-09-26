@@ -1,5 +1,13 @@
 # Experimental MuJoCo Metal package
 
+> **Development branch:** the published 0.3.0 release has the bounded
+> contact-free Euler features documented below. New source profiles add RK4,
+> rigid passive forces, stateless joint/tendon servos, current-state sensors
+> and normal sphere contact. See [development coverage](DEVELOPMENT.md) and the
+> [creative demo gallery](examples/demo_gallery.md) for scope and evidence.
+> These increments do not establish full MuJoCo support.
+
+
 **Current status: experimental contact-free stepping, not a complete simulation backend.**
 This generalized branch computes kinematics, `M(q)`, and inertial/gravity bias,
 solves dense SPD systems, integrates state, and provides a narrowly qualified
@@ -44,7 +52,7 @@ Run the opt-in GPU correctness tests only on an available Apple GPU with the pin
 ## Applied forces, damping and basic motors
 
 Select a profile explicitly; the original `contact_free_euler_v1` remains the
-unforced baseline. All profiles require contacts disabled and Euler integration.
+unforced baseline. The published 0.3.0 profiles require contacts disabled and Euler integration.
 
 | Profile | Additional supported behavior |
 | --- | --- |
@@ -113,7 +121,9 @@ CPU rollout writes float64 trajectories while Metal retains float32 device state
 that difference is included in the reported comparison. No full-library or
 cross-hardware speedup is claimed.
 
-## Boundaries before general MuJoCo simulation
+## Published 0.3.0 boundaries
+
+For the additional source-branch capabilities, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
 | Stage | Status in this generalized package |
 | --- | --- |

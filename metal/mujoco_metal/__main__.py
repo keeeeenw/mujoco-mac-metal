@@ -60,6 +60,16 @@ def preflight(model_path=None, include_inventory=False):
       "smooth_bias": package / "shaders" / "smooth_bias.metal",
       "smooth_solve": package / "shaders" / "smooth_solve.metal",
       "integration": package / "shaders" / "integration.metal",
+      **{
+          name: package / "shaders" / f"{name}.metal"
+          for name in (
+              "actuation",
+              "passive",
+              "transmissions",
+              "sensors",
+              "contact",
+          )
+      },
   }
   result = {
       "package_version": __version__,
@@ -124,10 +134,12 @@ def preflight(model_path=None, include_inventory=False):
               "narrowly GPU-qualified on M1; scalar hinge/slide motors, "
               "clipping and disable flags; 15 independent 1000-step trajectories"
           ),
-          "full_stepping": "unsupported beyond the bounded contact-free Euler profiles",
-          "collision": "unsupported",
-          "constraints": "unsupported",
-          "sensors": "unsupported",
+          "full_stepping": "unsupported beyond bounded Euler/RK4 profiles; see DEVELOPMENT.md",
+          "passive": "narrowly qualified rigid springs, polynomial damping, Cartesian wrenches and gravcomp",
+          "transmissions": "narrowly qualified stateless scalar servos and fixed-joint tendons",
+          "collision": "narrowly qualified plane-sphere and sphere-sphere normal contact",
+          "constraints": "bounded normal-contact solve only; wider families in development",
+          "sensors": "bounded current-state joint/frame/clock/gyro/velocity queries; not full mj_step sensor timing",
           "rendering": "unsupported",
       },
   }

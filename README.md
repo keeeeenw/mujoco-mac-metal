@@ -5,7 +5,7 @@ Experimental native Apple GPU physics for MuJoCo, maintained by
 [Google DeepMind's MuJoCo](https://github.com/google-deepmind/mujoco) and adds an
 optional [Metal package](metal/README.md). It is not an official MuJoCo release.
 
-**Native contact-free stepping works for a bounded model profile. Full MuJoCo
+**Native stepping works for explicit, bounded model profiles. Full MuJoCo
 Metal support remains a work in progress.** The ordinary MuJoCo build remains
 available alongside the optional package.
 
@@ -19,14 +19,17 @@ available alongside the optional package.
   per-step host state readback, per-world failure handling, selected-row reset,
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
-- **Validation and reproducible measurements:** 133 tests passed with GPU execution
+- **Validation and reproducible measurements:** the 0.3.0 baseline passed 133 tests with GPU execution
   enabled; independent CPU-reference trajectory and solve checks supplement the
   suite. Benchmarks include actual eight-thread CPU measurements at every tested
   batch through 524,288 worlds.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
   plus bounded hinge/slide motors with clipping and disable flags. Separate
   profiles preserve the original unforced baseline.
-- **Tools and documentation:** spacecraft and pendulum comparisons, capability inventory,
+- **Development physics coverage:** contact-free RK4, rigid springs and body
+  forces, stateless tendon servos, selected sensor queries, and a normal-contact
+  slice have CPU-reference checks. See the [precise development coverage](metal/DEVELOPMENT.md).
+- **Tools and documentation:** creative simulation demos, capability inventory,
   runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.
 - **Upstream regression coverage:** an `mj_setConst` inertial-update roundtrip test
   and documentation clarifying compiled simple-body/sparsity limitations.
@@ -63,6 +66,13 @@ See [installation and diagnostics](metal/INSTALL.md) for requirements and status
 ## Try the Mac demos
 
 We built a few demos to explore Metal physics on the Mac—give them a try!
+The [demo gallery](metal/examples/demo_gallery.md) includes tumbling toys,
+a spring flower, a marble cascade, a sensor scanning rig and a cable plotter.
+Each major development milestone gets a distinct demonstration with an
+independent CPU reference. New development demos require this source branch,
+rather than the published 0.3.0 package.
+
+![Sensor scanning rig with live native measurements](metal/examples/assets/scanning_rig.gif)
 
 ![Native Metal spacecraft approach beside CPU MuJoCo](metal/examples/assets/space_docking.gif)
 
@@ -89,11 +99,13 @@ The optional package targets Python 3.12, MuJoCo **3.10.0** and Torch **2.9.1**;
 use its isolated installation instructions rather than treating the newer
 surrounding MuJoCo source version as the qualified runtime.
 
-All current profiles require contacts disabled and Euler integration. Explicit
-profiles support generalized forces, linear damping and basic scalar-joint motors;
-other actuation, passive/fluid forces, tendons, contacts and
-constraints, sensors, other integrators, native rendering and training integration
-remain unsupported. Per-environment model randomization is not connected to
+The published 0.3.0 profiles require contact-free Euler models. This development
+branch adds bounded RK4, passive force, servo, sensor-query and normal-contact
+profiles, each with explicit guards. These are partial implementations:
+remaining contact/constraint families, stateful actuation, spatial tendons,
+fluids, implicit integrators and broader sensors/model/API coverage still need
+implementation and qualification. Native rendering and training integration
+remain outside the implemented scope. Per-environment model randomization is not connected to
 native stepping. Linux/CUDA integration and other Apple hardware/OS combinations
 have not been validated for this Metal package. Full upstream-core and
 single-precision compatibility are not established.

@@ -232,7 +232,7 @@ def _inventory():
               Implementation.NOT_IMPLEMENTED,
               Qualification.UNQUALIFIED,
               Execution.NONE,
-              "no device collisions",
+              "general collision coverage remains incomplete; bounded normal-contact stage inventoried separately",
           ),
           Feature(
               "constraint assembly and solvers",
@@ -240,7 +240,7 @@ def _inventory():
               Implementation.NOT_IMPLEMENTED,
               Qualification.UNQUALIFIED,
               Execution.NONE,
-              "no device constraints",
+              "general constraints remain incomplete; bounded normal-contact stage inventoried separately",
           ),
           Feature(
               "actuator evaluation",
@@ -248,7 +248,7 @@ def _inventory():
               Implementation.NOT_IMPLEMENTED,
               Qualification.UNQUALIFIED,
               Execution.NONE,
-              "no device actuation",
+              "unrestricted actuation remains incomplete; bounded motor and servo stages inventoried separately",
           ),
           Feature(
               "forward/inverse dynamics",
@@ -320,7 +320,7 @@ def _inventory():
               Implementation.NOT_IMPLEMENTED,
               Qualification.UNQUALIFIED,
               Execution.NONE,
-              "no device sensors",
+              "full sensor family/timing semantics remain incomplete; bounded current-state queries inventoried separately",
           ),
           Feature(
               "deformables and plugins",
@@ -340,6 +340,43 @@ def _inventory():
           ),
       )
   )
+  for name, stage, scope in (
+      (
+          "contact-free RK4",
+          Stage.INTEGRATION,
+          "quaternion-aware native RK4, mixed-joint trajectories; no stateful actuators or contact RK4",
+      ),
+      (
+          "rigid passive forces",
+          Stage.DYNAMICS,
+          "joint springs, polynomial damping, gravcomp and Cartesian body forces; no fluids or general tendon passive forces",
+      ),
+      (
+          "stateless scalar transmissions",
+          Stage.DYNAMICS,
+          "fixed/affine gains and affine biases, scalar joints and fixed joint tendons; no activation state or spatial tendon wrapping",
+      ),
+      (
+          "normal contact slice",
+          Stage.CONSTRAINTS,
+          "plane-sphere/sphere-sphere condim1; nv<=32, <=16 candidates, Euler only; no broad geometry/constraint coverage",
+      ),
+      (
+          "current-state sensor queries",
+          Stage.SENSOR,
+          "joint/frame/clock/gyro/velocity subset; explicit query, not stored mj_step timing; no history/noise/delay",
+      ),
+  ):
+    result.append(
+        Feature(
+            name,
+            stage,
+            Implementation.NATIVE_GPU,
+            Qualification.GPU_QUALIFIED,
+            Execution.DEVICE,
+            "narrow local M1 CPU-reference qualification: " + scope,
+        )
+    )
   return tuple(result)
 
 
