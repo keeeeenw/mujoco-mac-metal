@@ -3,12 +3,12 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Native Metal normal contact primitives for MuJoCo 3.10.0.
+"""Native Metal contact primitives for a bounded MuJoCo 3.10.0 profile.
 
-This stage lowers a deliberately bounded contact family (sphere/sphere and
-plane/sphere, condim=1) to fixed geometry-pair work items. Detection,
-Jacobian construction, reference generation and the regularized normal solve
-run in MSL. Host code only validates/lower constants and allocates buffers.
+This stage lowers sphere/sphere and plane/sphere pairs with condim=1 or
+pyramidal condim=3 to fixed work items. Detection, Jacobian construction,
+reference generation, and the regularized unilateral solve run in MSL. Host
+code only validates/lower constants and allocates buffers.
 """
 
 from dataclasses import dataclass
@@ -30,7 +30,7 @@ def _frozen(value, dtype):
 
 @dataclass(frozen=True)
 class ContactDescriptor:
-  """Fixed model constants and candidate pairs for supported normal contacts."""
+  """Fixed model constants and candidate pairs for bounded contacts."""
 
   geom1: np.ndarray
   geom2: np.ndarray
@@ -40,8 +40,11 @@ class ContactDescriptor:
   gap: np.ndarray
   solref: np.ndarray
   solimp: np.ndarray
+  condim: np.ndarray
+  friction: np.ndarray
   timestep: float
   refsafe: bool
+  impratio: float
   nv: int
   nbody: int
   njnt: int
@@ -62,7 +65,7 @@ class ContactDescriptor:
 
 
 def lower_contacts(model):
-  """Build eligible geom pairs and effective condim-1 contact parameters.
+  """Build eligible geom pairs and effective supported contact parameters.
 
   Unsupported collision types, pair overrides, exclusions, runtime contact
   filters, override parameters, and adhesion fail explicitly. This avoids
@@ -114,25 +117,36 @@ def lower_contacts(model):
           max(int(model.geom_condim[a]), int(model.geom_condim[b]))
       )
       if condim != 1:
-        raise ValueError(f"contact pair ({a}, {b}) has condim other than 1")
+        if condim != 3:
+          raise ValueError(f"contact pair ({a}, {b}) has unsupported condim {condim}")
+        if int(model.opt.cone) != int(mujoco.mjtCone.mjCONE_PYRAMIDAL):
+          raise ValueError("condim=3 native contact requires the pyramidal cone")
       # MuJoCo's regular collision path orders geom ids. Preserve that order.
       p1, p2 = a, b
-      solref, solimp = _mix_contact_parameters(model, p1, p2)
+      solref, solimp, friction = _mix_contact_parameters(model, p1, p2)
       if bool(solref[0] > 0) != bool(solref[1] > 0):
         solref = np.asarray(model.opt.o_solref).copy()
       if not (int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)) and solref[0] > 0:
         solref[0] = max(float(solref[0]), 2.0 * float(model.opt.timestep))
-      pairs.append((p1, p2, solref, solimp))
+      # MuJoCo expands geom friction [slide, torsion, roll] into contact
+      # friction [slide, slide, torsion, roll, roll]. Both condim=3 tangent
+      # axes therefore use the geom's first (sliding) coefficient.
+      pairs.append((p1, p2, solref, solimp, condim,
+                    np.repeat(friction[0], 2)))
 
   if pairs:
     g1 = np.array([p[0] for p in pairs], dtype=np.int32)
     g2 = np.array([p[1] for p in pairs], dtype=np.int32)
     sr = np.array([p[2] for p in pairs], dtype=np.float64)
     si = np.array([p[3] for p in pairs], dtype=np.float64)
+    cd = np.array([p[4] for p in pairs], dtype=np.int32)
+    fr = np.array([p[5] for p in pairs], dtype=np.float64).reshape(-1, 2)
   else:
     g1 = g2 = np.empty(0, dtype=np.int32)
     sr = np.empty((0, 2), dtype=np.float64)
     si = np.empty((0, 5), dtype=np.float64)
+    cd = np.empty(0, dtype=np.int32)
+    fr = np.empty((0, 2), dtype=np.float64)
   return ContactDescriptor(
       geom1=_frozen(g1, np.int32),
       geom2=_frozen(g2, np.int32),
@@ -142,6 +156,8 @@ def lower_contacts(model):
       gap=_frozen(model.geom_gap[g1] + model.geom_gap[g2], np.float32),
       solref=_frozen(sr, np.float32),
       solimp=_frozen(si, np.float32),
+      condim=_frozen(cd, np.int32),
+      friction=_frozen(fr, np.float32),
       nv=int(model.nv),
       nbody=int(model.nbody),
       njnt=int(model.njnt),
@@ -150,6 +166,7 @@ def lower_contacts(model):
       refsafe=not bool(
           int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)
       ),
+      impratio=float(model.opt.impratio),
       geom_bodyid=_frozen(model.geom_bodyid, np.int32),
       body_parentid=_frozen(model.body_parentid, np.int32),
       body_jntadr=_frozen(model.body_jntadr, np.int32),
@@ -166,9 +183,9 @@ def _mix_contact_parameters(model, g1, g2):
   """MuJoCo 3.10 same-priority solref/solimp mixing for geom contacts."""
   p1, p2 = int(model.geom_priority[g1]), int(model.geom_priority[g2])
   if p1 > p2:
-    return model.geom_solref[g1].copy(), model.geom_solimp[g1].copy()
+    return model.geom_solref[g1].copy(), model.geom_solimp[g1].copy(), model.geom_friction[g1].copy()
   if p2 > p1:
-    return model.geom_solref[g2].copy(), model.geom_solimp[g2].copy()
+    return model.geom_solref[g2].copy(), model.geom_solimp[g2].copy(), model.geom_friction[g2].copy()
   m1, m2 = float(model.geom_solmix[g1]), float(model.geom_solmix[g2])
   if m1 >= _MINVAL and m2 >= _MINVAL:
     mix = m1 / (m1 + m2)
@@ -179,7 +196,8 @@ def _mix_contact_parameters(model, g1, g2):
   r1, r2 = model.geom_solref[g1], model.geom_solref[g2]
   ref = mix * r1 + (1 - mix) * r2 if r1[0] > 0 and r2[0] > 0 else np.minimum(r1, r2)
   imp = mix * model.geom_solimp[g1] + (1 - mix) * model.geom_solimp[g2]
-  return ref, imp
+  friction = np.maximum(model.geom_friction[g1], model.geom_friction[g2])
+  return ref, imp, friction
 
 
 def _get_impedance(solimp, pos, margin):
@@ -236,6 +254,8 @@ class MetalContact:
         "gap": self._tensor(self.descriptor.gap),
         "solref": self._tensor(self.descriptor.solref.reshape(-1)),
         "solimp": self._tensor(self.descriptor.solimp.reshape(-1)),
+        "condim": self._tensor(self.descriptor.condim),
+        "friction": self._tensor(self.descriptor.friction),
         "geom_bodyid": self._tensor(self.descriptor.geom_bodyid),
         "body_parentid": self._tensor(self.descriptor.body_parentid),
         "body_jntadr": self._tensor(self.descriptor.body_jntadr),
@@ -258,17 +278,20 @@ class MetalContact:
     ) or int(batch_size) <= 0:
       raise ValueError("batch_size must be positive")
     b, c, nv = int(batch_size), d.pair_count, d.nv
-    if b > (1 << 31) - 1 or b * max(c, 1) * max(nv, 1) > (1 << 32):
+    if b > (1 << 31) - 1 or b * max(c * 5, 1) * max(nv, 1) > (1 << 32):
       raise ValueError("contact workspace exceeds Metal index capacity")
     self.batch_size = b
     def empty(size):
       return torch.zeros(max(size, 1), dtype=torch.float32, device=self._device)
     self._workspace = {
-        "row_data": empty(b * c * 6), "frame": empty(b * c * 6),
-        "jacobian": empty(b * c * nv), "force": empty(b * c),
+        "row_data": empty(b * c * 5 * 6), "frame": empty(b * c * 12),
+        "jacobian": empty(b * c * 5 * nv), "force": empty(b * c * 5),
         "qacc": empty(b * nv),
+        "qfrc_contact": empty(b * nv),
         "status": torch.zeros(b, dtype=torch.int32, device=self._device),
+        "solver_diagnostics": empty(b * 2),
         "dims": torch.tensor([nv, c, b, d.nbody, d.njnt, d.ngeom], dtype=torch.int32, device=self._device),
+        "solver_params": torch.tensor([d.impratio], dtype=torch.float32, device=self._device),
     }
     return self._workspace
 
@@ -303,33 +326,49 @@ class MetalContact:
     self._kernel(
         fk["geom_pos"], fk["geom_quat"], fk["body_pos"], fk["body_quat"],
         fk["joint_anchor"], fk["joint_axis"], qvel.reshape(-1),
-        *[self._constants[k] for k in ("geom1", "geom2", "radius1", "radius2", "margin", "gap", "solref", "solimp")],
+        *[self._constants[k] for k in ("geom1", "geom2", "radius1", "radius2", "margin", "gap", "solref", "solimp", "condim", "friction")],
         *[self._constants[k] for k in ("geom_bodyid", "body_parentid", "body_jntadr", "body_jntnum", "jnt_type", "jnt_dofadr", "body_invweight0")],
         w["row_data"], w["frame"], w["jacobian"], w["dims"],
         threads=(self.batch_size * max(d.pair_count, 1),), group_size=(1,),
     )
     self._solve_kernel(
         mass.reshape(-1), free_acceleration.reshape(-1), w["jacobian"],
-        w["row_data"], w["force"], w["qacc"], w["status"], w["dims"],
+        w["row_data"], self._constants["friction"], w["force"], w["qacc"],
+        w["qfrc_contact"], w["status"], w["solver_diagnostics"],
+        w["dims"], w["solver_params"],
         threads=(self.batch_size,), group_size=(1,),
     )
-    rows = w["row_data"][: self.batch_size * d.pair_count * 6].reshape(
-        self.batch_size, d.pair_count, 6
+    rows = w["row_data"][: self.batch_size * d.pair_count * 5 * 6].reshape(
+        self.batch_size, d.pair_count, 5, 6
     )
-    frames = w["frame"][: self.batch_size * d.pair_count * 6].reshape(
-        self.batch_size, d.pair_count, 6
+    frames = w["frame"][: self.batch_size * d.pair_count * 12].reshape(
+        self.batch_size, d.pair_count, 12
+    )
+    jacobian_rows = w["jacobian"][: self.batch_size * d.pair_count * 5 * d.nv].reshape(
+        self.batch_size, d.pair_count, 5, d.nv
+    )
+    force_rows = w["force"][: self.batch_size * d.pair_count * 5].reshape(
+        self.batch_size, d.pair_count, 5
+    )
+    detected = torch.where(
+        self._constants["condim"].reshape(1, -1) == 3,
+        rows[:, :, 1, 0], rows[:, :, 0, 0],
     )
     return {
-        "mask": rows[:, :, 0], "dist": rows[:, :, 1],
-        "velocity": rows[:, :, 2], "reference": rows[:, :, 3],
-        "impedance": rows[:, :, 4], "normal": frames[:, :, :3],
-        "position": frames[:, :, 3:],
-        "jacobian": w["jacobian"][: self.batch_size * d.pair_count * d.nv].reshape(
-            self.batch_size, d.pair_count, d.nv
-        ),
-        "force": w["force"][: self.batch_size * d.pair_count].reshape(
-            self.batch_size, d.pair_count
+        "mask": detected, "dist": rows[:, :, 0, 1],
+        "velocity": rows[:, :, 0, 2], "reference": rows[:, :, 0, 3],
+        "impedance": rows[:, :, 0, 4], "normal": frames[:, :, :3],
+        "tangent1": frames[:, :, 3:6], "tangent2": frames[:, :, 6:9],
+        "position": frames[:, :, 9:12],
+        "jacobian": jacobian_rows[:, :, 0, :],
+        "jacobian_rows": jacobian_rows,
+        "force": force_rows[:, :, 0], "force_rows": force_rows,
+        "qfrc_contact": w["qfrc_contact"][: self.batch_size * d.nv].reshape(
+            self.batch_size, d.nv
         ),
         "qacc": w["qacc"][: self.batch_size * d.nv].reshape(self.batch_size, d.nv),
         "status": w["status"],
+        "solver_diagnostics": w["solver_diagnostics"][: self.batch_size * 2].reshape(
+            self.batch_size, 2
+        ),
     }

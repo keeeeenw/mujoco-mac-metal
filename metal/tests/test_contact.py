@@ -86,7 +86,10 @@ def test_contact_guards_reject_unsupported_families_and_parameters():
       _plane_sphere_xml().replace('condim="1"', 'condim="3"')
   )
   with pytest.raises(ValueError, match="condim"):
-    lower_contacts(frictional)
+    lower_contacts(mujoco.MjModel.from_xml_string(
+        _plane_sphere_xml().replace('condim="1"', 'condim="4"')
+    ))
+  assert lower_contacts(frictional).condim.tolist() == [3]
 
   explicit_pair = mujoco.MjModel.from_xml_string(
       '<mujoco><worldbody><geom name="floor" type="plane" size="2 2 .1"/>'
@@ -121,6 +124,26 @@ def test_priority_and_direct_solref_mixing_match_contact_records():
   np.testing.assert_allclose(desc.solref[0], data.contact[0].solref, atol=1e-7)
   np.testing.assert_allclose(desc.solimp[0], data.contact[0].solimp, atol=1e-7)
   assert desc.margin[0] == pytest.approx(data.contact[0].includemargin)
+
+
+def test_pyramidal_condim3_friction_mixing_matches_contact_record():
+  xml = """<mujoco><option cone="pyramidal"/><worldbody>
+    <geom name="floor" type="plane" size="2 2 .1" condim="3"
+      friction=".4 .02 .01" priority="2"/>
+    <body pos="0 0 .18"><freejoint/><geom name="ball" type="sphere"
+      size=".2" condim="3" friction=".8 .03 .02" priority="1"/>
+    </body></worldbody></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  assert data.ncon == 1
+  assert data.contact[0].dim == 3
+  desc = lower_contacts(model)
+  assert desc.condim.tolist() == [3]
+  # The higher-priority geom supplies all contact parameters.
+  assert desc.friction[0].tolist() == pytest.approx([0.4, 0.4])
+  np.testing.assert_allclose(desc.solref[0], data.contact[0].solref, atol=1e-7)
+  np.testing.assert_allclose(desc.solimp[0], data.contact[0].solimp, atol=1e-7)
 
 
 def _mps(array):
@@ -245,4 +268,41 @@ def test_native_coupled_sphere_contacts_with_nonzero_velocity_match_cpu():
   mujoco.mj_forward(model, data)
   np.testing.assert_allclose(
       actual["qacc"][0].cpu().numpy(), data.qacc, rtol=4e-3, atol=4e-3
+  )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
+    reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
+)
+def test_native_pyramidal_friction_contact_matches_cpu_oracle():
+  xml = """<mujoco><compiler angle="radian"/><option timestep=".002"
+  gravity="0 0 0" cone="pyramidal"/><worldbody>
+    <geom type="plane" size="2 2 .1" euler="0 .28 0" condim="3"
+      friction=".7 .01 .01"/>
+    <body pos=".02 -.01 .18"><freejoint/><geom type="sphere"
+      pos=".045 .02 0" size=".2"
+      condim="3" friction=".7 .01 .01"/></body>
+  </worldbody></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = model.qpos0[None, :].copy()
+  qvel = np.zeros((1, model.nv))
+  qvel[0, 0] = 1.0
+  qvel[0, 3:6] = [0.2, -0.3, 0.1]
+  actual = _gpu_contact_acceleration(model, qpos, qvel)
+  assert actual["status"].cpu().numpy().tolist() == [0]
+  data = mujoco.MjData(model)
+  data.qpos[:] = qpos[0]
+  data.qvel[:] = qvel[0]
+  mujoco.mj_forward(model, data)
+  assert data.ncon == 1 and data.contact[0].dim == 3
+  # Four pyramidal edges carry force; slot zero is the retained normal row.
+  assert actual["force_rows"][0, 0, 0].item() == 0.0
+  np.testing.assert_allclose(
+      actual["qacc"][0].cpu().numpy(), data.qacc, rtol=8e-3, atol=8e-3
+  )
+  np.testing.assert_allclose(
+      actual["qfrc_contact"][0].cpu().numpy(), data.qfrc_constraint,
+      rtol=1e-2, atol=1e-2,
   )
