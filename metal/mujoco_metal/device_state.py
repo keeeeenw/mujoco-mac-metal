@@ -55,6 +55,8 @@ def _state_fingerprint(profile):
       repr(profile.supported),
       repr(profile.irrelevant),
       repr(profile.rejected),
+      repr(profile.passive_damping_enabled),
+      repr(profile.implicit_euler_damping),
   ):
     digest.update(value.encode("utf-8"))
     digest.update(b"\0")

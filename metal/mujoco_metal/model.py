@@ -97,6 +97,7 @@ class ModelDescriptor:
   body_mass: np.ndarray
   body_inertia: np.ndarray
   dof_armature: np.ndarray
+  dof_damping: np.ndarray
   tendon_armature: np.ndarray
   jnt_type: np.ndarray
   jnt_qposadr: np.ndarray
@@ -245,6 +246,7 @@ def _validate_lowered(counts, values):
       "body_mass": (nb,),
       "body_inertia": (nb, 3),
       "dof_armature": (nv,),
+      "dof_damping": (nv,),
       "tendon_armature": (counts["ntendon"],),
       "jnt_type": (nj,),
       "jnt_qposadr": (nj,),
@@ -436,6 +438,7 @@ def load_model(source):
       "body_mass",
       "body_inertia",
       "dof_armature",
+      "dof_damping",
       "tendon_armature",
       "jnt_type",
       "jnt_qposadr",

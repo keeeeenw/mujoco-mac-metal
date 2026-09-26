@@ -16,6 +16,8 @@
 
 import numbers
 
+import numpy as np
+
 import mujoco
 
 from mujoco_metal.device_state import DeviceState
@@ -44,7 +46,15 @@ class MetalSimulation:
   readback; use them outside the hot stepping loop.
   """
 
-  def __init__(self, model, batch_size=1, qpos=None, qvel=None):
+  def __init__(
+      self,
+      model,
+      batch_size=1,
+      qpos=None,
+      qvel=None,
+      *,
+      profile="contact_free_euler_v1",
+  ):
     if not isinstance(model, mujoco.MjModel):
       raise TypeError("model must be a compiled mujoco.MjModel")
     if isinstance(batch_size, bool) or not isinstance(
@@ -56,7 +66,7 @@ class MetalSimulation:
     batch_size = int(batch_size)
     # This CPU-only contract check must finish before any constructor can
     # initialize MPS or compile a shader.
-    profile = validate_stepping_profile(model)
+    profile = validate_stepping_profile(model, profile=profile)
     _validate_workspace_index_capacity(
         batch_size,
         {
@@ -96,6 +106,11 @@ class MetalSimulation:
     self.profile = profile
     self._smooth = MetalSmoothDynamics(descriptor, batch_size=batch_size)
     self._solver = MetalDenseSolve(descriptor.nv, batch_size)
+    self._euler_solver = (
+        MetalDenseSolve(descriptor.nv, batch_size)
+        if profile.implicit_euler_damping
+        else None
+    )
     self._integrator = MetalEulerIntegration(
         descriptor, batch_size, profile.timestep
     )
@@ -105,6 +120,28 @@ class MetalSimulation:
         (batch_size, descriptor.nv),
         dtype=torch.float32,
         device=self._state._device,
+    )
+    self._applied_force = torch.zeros_like(self._rhs)
+    self._damping = torch.tensor(
+        descriptor.dof_damping
+        if profile.passive_damping_enabled
+        else np.zeros(descriptor.nv),
+        dtype=torch.float32,
+        device=self._state._device,
+    )
+    self._effective_mass = (
+        torch.empty(
+            (batch_size, descriptor.nv, descriptor.nv),
+            dtype=torch.float32,
+            device=self._state._device,
+        )
+        if profile.implicit_euler_damping
+        else None
+    )
+    self._implicit_damping = (
+        self.profile.timestep * self._damping
+        if profile.implicit_euler_damping
+        else None
     )
     self._success = torch.empty(
         (batch_size,), dtype=torch.bool, device=self._state._device
@@ -121,7 +158,38 @@ class MetalSimulation:
     """The owned :class:`DeviceState` lifecycle and checkpoint interface."""
     return self._state
 
-  def step(self, steps=1):
+  def _prepare_force(self, qfrc_applied):
+    torch = self._state._torch
+    shape = (self._state.batch_size, self._state._model.nv)
+    if qfrc_applied is None:
+      if self.profile.name == "contact_free_forces_euler_v1":
+        self._applied_force.zero_()
+      return
+    if self.profile.name == "contact_free_euler_v1":
+      raise ValueError("qfrc_applied requires contact_free_forces_euler_v1")
+    if isinstance(qfrc_applied, torch.Tensor):
+      if qfrc_applied.dtype != torch.float32:
+        raise TypeError("qfrc_applied tensor must have dtype torch.float32")
+      if tuple(qfrc_applied.shape) != shape:
+        raise ValueError(f"qfrc_applied must have shape {shape}")
+      if qfrc_applied.device.type != "mps":
+        raise ValueError("qfrc_applied tensor must be on MPS")
+      if not qfrc_applied.is_contiguous():
+        raise ValueError("qfrc_applied tensor must be contiguous")
+      self._applied_force.copy_(qfrc_applied)
+      return
+    array = np.asarray(qfrc_applied)
+    if array.shape != shape or array.dtype.kind not in "fiu":
+      raise ValueError(f"qfrc_applied must be numeric with shape {shape}")
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+      array = np.asarray(array, dtype=np.float32, order="C")
+    if not np.all(np.isfinite(array)):
+      raise ValueError(
+          "qfrc_applied must be finite and representable as float32"
+      )
+    self._applied_force.copy_(torch.tensor(array, device=self._state._device))
+
+  def step(self, steps=1, *, qfrc_applied=None, ctrl=None):
     """Advance all worlds by a positive number of native contact-free steps.
 
     The fixed workspace is reused. Failed worlds retain their previous state
@@ -133,14 +201,41 @@ class MetalSimulation:
       raise TypeError("steps must be a positive integer")
     if steps <= 0:
       raise ValueError("steps must be a positive integer")
+    if ctrl is not None:
+      raise ValueError(
+          "ctrl is unsupported until scalar motor lowering is qualified"
+      )
+    self._prepare_force(qfrc_applied)
     torch = self._state._torch
     state = self._state
     for _ in range(int(steps)):
       dynamics = self._smooth.run_device(state._qpos, state._qvel)
       torch.neg(dynamics["qfrc_bias"], out=self._rhs)
+      if self.profile.name == "contact_free_forces_euler_v1":
+        if self.profile.passive_damping_enabled and self._rhs.numel():
+          self._rhs.addcmul_(
+              state._qvel, self._damping.unsqueeze(0), value=-1.0
+          )
+        self._rhs.add_(self._applied_force)
       acceleration, solve_status = self._solver.run_device(
           dynamics["mass_matrix"], self._rhs
       )
+      integration_acceleration = acceleration
+      if self._euler_solver is not None:
+        self._effective_mass.copy_(dynamics["mass_matrix"])
+        self._effective_mass.diagonal(dim1=1, dim2=2).add_(
+            self._implicit_damping
+        )
+        integration_acceleration, euler_status = self._euler_solver.run_device(
+            self._effective_mass, self._rhs
+        )
+        torch.where(
+            (solve_status == 0),
+            euler_status,
+            solve_status,
+            out=self._combined_status,
+        )
+        solve_status = self._combined_status
       torch.eq(state._status, 0, out=self._success)
       torch.where(
           self._success, solve_status, state._status, out=self._combined_status
@@ -148,7 +243,7 @@ class MetalSimulation:
       qpos, qvel, time, status = self._integrator.run_device(
           state._qpos,
           state._qvel,
-          acceleration,
+          integration_acceleration,
           state._time,
           self._combined_status,
       )
