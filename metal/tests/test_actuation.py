@@ -62,11 +62,13 @@ def _cpu_oracle(model, ctrl):
 
 def test_scalar_motor_lowering_matches_mujoco_clipping_and_summed_moments():
   model = _compiled()
-  controls = np.array([
-      [4.0, 2.0, -3.0],
-      [-4.0, -6.0, 1.0],
-      [0.5, -0.25, 2.5],
-  ])
+  controls = np.array(
+      [
+          [4.0, 2.0, -3.0],
+          [-4.0, -6.0, 1.0],
+          [0.5, -0.25, 2.5],
+      ]
+  )
   lowered = ScalarMotorModel.from_model(model)
   actual = lowered.generalized_force(controls)
   expected = _cpu_oracle(model, controls)
@@ -80,13 +82,15 @@ def test_control_clamp_disable_group_disable_and_global_disable_match_mujoco():
   controls = np.array([[4.0, 2.0, -3.0], [-4.0, -6.0, 1.0]])
   for mutation in (
       lambda model: setattr(
-          model.opt, "disableflags",
+          model.opt,
+          "disableflags",
           int(model.opt.disableflags)
           | int(mujoco.mjtDisableBit.mjDSBL_CLAMPCTRL),
       ),
       lambda model: setattr(model.opt, "disableactuator", 1 << 1),
       lambda model: setattr(
-          model.opt, "disableflags",
+          model.opt,
+          "disableflags",
           int(model.opt.disableflags)
           | int(mujoco.mjtDisableBit.mjDSBL_ACTUATION),
       ),
@@ -122,19 +126,27 @@ def test_public_metadata_constructor_detaches_arrays_and_checks_bounds():
   assert not copied.gear.flags.writeable
   with pytest.raises(ValueError, match="dof indices"):
     replace(lowered, dof=np.array([-1, 0, 1], dtype=np.int32))
+  with pytest.raises(ValueError, match="integer storage range"):
+    replace(lowered, dof=np.array([2**32, 0, 1], dtype=np.int64))
+  with pytest.raises(ValueError, match="int32 dimension"):
+    replace(lowered, nv=True)
 
 
 @pytest.mark.parametrize(
     "xml, pattern",
     [
         (
-            _XML.replace('joint="hinge" gear="2"', 'joint="hinge" gear="2" '
-                         'armature=".1"'),
+            _XML.replace(
+                'joint="hinge" gear="2"',
+                'joint="hinge" gear="2" ' 'armature=".1"',
+            ),
             "armature",
         ),
         (
-            _XML.replace('joint="hinge" gear="2"', 'joint="hinge" gear="2" '
-                         'damping=".1"'),
+            _XML.replace(
+                'joint="hinge" gear="2"',
+                'joint="hinge" gear="2" ' 'damping=".1"',
+            ),
             "damping",
         ),
         (
@@ -226,11 +238,15 @@ def test_native_scalar_motor_force_matches_mujoco_and_tracks_controls():
   device_ctrl[0, 0] = -0.5
   updated = stage.run_device(device_ctrl)
   np.testing.assert_allclose(
-      updated.cpu().numpy(), _cpu_oracle(model, device_ctrl.cpu().numpy()),
-      rtol=2e-6, atol=2e-6,
+      updated.cpu().numpy(),
+      _cpu_oracle(model, device_ctrl.cpu().numpy()),
+      rtol=2e-6,
+      atol=2e-6,
   )
   with pytest.raises(ValueError, match="batch"):
-    stage.run_device(torch.zeros((1, model.nu), dtype=torch.float32, device="mps"))
+    stage.run_device(
+        torch.zeros((1, model.nu), dtype=torch.float32, device="mps")
+    )
 
 
 @pytest.mark.gpu
@@ -250,11 +266,19 @@ def test_native_motor_disable_flags_match_mujoco(disable):
   else:
     model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_ACTUATION)
   controls = np.array([[4.0, 2.0, -3.0], [-4.0, -6.0, 1.0]])
-  stage = MetalScalarMotorForce(ScalarMotorModel.from_model(model), batch_size=2)
-  actual = stage.run_device(
-      torch.tensor(controls, dtype=torch.float32, device="mps")
-  ).cpu().numpy()
-  np.testing.assert_allclose(actual, _cpu_oracle(model, controls), rtol=2e-6, atol=2e-6)
+  stage = MetalScalarMotorForce(
+      ScalarMotorModel.from_model(model), batch_size=2
+  )
+  actual = (
+      stage.run_device(
+          torch.tensor(controls, dtype=torch.float32, device="mps")
+      )
+      .cpu()
+      .numpy()
+  )
+  np.testing.assert_allclose(
+      actual, _cpu_oracle(model, controls), rtol=2e-6, atol=2e-6
+  )
 
 
 @pytest.mark.gpu
@@ -276,10 +300,14 @@ def test_native_motor_empty_actuators_and_nonfinite_controls_are_explicit():
       torch.empty((2, 0), dtype=torch.float32, device="mps")
   )
   assert tuple(empty.shape) == (2, no_actuator.nv)
-  np.testing.assert_array_equal(empty.cpu().numpy(), np.zeros((2, no_actuator.nv)))
+  np.testing.assert_array_equal(
+      empty.cpu().numpy(), np.zeros((2, no_actuator.nv))
+  )
 
   model = _compiled()
-  stage = MetalScalarMotorForce(ScalarMotorModel.from_model(model), batch_size=2)
+  stage = MetalScalarMotorForce(
+      ScalarMotorModel.from_model(model), batch_size=2
+  )
   controls = torch.zeros((2, model.nu), dtype=torch.float32, device="mps")
   controls[1, 1] = float("nan")
   result = stage.run_device(controls).cpu().numpy()

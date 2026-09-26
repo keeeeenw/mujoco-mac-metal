@@ -41,7 +41,9 @@ kernel void scalar_motor_force(
   if (actuation_disabled != 0) return;
 
   for (int actuator = 0; actuator < nu; ++actuator) {
-    if (!isfinite(ctrl[world * uint(nu) + uint(actuator)])) {
+    // Inspect exponent bits so fast-math cannot fold away the validity check.
+    uint control_bits = as_type<uint>(ctrl[world * uint(nu) + uint(actuator)]);
+    if ((control_bits & 0x7f800000u) == 0x7f800000u) {
       float invalid = as_type<float>(0x7fc00000u);
       for (int v = 0; v < nv; ++v) qfrc[force_offset + uint(v)] = invalid;
       return;

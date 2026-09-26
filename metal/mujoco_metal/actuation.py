@@ -57,8 +57,14 @@ class ScalarMotorModel:
 
   def __post_init__(self):
     """Validate direct construction too and own immutable metadata arrays."""
-    if self.nv < 0 or self.nu < 0:
-      raise ValueError("nv and nu must be nonnegative")
+    for name in ("nv", "nu"):
+      value = getattr(self, name)
+      if (
+          isinstance(value, (bool, np.bool_))
+          or not isinstance(value, (int, np.integer))
+          or not 0 <= value <= (1 << 31) - 1
+      ):
+        raise ValueError(f"{name} must be a nonnegative int32 dimension")
     specs = {
         "dof": ((self.nu,), np.int32),
         "gear": ((self.nu,), np.float32),
@@ -75,13 +81,20 @@ class ScalarMotorModel:
         raise ValueError(f"{name} must be numeric with shape {shape}")
       if not np.all(np.isfinite(value)):
         raise ValueError(f"{name} must be finite")
-      if dtype != np.float32 and value.dtype.kind == "f" and not np.all(
-          value == np.floor(value)
+      if (
+          dtype != np.float32
+          and value.dtype.kind == "f"
+          and not np.all(value == np.floor(value))
       ):
         raise ValueError(f"{name} must contain integer values")
       if dtype == np.uint8 and np.any((value < 0) | (value > 1)):
         raise ValueError(f"{name} must contain only zero or one")
-      converted = np.asarray(value, dtype=dtype)
+      if np.issubdtype(dtype, np.integer):
+        limits = np.iinfo(dtype)
+        if np.any(value < limits.min) or np.any(value > limits.max):
+          raise ValueError(f"{name} exceeds its integer storage range")
+      with np.errstate(over="ignore", invalid="ignore"):
+        converted = np.asarray(value, dtype=dtype)
       if dtype == np.float32 and not np.all(np.isfinite(converted)):
         raise ValueError(f"{name} must be finite and representable as float32")
       if dtype != np.float32 and not np.all(np.isfinite(value)):
@@ -150,19 +163,30 @@ class ScalarMotorModel:
       if joint < 0 or joint >= int(model.njnt):
         raise ValueError("actuator must target exactly one valid joint")
       if int(model.jnt_type[joint]) not in (hinge, slide):
-        raise ValueError("actuator joint transmission must target hinge or slide")
+        raise ValueError(
+            "actuator joint transmission must target hinge or slide"
+        )
       dof[actuator] = int(model.jnt_dofadr[joint])
 
     gear6 = np.asarray(model.actuator_gear, dtype=np.float64).reshape(nu, 6)
     gear = gear6[:, 0].copy()
     gain = (
-        np.asarray(model.actuator_gainprm, dtype=np.float64).reshape(nu, -1)[:, 0]
-        if nu else np.empty((0,), dtype=np.float64)
+        np.asarray(model.actuator_gainprm, dtype=np.float64).reshape(nu, -1)[
+            :, 0
+        ]
+        if nu
+        else np.empty((0,), dtype=np.float64)
     )
-    ctrl_range = np.asarray(model.actuator_ctrlrange, dtype=np.float64).reshape(nu, 2)
-    force_range = np.asarray(model.actuator_forcerange, dtype=np.float64).reshape(nu, 2)
+    ctrl_range = np.asarray(model.actuator_ctrlrange, dtype=np.float64).reshape(
+        nu, 2
+    )
+    force_range = np.asarray(
+        model.actuator_forcerange, dtype=np.float64
+    ).reshape(nu, 2)
     ctrl_limited = np.asarray(model.actuator_ctrllimited, dtype=np.uint8).copy()
-    force_limited = np.asarray(model.actuator_forcelimited, dtype=np.uint8).copy()
+    force_limited = np.asarray(
+        model.actuator_forcelimited, dtype=np.uint8
+    ).copy()
     groups = np.asarray(model.actuator_group, dtype=np.int32).copy()
 
     for name, values in (
@@ -176,7 +200,9 @@ class ScalarMotorModel:
     if not np.all(np.isfinite(gear.astype(np.float32))) or not np.all(
         np.isfinite(gain.astype(np.float32))
     ):
-      raise ValueError("actuator gear and gain must be representable as float32")
+      raise ValueError(
+          "actuator gear and gain must be representable as float32"
+      )
     if np.any(ctrl_limited & (ctrl_range[:, 0] > ctrl_range[:, 1])):
       raise ValueError("limited actuator control ranges must be ordered")
     if np.any(force_limited & (force_range[:, 0] > force_range[:, 1])):
@@ -203,7 +229,9 @@ class ScalarMotorModel:
     """CPU reference mapping for finite controls shaped ``[B, nu]``."""
     values = np.asarray(ctrl, dtype=np.float64)
     if values.ndim != 2 or values.shape[1] != self.nu or values.shape[0] <= 0:
-      raise ValueError(f"ctrl must have shape (batch, {self.nu}) with batch > 0")
+      raise ValueError(
+          f"ctrl must have shape (batch, {self.nu}) with batch > 0"
+      )
     if not np.all(np.isfinite(values)):
       raise ValueError("ctrl must contain only finite values")
     with np.errstate(over="ignore", invalid="ignore"):
@@ -227,7 +255,9 @@ def _generalized_force_numpy(model, ctrl):
   with np.errstate(over="ignore", invalid="ignore"):
     force = ctrl * model.gain[None, :]
   for actuator in range(model.nu):
-    group_disabled = bool(model.disableactuator & (1 << model.actuator_group[actuator]))
+    group_disabled = bool(
+        model.disableactuator & (1 << model.actuator_group[actuator])
+    )
     if group_disabled:
       force[:, actuator] = 0
     elif model.force_limited[actuator]:
@@ -237,7 +267,9 @@ def _generalized_force_numpy(model, ctrl):
   result = np.zeros((batch, model.nv), dtype=np.float32)
   with np.errstate(over="ignore", invalid="ignore"):
     for actuator in range(model.nu):
-      result[:, model.dof[actuator]] += model.gear[actuator] * force[:, actuator]
+      result[:, model.dof[actuator]] += (
+          model.gear[actuator] * force[:, actuator]
+      )
   if not np.all(np.isfinite(result)):
     raise ValueError("actuator controls produce nonfinite generalized force")
   return result
@@ -262,7 +294,9 @@ class MetalScalarMotorForce:
     import torch
 
     if not torch.backends.mps.is_available():
-      raise RuntimeError("MetalScalarMotorForce requires an available MPS device")
+      raise RuntimeError(
+          "MetalScalarMotorForce requires an available MPS device"
+      )
     self._torch = torch
     self._device = torch.device("mps")
     self._library = torch.mps.compile_shader(_SHADER.read_text())
@@ -280,8 +314,18 @@ class MetalScalarMotorForce:
             model.nu,
             model.nv,
             self._batch_size,
-            int(bool(model.disableflags & int(mujoco.mjtDisableBit.mjDSBL_ACTUATION))),
-            int(bool(model.disableflags & int(mujoco.mjtDisableBit.mjDSBL_CLAMPCTRL))),
+            int(
+                bool(
+                    model.disableflags
+                    & int(mujoco.mjtDisableBit.mjDSBL_ACTUATION)
+                )
+            ),
+            int(
+                bool(
+                    model.disableflags
+                    & int(mujoco.mjtDisableBit.mjDSBL_CLAMPCTRL)
+                )
+            ),
             model.disableactuator,
         ],
         dtype=torch.int32,
@@ -294,12 +338,14 @@ class MetalScalarMotorForce:
     self._batch_size = _positive_batch(batch_size)
     self._check_capacity(self._batch_size)
     self._workspace = self._torch.empty(
-        (self._batch_size, max(self.model.nv, 1)), dtype=self._torch.float32,
+        (self._batch_size, max(self.model.nv, 1)),
+        dtype=self._torch.float32,
         device=self._device,
     )
     self._empty_ctrl = (
         self._torch.empty((1,), dtype=self._torch.float32, device=self._device)
-        if self.model.nu == 0 else None
+        if self.model.nu == 0
+        else None
     )
     self._dims[2] = self._batch_size
 
@@ -313,7 +359,9 @@ class MetalScalarMotorForce:
     array = np.asarray(value, dtype=numpy_dtype)
     if array.size == 0:
       array = np.zeros((1,), dtype=array.dtype)
-    return self._torch.from_numpy(np.ascontiguousarray(array.copy())).to(self._device)
+    return self._torch.from_numpy(np.ascontiguousarray(array.copy())).to(
+        self._device
+    )
 
   def run_device(self, ctrl):
     """Compute ``qfrc_actuator = moment.T @ actuator_force`` on MPS."""
@@ -325,10 +373,7 @@ class MetalScalarMotorForce:
       raise ValueError(
           f"ctrl must have shape (batch, {self.model.nu}) with batch > 0"
       )
-    if (
-        ctrl.dtype != torch.float32
-        or not ctrl.is_contiguous()
-    ):
+    if ctrl.dtype != torch.float32 or not ctrl.is_contiguous():
       raise ValueError("ctrl must be contiguous float32")
     if batch != self._batch_size:
       raise ValueError("call prepare_workspace(batch_size) before this batch")
@@ -337,18 +382,28 @@ class MetalScalarMotorForce:
     self._check_capacity(batch)
     device_ctrl = self._empty_ctrl if self.model.nu == 0 else ctrl.reshape(-1)
     self._kernel(
-        device_ctrl, self._dof, self._gear, self._gain,
-        self._ctrl_limited, self._ctrl_range.reshape(-1),
-        self._force_limited, self._force_range.reshape(-1), self._groups,
-        self._dims, self._workspace.reshape(-1),
-        threads=(batch,), group_size=(1,),
+        device_ctrl,
+        self._dof,
+        self._gear,
+        self._gain,
+        self._ctrl_limited,
+        self._ctrl_range.reshape(-1),
+        self._force_limited,
+        self._force_range.reshape(-1),
+        self._groups,
+        self._dims,
+        self._workspace.reshape(-1),
+        threads=(batch,),
+        group_size=(1,),
     )
-    return self._workspace[:, :self.model.nv]
+    return self._workspace[:, : self.model.nv]
 
 
 def _positive_batch(value):
-  if isinstance(value, (bool, np.bool_)) or not isinstance(
-      value, (int, np.integer)
-  ) or value <= 0:
+  if (
+      isinstance(value, (bool, np.bool_))
+      or not isinstance(value, (int, np.integer))
+      or value <= 0
+  ):
     raise ValueError("batch_size must be a positive integer")
   return int(value)
