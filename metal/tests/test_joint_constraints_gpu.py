@@ -25,10 +25,12 @@ def _gpu_case(model, states, eq_active=None):
   batch = len(states)
   program = JointConstraintProgram(model, batch)
   masses, smooth, positions, velocities, expected_force, expected_acc = [], [], [], [], [], []
-  for pos, vel in states:
+  for world, (pos, vel) in enumerate(states):
     data = mujoco.MjData(model)
     data.qpos[:] = pos
     data.qvel[:] = vel
+    if eq_active is not None:
+      data.eq_active[:] = np.asarray(eq_active[world], dtype=np.uint8)
     mujoco.mj_forward(model, data)
     mass = np.empty((model.nv, model.nv), dtype=np.float64)
     mujoco.mj_fullM(model, data, mass)

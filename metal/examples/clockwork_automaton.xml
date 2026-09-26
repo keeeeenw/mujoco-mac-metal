@@ -1,0 +1,56 @@
+<!-- Copyright 2026 The MuJoCo Metal contributors; Apache-2.0. -->
+<mujoco model="clockwork_automaton">
+  <compiler angle="radian" inertiafromgeom="true"/>
+  <option timestep=".002" integrator="Euler" gravity="0 0 -9.81">
+    <flag contact="disable"/>
+  </option>
+  <visual>
+    <global offwidth="1280" offheight="760"/>
+    <headlight ambient=".65 .65 .65" diffuse=".85 .85 .85" specular=".25 .25 .25"/>
+  </visual>
+  <default>
+    <geom contype="0" conaffinity="0" density="450"/>
+  </default>
+  <worldbody>
+    <light pos="0 -1 3" dir="0 0 -1" diffuse="1 .95 .82"/>
+    <geom name="plinth" type="box" pos="0 0 .14" size=".83 .48 .14" rgba=".12 .17 .24 1"/>
+    <geom name="backplate" type="box" pos="0 0 .72" size=".8 .065 .62" rgba=".15 .21 .27 1"/>
+    <body name="drive_wheel" pos="-.35 -.10 .88">
+      <joint name="drive" type="hinge" axis="0 0 1" limited="true" range="-2.1 2.1" frictionloss=".025"/>
+      <geom name="drive_disk" type="cylinder" size=".29 .055" rgba=".95 .36 .12 1"/>
+      <geom type="cylinder" size=".105 .075" pos="0 0 .012" rgba=".98 .72 .25 1"/>
+      <replicate count="12" euler="0 0 30">
+        <geom name="drive_tooth" type="box" pos=".315 0 0" size=".045 .045 .055" rgba="1 .57 .18 1"/>
+        <geom type="capsule" fromto=".08 0 .06 .245 0 .06" size=".018" rgba="1 .82 .46 1"/>
+      </replicate>
+    </body>
+    <body name="follower_wheel" pos=".35 -.10 .88">
+      <joint name="follower" type="hinge" axis="0 0 1" limited="true" range="-2.1 2.1" frictionloss=".025"/>
+      <geom name="follower_disk" type="cylinder" size=".29 .055" rgba=".06 .63 .73 1"/>
+      <geom type="cylinder" size=".105 .075" pos="0 0 .012" rgba=".42 .91 .83 1"/>
+      <replicate count="12" euler="0 0 30">
+        <geom name="follower_tooth" type="box" pos=".315 0 0" size=".045 .045 .055" rgba=".11 .83 .84 1"/>
+        <geom type="capsule" fromto=".08 0 .06 .245 0 .06" size=".018" rgba=".65 .98 .9 1"/>
+      </replicate>
+    </body>
+    <body name="escapement_pawl" pos="0 .30 .76">
+      <joint name="pawl_slide" type="slide" axis="0 1 0" limited="true" range="-.11 .11" frictionloss=".12" margin=".012"/>
+      <geom name="pawl_guide" type="box" pos="0 0 0" size=".38 .035 .045" rgba=".34 .42 .49 1"/>
+      <geom name="pawl_tip" type="capsule" fromto="0 0 0 0 -.34 -.05" size=".04" rgba=".96 .77 .20 1"/>
+      <geom type="sphere" pos="0 -.36 -.05" size=".075" rgba="1 .88 .38 1"/>
+    </body>
+    <body name="balance_pendulum" pos="0 -.43 .56">
+      <joint name="pendulum" type="hinge" axis="1 0 0" damping=".025"/>
+      <geom type="cylinder" fromto="0 0 0 0 .38 -.02" size=".018" rgba=".81 .85 .89 1"/>
+      <geom type="ellipsoid" pos="0 .39 -.02" size=".09 .12 .075" rgba=".81 .85 .89 1"/>
+      <geom type="sphere" pos="0 .39 -.02" size=".12" rgba=".28 .35 .42 .28"/>
+    </body>
+    <site name="drive_marker" pos="-.35 -.10 .99" size=".025" rgba="1 1 .8 1"/>
+  </worldbody>
+  <equality>
+    <joint name="gear_ratio" joint1="drive" joint2="follower" polycoef="0 -1 0 0 0" solref=".025 1" solimp=".9 .98 .001 .5 2"/>
+  </equality>
+  <actuator>
+    <motor name="winder" joint="drive" gear="1" ctrllimited="true" ctrlrange="-.16 .16"/>
+  </actuator>
+</mujoco>
