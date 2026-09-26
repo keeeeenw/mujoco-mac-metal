@@ -1,14 +1,13 @@
 # Install mujoco-mac-metal
 
-The `mujoco-mac-metal` 0.3.0 release is not published on PyPI yet. Until it is
-uploaded, install the current source from GitHub in a fresh Python 3.12
-environment on an Apple Silicon Mac:
+The experimental [0.3.0 release](https://pypi.org/project/mujoco-mac-metal/0.3.0/)
+is available on PyPI. Use a fresh Python 3.12 environment on an Apple Silicon Mac:
 
 ```sh
 python3.12 -m venv .venv-metal
 source .venv-metal/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "mujoco-mac-metal[metal] @ git+https://github.com/keeeeenw/mujoco-mac-metal.git@main#subdirectory=metal"
+python -m pip install mujoco-mac-metal
 ```
 
 On macOS arm64, the default dependencies include PyTorch 2.9.1. The `metal`
@@ -36,11 +35,10 @@ it does not qualify every model or MuJoCo feature.
 
 ## PyPI release
 
-Version 0.3.0 is prepared as the `mujoco-mac-metal` distribution, but remains
-unpublished until the owner uploads it. To publish, configure PyPI Trusted
-Publishing for GitHub owner `keeeeenw`, repository `mujoco-mac-metal`, workflow
-`publish-metal.yml`, and GitHub Actions environment `pypi`. Then run the
-repository's **Publish Metal package to PyPI** workflow manually with
+Version 0.3.0 was published with PyPI Trusted Publishing. The publisher uses
+GitHub owner `keeeeenw`, repository `mujoco-mac-metal`, workflow
+`publish-metal.yml`, and GitHub Actions environment `pypi`. For a new version, update the package and module versions, qualify the
+built wheel on a supported Mac, then run the repository's **Publish Metal package to PyPI** workflow manually with
 `workflow_dispatch`. It builds only the distribution under `metal/` and uses
 GitHub Actions OIDC; no PyPI token is needed.
 

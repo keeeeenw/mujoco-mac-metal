@@ -84,8 +84,8 @@ stricter motor-profile validation. This distinction prevents unsupported inertia
 terms from silently disappearing.
 
 Try the [spacecraft force-control demo](examples/space_docking.md), or use the
-[installation and diagnostic guide](INSTALL.md) for repository-based pip install
-and `mujoco-metal doctor --gpu`. No PyPI release is available yet.
+[installation and diagnostic guide](INSTALL.md) for `pip install mujoco-mac-metal`
+and `mujoco-metal doctor --gpu`. The experimental 0.3.0 release is on PyPI.
 
 ## Achievements and measured scaling
 

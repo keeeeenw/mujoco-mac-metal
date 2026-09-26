@@ -50,14 +50,14 @@ explain the measurement boundaries.
 
 ## Install and check
 
-In an isolated Python 3.12 environment, install directly from this repository:
+In an isolated Python 3.12 environment, install the experimental release from PyPI:
 
 ```sh
-python -m pip install "mujoco-mac-metal[metal] @ git+https://github.com/keeeeenw/mujoco-mac-metal.git@main#subdirectory=metal"
+python -m pip install mujoco-mac-metal
 PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal doctor --gpu
 ```
 
-The proposed `pip install mujoco-mac-metal` release is not on PyPI yet.
+[Version 0.3.0 is available on PyPI](https://pypi.org/project/mujoco-mac-metal/0.3.0/).
 See [installation and diagnostics](metal/INSTALL.md) for requirements and status.
 
 ## Try the Mac demos
