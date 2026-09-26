@@ -74,6 +74,27 @@ def test_disable_bits_and_raw_qpos_reference_are_respected():
   np.testing.assert_array_equal(tangent, np.zeros((1, model.nv, model.nv)))
 
 
+def test_polynomial_spring_and_damper_match_mujoco_tangent():
+  model = mujoco.MjModel.from_xml_string(_xml())
+  model.tendon_stiffnesspoly[0] = [.3, .2]
+  model.tendon_dampingpoly[0] = [.1, .15]
+  stage = FixedTendonModel(model)
+  qpos = np.array([[.27, .31]])
+  qvel = np.array([[.5, -.2]])
+  force, tangent, _ = stage.run(qpos, qvel)
+  data = _oracle(model, qpos[0], qvel[0])
+  np.testing.assert_allclose(force[0], data.qfrc_passive, rtol=3e-8, atol=3e-8)
+  eps = 1e-6
+  columns = []
+  for axis in range(model.nv):
+    plus, minus = qvel[0].copy(), qvel[0].copy()
+    plus[axis] += eps
+    minus[axis] -= eps
+    columns.append(-(_oracle(model, qpos[0], plus).qfrc_passive -
+                     _oracle(model, qpos[0], minus).qfrc_passive) / (2 * eps))
+  np.testing.assert_allclose(tangent[0], np.column_stack(columns), rtol=3e-8, atol=3e-8)
+
+
 def test_spatial_tendons_are_rejected():
   xml = _xml().replace('</worldbody>',
       '<site name="a" pos="0 0 0"/><site name="b" pos=".1 0 0"/></worldbody>')
