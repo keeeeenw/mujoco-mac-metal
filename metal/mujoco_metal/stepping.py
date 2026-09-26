@@ -106,13 +106,13 @@ def validate_stepping_profile(
         descriptor_fingerprint=_fingerprint(load_model(model)),
         implicit_euler_damping=False,
         supported=base.supported
-        + ("bounded non-free-joint implicitfast velocity solve",),
+        + (
+            "bounded implicitfast velocity solve and eligible free-body midpoint",
+        ),
         rejected=tuple(
             item for item in base.rejected if item != "non-Euler integrators"
         )
-        + (
-            "free-joint midpoint integration, full implicit integrator, nonconstant velocity derivatives",
-        ),
+        + ("full implicit integrator, nonconstant velocity derivatives",),
     )
   if profile in ("normal_contact_euler_v1", "friction_contact_euler_v1"):
     from mujoco_metal.contact import lower_contacts

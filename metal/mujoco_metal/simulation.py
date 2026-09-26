@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""All-device contact-free semi-implicit Euler simulation orchestration."""
+"""All-device orchestration for explicitly validated native physics profiles."""
 
 import numbers
 
@@ -33,7 +33,7 @@ from mujoco_metal.stepping import validate_stepping_profile
 
 
 class MetalSimulation:
-  """Batched native MPS stepping for explicit contact-free Euler profiles.
+  """Batched native MPS stepping for bounded, explicitly selected profiles.
 
   The default ``contact_free_euler_v1`` profile uses native smooth dynamics,
   a dense SPD solve and semi-implicit Euler with no applied forces. The opt-in
@@ -207,10 +207,16 @@ class MetalSimulation:
       self._contact = MetalContact(model, batch_size)
     self._solver = MetalDenseSolve(descriptor.nv, batch_size)
     self._implicitfast = None
+    self._midpoint = None
     if profile.name == "contact_free_implicitfast_v1":
       from mujoco_metal.implicit import ImplicitFastProgram
 
       self._implicitfast = ImplicitFastProgram(model, batch_size)
+      from mujoco_metal.implicit_midpoint import FreeBodyMidpointProgram
+      from mujoco_metal.implicit_midpoint import lower_free_body_midpoints
+
+      if lower_free_body_midpoints(model).nfree:
+        self._midpoint = FreeBodyMidpointProgram(model, batch_size)
     self._euler_solver = (
         MetalDenseSolve(descriptor.nv, batch_size)
         if profile.implicit_euler_damping
@@ -464,13 +470,13 @@ class MetalSimulation:
     return acceleration, status, dynamics
 
   def step(self, steps=1, *, qfrc_applied=None, ctrl=None, xfrc_applied=None):
-    """Advance all worlds by a positive number of native contact-free steps.
+    """Advance all worlds by a positive number of native profile steps.
 
     ``qfrc_applied`` and ``ctrl`` are optional per-call host arrays or
     contiguous float32 MPS tensors with shapes ``[batch_size, nv]`` and
     ``[batch_size, nu]``. Each supplied input is held constant for all steps in
-    this call; omitting one supplies zeros. Controls require the scalar motor
-    profile. Host arrays are validated and copied before device stepping;
+    this call; omitting one supplies zeros. Controls require a profile supporting the model
+    actuator family. Host arrays are validated and copied before device stepping;
     MPS tensors stay on device and nonfinite rows fail independently.
 
     The fixed workspace is reused. Failed worlds retain their previous state
@@ -508,6 +514,7 @@ class MetalSimulation:
           state._qpos, state._qvel
       )
       integration_acceleration = acceleration
+      next_velocity = position_velocity = None
       if self._implicitfast is not None:
         implicit = self._implicitfast.run_device(
             dynamics["mass_matrix"], self._rhs
@@ -515,6 +522,20 @@ class MetalSimulation:
         integration_acceleration = implicit["qacc"]
         solve_status = torch.where(
             solve_status == 0, implicit["status"], solve_status
+        )
+      if self._midpoint is not None:
+        midpoint = self._midpoint.run_device(
+            state._qvel,
+            integration_acceleration,
+            acceleration,
+            self._rhs + dynamics["qfrc_bias"],
+            dynamics["poses"]["body_quat"],
+        )
+        next_velocity = midpoint["qvel_next"]
+        position_velocity = midpoint["position_velocity"]
+        acceleration = midpoint["qacc"]
+        solve_status = torch.where(
+            solve_status == 0, midpoint["status"], solve_status
         )
       if self._euler_solver is not None:
         self._effective_mass.copy_(dynamics["mass_matrix"])
@@ -543,6 +564,8 @@ class MetalSimulation:
           integration_acceleration,
           state._time,
           self._combined_status,
+          next_velocity=next_velocity,
+          position_velocity=position_velocity,
       )
       torch.eq(status, 0, out=self._success)
       torch.where(
