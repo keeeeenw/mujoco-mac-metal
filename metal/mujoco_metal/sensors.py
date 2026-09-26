@@ -40,6 +40,13 @@ _SUPPORTED = {
 _POS = int(mujoco.mjtStage.mjSTAGE_POS)
 _VEL = int(mujoco.mjtStage.mjSTAGE_VEL)
 _DISABLE_SENSOR = int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
+_KERNEL_METADATA = (
+    "sensor_type", "sensor_datatype", "sensor_needstage", "sensor_objtype",
+    "sensor_objid", "sensor_reftype", "sensor_refid", "sensor_dim",
+    "sensor_adr", "sensor_cutoff", "jnt_qposadr", "jnt_dofadr",
+    "body_rootid", "geom_bodyid", "site_bodyid",
+)
+_KERNEL_FIXED_BUFFER_COUNT = 16
 
 
 @dataclass(frozen=True)
@@ -189,6 +196,8 @@ def lower_sensors(model) -> SensorDescriptor:
       sid = int(arrays["sensor_objid"][i])
       if int(arrays["sensor_objtype"][i]) != int(mujoco.mjtObj.mjOBJ_SITE) or not 0 <= sid < nsite:
         raise ValueError(f"sensor {i}: gyro and velocimeter require a site")
+      if dim != 3:
+        raise ValueError(f"sensor {i}: gyro and velocimeter require dimension 3")
     if int(arrays["sensor_datatype"][i]) in (int(mujoco.mjtDataType.mjDATATYPE_AXIS), int(mujoco.mjtDataType.mjDATATYPE_QUATERNION)) and float(arrays["sensor_cutoff"][i]) > 0:
       # MuJoCo cutoff is ignored for these normalized data types.
       pass
@@ -266,12 +275,10 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
           if refid > -1:
             ref_type = int(desc.sensor_reftype[i])
             ref_pos, ref_quat = _frame_pose(desc, poses, w, ref_type, refid)
-            ref_body = _object_body(desc, ref_type, refid)
             ref_vel = _object_velocity(desc, poses, w, ref_type, refid, ref_pos)
-            relative = np.concatenate((obj_vel[:3] - ref_vel[:3], obj_vel[3:] - ref_vel[3:] - np.cross(obj_pos-ref_pos, ref_vel[:3])))
+            relative = np.concatenate((obj_vel[:3] - ref_vel[:3], obj_vel[3:] - ref_vel[3:] + np.cross(obj_pos-ref_pos, ref_vel[:3])))
             relative[:3] = _quat_rot(np.array([ref_quat[0], *(-ref_quat[1:])]), relative[:3])
             relative[3:] = _quat_rot(np.array([ref_quat[0], *(-ref_quat[1:])]), relative[3:])
-            del ref_body
             obj_vel = relative
           value = obj_vel[3:] if typ == int(mujoco.mjtSensor.mjSENS_FRAMELINVEL) else obj_vel[:3]
       elif typ == int(mujoco.mjtSensor.mjSENS_CLOCK):
@@ -322,8 +329,8 @@ def _object_body(desc, objtype, objid):
 def _object_velocity(desc, poses, world, objtype, objid, pos):
   body = _object_body(desc, objtype, objid)
   root = int(desc.body_rootid[body])
-  cvel = np.asarray(poses["cvel"])[world, body]
-  root_com = np.asarray(poses["root_com"])[world, root]
+  cvel = np.asarray(poses["cvel"]).reshape(-1, desc.nbody, 6)[world, body]
+  root_com = np.asarray(poses["root_com"]).reshape(-1, desc.nbody, 3)[world, root]
   return np.concatenate((cvel[:3], cvel[3:] + np.cross(cvel[:3], pos-root_com)))
 
 
@@ -348,12 +355,18 @@ class SensorProgram:
     self._kernel = self._library.evaluate_sensors
     d = self.descriptor
     self._meta = {}
-    for name in ("sensor_type", "sensor_datatype", "sensor_needstage", "sensor_objtype", "sensor_objid", "sensor_reftype", "sensor_refid", "sensor_dim", "sensor_adr", "sensor_cutoff", "jnt_type", "jnt_qposadr", "jnt_dofadr", "body_iquat", "geom_bodyid", "geom_pos", "geom_quat", "site_bodyid", "site_pos", "site_quat"):
+    for name in ("sensor_type", "sensor_datatype", "sensor_needstage", "sensor_objtype", "sensor_objid", "sensor_reftype", "sensor_refid", "sensor_dim", "sensor_adr", "sensor_cutoff", "jnt_type", "jnt_qposadr", "jnt_dofadr", "body_iquat", "body_rootid", "geom_bodyid", "geom_pos", "geom_quat", "site_bodyid", "site_pos", "site_quat"):
       arr = getattr(d, name)
       self._meta[name] = torch.as_tensor(np.array(arr, copy=True), device=self._device)
     self._dims = torch.tensor([d.nsensor, d.nsensordata, d.nq, d.nv, d.njnt, d.nbody, d.ngeom, d.nsite, batch_size, d.disableflags], dtype=torch.int32, device=self._device)
     self._stage_mask = torch.zeros(1, dtype=torch.int32, device=self._device)
     self._output = torch.zeros((batch_size, d.nsensordata), dtype=torch.float32, device=self._device)
+    self._needs_velocity = bool(np.any(np.isin(d.sensor_type, [
+        int(mujoco.mjtSensor.mjSENS_FRAMELINVEL),
+        int(mujoco.mjtSensor.mjSENS_FRAMEANGVEL),
+        int(mujoco.mjtSensor.mjSENS_GYRO),
+        int(mujoco.mjtSensor.mjSENS_VELOCIMETER),
+    ])))
 
   def run_device(self, qpos, qvel, time, poses, *, stages=(_POS, _VEL), sensordata=None):
     """Update selected sensor stages and return borrowed device sensordata.
@@ -386,6 +399,15 @@ class SensorProgram:
         raise ValueError(f"poses must contain MPS {key}")
       if tuple(poses[key].shape) != shape or poses[key].dtype != torch.float32 or not poses[key].is_contiguous():
         raise ValueError(f"poses[{key!r}] must be contiguous float32 with shape {shape}")
+    cvel = root_com = None
+    if self._needs_velocity:
+      for key, size in (("cvel", self.batch_size * d.nbody * 6), ("root_com", self.batch_size * d.nbody * 3)):
+        if key not in poses or poses[key].device.type != "mps" or poses[key].dtype != torch.float32 or not poses[key].is_contiguous() or poses[key].numel() != size:
+          raise ValueError(f"velocity sensors require contiguous float32 MPS poses[{key!r}] with {size} values")
+      cvel, root_com = poses["cvel"].reshape(-1), poses["root_com"].reshape(-1)
+    else:
+      cvel = torch.zeros(1, dtype=torch.float32, device=self._device)
+      root_com = cvel
     base = self._output if sensordata is None else sensordata
     if base.device.type != "mps" or tuple(base.shape) != (self.batch_size, d.nsensordata) or base.dtype != torch.float32 or not base.is_contiguous():
       raise ValueError("sensordata must be an MPS tensor matching model output")
@@ -398,5 +420,5 @@ class SensorProgram:
     if stage_mask < 0 or stage_mask > np.iinfo(np.int32).max:
       raise ValueError("invalid sensor stage mask")
     self._stage_mask.fill_(stage_mask)
-    self._kernel(qpos, qvel, time, poses["body_pos"], poses["body_quat"], poses["inertial_pos"], poses["inertial_quat"], poses["geom_pos"], poses["geom_quat"], poses["site_pos"], poses["site_quat"], *(self._meta[n] for n in ("sensor_type", "sensor_datatype", "sensor_needstage", "sensor_objtype", "sensor_objid", "sensor_reftype", "sensor_refid", "sensor_dim", "sensor_adr", "sensor_cutoff", "jnt_qposadr", "jnt_dofadr")), self._dims, self._output, self._stage_mask, threads=(self.batch_size * max(d.nsensor, 1),), group_size=(1,))
+    self._kernel(qpos, qvel, time, poses["body_pos"], poses["body_quat"], poses["inertial_pos"], poses["inertial_quat"], poses["geom_pos"], poses["geom_quat"], poses["site_pos"], poses["site_quat"], cvel, root_com, *(self._meta[n] for n in _KERNEL_METADATA), self._dims, self._output, self._stage_mask, threads=(self.batch_size * max(d.nsensor, 1),), group_size=(1,))
     return self._output

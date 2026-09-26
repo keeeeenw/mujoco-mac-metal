@@ -9,6 +9,8 @@
 """CPU oracle and opt-in device checks for the bounded sensor stage."""
 
 import os
+from pathlib import Path
+import re
 
 import mujoco
 import numpy as np
@@ -18,6 +20,8 @@ from mujoco_metal.model import load_model
 from mujoco_metal.sensors import SensorProgram
 from mujoco_metal.sensors import lower_sensors
 from mujoco_metal.sensors import sensor_oracle
+from mujoco_metal.sensors import _KERNEL_FIXED_BUFFER_COUNT
+from mujoco_metal.sensors import _KERNEL_METADATA
 
 _XML = """<mujoco><worldbody>
   <body name="hinge" pos=".2 .1 .3"><joint name="h" type="hinge" axis="0 0 1"/>
@@ -36,6 +40,9 @@ _XML = """<mujoco><worldbody>
   <framexaxis objtype="site" objname="s" reftype="site" refname="r"/>
   <frameyaxis objtype="site" objname="s"/>
   <framezaxis objtype="geom" objname="g"/>
+  <framelinvel objtype="site" objname="s" reftype="site" refname="r"/>
+  <frameangvel objtype="site" objname="s"/>
+  <gyro site="s"/><velocimeter site="s"/>
   <clock/>
 </sensor></mujoco>"""
 
@@ -57,7 +64,7 @@ def test_sensor_cpu_oracle_matches_mujoco_310_for_pose_and_velocity_families():
   model = mujoco.MjModel.from_xml_string(_XML)
   descriptor = load_model(model)
   qpos, qvel, times = _input_batch(model, descriptor)
-  poses = {key: [] for key in ("body_pos", "body_quat", "geom_pos", "geom_quat", "site_pos", "site_quat", "inertial_pos", "inertial_quat")}
+  poses = {key: [] for key in ("body_pos", "body_quat", "geom_pos", "geom_quat", "site_pos", "site_quat", "inertial_pos", "inertial_quat", "cvel", "root_com")}
   expected = []
   for world in range(len(qpos)):
     data = mujoco.MjData(model)
@@ -67,8 +74,10 @@ def test_sensor_cpu_oracle_matches_mujoco_310_for_pose_and_velocity_families():
     mujoco.mj_forward(model, data)
     expected.append(data.sensordata.copy())
     fk = descriptor.forward_kinematics(qpos[world])
-    for key in poses:
+    for key in ("body_pos", "body_quat", "geom_pos", "geom_quat", "site_pos", "site_quat", "inertial_pos", "inertial_quat"):
       poses[key].append(fk[key])
+    poses["cvel"].append(data.cvel.copy())
+    poses["root_com"].append(data.subtree_com.copy())
   poses = {key: np.asarray(value) for key, value in poses.items()}
   actual = sensor_oracle(model, qpos, qvel, times, poses)
   # Descriptor constants intentionally match the backend's float32 device ABI.
@@ -81,6 +90,8 @@ def test_sensor_stage_filter_preserves_prior_other_stage_and_disable_is_noop():
   qpos, qvel, times = _input_batch(model, descriptor, batch=1)
   times = times[:1]
   poses = {key: np.asarray([value]) for key, value in descriptor.forward_kinematics(qpos[0]).items() if key in ("body_pos", "body_quat", "geom_pos", "geom_quat", "site_pos", "site_quat", "inertial_pos", "inertial_quat")}
+  poses["cvel"] = np.zeros((1, model.nbody, 6))
+  poses["root_com"] = np.zeros((1, model.nbody, 3))
   initial = np.full((1, model.nsensordata), 17.0)
   pos = sensor_oracle(model, qpos, qvel, times, poses, initial, stages=(int(mujoco.mjtStage.mjSTAGE_POS),))
   vel_cols = np.concatenate([np.arange(a, a+d) for a, d, stage in zip(model.sensor_adr, model.sensor_dim, model.sensor_needstage) if stage == int(mujoco.mjtStage.mjSTAGE_VEL)])
@@ -97,6 +108,23 @@ def test_sensor_lowering_rejects_acceleration_sensor_and_stateful_delay():
   delayed = mujoco.MjModel.from_xml_string("""<mujoco><worldbody><body><joint name="j"/><geom type="sphere" size=".1" mass="1"/></body></worldbody><sensor><jointpos joint="j" delay=".01" nsample="2"/></sensor></mujoco>""")
   with pytest.raises(ValueError, match="delay, interval, noise, and history"):
     lower_sensors(delayed)
+
+
+def test_sensor_shader_buffer_abi_is_contiguous_and_matches_host_arguments():
+  source = Path(__file__).parents[1].joinpath(
+      "mujoco_metal", "shaders", "sensors.metal"
+  ).read_text()
+  indices = [int(x) for x in re.findall(r"\[\[buffer\((\d+)\)\]\]", source)]
+  assert indices == list(range(len(indices)))
+  assert len(indices) == _KERNEL_FIXED_BUFFER_COUNT + len(_KERNEL_METADATA)
+
+
+def test_sensor_oracle_accepts_empty_world_without_sensor_buffers():
+  model = mujoco.MjModel.from_xml_string("<mujoco><worldbody/></mujoco>")
+  actual = sensor_oracle(
+      model, np.zeros((1, 0)), np.zeros((1, 0)), np.zeros(1), {}
+  )
+  assert actual.shape == (1, 0)
 
 
 @pytest.mark.gpu
@@ -118,8 +146,9 @@ def test_device_sensor_output_matches_mujoco_forward():
   qpos_t = torch.as_tensor(qpos, dtype=torch.float32, device="mps")
   qvel_t = torch.as_tensor(qvel, dtype=torch.float32, device="mps")
   time_t = torch.as_tensor(times, dtype=torch.float32, device="mps")
-  output = sensor.run_device(qpos_t, qvel_t, time_t, poses)
   expected = []
+  cvel = []
+  root_com = []
   for row in range(batch):
     data = mujoco.MjData(model)
     data.qpos[:] = qpos[row]
@@ -127,4 +156,9 @@ def test_device_sensor_output_matches_mujoco_forward():
     data.time = times[row]
     mujoco.mj_forward(model, data)
     expected.append(data.sensordata.copy())
+    cvel.append(data.cvel.copy())
+    root_com.append(data.subtree_com.copy())
+  poses["cvel"] = torch.as_tensor(np.asarray(cvel), dtype=torch.float32, device="mps")
+  poses["root_com"] = torch.as_tensor(np.asarray(root_com), dtype=torch.float32, device="mps")
+  output = sensor.run_device(qpos_t, qvel_t, time_t, poses)
   np.testing.assert_allclose(output.cpu().numpy(), expected, rtol=3e-5, atol=3e-6)

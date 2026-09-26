@@ -1,0 +1,55 @@
+<mujoco model="sensor scan rig">
+  <option timestep="0.002" gravity="0 0 0">
+    <flag contact="disable" energy="disable"/>
+  </option>
+  <visual>
+    <global offwidth="1200" offheight="720"/>
+    <rgba haze="0.04 0.08 0.13 1"/>
+    <quality shadowsize="2048"/>
+  </visual>
+  <worldbody>
+    <light pos="0 -3 5" dir="0 0 -1" diffuse=".9 .95 1"/>
+    <light pos="3 2 3" dir="-1 -1 -1" diffuse=".45 .72 1"/>
+    <geom name="floor" type="plane" size="4 4 .1" rgba=".055 .085 .12 1"/>
+
+    <body name="target" pos="2.1 .25 .8">
+      <geom type="cylinder" size=".055 .58" rgba=".11 .31 .42 1"/>
+      <geom type="sphere" size=".15" pos="0 0 .57" rgba=".2 .92 .85 1"/>
+      <site name="target_frame" pos="0 0 .57" size=".045" rgba=".2 1 .9 1"/>
+    </body>
+
+    <body name="pedestal" pos="0 0 .05">
+      <geom type="cylinder" size=".24 .07" rgba=".15 .24 .34 1"/>
+      <body name="pan" pos="0 0 .18">
+        <joint name="pan_joint" type="hinge" axis="0 0 1" damping=".025"/>
+        <geom type="cylinder" size=".075 .16" pos="0 0 .14" rgba=".22 .54 .83 1"/>
+        <geom type="box" size=".34 .045 .045" pos=".24 0 .22" rgba=".16 .4 .68 1"/>
+        <body name="tilt" pos=".48 0 .22">
+          <joint name="tilt_joint" type="hinge" axis="0 1 0" damping=".018"/>
+          <geom type="capsule" fromto="0 -.12 0 0 .12 0" size=".055" rgba=".32 .69 .96 1"/>
+          <geom type="cylinder" size=".11 .045" euler="0 90 0" pos=".11 0 0" rgba=".11 .83 .91 1"/>
+          <site name="scanner_frame" pos=".24 0 0" quat=".7071068 0 .7071068 0" size=".055" rgba="1 .64 .12 1"/>
+          <geom type="capsule" fromto=".24 0 0 .7 0 0" size=".018" rgba="1 .47 .08 .75"/>
+        </body>
+      </body>
+    </body>
+
+    <body name="marker_a" pos="1.2 .8 .03"><geom type="sphere" size=".05" rgba=".98 .55 .18 1"/></body>
+    <body name="marker_b" pos="2.9 -.55 .03"><geom type="sphere" size=".05" rgba=".62 .42 .98 1"/></body>
+  </worldbody>
+  <actuator>
+    <motor name="pan_drive" joint="pan_joint" gear=".35" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="tilt_drive" joint="tilt_joint" gear=".22" ctrllimited="true" ctrlrange="-1 1"/>
+  </actuator>
+  <sensor>
+    <jointpos name="pan_angle" joint="pan_joint"/>
+    <jointpos name="tilt_angle" joint="tilt_joint"/>
+    <framepos name="tip_position" objtype="site" objname="scanner_frame" reftype="site" refname="target_frame"/>
+    <framequat name="tip_orientation" objtype="site" objname="scanner_frame" reftype="site" refname="target_frame"/>
+    <framezaxis name="tip_forward" objtype="site" objname="scanner_frame"/>
+    <gyro name="tip_gyro" site="scanner_frame"/>
+    <velocimeter name="tip_velocity" site="scanner_frame"/>
+    <framelinvel name="tip_relative_velocity" objtype="site" objname="scanner_frame" reftype="site" refname="target_frame"/>
+    <clock name="elapsed"/>
+  </sensor>
+</mujoco>

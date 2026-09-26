@@ -58,6 +58,27 @@ inline void frame_pose(int type, int id, uint world, constant int* dims,
   }
 }
 
+inline int object_body(int type, int id,
+    device const int* geom_bodyid, device const int* site_bodyid) {
+  if (type == 1 || type == 2) return id;
+  if (type == 5) return geom_bodyid[id];
+  return site_bodyid[id];
+}
+
+inline void object_velocity(int type, int id, uint world, float3 pos,
+    constant int* dims, device const float* cvel,
+    device const float* root_com, device const int* body_rootid,
+    device const int* geom_bodyid, device const int* site_bodyid,
+    thread float3& angular, thread float3& linear) {
+  int body = object_body(type, id, geom_bodyid, site_bodyid);
+  int root = body_rootid[body];
+  uint nb = uint(dims[5]);
+  uint cv = (world*nb+uint(body))*6;
+  uint rc = (world*nb+uint(root))*3;
+  angular = read3(cvel, cv);
+  linear = read3(cvel, cv+3) + cross(angular, pos-read3(root_com, rc));
+}
+
 kernel void evaluate_sensors(
     device const float* qpos [[buffer(0)]],
     device const float* qvel [[buffer(1)]],
@@ -70,21 +91,26 @@ kernel void evaluate_sensors(
     device const float* geom_world_quat [[buffer(8)]],
     device const float* site_world_pos [[buffer(9)]],
     device const float* site_world_quat [[buffer(10)]],
-    device const int* sensor_type [[buffer(11)]],
-    device const int* sensor_datatype [[buffer(12)]],
-    device const int* sensor_needstage [[buffer(13)]],
-    device const int* sensor_objtype [[buffer(14)]],
-    device const int* sensor_objid [[buffer(15)]],
-    device const int* sensor_reftype [[buffer(16)]],
-    device const int* sensor_refid [[buffer(17)]],
-    device const int* sensor_dim [[buffer(18)]],
-    device const int* sensor_adr [[buffer(19)]],
-    device const float* sensor_cutoff [[buffer(20)]],
-    device const int* jnt_qposadr [[buffer(21)]],
-    device const int* jnt_dofadr [[buffer(22)]],
-    constant int* dims [[buffer(23)]],
-    device float* output [[buffer(24)]],
-    constant int* stage_mask [[buffer(25)]],
+    device const float* cvel [[buffer(11)]],
+    device const float* root_com [[buffer(12)]],
+    device const int* sensor_type [[buffer(13)]],
+    device const int* sensor_datatype [[buffer(14)]],
+    device const int* sensor_needstage [[buffer(15)]],
+    device const int* sensor_objtype [[buffer(16)]],
+    device const int* sensor_objid [[buffer(17)]],
+    device const int* sensor_reftype [[buffer(18)]],
+    device const int* sensor_refid [[buffer(19)]],
+    device const int* sensor_dim [[buffer(20)]],
+    device const int* sensor_adr [[buffer(21)]],
+    device const float* sensor_cutoff [[buffer(22)]],
+    device const int* jnt_qposadr [[buffer(23)]],
+    device const int* jnt_dofadr [[buffer(24)]],
+    device const int* body_rootid [[buffer(25)]],
+    device const int* geom_bodyid [[buffer(26)]],
+    device const int* site_bodyid [[buffer(27)]],
+    constant int* dims [[buffer(28)]],
+    device float* output [[buffer(29)]],
+    constant int* stage_mask [[buffer(30)]],
     uint index [[thread_position_in_grid]]) {
   uint nsensor=uint(dims[0]), ndata=uint(dims[1]), nq=uint(dims[2]);
   uint nv=uint(dims[3]), batch=uint(dims[8]);
@@ -106,6 +132,36 @@ kernel void evaluate_sensors(
   } else if (typ==19) {
     float3 v=read3(qvel,world*nv+da);
     value[0]=v.x; value[1]=v.y; value[2]=v.z;
+  } else if (typ==2 || typ==3 || typ==31 || typ==32) {
+    float3 pos, ref_pos; float4 quat, ref_quat;
+    frame_pose(sensor_objtype[i],sensor_objid[i],world,dims,body_pos,body_quat,
+        inertial_pos,inertial_quat,geom_world_pos,geom_world_quat,
+        site_world_pos,site_world_quat,pos,quat);
+    float3 angular, linear;
+    object_velocity(sensor_objtype[i],sensor_objid[i],world,pos,dims,cvel,
+        root_com,body_rootid,geom_bodyid,site_bodyid,angular,linear);
+    if (typ==2 || typ==3) {
+      angular=qrot(qconj(quat),angular);
+      linear=qrot(qconj(quat),linear);
+      float3 v=typ==3 ? angular : linear;
+      value[0]=v.x; value[1]=v.y; value[2]=v.z;
+    } else {
+      int refid=sensor_refid[i];
+      if (refid>=0) {
+        frame_pose(sensor_reftype[i],refid,world,dims,body_pos,body_quat,
+            inertial_pos,inertial_quat,geom_world_pos,geom_world_quat,
+            site_world_pos,site_world_quat,ref_pos,ref_quat);
+        float3 ref_ang, ref_lin;
+        object_velocity(sensor_reftype[i],refid,world,ref_pos,dims,cvel,
+            root_com,body_rootid,geom_bodyid,site_bodyid,ref_ang,ref_lin);
+        linear=linear-ref_lin+cross(pos-ref_pos,ref_ang);
+        angular=angular-ref_ang;
+        angular=qrot(qconj(ref_quat),angular);
+        linear=qrot(qconj(ref_quat),linear);
+      }
+      float3 v=typ==31 ? linear : angular;
+      value[0]=v.x; value[1]=v.y; value[2]=v.z;
+    }
   } else if (typ==45) value[0]=time[world];
   else {
     float3 pos, rpos; float4 quat, rquat;
