@@ -90,6 +90,30 @@ def validate_stepping_profile(
   separate from ``load_model``: generalized mass and bias queries support a
   broader model set than this stepping profile.
   """
+  if profile == "contact_free_implicitfast_v1":
+    from mujoco_metal.implicit import lower_implicitfast
+
+    lower_implicitfast(model)
+    reference = copy.copy(model)
+    reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
+    base = validate_stepping_profile(
+        reference, timestep, "contact_free_passive_euler_v1"
+    )
+    return replace(
+        base,
+        name=profile,
+        model_fingerprint=_fingerprint(model),
+        descriptor_fingerprint=_fingerprint(load_model(model)),
+        implicit_euler_damping=False,
+        supported=base.supported
+        + ("bounded non-free-joint implicitfast velocity solve",),
+        rejected=tuple(
+            item for item in base.rejected if item != "non-Euler integrators"
+        )
+        + (
+            "free-joint midpoint integration, full implicit integrator, nonconstant velocity derivatives",
+        ),
+    )
   if profile in ("normal_contact_euler_v1", "friction_contact_euler_v1"):
     from mujoco_metal.contact import lower_contacts
 

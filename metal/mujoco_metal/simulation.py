@@ -82,6 +82,7 @@ class MetalSimulation:
             "contact_free_motor_euler_v1",
             "joint_constraints_euler_v1",
             "contact_free_fluid_euler_v1",
+            "contact_free_implicitfast_v1",
             "contact_free_passive_euler_v1",
             "contact_free_sensor_euler_v1",
             "normal_contact_euler_v1",
@@ -165,6 +166,7 @@ class MetalSimulation:
         with_transmissions
         or "joint_constraints" in profile.name
         or "fluid" in profile.name
+        or "implicitfast" in profile.name
         or "passive" in profile.name
         or "sensor" in profile.name
         or profile.name
@@ -204,6 +206,11 @@ class MetalSimulation:
 
       self._contact = MetalContact(model, batch_size)
     self._solver = MetalDenseSolve(descriptor.nv, batch_size)
+    self._implicitfast = None
+    if profile.name == "contact_free_implicitfast_v1":
+      from mujoco_metal.implicit import ImplicitFastProgram
+
+      self._implicitfast = ImplicitFastProgram(model, batch_size)
     self._euler_solver = (
         MetalDenseSolve(descriptor.nv, batch_size)
         if profile.implicit_euler_damping
@@ -228,6 +235,7 @@ class MetalSimulation:
             "contact_free_transmission_euler_v1",
             "joint_constraints_euler_v1",
             "contact_free_fluid_euler_v1",
+            "contact_free_implicitfast_v1",
             "contact_free_passive_euler_v1",
             "contact_free_sensor_euler_v1",
             "normal_contact_euler_v1",
@@ -500,6 +508,14 @@ class MetalSimulation:
           state._qpos, state._qvel
       )
       integration_acceleration = acceleration
+      if self._implicitfast is not None:
+        implicit = self._implicitfast.run_device(
+            dynamics["mass_matrix"], self._rhs
+        )
+        integration_acceleration = implicit["qacc"]
+        solve_status = torch.where(
+            solve_status == 0, implicit["status"], solve_status
+        )
       if self._euler_solver is not None:
         self._effective_mass.copy_(dynamics["mass_matrix"])
         self._effective_mass.diagonal(dim1=1, dim2=2).add_(

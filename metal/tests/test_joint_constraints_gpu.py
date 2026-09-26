@@ -4,7 +4,7 @@ import os
 import mujoco
 import numpy as np
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from mujoco_metal.joint_constraints import JointConstraintProgram
 
