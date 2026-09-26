@@ -1,0 +1,41 @@
+<!-- Copyright 2026 The MuJoCo Metal contributors. Apache-2.0. -->
+<mujoco model="space docking ballet">
+  <compiler angle="radian" inertiafromgeom="true"/>
+  <option timestep=".002" gravity="0 0 0" integrator="Euler">
+    <flag contact="disable" energy="enable"/>
+  </option>
+  <visual>
+    <global offwidth="1500" offheight="600"/>
+    <headlight ambient=".48 .52 .62" diffuse=".72 .76 .84" specular=".20 .22 .28"/>
+  </visual>
+  <default>
+    <geom contype="0" conaffinity="0"/>
+  </default>
+  <worldbody>
+    <light pos="0 -2 6" dir="0 0 -1" diffuse=".8 .8 .8"/>
+    <body name="craft_low" pos="-2.5 0 0">
+      <joint name="free_low" type="free" damping=".08"/>
+      <geom type="box" size=".25 .18 .14" mass="2.5" rgba=".05 .82 1 1"/>
+      <geom type="box" pos="0 0 .23" size=".46 .045 .018" mass=".12" rgba=".05 .82 1 .9"/>
+      <geom type="box" pos="0 0 -.23" size=".46 .045 .018" mass=".12" rgba=".05 .82 1 .9"/>
+      <geom type="capsule" fromto="-.17 0 0 -.30 0 0" size=".055" rgba=".95 .62 .2 1"/>
+      <geom type="cylinder" pos="0 0 .20" size=".065 .02" rgba=".84 .96 1 1"/>
+    </body>
+    <body name="craft_mid" pos="0 0 -.5">
+      <joint name="free_mid" type="free" damping=".65"/>
+      <geom type="box" size=".25 .18 .14" mass="2.5" rgba=".42 1 .22 1"/>
+      <geom type="box" pos="0 0 .23" size=".46 .045 .018" mass=".12" rgba=".42 1 .22 .9"/>
+      <geom type="box" pos="0 0 -.23" size=".46 .045 .018" mass=".12" rgba=".42 1 .22 .9"/>
+      <geom type="capsule" fromto="-.17 0 0 -.30 0 0" size=".055" rgba=".95 .62 .2 1"/>
+      <geom type="cylinder" pos="0 0 .20" size=".065 .02" rgba=".84 .96 1 1"/>
+    </body>
+    <body name="craft_high" pos="2.5 0 .5">
+      <joint name="free_high" type="free" damping="2.4"/>
+      <geom type="box" size=".25 .18 .14" mass="2.5" rgba="1 .22 .52 1"/>
+      <geom type="box" pos="0 0 .23" size=".46 .045 .018" mass=".12" rgba="1 .22 .52 .9"/>
+      <geom type="box" pos="0 0 -.23" size=".46 .045 .018" mass=".12" rgba="1 .22 .52 .9"/>
+      <geom type="capsule" fromto="-.17 0 0 -.30 0 0" size=".055" rgba=".95 .62 .2 1"/>
+      <geom type="cylinder" pos="0 0 .20" size=".065 .02" rgba=".84 .96 1 1"/>
+    </body>
+  </worldbody>
+</mujoco>
