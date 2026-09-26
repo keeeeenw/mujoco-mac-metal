@@ -98,4 +98,4 @@ def test_metal_argument_abi_is_dense_and_matches_host_pack_order():
   from pathlib import Path
   source = Path(__file__).parents[1] / "mujoco_metal" / "shaders" / "joint_constraints.metal"
   indices = [int(x) for x in re.findall(r"\[\[buffer\((\d+)\)\]\]", source.read_text())]
-  assert indices == list(range(30))
+  assert indices == list(range(29))

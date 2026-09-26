@@ -319,7 +319,7 @@ class JointConstraintProgram:
     d = self.descriptor
     self._arrays = {}
     for name in (
-        "joint_type", "joint_qposadr", "qpos0", "joint_dofadr", "joint_limited",
+        "joint_qposadr", "qpos0", "joint_dofadr", "joint_limited",
         "joint_range", "joint_margin", "joint_solref", "joint_solimp",
         "dof_frictionloss", "dof_invweight0", "dof_solref", "dof_solimp",
         "equality_type", "equality_obj1", "equality_obj2", "equality_data",
@@ -366,7 +366,7 @@ class JointConstraintProgram:
       active = eq_active.to(dtype=torch.int32).contiguous()
     args = [mass_matrix.reshape(-1), qfrc_smooth.reshape(-1), qpos.reshape(-1), qvel.reshape(-1), active.reshape(-1)]
     for name in (
-        "joint_type", "joint_qposadr", "qpos0", "joint_dofadr", "joint_limited",
+        "joint_qposadr", "qpos0", "joint_dofadr", "joint_limited",
         "joint_range", "joint_margin", "joint_solref", "joint_solimp",
         "dof_frictionloss", "dof_invweight0", "dof_solref", "dof_solimp",
         "equality_obj1", "equality_obj2", "equality_data", "equality_solref",

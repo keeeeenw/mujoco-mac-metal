@@ -37,19 +37,19 @@ kernel void solve_joint_constraints(
     device const float* mass [[buffer(0)]], device const float* qfrc [[buffer(1)]],
     device const float* qpos [[buffer(2)]], device const float* qvel [[buffer(3)]],
     device const int* eq_active [[buffer(4)]],
-    device const int* joint_type [[buffer(5)]], device const int* joint_qadr [[buffer(6)]],
-    device const float* qpos0 [[buffer(7)]], device const int* joint_dadr [[buffer(8)]],
-    device const uchar* joint_limited [[buffer(9)]], device const float* joint_range [[buffer(10)]],
-    device const float* joint_margin [[buffer(11)]], device const float* joint_solref [[buffer(12)]],
-    device const float* joint_solimp [[buffer(13)]], device const float* frictionloss [[buffer(14)]],
-    device const float* invweight [[buffer(15)]], device const float* dof_solref [[buffer(16)]],
-    device const float* dof_solimp [[buffer(17)]], device const int* eq_obj1 [[buffer(18)]],
-    device const int* eq_obj2 [[buffer(19)]], device const float* eq_data [[buffer(20)]],
-    device const float* eq_solref [[buffer(21)]], device const float* eq_solimp [[buffer(22)]],
-    constant int* dims [[buffer(23)]], constant float* timestep [[buffer(24)]],
-    device float* out_force [[buffer(25)]], device float* out_acc [[buffer(26)]],
-    device int* out_status [[buffer(27)]], device float* out_residual [[buffer(28)]],
-    device int* out_iterations [[buffer(29)]], uint world [[thread_position_in_grid]]) {
+    device const int* joint_qadr [[buffer(5)]], device const float* qpos0 [[buffer(6)]],
+    device const int* joint_dadr [[buffer(7)]], device const uchar* joint_limited [[buffer(8)]],
+    device const float* joint_range [[buffer(9)]], device const float* joint_margin [[buffer(10)]],
+    device const float* joint_solref [[buffer(11)]], device const float* joint_solimp [[buffer(12)]],
+    device const float* frictionloss [[buffer(13)]], device const float* invweight [[buffer(14)]],
+    device const float* dof_solref [[buffer(15)]], device const float* dof_solimp [[buffer(16)]],
+    device const int* eq_obj1 [[buffer(17)]], device const int* eq_obj2 [[buffer(18)]],
+    device const float* eq_data [[buffer(19)]], device const float* eq_solref [[buffer(20)]],
+    device const float* eq_solimp [[buffer(21)]], constant int* dims [[buffer(22)]],
+    constant float* timestep [[buffer(23)]], device float* out_force [[buffer(24)]],
+    device float* out_acc [[buffer(25)]], device int* out_status [[buffer(26)]],
+    device float* out_residual [[buffer(27)]], device int* out_iterations [[buffer(28)]],
+    uint world [[thread_position_in_grid]]) {
   int nq=dims[0], nv=dims[1], nj=dims[2], neq=dims[3], nr=dims[4], batch=dims[5];
   int flags=dims[6]; bool refsafe=dims[7]!=0; int maxiter=dims[8];
   if (world>=uint(batch)) return;
