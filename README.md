@@ -62,6 +62,8 @@ See [installation and diagnostics](metal/INSTALL.md) for requirements and status
 
 ## Try the Mac demos
 
+We built a few demos to explore Metal physics on the Mac—give them a try!
+
 ![Native Metal spacecraft approach beside CPU MuJoCo](metal/examples/assets/space_docking.gif)
 
 The [spacecraft approach demo](metal/examples/space_docking.md) uses three free
@@ -69,7 +71,8 @@ bodies, applied forces/torques and different damping values, with an independent
 CPU reference. Targets are visual only: no docking contacts or latching are
 modeled. Its controller runs on the host; native physics runs on Metal.
 
-The original pendulum comparison is also available:
+**Chaotic pendulum:** watch four connected arms swing and tumble, with Metal
+and CPU MuJoCo shown side by side.
 
 ![Hybrid Metal pendulum compared with CPU MuJoCo](metal/examples/assets/pendulum.gif)
 
