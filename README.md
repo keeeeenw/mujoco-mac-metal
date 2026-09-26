@@ -20,7 +20,8 @@ available alongside the optional package.
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
 - **Validation and reproducible measurements:** the development checkpoint passed
-  **257 tests with native GPU execution enabled** (the 0.3.0 baseline passed 133); independent CPU-reference trajectory and solve checks supplement the
+  **257 tests with native GPU execution enabled**; independent CPU-reference
+  trajectory and solve checks supplement the
   suite. Benchmarks include actual eight-thread CPU measurements at every tested
   batch through 524,288 worlds.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
@@ -162,7 +163,7 @@ The optional package targets Python 3.12, MuJoCo **3.10.0** and Torch **2.9.1**;
 use its isolated installation instructions rather than treating the newer
 surrounding MuJoCo source version as the qualified runtime.
 
-The earlier 0.3.0 profiles required contact-free Euler models. Version 0.4.0 adds bounded RK4/implicitfast, passive and fluid forces, fixed-tendon
+Version **0.4.0** supports bounded Euler, RK4/implicitfast, passive and fluid forces, fixed-tendon
 servos, sensor queries, sphere contact and joint-constraint profiles, each with
 explicit guards. These are partial implementations:
 remaining contact/constraint families, stateful actuation, spatial tendons,
@@ -178,7 +179,8 @@ state and spatial tendons, full implicit integration, and remaining sensor and
 model/API behavior. RL integration and broader Mac hardware validation are
 deferred. See the [development coverage](metal/DEVELOPMENT.md) for the current
 qualified subsets; the pendulum timing results do not qualify the new profiles.
-See the [support inventory and FAQ](metal/README.md) for precise boundaries.
+See the [API contracts](metal/API.md) and [Apple Silicon FAQ](metal/FAQ.md)
+for usage details and common questions.
 
 ## Contribute
 

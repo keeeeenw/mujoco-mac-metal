@@ -20,6 +20,6 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 
 Use version **0.4.0 or newer** and the [demo/source setup](../INSTALL.md#development-source).
 Demo scripts and assets live in the repository; the wheel supplies the physics
-package. Version 0.3.0 does not include the new profiles.
+package.
 Follow the command in each guide. Most new demos produce numerical reports
 and optional GIFs; an interactive viewer is available only where documented. Rendering currently uses MuJoCo OpenGL.

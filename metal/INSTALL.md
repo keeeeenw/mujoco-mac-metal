@@ -99,7 +99,7 @@ or pushing source does not publish a release.
 
 ## PyPI release
 
-Releases use PyPI Trusted Publishing, first configured for 0.3.0. The publisher uses
+Releases use PyPI Trusted Publishing. The publisher uses
 GitHub owner `keeeeenw`, repository `mujoco-mac-metal`, workflow
 `publish-metal.yml`, and GitHub Actions environment `pypi`. For a new version, update the package and module versions, qualify the
 built wheel on a supported Mac, then run the repository's **Publish Metal package to PyPI** workflow manually with

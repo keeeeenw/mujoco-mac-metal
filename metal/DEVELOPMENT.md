@@ -1,8 +1,7 @@
 # Native physics development coverage
 
-Version **0.4.0** extends the earlier **0.3.0** package with the bounded profiles
-below. Upgrade the installed package, and use the [source setup](INSTALL.md#development-source)
-for demo scripts and assets. Version 0.3.0 does not provide these new profiles.
+Version **0.4.0** provides the bounded profiles below. Upgrade the installed package, and use the [source setup](INSTALL.md#development-source)
+for demo scripts and assets.
 The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
