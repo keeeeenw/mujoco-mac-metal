@@ -29,8 +29,9 @@ class ImplicitFastDescriptor:
 def lower_implicitfast(model, *, external_derivative=False):
   """Validate the subset whose velocity derivative and advance are exact here.
 
-  Free joints are rejected because MuJoCo 3.10 implicitfast may use a separate
-  rotational/translational midpoint solve for eligible free bodies.
+  Free bodies are handled by ``FreeBodyMidpointProgram`` after this solve;
+  that stage applies MuJoCo's eligibility test and leaves all other DOFs on the
+  ordinary implicitfast velocity path.
   """
   if not isinstance(model, mujoco.MjModel):
     raise TypeError("implicitfast lowering requires a MuJoCo MjModel")
@@ -42,9 +43,6 @@ def lower_implicitfast(model, *, external_derivative=False):
     raise ValueError("implicitfast stage requires contact explicitly disabled")
   if model.nv > 24:
     raise ValueError("implicitfast stage currently bounds nv to 24")
-  free = int(mujoco.mjtJoint.mjJNT_FREE)
-  if np.any(np.asarray(model.jnt_type) == free):
-    raise ValueError("free joints require the MuJoCo implicitfast midpoint stage")
   if model.neq or np.any(model.jnt_limited) or np.any(model.dof_frictionloss):
     raise ValueError("implicitfast stage currently excludes joint constraints")
   if model.nflex or model.nflexvert or model.nflexelem:

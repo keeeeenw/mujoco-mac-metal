@@ -90,11 +90,11 @@ def test_batched_shapes_and_nonfinite_values_are_rejected():
     implicitfast_oracle(model, np.full_like(mass, np.nan), data.qfrc_smooth)
 
 
-def test_freejoint_profile_fails_explicitly():
+def test_freejoint_is_allowed_for_midpoint_profile():
   free = '''<mujoco><option integrator="implicitfast"><flag contact="disable"/></option>
   <worldbody><body><freejoint/><geom type="box" size=".1 .2 .3" mass="1"/></body></worldbody></mujoco>'''
-  with pytest.raises(ValueError, match="free joints"):
-    lower_implicitfast(mujoco.MjModel.from_xml_string(free))
+  descriptor = lower_implicitfast(mujoco.MjModel.from_xml_string(free))
+  assert descriptor.nv == 6
 
 
 def test_external_full_derivative_unblocks_other_velocity_force_families():
