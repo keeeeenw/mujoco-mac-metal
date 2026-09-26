@@ -120,6 +120,7 @@ def validate_stepping_profile(
       "contact_free_rk4_v1",
       "contact_free_forces_rk4_v1",
       "contact_free_motor_rk4_v1",
+      "contact_free_transmission_rk4_v1",
       "contact_free_passive_rk4_v1",
       "contact_free_sensor_rk4_v1",
   ):
@@ -146,8 +147,10 @@ def validate_stepping_profile(
             for item in result.rejected
         ),
     )
+  with_transmissions = profile == "contact_free_transmission_euler_v1"
   with_sensors = profile == "contact_free_sensor_euler_v1"
   advanced_passive = profile in (
+      "contact_free_transmission_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   )
@@ -156,11 +159,13 @@ def validate_stepping_profile(
 
     PassiveForceModel(model)
   if profile not in (
+      "contact_free_transmission_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
       "contact_free_euler_v1",
       "contact_free_forces_euler_v1",
       "contact_free_motor_euler_v1",
+      "contact_free_transmission_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -222,6 +227,7 @@ def validate_stepping_profile(
     if profile in (
         "contact_free_forces_euler_v1",
         "contact_free_motor_euler_v1",
+        "contact_free_transmission_euler_v1",
         "contact_free_passive_euler_v1",
         "contact_free_sensor_euler_v1",
     ) and name in (
@@ -234,6 +240,7 @@ def validate_stepping_profile(
   if profile in (
       "contact_free_forces_euler_v1",
       "contact_free_motor_euler_v1",
+      "contact_free_transmission_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -266,24 +273,46 @@ def validate_stepping_profile(
   motor_supported = ()
   if model.nu and profile not in (
       "contact_free_motor_euler_v1",
+      "contact_free_transmission_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
     raise ValueError(f"actuators are unsupported by {profile}")
   if profile in (
       "contact_free_motor_euler_v1",
+      "contact_free_transmission_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
     from mujoco_metal.actuation import ScalarMotorModel
 
-    ScalarMotorModel.from_model(model)
+    if with_transmissions:
+      from mujoco_metal.transmissions import TransmissionModel
+
+      TransmissionModel(model)
+    else:
+      ScalarMotorModel.from_model(model)
     motor_supported = (
         "fixed-gain hinge and slide joint motors",
         "per-call controls with MuJoCo control/force clipping and disable flags",
     )
+  if with_transmissions:
+    motor_supported = (
+        "stateless scalar fixed/affine gain and affine bias actuators",
+        "hinge/slide and fixed joint tendon transmissions",
+        "per-call controls with control/force clipping and disable flags",
+    )
   if model.ntendon:
-    raise ValueError("tendons, including tendon armature, are unsupported")
+    if not with_transmissions:
+      raise ValueError("tendons, including tendon armature, are unsupported")
+    if (
+        np.any(model.tendon_armature)
+        or np.any(model.tendon_limited)
+        or np.any(model.tendon_actfrclimited)
+    ):
+      raise ValueError("tendon armature and tendon limits are unsupported")
+    if np.any(model.wrap_type != int(mujoco.mjtWrap.mjWRAP_JOINT)):
+      raise ValueError("only fixed joint tendons are supported")
   if model.neq:
     raise ValueError("equality constraints are unsupported")
   if np.any(model.jnt_limited):
@@ -355,6 +384,7 @@ def validate_stepping_profile(
               in (
                   "contact_free_forces_euler_v1",
                   "contact_free_motor_euler_v1",
+                  "contact_free_transmission_euler_v1",
                   "contact_free_passive_euler_v1",
                   "contact_free_sensor_euler_v1",
               )
@@ -373,6 +403,7 @@ def validate_stepping_profile(
           in (
               "contact_free_forces_euler_v1",
               "contact_free_motor_euler_v1",
+              "contact_free_transmission_euler_v1",
               "contact_free_passive_euler_v1",
               "contact_free_sensor_euler_v1",
           )
@@ -391,6 +422,7 @@ def validate_stepping_profile(
                   in (
                       "contact_free_forces_euler_v1",
                       "contact_free_motor_euler_v1",
+                      "contact_free_transmission_euler_v1",
                       "contact_free_passive_euler_v1",
                       "contact_free_sensor_euler_v1",
                   )
@@ -398,10 +430,15 @@ def validate_stepping_profile(
               and not (advanced_passive and item == "body gravity compensation")
               and not (with_sensors and item == "sensors")
               and not (
+                  with_transmissions
+                  and item == "tendons, including tendon armature"
+              )
+              and not (
                   "actuators and actuator state" in item
                   and profile
                   in (
                       "contact_free_motor_euler_v1",
+                      "contact_free_transmission_euler_v1",
                       "contact_free_passive_euler_v1",
                       "contact_free_sensor_euler_v1",
                   )
@@ -409,13 +446,19 @@ def validate_stepping_profile(
           )
           + (
               (
-                  "unsupported actuator state, plugins, non-joint transmissions, "
-                  "non-fixed gains, biases, dynamics, actuator armature or damping, "
-                  "and joint-level actuator force limits",
+                  (
+                      "stateful actuators, spatial tendons, wrapping, tendon armature, "
+                      "non-affine gains/biases, actuator damping and force-limit routing"
+                      if with_transmissions
+                      else "unsupported actuator state, plugins, non-joint transmissions, "
+                      "non-fixed gains, biases, dynamics, actuator armature or damping, "
+                      "and joint-level actuator force limits"
+                  ),
               )
               if profile
               in (
                   "contact_free_motor_euler_v1",
+                  "contact_free_transmission_euler_v1",
                   "contact_free_passive_euler_v1",
                   "contact_free_sensor_euler_v1",
               )
@@ -427,6 +470,7 @@ def validate_stepping_profile(
           in (
               "contact_free_forces_euler_v1",
               "contact_free_motor_euler_v1",
+              "contact_free_transmission_euler_v1",
               "contact_free_passive_euler_v1",
               "contact_free_sensor_euler_v1",
           )
@@ -441,6 +485,7 @@ def validate_stepping_profile(
           in (
               "contact_free_forces_euler_v1",
               "contact_free_motor_euler_v1",
+              "contact_free_transmission_euler_v1",
               "contact_free_passive_euler_v1",
               "contact_free_sensor_euler_v1",
           )

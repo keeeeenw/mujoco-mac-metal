@@ -72,6 +72,7 @@ class MetalSimulation:
     # This CPU-only contract check must finish before any constructor can
     # initialize MPS or compile a shader.
     profile = validate_stepping_profile(model, profile=profile)
+    with_transmissions = "transmission" in profile.name
     motor_model = (
         ScalarMotorModel.from_model(model)
         if profile.name.replace("rk4", "euler")
@@ -136,10 +137,16 @@ class MetalSimulation:
         if motor_model is not None
         else None
     )
+    self._transmissions = None
+    if with_transmissions:
+      from mujoco_metal.transmissions import MetalTransmissions
+
+      self._transmissions = MetalTransmissions(model)
     self._passive = None
     self._damping_tangent = None
     if (
-        "passive" in profile.name
+        with_transmissions
+        or "passive" in profile.name
         or "sensor" in profile.name
         or profile.name == "normal_contact_euler_v1"
     ):
@@ -185,6 +192,7 @@ class MetalSimulation:
         in (
             "contact_free_forces_euler_v1",
             "contact_free_motor_euler_v1",
+            "contact_free_transmission_euler_v1",
             "contact_free_passive_euler_v1",
             "contact_free_sensor_euler_v1",
             "normal_contact_euler_v1",
@@ -206,7 +214,7 @@ class MetalSimulation:
             dtype=torch.float32,
             device=self._state._device,
         )
-        if motor_model is not None
+        if motor_model is not None or with_transmissions
         else None
     )
     self._damping = torch.tensor(
@@ -337,7 +345,7 @@ class MetalSimulation:
         raise ValueError("ctrl requires contact_free_motor_euler_v1")
       return
     torch = self._state._torch
-    shape = (self._state.batch_size, self._motor.model.nu)
+    shape = tuple(self._control.shape)
     if ctrl is None:
       self._control.zero_()
       return
@@ -377,6 +385,8 @@ class MetalSimulation:
           qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True
       )
       self._rhs.add_(passive)
+    if self._transmissions is not None:
+      self._rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
     if self._motor is not None:
       self._rhs.add_(self._motor.run_device(self._control))
     acceleration, status = self._solver.run_device(
