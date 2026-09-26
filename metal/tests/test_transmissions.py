@@ -52,6 +52,34 @@ def test_fixed_and_affine_gains_biases_match_mujoco_joint_oracle():
   assert moment.shape == (len(qpos), model.nu, model.nv)
 
 
+def test_fixed_joint_tendon_transmission_uses_raw_qpos_reference_semantics():
+  xml = """<mujoco><compiler angle="radian"/><worldbody>
+    <body><joint name="h" type="hinge" ref=".25"/>
+      <geom type="capsule" size=".05 .1"/></body>
+    <body pos="1 0 0"><joint name="s" type="slide" ref="-.15"/>
+      <geom type="sphere" size=".1"/></body>
+  </worldbody>
+  <tendon><fixed name="cable"><joint joint="h" coef="2"/>
+    <joint joint="s" coef="-.5"/></fixed></tendon>
+  <actuator><general name="pull" tendon="cable" gear="1.4"
+    dyntype="none" gaintype="affine" gainprm="1.1 .2 -.3"
+    biastype="affine" biasprm=".1 -.7 -.2" forcelimited="true"
+    forcerange="-1.5 1.5"/></actuator></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  assert model.qpos0.tolist() == pytest.approx([.25, -.15])
+  qpos = np.array([[.4, -.7], [-.1, .3]])
+  qvel = np.array([[.8, -.4], [-.5, .2]])
+  ctrl = np.array([[.3], [-.8]])
+  stage = TransmissionModel(model)
+  np.testing.assert_allclose(stage.generalized_force(qpos, qvel, ctrl), _oracle(model, qpos, qvel, ctrl), rtol=0, atol=2e-7)
+  length, moment, velocity = stage.transmission_state(qpos, qvel)
+  expected_length = 1.4 * (2*qpos[:, 0] - .5*qpos[:, 1])
+  expected_velocity = 1.4 * (2*qvel[:, 0] - .5*qvel[:, 1])
+  np.testing.assert_allclose(length[:, 0], expected_length, rtol=0, atol=1e-7)
+  np.testing.assert_allclose(velocity[:, 0], expected_velocity, rtol=0, atol=1e-7)
+  np.testing.assert_allclose(moment[0, 0], [2.8, -.7], rtol=0, atol=1e-7)
+
+
 def test_control_force_limits_and_all_disable_modes_match_mujoco():
   qpos = np.array([[.35, -.4], [-.6, .7]])
   qvel = np.array([[.8, -.5], [-.3, 1.1]])
@@ -95,6 +123,34 @@ def test_native_joint_transmissions_match_mujoco():
   qpos = np.array([[.35, -.4], [-.6, .7]], dtype=np.float32)
   qvel = np.array([[.8, -.5], [-.3, 1.1]], dtype=np.float32)
   ctrl = np.array([[.2, 2., .8], [-.5, -.4, -.7]], dtype=np.float32)
+  import torch
+  stage = MetalTransmissions(model)
+  actual = stage.run_device(
+      torch.tensor(qpos, dtype=torch.float32, device="mps"),
+      torch.tensor(qvel, dtype=torch.float32, device="mps"),
+      torch.tensor(ctrl, dtype=torch.float32, device="mps"),
+  )
+  np.testing.assert_allclose(actual.cpu().numpy(), _oracle(model, qpos, qvel, ctrl), rtol=0, atol=2e-6)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1", reason="set MUJOCO_METAL_RUN_GPU=1 on an Apple GPU")
+def test_native_fixed_tendon_transmission_matches_mujoco():
+  xml = """<mujoco><compiler angle="radian"/><worldbody>
+    <body><joint name="h" type="hinge" ref=".25"/>
+      <geom type="capsule" size=".05 .1"/></body>
+    <body pos="1 0 0"><joint name="s" type="slide" ref="-.15"/>
+      <geom type="sphere" size=".1"/></body>
+  </worldbody><tendon><fixed name="cable"><joint joint="h" coef="2"/>
+    <joint joint="s" coef="-.5"/></fixed></tendon>
+  <actuator><general tendon="cable" gear="1.4" dyntype="none"
+    gaintype="affine" gainprm="1.1 .2 -.3" biastype="affine"
+    biasprm=".1 -.7 -.2" forcelimited="true" forcerange="-1.5 1.5"/>
+  </actuator></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = np.array([[.4, -.7], [-.1, .3]], dtype=np.float32)
+  qvel = np.array([[.8, -.4], [-.5, .2]], dtype=np.float32)
+  ctrl = np.array([[.3], [-.8]], dtype=np.float32)
   import torch
   stage = MetalTransmissions(model)
   actual = stage.run_device(

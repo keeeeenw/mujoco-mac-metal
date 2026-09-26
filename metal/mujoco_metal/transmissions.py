@@ -24,7 +24,8 @@ class TransmissionModel:
   """Immutable model-derived scalar force map for MuJoCo 3.10.0.
 
   The accepted actuator family is stateless SISO with fixed or affine gain,
-  none or affine bias, and scalar hinge/slide joint transmission. Control
+  none or affine bias, and scalar hinge/slide joint or fixed-joint-tendon
+  transmission. Control
   clipping, actuator force clipping, actuator-group disable, and global
   actuation disable follow MuJoCo's source behavior.
   """
@@ -37,8 +38,12 @@ class TransmissionModel:
     self.model = model
     self.nq, self.nv, self.nu = int(model.nq), int(model.nv), int(model.nu)
     self.na = int(np.asarray(model.actuator_gaintype).size)
+    if any(value < 0 or value > _INT32_MAX for value in (self.nq, self.nv, self.nu, self.na)):
+      raise ValueError("transmission dimensions exceed int32")
     if self.nu != self.na:
       raise ValueError("only one-control, one-output scalar actuators are supported")
+    if self.nu * self.nq > _UINT32_MAX or self.nu * self.nv > _UINT32_MAX:
+      raise ValueError("transmission model buffers exceed uint32 indexing")
     if int(model.nplugin):
       raise ValueError("actuator plugins are unsupported")
     if np.any(np.asarray(model.actuator_actnum) != 0) or np.any(np.asarray(model.actuator_dyntype) != int(mujoco.mjtDyn.mjDYN_NONE)):
@@ -58,6 +63,8 @@ class TransmissionModel:
     affine_bias = int(mujoco.mjtBias.mjBIAS_AFFINE)
     joint_trn = int(mujoco.mjtTrn.mjTRN_JOINT)
     parent_trn = int(mujoco.mjtTrn.mjTRN_JOINTINPARENT)
+    tendon_trn = int(mujoco.mjtTrn.mjTRN_TENDON)
+    wrap_joint = int(mujoco.mjtWrap.mjWRAP_JOINT)
     hinge, slide = int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)
     length_map = np.zeros((self.nu, self.nq), dtype=np.float64)
     moment_map = np.zeros((self.nu, self.nv), dtype=np.float64)
@@ -69,17 +76,33 @@ class TransmissionModel:
       if int(model.actuator_plugin[actuator]) >= 0:
         raise ValueError("actuator plugins are unsupported")
       transmission = int(model.actuator_trntype[actuator])
-      if transmission not in (joint_trn, parent_trn):
-        raise ValueError("only scalar hinge/slide joint transmissions are currently supported")
-      joint = int(model.actuator_trnid[actuator, 0])
-      if joint < 0 or joint >= int(model.njnt) or int(model.jnt_type[joint]) not in (hinge, slide):
-        raise ValueError("actuator transmission must target a hinge or slide joint")
       gear = np.asarray(model.actuator_gear[actuator], dtype=np.float64)
       if np.any(gear[1:] != 0):
-        raise ValueError("scalar joint actuator gear must use only its first component")
-      qa, da = int(model.jnt_qposadr[joint]), int(model.jnt_dofadr[joint])
-      length_map[actuator, qa] = gear[0]
-      moment_map[actuator, da] = gear[0]
+        raise ValueError("scalar actuator gear must use only its first component")
+      target = int(model.actuator_trnid[actuator, 0])
+      if transmission in (joint_trn, parent_trn):
+        if target < 0 or target >= int(model.njnt) or int(model.jnt_type[target]) not in (hinge, slide):
+          raise ValueError("actuator transmission must target a hinge or slide joint")
+        qa, da = int(model.jnt_qposadr[target]), int(model.jnt_dofadr[target])
+        length_map[actuator, qa] = gear[0]
+        moment_map[actuator, da] = gear[0]
+      elif transmission == tendon_trn:
+        if target < 0 or target >= int(model.ntendon):
+          raise ValueError("actuator transmission must target a valid tendon")
+        if bool(model.tendon_actfrclimited[target]):
+          raise ValueError("tendon-level actuator force limits are unsupported")
+        start, count = int(model.tendon_adr[target]), int(model.tendon_num[target])
+        if count <= 0 or any(int(t) != wrap_joint for t in model.wrap_type[start:start+count]):
+          raise ValueError("actuator tendon must be a fixed tendon made only of joint wraps")
+        for wrap in range(start, start+count):
+          joint = int(model.wrap_objid[wrap])
+          if joint < 0 or joint >= int(model.njnt) or int(model.jnt_type[joint]) not in (hinge, slide):
+            raise ValueError("fixed tendon wraps must target hinge or slide joints")
+          coefficient = gear[0] * float(model.wrap_prm[wrap])
+          length_map[actuator, int(model.jnt_qposadr[joint])] += coefficient
+          moment_map[actuator, int(model.jnt_dofadr[joint])] += coefficient
+      else:
+        raise ValueError("only scalar joint and fixed-joint-tendon transmissions are supported")
 
     self.length_map = _frozen(length_map, np.float32)
     self.moment_map = _frozen(moment_map, np.float32)
@@ -209,7 +232,11 @@ class MetalTransmissions:
     if any(value > _INT32_MAX for value in dimensions):
       raise ValueError("transmission dimensions exceed int32")
     elements = batch * max(1, self._meta.nq, self._meta.nv, self._meta.nu)
-    if elements > _UINT32_MAX or batch * self._meta.nu * self._meta.nv > _UINT32_MAX:
+    if (
+        elements > _UINT32_MAX
+        or batch * self._meta.nu * self._meta.nv > _UINT32_MAX
+        or batch * self._meta.nu * self._meta.nq > _UINT32_MAX
+    ):
       raise ValueError("transmission kernel offsets exceed uint32")
     output = torch.empty((batch, self._meta.nv), dtype=torch.float32, device=self._device)
     self._kernel(

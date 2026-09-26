@@ -64,4 +64,11 @@ kernel void scalar_transmission_force(
     if (force_limited[a]) force=clamp(force,force_range[2*a],force_range[2*a+1]);
     for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]+=moment_map[a*nv+d]*force;
   }
+  for (int d=0;d<nv;++d) {
+    if ((as_type<uint>(qfrc[vbase+uint(d)]) & 0x7f800000u)==0x7f800000u) {
+      float bad=as_type<float>(0x7fc00000u);
+      for (int k=0;k<nv;++k) qfrc[vbase+uint(k)]=bad;
+      return;
+    }
+  }
 }
