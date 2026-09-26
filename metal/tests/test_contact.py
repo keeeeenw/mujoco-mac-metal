@@ -90,6 +90,12 @@ def test_contact_guards_reject_unsupported_families_and_parameters():
         _plane_sphere_xml().replace('condim="1"', 'condim="4"')
     ))
   assert lower_contacts(frictional).condim.tolist() == [3]
+  elliptic = mujoco.MjModel.from_xml_string(
+      _plane_sphere_xml().replace('condim="1"', 'condim="3"')
+      .replace("<mujoco>", '<mujoco><option cone="elliptic"/>')
+  )
+  with pytest.raises(ValueError, match="pyramidal cone"):
+    lower_contacts(elliptic)
 
   explicit_pair = mujoco.MjModel.from_xml_string(
       '<mujoco><worldbody><geom name="floor" type="plane" size="2 2 .1"/>'
@@ -292,6 +298,8 @@ def test_native_pyramidal_friction_contact_matches_cpu_oracle():
   qvel[0, 3:6] = [0.2, -0.3, 0.1]
   actual = _gpu_contact_acceleration(model, qpos, qvel)
   assert actual["status"].cpu().numpy().tolist() == [0]
+  diagnostic = actual["solver_diagnostics"].cpu().numpy()[0]
+  assert diagnostic[0] <= 1e-6 and diagnostic[1] <= 256, diagnostic
   data = mujoco.MjData(model)
   data.qpos[:] = qpos[0]
   data.qvel[:] = qvel[0]
@@ -300,9 +308,56 @@ def test_native_pyramidal_friction_contact_matches_cpu_oracle():
   # Four pyramidal edges carry force; slot zero is the retained normal row.
   assert actual["force_rows"][0, 0, 0].item() == 0.0
   np.testing.assert_allclose(
-      actual["qacc"][0].cpu().numpy(), data.qacc, rtol=8e-3, atol=8e-3
+      actual["qacc"][0].cpu().numpy(), data.qacc, rtol=2e-5, atol=1e-4
   )
   np.testing.assert_allclose(
       actual["qfrc_contact"][0].cpu().numpy(), data.qfrc_constraint,
-      rtol=1e-2, atol=1e-2,
+      rtol=2e-5, atol=4e-4,
   )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
+    reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
+)
+def test_friction_profile_400_step_sliding_and_separating_batch():
+  from mujoco_metal.simulation import MetalSimulation
+
+  xml = """<mujoco><option timestep=".002" gravity="0 0 -9.81"
+      cone="pyramidal" iterations="100" tolerance="1e-10"/>
+    <worldbody><geom type="plane" size="3 3 .1" condim="3"
+        friction=".6 .01 .01"/>
+      <body pos="0 0 .098"><freejoint/><geom type="sphere" size=".1"
+          mass=".3" condim="3" friction=".6 .01 .01"/></body>
+    </worldbody></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = np.tile(model.qpos0, (2, 1)).astype(np.float32)
+  qvel = np.zeros((2, model.nv), dtype=np.float32)
+  qvel[0, 0] = 0.8
+  qvel[1, 0] = 0.8
+  qvel[1, 2] = 2.0  # the second world quickly separates from the floor
+  simulation = MetalSimulation(
+      model, 2, qpos=qpos, qvel=qvel, profile="friction_contact_euler_v1"
+  )
+  references = [mujoco.MjData(model) for _ in range(2)]
+  for i, data in enumerate(references):
+    data.qpos[:] = qpos[i]
+    data.qvel[:] = qvel[i]
+  errors = np.zeros(2)
+  contact_steps = np.zeros(2, dtype=np.int32)
+  for _ in range(400):
+    simulation.step()
+    for data in references:
+      mujoco.mj_step(model, data)
+    state = simulation.state.snapshot()
+    assert not np.any(state.status), state.status
+    for i, data in enumerate(references):
+      errors = np.maximum(errors, [
+          np.max(np.abs(state.qpos[i] - data.qpos)),
+          np.max(np.abs(state.qvel[i] - data.qvel)),
+      ])
+      contact_steps[i] += data.ncon > 0
+  assert contact_steps[0] > 300
+  assert contact_steps[1] < 20
+  assert errors[0] < 0.01 and errors[1] < 0.1, errors

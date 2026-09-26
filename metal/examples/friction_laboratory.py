@@ -1,10 +1,6 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
-"""Three marbles roll down a tilted plane and exchange momentum by contact.
-
-The left view is the native normal-contact profile. The right view is an
-independent MuJoCo ``mj_step`` reference from the same state and inputs.
-"""
+"""Compare low, medium, and high friction as identical balls slide and roll."""
 
 import argparse
 import json
@@ -14,26 +10,27 @@ import mujoco
 import numpy as np
 
 
+_BODY_NAMES = ("low_friction", "medium_friction", "high_friction")
+
+
 def _load_model():
   model = mujoco.MjModel.from_xml_path(str(Path(__file__).with_suffix(".xml")))
   if model.nv != 18 or model.ngeom != 4 or model.npair or model.nexclude:
-    raise RuntimeError("Expected three free marbles and one tilted plane")
-  if np.any(model.geom_condim != 1):
-    raise RuntimeError("The marble cascade requires condim=1")
+    raise RuntimeError("Expected three free balls on one floor")
+  if np.any(model.geom_condim != 3):
+    raise RuntimeError("All laboratory contacts must use condim=3")
+  if int(model.opt.cone) != int(mujoco.mjtCone.mjCONE_PYRAMIDAL):
+    raise RuntimeError("The friction laboratory requires the pyramidal cone")
   return model
 
 
 def _initial_state(model):
   qpos = model.qpos0.copy().astype(np.float32)
   qvel = np.zeros(model.nv, dtype=np.float32)
-  # The plane normal is rotated 20 degrees about world Y. The ramp direction
-  # is its tangent; each following marble begins faster than the one ahead.
-  angle = np.deg2rad(20.0)
-  downhill = np.array([-np.cos(angle), 0.0, np.sin(angle)])
-  for body, speed in ((1, 0.2), (2, 1.1), (3, 1.9)):
-    qa = int(model.jnt_qposadr[int(model.body_jntadr[body])])
-    da = int(model.jnt_dofadr[int(model.body_jntadr[body])])
-    qvel[da : da + 3] = speed * downhill
+  for body in range(1, 4):
+    jnt = int(model.body_jntadr[body])
+    dof = int(model.jnt_dofadr[jnt])
+    qvel[dof] = 1.3
   return qpos, qvel
 
 
@@ -54,7 +51,7 @@ def run(steps=600, mode="metal", check=False, record=None):
         model,
         qpos=qpos[None, :],
         qvel=qvel[None, :],
-        profile="normal_contact_euler_v1",
+        profile="friction_contact_euler_v1",
     )
 
   recorder = None
@@ -62,7 +59,7 @@ def run(steps=600, mode="metal", check=False, record=None):
     from demo_recording import ComparisonRecorder
 
     recorder = ComparisonRecorder(
-        model, record, "Marble cascade", [-0.25, 0.0, 0.25], 3.0,
+        model, record, "Friction laboratory", [0.25, 0.0, 0.12], 3.1,
         azimuth=110, elevation=-42,
     )
   max_qpos_error = max_qvel_error = 0.0
@@ -90,25 +87,37 @@ def run(steps=600, mode="metal", check=False, record=None):
     if recorder:
       recorder.frame(
           step, actual, reference,
-          extra=f"3 free marbles | {reference.ncon} CPU contacts | 2 ms steps",
+          extra=f"μ = 0.01 / 0.12 / 1.00 | {reference.ncon} CPU contacts",
       )
   if recorder:
     recorder.close()
+  body_states = {}
+  for name in _BODY_NAMES:
+    body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+    jnt = int(model.body_jntadr[body])
+    dof = int(model.jnt_dofadr[jnt])
+    body_states[name] = {
+        "x_displacement": float(actual.qpos[int(model.jnt_qposadr[jnt])] - qpos[int(model.jnt_qposadr[jnt])]),
+        "slide_speed": float(np.linalg.norm(actual.qvel[dof : dof + 3])),
+        "spin_speed": float(np.linalg.norm(actual.qvel[dof + 3 : dof + 6])),
+        "x_slip_speed": float(abs(actual.qvel[dof] - 0.12 * actual.qvel[dof + 4])),
+    }
   result = {
-      "demo": "marble_cascade",
+      "demo": "friction_laboratory",
       "mode": mode,
       "steps": steps,
-      "profile": "normal_contact_euler_v1" if native else "MuJoCo CPU",
-      "contact_family": "plane-sphere and sphere-sphere, condim=1",
+      "profile": "friction_contact_euler_v1" if native else "MuJoCo CPU",
+      "contact_family": "plane-sphere and sphere-sphere, pyramidal condim=3",
       "peak_contacts": peak_contacts,
       "contact_steps": contact_steps,
       "max_qpos_error": max_qpos_error,
       "max_qvel_error": max_qvel_error,
+      "balls": body_states,
       "record": str(record) if record else None,
   }
   if check and mode == "metal":
-    if contact_steps < 10:
-      raise AssertionError("marble cascade did not exercise sustained contact")
+    if contact_steps < steps // 2 or peak_contacts < 3:
+      raise AssertionError("friction laboratory did not exercise sustained contacts")
     if max_qpos_error > 0.08 or max_qvel_error > 0.8:
       raise AssertionError(json.dumps(result, indent=2))
   return result
