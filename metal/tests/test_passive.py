@@ -43,7 +43,10 @@ def test_polynomial_spring_and_damper_match_mujoco():
   model.dof_dampingpoly[0] = [.2, .05]
   qpos = np.array([[.8, -.5], [-.3, .2]])
   qvel = np.array([[1.2, -.8], [-.4, .5]])
-  np.testing.assert_allclose(PassiveForceModel(model).force(qpos, qvel), _oracle(model, qpos, qvel), rtol=0, atol=1e-7)
+  stage = PassiveForceModel(model)
+  np.testing.assert_allclose(stage.force(qpos, qvel), _oracle(model, qpos, qvel), rtol=0, atol=1e-7)
+  expected_derivative = model.dof_damping + 2*model.dof_dampingpoly[:, 0]*np.abs(qvel) + 3*model.dof_dampingpoly[:, 1]*qvel*qvel
+  np.testing.assert_allclose(stage.damping_derivative(qvel), expected_derivative, rtol=0, atol=3e-8)
 
 
 def test_disable_flags_and_input_validation():
@@ -52,8 +55,21 @@ def test_disable_flags_and_input_validation():
   stage = PassiveForceModel(model)
   result = stage.force(np.zeros((2, 2)), np.ones((2, 2)))
   np.testing.assert_array_equal(result, np.zeros((2, 2)))
+  np.testing.assert_array_equal(stage.damping_derivative(np.ones((2, 2))), np.zeros((2, 2)))
   with pytest.raises(ValueError, match="shapes"):
     stage.force(np.zeros((2, 3)), np.zeros((2, 2)))
+
+
+def test_ball_and_free_rigid_springs_match_mujoco_quaternion_convention():
+  xml = """<mujoco><option gravity="0 0 0"/><worldbody>
+  <body><joint type="free" stiffness="2"/><geom type="sphere" size=".1"/></body>
+  <body pos="1 0 0"><joint type="ball" stiffness="1.5"/>
+  <geom type="sphere" size=".1"/></body></worldbody></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = np.array([[.1, -.2, .3, .98, .1, -.05, .02, .96, .1, .2, -.1],
+                   [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]], dtype=np.float64)
+  qvel = np.zeros((2, model.nv))
+  np.testing.assert_allclose(PassiveForceModel(model).force(qpos, qvel), _oracle(model, qpos, qvel), rtol=0, atol=2e-7)
 
 
 @pytest.mark.gpu

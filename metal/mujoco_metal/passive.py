@@ -63,29 +63,57 @@ class PassiveForceModel:
           radius = np.linalg.norm(diff, axis=1)
           k = self.stiffness[j] + self.springpoly[j, 0] * radius + self.springpoly[j, 1] * radius**2
           out[:, da:da+3] += -diff * k[:, None]
-          # Quaternion spring terms are deliberately rejected until their
-          # MuJoCo quaternion-difference convention is represented natively.
-        # Ball and free rotational springs are intentionally zero for now.
+          current = np.asarray(qpos[:, qa+3:qa+7], dtype=np.float64)
+          reference = np.asarray(self.springref[qa+3:qa+7], dtype=np.float64)
+          for row in range(len(qpos)):
+            quat = current[row].copy()
+            mujoco.mju_normalize4(quat)
+            diff = np.zeros(3, dtype=np.float64)
+            mujoco.mju_subQuat(diff, quat, reference)
+            radius = np.linalg.norm(diff)
+            k = self._poly(float(self.stiffness[j]), self.springpoly[j], radius)
+            out[row, da+3:da+6] += -diff * k
+        elif typ == int(mujoco.mjtJoint.mjJNT_BALL):
+          for row in range(len(qpos)):
+            quat = np.asarray(qpos[row, qa:qa+4], dtype=np.float64).copy()
+            mujoco.mju_normalize4(quat)
+            diff = np.zeros(3, dtype=np.float64)
+            mujoco.mju_subQuat(diff, quat, self.springref[qa:qa+4])
+            radius = np.linalg.norm(diff)
+            k = self._poly(float(self.stiffness[j]), self.springpoly[j], radius)
+            out[row, da:da+3] += -diff * k
     if not self.disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER):
       for d in range(self.nv):
         v = qvel[:, d]
         out[:, d] += -v * (self.damping[d] + self.damperpoly[d, 0] * np.abs(v) + self.damperpoly[d, 1] * v * v)
     return out
 
+  def damping_derivative(self, qvel):
+    """Return the positive diagonal derivative of the damper force magnitude."""
+    qvel = np.asarray(qvel, dtype=np.float64)
+    if qvel.ndim != 2 or qvel.shape[1] != self.nv or not np.all(np.isfinite(qvel)):
+      raise ValueError(f"qvel must be finite with shape (batch, {self.nv})")
+    if self.disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER):
+      return np.zeros_like(qvel)
+    return self.damping[None, :] + 2*self.damperpoly[None, :, 0]*np.abs(qvel) + 3*self.damperpoly[None, :, 1]*qvel*qvel
+
 
 class MetalPassiveForces:
   """MPS launch wrapper for linear/polynomial rigid-joint springs and dampers."""
 
   def __init__(self, model):
-    import torch
     self.model = model
+    self._meta = PassiveForceModel(model)
+    import torch
     self._torch = torch
     self._device = torch.device("mps")
     self._lib = torch.mps.compile_shader(_SHADER.read_text())
     self._kernel = self._lib.passive_joint_force
-    self._meta = PassiveForceModel(model)
     def tensor(a, dtype=torch.float32):
-      return torch.as_tensor(np.ascontiguousarray(a), dtype=dtype, device=self._device)
+      arr = np.ascontiguousarray(a, dtype=np.int32 if dtype == torch.int32 else np.float32)
+      if arr.dtype == np.float32 and not np.all(np.isfinite(arr)):
+        raise ValueError("passive constants must be finite and float32-representable")
+      return torch.as_tensor(arr if arr.size else np.zeros(1, dtype=arr.dtype), dtype=dtype, device=self._device)
     self._qadr = tensor(self._meta.qadr, torch.int32)
     self._dadr = tensor(self._meta.dadr, torch.int32)
     self._type = tensor(self._meta.jnt_type, torch.int32)
@@ -94,9 +122,11 @@ class MetalPassiveForces:
     self._spoly = tensor(self._meta.springpoly.reshape(-1))
     self._damp = tensor(self._meta.damping)
     self._dpoly = tensor(self._meta.damperpoly.reshape(-1))
-    self._dims = tensor([self._meta.nq, self._meta.nv, self._meta.njnt, self._meta._num_poly, self._meta.disableflags], torch.int32)
+    spring_disabled = bool(self._meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
+    damper_disabled = bool(self._meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
+    self._dims = tensor([self._meta.nq, self._meta.nv, self._meta.njnt, self._meta._num_poly, int(spring_disabled), int(damper_disabled)], torch.int32)
 
-  def run_device(self, qpos, qvel):
+  def run_device(self, qpos, qvel, return_damping=False):
     """Return borrowed MPS generalized passive forces for device state tensors."""
     torch = self._torch
     if not isinstance(qpos, torch.Tensor) or not isinstance(qvel, torch.Tensor):
@@ -105,8 +135,9 @@ class MetalPassiveForces:
     if b <= 0 or qpos.shape != (b, self._meta.nq) or qvel.shape != (b, self._meta.nv):
       raise ValueError("qpos and qvel have invalid batch dimensions")
     for name, value in (("qpos", qpos), ("qvel", qvel)):
-      if value.device != self._device or value.dtype != torch.float32 or not value.is_contiguous():
+      if value.device.type != "mps" or value.dtype != torch.float32 or not value.is_contiguous():
         raise ValueError(f"{name} must be contiguous float32 MPS")
     out = torch.empty((b, self._meta.nv), dtype=torch.float32, device=self._device)
-    self._kernel(qpos.reshape(-1), qvel.reshape(-1), self._qadr, self._dadr, self._type, self._ref, self._stiff, self._spoly, self._damp, self._dpoly, self._dims, out.reshape(-1), threads=(b,), group_size=(1,))
-    return out
+    deriv = torch.empty_like(out) if return_damping else out
+    self._kernel(qpos.reshape(-1), qvel.reshape(-1), self._qadr, self._dadr, self._type, self._ref, self._stiff, self._spoly, self._damp, self._dpoly, self._dims, out.reshape(-1), deriv.reshape(-1), threads=(b,), group_size=(1,))
+    return (out, deriv) if return_damping else out
