@@ -4,6 +4,7 @@
 """CPU-only contact lowering guards and pinned MuJoCo 3.10.0 oracle checks."""
 
 import os
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -53,9 +54,9 @@ def test_plane_sphere_signed_distance_and_surface_point_match_cpu_oracle():
   assert contact.dist == pytest.approx(expected_dist, abs=1e-12)
   desc = lower_contacts(model)
   assert desc.pair_count == 1
-  assert _get_impedance(contact.solimp, contact.dist, contact.includemargin)[0] == pytest.approx(
-      model.geom_solimp[0, 1], abs=1e-10
-  )
+  assert _get_impedance(contact.solimp, contact.dist, contact.includemargin)[
+      0
+  ] == pytest.approx(model.geom_solimp[0, 1], abs=1e-10)
 
 
 def test_sphere_sphere_pair_is_model_derived_and_collision_matches_oracle():
@@ -77,7 +78,7 @@ def test_contact_guards_reject_unsupported_families_and_parameters():
   box = mujoco.MjModel.from_xml_string(
       '<mujoco><worldbody><geom type="plane" size="2 2 .1"/>'
       '<body pos="0 0 .1"><freejoint/><geom type="box" size=".1 .1 .1"/>'
-      '</body></worldbody></mujoco>'
+      "</body></worldbody></mujoco>"
   )
   with pytest.raises(ValueError, match="does not support collidable geom pair"):
     lower_contacts(box)
@@ -86,12 +87,15 @@ def test_contact_guards_reject_unsupported_families_and_parameters():
       _plane_sphere_xml().replace('condim="1"', 'condim="3"')
   )
   with pytest.raises(ValueError, match="condim"):
-    lower_contacts(mujoco.MjModel.from_xml_string(
-        _plane_sphere_xml().replace('condim="1"', 'condim="4"')
-    ))
+    lower_contacts(
+        mujoco.MjModel.from_xml_string(
+            _plane_sphere_xml().replace('condim="1"', 'condim="4"')
+        )
+    )
   assert lower_contacts(frictional).condim.tolist() == [3]
   elliptic = mujoco.MjModel.from_xml_string(
-      _plane_sphere_xml().replace('condim="1"', 'condim="3"')
+      _plane_sphere_xml()
+      .replace('condim="1"', 'condim="3"')
       .replace("<mujoco>", '<mujoco><option cone="elliptic"/>')
   )
   with pytest.raises(ValueError, match="pyramidal cone"):
@@ -110,7 +114,7 @@ def test_masking_removes_noncolliding_candidates():
   model = mujoco.MjModel.from_xml_string(
       '<mujoco><worldbody><geom type="plane" size="2 2 .1" contype="0" conaffinity="0"/>'
       '<body pos="0 0 .1"><freejoint/><geom type="sphere" size=".1"/>'
-      '</body></worldbody></mujoco>'
+      "</body></worldbody></mujoco>"
   )
   assert lower_contacts(model).pair_count == 0
 
@@ -172,6 +176,93 @@ def _gpu_contact_acceleration(model, qpos, qvel):
   ).squeeze(-1)
   return MetalContact(model, batch_size=len(qpos)).run_device(
       fk, smooth["mass_matrix"], free_acceleration, qvel_t
+  )
+
+
+def _saved_friction_transition():
+  model = mujoco.MjModel.from_xml_path(
+      str(Path(__file__).parents[1] / "examples" / "friction_laboratory.xml")
+  )
+  qpos = np.array(
+      [
+          [
+              -0.31668678,
+              0.0,
+              0.11998787,
+              0.99870896,
+              0.0,
+              0.05079811,
+              0.0,
+              0.3495785,
+              -6.8982237e-10,
+              0.11990365,
+              0.81985062,
+              -5.9871010e-9,
+              0.57257748,
+              -3.9654973e-9,
+              1.0161743,
+              6.6931674e-9,
+              0.11963283,
+              0.3988457,
+              5.5450663e-8,
+              0.91701806,
+              1.9204172e-9,
+          ]
+      ],
+      dtype=np.float32,
+  )
+  qvel = np.array(
+      [
+          [
+              1.2693158,
+              0.0,
+              -0.011822759,
+              0.0,
+              0.63867962,
+              0.0,
+              0.93312311,
+              -1.2226725e-7,
+              -1.7899617e-4,
+              -9.7863233e-7,
+              7.6359115,
+              -2.3501532e-6,
+              0.92674041,
+              1.2366859e-8,
+              -5.4390370e-7,
+              6.9035923e-7,
+              7.7346683,
+              -1.7903335e-7,
+          ]
+      ],
+      dtype=np.float32,
+  )
+  return model, qpos, qvel
+
+
+def test_saved_friction_laboratory_transition_matches_cpu_oracle():
+  model, qpos, qvel = _saved_friction_transition()
+  data = mujoco.MjData(model)
+  data.qpos[:], data.qvel[:] = qpos[0], qvel[0]
+  mujoco.mj_forward(model, data)
+  assert data.ncon == 3 and data.nefc == 12
+  np.testing.assert_allclose(
+      data.efc_force[: data.nefc],
+      [
+          0,
+          0,
+          3.70068223,
+          0,
+          0.7546075,
+          0.75457632,
+          1.3809145,
+          0.12826932,
+          0.73575032,
+          0.73575061,
+          0.73575122,
+          0.73574971,
+      ],
+      rtol=1e-5,
+      atol=3e-4,
   )
 
 
@@ -299,7 +390,7 @@ def test_native_pyramidal_friction_contact_matches_cpu_oracle():
   actual = _gpu_contact_acceleration(model, qpos, qvel)
   assert actual["status"].cpu().numpy().tolist() == [0]
   diagnostic = actual["solver_diagnostics"].cpu().numpy()[0]
-  assert diagnostic[0] <= 1e-6 and diagnostic[1] <= 256, diagnostic
+  assert diagnostic[0] <= 1e-6 and diagnostic[1] <= 320, diagnostic
   data = mujoco.MjData(model)
   data.qpos[:] = qpos[0]
   data.qvel[:] = qvel[0]
@@ -311,8 +402,36 @@ def test_native_pyramidal_friction_contact_matches_cpu_oracle():
       actual["qacc"][0].cpu().numpy(), data.qacc, rtol=2e-5, atol=1e-4
   )
   np.testing.assert_allclose(
-      actual["qfrc_contact"][0].cpu().numpy(), data.qfrc_constraint,
-      rtol=2e-5, atol=4e-4,
+      actual["qfrc_contact"][0].cpu().numpy(),
+      data.qfrc_constraint,
+      rtol=2e-5,
+      atol=4e-4,
+  )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
+    reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
+)
+def test_native_saved_friction_transition_matches_cpu_oracle():
+  model, qpos, qvel = _saved_friction_transition()
+  actual = _gpu_contact_acceleration(model, qpos, qvel)
+  assert actual["status"].cpu().numpy().tolist() == [0]
+  diagnostic = actual["solver_diagnostics"].cpu().numpy()[0]
+  assert diagnostic[0] <= 1e-6 and diagnostic[1] <= 320, diagnostic
+  data = mujoco.MjData(model)
+  data.qpos[:], data.qvel[:] = qpos[0], qvel[0]
+  mujoco.mj_forward(model, data)
+  assert data.ncon == 3
+  np.testing.assert_allclose(
+      actual["qacc"][0].cpu().numpy(), data.qacc, rtol=2e-5, atol=1e-4
+  )
+  np.testing.assert_allclose(
+      actual["qfrc_contact"][0].cpu().numpy(),
+      data.qfrc_constraint,
+      rtol=2e-5,
+      atol=4e-4,
   )
 
 
@@ -354,7 +473,9 @@ def test_friction_profile_400_step_sliding_and_separating_batch():
       mujoco.mj_step(model, data)
     state = simulation.state.snapshot()
     if np.any(state.status):
-      diagnostics = simulation._contact._workspace["solver_diagnostics"].reshape(3, 2)
+      diagnostics = simulation._contact._workspace[
+          "solver_diagnostics"
+      ].reshape(3, 2)
       force_rows = simulation._contact._workspace["force"].reshape(3, -1, 5)
       raise AssertionError(
           f"step status={state.status.tolist()} diagnostics="
@@ -363,10 +484,13 @@ def test_friction_profile_400_step_sliding_and_separating_batch():
           f"{state.qvel[1].tolist()}"
       )
     for i, data in enumerate(references):
-      errors = np.maximum(errors, [
-          np.max(np.abs(state.qpos[i] - data.qpos)),
-          np.max(np.abs(state.qvel[i] - data.qvel)),
-      ])
+      errors = np.maximum(
+          errors,
+          [
+              np.max(np.abs(state.qpos[i] - data.qpos)),
+              np.max(np.abs(state.qvel[i] - data.qvel)),
+          ],
+      )
       contact_steps[i] += data.ncon > 0
   assert contact_steps[0] > 300
   assert contact_steps[1] > 20

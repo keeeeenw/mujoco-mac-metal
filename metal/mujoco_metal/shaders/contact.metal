@@ -9,6 +9,76 @@ inline float3 rotate_q(float4 q, float3 v) {
 }
 inline float3 cross3(float3 a, float3 b) { return cross(a, b); }
 
+// Solve the local nonnegative convex QP for one contact's (at most four)
+// pyramidal edge forces by enumerating its 16 possible active sets. Returns
+// the best scaled feasibility error and writes that candidate to solution.
+inline float solve_contact_block(
+    thread const float* A, thread const float* b, int n,
+    thread float* solution) {
+  float best_error=1e30f, best_objective=1e30f;
+  for (int i=0;i<4;++i) solution[i]=0.0f;
+  for (int set=0;set<(1<<n);++set) {
+    thread int ids[4]; int nactive=0;
+    for (int i=0;i<n;++i) if (set & (1<<i)) ids[nactive++]=i;
+    thread float mat[16], rhs[4], x[4], candidate[4];
+    for (int i=0;i<16;++i) mat[i]=0.0f;
+    for (int i=0;i<4;++i) { rhs[i]=0.0f; x[i]=0.0f; candidate[i]=0.0f; }
+    for (int i=0;i<nactive;++i) {
+      rhs[i]=-b[ids[i]];
+      for (int j=0;j<nactive;++j)
+        mat[i*4+j]=A[ids[i]*4+ids[j]];
+    }
+    bool valid=true;
+    // Partial-pivoted Gaussian elimination on the active principal block.
+    for (int p=0;p<nactive;++p) {
+      int pivot_row=p; float pivot_abs=abs(mat[p*4+p]);
+      for (int r=p+1;r<nactive;++r) {
+        float value=abs(mat[r*4+p]);
+        if (value>pivot_abs) { pivot_abs=value; pivot_row=r; }
+      }
+      if (!(pivot_abs>1e-15f) || !isfinite(pivot_abs)) { valid=false; break; }
+      if (pivot_row!=p) {
+        for (int j=0;j<nactive;++j) {
+          float tmp=mat[p*4+j]; mat[p*4+j]=mat[pivot_row*4+j]; mat[pivot_row*4+j]=tmp;
+        }
+        float tmp=rhs[p]; rhs[p]=rhs[pivot_row]; rhs[pivot_row]=tmp;
+      }
+      float pivot=mat[p*4+p];
+      for (int r=p+1;r<nactive;++r) {
+        float factor=mat[r*4+p]/pivot;
+        for (int j=p;j<nactive;++j) mat[r*4+j]-=factor*mat[p*4+j];
+        rhs[r]-=factor*rhs[p];
+      }
+    }
+    if (!valid) continue;
+    for (int r=nactive-1;r>=0;--r) {
+      float value=rhs[r];
+      for (int j=r+1;j<nactive;++j) value-=mat[r*4+j]*x[j];
+      x[r]=value/mat[r*4+r];
+      if (!isfinite(x[r])) valid=false;
+    }
+    if (!valid) continue;
+    for (int i=0;i<nactive;++i) candidate[ids[i]]=x[i];
+    float error=0.0f, scale=1.0f, objective=0.0f;
+    for (int i=0;i<n;++i) {
+      float gradient=b[i];
+      for (int j=0;j<n;++j) gradient+=A[i*4+j]*candidate[j];
+      scale+=abs(b[i]);
+      for (int j=0;j<n;++j) scale+=abs(A[i*4+j]*candidate[j]);
+      bool active=(set & (1<<i))!=0;
+      error=max(error,active ? max(0.0f,-candidate[i]) : max(0.0f,-gradient));
+      objective+=0.5f*candidate[i]*(gradient+b[i]);
+    }
+    float scaled_error=error/scale;
+    if (scaled_error<best_error ||
+        (scaled_error==best_error && objective<best_objective)) {
+      best_error=scaled_error; best_objective=objective;
+      for (int i=0;i<4;++i) solution[i]=candidate[i];
+    }
+  }
+  return best_error;
+}
+
 // One fixed work item per eligible geometry pair. All outputs are initialized,
 // including inactive pairs, so masks are safe for downstream kernels.
 kernel void contact_normal(
@@ -270,6 +340,68 @@ kernel void solve_normal_contacts(
     diagnostics[world*2]=max_residual;
     diagnostics[world*2+1]=float(sweep+1);
     if (max_residual<1e-6f) { converged=true; break; }
+  }
+  // Scalar PGS can stagnate at low slip speeds when all four pyramidal edges
+  // are nearly dependent. Refine unresolved contacts with an exact local
+  // active-set solve (16 subsets per contact), cycling bounded contact blocks
+  // while holding other contact forces fixed. The global KKT test below still
+  // decides success for coupled contacts.
+  if (!converged) {
+    int pgs_sweeps=int(diagnostics[world*2+1]);
+    for (int refinement=0;refinement<64;++refinement) {
+      for (int contact=0;contact<nc;++contact) {
+        int local_rows[4]; int nlocal=0;
+        for (int slot=0;slot<5;++slot) {
+          int row=contact*5+slot, rb=(world*nr+row)*6;
+          if (row_data[rb]>=0.5f && nlocal<4) local_rows[nlocal++]=row;
+        }
+        if (nlocal==0) continue;
+        thread float local_A[16], local_b[4], local_solution[4];
+        for (int i=0;i<16;++i) local_A[i]=0.0f;
+        for (int i=0;i<4;++i) { local_b[i]=0.0f; local_solution[i]=0.0f; }
+        for (int i=0;i<nlocal;++i) {
+          int row=local_rows[i], rb=(world*nr+row)*6;
+          float value=-row_data[rb+3];
+          for (int k=0;k<nv;++k)
+            value+=J[jb+row*nv+k]*free_acc[world*nv+k];
+          for (int c=0;c<nr;++c) if (c/5!=contact)
+            value+=W[row*nr+c]*force[world*nr+c];
+          local_b[i]=value;
+          for (int j=0;j<nlocal;++j) {
+            int other=local_rows[j];
+            local_A[i*4+j]=W[row*nr+other]+(i==j ? R[row] : 0.0f);
+          }
+        }
+        float block_error=solve_contact_block(local_A,local_b,nlocal,local_solution);
+        if (block_error<1e-5f) for (int i=0;i<nlocal;++i)
+          force[world*nr+local_rows[i]]=max(0.0f,local_solution[i]);
+      }
+
+      // Rebuild the generalized acceleration after each contact-block sweep.
+      for (int k=0;k<nv;++k) qacc[world*nv+k]=free_acc[world*nv+k];
+      for (int row=0;row<nr;++row) for (int k=0;k<nv;++k)
+        qacc[world*nv+k]+=response[row*nv+k]*force[world*nr+row];
+
+      float max_residual=0.0f;
+      for (int row=0;row<nr;++row) {
+        int rb=(world*nr+row)*6;
+        if (row_data[rb]<0.5f) continue;
+        float ja=0.0f; for (int k=0;k<nv;++k) ja+=J[jb+row*nv+k]*qacc[world*nv+k];
+        float old=force[world*nr+row], ref=row_data[rb+3];
+        float diagonal=max(1e-15f,W[row*nr+row]+R[row]);
+        float projected=max(0.0f,old+(ref-ja-R[row]*old)/diagonal);
+        float jfree=0.0f;
+        for (int k=0;k<nv;++k) jfree+=J[jb+row*nv+k]*free_acc[world*nv+k];
+        float row_scale=abs(ref)+abs(jfree)+abs(R[row]*old);
+        for (int c=0;c<nr;++c)
+          row_scale+=abs(W[row*nr+c]*force[world*nr+c]);
+        row_scale=max(1.0f,row_scale);
+        max_residual=max(max_residual,abs(projected-old)*diagonal/row_scale);
+      }
+      diagnostics[world*2]=max_residual;
+      diagnostics[world*2+1]=float(pgs_sweeps+refinement+1);
+      if (max_residual<1e-6f) { converged=true; break; }
+    }
   }
   if (!converged) status[world]=3;
   for (int row=0;row<nr;++row) for (int k=0;k<nv;++k)

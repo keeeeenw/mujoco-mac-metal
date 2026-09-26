@@ -301,6 +301,9 @@ class MetalContact:
     ``fk`` is the dict returned by ``MetalKinematics.run_device``. ``mass`` is
     batched dense generalized inertia [batch,nv,nv], and free acceleration and
     velocity have shape [batch,nv]. Returned tensors borrow this workspace.
+    ``solver_diagnostics[:, 0]`` is the normalized projected KKT residual;
+    ``[:, 1]`` is the total sweep count, capped at 320 (256 scalar PGS plus
+    at most 64 contact-block active-set refinement sweeps).
     """
     w, torch, d = self._workspace, self._torch, self.descriptor
     def check(tensor, name, shape):
