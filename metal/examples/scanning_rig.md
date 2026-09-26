@@ -22,14 +22,14 @@ On an MPS-enabled Mac, compare native Metal with MuJoCo using the pinned Python
 environment and keep MPS fallback disabled:
 
 ```sh
-PYTORCH_ENABLE_MPS_FALLBACK=0 python metal/examples/scanning_rig.py \
+PYTHONPATH=metal PYTORCH_ENABLE_MPS_FALLBACK=0 python metal/examples/scanning_rig.py \
   --mode metal --headless --check --steps 160
 ```
 
 Save an actual rendered comparison GIF with:
 
 ```sh
-PYTORCH_ENABLE_MPS_FALLBACK=0 python metal/examples/scanning_rig.py \
+PYTHONPATH=metal PYTORCH_ENABLE_MPS_FALLBACK=0 python metal/examples/scanning_rig.py \
   --mode metal --headless --record metal/examples/assets/scanning_rig.gif \
   --record-seconds 4
 ```
@@ -37,3 +37,5 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 python metal/examples/scanning_rig.py \
 Offscreen rendering still needs MuJoCo's OpenGL renderer. The interactive mode
 uses the passive MuJoCo viewer; add `--viewer-seconds 10` to end it after ten
 seconds. `--mode cpu` runs both sides through CPU MuJoCo for a visual baseline.
+
+![Native sensor scan beside CPU reference](assets/scanning_rig.gif)
