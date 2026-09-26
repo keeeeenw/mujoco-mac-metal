@@ -1,0 +1,30 @@
+# Kinetic sculpture
+
+Four spring-driven petals fold around a fixed stem. Joint stiffness and
+damping set the motion, while body gravity compensation carries most of each
+petal's weight. A gentle alternating force and torque act at two petal centers
+to add a breeze. The model disables contacts and uses Euler integration.
+
+Run a native MPS comparison on Apple Silicon with the pinned MuJoCo 3.10.0 and
+Python 3.12 environment:
+
+```sh
+PYTHONPATH=metal PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  .venv-demo/bin/python metal/examples/kinetic_sculpture.py \
+  --mode metal --headless --check --steps 200
+```
+
+The script compares every native state against a separate CPU `mj_step`
+reference. It also has a CPU-only run for checking the model and input stream
+without initializing MPS:
+
+```sh
+PYTHONPATH=metal .venv-demo/bin/python \
+  metal/examples/kinetic_sculpture.py --mode cpu --headless --steps 200
+```
+
+This example exercises the `contact_free_passive_euler_v1` profile with four
+hinge springs, linear dampers, body gravity compensation, and per-step body
+wrenches. It is a targeted demonstration of those features; the overall
+backend remains experimental and does not support general contacts or
+constraints.
