@@ -18,8 +18,12 @@ import numpy as np
 
 def _load_model():
   model = mujoco.MjModel.from_xml_path(str(Path(__file__).with_suffix(".xml")))
-  if model.njnt != 4 or model.nu or not (
-      int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+  if (
+      model.njnt != 4
+      or model.nu
+      or not (
+          int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+      )
   ):
     raise RuntimeError("Expected four unactuated petals without contacts")
   return model
@@ -36,17 +40,17 @@ def _inputs(model, at_time):
   return wrench
 
 
-def run(steps=200, mode="metal", check=False):
+def run(steps=200, mode="metal", check=False, record=None):
   model = _load_model()
   if mode not in ("metal", "cpu"):
     raise ValueError(f"Unknown mode {mode!r}")
   qpos = model.qpos0.copy().astype(np.float32)
   qvel = np.zeros(model.nv, dtype=np.float32)
   for joint, position, velocity in (
-      ("east_fold", .18, 1.1),
-      ("north_fold", -.12, -.8),
-      ("west_fold", .1, .7),
-      ("south_fold", -.16, -1.0),
+      ("east_fold", 0.18, 1.1),
+      ("north_fold", -0.12, -0.8),
+      ("west_fold", 0.1, 0.7),
+      ("south_fold", -0.16, -1.0),
   ):
     jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint)
     qpos[int(model.jnt_qposadr[jid])] = position
@@ -70,7 +74,14 @@ def run(steps=200, mode="metal", check=False):
     )
 
   max_qpos_error = max_qvel_error = 0.0
-  for _ in range(steps):
+  recorder = None
+  if record:
+    from demo_recording import ComparisonRecorder
+
+    recorder = ComparisonRecorder(
+        model, record, "Spring flower", [0, 0, 0.9], 2.6
+    )
+  for step in range(steps):
     wrench = _inputs(model, float(reference.time))
     reference.xfrc_applied[:] = wrench[0]
     mujoco.mj_step(model, reference)
@@ -84,15 +95,29 @@ def run(steps=200, mode="metal", check=False):
         raise RuntimeError(f"native simulation status: {state.status.tolist()}")
       actual.qpos[:] = state.qpos[0]
       actual.qvel[:] = state.qvel[0]
-    max_qpos_error = max(max_qpos_error, float(np.max(np.abs(actual.qpos - reference.qpos))))
-    max_qvel_error = max(max_qvel_error, float(np.max(np.abs(actual.qvel - reference.qvel))))
+    max_qpos_error = max(
+        max_qpos_error, float(np.max(np.abs(actual.qpos - reference.qpos)))
+    )
+    max_qvel_error = max(
+        max_qvel_error, float(np.max(np.abs(actual.qvel - reference.qvel)))
+    )
+
+    if recorder:
+      recorder.frame(step, actual, reference)
+  if recorder:
+    recorder.close()
 
   result = {
       "demo": "kinetic_sculpture",
       "mode": mode,
       "steps": steps,
       "profile": "contact_free_passive_euler_v1" if native else "MuJoCo CPU",
-      "features": ["joint springs", "linear damping", "body gravity compensation", "applied body wrenches"],
+      "features": [
+          "joint springs",
+          "linear damping",
+          "body gravity compensation",
+          "applied body wrenches",
+      ],
       "max_qpos_error": max_qpos_error,
       "max_qvel_error": max_qvel_error,
   }
@@ -105,13 +130,24 @@ def run(steps=200, mode="metal", check=False):
 def main(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--mode", choices=("metal", "cpu"), default="metal")
-  parser.add_argument("--headless", action="store_true", help="Run without a viewer")
+  parser.add_argument(
+      "--headless", action="store_true", help="Run without a viewer"
+  )
   parser.add_argument("--steps", type=int, default=200)
-  parser.add_argument("--check", action="store_true", help="Check a short native-versus-CPU rollout (at most 200 steps)")
+  parser.add_argument(
+      "--check",
+      action="store_true",
+      help="Check a short native-versus-CPU rollout (at most 200 steps)",
+  )
+  parser.add_argument("--record", help="Save actual simulation frames as GIF")
   args = parser.parse_args(argv)
   if args.steps <= 0 or args.check and (not args.headless or args.steps > 200):
-    parser.error("Use positive --steps; --check requires --headless and at most 200 steps")
-  print(json.dumps(run(args.steps, args.mode, args.check), indent=2))
+    parser.error(
+        "Use positive --steps; --check requires --headless and at most 200 steps"
+    )
+  print(
+      json.dumps(run(args.steps, args.mode, args.check, args.record), indent=2)
+  )
 
 
 if __name__ == "__main__":

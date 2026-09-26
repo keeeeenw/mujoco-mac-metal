@@ -8,6 +8,7 @@
     <joint damping=".08" stiffness=".9" springref=".55"/>
     <geom contype="0" conaffinity="0" density="320"/>
   </default>
+  <visual><global offwidth="1200" offheight="720"/><headlight ambient=".5 .5 .5" diffuse=".7 .7 .7"/></visual>
   <worldbody>
     <light pos="0 -1 2"/>
     <body name="stem" pos="0 0 .8">

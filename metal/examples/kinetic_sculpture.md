@@ -28,3 +28,15 @@ hinge springs, linear dampers, body gravity compensation, and per-step body
 wrenches. It is a targeted demonstration of those features; the overall
 backend remains experimental and does not support general contacts or
 constraints.
+
+## Recorded native simulation
+
+![Spring flower: native Metal and CPU reference](assets/kinetic_sculpture.gif)
+
+```sh
+PYTHONPATH=metal PYTORCH_ENABLE_MPS_FALLBACK=0 python metal/examples/kinetic_sculpture.py --mode metal --headless --steps 1000 --record metal/examples/assets/kinetic_sculpture.gif
+```
+
+Recording uses Pillow and MuJoCo OpenGL. The 200-step M1 Max native check
+observed maximum qpos error 3.01e-7 and qvel error 1.09e-6 against CPU MuJoCo.
+The animation shows simulation time, not computation speed.
