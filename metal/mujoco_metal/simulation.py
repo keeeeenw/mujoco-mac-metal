@@ -18,6 +18,8 @@ import numbers
 
 import numpy as np
 
+from dataclasses import replace
+
 import mujoco
 
 from mujoco_metal.device_state import DeviceState
@@ -78,9 +80,11 @@ class MetalSimulation:
         if profile.name.replace("rk4", "euler")
         in (
             "contact_free_motor_euler_v1",
+            "joint_constraints_euler_v1",
             "contact_free_passive_euler_v1",
             "contact_free_sensor_euler_v1",
             "normal_contact_euler_v1",
+            "friction_contact_euler_v1",
         )
         else None
     )
@@ -128,8 +132,14 @@ class MetalSimulation:
     self._state = DeviceState(model, profile, batch_size, qpos=qpos, qvel=qvel)
     descriptor = self._state._model
     self.profile = profile
+    smooth_descriptor = descriptor
+    if with_transmissions:
+      # Fixed tendon armature is assembled separately as J.T @ armature @ J.
+      smooth_descriptor = replace(
+          descriptor, tendon_armature=np.zeros_like(descriptor.tendon_armature)
+      )
     self._smooth = MetalSmoothDynamics(
-        descriptor,
+        smooth_descriptor,
         batch_size=batch_size,
     )
     self._motor = (
@@ -142,13 +152,21 @@ class MetalSimulation:
       from mujoco_metal.transmissions import MetalTransmissions
 
       self._transmissions = MetalTransmissions(model)
+    self._tendons = None
+    self._tendon_damping = None
+    if with_transmissions and model.ntendon:
+      from mujoco_metal.tendons import MetalFixedTendonDynamics
+
+      self._tendons = MetalFixedTendonDynamics(model, batch_size)
     self._passive = None
     self._damping_tangent = None
     if (
         with_transmissions
+        or "joint_constraints" in profile.name
         or "passive" in profile.name
         or "sensor" in profile.name
-        or profile.name == "normal_contact_euler_v1"
+        or profile.name
+        in ("normal_contact_euler_v1", "friction_contact_euler_v1")
     ):
       from mujoco_metal.passive import MetalPassiveForces
 
@@ -159,8 +177,16 @@ class MetalSimulation:
       from mujoco_metal.sensors import SensorProgram
 
       self._sensors = SensorProgram(model, batch_size)
+    self._joint_constraints = None
+    if profile.name == "joint_constraints_euler_v1":
+      from mujoco_metal.joint_constraints import JointConstraintProgram
+
+      self._joint_constraints = JointConstraintProgram(model, batch_size)
     self._contact = None
-    if profile.name == "normal_contact_euler_v1" and not (
+    if profile.name in (
+        "normal_contact_euler_v1",
+        "friction_contact_euler_v1",
+    ) and not (
         int(model.opt.disableflags)
         & (
             int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
@@ -193,9 +219,11 @@ class MetalSimulation:
             "contact_free_forces_euler_v1",
             "contact_free_motor_euler_v1",
             "contact_free_transmission_euler_v1",
+            "joint_constraints_euler_v1",
             "contact_free_passive_euler_v1",
             "contact_free_sensor_euler_v1",
             "normal_contact_euler_v1",
+            "friction_contact_euler_v1",
         )
         else None
     )
@@ -385,6 +413,12 @@ class MetalSimulation:
           qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True
       )
       self._rhs.add_(passive)
+    if self._tendons is not None:
+      tendon_force, self._tendon_damping, tendon_armature = (
+          self._tendons.run_device(qpos, qvel)
+      )
+      self._rhs.add_(tendon_force)
+      dynamics["mass_matrix"].add_(tendon_armature)
     if self._transmissions is not None:
       self._rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
     if self._motor is not None:
@@ -399,11 +433,16 @@ class MetalSimulation:
       torch = self._state._torch
       status = torch.where(status == 0, contact["status"], status)
       acceleration = contact["qacc"]
-      self._rhs.add_(
-          torch.bmm(
-              contact["jacobian"].transpose(1, 2), contact["force"].unsqueeze(2)
-          ).squeeze(2)
+      self._rhs.add_(contact["qfrc_contact"])
+    if self._joint_constraints is not None:
+      constrained = self._joint_constraints.run_device(
+          dynamics["mass_matrix"], self._rhs, qpos, qvel
       )
+      status = self._state._torch.where(
+          status == 0, constrained["status"], status
+      )
+      acceleration = constrained["qacc"]
+      self._rhs.add_(constrained["qfrc_constraint"])
     return acceleration, status, dynamics
 
   def step(self, steps=1, *, qfrc_applied=None, ctrl=None, xfrc_applied=None):

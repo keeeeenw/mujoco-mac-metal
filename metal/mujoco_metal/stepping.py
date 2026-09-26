@@ -90,10 +90,18 @@ def validate_stepping_profile(
   separate from ``load_model``: generalized mass and bias queries support a
   broader model set than this stepping profile.
   """
-  if profile == "normal_contact_euler_v1":
+  if profile in ("normal_contact_euler_v1", "friction_contact_euler_v1"):
     from mujoco_metal.contact import lower_contacts
 
-    lower_contacts(model)
+    contacts = lower_contacts(model)
+    if contacts.nv > 32 or contacts.pair_count > 16:
+      raise ValueError(
+          "native contact requires nv<=32 and at most16 candidate pairs"
+      )
+    if profile == "normal_contact_euler_v1" and np.any(contacts.condim != 1):
+      raise ValueError(
+          "normal_contact_euler_v1 requires condim1; use friction_contact_euler_v1"
+      )
     reference = copy.copy(model)
     reference.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
     reference.opt.disableflags &= ~(
@@ -111,7 +119,11 @@ def validate_stepping_profile(
         supported=tuple(
             item for item in base.supported if "contact disabled" not in item
         )
-        + ("normal-only sphere/plane and sphere/sphere contact",),
+        + (
+            ("normal-only sphere/plane and sphere/sphere contact",)
+            if profile == "normal_contact_euler_v1"
+            else ("sphere/plane and sphere/sphere condim1/3 pyramidal contact",)
+        ),
         irrelevant=tuple(
             item for item in base.irrelevant if "constraint-solver" not in item
         ),
@@ -147,10 +159,16 @@ def validate_stepping_profile(
             for item in result.rejected
         ),
     )
+  with_joint_constraints = profile == "joint_constraints_euler_v1"
+  if with_joint_constraints:
+    from mujoco_metal.joint_constraints import lower_joint_constraints
+
+    lower_joint_constraints(model)
   with_transmissions = profile == "contact_free_transmission_euler_v1"
   with_sensors = profile == "contact_free_sensor_euler_v1"
   advanced_passive = profile in (
       "contact_free_transmission_euler_v1",
+      "joint_constraints_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   )
@@ -160,12 +178,14 @@ def validate_stepping_profile(
     PassiveForceModel(model)
   if profile not in (
       "contact_free_transmission_euler_v1",
+      "joint_constraints_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
       "contact_free_euler_v1",
       "contact_free_forces_euler_v1",
       "contact_free_motor_euler_v1",
       "contact_free_transmission_euler_v1",
+      "joint_constraints_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -228,6 +248,7 @@ def validate_stepping_profile(
         "contact_free_forces_euler_v1",
         "contact_free_motor_euler_v1",
         "contact_free_transmission_euler_v1",
+        "joint_constraints_euler_v1",
         "contact_free_passive_euler_v1",
         "contact_free_sensor_euler_v1",
     ) and name in (
@@ -241,6 +262,7 @@ def validate_stepping_profile(
       "contact_free_forces_euler_v1",
       "contact_free_motor_euler_v1",
       "contact_free_transmission_euler_v1",
+      "joint_constraints_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -248,6 +270,8 @@ def validate_stepping_profile(
         int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
         | int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
     )
+  if with_joint_constraints:
+    unknown_disable &= ~int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)
   if unknown_disable:
     raise ValueError(f"unsupported disable flags: 0x{unknown_disable:x}")
 
@@ -274,6 +298,7 @@ def validate_stepping_profile(
   if model.nu and profile not in (
       "contact_free_motor_euler_v1",
       "contact_free_transmission_euler_v1",
+      "joint_constraints_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -281,6 +306,7 @@ def validate_stepping_profile(
   if profile in (
       "contact_free_motor_euler_v1",
       "contact_free_transmission_euler_v1",
+      "joint_constraints_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -290,6 +316,9 @@ def validate_stepping_profile(
       from mujoco_metal.transmissions import TransmissionModel
 
       TransmissionModel(model)
+      from mujoco_metal.tendons import FixedTendonModel
+
+      FixedTendonModel(model)
     else:
       ScalarMotorModel.from_model(model)
     motor_supported = (
@@ -305,19 +334,17 @@ def validate_stepping_profile(
   if model.ntendon:
     if not with_transmissions:
       raise ValueError("tendons, including tendon armature, are unsupported")
-    if (
-        np.any(model.tendon_armature)
-        or np.any(model.tendon_limited)
-        or np.any(model.tendon_actfrclimited)
-    ):
+    if np.any(model.tendon_limited) or np.any(model.tendon_actfrclimited):
       raise ValueError("tendon armature and tendon limits are unsupported")
     if np.any(model.wrap_type != int(mujoco.mjtWrap.mjWRAP_JOINT)):
       raise ValueError("only fixed joint tendons are supported")
-  if model.neq:
+  if model.neq and not with_joint_constraints:
     raise ValueError("equality constraints are unsupported")
-  if np.any(model.jnt_limited):
+  if np.any(model.jnt_limited) and not with_joint_constraints:
     raise ValueError("joint limits are unsupported, including delayed limits")
-  if np.any(model.dof_frictionloss) or np.any(model.tendon_frictionloss):
+  if (np.any(model.dof_frictionloss) and not with_joint_constraints) or np.any(
+      model.tendon_frictionloss
+  ):
     raise ValueError("friction loss is unsupported")
   if model.nflex or model.nflexvert or model.nflexelem:
     raise ValueError("flex/deformable elements are unsupported")
@@ -352,9 +379,13 @@ def validate_stepping_profile(
       np.any(model.jnt_stiffness) or np.any(model.jnt_stiffnesspoly)
   ) and not advanced_passive:
     raise ValueError("joint stiffness and springs are unsupported")
-  if np.any(model.tendon_damping) or np.any(model.tendon_dampingpoly):
+  if (
+      np.any(model.tendon_damping) or np.any(model.tendon_dampingpoly)
+  ) and not with_transmissions:
     raise ValueError("tendon damping is unsupported")
-  if np.any(model.tendon_stiffness) or np.any(model.tendon_stiffnesspoly):
+  if (
+      np.any(model.tendon_stiffness) or np.any(model.tendon_stiffnesspoly)
+  ) and not with_transmissions:
     raise ValueError("tendon stiffness is unsupported")
   if opt.density != 0 or opt.viscosity != 0 or np.any(opt.wind):
     raise ValueError("fluid forces are unsupported")
@@ -385,6 +416,7 @@ def validate_stepping_profile(
                   "contact_free_forces_euler_v1",
                   "contact_free_motor_euler_v1",
                   "contact_free_transmission_euler_v1",
+                  "joint_constraints_euler_v1",
                   "contact_free_passive_euler_v1",
                   "contact_free_sensor_euler_v1",
               )
@@ -392,18 +424,31 @@ def validate_stepping_profile(
           )
           + motor_supported
           + (
+              (
+                  "scalar joint limits, DOF frictionloss and polynomial joint equality",
+              )
+              if with_joint_constraints
+              else ()
+          )
+          + (
               ("rigid joint linear/polynomial springs and damping",)
               if advanced_passive
               else ()
           )
       ),
       irrelevant=(
-          tuple(item for item in _IRRELEVANT if "disable flags" not in item)
+          tuple(
+              item
+              for item in _IRRELEVANT
+              if "disable flags" not in item
+              and not (with_joint_constraints and "constraint-solver" in item)
+          )
           if profile
           in (
               "contact_free_forces_euler_v1",
               "contact_free_motor_euler_v1",
               "contact_free_transmission_euler_v1",
+              "joint_constraints_euler_v1",
               "contact_free_passive_euler_v1",
               "contact_free_sensor_euler_v1",
           )
@@ -423,6 +468,7 @@ def validate_stepping_profile(
                       "contact_free_forces_euler_v1",
                       "contact_free_motor_euler_v1",
                       "contact_free_transmission_euler_v1",
+                      "joint_constraints_euler_v1",
                       "contact_free_passive_euler_v1",
                       "contact_free_sensor_euler_v1",
                   )
@@ -430,8 +476,21 @@ def validate_stepping_profile(
               and not (advanced_passive and item == "body gravity compensation")
               and not (with_sensors and item == "sensors")
               and not (
+                  with_joint_constraints
+                  and item
+                  in (
+                      "equality constraints",
+                      "joint or tendon limits, even if not active at the initial state",
+                      "joint or tendon friction loss",
+                  )
+              )
+              and not (
                   with_transmissions
-                  and item == "tendons, including tendon armature"
+                  and item
+                  in (
+                      "tendons, including tendon armature",
+                      "tendon damping and stiffness",
+                  )
               )
               and not (
                   "actuators and actuator state" in item
@@ -439,6 +498,7 @@ def validate_stepping_profile(
                   in (
                       "contact_free_motor_euler_v1",
                       "contact_free_transmission_euler_v1",
+                      "joint_constraints_euler_v1",
                       "contact_free_passive_euler_v1",
                       "contact_free_sensor_euler_v1",
                   )
@@ -446,8 +506,15 @@ def validate_stepping_profile(
           )
           + (
               (
+                  "non-joint equalities, ball/tendon limits, tendon frictionloss, contacts, warmstart and general solver configuration",
+              )
+              if with_joint_constraints
+              else ()
+          )
+          + (
+              (
                   (
-                      "stateful actuators, spatial tendons, wrapping, tendon armature, "
+                      "stateful actuators, spatial tendons, wrapping, "
                       "non-affine gains/biases, actuator damping and force-limit routing"
                       if with_transmissions
                       else "unsupported actuator state, plugins, non-joint transmissions, "
@@ -459,6 +526,7 @@ def validate_stepping_profile(
               in (
                   "contact_free_motor_euler_v1",
                   "contact_free_transmission_euler_v1",
+                  "joint_constraints_euler_v1",
                   "contact_free_passive_euler_v1",
                   "contact_free_sensor_euler_v1",
               )
@@ -471,6 +539,7 @@ def validate_stepping_profile(
               "contact_free_forces_euler_v1",
               "contact_free_motor_euler_v1",
               "contact_free_transmission_euler_v1",
+              "joint_constraints_euler_v1",
               "contact_free_passive_euler_v1",
               "contact_free_sensor_euler_v1",
           )
@@ -486,6 +555,7 @@ def validate_stepping_profile(
               "contact_free_forces_euler_v1",
               "contact_free_motor_euler_v1",
               "contact_free_transmission_euler_v1",
+              "joint_constraints_euler_v1",
               "contact_free_passive_euler_v1",
               "contact_free_sensor_euler_v1",
           )
