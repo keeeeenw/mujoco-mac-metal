@@ -9,7 +9,6 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-
 _BODY_NAMES = ("low_friction", "medium_friction", "high_friction")
 
 
@@ -59,8 +58,13 @@ def run(steps=600, mode="metal", check=False, record=None):
     from demo_recording import ComparisonRecorder
 
     recorder = ComparisonRecorder(
-        model, record, "Friction laboratory", [0.25, 0.0, 0.12], 3.1,
-        azimuth=110, elevation=-42,
+        model,
+        record,
+        "Friction laboratory",
+        [0.25, 0.0, 0.12],
+        3.1,
+        azimuth=110,
+        elevation=-42,
     )
   max_qpos_error = max_qvel_error = 0.0
   contact_steps = 0
@@ -86,7 +90,9 @@ def run(steps=600, mode="metal", check=False, record=None):
     contact_steps += int(reference.ncon > 0)
     if recorder:
       recorder.frame(
-          step, actual, reference,
+          step,
+          actual,
+          reference,
           extra=f"μ = 0.01 / 0.12 / 1.00 | {reference.ncon} CPU contacts",
       )
   if recorder:
@@ -97,10 +103,15 @@ def run(steps=600, mode="metal", check=False, record=None):
     jnt = int(model.body_jntadr[body])
     dof = int(model.jnt_dofadr[jnt])
     body_states[name] = {
-        "x_displacement": float(actual.qpos[int(model.jnt_qposadr[jnt])] - qpos[int(model.jnt_qposadr[jnt])]),
+        "x_displacement": float(
+            actual.qpos[int(model.jnt_qposadr[jnt])]
+            - qpos[int(model.jnt_qposadr[jnt])]
+        ),
         "slide_speed": float(np.linalg.norm(actual.qvel[dof : dof + 3])),
         "spin_speed": float(np.linalg.norm(actual.qvel[dof + 3 : dof + 6])),
-        "x_slip_speed": float(abs(actual.qvel[dof] - 0.12 * actual.qvel[dof + 4])),
+        "x_slip_speed": float(
+            abs(actual.qvel[dof] - 0.12 * actual.qvel[dof + 4])
+        ),
     }
   result = {
       "demo": "friction_laboratory",
@@ -117,8 +128,10 @@ def run(steps=600, mode="metal", check=False, record=None):
   }
   if check and mode == "metal":
     if contact_steps < steps // 2 or peak_contacts < 3:
-      raise AssertionError("friction laboratory did not exercise sustained contacts")
-    if max_qpos_error > 0.08 or max_qvel_error > 0.8:
+      raise AssertionError(
+          "friction laboratory did not exercise sustained contacts"
+      )
+    if max_qpos_error > 2e-4 or max_qvel_error > 2e-4:
       raise AssertionError(json.dumps(result, indent=2))
   return result
 
@@ -126,14 +139,31 @@ def run(steps=600, mode="metal", check=False, record=None):
 def main(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--mode", choices=("metal", "cpu"), default="metal")
-  parser.add_argument("--headless", action="store_true", help="Run without a viewer")
+  parser.add_argument(
+      "--headless", action="store_true", help="Run without a viewer"
+  )
   parser.add_argument("--steps", type=int, default=600)
-  parser.add_argument("--check", action="store_true", help="Check native state against CPU MuJoCo")
-  parser.add_argument("--record", help="Optionally save side-by-side actual simulation frames as a GIF")
+  parser.add_argument(
+      "--check",
+      action="store_true",
+      help="Check native state against CPU MuJoCo",
+  )
+  parser.add_argument(
+      "--record",
+      help="Optionally save side-by-side actual simulation frames as a GIF",
+  )
   args = parser.parse_args(argv)
-  if args.steps <= 0 or args.check and (not args.headless or args.mode != "metal"):
-    parser.error("Use positive --steps; --check requires --headless and --mode metal")
-  print(json.dumps(run(args.steps, args.mode, args.check, args.record), indent=2))
+  if (
+      args.steps <= 0
+      or args.check
+      and (not args.headless or args.mode != "metal")
+  ):
+    parser.error(
+        "Use positive --steps; --check requires --headless and --mode metal"
+    )
+  print(
+      json.dumps(run(args.steps, args.mode, args.check, args.record), indent=2)
+  )
 
 
 if __name__ == "__main__":
