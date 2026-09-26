@@ -34,3 +34,11 @@ offset COM, solves the corresponding analytic midpoint translation. The CPU
 test suite compares qpos, qvel, and reported qacc against actual `mj_step`,
 including an articulated free-body tree that correctly remains on the
 ordinary implicitfast path.
+
+![Native Metal and CPU off-center balance workshop](assets/offcenter_balance.gif)
+
+The recorded 1,800-step run has maximum absolute qpos/qvel differences of
+`3.20e-5` / `2.58e-5`. Each panel plots its own measured trajectories relative
+to each body's initial center of mass, in the labeled world-coordinate plane.
+The faint circles have radius 0.1 m. These checks describe this fixture; the
+clip is not a performance comparison.

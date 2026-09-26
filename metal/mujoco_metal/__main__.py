@@ -72,6 +72,7 @@ def preflight(model_path=None, include_inventory=False):
               "joint_constraints",
               "fluid",
               "implicit",
+              "implicit_midpoint",
           )
       },
   }
@@ -144,7 +145,7 @@ def preflight(model_path=None, include_inventory=False):
           "collision": "narrowly qualified plane-sphere and sphere-sphere normal contact",
           "constraints": "bounded normal/pyramidal sphere contact and scalar joint constraints; wider families incomplete",
           "fluid": "bounded inertia-box drag, viscosity and wind; no geom-fluid model",
-          "implicitfast": "bounded non-free rigid joints; no midpoint or full implicit",
+          "implicitfast": "bounded rigid joints and eligible free-body midpoint; no full implicit",
           "sensors": "bounded current-state joint/frame/clock/gyro/velocity queries; not full mj_step sensor timing",
           "rendering": "unsupported",
       },

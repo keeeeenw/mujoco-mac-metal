@@ -374,7 +374,7 @@ def _inventory():
       (
           "bounded implicitfast",
           Stage.INTEGRATION,
-          "non-free rigid joints, constant damping and scalar motors; free-body midpoint and full implicit remain unsupported",
+          "rigid joints, constant damping, scalar motors and eligible free-body midpoint; full implicit remains unsupported",
       ),
       (
           "current-state sensor queries",

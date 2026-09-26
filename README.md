@@ -104,7 +104,7 @@ branch adds bounded RK4/implicitfast, passive and fluid forces, fixed-tendon
 servos, sensor queries, sphere contact and joint-constraint profiles, each with
 explicit guards. These are partial implementations:
 remaining contact/constraint families, stateful actuation, spatial tendons,
-geom-level fluid models, full implicit/free-body midpoint integration and broader sensors/model/API coverage still need
+geom-level fluid models, full implicit integration and broader sensors/model/API coverage still need
 implementation and qualification. Native rendering and training integration
 remain outside the implemented scope. Per-environment model randomization is not connected to
 native stepping. Linux/CUDA integration and other Apple hardware/OS combinations

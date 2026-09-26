@@ -1,7 +1,7 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
 
-"""Bounded native implicitfast velocity solve for rigid non-free joints."""
+"""Bounded native implicitfast velocity solve for rigid joints."""
 
 from dataclasses import dataclass
 from pathlib import Path

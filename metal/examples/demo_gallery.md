@@ -15,6 +15,7 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Clockwork automaton](clockwork_automaton.md) | Counter-rotating gears and a sequenced pawl | Polynomial joint equality, limits and dry joint friction |
 | [Current-driven bodies](fluid_buoys.md) | Colorful shapes drift and rotate in a current | MuJoCo inertia-box fluid drag and viscosity |
 | [Mechanical wave lattice](wave_lattice.md) | A motor drives a chain of colored articulated links | Bounded implicitfast integration |
+| [Off-center balance workshop](offcenter_balance.md) | L-shaped tools spin around stationary centers of mass with measured orbit plots | Free-body implicitfast midpoint, including offset COMs |
 | [Chaotic pendulum](README.md) | Four connected arms swing and tumble | Generalized rigid-body mass and bias |
 
 The development demos may require newer source than the latest PyPI release.

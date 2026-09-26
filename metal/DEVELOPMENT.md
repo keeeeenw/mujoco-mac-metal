@@ -6,9 +6,9 @@ The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
 
-The current regression checkpoint passed **240 tests with native GPU execution
-enabled**. A separate environment without Torch passed **131 CPU tests**, with
-106 GPU checks skipped. These counts describe the source snapshot and do not
+The current regression checkpoint passed **257 tests with native GPU execution
+enabled**. A separate environment without Torch passed **138 CPU tests**, with
+116 GPU checks skipped. These counts describe the source snapshot and do not
 establish coverage of every MuJoCo feature.
 
 ## Qualified increments
@@ -20,7 +20,7 @@ establish coverage of every MuJoCo feature.
 | Stateless scalar servos, fixed/affine gain and affine bias, fixed-joint tendon transmissions plus spring/damping/armature | `contact_free_transmission_euler_v1`, `contact_free_transmission_rk4_v1` | Force stage and 400-step trajectories against CPU; [cable plotter](examples/cable_plotter.md) |
 | Joint, quaternion, frame, clock, gyro and velocimeter sensor queries | `contact_free_sensor_euler_v1`, `contact_free_sensor_rk4_v1` | Current-state queries, reset/restore and CPU sensor oracles; [scanning rig](examples/scanning_rig.md) |
 | Inertia-box body fluid drag, viscosity and wind | `contact_free_fluid_euler_v1`, `contact_free_fluid_rk4_v1` | Rotated articulated-body forces and 400-step trajectories; [current-driven bodies](examples/fluid_buoys.md) |
-| Non-free-joint implicitfast with constant DOF damping | `contact_free_implicitfast_v1` | Mixed ball/hinge/slide trajectories and physical qacc; [mechanical wave lattice](examples/wave_lattice.md) |
+| Implicitfast with constant DOF damping and eligible free-body midpoint | `contact_free_implicitfast_v1` | Mixed ball/hinge/slide and standalone/articulated free-body trajectories, source-exact qacc and replay; [mechanical wave lattice](examples/wave_lattice.md) and [off-center balance workshop](examples/offcenter_balance.md) |
 | Scalar joint limits, frictionloss and polynomial equality | `joint_constraints_euler_v1` | Coupled forces, disabled/active rows, 300-step trajectories and replay; [clockwork automaton](examples/clockwork_automaton.md) |
 | Pyramidal condim3 sphere contact | `friction_contact_euler_v1` | Rotated/offset direct-force oracle, sliding/re-impact/separation trajectories; bounded block refinement for sliding-to-rolling transitions; [friction laboratory](examples/friction_laboratory.md) |
 | Plane–sphere and sphere–sphere normal contact | `normal_contact_euler_v1` | Coupled contact forces, 500-step drop/stack and checkpoint replay; [marble cascade](examples/marble_cascade.md) |
@@ -35,6 +35,11 @@ capacities fail at construction.
 It does **not** reproduce MuJoCo `mj_step`'s stored pre-integration sensor timing.
 Unsupported sensor types, delay/history/noise features and callbacks are
 rejected. Native stepping remains separate from OpenGL visualization.
+
+Implicitfast uses midpoint correction only for source-eligible standalone free
+bodies. Other free trees retain ordinary implicitfast integration. Its reported
+`qacc` follows MuJoCo 3.10: midpoint DOFs store the velocity difference divided
+by the timestep; other DOFs keep the forward acceleration.
 
 ## Demo evidence
 
@@ -57,6 +62,8 @@ not throughput measurements. [Explore the gallery](examples/demo_gallery.md).
   `5.43e-6` / `5.00e-7`.
 - Mechanical wave lattice: 2,400 steps; maximum qpos/qvel differences
   `8.51e-6` / `2.65e-5`.
+- Off-center balance workshop: 1,800 steps; maximum qpos/qvel differences
+  `3.20e-5` / `2.58e-5`, with independently measured CPU/native COM and origin trails.
 - Sensor scanning rig: 2,000 steps (four simulated seconds); maximum qpos/qvel
   differences `6.53e-6` / `6.64e-6`, maximum current sensor difference `7.49e-5`
   across the fixture's mixed sensor units, including accumulated float32 time.
@@ -67,7 +74,7 @@ These measured errors describe the fixtures, not universal tolerances.
 
 Remaining work includes wider collision geometry, friction and constraint
 families, warm starting and solver settings, spatial/wrapped tendon dynamics,
-stateful and muscle actuators, geom-level fluid/lift models, full implicit and free-joint implicitfast midpoint, remaining sensor
+stateful and muscle actuators, geom-level fluid/lift models, full implicit and wider velocity derivatives, remaining sensor
 families and exact stage/history semantics, mocap, flex, plugins, mutable model
 and broader API behavior. Each needs its own source-derived implementation,
 negative capability guards and CPU-reference numerical qualification. A small
