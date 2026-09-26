@@ -28,3 +28,5 @@ Record the actual native/CPU renders:
 ```bash
 PYTHONPATH=metal python metal/examples/wave_lattice.py --record metal/examples/assets/wave_lattice.gif --steps 2400
 ```
+
+![Native implicitfast mechanical wave lattice beside CPU MuJoCo](assets/wave_lattice.gif)

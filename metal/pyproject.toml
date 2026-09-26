@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mujoco-mac-metal"
-version = "0.3.0"
-description = "Experimental generalized MuJoCo Metal contact-free stepping profile"
+version = "0.4.0.dev0"
+description = "Experimental generalized MuJoCo Metal physics profiles"
 readme = "PYPI_README.md"
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"

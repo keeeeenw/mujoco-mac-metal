@@ -1,10 +1,15 @@
 # Native physics development coverage
 
-This branch extends the published **0.3.0** package. Use the source checkout
+This unreleased **0.4.0.dev0** branch extends the published **0.3.0** package. Use the source checkout
 with `PYTHONPATH=metal`; installing 0.3.0 does not provide these new profiles.
 The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
+
+The current regression checkpoint passed **240 tests with native GPU execution
+enabled**. A separate environment without Torch passed **131 CPU tests**, with
+106 GPU checks skipped. These counts describe the source snapshot and do not
+establish coverage of every MuJoCo feature.
 
 ## Qualified increments
 
@@ -12,8 +17,12 @@ increments, not full MuJoCo compatibility or new performance results.
 |---|---|---|
 | Quaternion-aware RK4 | `contact_free_rk4_v1`, force/motor/passive/sensor/transmission RK4 variants | Mixed-joint trajectories; [tumbling toys](examples/tumbling_toys.md) |
 | Rigid joint springs, polynomial damping, body gravity compensation and Cartesian body forces | `contact_free_passive_euler_v1`, `contact_free_passive_rk4_v1` | Euler/RK4 trajectories, disable flags and applied-wrench checks; [spring flower](examples/kinetic_sculpture.md) |
-| Stateless scalar servos, fixed/affine gain and affine bias, fixed-joint tendon transmissions | `contact_free_transmission_euler_v1`, `contact_free_transmission_rk4_v1` | Force stage and 400-step trajectories against CPU; [cable plotter](examples/cable_plotter.md) |
+| Stateless scalar servos, fixed/affine gain and affine bias, fixed-joint tendon transmissions plus spring/damping/armature | `contact_free_transmission_euler_v1`, `contact_free_transmission_rk4_v1` | Force stage and 400-step trajectories against CPU; [cable plotter](examples/cable_plotter.md) |
 | Joint, quaternion, frame, clock, gyro and velocimeter sensor queries | `contact_free_sensor_euler_v1`, `contact_free_sensor_rk4_v1` | Current-state queries, reset/restore and CPU sensor oracles; [scanning rig](examples/scanning_rig.md) |
+| Inertia-box body fluid drag, viscosity and wind | `contact_free_fluid_euler_v1`, `contact_free_fluid_rk4_v1` | Rotated articulated-body forces and 400-step trajectories; [current-driven bodies](examples/fluid_buoys.md) |
+| Non-free-joint implicitfast with constant DOF damping | `contact_free_implicitfast_v1` | Mixed ball/hinge/slide trajectories and physical qacc; [mechanical wave lattice](examples/wave_lattice.md) |
+| Scalar joint limits, frictionloss and polynomial equality | `joint_constraints_euler_v1` | Coupled forces, disabled/active rows, 300-step trajectories and replay; [clockwork automaton](examples/clockwork_automaton.md) |
+| Pyramidal condim3 sphere contact | `friction_contact_euler_v1` | Rotated/offset direct-force oracle, sliding/re-impact/separation trajectories; bounded block refinement for sliding-to-rolling transitions; [friction laboratory](examples/friction_laboratory.md) |
 | Plane–sphere and sphere–sphere normal contact | `normal_contact_euler_v1` | Coupled contact forces, 500-step drop/stack and checkpoint replay; [marble cascade](examples/marble_cascade.md) |
 
 Profiles deliberately reject unimplemented combinations. For example, the
@@ -40,6 +49,14 @@ not throughput measurements. [Explore the gallery](examples/demo_gallery.md).
   `1.36e-7` / `1.51e-7`.
 - Marble cascade: 600 steps, 560 steps with CPU-reference contacts, peak four
   contacts; maximum qpos/qvel differences `1.67e-5` / `2.76e-5`.
+- Friction laboratory: 600 sustained-contact steps; maximum qpos/qvel
+  differences `7.52e-6` / `4.80e-6`.
+- Clockwork automaton: 1,800 steps; maximum qpos/qvel differences
+  `7.23e-6` / `2.63e-5`.
+- Inertia-box current drift: 1,200 steps; maximum qpos/qvel differences
+  `5.43e-6` / `5.00e-7`.
+- Mechanical wave lattice: 2,400 steps; maximum qpos/qvel differences
+  `8.51e-6` / `2.65e-5`.
 - Sensor scanning rig: 2,000 steps (four simulated seconds); maximum qpos/qvel
   differences `6.53e-6` / `6.64e-6`, maximum current sensor difference `7.49e-5`
   across the fixture's mixed sensor units, including accumulated float32 time.
@@ -50,7 +67,7 @@ These measured errors describe the fixtures, not universal tolerances.
 
 Remaining work includes wider collision geometry, friction and constraint
 families, warm starting and solver settings, spatial/wrapped tendon dynamics,
-stateful and muscle actuators, fluids, implicit integrators, remaining sensor
+stateful and muscle actuators, geom-level fluid/lift models, full implicit and free-joint implicitfast midpoint, remaining sensor
 families and exact stage/history semantics, mocap, flex, plugins, mutable model
 and broader API behavior. Each needs its own source-derived implementation,
 negative capability guards and CPU-reference numerical qualification. A small

@@ -68,6 +68,10 @@ def preflight(model_path=None, include_inventory=False):
               "transmissions",
               "sensors",
               "contact",
+              "tendons",
+              "joint_constraints",
+              "fluid",
+              "implicit",
           )
       },
   }
@@ -134,11 +138,13 @@ def preflight(model_path=None, include_inventory=False):
               "narrowly GPU-qualified on M1; scalar hinge/slide motors, "
               "clipping and disable flags; 15 independent 1000-step trajectories"
           ),
-          "full_stepping": "unsupported beyond bounded Euler/RK4 profiles; see DEVELOPMENT.md",
+          "full_stepping": "unsupported beyond bounded Euler/RK4/implicitfast profiles; see DEVELOPMENT.md",
           "passive": "narrowly qualified rigid springs, polynomial damping, Cartesian wrenches and gravcomp",
           "transmissions": "narrowly qualified stateless scalar servos and fixed-joint tendons",
           "collision": "narrowly qualified plane-sphere and sphere-sphere normal contact",
-          "constraints": "bounded normal-contact solve only; wider families in development",
+          "constraints": "bounded normal/pyramidal sphere contact and scalar joint constraints; wider families incomplete",
+          "fluid": "bounded inertia-box drag, viscosity and wind; no geom-fluid model",
+          "implicitfast": "bounded non-free rigid joints; no midpoint or full implicit",
           "sensors": "bounded current-state joint/frame/clock/gyro/velocity queries; not full mj_step sensor timing",
           "rendering": "unsupported",
       },

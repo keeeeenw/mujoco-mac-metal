@@ -30,3 +30,5 @@ OpenGL context:
 PYTHONPATH=metal .venv-demo/bin/python metal/examples/fluid_buoys.py \
   --mode metal --steps 600 --record metal/examples/assets/fluid_buoys.gif
 ```
+
+![Native inertia-box current drift beside CPU MuJoCo](assets/fluid_buoys.gif)

@@ -2,13 +2,13 @@
 
 > **Development branch:** the published 0.3.0 release has the bounded
 > contact-free Euler features documented below. New source profiles add RK4,
-> rigid passive forces, stateless joint/tendon servos, current-state sensors
-> and normal sphere contact. See [development coverage](DEVELOPMENT.md) and the
+> rigid passive forces, stateless joint/tendon servos, current-state sensors,
+> body-fluid drag, bounded implicitfast, sphere contact and joint constraints. See [development coverage](DEVELOPMENT.md) and the
 > [creative demo gallery](examples/demo_gallery.md) for scope and evidence.
 > These increments do not establish full MuJoCo support.
 
 
-**Current status: experimental contact-free stepping, not a complete simulation backend.**
+**Current status: experimental bounded native stepping, not a complete simulation backend.**
 This generalized branch computes kinematics, `M(q)`, and inertial/gravity bias,
 solves dense SPD systems, integrates state, and provides a narrowly qualified
 native `contact_free_euler_v1` simulation profile. It does not replace `mj_step`
@@ -47,7 +47,7 @@ results when retaining them beyond the next invocation.
 
 `simulation.step()` returns a borrowed MPS status vector. Solver and integration failures are per-world; a failed world keeps its state and its first nonzero status remains sticky until reset or restore. State views are copies; snapshots and resets cross the host/device boundary and belong outside the hot step loop. Position, velocity, acceleration, and simulation time use float32 on device. In particular, time's representable increment gets coarser as elapsed time grows.
 
-Run the opt-in GPU correctness tests only on an available Apple GPU with the pinned Torch extra installed: `MUJOCO_METAL_RUN_GPU=1 python -m pytest -m gpu`. Ordinary `python -m pytest` runs CPU tests and skips the GPU cases. `preflight` remains CPU-only: shader hashes and stage labels are inventory, not a device probe. The overall GPU-qualified field stays false because contacts and the full backend remain unsupported. The standalone source tree carries the Apache 2.0 license and notices.
+Run the opt-in GPU correctness tests only on an available Apple GPU with the pinned Torch extra installed: `MUJOCO_METAL_RUN_GPU=1 python -m pytest -m gpu`. Ordinary `python -m pytest` runs CPU tests and skips the GPU cases. `preflight` remains CPU-only: shader hashes and stage labels are inventory, not a device probe. The overall GPU-qualified field stays false because full-library physics coverage remains incomplete. The standalone source tree carries the Apache 2.0 license and notices.
 
 ## Applied forces, damping and basic motors
 
@@ -285,10 +285,11 @@ dependencies of this package. The
 The current validation covers batched kinematics, dense mass matrices,
 inertial/gravity bias, dense SPD solves, joint-coordinate integration, and the
 bounded `contact_free_euler_v1` pipeline on local M1 fixtures compared with
-MuJoCo 3.10. Explicit additional profiles cover generalized forces, linear damping and
-bounded scalar motors. Contacts, constraints, general actuation, other passive
-forces, tendons, native rendering, training and full-library coverage remain
-unsupported. Features outside the selected profile are rejected.
+MuJoCo 3.10. Additional development profiles cover bounded springs, fluids,
+servos/fixed tendons, RK4/implicitfast, sphere contact, joint constraints and
+current-state sensors. [Development coverage](DEVELOPMENT.md) lists each subset,
+its CPU-reference evidence and the substantial remaining gaps. Native rendering,
+training and full-library coverage remain unsupported. Features outside the selected profile are rejected.
 Validation of a separate robot-specific backend does not extend this
 generalized package's coverage.
 

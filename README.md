@@ -26,9 +26,9 @@ available alongside the optional package.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
   plus bounded hinge/slide motors with clipping and disable flags. Separate
   profiles preserve the original unforced baseline.
-- **Development physics coverage:** contact-free RK4, rigid springs and body
-  forces, stateless tendon servos, selected sensor queries, and a normal-contact
-  slice have CPU-reference checks. See the [precise development coverage](metal/DEVELOPMENT.md).
+- **Development physics coverage:** RK4 and bounded implicitfast, springs and body
+  forces, inertia-box fluid drag, fixed-tendon dynamics, selected sensor queries,
+  sphere contact and joint constraints have CPU-reference checks. See the [precise development coverage](metal/DEVELOPMENT.md).
 - **Tools and documentation:** creative simulation demos, capability inventory,
   runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.
 - **Upstream regression coverage:** an `mj_setConst` inertial-update roundtrip test
@@ -100,10 +100,11 @@ use its isolated installation instructions rather than treating the newer
 surrounding MuJoCo source version as the qualified runtime.
 
 The published 0.3.0 profiles require contact-free Euler models. This development
-branch adds bounded RK4, passive force, servo, sensor-query and normal-contact
-profiles, each with explicit guards. These are partial implementations:
+branch adds bounded RK4/implicitfast, passive and fluid forces, fixed-tendon
+servos, sensor queries, sphere contact and joint-constraint profiles, each with
+explicit guards. These are partial implementations:
 remaining contact/constraint families, stateful actuation, spatial tendons,
-fluids, implicit integrators and broader sensors/model/API coverage still need
+geom-level fluid models, full implicit/free-body midpoint integration and broader sensors/model/API coverage still need
 implementation and qualification. Native rendering and training integration
 remain outside the implemented scope. Per-environment model randomization is not connected to
 native stepping. Linux/CUDA integration and other Apple hardware/OS combinations

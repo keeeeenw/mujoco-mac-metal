@@ -349,17 +349,32 @@ def _inventory():
       (
           "rigid passive forces",
           Stage.DYNAMICS,
-          "joint springs, polynomial damping, gravcomp and Cartesian body forces; no fluids or general tendon passive forces",
+          "joint springs, polynomial damping, gravcomp and Cartesian body forces; wider force families are separate stages",
       ),
       (
           "stateless scalar transmissions",
           Stage.DYNAMICS,
-          "fixed/affine gains and affine biases, scalar joints and fixed joint tendons; no activation state or spatial tendon wrapping",
+          "fixed/affine gains and affine biases, scalar joints and fixed joint tendons with spring/damping/armature; no activation state or spatial wrapping",
       ),
       (
           "normal contact slice",
           Stage.CONSTRAINTS,
           "plane-sphere/sphere-sphere condim1; nv<=32, <=16 candidates, Euler only; no broad geometry/constraint coverage",
+      ),
+      (
+          "joint constraints",
+          Stage.CONSTRAINTS,
+          "scalar limits, DOF frictionloss, polynomial joint equality; no other equality families, contact coupling or general solver configuration",
+      ),
+      (
+          "inertia-box fluid",
+          Stage.DYNAMICS,
+          "body drag, viscosity and wind; no geom ellipsoid, lift or buoyancy",
+      ),
+      (
+          "bounded implicitfast",
+          Stage.INTEGRATION,
+          "non-free rigid joints, constant damping and scalar motors; free-body midpoint and full implicit remain unsupported",
       ),
       (
           "current-state sensor queries",

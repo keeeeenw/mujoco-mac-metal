@@ -10,3 +10,11 @@ PYTHONPATH=metal/examples:metal python metal/examples/friction_laboratory.py --m
 ```
 
 To save the side-by-side native and CPU rendering as a GIF, pass `--record metal/examples/assets/friction_laboratory.gif`.
+
+![Native Metal and CPU MuJoCo friction laboratory](assets/friction_laboratory.gif)
+
+The recorded 600-step run kept all three contacts active. Maximum absolute
+qpos/qvel differences were `7.52e-6` / `4.80e-6`. These are fixture-specific
+correctness results, not throughput measurements. The bounded solver retains
+an explicit nonconvergence status; the sliding-to-rolling case is a regression
+test for its contact-block refinement.

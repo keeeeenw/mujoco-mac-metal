@@ -24,3 +24,5 @@ GIF plays those recorded frames at 25 frames per second; recording time does
 not represent simulation speed. `--check` runs 600 Euler steps at 2 ms each,
 requires sustained contact, and bounds maximum position and velocity error
 against CPU MuJoCo.
+
+![Native marble collisions beside CPU MuJoCo](assets/marble_cascade.gif)

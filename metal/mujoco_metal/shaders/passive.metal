@@ -115,6 +115,7 @@ kernel void project_body_wrenches(
     constant int* dims [[buffer(14)]],
     device float* qfrc [[buffer(15)]],
     uint world [[thread_position_in_grid]]) {
+  (void)jnt_bodyid;  // Reserved metadata binding; ancestry uses body_jntadr.
   int nbody=dims[0], njnt=dims[1], nv=dims[2], gravity_disabled=dims[3];
   uint forcebase=world*uint(nv), bodybase=world*uint(nbody), jointbase=world*uint(njnt);
   for (int i=0;i<nbody*6;++i) {
