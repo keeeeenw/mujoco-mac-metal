@@ -14,22 +14,23 @@ static float4 get4(device const float* a, uint i) { return float4(a[i],a[i+1],a[
 
 kernel void inertia_box_fluid(
     device const int* parent [[buffer(0)]],
-    device const int* body_jntadr [[buffer(1)]],
-    device const int* body_jntnum [[buffer(2)]],
-    device const int* jnt_type [[buffer(3)]],
-    device const int* jnt_dofadr [[buffer(4)]],
-    device const float* body_mass [[buffer(5)]],
-    device const float* body_inertia [[buffer(6)]],
-    device const float* body_quat [[buffer(7)]],
-    device const float* inertial_pos [[buffer(8)]],
-    device const float* inertial_quat [[buffer(9)]],
-    device const float* cvel [[buffer(10)]],
-    device const float* root_com [[buffer(11)]],
-    device const float* joint_anchor [[buffer(12)]],
-    device const float* joint_axis [[buffer(13)]],
-    device const float* fluid [[buffer(14)]],
-    constant int* dims [[buffer(15)]],
-    device float* qfrc [[buffer(16)]],
+    device const int* body_rootid [[buffer(1)]],
+    device const int* body_jntadr [[buffer(2)]],
+    device const int* body_jntnum [[buffer(3)]],
+    device const int* jnt_type [[buffer(4)]],
+    device const int* jnt_dofadr [[buffer(5)]],
+    device const float* body_mass [[buffer(6)]],
+    device const float* body_inertia [[buffer(7)]],
+    device const float* body_quat [[buffer(8)]],
+    device const float* inertial_pos [[buffer(9)]],
+    device const float* inertial_quat [[buffer(10)]],
+    device const float* cvel [[buffer(11)]],
+    device const float* root_com [[buffer(12)]],
+    device const float* joint_anchor [[buffer(13)]],
+    device const float* joint_axis [[buffer(14)]],
+    device const float* fluid [[buffer(15)]],
+    constant int* dims [[buffer(16)]],
+    device float* qfrc [[buffer(17)]],
     uint world [[thread_position_in_grid]]) {
   int nv=dims[0], nbody=dims[1], njnt=dims[2], batch=dims[3], disabled=dims[4];
   if (world>=uint(batch)) return;
@@ -57,7 +58,7 @@ kernel void inertia_box_fluid(
     float3 omega=get3(cvel,body6+uint(b*6));
     float3 linear=get3(cvel,body6+uint(b*6+3));
     float3 pos=get3(inertial_pos,body3+uint(b*3));
-    float3 center=get3(root_com,body3+uint(b*3));
+    float3 center=get3(root_com,body3+uint(body_rootid[b]*3));
     linear-=cross(pos-center,omega);
     float4 inertial_rotation=get4(inertial_quat,body4+uint(b*4));
     float3 local_omega=invrot(inertial_rotation,omega);

@@ -174,7 +174,7 @@ class MetalInertiaBoxFluid:
       if not isinstance(value, torch.Tensor) or value.device.type != "mps" or value.dtype != torch.float32 or tuple(value.shape) != shape or not value.is_contiguous():
         raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
     nv = meta.nv
-    self._kernel(self._body_parentid, self._body_jntadr, self._body_jntnum,
+    self._kernel(self._body_parentid, self._body_rootid, self._body_jntadr, self._body_jntnum,
         self._jnt_type, self._jnt_dofadr, self._mass, self._inertia,
         poses["body_quat"].reshape(-1), poses["inertial_pos"].reshape(-1),
         poses["inertial_quat"].reshape(-1), dynamics["cvel"].reshape(-1),
