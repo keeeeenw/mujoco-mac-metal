@@ -32,6 +32,10 @@ _SUPPORTED = {
     int(mujoco.mjtSensor.mjSENS_FRAMEYAXIS),
     int(mujoco.mjtSensor.mjSENS_FRAMEZAXIS),
     int(mujoco.mjtSensor.mjSENS_CLOCK),
+    int(mujoco.mjtSensor.mjSENS_FRAMELINVEL),
+    int(mujoco.mjtSensor.mjSENS_FRAMEANGVEL),
+    int(mujoco.mjtSensor.mjSENS_GYRO),
+    int(mujoco.mjtSensor.mjSENS_VELOCIMETER),
 }
 _POS = int(mujoco.mjtStage.mjSTAGE_POS)
 _VEL = int(mujoco.mjtStage.mjSTAGE_VEL)
@@ -64,6 +68,7 @@ class SensorDescriptor:
   jnt_qposadr: np.ndarray
   jnt_dofadr: np.ndarray
   body_iquat: np.ndarray
+  body_rootid: np.ndarray
   geom_bodyid: np.ndarray
   geom_pos: np.ndarray
   geom_quat: np.ndarray
@@ -109,6 +114,7 @@ def lower_sensors(model) -> SensorDescriptor:
       "jnt_qposadr": (np.int32, (nj,)),
       "jnt_dofadr": (np.int32, (nj,)),
       "body_iquat": (np.float32, (nb, 4)),
+      "body_rootid": (np.int32, (nb,)),
       "geom_bodyid": (np.int32, (ng,)),
       "geom_pos": (np.float32, (ng, 3)),
       "geom_quat": (np.float32, (ng, 4)),
@@ -131,6 +137,10 @@ def lower_sensors(model) -> SensorDescriptor:
     expected_stage = _VEL if typ in (
         int(mujoco.mjtSensor.mjSENS_JOINTVEL),
         int(mujoco.mjtSensor.mjSENS_BALLANGVEL),
+        int(mujoco.mjtSensor.mjSENS_FRAMELINVEL),
+        int(mujoco.mjtSensor.mjSENS_FRAMEANGVEL),
+        int(mujoco.mjtSensor.mjSENS_GYRO),
+        int(mujoco.mjtSensor.mjSENS_VELOCIMETER),
     ) else _POS
     if stage not in stages or stage != expected_stage:
       raise ValueError(f"sensor {i}: unsupported computation stage {stage}")
@@ -138,7 +148,7 @@ def lower_sensors(model) -> SensorDescriptor:
     expected_dim = 1
     if typ in (int(mujoco.mjtSensor.mjSENS_BALLQUAT), int(mujoco.mjtSensor.mjSENS_FRAMEQUAT)):
       expected_dim = 4
-    elif typ in (int(mujoco.mjtSensor.mjSENS_FRAMEPOS), int(mujoco.mjtSensor.mjSENS_BALLANGVEL)) or typ in (
+    elif typ in (int(mujoco.mjtSensor.mjSENS_FRAMEPOS), int(mujoco.mjtSensor.mjSENS_BALLANGVEL), int(mujoco.mjtSensor.mjSENS_FRAMELINVEL), int(mujoco.mjtSensor.mjSENS_FRAMEANGVEL), int(mujoco.mjtSensor.mjSENS_GYRO), int(mujoco.mjtSensor.mjSENS_VELOCIMETER)) or typ in (
         int(mujoco.mjtSensor.mjSENS_FRAMEXAXIS), int(mujoco.mjtSensor.mjSENS_FRAMEYAXIS), int(mujoco.mjtSensor.mjSENS_FRAMEZAXIS)
     ):
       expected_dim = 3
@@ -168,6 +178,17 @@ def lower_sensors(model) -> SensorDescriptor:
         raise ValueError(f"sensor {i}: unsupported frame object type or id")
       if refid != -1 and (reftype not in valid_objtypes or not 0 <= refid < _object_count(reftype, nb, ng, nsite)):
         raise ValueError(f"sensor {i}: unsupported reference frame type or id")
+    if typ in (int(mujoco.mjtSensor.mjSENS_FRAMELINVEL), int(mujoco.mjtSensor.mjSENS_FRAMEANGVEL)):
+      objtype, objid = int(arrays["sensor_objtype"][i]), int(arrays["sensor_objid"][i])
+      refid, reftype = int(arrays["sensor_refid"][i]), int(arrays["sensor_reftype"][i])
+      if objtype not in valid_objtypes or not 0 <= objid < _object_count(objtype, nb, ng, nsite):
+        raise ValueError(f"sensor {i}: unsupported frame velocity object type or id")
+      if refid != -1 and (reftype not in valid_objtypes or not 0 <= refid < _object_count(reftype, nb, ng, nsite)):
+        raise ValueError(f"sensor {i}: unsupported velocity reference frame type or id")
+    if typ in (int(mujoco.mjtSensor.mjSENS_GYRO), int(mujoco.mjtSensor.mjSENS_VELOCIMETER)):
+      sid = int(arrays["sensor_objid"][i])
+      if int(arrays["sensor_objtype"][i]) != int(mujoco.mjtObj.mjOBJ_SITE) or not 0 <= sid < nsite:
+        raise ValueError(f"sensor {i}: gyro and velocimeter require a site")
     if int(arrays["sensor_datatype"][i]) in (int(mujoco.mjtDataType.mjDATATYPE_AXIS), int(mujoco.mjtDataType.mjDATATYPE_QUATERNION)) and float(arrays["sensor_cutoff"][i]) > 0:
       # MuJoCo cutoff is ignored for these normalized data types.
       pass
@@ -230,6 +251,29 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
         value = _unit(qpos[w, qa:qa+4], "ball quaternion")
       elif typ == int(mujoco.mjtSensor.mjSENS_BALLANGVEL):
         value = qvel[w, da:da+3]
+      elif typ in (int(mujoco.mjtSensor.mjSENS_FRAMELINVEL), int(mujoco.mjtSensor.mjSENS_FRAMEANGVEL), int(mujoco.mjtSensor.mjSENS_GYRO), int(mujoco.mjtSensor.mjSENS_VELOCIMETER)):
+        if "cvel" not in poses or "root_com" not in poses:
+          raise ValueError("velocity sensors require cvel and root_com in poses")
+        objtype = int(desc.sensor_objtype[i])
+        objid = int(desc.sensor_objid[i])
+        obj_pos, obj_quat = _frame_pose(desc, poses, w, objtype, objid)
+        obj_vel = _object_velocity(desc, poses, w, objtype, objid, obj_pos)
+        if typ in (int(mujoco.mjtSensor.mjSENS_GYRO), int(mujoco.mjtSensor.mjSENS_VELOCIMETER)):
+          rotated = np.concatenate((_quat_rot(np.array([obj_quat[0], *(-obj_quat[1:])]), obj_vel[:3]), _quat_rot(np.array([obj_quat[0], *(-obj_quat[1:])]), obj_vel[3:])))
+          value = rotated[:3] if typ == int(mujoco.mjtSensor.mjSENS_GYRO) else rotated[3:]
+        else:
+          refid = int(desc.sensor_refid[i])
+          if refid > -1:
+            ref_type = int(desc.sensor_reftype[i])
+            ref_pos, ref_quat = _frame_pose(desc, poses, w, ref_type, refid)
+            ref_body = _object_body(desc, ref_type, refid)
+            ref_vel = _object_velocity(desc, poses, w, ref_type, refid, ref_pos)
+            relative = np.concatenate((obj_vel[:3] - ref_vel[:3], obj_vel[3:] - ref_vel[3:] - np.cross(obj_pos-ref_pos, ref_vel[:3])))
+            relative[:3] = _quat_rot(np.array([ref_quat[0], *(-ref_quat[1:])]), relative[:3])
+            relative[3:] = _quat_rot(np.array([ref_quat[0], *(-ref_quat[1:])]), relative[3:])
+            del ref_body
+            obj_vel = relative
+          value = obj_vel[3:] if typ == int(mujoco.mjtSensor.mjSENS_FRAMELINVEL) else obj_vel[:3]
       elif typ == int(mujoco.mjtSensor.mjSENS_CLOCK):
         value = np.array([time[w]])
       else:
@@ -267,6 +311,22 @@ def _frame_pose(desc, poses, world, objtype, objid):
   return poses["body_pos"][world, bid] + _quat_rot(poses["body_quat"][world, bid], desc.site_pos[objid]), _unit(q, "site quaternion")
 
 
+def _object_body(desc, objtype, objid):
+  if objtype in (int(mujoco.mjtObj.mjOBJ_BODY), int(mujoco.mjtObj.mjOBJ_XBODY)):
+    return objid
+  if objtype == int(mujoco.mjtObj.mjOBJ_GEOM):
+    return int(desc.geom_bodyid[objid])
+  return int(desc.site_bodyid[objid])
+
+
+def _object_velocity(desc, poses, world, objtype, objid, pos):
+  body = _object_body(desc, objtype, objid)
+  root = int(desc.body_rootid[body])
+  cvel = np.asarray(poses["cvel"])[world, body]
+  root_com = np.asarray(poses["root_com"])[world, root]
+  return np.concatenate((cvel[:3], cvel[3:] + np.cross(cvel[:3], pos-root_com)))
+
+
 class SensorProgram:
   """Batched MSL sensor evaluator. Constructor is the explicit MPS boundary."""
 
@@ -290,7 +350,7 @@ class SensorProgram:
     self._meta = {}
     for name in ("sensor_type", "sensor_datatype", "sensor_needstage", "sensor_objtype", "sensor_objid", "sensor_reftype", "sensor_refid", "sensor_dim", "sensor_adr", "sensor_cutoff", "jnt_type", "jnt_qposadr", "jnt_dofadr", "body_iquat", "geom_bodyid", "geom_pos", "geom_quat", "site_bodyid", "site_pos", "site_quat"):
       arr = getattr(d, name)
-      self._meta[name] = torch.as_tensor(arr, device=self._device)
+      self._meta[name] = torch.as_tensor(np.array(arr, copy=True), device=self._device)
     self._dims = torch.tensor([d.nsensor, d.nsensordata, d.nq, d.nv, d.njnt, d.nbody, d.ngeom, d.nsite, batch_size, d.disableflags], dtype=torch.int32, device=self._device)
     self._stage_mask = torch.zeros(1, dtype=torch.int32, device=self._device)
     self._output = torch.zeros((batch_size, d.nsensordata), dtype=torch.float32, device=self._device)

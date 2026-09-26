@@ -80,12 +80,11 @@ kernel void evaluate_sensors(
     device const int* sensor_dim [[buffer(18)]],
     device const int* sensor_adr [[buffer(19)]],
     device const float* sensor_cutoff [[buffer(20)]],
-    device const int* jnt_type [[buffer(21)]],
-    device const int* jnt_qposadr [[buffer(22)]],
-    device const int* jnt_dofadr [[buffer(23)]],
-    constant int* dims [[buffer(24)]],
-    device float* output [[buffer(25)]],
-    constant int* stage_mask [[buffer(26)]],
+    device const int* jnt_qposadr [[buffer(21)]],
+    device const int* jnt_dofadr [[buffer(22)]],
+    constant int* dims [[buffer(23)]],
+    device float* output [[buffer(24)]],
+    constant int* stage_mask [[buffer(25)]],
     uint index [[thread_position_in_grid]]) {
   uint nsensor=uint(dims[0]), ndata=uint(dims[1]), nq=uint(dims[2]);
   uint nv=uint(dims[3]), batch=uint(dims[8]);

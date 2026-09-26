@@ -50,7 +50,7 @@ def _input_batch(model, descriptor, batch=3):
     angle = .23 * (w + 1)
     qpos[w, qa:qa+4] = [np.cos(angle/2), 0, np.sin(angle/2), 0]
     qvel[w] = np.linspace(-.3, .4, model.nv) + .1 * w
-  return qpos, qvel, np.array([.4, 1.25, 2.5])
+  return qpos, qvel, .4 + np.arange(batch) * .85
 
 
 def test_sensor_cpu_oracle_matches_mujoco_310_for_pose_and_velocity_families():
@@ -104,7 +104,7 @@ def test_sensor_lowering_rejects_acceleration_sensor_and_stateful_delay():
     os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
     reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
 )
-def test_device_sensor_output_matches_cpu_oracle():
+def test_device_sensor_output_matches_mujoco_forward():
   import torch
   from mujoco_metal.metal_kinematics import MetalKinematics
 
@@ -120,11 +120,11 @@ def test_device_sensor_output_matches_cpu_oracle():
   time_t = torch.as_tensor(times, dtype=torch.float32, device="mps")
   output = sensor.run_device(qpos_t, qvel_t, time_t, poses)
   expected = []
-  cpu_poses = {key: [] for key in ("body_pos", "body_quat", "geom_pos", "geom_quat", "site_pos", "site_quat", "inertial_pos", "inertial_quat")}
   for row in range(batch):
-    fkrow = descriptor.forward_kinematics(qpos[row])
-    for key in cpu_poses:
-      cpu_poses[key].append(fkrow[key])
-    expected.append(mujoco.MjData(model).sensordata.copy())
-  expected = sensor_oracle(model, qpos, qvel, times, {key: np.asarray(value) for key, value in cpu_poses.items()})
+    data = mujoco.MjData(model)
+    data.qpos[:] = qpos[row]
+    data.qvel[:] = qvel[row]
+    data.time = times[row]
+    mujoco.mj_forward(model, data)
+    expected.append(data.sensordata.copy())
   np.testing.assert_allclose(output.cpu().numpy(), expected, rtol=3e-5, atol=3e-6)
