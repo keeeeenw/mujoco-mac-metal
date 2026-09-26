@@ -133,6 +133,7 @@ def validate_stepping_profile(
       "contact_free_forces_rk4_v1",
       "contact_free_motor_rk4_v1",
       "contact_free_transmission_rk4_v1",
+      "contact_free_fluid_rk4_v1",
       "contact_free_passive_rk4_v1",
       "contact_free_sensor_rk4_v1",
   ):
@@ -159,6 +160,11 @@ def validate_stepping_profile(
             for item in result.rejected
         ),
     )
+  with_fluid = profile == "contact_free_fluid_euler_v1"
+  if with_fluid:
+    from mujoco_metal.fluid import InertiaBoxFluidModel
+
+    InertiaBoxFluidModel(model)
   with_joint_constraints = profile == "joint_constraints_euler_v1"
   if with_joint_constraints:
     from mujoco_metal.joint_constraints import lower_joint_constraints
@@ -169,6 +175,7 @@ def validate_stepping_profile(
   advanced_passive = profile in (
       "contact_free_transmission_euler_v1",
       "joint_constraints_euler_v1",
+      "contact_free_fluid_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   )
@@ -179,6 +186,7 @@ def validate_stepping_profile(
   if profile not in (
       "contact_free_transmission_euler_v1",
       "joint_constraints_euler_v1",
+      "contact_free_fluid_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
       "contact_free_euler_v1",
@@ -186,6 +194,7 @@ def validate_stepping_profile(
       "contact_free_motor_euler_v1",
       "contact_free_transmission_euler_v1",
       "joint_constraints_euler_v1",
+      "contact_free_fluid_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -249,6 +258,7 @@ def validate_stepping_profile(
         "contact_free_motor_euler_v1",
         "contact_free_transmission_euler_v1",
         "joint_constraints_euler_v1",
+        "contact_free_fluid_euler_v1",
         "contact_free_passive_euler_v1",
         "contact_free_sensor_euler_v1",
     ) and name in (
@@ -263,6 +273,7 @@ def validate_stepping_profile(
       "contact_free_motor_euler_v1",
       "contact_free_transmission_euler_v1",
       "joint_constraints_euler_v1",
+      "contact_free_fluid_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -299,6 +310,7 @@ def validate_stepping_profile(
       "contact_free_motor_euler_v1",
       "contact_free_transmission_euler_v1",
       "joint_constraints_euler_v1",
+      "contact_free_fluid_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -307,6 +319,7 @@ def validate_stepping_profile(
       "contact_free_motor_euler_v1",
       "contact_free_transmission_euler_v1",
       "joint_constraints_euler_v1",
+      "contact_free_fluid_euler_v1",
       "contact_free_passive_euler_v1",
       "contact_free_sensor_euler_v1",
   ):
@@ -387,7 +400,9 @@ def validate_stepping_profile(
       np.any(model.tendon_stiffness) or np.any(model.tendon_stiffnesspoly)
   ) and not with_transmissions:
     raise ValueError("tendon stiffness is unsupported")
-  if opt.density != 0 or opt.viscosity != 0 or np.any(opt.wind):
+  if (
+      opt.density != 0 or opt.viscosity != 0 or np.any(opt.wind)
+  ) and not with_fluid:
     raise ValueError("fluid forces are unsupported")
   if np.any(model.geom_fluid):
     raise ValueError("geom fluid interaction is unsupported")
@@ -417,12 +432,18 @@ def validate_stepping_profile(
                   "contact_free_motor_euler_v1",
                   "contact_free_transmission_euler_v1",
                   "joint_constraints_euler_v1",
+                  "contact_free_fluid_euler_v1",
                   "contact_free_passive_euler_v1",
                   "contact_free_sensor_euler_v1",
               )
               else ()
           )
           + motor_supported
+          + (
+              ("inertia-box body fluid drag, viscosity and wind",)
+              if with_fluid
+              else ()
+          )
           + (
               (
                   "scalar joint limits, DOF frictionloss and polynomial joint equality",
@@ -449,6 +470,7 @@ def validate_stepping_profile(
               "contact_free_motor_euler_v1",
               "contact_free_transmission_euler_v1",
               "joint_constraints_euler_v1",
+              "contact_free_fluid_euler_v1",
               "contact_free_passive_euler_v1",
               "contact_free_sensor_euler_v1",
           )
@@ -469,12 +491,18 @@ def validate_stepping_profile(
                       "contact_free_motor_euler_v1",
                       "contact_free_transmission_euler_v1",
                       "joint_constraints_euler_v1",
+                      "contact_free_fluid_euler_v1",
                       "contact_free_passive_euler_v1",
                       "contact_free_sensor_euler_v1",
                   )
               )
               and not (advanced_passive and item == "body gravity compensation")
               and not (with_sensors and item == "sensors")
+              and not (
+                  with_fluid
+                  and item
+                  == "fluid forces and nonzero density, viscosity, or wind"
+              )
               and not (
                   with_joint_constraints
                   and item
@@ -499,6 +527,7 @@ def validate_stepping_profile(
                       "contact_free_motor_euler_v1",
                       "contact_free_transmission_euler_v1",
                       "joint_constraints_euler_v1",
+                      "contact_free_fluid_euler_v1",
                       "contact_free_passive_euler_v1",
                       "contact_free_sensor_euler_v1",
                   )
@@ -527,6 +556,7 @@ def validate_stepping_profile(
                   "contact_free_motor_euler_v1",
                   "contact_free_transmission_euler_v1",
                   "joint_constraints_euler_v1",
+                  "contact_free_fluid_euler_v1",
                   "contact_free_passive_euler_v1",
                   "contact_free_sensor_euler_v1",
               )
@@ -540,6 +570,7 @@ def validate_stepping_profile(
               "contact_free_motor_euler_v1",
               "contact_free_transmission_euler_v1",
               "joint_constraints_euler_v1",
+              "contact_free_fluid_euler_v1",
               "contact_free_passive_euler_v1",
               "contact_free_sensor_euler_v1",
           )
@@ -556,6 +587,7 @@ def validate_stepping_profile(
               "contact_free_motor_euler_v1",
               "contact_free_transmission_euler_v1",
               "joint_constraints_euler_v1",
+              "contact_free_fluid_euler_v1",
               "contact_free_passive_euler_v1",
               "contact_free_sensor_euler_v1",
           )

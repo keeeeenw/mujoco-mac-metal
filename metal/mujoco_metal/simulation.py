@@ -81,6 +81,7 @@ class MetalSimulation:
         in (
             "contact_free_motor_euler_v1",
             "joint_constraints_euler_v1",
+            "contact_free_fluid_euler_v1",
             "contact_free_passive_euler_v1",
             "contact_free_sensor_euler_v1",
             "normal_contact_euler_v1",
@@ -163,6 +164,7 @@ class MetalSimulation:
     if (
         with_transmissions
         or "joint_constraints" in profile.name
+        or "fluid" in profile.name
         or "passive" in profile.name
         or "sensor" in profile.name
         or profile.name
@@ -171,6 +173,11 @@ class MetalSimulation:
       from mujoco_metal.passive import MetalPassiveForces
 
       self._passive = MetalPassiveForces(model)
+    self._fluid = None
+    if "fluid" in profile.name:
+      from mujoco_metal.fluid import MetalInertiaBoxFluid
+
+      self._fluid = MetalInertiaBoxFluid(model, batch_size)
     self._sensors = None
     self._sensordata = None
     if "sensor" in profile.name:
@@ -220,6 +227,7 @@ class MetalSimulation:
             "contact_free_motor_euler_v1",
             "contact_free_transmission_euler_v1",
             "joint_constraints_euler_v1",
+            "contact_free_fluid_euler_v1",
             "contact_free_passive_euler_v1",
             "contact_free_sensor_euler_v1",
             "normal_contact_euler_v1",
@@ -413,6 +421,8 @@ class MetalSimulation:
           qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True
       )
       self._rhs.add_(passive)
+    if self._fluid is not None:
+      self._rhs.add_(self._fluid.run_device(qpos, qvel, dynamics))
     if self._tendons is not None:
       tendon_force, self._tendon_damping, tendon_armature = (
           self._tendons.run_device(qpos, qvel)
