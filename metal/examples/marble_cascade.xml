@@ -1,0 +1,28 @@
+<mujoco model="marble cascade">
+  <compiler angle="radian" inertiafromgeom="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler"/>
+  <default>
+    <geom condim="1" friction="0 0 0" solref="0.02 1" solimp="0.9 0.95 0.001 0.5 2"/>
+    <joint damping="0" armature="0"/>
+  </default>
+  <worldbody>
+    <geom name="tilted_ramp" type="plane" size="20 20 0.1"
+      quat="0.98480775 0 0.17364818 0" contype="1" conaffinity="2"
+      rgba="0.22 0.3 0.38 1"/>
+    <body name="marble_a" pos="0 0 0.18">
+      <freejoint/>
+      <geom name="marble_a_geom" type="sphere" size="0.14" mass="0.8"
+        contype="2" conaffinity="3" rgba="0.95 0.31 0.19 1"/>
+    </body>
+    <body name="marble_b" pos="0.43 0 0.18">
+      <freejoint/>
+      <geom name="marble_b_geom" type="sphere" size="0.14" mass="0.8"
+        contype="2" conaffinity="3" rgba="0.98 0.72 0.24 1"/>
+    </body>
+    <body name="marble_c" pos="0.86 0 0.18">
+      <freejoint/>
+      <geom name="marble_c_geom" type="sphere" size="0.14" mass="0.8"
+        contype="2" conaffinity="3" rgba="0.24 0.62 0.87 1"/>
+    </body>
+  </worldbody>
+</mujoco>
