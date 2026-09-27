@@ -21,6 +21,7 @@ the same generalized Delassus matrix, regularizer, and projected solve.
 """
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 
 import mujoco
@@ -49,6 +50,17 @@ def _frozen(value, dtype=np.float32):
 
 
 @dataclass(frozen=True)
+class CoupledSolverSettings:
+  """Explicit configuration for the native coupled Delassus constraint solver."""
+  requested_iterations: int
+  effective_iterations: int
+  requested_tolerance: float
+  effective_tolerance: float
+  max_refinement_sweeps: int = 64
+  metric: str = "max_normalized_projected_gradient"
+
+
+@dataclass(frozen=True)
 class CoupledConstraintDescriptor:
   """Model constants and candidate constraint rows for the coupled solve."""
 
@@ -67,6 +79,7 @@ class CoupledConstraintDescriptor:
   disableflags: int
   iterations: int
   tolerance: float
+  solver_settings: CoupledSolverSettings
 
   # Joint constraint constants
   joint_type: np.ndarray
@@ -271,15 +284,29 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
     fr = np.empty((0, 2), dtype=np.float32)
     r1 = r2 = margin = gap = np.empty(0, dtype=np.float32)
 
-  if model.opt.iterations > 0 and model.opt.iterations != 100:
-    iterations = min(max(int(model.opt.iterations), 1), 2048)
-  else:
-    iterations = _MAX_ITERATIONS
+  iter_req = int(model.opt.iterations)
+  if iter_req <= 0 or iter_req > 2048:
+    raise ValueError(
+        f"integrated_euler_v1 bounds iterations to [1, 2048]; found {iter_req}"
+    )
 
-  if model.opt.tolerance >= _TOLERANCE:
-    tolerance = float(model.opt.tolerance)
-  else:
-    tolerance = _TOLERANCE
+  tol_req = float(model.opt.tolerance)
+  if not math.isfinite(tol_req) or tol_req <= 0:
+    raise ValueError("model.opt.tolerance must be finite and positive")
+
+  # On single-precision float32 MPS, eps ~ 1.19e-7; tolerances below 1e-6 cannot be guaranteed
+  # and are clamped to the hardware precision floor 1e-6. Both requested and effective values
+  # are explicitly exposed in CoupledSolverSettings.
+  eff_tol = max(tol_req, _TOLERANCE)
+
+  solver_settings = CoupledSolverSettings(
+      requested_iterations=iter_req,
+      effective_iterations=iter_req,
+      requested_tolerance=tol_req,
+      effective_tolerance=eff_tol,
+      max_refinement_sweeps=64,
+      metric="max_normalized_projected_gradient",
+  )
 
   return CoupledConstraintDescriptor(
       nq=int(model.nq), nv=int(model.nv), njnt=int(model.njnt),
@@ -289,8 +316,9 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       refsafe=not bool(int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)),
       impratio=float(model.opt.impratio),
       disableflags=int(model.opt.disableflags),
-      iterations=iterations,
-      tolerance=tolerance,
+      iterations=iter_req,
+      tolerance=eff_tol,
+      solver_settings=solver_settings,
       joint_type=_frozen(model.jnt_type, np.int32),
       joint_qposadr=_frozen(model.jnt_qposadr, np.int32),
       qpos0=_frozen(model.qpos0, np.float32),
@@ -381,6 +409,7 @@ class MetalCoupledConstraints:
 
   def __init__(self, model, batch_size=1):
     self.descriptor = lower_coupled_constraints(model)
+    self.solver_settings = self.descriptor.solver_settings
     self.batch_size = int(batch_size)
     if self.batch_size <= 0:
       raise ValueError("batch_size must be positive")

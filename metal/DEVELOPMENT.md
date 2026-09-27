@@ -47,23 +47,31 @@ bodies. Other free trees retain ordinary implicitfast integration. Its reported
 `qacc` follows MuJoCo 3.10: midpoint DOFs store the velocity difference divided
 by the timestep; other DOFs keep the forward acceleration.
 
-The `integrated_euler_v1` profile implements an explicit execution plan (`sim.execution_plan`)
-comprising nine ordered pipeline stages:
+The `integrated_euler_v1` profile implements a model-derived execution plan (`sim.execution_plan`)
+as the runtime authority for stage enablement, subsystem construction, and dependency validation.
+The pipeline consists of ten sequential integration stages plus an explicit on-demand sensor query:
 1. `smooth_dynamics`: Forward kinematics, body inertias, CRBA generalized mass matrix, and bias forces.
-2. `fixed_tendons`: Fixed-joint tendon lengths, Jacobian, spring/damping forces, and tendon armature matrix.
-3. `passive_forces`: Joint springs, polynomial damping, gravity compensation, and Cartesian body wrenches.
-4. `fluid_forces`: Inertia-box fluid drag, viscosity, and wind forces.
-5. `actuation`: Stateless scalar motor actuators and transmissions.
-6. `coupled_constraints`: Unified Delassus Projected Gauss-Seidel (PGS) constraint solve simultaneously coupling plane–sphere and sphere–sphere contacts (condim 1 and pyramidal condim 3), scalar joint limits, dry joint frictionloss, and polynomial equality constraints. The generalized mass matrix incorporates rigid body inertia and tendon armature.
-7. `euler_damping`: Semi-implicit velocity damping solve $(M + h D) v^+ = M v^*$.
-8. `euler_integration`: Semi-implicit Euler state integration with sticky failure rollback.
-9. `sensors`: Stateless current-state sensor queries executed on GPU directly from device-resident state.
+2. `passive_forces`: Joint springs, polynomial damping, gravity compensation, and Cartesian body wrenches.
+3. `fluid_forces`: Inertia-box fluid drag, viscosity, and wind forces.
+4. `fixed_tendons`: Fixed-joint tendon lengths, Jacobian, spring/damping forces, and tendon armature matrix.
+5. `actuation`: Stateless scalar motor actuators and transmissions with `ctrlrange` clipping.
+6. `smooth_assembly`: Aggregates unconstrained forces and tendon armature.
+7. `unconstrained_solve`: Unconstrained acceleration solve $M \hat{a} = \tau_{\text{smooth}}$.
+8. `coupled_constraints`: Unified Delassus Projected Gauss-Seidel (PGS) constraint solve simultaneously coupling plane–sphere and sphere–sphere contacts (condim 1 and pyramidal condim 3), scalar joint limits, dry joint frictionloss, and polynomial equality constraints.
+9. `euler_damping`: Semi-implicit velocity damping solve $(M + h D) v^+ = M v^*$.
+10. `euler_integration`: Semi-implicit Euler state integration with sticky failure rollback.
 
-The coupled solver enforces a strict convergence contract:
-- Iteration cap: 1024 iterations default (or model-configured `model.opt.iterations`).
-- Convergence tolerance: Strict $L_\infty$ residual $\le 10^{-6}$ (or model-configured `model.opt.tolerance`).
-- Solver status codes: 0 = converged, 2 = non-finite / divergence, 3 = iteration exhaustion / non-convergence. If any world fails to converge, its state stickily rolls back to its previous valid state without advancing, while healthy worlds continue. Recovery is achieved via selective per-world reset (`sim.state.reset(env_ids)`).
-- Complete device residency: Stepping requires zero host-device synchronization, CPU physics fallbacks, or per-step memory allocations. All buffers are accounted for in the model-derived buffer audit (`sim.buffer_audit()`). On the 100-step coupled verification fixture, native Metal matches CPU MuJoCo with maximum position error `1.50e-7`, velocity error `1.67e-6`, and sensor error `1.07e-6`.
+On-demand queries:
+- `sensor_query`: Explicit stateless current-state forward sensor evaluations (`sim.sensor_values()`) on MPS.
+
+The coupled solver enforces an explicit, validated convergence contract:
+- Iteration settings: Bound to $[1, 2048]$ (values $\le 0$ or $> 2048$ raise `ValueError`).
+- Tolerance settings: Must be finite and positive; floored at single-precision float32 hardware precision floor $10^{-6}$.
+- Contract exposure: Both requested and effective iterations/tolerances, maximum refinement sweeps (64), and convergence metric (`max_normalized_projected_gradient`) are explicitly exposed on `CoupledSolverSettings` via `sim.solver_settings`.
+- Convergence metric: $\max_i |\text{proj}_i - \lambda_i| \cdot D_{ii} / s_i \le \text{tolerance}$.
+- Solver status codes: 0 = converged, 2 = non-finite / divergence, 3 = iteration exhaustion / non-convergence. If any world fails to converge, its state stickily rolls back to its previous valid state without advancing, while healthy worlds continue. Recovery is achieved via selective per-world reset (`sim.state.reset(env_ids, qpos=..., qvel=...)`).
+- Device residency & buffer audit: Hot path physics execute on MPS with preallocated workspace buffers (`workspace_J`, `contact_row_data`, `contact_jacobian`, `out_force`, `out_acc`, etc.) and persistent preallocated default equality state, avoiding CPU physics and host-device state synchronization. Intermediate PyTorch MPS operations (e.g. status mask selection) execute within device memory. Buffer specifications are grounded in real allocations via `sim.buffer_audit()`. On the 100-step coupled verification fixture, native Metal matches CPU MuJoCo with maximum position error `1.50e-7`, velocity error `1.67e-6`, and sensor error `1.07e-6`.
+- Test suite: **287 passed** with GPU enabled (`MUJOCO_METAL_RUN_GPU=1`), **150 passed** in no-Torch environment.
 
 ## Demo evidence
 

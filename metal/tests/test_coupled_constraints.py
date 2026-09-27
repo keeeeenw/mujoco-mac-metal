@@ -10,6 +10,7 @@ import pytest
 
 from mujoco_metal.coupled_constraints import (
     CoupledConstraintDescriptor,
+    CoupledSolverSettings,
     coupled_constraint_oracle,
     lower_coupled_constraints,
     MetalCoupledConstraints,
@@ -236,3 +237,57 @@ def test_hot_loop_device_resident_invariants():
     )
     assert res["status"].device.type == "mps"
     assert res["qacc"].device.type == "mps"
+
+
+def test_coupled_solver_settings_range_contracts():
+  model = mujoco.MjModel.from_xml_string(COUPLED_XML)
+  desc = lower_coupled_constraints(model)
+  settings = desc.solver_settings
+  assert isinstance(settings, CoupledSolverSettings)
+  assert settings.requested_iterations == 1000
+  assert settings.effective_iterations == 1000
+  assert settings.requested_tolerance == 1e-6
+  assert settings.effective_tolerance == 1e-6
+  assert settings.max_refinement_sweeps == 64
+  assert settings.metric == "max_normalized_projected_gradient"
+
+  # Iterations contract: [1, 2048]
+  # Value 100 is NOT silently overridden to 1024
+  m100 = mujoco.MjModel.from_xml_string(COUPLED_XML)
+  m100.opt.iterations = 100
+  d100 = lower_coupled_constraints(m100)
+  assert d100.solver_settings.requested_iterations == 100
+  assert d100.solver_settings.effective_iterations == 100
+
+  # Bound 2048 is accepted
+  m2048 = mujoco.MjModel.from_xml_string(COUPLED_XML)
+  m2048.opt.iterations = 2048
+  d2048 = lower_coupled_constraints(m2048)
+  assert d2048.solver_settings.effective_iterations == 2048
+
+  # <= 0 or > 2048 rejected
+  for bad_iter in [0, -1, 2049]:
+    mbad = mujoco.MjModel.from_xml_string(COUPLED_XML)
+    mbad.opt.iterations = bad_iter
+    with pytest.raises(ValueError, match="bounds iterations to \\[1, 2048\\]"):
+      lower_coupled_constraints(mbad)
+
+  # Tolerance contract: finite and positive, floored at float32 floor 1e-6
+  m_tol4 = mujoco.MjModel.from_xml_string(COUPLED_XML)
+  m_tol4.opt.tolerance = 1e-4
+  d_tol4 = lower_coupled_constraints(m_tol4)
+  assert d_tol4.solver_settings.requested_tolerance == 1e-4
+  assert d_tol4.solver_settings.effective_tolerance == 1e-4
+
+  m_tol8 = mujoco.MjModel.from_xml_string(COUPLED_XML)
+  m_tol8.opt.tolerance = 1e-8
+  d_tol8 = lower_coupled_constraints(m_tol8)
+  assert d_tol8.solver_settings.requested_tolerance == 1e-8
+  assert d_tol8.solver_settings.effective_tolerance == 1e-6
+
+  for bad_tol in [0.0, -1e-6, float("nan"), float("inf")]:
+    mtol_bad = mujoco.MjModel.from_xml_string(COUPLED_XML)
+    mtol_bad.opt.tolerance = bad_tol
+    with pytest.raises(ValueError, match="model.opt.tolerance must be finite and positive"):
+      lower_coupled_constraints(mtol_bad)
+

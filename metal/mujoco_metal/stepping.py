@@ -44,7 +44,49 @@ class ExecutionPlan:
   profile_name: str
   timestep: float
   stages: tuple[PipelineStageSpec, ...]
-  buffer_audit: tuple[dict, ...]
+  on_demand_queries: tuple[PipelineStageSpec, ...] = ()
+  buffer_audit: tuple[dict, ...] = ()
+
+  def is_stage_enabled(self, name: str) -> bool:
+    for stage in self.stages:
+      if stage.name == name:
+        return stage.enabled
+    for query in self.on_demand_queries:
+      if query.name == name:
+        return query.enabled
+    return False
+
+  def get_stage(self, name: str) -> PipelineStageSpec | None:
+    for stage in self.stages:
+      if stage.name == name:
+        return stage
+    for query in self.on_demand_queries:
+      if query.name == name:
+        return query
+    return None
+
+  def validate_dependencies(self) -> None:
+    """Validate that the execution plan forms a topologically valid closed graph."""
+    available = {
+        "qpos", "qvel", "time", "status", "ctrl", "qfrc_applied", "xfrc_applied",
+        "eq_active", "implicit_damping"
+    }
+    enabled_stages = set()
+    for stage in self.stages:
+      if not stage.enabled:
+        continue
+      for dep in stage.dependencies:
+        if dep not in enabled_stages:
+          raise ValueError(
+              f"Stage '{stage.name}' requires dependency '{dep}' to be enabled and executed before it."
+          )
+      for inp in stage.inputs:
+        if inp not in available:
+          raise ValueError(
+              f"Stage '{stage.name}' requires input '{inp}' which is not produced by any preceding stage."
+          )
+      available.update(stage.outputs)
+      enabled_stages.add(stage.name)
 
 
 @dataclass(frozen=True)
@@ -106,6 +148,37 @@ _REJECTED = (
 def _build_integrated_execution_plan(
     model, timestep, implicit_euler_damping, passive_damping_enabled, coupled_desc
 ) -> ExecutionPlan:
+  dis = int(model.opt.disableflags)
+  passive_enabled = bool(model.njnt > 0 or model.nbody > 0)
+  fluid_enabled = bool(
+      model.opt.density > 0 or model.opt.viscosity > 0 or np.any(model.opt.wind != 0)
+  )
+  tendons_enabled = bool(model.ntendon > 0)
+  actuation_enabled = bool(
+      model.nu > 0
+      and not (dis & int(mujoco.mjtDisableBit.mjDSBL_ACTUATION))
+  )
+  coupled_constraints_enabled = bool(
+      (coupled_desc.nc > 0 or coupled_desc.nr_joint > 0)
+      and not (dis & int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT))
+  )
+  euler_damping_enabled = bool(implicit_euler_damping)
+
+  smooth_assembly_deps = ["smooth_dynamics"]
+  smooth_assembly_inputs = ["qfrc_bias", "qfrc_applied", "mass_matrix"]
+  if passive_enabled:
+    smooth_assembly_deps.append("passive_forces")
+    smooth_assembly_inputs.append("qfrc_passive")
+  if fluid_enabled:
+    smooth_assembly_deps.append("fluid_forces")
+    smooth_assembly_inputs.append("qfrc_fluid")
+  if tendons_enabled:
+    smooth_assembly_deps.append("fixed_tendons")
+    smooth_assembly_inputs.extend(["qfrc_tendon", "tendon_armature"])
+  if actuation_enabled:
+    smooth_assembly_deps.append("actuation")
+    smooth_assembly_inputs.append("qfrc_actuator")
+
   stages = [
       PipelineStageSpec(
           name="smooth_dynamics",
@@ -117,109 +190,143 @@ def _build_integrated_execution_plan(
           buffer_lifetimes=("scratch per step: poses, mass_matrix (batch, nv, nv), qfrc_bias (batch, nv)",),
       ),
       PipelineStageSpec(
-          name="fixed_tendons",
-          subsystem="tendons",
-          enabled=bool(model.ntendon > 0),
-          dependencies=("smooth_dynamics",),
-          inputs=("qpos", "qvel"),
-          outputs=("qfrc_tendon", "damping_matrix", "armature_matrix"),
-          buffer_lifetimes=("constant: _ancestor_mask; scratch per step: qfrc_tendon, damping_matrix, armature_matrix",),
-      ),
-      PipelineStageSpec(
           name="passive_forces",
           subsystem="passive",
-          enabled=bool(model.njnt > 0 or model.nbody > 0),
+          enabled=passive_enabled,
           dependencies=("smooth_dynamics",),
-          inputs=("qpos", "qvel", "poses"),
-          outputs=("qfrc_passive", "body_wrench"),
-          buffer_lifetimes=("scratch per step: qfrc_passive (batch, nv), body_wrench (batch, nbody, 6)",),
+          inputs=("qpos", "qvel", "poses", "xfrc_applied"),
+          outputs=("qfrc_passive", "damping_tangent"),
+          buffer_lifetimes=("scratch per step: qfrc_passive (batch, nv), damping_tangent (batch, nv)",),
       ),
       PipelineStageSpec(
           name="fluid_forces",
           subsystem="fluid",
-          enabled=bool(model.opt.density > 0 or model.opt.viscosity > 0 or np.any(model.opt.wind != 0)),
+          enabled=fluid_enabled,
           dependencies=("smooth_dynamics",),
           inputs=("poses", "qvel"),
           outputs=("qfrc_fluid",),
           buffer_lifetimes=("scratch per step: qfrc_fluid (batch, nv)",),
       ),
       PipelineStageSpec(
+          name="fixed_tendons",
+          subsystem="tendons",
+          enabled=tendons_enabled,
+          dependencies=("smooth_dynamics",),
+          inputs=("qpos", "qvel"),
+          outputs=("qfrc_tendon", "tendon_damping", "tendon_armature"),
+          buffer_lifetimes=("constant: _ancestor_mask; scratch per step: qfrc_tendon, tendon_damping, tendon_armature",),
+      ),
+      PipelineStageSpec(
           name="actuation",
           subsystem="transmissions",
-          enabled=bool(model.nu > 0),
+          enabled=actuation_enabled,
           dependencies=("smooth_dynamics",),
           inputs=("ctrl", "qpos", "qvel"),
           outputs=("qfrc_actuator",),
           buffer_lifetimes=("scratch per step: qfrc_actuator (batch, nv)",),
       ),
       PipelineStageSpec(
+          name="smooth_assembly",
+          subsystem="smooth",
+          enabled=True,
+          dependencies=tuple(smooth_assembly_deps),
+          inputs=tuple(smooth_assembly_inputs),
+          outputs=("qfrc_smooth", "effective_mass"),
+          buffer_lifetimes=("scratch per step: qfrc_smooth (batch, nv), effective_mass (batch, nv, nv)",),
+      ),
+      PipelineStageSpec(
+          name="unconstrained_solve",
+          subsystem="dense_solve",
+          enabled=True,
+          dependencies=("smooth_assembly",),
+          inputs=("effective_mass", "qfrc_smooth"),
+          outputs=("qacc_unconstrained", "unconstrained_status"),
+          buffer_lifetimes=("scratch per step: qacc_unconstrained (batch, nv)",),
+      ),
+      PipelineStageSpec(
           name="coupled_constraints",
           subsystem="coupled_constraints",
-          enabled=bool(coupled_desc.nc > 0 or coupled_desc.nr_joint > 0),
-          dependencies=("smooth_dynamics", "fixed_tendons", "passive_forces", "fluid_forces", "actuation"),
-          inputs=("mass_matrix", "qfrc_smooth", "poses", "qpos", "qvel", "eq_active"),
-          outputs=("qacc", "qfrc_constraint", "status", "solver_diagnostics", "contact_force", "joint_force"),
+          enabled=coupled_constraints_enabled,
+          dependencies=("smooth_dynamics", "smooth_assembly", "unconstrained_solve"),
+          inputs=("poses", "effective_mass", "qfrc_smooth", "qpos", "qvel", "eq_active"),
+          outputs=("qacc", "qfrc_constraint", "coupled_status", "solver_diagnostics", "contact_force", "joint_force"),
           buffer_lifetimes=(
-              "persistent MPS: _eq_active_default; preallocated MPS workspace: workspace_J (batch, 96, 32), "
-              "contact_row_data (batch, nc, 5, 6), contact_jacobian (batch, nc, 5, nv), out_force, out_acc",
+              f"persistent MPS: _eq_active_default; preallocated MPS workspace: workspace_J (batch, {coupled_desc.nr}, {model.nv}), "
+              "contact_row_data, contact_jacobian, out_force, out_acc",
           ),
       ),
       PipelineStageSpec(
           name="euler_damping",
           subsystem="dense_solve",
-          enabled=bool(implicit_euler_damping),
-          dependencies=("coupled_constraints",),
-          inputs=("effective_mass", "qrhs"),
+          enabled=euler_damping_enabled,
+          dependencies=(("coupled_constraints",) if coupled_constraints_enabled else ("unconstrained_solve",)),
+          inputs=("effective_mass", "qfrc_smooth", "damping_tangent" if passive_enabled else "implicit_damping"),
           outputs=("integration_acceleration", "euler_status"),
           buffer_lifetimes=("scratch per step: effective_mass (batch, nv, nv), qrhs (batch, nv)",),
       ),
       PipelineStageSpec(
           name="euler_integration",
           subsystem="integration",
-          dependencies=("euler_damping" if implicit_euler_damping else "coupled_constraints",),
           enabled=True,
-          inputs=("qpos", "qvel", "integration_acceleration", "time", "status"),
+          dependencies=(("euler_damping",) if euler_damping_enabled else (("coupled_constraints",) if coupled_constraints_enabled else ("unconstrained_solve",))),
+          inputs=("qpos", "qvel", "integration_acceleration" if euler_damping_enabled else ("qacc" if coupled_constraints_enabled else "qacc_unconstrained"), "time", "status"),
           outputs=("qpos_next", "qvel_next", "time_next", "status_next"),
           buffer_lifetimes=("persistent MPS: state.qpos, state.qvel, state.time, state.status",),
       ),
+  ]
+
+  on_demand_queries = (
       PipelineStageSpec(
-          name="sensors",
+          name="sensor_query",
           subsystem="sensors",
           enabled=bool(model.nsensor > 0),
-          dependencies=("euler_integration",),
-          inputs=("qpos_next", "qvel_next", "poses"),
+          dependencies=(),
+          inputs=("qpos", "qvel", "poses"),
           outputs=("sensordata",),
           buffer_lifetimes=("persistent MPS: sensordata (batch, nsensordata)",),
       ),
-  ]
+  )
 
-  audit = (
+  audit = [
       {"name": "state.qpos", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"(batch, {model.nq})", "dtype": "float32"},
       {"name": "state.qvel", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"(batch, {model.nv})", "dtype": "float32"},
-      {"name": "state.status", "residency": "MPS device-resident", "lifetime": "persistent", "shape": "(batch,)", "dtype": "uint8"},
+      {"name": "state.status", "residency": "MPS device-resident", "lifetime": "persistent", "shape": "(batch,)", "dtype": "int32"},
       {"name": "state.time", "residency": "MPS device-resident", "lifetime": "persistent", "shape": "(batch,)", "dtype": "float32"},
       {"name": "mass_matrix", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv}, {model.nv})", "dtype": "float32"},
       {"name": "qfrc_bias", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv})", "dtype": "float32"},
-      {"name": "workspace_J", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch, 96, 32)", "dtype": "float32"},
-      {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc}, 5, 6)", "dtype": "float32"},
-      {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc}, 5, {model.nv})", "dtype": "float32"},
-      {"name": "_eq_active_default", "residency": "MPS device-resident", "lifetime": "persistent preallocated", "shape": f"(batch, {max(model.neq, 1)})", "dtype": "int32"},
-      {"name": "out_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
-      {"name": "out_acc", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
-      {"name": "out_status", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch,)", "dtype": "int32"},
-      {"name": "out_diagnostics", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch, 2)", "dtype": "float32"},
-  )
+      {"name": "qfrc_smooth", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv})", "dtype": "float32"},
+  ]
+  if euler_damping_enabled:
+    audit.append({"name": "effective_mass", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv}, {model.nv})", "dtype": "float32"})
+  if coupled_constraints_enabled:
+    audit.extend([
+        {"name": "_eq_active_default", "residency": "MPS device-resident", "lifetime": "persistent preallocated", "shape": f"(batch, {max(model.neq, 1)})", "dtype": "int32"},
+        {"name": "workspace_J", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nr}, {model.nv})", "dtype": "float32"},
+        {"name": "out_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
+        {"name": "out_acc", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
+        {"name": "out_status", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch,)", "dtype": "int32"},
+        {"name": "out_diagnostics", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch, 2)", "dtype": "float32"},
+    ])
+    if coupled_desc.nc > 0:
+      audit.extend([
+          {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc}, 5, 6)", "dtype": "float32"},
+          {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc}, 5, {model.nv})", "dtype": "float32"},
+          {"name": "out_contact_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc * 5})", "dtype": "float32"},
+      ])
+    if coupled_desc.nr_joint > 0:
+      audit.append({"name": "out_joint_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {max(coupled_desc.nr_joint, 1)})", "dtype": "float32"})
   if model.nsensor > 0:
-    audit = audit + (
-        {"name": "sensordata", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"(batch, {model.nsensordata})", "dtype": "float32"},
-    )
+    audit.append({"name": "sensordata", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"(batch, {model.nsensordata})", "dtype": "float32"})
 
-  return ExecutionPlan(
+  plan = ExecutionPlan(
       profile_name="integrated_euler_v1",
       timestep=float(timestep),
       stages=tuple(stages),
-      buffer_audit=audit,
+      on_demand_queries=on_demand_queries,
+      buffer_audit=tuple(audit),
   )
+  plan.validate_dependencies()
+  return plan
 
 
 def validate_stepping_profile(

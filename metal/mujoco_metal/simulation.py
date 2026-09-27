@@ -136,6 +136,8 @@ class MetalSimulation:
         },
     )
     self._state = DeviceState(model, profile, batch_size, qpos=qpos, qvel=qvel)
+    self.batch_size = int(batch_size)
+    self._mjmodel = model
     descriptor = self._state._model
     self.profile = profile
     smooth_descriptor = descriptor
@@ -154,80 +156,76 @@ class MetalSimulation:
         else None
     )
     self._transmissions = None
-    if (with_transmissions or is_integrated) and model.nu:
-      from mujoco_metal.transmissions import MetalTransmissions
-
-      self._transmissions = MetalTransmissions(model)
     self._tendons = None
     self._tendon_damping = None
-    if (with_transmissions or is_integrated) and model.ntendon:
-      from mujoco_metal.tendons import MetalFixedTendonDynamics
-
-      self._tendons = MetalFixedTendonDynamics(model, batch_size)
     self._passive = None
     self._damping_tangent = None
-    if (
-        is_integrated
-        or with_transmissions
-        or "joint_constraints" in profile.name
-        or "fluid" in profile.name
-        or "implicitfast" in profile.name
-        or "passive" in profile.name
-        or "sensor" in profile.name
-        or profile.name
-        in ("normal_contact_euler_v1", "friction_contact_euler_v1")
-    ):
-      from mujoco_metal.passive import MetalPassiveForces
-
-      self._passive = MetalPassiveForces(model)
     self._fluid = None
-    if "fluid" in profile.name or (
-        is_integrated
-        and (
-            model.opt.density > 0
-            or model.opt.viscosity > 0
-            or np.any(model.opt.wind != 0)
-        )
-    ):
-      from mujoco_metal.fluid import MetalInertiaBoxFluid
-
-      self._fluid = MetalInertiaBoxFluid(model, batch_size)
     self._sensors = None
     self._sensordata = None
-    if "sensor" in profile.name or (is_integrated and model.nsensor > 0):
-      from mujoco_metal.sensors import SensorProgram
-
-      self._sensors = SensorProgram(model, batch_size)
     self._joint_constraints = None
-    if profile.name == "joint_constraints_euler_v1":
-      from mujoco_metal.joint_constraints import JointConstraintProgram
-
-      self._joint_constraints = JointConstraintProgram(model, batch_size)
     self._contact = None
-    if profile.name in (
-        "normal_contact_euler_v1",
-        "friction_contact_euler_v1",
-    ) and not (
-        int(model.opt.disableflags)
-        & (
-            int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
-            | int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
-        )
-    ):
-      from mujoco_metal.contact import MetalContact
-
-      self._contact = MetalContact(model, batch_size)
-
     self._coupled_constraints = None
-    if is_integrated and not (
-        int(model.opt.disableflags)
-        & int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
-    ):
-      from mujoco_metal.coupled_constraints import lower_coupled_constraints, MetalCoupledConstraints
 
-      c_desc = lower_coupled_constraints(model)
-      if c_desc.nc > 0 or c_desc.nr_joint > 0:
+    if is_integrated:
+      plan = profile.execution_plan
+      if plan.is_stage_enabled("actuation"):
+        from mujoco_metal.transmissions import MetalTransmissions
+        self._transmissions = MetalTransmissions(model)
+      if plan.is_stage_enabled("fixed_tendons"):
+        from mujoco_metal.tendons import MetalFixedTendonDynamics
+        self._tendons = MetalFixedTendonDynamics(model, batch_size)
+      if plan.is_stage_enabled("passive_forces"):
+        from mujoco_metal.passive import MetalPassiveForces
+        self._passive = MetalPassiveForces(model)
+      if plan.is_stage_enabled("fluid_forces"):
+        from mujoco_metal.fluid import MetalInertiaBoxFluid
+        self._fluid = MetalInertiaBoxFluid(model, batch_size)
+      if plan.is_stage_enabled("coupled_constraints"):
+        from mujoco_metal.coupled_constraints import MetalCoupledConstraints
         self._coupled_constraints = MetalCoupledConstraints(model, batch_size)
+      if plan.is_stage_enabled("sensor_query"):
+        from mujoco_metal.sensors import SensorProgram
+        self._sensors = SensorProgram(model, batch_size)
+    else:
+      if with_transmissions and model.nu:
+        from mujoco_metal.transmissions import MetalTransmissions
+        self._transmissions = MetalTransmissions(model)
+      if with_transmissions and model.ntendon:
+        from mujoco_metal.tendons import MetalFixedTendonDynamics
+        self._tendons = MetalFixedTendonDynamics(model, batch_size)
+      if (
+          with_transmissions
+          or "joint_constraints" in profile.name
+          or "fluid" in profile.name
+          or "implicitfast" in profile.name
+          or "passive" in profile.name
+          or "sensor" in profile.name
+          or profile.name in ("normal_contact_euler_v1", "friction_contact_euler_v1")
+      ):
+        from mujoco_metal.passive import MetalPassiveForces
+        self._passive = MetalPassiveForces(model)
+      if "fluid" in profile.name:
+        from mujoco_metal.fluid import MetalInertiaBoxFluid
+        self._fluid = MetalInertiaBoxFluid(model, batch_size)
+      if "sensor" in profile.name:
+        from mujoco_metal.sensors import SensorProgram
+        self._sensors = SensorProgram(model, batch_size)
+      if profile.name == "joint_constraints_euler_v1":
+        from mujoco_metal.joint_constraints import JointConstraintProgram
+        self._joint_constraints = JointConstraintProgram(model, batch_size)
+      if profile.name in (
+          "normal_contact_euler_v1",
+          "friction_contact_euler_v1",
+      ) and not (
+          int(model.opt.disableflags)
+          & (
+              int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+              | int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+          )
+      ):
+        from mujoco_metal.contact import MetalContact
+        self._contact = MetalContact(model, batch_size)
 
     self._solver = MetalDenseSolve(descriptor.nv, batch_size)
     self._implicitfast = None
@@ -243,7 +241,11 @@ class MetalSimulation:
         self._midpoint = FreeBodyMidpointProgram(model, batch_size)
     self._euler_solver = (
         MetalDenseSolve(descriptor.nv, batch_size)
-        if profile.implicit_euler_damping
+        if (
+            profile.execution_plan.is_stage_enabled("euler_damping")
+            if is_integrated
+            else profile.implicit_euler_damping
+        )
         else None
     )
     self._integrator = MetalEulerIntegration(
@@ -341,11 +343,48 @@ class MetalSimulation:
     """The model-derived execution plan for the active stepping profile."""
     return self.profile.execution_plan
 
+  @property
+  def solver_settings(self):
+    """The explicit solver configuration for the coupled constraint solve."""
+    if self._coupled_constraints is not None:
+      return self._coupled_constraints.solver_settings
+    return None
+
   def buffer_audit(self):
-    """Return a tuple of buffer specifications describing all device allocations."""
-    if self.profile.execution_plan is not None:
-      return self.profile.execution_plan.buffer_audit
-    return ()
+    """Return a tuple of buffer specifications derived from real device allocations."""
+    b = self.batch_size
+    entries = [
+        {"name": "state.qpos", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._state._model.nq})", "dtype": str(self._state._qpos.dtype).replace("torch.", "")},
+        {"name": "state.qvel", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._state._model.nv})", "dtype": str(self._state._qvel.dtype).replace("torch.", "")},
+        {"name": "state.status", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b},)", "dtype": str(self._state._status.dtype).replace("torch.", "")},
+        {"name": "state.time", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b},)", "dtype": str(self._state._time.dtype).replace("torch.", "")},
+        {"name": "mass_matrix", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._model.nv}, {self._state._model.nv})", "dtype": "float32"},
+        {"name": "qfrc_bias", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._model.nv})", "dtype": "float32"},
+        {"name": "qfrc_smooth", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._model.nv})", "dtype": "float32"},
+    ]
+    if self._euler_solver is not None:
+      entries.append({"name": "effective_mass", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._model.nv}, {self._state._model.nv})", "dtype": "float32"})
+    if self._coupled_constraints is not None:
+      d = self._coupled_constraints.descriptor
+      entries.extend([
+          {"name": "_eq_active_default", "residency": "MPS device-resident", "lifetime": "persistent preallocated", "shape": f"({b}, {max(d.neq, 1)})", "dtype": str(self._coupled_constraints._eq_active_default.dtype).replace("torch.", "")},
+          {"name": "workspace_J", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nr}, {d.nv})", "dtype": "float32"},
+          {"name": "out_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nv})", "dtype": "float32"},
+          {"name": "out_acc", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nv})", "dtype": "float32"},
+          {"name": "out_status", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b},)", "dtype": str(self._coupled_constraints._workspace["out_status"].dtype).replace("torch.", "")},
+          {"name": "out_diagnostics", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, 2)", "dtype": "float32"},
+      ])
+      if d.nc > 0:
+        entries.extend([
+            {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nc}, 5, 6)", "dtype": "float32"},
+            {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nc}, 5, {d.nv})", "dtype": "float32"},
+            {"name": "out_contact_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nc * 5})", "dtype": "float32"},
+        ])
+      if d.nr_joint > 0:
+        entries.append({"name": "out_joint_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {max(d.nr_joint, 1)})", "dtype": "float32"})
+    if self._sensors is not None:
+      entries.append({"name": "sensordata", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._mjmodel.nsensordata})", "dtype": "float32"})
+    return tuple(entries)
 
   def sensor_values(self):
     """Evaluate supported stateless sensors at CURRENT state on MPS.
