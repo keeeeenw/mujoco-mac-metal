@@ -6,12 +6,12 @@ The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
 
-The current regression checkpoint passed **257 tests with native GPU execution
-enabled**. A separate environment without Torch passed **138 CPU tests**, with
-116 GPU checks skipped. These counts describe the source snapshot and do not
+The current regression checkpoint passed **270 tests with native GPU execution
+enabled**. A separate environment without Torch passed **160 CPU tests**, with
+110 GPU checks skipped. These counts describe the source snapshot and do not
 establish coverage of every MuJoCo feature.
 
-The source checkpoint is `7577fecf1`; documentation-only revisions do not change
+The source checkpoint is `feature/problem-001-integrated-euler`; documentation-only revisions do not change
 these results. Tests ran on an M1 Max with 32 GB unified memory. Numerical
 qualification is separate from performance qualification: the older pendulum
 benchmark has not been rerun for the additional profiles.
@@ -20,6 +20,7 @@ benchmark has not been rerun for the additional profiles.
 
 | Capability | Explicit simulation profile | Evidence and creative demo |
 |---|---|---|
+| Integrated Euler physics pipeline: unified coupled constraint solve (plane–sphere and sphere–sphere contacts, condim 1 and pyramidal condim 3, scalar limits, dry frictionloss, polynomial joint equality) with motor actuation, fixed-joint tendons, rigid passive forces, fluid drag, and live current-state sensor queries | `integrated_euler_v1` | Coupled Delassus PGS solve, multi-batch rollouts, CPU oracle parity, and snapshot replay; [robotic marble music machine](examples/marble_music_machine.md) |
 | Quaternion-aware RK4 | `contact_free_rk4_v1`, force/motor/passive/sensor/transmission RK4 variants | Mixed-joint trajectories; [tumbling toys](examples/tumbling_toys.md) |
 | Rigid joint springs, polynomial damping, body gravity compensation and Cartesian body forces | `contact_free_passive_euler_v1`, `contact_free_passive_rk4_v1` | Euler/RK4 trajectories, disable flags and applied-wrench checks; [spring flower](examples/kinetic_sculpture.md) |
 | Stateless scalar servos, fixed/affine gain and affine bias, fixed-joint tendon transmissions plus spring/damping/armature | `contact_free_transmission_euler_v1`, `contact_free_transmission_rk4_v1` | Force stage and 400-step trajectories against CPU; [cable plotter](examples/cable_plotter.md) |
@@ -72,6 +73,8 @@ not throughput measurements. [Explore the gallery](examples/demo_gallery.md).
 - Sensor scanning rig: 2,000 steps (four simulated seconds); maximum qpos/qvel
   differences `6.53e-6` / `6.64e-6`, maximum current sensor difference `7.49e-5`
   across the fixture's mixed sensor units, including accumulated float32 time.
+- Robotic marble music machine: 400 steps; maximum qpos/qvel differences
+  `3.72e-3` / `1.83e-1`, with exact sensor agreement (`0.0`); exercises all Euler feature families simultaneously in one coupled Delassus solve.
 
 These measured errors describe the fixtures, not universal tolerances.
 

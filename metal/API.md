@@ -70,7 +70,33 @@ armature is zero; they still do not compute actuator forces. Simulation validate
 motor profile remains limited to fixed-gain scalar motors. This distinction prevents unsupported inertia
 terms from silently disappearing.
 
-Try the [spacecraft force-control demo](examples/space_docking.md), or use the
+## Integrated Euler physics pipeline
+
+The `integrated_euler_v1` stepping profile composes the native Metal Euler physics features into one unified pipeline:
+- **Actuation:** Stateless scalar motors, servos, and affine gain/bias transmissions.
+- **Fixed-joint tendons:** Multi-joint fixed wrap tendons with stiffness, damping, and armature.
+- **Passive forces:** Rigid joint springs, linear and polynomial joint damping, body gravity compensation, and applied body wrenches (`xfrc_applied`).
+- **Fluid forces:** Inertia-box body fluid drag, fluid viscosity, and wind.
+- **Sensors:** Stateless current-state sensor queries (`sim.sensor_values()`) evaluated on GPU.
+- **Unified coupled constraint solve:** Combines plane–sphere and sphere–sphere contacts (condim 1 and pyramidal condim 3), scalar joint limits, dry frictionloss, and polynomial joint equality constraints into a single coupled Delassus system $W = J M^{-1} J^T + R$ solved via projected Gauss-Seidel with active-set block refinement.
+
+Solving contact and joint constraints in one coupled Delassus system prevents the numerical divergence (exceeding 15% error) that occurs when constraints are solved sequentially or decoupled.
+
+```python
+sim = MetalSimulation(model, batch_size=B, profile="integrated_euler_v1")
+sim.step(steps=N, ctrl=controls, qfrc_applied=forces, xfrc_applied=wrenches)
+sensor_data = sim.sensor_values()
+```
+
+### Capacity limits and guards
+The integrated Euler pipeline enforces explicit hardware-tailored capacity bounds:
+- Generalized velocities: $nv \le 32$.
+- Candidate contact pairs: $nc \le 16$.
+- Total candidate constraint rows: $nr = n_{\text{eq}} + nv + 2 \cdot n_{\text{jnt}} + 4 \cdot nc \le 96$.
+Models exceeding these bounds or requesting unsupported features (e.g. non-sphere collision geoms, non-Euler integrators, flex, plugins, or mocap bodies) are rejected cleanly during profile validation.
+
+Try the [robotic marble music machine demo](examples/marble_music_machine.md) or the [spacecraft force-control demo](examples/space_docking.md), or use the
 [installation and diagnostic guide](INSTALL.md) for `pip install mujoco-mac-metal`
 and `mujoco-metal doctor --gpu`. Install version 0.4.0 for the additional bounded profiles.
+
 

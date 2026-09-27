@@ -20,16 +20,18 @@ available alongside the optional package.
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
 - **Validation and reproducible measurements:** the development checkpoint passed
-  **257 tests with native GPU execution enabled**; independent CPU-reference
+  **270 tests with native GPU execution enabled**; independent CPU-reference
   trajectory and solve checks supplement the
   suite. Benchmarks include actual eight-thread CPU measurements at every tested
   batch through 524,288 worlds.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
   plus bounded hinge/slide motors with clipping and disable flags. Separate
   profiles preserve the original unforced baseline.
-- **Development physics coverage:** RK4 and bounded implicitfast, springs and body
-  forces, inertia-box fluid drag, fixed-tendon dynamics, selected sensor queries,
-  sphere contact and joint constraints have CPU-reference checks. See the [precise development coverage](metal/DEVELOPMENT.md).
+- **Development physics coverage:** an integrated Euler pipeline (`integrated_euler_v1`)
+  combining motor actuation, fixed-joint tendons, passive spring/damping forces, fluid drag,
+  sphere contacts, joint constraints, and sensor queries with one coupled Delassus constraint solve;
+  RK4 and bounded implicitfast; springs and body forces; inertia-box fluid drag; fixed-tendon dynamics;
+  selected sensor queries; sphere contact and joint constraints have CPU-reference checks. See the [precise development coverage](metal/DEVELOPMENT.md).
 - **Tools and documentation:** creative simulation demos, capability inventory,
   runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.
 - **Upstream regression coverage:** an `mj_setConst` inertial-update roundtrip test
@@ -80,6 +82,12 @@ execution speed. Rendering uses MuJoCo OpenGL. Most examples offer headless
 checks and GIF recording; interactive viewing is documented where available.
 The [compact gallery](metal/examples/demo_gallery.md) maps each demo to its
 physics capability.
+
+### [Robotic marble music machine](metal/examples/marble_music_machine.md)
+
+Dual selector gates and resonant chime bars struck by descending marbles demonstrate the integrated Euler pipeline: motor actuation, fixed tendons, passive resonant springs, fluid drag, joint limits, dry friction, polynomial equality, and pyramidal contacts coupled in one solve.
+
+![Robotic marble music machine: native Metal beside CPU MuJoCo](metal/examples/assets/marble_music_machine.gif)
 
 ### [Off-center balance workshop](metal/examples/offcenter_balance.md)
 
