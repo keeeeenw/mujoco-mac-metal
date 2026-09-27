@@ -62,4 +62,13 @@ def __getattr__(name):
     from mujoco_metal.simulation import MetalSimulation
 
     return MetalSimulation
+  if name in (
+      "CoupledConstraintDescriptor",
+      "lower_coupled_constraints",
+      "coupled_constraint_oracle",
+      "MetalCoupledConstraints",
+  ):
+    from mujoco_metal import coupled_constraints
+
+    return getattr(coupled_constraints, name)
   raise AttributeError(name)

@@ -73,6 +73,7 @@ def preflight(model_path=None, include_inventory=False):
               "fluid",
               "implicit",
               "implicit_midpoint",
+              "coupled_constraints",
           )
       },
   }

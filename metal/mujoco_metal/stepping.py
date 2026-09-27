@@ -90,6 +90,135 @@ def validate_stepping_profile(
   separate from ``load_model``: generalized mass and bias queries support a
   broader model set than this stepping profile.
   """
+  if profile == "integrated_euler_v1":
+    if not isinstance(model, mujoco.MjModel):
+      raise TypeError("model must be a compiled mujoco.MjModel")
+    if mujoco.__version__ != TARGET_MUJOCO_VERSION:
+      raise RuntimeError(
+          f"requires MuJoCo {TARGET_MUJOCO_VERSION}; found {mujoco.__version__}"
+      )
+    dt = model.opt.timestep if timestep is None else timestep
+    try:
+      dt = float(dt)
+    except (TypeError, ValueError, OverflowError) as error:
+      raise ValueError("timestep must be finite and positive") from error
+    if not math.isfinite(dt) or dt <= 0:
+      raise ValueError("timestep must be finite and positive")
+    with np.errstate(over="ignore", under="ignore"):
+      native_dt = np.float32(dt)
+    if not np.isfinite(native_dt) or native_dt <= 0:
+      raise ValueError(
+          "timestep must be representable as a finite positive float32"
+      )
+
+    opt = model.opt
+    if int(opt.integrator) != int(mujoco.mjtIntegrator.mjINT_EULER):
+      raise ValueError("integrated_euler_v1 requires the Euler integrator")
+    if not math.isfinite(float(opt.timestep)) or opt.timestep <= 0:
+      raise ValueError("compiled model timestep must be finite and positive")
+
+    if model.nv > 32:
+      raise ValueError(f"integrated_euler_v1 bounds nv to 32; found {model.nv}")
+
+    enable = int(opt.enableflags)
+    sleep = int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+    if enable & sleep:
+      raise ValueError("sleep mode is unsupported by integrated_euler_v1")
+    energy = int(mujoco.mjtEnableBit.mjENBL_ENERGY)
+    unknown_enable = enable & ~(energy | sleep)
+    if unknown_enable:
+      raise ValueError(f"unsupported enable flags: 0x{unknown_enable:x}")
+
+    allowed_joints = {
+        int(mujoco.mjtJoint.mjJNT_HINGE),
+        int(mujoco.mjtJoint.mjJNT_SLIDE),
+        int(mujoco.mjtJoint.mjJNT_FREE),
+        int(mujoco.mjtJoint.mjJNT_BALL),
+    }
+    joint_types = tuple(int(value) for value in model.jnt_type)
+    if any(value not in allowed_joints for value in joint_types):
+      raise ValueError("unsupported joint type in integrated_euler_v1")
+
+    if mujoco.get_mjcb_contactfilter() is not None:
+      raise ValueError("global contact filter callback is unsupported")
+    if mujoco.get_mjcb_passive() is not None:
+      raise ValueError("global passive callback is unsupported")
+    if mujoco.get_mjcb_control() is not None:
+      raise ValueError("global control callback is unsupported")
+
+    if hasattr(model, "nflex") and model.nflex > 0:
+      raise ValueError("flex/deformable elements are unsupported")
+    if model.nplugin > 0:
+      raise ValueError("MuJoCo plugins are unsupported")
+    if model.nmocap > 0:
+      raise ValueError("mocap bodies are unsupported")
+
+    supported_list = [
+        "rigid hinge, slide, free, and ball joints",
+        "semi-implicit Euler integration",
+        "gravity compensation and MuJoCo disable flags",
+    ]
+
+    if model.nu > 0:
+      from mujoco_metal.transmissions import TransmissionModel
+      TransmissionModel(model)
+      supported_list.append("stateless scalar actuators and transmissions")
+    if model.ntendon > 0:
+      from mujoco_metal.tendons import FixedTendonModel
+      FixedTendonModel(model)
+      supported_list.append("fixed-joint tendons with spring, damping, and armature")
+
+    from mujoco_metal.passive import PassiveForceModel
+    PassiveForceModel(model)
+    supported_list.append("passive joint springs, damping, gravcomp, and body wrenches")
+
+    if model.opt.density > 0 or model.opt.viscosity > 0 or np.any(model.opt.wind != 0):
+      from mujoco_metal.fluid import InertiaBoxFluidModel
+      InertiaBoxFluidModel(model)
+      supported_list.append("inertia-box fluid forces, wind, and viscosity")
+
+    if model.nsensor > 0:
+      from mujoco_metal.sensors import lower_sensors
+      lower_sensors(model)
+      supported_list.append("stateless current-state sensor queries")
+
+    from mujoco_metal.coupled_constraints import lower_coupled_constraints
+    coupled_desc = lower_coupled_constraints(model)
+    if coupled_desc.nc > 0 or coupled_desc.nr_joint > 0:
+      supported_list.append("coupled constraint solve for contacts, joint limits, dry friction, and equalities")
+
+    implicit_euler_damping = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP))
+    passive_damping_enabled = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
+
+    return SteppingProfile(
+        name="integrated_euler_v1",
+        timestep=float(native_dt),
+        model_fingerprint=_fingerprint(model),
+        descriptor_fingerprint=_fingerprint(load_model(model)),
+        nq=int(model.nq),
+        nv=int(model.nv),
+        joint_types=joint_types,
+        supported=tuple(supported_list),
+        irrelevant=(
+            "energy diagnostics flag; stepping does not produce energy diagnostics",
+            "visual, rendering, naming, keyframe, and user-data metadata",
+            "warmstart disable flag",
+        ),
+        rejected=(
+            "flex/deformable elements",
+            "MuJoCo plugins",
+            "mocap bodies",
+            "spatial/wrapping tendons, tendon limits, and tendon frictionloss",
+            "non-scalar/non-fixed-tendon actuators, activation state, and muscles",
+            "non-sphere collision geoms",
+            "sleep mode",
+            "non-Euler integrators",
+            "global callbacks",
+        ),
+        passive_damping_enabled=passive_damping_enabled,
+        implicit_euler_damping=implicit_euler_damping,
+    )
+
   if profile == "contact_free_implicitfast_v1":
     from mujoco_metal.implicit import lower_implicitfast
 

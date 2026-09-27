@@ -74,19 +74,23 @@ class MetalSimulation:
     # This CPU-only contract check must finish before any constructor can
     # initialize MPS or compile a shader.
     profile = validate_stepping_profile(model, profile=profile)
-    with_transmissions = "transmission" in profile.name
+    is_integrated = profile.name == "integrated_euler_v1"
+    with_transmissions = "transmission" in profile.name or is_integrated
     motor_model = (
         ScalarMotorModel.from_model(model)
-        if profile.name.replace("rk4", "euler")
-        in (
-            "contact_free_motor_euler_v1",
-            "joint_constraints_euler_v1",
-            "contact_free_fluid_euler_v1",
-            "contact_free_implicitfast_v1",
-            "contact_free_passive_euler_v1",
-            "contact_free_sensor_euler_v1",
-            "normal_contact_euler_v1",
-            "friction_contact_euler_v1",
+        if (
+            not is_integrated
+            and profile.name.replace("rk4", "euler")
+            in (
+                "contact_free_motor_euler_v1",
+                "joint_constraints_euler_v1",
+                "contact_free_fluid_euler_v1",
+                "contact_free_implicitfast_v1",
+                "contact_free_passive_euler_v1",
+                "contact_free_sensor_euler_v1",
+                "normal_contact_euler_v1",
+                "friction_contact_euler_v1",
+            )
         )
         else None
     )
@@ -135,7 +139,7 @@ class MetalSimulation:
     descriptor = self._state._model
     self.profile = profile
     smooth_descriptor = descriptor
-    if with_transmissions:
+    if with_transmissions and model.ntendon:
       # Fixed tendon armature is assembled separately as J.T @ armature @ J.
       smooth_descriptor = replace(
           descriptor, tendon_armature=np.zeros_like(descriptor.tendon_armature)
@@ -150,20 +154,21 @@ class MetalSimulation:
         else None
     )
     self._transmissions = None
-    if with_transmissions:
+    if (with_transmissions or is_integrated) and model.nu:
       from mujoco_metal.transmissions import MetalTransmissions
 
       self._transmissions = MetalTransmissions(model)
     self._tendons = None
     self._tendon_damping = None
-    if with_transmissions and model.ntendon:
+    if (with_transmissions or is_integrated) and model.ntendon:
       from mujoco_metal.tendons import MetalFixedTendonDynamics
 
       self._tendons = MetalFixedTendonDynamics(model, batch_size)
     self._passive = None
     self._damping_tangent = None
     if (
-        with_transmissions
+        is_integrated
+        or with_transmissions
         or "joint_constraints" in profile.name
         or "fluid" in profile.name
         or "implicitfast" in profile.name
@@ -176,13 +181,20 @@ class MetalSimulation:
 
       self._passive = MetalPassiveForces(model)
     self._fluid = None
-    if "fluid" in profile.name:
+    if "fluid" in profile.name or (
+        is_integrated
+        and (
+            model.opt.density > 0
+            or model.opt.viscosity > 0
+            or np.any(model.opt.wind != 0)
+        )
+    ):
       from mujoco_metal.fluid import MetalInertiaBoxFluid
 
       self._fluid = MetalInertiaBoxFluid(model, batch_size)
     self._sensors = None
     self._sensordata = None
-    if "sensor" in profile.name:
+    if "sensor" in profile.name or (is_integrated and model.nsensor > 0):
       from mujoco_metal.sensors import SensorProgram
 
       self._sensors = SensorProgram(model, batch_size)
@@ -205,6 +217,18 @@ class MetalSimulation:
       from mujoco_metal.contact import MetalContact
 
       self._contact = MetalContact(model, batch_size)
+
+    self._coupled_constraints = None
+    if is_integrated and not (
+        int(model.opt.disableflags)
+        & int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+    ):
+      from mujoco_metal.coupled_constraints import lower_coupled_constraints, MetalCoupledConstraints
+
+      c_desc = lower_coupled_constraints(model)
+      if c_desc.nc > 0 or c_desc.nr_joint > 0:
+        self._coupled_constraints = MetalCoupledConstraints(model, batch_size)
+
     self._solver = MetalDenseSolve(descriptor.nv, batch_size)
     self._implicitfast = None
     self._midpoint = None
@@ -234,18 +258,21 @@ class MetalSimulation:
     )
     self._applied_force = (
         torch.zeros_like(self._rhs)
-        if profile.name.replace("rk4", "euler")
-        in (
-            "contact_free_forces_euler_v1",
-            "contact_free_motor_euler_v1",
-            "contact_free_transmission_euler_v1",
-            "joint_constraints_euler_v1",
-            "contact_free_fluid_euler_v1",
-            "contact_free_implicitfast_v1",
-            "contact_free_passive_euler_v1",
-            "contact_free_sensor_euler_v1",
-            "normal_contact_euler_v1",
-            "friction_contact_euler_v1",
+        if (
+            is_integrated
+            or profile.name.replace("rk4", "euler")
+            in (
+                "contact_free_forces_euler_v1",
+                "contact_free_motor_euler_v1",
+                "contact_free_transmission_euler_v1",
+                "joint_constraints_euler_v1",
+                "contact_free_fluid_euler_v1",
+                "contact_free_implicitfast_v1",
+                "contact_free_passive_euler_v1",
+                "contact_free_sensor_euler_v1",
+                "normal_contact_euler_v1",
+                "friction_contact_euler_v1",
+            )
         )
         else None
     )
@@ -450,6 +477,15 @@ class MetalSimulation:
     acceleration, status = self._solver.run_device(
         dynamics["mass_matrix"], self._rhs
     )
+    if self._coupled_constraints is not None:
+      coupled = self._coupled_constraints.run_device(
+          dynamics["poses"], dynamics["mass_matrix"], self._rhs, qpos, qvel
+      )
+      status = self._state._torch.where(
+          status == 0, coupled["status"], status
+      )
+      acceleration = coupled["qacc"]
+      self._rhs.add_(coupled["qfrc_constraint"])
     if self._contact is not None:
       contact = self._contact.run_device(
           dynamics["poses"], dynamics["mass_matrix"], acceleration, qvel

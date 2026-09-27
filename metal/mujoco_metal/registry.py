@@ -381,6 +381,11 @@ def _inventory():
           Stage.SENSOR,
           "joint/frame/clock/gyro/velocity subset; explicit query, not stored mj_step timing; no history/noise/delay",
       ),
+      (
+          "integrated Euler pipeline",
+          Stage.INTEGRATION,
+          "coupled constraints (sphere contacts, scalar limits, dry friction, equalities) with actuation, tendons, passive/fluid forces, and sensors in integrated_euler_v1",
+      ),
   ):
     result.append(
         Feature(
