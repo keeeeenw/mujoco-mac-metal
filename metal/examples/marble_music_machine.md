@@ -27,7 +27,7 @@ PYTHONPATH=metal python metal/examples/marble_music_machine.py --mode cpu --head
 Run the native Metal comparison check on an Apple Silicon Mac:
 
 ```bash
-MUJOCO_METAL_RUN_GPU=1 PYTHONPATH=metal python metal/examples/marble_music_machine.py --headless --check --steps 100
+MUJOCO_METAL_RUN_GPU=1 PYTHONPATH=metal python metal/examples/marble_music_machine.py --headless --check --steps 400
 ```
 
 Record the side-by-side native Metal and CPU MuJoCo renders:
@@ -39,5 +39,7 @@ PYTHONPATH=metal python metal/examples/marble_music_machine.py --record metal/ex
 ![Native Metal robotic marble music machine beside CPU MuJoCo](assets/marble_music_machine.gif)
 
 The 400-step native run exercises all integrated feature families simultaneously. Maximum qpos/qvel
-differences from CPU were `3.72e-3` / `1.83e-1`; sensor values remained within `0.0` error.
+differences from CPU were `8.94e-6` / `1.97e-4`; stage sensor error was `0.0`, and trajectory sensor error was `8.57e-6`.
+The run recorded 211 active joint limit constraint steps (238 steps near limits), chime oscillations of `0.091 rad` (chime 1) and `0.066 rad` (chime 2), and 4 distinct contact pairs (`chime1_sphere <-> marble1_sphere`, `chime2_sphere <-> marble2_sphere`, `gate1_bar <-> marble1_sphere`, and `gate2_bar <-> marble2_sphere`).
 Coupled constraints prevent the numerical divergence that occurs when contact and joint constraints are solved independently.
+

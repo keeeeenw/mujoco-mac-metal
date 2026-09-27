@@ -13,7 +13,7 @@ from mujoco_metal.stepping import validate_stepping_profile
 
 INTEGRATED_XML = """<mujoco model="integrated_all_families">
   <compiler angle="radian"/>
-  <option timestep="0.002" integrator="Euler" iterations="500" tolerance="1e-8" density="1.2" viscosity="0.00001">
+  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6" density="1.2" viscosity="0.00001">
     <flag contact="enable" equality="enable" limit="enable" frictionloss="enable"/>
   </option>
   <default>
@@ -324,3 +324,179 @@ def test_minimal_actuated_model_gpu():
   for b in range(2):
     np.testing.assert_allclose(sim.state.qpos[b].cpu().numpy(), d_cpu[b].qpos, atol=1e-5)
     np.testing.assert_allclose(sim.state.qvel[b].cpu().numpy(), d_cpu[b].qvel, atol=1e-4)
+
+
+def test_integrated_simulation_execution_plan_and_buffer_audit():
+  model = mujoco.MjModel.from_xml_string(INTEGRATED_XML)
+  profile = validate_stepping_profile(model, profile="integrated_euler_v1")
+  plan = profile.execution_plan
+  assert plan is not None
+  assert plan.profile_name == "integrated_euler_v1"
+  assert len(plan.stages) == 9
+  assert any(s.name == "coupled_constraints" and s.enabled for s in plan.stages)
+  assert any(s.name == "fixed_tendons" and s.enabled for s in plan.stages)
+  assert any(s.name == "sensors" and s.enabled for s in plan.stages)
+
+  audit = plan.buffer_audit
+  assert len(audit) >= 14
+  names = [b["name"] for b in audit]
+  assert "state.qpos" in names
+  assert "workspace_J" in names
+  assert "_eq_active_default" in names
+  assert "sensordata" in names
+
+
+def test_integrated_simulation_capacity_boundary_and_overflow_rejection():
+  from mujoco_metal.coupled_constraints import lower_coupled_constraints
+
+  # nv > 32
+  huge_xml = """<mujoco><compiler angle="radian"/><option integrator="Euler"/><worldbody>"""
+  for i in range(35):
+    huge_xml += f'<body pos="{i} 0 0"><joint type="hinge"/><geom type="sphere" size="0.1"/></body>'
+  huge_xml += "</worldbody></mujoco>"
+  with pytest.raises(ValueError, match="bounds nv to 32"):
+    validate_stepping_profile(mujoco.MjModel.from_xml_string(huge_xml), profile="integrated_euler_v1")
+
+  # nc > 16 (7 dynamic bodies give 21 candidate pairs > 16)
+  pairs_xml = """<mujoco><compiler angle="radian"/><option integrator="Euler"/><worldbody>"""
+  for i in range(7):
+    pairs_xml += f'<body pos="{i} 0 0"><joint type="slide" axis="0 0 1"/><geom type="sphere" size="0.1"/></body>'
+  pairs_xml += "</worldbody></mujoco>"
+  with pytest.raises(ValueError, match="contact pairs"):
+    lower_coupled_constraints(mujoco.MjModel.from_xml_string(pairs_xml))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_integrated_simulation_multiple_timesteps_and_nonzero_initial_states():
+  import torch
+
+  for dt in [0.001, 0.002, 0.004]:
+    xml = INTEGRATED_XML.replace('timestep="0.002"', f'timestep="{dt}"')
+    model = mujoco.MjModel.from_xml_string(xml)
+    q0 = np.array([[0.1, -0.15, -0.22]], dtype=np.float32)
+    v0 = np.array([[0.2, 0.1, -0.05]], dtype=np.float32)
+
+    sim = MetalSimulation(model, batch_size=1, qpos=q0, qvel=v0, profile="integrated_euler_v1")
+    d_cpu = mujoco.MjData(model)
+    d_cpu.qpos[:] = q0[0]
+    d_cpu.qvel[:] = v0[0]
+
+    for step in range(25):
+      ctrl = np.array([[0.3 * np.sin(step * 0.1)]], dtype=np.float32)
+      sim.step(1, ctrl=ctrl)
+      d_cpu.ctrl[0] = ctrl[0, 0]
+      mujoco.mj_step(model, d_cpu)
+
+    np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), d_cpu.qpos, atol=1e-5)
+    np.testing.assert_allclose(sim.state.qvel[0].cpu().numpy(), d_cpu.qvel, atol=1e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_integrated_simulation_varying_forces_and_body_wrenches():
+  import torch
+
+  model = mujoco.MjModel.from_xml_string(INTEGRATED_XML)
+  sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  d_cpu = mujoco.MjData(model)
+
+  for step in range(30):
+    qfrc = np.array([[0.2 * np.sin(step * 0.2), -0.1 * np.cos(step * 0.15), 0.05 * np.sin(step * 0.1)]], dtype=np.float32)
+    xfrc = np.zeros((1, model.nbody, 6), dtype=np.float32)
+    xfrc[0, 1, :3] = [0.1 * np.cos(step * 0.1), 0.0, 0.2 * np.sin(step * 0.1)]
+
+    sim.step(1, qfrc_applied=qfrc, xfrc_applied=xfrc)
+
+    d_cpu.qfrc_applied[:] = qfrc[0]
+    d_cpu.xfrc_applied[:] = xfrc[0]
+    mujoco.mj_step(model, d_cpu)
+
+    np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), d_cpu.qpos, atol=1e-5)
+    np.testing.assert_allclose(sim.state.qvel[0].cpu().numpy(), d_cpu.qvel, atol=1e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_integrated_simulation_disable_flags_physical_effect():
+  import torch
+
+  for bit in [
+      mujoco.mjtDisableBit.mjDSBL_ACTUATION,
+      mujoco.mjtDisableBit.mjDSBL_DAMPER,
+      mujoco.mjtDisableBit.mjDSBL_EQUALITY,
+      mujoco.mjtDisableBit.mjDSBL_LIMIT,
+      mujoco.mjtDisableBit.mjDSBL_CONTACT,
+  ]:
+    model = mujoco.MjModel.from_xml_string(INTEGRATED_XML)
+    model.opt.disableflags |= int(bit)
+    sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+    d_cpu = mujoco.MjData(model)
+    ctrl = np.array([[0.5]], dtype=np.float32)
+
+    for _ in range(15):
+      sim.step(1, ctrl=ctrl)
+      d_cpu.ctrl[0] = ctrl[0, 0]
+      mujoco.mj_step(model, d_cpu)
+
+    np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), d_cpu.qpos, atol=1e-5)
+    np.testing.assert_allclose(sim.state.qvel[0].cpu().numpy(), d_cpu.qvel, atol=1e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_integrated_simulation_convergence_failure_and_rollback():
+  import torch
+
+  # Coupled problem with tight tolerance and low iteration cap causing iteration exhaustion
+  xml = """<mujoco>
+  <option timestep="0.002" integrator="Euler" iterations="2" tolerance="1e-6"/>
+  <worldbody>
+    <geom type="plane" size="1 1 0.1"/>
+    <body pos="0 0 0.05">
+      <joint name="j1" type="slide" axis="0 0 1"/>
+      <geom type="sphere" size="0.1" friction="1 0.1 0.1"/>
+    </body>
+    <body pos="0 0 0.15">
+      <joint name="j2" type="slide" axis="0 0 1"/>
+      <geom type="sphere" size="0.1" friction="1 0.1 0.1"/>
+    </body>
+  </worldbody>
+  <equality>
+    <joint joint1="j1" joint2="j2" polycoef="0.05 1 0 0 0"/>
+  </equality>
+</mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+
+  qpos_initial = sim.state.qpos.clone()
+  sim.step(1)
+
+  # Status reports 3 (iteration exhaustion / non-convergence)
+  status = sim.state.status.cpu().numpy()
+  assert np.all(status == 3), f"Expected status 3, got {status}"
+
+  # Verify world state did not advance on failure (rollback to previous valid state)
+  assert torch.allclose(sim.state.qpos, qpos_initial)
+
+  # Verify subsequent step remains sticky failure
+  sim.step(1)
+  assert np.all(sim.state.status.cpu().numpy() == 3)
+  assert torch.allclose(sim.state.qpos, qpos_initial)
+
+  # Verify selective reset recovers cleanly per environment
+  sim.state.reset(env_ids=[0])
+  assert sim.state.status[0].item() == 0
+  assert sim.state.status[1].item() == 3
+
+  sim.state.reset(env_ids=[1])
+  assert torch.all(sim.state.status == 0)
+

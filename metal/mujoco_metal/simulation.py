@@ -336,6 +336,17 @@ class MetalSimulation:
     """The owned :class:`DeviceState` lifecycle and checkpoint interface."""
     return self._state
 
+  @property
+  def execution_plan(self):
+    """The model-derived execution plan for the active stepping profile."""
+    return self.profile.execution_plan
+
+  def buffer_audit(self):
+    """Return a tuple of buffer specifications describing all device allocations."""
+    if self.profile.execution_plan is not None:
+      return self.profile.execution_plan.buffer_audit
+    return ()
+
   def sensor_values(self):
     """Evaluate supported stateless sensors at CURRENT state on MPS.
 

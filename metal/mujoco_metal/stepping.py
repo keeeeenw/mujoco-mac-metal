@@ -27,6 +27,27 @@ from mujoco_metal.registry import TARGET_MUJOCO_VERSION
 
 
 @dataclass(frozen=True)
+class PipelineStageSpec:
+  """Explicit model-derived specification of one pipeline stage."""
+  name: str
+  subsystem: str
+  enabled: bool
+  dependencies: tuple[str, ...]
+  inputs: tuple[str, ...]
+  outputs: tuple[str, ...]
+  buffer_lifetimes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+  """Model-derived execution plan and buffer audit."""
+  profile_name: str
+  timestep: float
+  stages: tuple[PipelineStageSpec, ...]
+  buffer_audit: tuple[dict, ...]
+
+
+@dataclass(frozen=True)
 class SteppingProfile:
   """Immutable validation result for one compiled model and Euler timestep."""
 
@@ -42,6 +63,7 @@ class SteppingProfile:
   rejected: tuple[str, ...]
   passive_damping_enabled: bool = False
   implicit_euler_damping: bool = False
+  execution_plan: object = None
 
 
 _SUPPORTED = (
@@ -79,6 +101,125 @@ _REJECTED = (
     "global passive or control callbacks",
     "unsupported disable/enable flags",
 )
+
+
+def _build_integrated_execution_plan(
+    model, timestep, implicit_euler_damping, passive_damping_enabled, coupled_desc
+) -> ExecutionPlan:
+  stages = [
+      PipelineStageSpec(
+          name="smooth_dynamics",
+          subsystem="smooth",
+          enabled=True,
+          dependencies=(),
+          inputs=("qpos", "qvel"),
+          outputs=("poses", "mass_matrix", "qfrc_bias"),
+          buffer_lifetimes=("scratch per step: poses, mass_matrix (batch, nv, nv), qfrc_bias (batch, nv)",),
+      ),
+      PipelineStageSpec(
+          name="fixed_tendons",
+          subsystem="tendons",
+          enabled=bool(model.ntendon > 0),
+          dependencies=("smooth_dynamics",),
+          inputs=("qpos", "qvel"),
+          outputs=("qfrc_tendon", "damping_matrix", "armature_matrix"),
+          buffer_lifetimes=("constant: _ancestor_mask; scratch per step: qfrc_tendon, damping_matrix, armature_matrix",),
+      ),
+      PipelineStageSpec(
+          name="passive_forces",
+          subsystem="passive",
+          enabled=bool(model.njnt > 0 or model.nbody > 0),
+          dependencies=("smooth_dynamics",),
+          inputs=("qpos", "qvel", "poses"),
+          outputs=("qfrc_passive", "body_wrench"),
+          buffer_lifetimes=("scratch per step: qfrc_passive (batch, nv), body_wrench (batch, nbody, 6)",),
+      ),
+      PipelineStageSpec(
+          name="fluid_forces",
+          subsystem="fluid",
+          enabled=bool(model.opt.density > 0 or model.opt.viscosity > 0 or np.any(model.opt.wind != 0)),
+          dependencies=("smooth_dynamics",),
+          inputs=("poses", "qvel"),
+          outputs=("qfrc_fluid",),
+          buffer_lifetimes=("scratch per step: qfrc_fluid (batch, nv)",),
+      ),
+      PipelineStageSpec(
+          name="actuation",
+          subsystem="transmissions",
+          enabled=bool(model.nu > 0),
+          dependencies=("smooth_dynamics",),
+          inputs=("ctrl", "qpos", "qvel"),
+          outputs=("qfrc_actuator",),
+          buffer_lifetimes=("scratch per step: qfrc_actuator (batch, nv)",),
+      ),
+      PipelineStageSpec(
+          name="coupled_constraints",
+          subsystem="coupled_constraints",
+          enabled=bool(coupled_desc.nc > 0 or coupled_desc.nr_joint > 0),
+          dependencies=("smooth_dynamics", "fixed_tendons", "passive_forces", "fluid_forces", "actuation"),
+          inputs=("mass_matrix", "qfrc_smooth", "poses", "qpos", "qvel", "eq_active"),
+          outputs=("qacc", "qfrc_constraint", "status", "solver_diagnostics", "contact_force", "joint_force"),
+          buffer_lifetimes=(
+              "persistent MPS: _eq_active_default; preallocated MPS workspace: workspace_J (batch, 96, 32), "
+              "contact_row_data (batch, nc, 5, 6), contact_jacobian (batch, nc, 5, nv), out_force, out_acc",
+          ),
+      ),
+      PipelineStageSpec(
+          name="euler_damping",
+          subsystem="dense_solve",
+          enabled=bool(implicit_euler_damping),
+          dependencies=("coupled_constraints",),
+          inputs=("effective_mass", "qrhs"),
+          outputs=("integration_acceleration", "euler_status"),
+          buffer_lifetimes=("scratch per step: effective_mass (batch, nv, nv), qrhs (batch, nv)",),
+      ),
+      PipelineStageSpec(
+          name="euler_integration",
+          subsystem="integration",
+          dependencies=("euler_damping" if implicit_euler_damping else "coupled_constraints",),
+          enabled=True,
+          inputs=("qpos", "qvel", "integration_acceleration", "time", "status"),
+          outputs=("qpos_next", "qvel_next", "time_next", "status_next"),
+          buffer_lifetimes=("persistent MPS: state.qpos, state.qvel, state.time, state.status",),
+      ),
+      PipelineStageSpec(
+          name="sensors",
+          subsystem="sensors",
+          enabled=bool(model.nsensor > 0),
+          dependencies=("euler_integration",),
+          inputs=("qpos_next", "qvel_next", "poses"),
+          outputs=("sensordata",),
+          buffer_lifetimes=("persistent MPS: sensordata (batch, nsensordata)",),
+      ),
+  ]
+
+  audit = (
+      {"name": "state.qpos", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"(batch, {model.nq})", "dtype": "float32"},
+      {"name": "state.qvel", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"(batch, {model.nv})", "dtype": "float32"},
+      {"name": "state.status", "residency": "MPS device-resident", "lifetime": "persistent", "shape": "(batch,)", "dtype": "uint8"},
+      {"name": "state.time", "residency": "MPS device-resident", "lifetime": "persistent", "shape": "(batch,)", "dtype": "float32"},
+      {"name": "mass_matrix", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv}, {model.nv})", "dtype": "float32"},
+      {"name": "qfrc_bias", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv})", "dtype": "float32"},
+      {"name": "workspace_J", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch, 96, 32)", "dtype": "float32"},
+      {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc}, 5, 6)", "dtype": "float32"},
+      {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc}, 5, {model.nv})", "dtype": "float32"},
+      {"name": "_eq_active_default", "residency": "MPS device-resident", "lifetime": "persistent preallocated", "shape": f"(batch, {max(model.neq, 1)})", "dtype": "int32"},
+      {"name": "out_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
+      {"name": "out_acc", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
+      {"name": "out_status", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch,)", "dtype": "int32"},
+      {"name": "out_diagnostics", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch, 2)", "dtype": "float32"},
+  )
+  if model.nsensor > 0:
+    audit = audit + (
+        {"name": "sensordata", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"(batch, {model.nsensordata})", "dtype": "float32"},
+    )
+
+  return ExecutionPlan(
+      profile_name="integrated_euler_v1",
+      timestep=float(timestep),
+      stages=tuple(stages),
+      buffer_audit=audit,
+  )
 
 
 def validate_stepping_profile(
@@ -190,6 +331,10 @@ def validate_stepping_profile(
     implicit_euler_damping = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP))
     passive_damping_enabled = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
 
+    execution_plan = _build_integrated_execution_plan(
+        model, float(native_dt), implicit_euler_damping, passive_damping_enabled, coupled_desc
+    )
+
     return SteppingProfile(
         name="integrated_euler_v1",
         timestep=float(native_dt),
@@ -217,6 +362,7 @@ def validate_stepping_profile(
         ),
         passive_damping_enabled=passive_damping_enabled,
         implicit_euler_damping=implicit_euler_damping,
+        execution_plan=execution_plan,
     )
 
   if profile == "contact_free_implicitfast_v1":

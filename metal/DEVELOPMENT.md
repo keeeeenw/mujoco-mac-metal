@@ -6,9 +6,9 @@ The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
 
-The current regression checkpoint passed **270 tests with native GPU execution
-enabled**. A separate environment without Torch passed **160 CPU tests**, with
-110 GPU checks skipped. These counts describe the source snapshot and do not
+The current regression checkpoint passed **282 tests with native GPU execution
+enabled**. A separate environment without Torch passed **155 CPU tests**, with
+127 GPU checks skipped. These counts describe the source snapshot and do not
 establish coverage of every MuJoCo feature.
 
 The source checkpoint is `feature/problem-001-integrated-euler`; documentation-only revisions do not change
@@ -47,6 +47,24 @@ bodies. Other free trees retain ordinary implicitfast integration. Its reported
 `qacc` follows MuJoCo 3.10: midpoint DOFs store the velocity difference divided
 by the timestep; other DOFs keep the forward acceleration.
 
+The `integrated_euler_v1` profile implements an explicit execution plan (`sim.execution_plan`)
+comprising nine ordered pipeline stages:
+1. `smooth_dynamics`: Forward kinematics, body inertias, CRBA generalized mass matrix, and bias forces.
+2. `fixed_tendons`: Fixed-joint tendon lengths, Jacobian, spring/damping forces, and tendon armature matrix.
+3. `passive_forces`: Joint springs, polynomial damping, gravity compensation, and Cartesian body wrenches.
+4. `fluid_forces`: Inertia-box fluid drag, viscosity, and wind forces.
+5. `actuation`: Stateless scalar motor actuators and transmissions.
+6. `coupled_constraints`: Unified Delassus Projected Gauss-Seidel (PGS) constraint solve simultaneously coupling plane–sphere and sphere–sphere contacts (condim 1 and pyramidal condim 3), scalar joint limits, dry joint frictionloss, and polynomial equality constraints. The generalized mass matrix incorporates rigid body inertia and tendon armature.
+7. `euler_damping`: Semi-implicit velocity damping solve $(M + h D) v^+ = M v^*$.
+8. `euler_integration`: Semi-implicit Euler state integration with sticky failure rollback.
+9. `sensors`: Stateless current-state sensor queries executed on GPU directly from device-resident state.
+
+The coupled solver enforces a strict convergence contract:
+- Iteration cap: 1024 iterations default (or model-configured `model.opt.iterations`).
+- Convergence tolerance: Strict $L_\infty$ residual $\le 10^{-6}$ (or model-configured `model.opt.tolerance`).
+- Solver status codes: 0 = converged, 2 = non-finite / divergence, 3 = iteration exhaustion / non-convergence. If any world fails to converge, its state stickily rolls back to its previous valid state without advancing, while healthy worlds continue. Recovery is achieved via selective per-world reset (`sim.state.reset(env_ids)`).
+- Complete device residency: Stepping requires zero host-device synchronization, CPU physics fallbacks, or per-step memory allocations. All buffers are accounted for in the model-derived buffer audit (`sim.buffer_audit()`). On the 100-step coupled verification fixture, native Metal matches CPU MuJoCo with maximum position error `1.50e-7`, velocity error `1.67e-6`, and sensor error `1.07e-6`.
+
 ## Demo evidence
 
 The clips are actual native/CPU simulations at a presentation playback rate,
@@ -73,8 +91,8 @@ not throughput measurements. [Explore the gallery](examples/demo_gallery.md).
 - Sensor scanning rig: 2,000 steps (four simulated seconds); maximum qpos/qvel
   differences `6.53e-6` / `6.64e-6`, maximum current sensor difference `7.49e-5`
   across the fixture's mixed sensor units, including accumulated float32 time.
-- Robotic marble music machine: 400 steps; maximum qpos/qvel differences
-  `3.72e-3` / `1.83e-1`, with exact sensor agreement (`0.0`); exercises all Euler feature families simultaneously in one coupled Delassus solve.
+- Robotic marble music machine: 400 steps; maximum absolute qpos/qvel differences
+  `8.94e-6` / `1.97e-4`; stage sensor difference `0.0`, trajectory sensor difference `8.57e-6`; exercises all Euler feature families simultaneously in one coupled Delassus solve (211 active joint limit steps, 238 near limit steps, chime oscillations 0.091 rad / 0.066 rad, 4 active contact pairs).
 
 These measured errors describe the fixtures, not universal tolerances.
 

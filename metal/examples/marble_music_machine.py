@@ -87,8 +87,10 @@ def run(steps=800, mode="metal", check=False, record=None):
   max_stage_sensor_error = 0.0
   max_trajectory_sensor_error = 0.0
   equality_max_residual = 0.0
-  joint_limit_events = 0
+  active_joint_limit_steps = 0
+  near_limit_steps = 0
   unique_contact_pairs = set()
+  cpu_detected_contact_pairs = set()
   dt = float(model.opt.timestep)
 
   chime1_dof = int(model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "chime1_hinge")])
@@ -128,23 +130,25 @@ def run(steps=800, mode="metal", check=False, record=None):
     eq_res = abs(float(actual.qpos[gate2_dof] + actual.qpos[gate1_dof]))
     equality_max_residual = max(equality_max_residual, eq_res)
 
-    # Joint limit events (approaching or hitting limit range [-0.6, 0.6])
+    # Joint limit events:
+    # 1. Near limit states (|q| >= 0.58)
     if (abs(float(actual.qpos[gate1_dof])) >= 0.58 or
         abs(float(actual.qpos[gate2_dof])) >= 0.58 or
         abs(float(actual.qpos[chime1_dof])) >= 0.58 or
         abs(float(actual.qpos[chime2_dof])) >= 0.58):
-      joint_limit_events += 1
+      near_limit_steps += 1
 
     # Stage sensor comparison (sensor-stage parity at current Metal state)
     d_check = mujoco.MjData(model)
     d_check.qpos[:] = actual.qpos
     d_check.qvel[:] = actual.qvel
     d_check.time = actual.time
-    mujoco.mj_fwdPosition(model, d_check)
-    mujoco.mj_fwdVelocity(model, d_check)
-    mujoco.mj_sensorPos(model, d_check)
-    mujoco.mj_sensorVel(model, d_check)
+    mujoco.mj_forward(model, d_check)
     max_stage_sensor_error = max(max_stage_sensor_error, float(np.max(np.abs(sensor_vals - d_check.sensordata))))
+
+    # 2. Active limit constraint rows in MuJoCo forward
+    if np.sum(d_check.efc_type == mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT) > 0:
+      active_joint_limit_steps += 1
 
     # Trajectory sensor comparison (against independent CPU trajectory rollout)
     d_traj = mujoco.MjData(model)
@@ -157,11 +161,12 @@ def run(steps=800, mode="metal", check=False, record=None):
     mujoco.mj_sensorVel(model, d_traj)
     max_trajectory_sensor_error = max(max_trajectory_sensor_error, float(np.max(np.abs(sensor_vals - d_traj.sensordata))))
 
-    # Record active contact pairs
+    # Record active contact pairs from CPU collision queries at native states
     for c_idx in range(d_check.ncon):
       g1 = model.geom(d_check.contact[c_idx].geom1).name
       g2 = model.geom(d_check.contact[c_idx].geom2).name
       pair_name = f"{min(g1, g2)} <-> {max(g1, g2)}"
+      cpu_detected_contact_pairs.add(pair_name)
       unique_contact_pairs.add(pair_name)
 
     max_chime1_vib = max(max_chime1_vib, abs(float(actual.qpos[chime1_dof])))
@@ -206,14 +211,31 @@ def run(steps=800, mode="metal", check=False, record=None):
       "max_trajectory_sensor_error": max_trajectory_sensor_error,
       "max_sensor_error": max_stage_sensor_error,
       "equality_max_residual": equality_max_residual,
-      "joint_limit_events": joint_limit_events,
+      "active_joint_limit_steps": active_joint_limit_steps,
+      "near_limit_steps": near_limit_steps,
+      "joint_limit_events": active_joint_limit_steps,
+      "cpu_detected_contact_pairs": sorted(list(cpu_detected_contact_pairs)),
       "unique_contact_pairs": sorted(list(unique_contact_pairs)),
   }
 
-  if check and mode == "metal" and (
-      max_qpos_error > 2e-2 or max_qvel_error > 3e-1 or max_stage_sensor_error > 1e-4
-  ):
-    raise AssertionError(json.dumps(result, indent=2))
+  if check and mode == "metal":
+    if max_qpos_error > 5e-5:
+      raise AssertionError(f"qpos error {max_qpos_error} exceeded 5e-5")
+    if max_qvel_error > 1e-3:
+      raise AssertionError(f"qvel error {max_qvel_error} exceeded 1e-3")
+    if max_stage_sensor_error > 1e-6:
+      raise AssertionError(f"stage sensor error {max_stage_sensor_error} exceeded 1e-6")
+    if max_trajectory_sensor_error > 5e-4:
+      raise AssertionError(f"trajectory sensor error {max_trajectory_sensor_error} exceeded 5e-4")
+    if steps >= 300:
+      if max_chime1_vib < 0.05:
+        raise AssertionError(f"chime 1 did not vibrate sufficiently: {max_chime1_vib}")
+      if max_chime2_vib < 0.03:
+        raise AssertionError(f"chime 2 did not vibrate sufficiently: {max_chime2_vib}")
+      if len(unique_contact_pairs) < 4:
+        raise AssertionError(f"expected 4 unique contact pairs, found {len(unique_contact_pairs)}")
+      if active_joint_limit_steps < 100:
+        raise AssertionError(f"expected active joint limit constraints, found {active_joint_limit_steps}")
 
   return result
 
@@ -224,13 +246,13 @@ def main(argv=None):
   parser.add_argument("--headless", action="store_true")
   parser.add_argument("--steps", type=int, default=500)
   parser.add_argument(
-      "--check", action="store_true", help="check a short independent native/CPU rollout"
+      "--check", action="store_true", help="check an independent native/CPU rollout"
   )
   parser.add_argument("--record", help="record actual native and CPU renders to a GIF")
   args = parser.parse_args(argv)
 
-  if args.steps <= 0 or (args.check and (not args.headless or args.steps > 200)):
-    parser.error("--check requires --headless and 1..200 steps")
+  if args.steps <= 0 or (args.check and not args.headless):
+    parser.error("--check requires --headless")
   if args.check and args.mode != "metal":
     parser.error("--check compares native Metal with the independent CPU reference")
 

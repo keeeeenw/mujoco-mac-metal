@@ -31,7 +31,7 @@ _MINVAL = 1e-15
 _MAX_NV = 32
 _MAX_CONTACT_PAIRS = 16
 _MAX_ROWS = 96
-_MAX_ITERATIONS = 512
+_MAX_ITERATIONS = 1024
 _TOLERANCE = 1e-6
 
 _PLANE = int(mujoco.mjtGeom.mjGEOM_PLANE)
@@ -65,6 +65,8 @@ class CoupledConstraintDescriptor:
   refsafe: bool
   impratio: float
   disableflags: int
+  iterations: int
+  tolerance: float
 
   # Joint constraint constants
   joint_type: np.ndarray
@@ -269,6 +271,16 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
     fr = np.empty((0, 2), dtype=np.float32)
     r1 = r2 = margin = gap = np.empty(0, dtype=np.float32)
 
+  if model.opt.iterations > 0 and model.opt.iterations != 100:
+    iterations = min(max(int(model.opt.iterations), 1), 2048)
+  else:
+    iterations = _MAX_ITERATIONS
+
+  if model.opt.tolerance >= _TOLERANCE:
+    tolerance = float(model.opt.tolerance)
+  else:
+    tolerance = _TOLERANCE
+
   return CoupledConstraintDescriptor(
       nq=int(model.nq), nv=int(model.nv), njnt=int(model.njnt),
       neq=int(model.neq), nc=nc, nr_joint=nr_joint, nr=nr,
@@ -277,6 +289,8 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       refsafe=not bool(int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)),
       impratio=float(model.opt.impratio),
       disableflags=int(model.opt.disableflags),
+      iterations=iterations,
+      tolerance=tolerance,
       joint_type=_frozen(model.jnt_type, np.int32),
       joint_qposadr=_frozen(model.jnt_qposadr, np.int32),
       qpos0=_frozen(model.qpos0, np.float32),
@@ -416,11 +430,11 @@ class MetalCoupledConstraints:
             dtype=torch.int32, device=self._device,
         ),
         "solver_dims": torch.tensor(
-            [d.nq, d.nv, d.njnt, d.neq, d.nc, self.batch_size, d.disableflags, 1 if d.refsafe else 0, _MAX_ITERATIONS, d.nr],
+            [d.nq, d.nv, d.njnt, d.neq, d.nc, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr],
             dtype=torch.int32, device=self._device,
         ),
         "solver_params": torch.tensor(
-            [d.timestep, d.impratio, _TOLERANCE],
+            [d.timestep, d.impratio, d.tolerance],
             dtype=torch.float32, device=self._device,
         ),
     }

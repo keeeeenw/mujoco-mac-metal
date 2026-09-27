@@ -19,7 +19,7 @@ from mujoco_metal.smooth_metal import MetalSmoothDynamics
 
 COUPLED_XML = """<mujoco model="coupled_test">
   <compiler angle="radian"/>
-  <option timestep="0.002" integrator="Euler" iterations="500" tolerance="1e-8">
+  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6">
     <flag contact="enable" equality="enable" limit="enable" frictionloss="enable"/>
   </option>
   <worldbody>
@@ -79,7 +79,7 @@ def test_coupled_lowering_unsupported_condim_rejected():
 
 
 def test_coupled_lowering_elliptic_cone_rejected_for_condim3():
-  xml = COUPLED_XML.replace('tolerance="1e-8">', 'tolerance="1e-8" cone="elliptic">')
+  xml = COUPLED_XML.replace('tolerance="1e-6">', 'tolerance="1e-6" cone="elliptic">')
   m = mujoco.MjModel.from_xml_string(xml)
   with pytest.raises(ValueError, match="pyramidal"):
     lower_coupled_constraints(m)

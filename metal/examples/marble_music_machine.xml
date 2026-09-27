@@ -1,6 +1,6 @@
 <mujoco model="robotic_marble_music_machine">
   <compiler angle="radian" inertiafromgeom="true"/>
-  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler" iterations="500" tolerance="1e-8" density="1.2" viscosity="0.00002">
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler" iterations="1000" tolerance="1e-6" density="1.2" viscosity="0.00002">
     <flag contact="enable" equality="enable" limit="enable" frictionloss="enable"/>
   </option>
 

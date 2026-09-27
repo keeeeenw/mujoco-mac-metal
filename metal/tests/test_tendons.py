@@ -116,3 +116,72 @@ def test_state_shape_and_finiteness_are_checked():
     stage.run(np.zeros(2), np.zeros((1, 2)))
   with pytest.raises(ValueError, match='finite'):
     stage.run([[np.nan, 0]], [[0, 0]])
+
+
+def test_tendon_armature_crba_sparsity_matches_mujoco_fullM():
+  """Independently verifies MuJoCo CRBA mass matrix sparsity against FixedTendonModel."""
+  xml = """<mujoco model="tree_tendon">
+    <worldbody>
+      <!-- Branch A -->
+      <body name="a1" pos="0 0 1">
+        <joint name="ja1" type="hinge" axis="0 1 0"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+        <body name="a2" pos="0.5 0 0">
+          <joint name="ja2" type="hinge" axis="0 1 0"/>
+          <geom type="sphere" size="0.1" mass="1"/>
+        </body>
+      </body>
+      <!-- Branch B -->
+      <body name="b1" pos="0 1 1">
+        <joint name="jb1" type="hinge" axis="0 1 0"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+        <body name="b2" pos="0.5 0 0">
+          <joint name="jb2" type="hinge" axis="0 1 0"/>
+          <geom type="sphere" size="0.1" mass="1"/>
+        </body>
+      </body>
+    </worldbody>
+    <tendon>
+      <!-- Cross-branch tendon between disjoint branches -->
+      <fixed name="t_cross" armature="0.2">
+        <joint joint="ja1" coef="1.0"/>
+        <joint joint="jb1" coef="0.5"/>
+      </fixed>
+      <!-- Ancestor-chain tendon on Branch A -->
+      <fixed name="t_chain" armature="0.3">
+        <joint joint="ja1" coef="0.4"/>
+        <joint joint="ja2" coef="0.8"/>
+      </fixed>
+    </tendon>
+  </mujoco>"""
+  m = mujoco.MjModel.from_xml_string(xml)
+  d = mujoco.MjData(m)
+  mujoco.mj_forward(m, d)
+  M_with = np.zeros((m.nv, m.nv))
+  mujoco.mj_fullM(m, d, M_with)
+
+  xml_no_arm = xml.replace('armature="0.2"', '').replace('armature="0.3"', '')
+  m_no = mujoco.MjModel.from_xml_string(xml_no_arm)
+  d_no = mujoco.MjData(m_no)
+  mujoco.mj_forward(m_no, d_no)
+  M_no = np.zeros((m.nv, m.nv))
+  mujoco.mj_fullM(m_no, d_no, M_no)
+
+  # Direct MuJoCo ground truth difference
+  delta_M_mujoco = M_with - M_no
+
+  # Independent assert 1: MuJoCo CRBA tree representation explicitly zeros disjoint cross-branch coupling
+  # ja1 is DOF 0, jb1 is DOF 2. Naive outer product would have 0.2 * 1.0 * 0.5 = 0.10.
+  assert delta_M_mujoco[0, 2] == 0.0, "MuJoCo must drop cross-branch armature coupling"
+  assert delta_M_mujoco[2, 0] == 0.0, "MuJoCo must drop cross-branch armature coupling"
+
+  # Independent assert 2: MuJoCo preserves ancestor-descendant chain coupling
+  # ja1 is DOF 0, ja2 is DOF 1. Expected armature: 0.3 * 0.4 * 0.8 = 0.096.
+  assert np.isclose(delta_M_mujoco[0, 1], 0.096, atol=1e-6)
+  assert np.isclose(delta_M_mujoco[1, 0], 0.096, atol=1e-6)
+
+  # Independent assert 3: FixedTendonModel matches MuJoCo delta_M across the entire matrix
+  tendon_model = FixedTendonModel(m)
+  _, _, armature_matrix = tendon_model.run(np.zeros((1, m.nq)), np.zeros((1, m.nv)))
+  np.testing.assert_allclose(armature_matrix, delta_M_mujoco, atol=1e-7)
+
