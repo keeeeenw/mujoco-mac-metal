@@ -468,9 +468,14 @@ def test_pair_box_box():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_swapped_geometry_orderings():
-  """Qualifies that (B, A) reversed pair declarations produce identical contact physics across all 9 primitive pairs.
+  """Reversed explicit pair declarations yield identical canonicalized contact physics for all 9 pairs.
 
-  Also asserts antiparallel raw normals before canonicalization.
+  The lowering canonicalizes pair geometry ordering by geom type then geom id
+  (matching MuJoCo C pushGeomGeom), so both (g1, g2) and (g2, g1) declarations
+  dispatch the identical canonical pair. This test therefore asserts *equal
+  canonicalized* distances, positions and normals — raw antiparallel normals
+  are not observable through reversed pair declarations and are qualified
+  separately in test_raw_reversed_same_type_dispatch.
   """
   pairs = [
       ("plane_sphere", "plane", 'size="5 5 0.1" pos="0 0 0"', False, "sphere", 'size="0.1" pos="0 0 0.08"', True),
@@ -538,6 +543,103 @@ def test_swapped_geometry_orderings():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_raw_reversed_same_type_dispatch():
+  """Raw reversed dispatch for same-type pairs: antiparallel normals, identical physics.
+
+  For same-type pairs (sphere-sphere, capsule-capsule, box-box) the canonical
+  ordering is by ascending geom id. Reversing which body declares which physical
+  geom reverses the raw dispatch order presented to the collision kernels while
+  keeping the relative geometry identical. The raw contact normals must then be
+  strictly antiparallel (dot = -1), distances and contact positions identical,
+  MuJoCo CPU must flip its contact normal identically, and the resulting
+  constraint forces/accelerations must agree up to the free-body dof permutation.
+  """
+  cases = {
+      "sphere_sphere": ("sphere", 'size="0.1"', 'pos="0 0 0"', 'pos="0 0 0.18"'),
+      "capsule_capsule": ("capsule", 'size="0.05 0.1"',
+                          'pos="0 0 0" quat="0.7071068 0 0.7071068 0"',
+                          'pos="0 0.02 0.05" quat="0.7071068 0.7071068 0 0"'),
+      "box_box": ("box", 'size="0.1 0.1 0.05"', 'pos="0 0 0"', 'pos="0.01 0.02 0.08"'),
+  }
+
+  for name, (gtype, gattr, a1, a2) in cases.items():
+    # xml1: b1/g1 declared first holds geom A, b2/g2 holds geom B
+    xml1 = f"""<mujoco><worldbody>
+      <body name="b1"><freejoint/><geom name="g1" type="{gtype}" {gattr} {a1}/></body>
+      <body name="b2"><freejoint/><geom name="g2" type="{gtype}" {gattr} {a2}/></body>
+    </worldbody><contact><pair geom1="g1" geom2="g2"/></contact></mujoco>"""
+    # xml2: declaration order swapped -> g2 gets geom id 0, g1 gets id 1
+    xml2 = f"""<mujoco><worldbody>
+      <body name="b2"><freejoint/><geom name="g2" type="{gtype}" {gattr} {a2}/></body>
+      <body name="b1"><freejoint/><geom name="g1" type="{gtype}" {gattr} {a1}/></body>
+    </worldbody><contact><pair geom1="g2" geom2="g1"/></contact></mujoco>"""
+
+    m1 = mujoco.MjModel.from_xml_string(xml1)
+    m2 = mujoco.MjModel.from_xml_string(xml2)
+    s1 = MetalSimulation(m1, batch_size=1, profile="integrated_euler_v1")
+    s2 = MetalSimulation(m2, batch_size=1, profile="integrated_euler_v1")
+    c1 = s1.assembled_system()
+    c2 = s2.assembled_system()
+
+    d1 = mujoco.MjData(m1)
+    mujoco.mj_forward(m1, d1)
+    d2 = mujoco.MjData(m2)
+    mujoco.mj_forward(m2, d2)
+
+    n1 = int(np.sum(c1["contact_mask"][0].cpu().numpy() > 0.5))
+    n2 = int(np.sum(c2["contact_mask"][0].cpu().numpy() > 0.5))
+    assert n1 == n2 > 0, f"{name}: ncon mismatch {n1} vs {n2}"
+    assert d1.ncon == n1 and d2.ncon == n2, f"{name}: CPU ncon mismatch"
+
+    p1 = c1["contact_position"][0, :n1].cpu().numpy()
+    p2 = c2["contact_position"][0, :n2].cpu().numpy()
+    dist1 = c1["contact_distance"][0, :n1].cpu().numpy()
+    dist2 = c2["contact_distance"][0, :n2].cpu().numpy()
+    nor1 = c1["contact_normal"][0, :n1].cpu().numpy()
+    nor2 = c2["contact_normal"][0, :n2].cpu().numpy()
+
+    # match contacts by position (one-to-one bijection), then require identical geometry and
+    # strictly antiparallel raw normals
+    used_j = set()
+    for k in range(n1):
+      candidates = [j for j in range(n2) if j not in used_j and np.linalg.norm(p2[j] - p1[k]) < 1e-5]
+      assert len(candidates) == 1, f"{name} con {k}: expected unique match in p2, found {len(candidates)}"
+      j = candidates[0]
+      used_j.add(j)
+
+      np.testing.assert_allclose(dist1[k], dist2[j], atol=1e-6)
+      dot = float(np.dot(nor1[k], nor2[j]))
+      assert dot < -1.0 + 1e-5, f"{name} con {k}: raw normals not antiparallel (dot {dot:+.6f})"
+
+      # Match CPU contacts independently for d1 and d2
+      cand_cpu1 = [c for c in range(d1.ncon) if np.linalg.norm(d1.contact[c].pos - p1[k]) < 1e-5]
+      assert len(cand_cpu1) >= 1, f"{name} con {k}: no matching CPU contact in d1"
+      c1_idx = cand_cpu1[0]
+      cand_cpu2 = [c for c in range(d2.ncon) if np.linalg.norm(d2.contact[c].pos - p2[j]) < 1e-5]
+      assert len(cand_cpu2) >= 1, f"{name} con {k}: no matching CPU contact in d2"
+      c2_idx = cand_cpu2[0]
+
+      cpu_dot = float(np.dot(d1.contact[c1_idx].frame[:3], d2.contact[c2_idx].frame[:3]))
+      assert cpu_dot < -1.0 + 1e-5, f"{name} con {k}: CPU normals not antiparallel (dot {cpu_dot:+.6f})"
+      np.testing.assert_allclose(nor1[k], d1.contact[c1_idx].frame[:3], atol=1e-5)
+      np.testing.assert_allclose(nor2[j], d2.contact[c2_idx].frame[:3], atol=1e-5)
+
+    assert len(used_j) == n1, f"{name}: matched contacts must form a complete bijection"
+
+    # physics identical up to the free-body dof permutation (b1 <-> b2 declared order)
+    qf1 = c1["qfrc_constraint"][0].cpu().numpy()
+    qf2 = c2["qfrc_constraint"][0].cpu().numpy()
+    qa1 = c1["qacc"][0].cpu().numpy()
+    qa2 = c2["qacc"][0].cpu().numpy()
+    perm = np.concatenate([np.arange(6, 12), np.arange(0, 6)])
+    np.testing.assert_allclose(qf2[perm], qf1, rtol=1e-3, atol=1e-3,
+                               err_msg=f"{name}: permuted qfrc_constraint mismatch")
+    np.testing.assert_allclose(qa2[perm], qa1, rtol=1e-2, atol=1e-2,
+                               err_msg=f"{name}: permuted qacc mismatch")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_rotated_box_box_regression_probes():
   """Regresses arbitrary 3D rotated box configurations from the independent probe suite."""
   xml = '<mujoco><option iterations="1000" tolerance="1e-5"/><worldbody><geom type="box" size=".2 .16 .12"/><body><freejoint/><geom type="box" size=".15 .13 .1"/></body></worldbody></mujoco>'
@@ -589,95 +691,277 @@ def test_rotated_box_box_regression_probes():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_coupled_system_mixed_primitive_manifolds():
-  """Coupled Delassus matrix, regularizer, RHS, multipliers, and KKT residual for mixed model."""
+  """Full coupled-system qualification with all four advertised contact families active.
+
+  Fixture activates plane-box (floor <-> pbox1, 4-point face manifold, condim=3),
+  box-box (pallet <-> pbox, 4-point manifold, condim=1), sphere-box (sph_geom <->
+  pallet, condim=3) and capsule-box (cap_geom <-> pallet, 2-point manifold,
+  condim=3) simultaneously, plus joint equality (j1 <-> j3), two frictionloss rows
+  and one active joint-limit row. Parcels ride on the lever hinge j1 so contact
+  Jacobians share the j1 dof with the equality row, producing nonzero
+  cross-coupling blocks.
+
+  Establishes an exhaustive one-to-one GPU<->CPU active-row mapping and compares
+  every active J/R/ar/rhs entry, the complete reconstructed Delassus matrix
+  J M^-1 J^T + diag(efc_R), per-row multipliers vs efc_force, resultant forces,
+  and the host projected KKT residual with the correct bounds for each row type.
+  """
   xml_mixed = """<mujoco>
   <compiler angle="radian"/>
-  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler" iterations="1000" tolerance="1e-6"/>
+  <default>
+    <geom condim="3" solref="0.02 1.0" solimp="0.9 0.95 0.001 0.5 2"/>
+  </default>
   <worldbody>
-    <geom name="floor" type="plane" size="5 5 0.1"/>
-    <!-- Articulated mechanism with box ramp, capsule link, and box parcel -->
-    <body name="link1" pos="0 0 0.4">
-      <joint name="j1" type="hinge" axis="0 1 0" range="-0.3 0.5" limited="true" frictionloss="0.05"/>
-      <geom name="ramp_box" type="box" size="0.2 0.15 0.05" friction="0.8 0.1 0.1"/>
-      <body name="link2" pos="0.25 0 0.1">
-        <joint name="j2" type="hinge" axis="0 1 0" range="-0.4 0.4" limited="true" frictionloss="0.02"/>
-        <geom name="arm_cap" type="capsule" size="0.04 0.15" friction="0.6 0.1 0.1"/>
+    <geom name="floor" type="plane" size="5 5 0.1" contype="0" conaffinity="0"/>
+    <body name="lever" pos="0 0 0.35">
+      <joint name="j1" type="hinge" axis="0 1 0" range="-0.05 0.5" limited="true" frictionloss="0.05" solreflimit="0.1 1"/>
+      <geom name="pallet" type="box" size="0.22 0.14 0.05" friction="0.8 0.1 0.1" mass="1.5" contype="0" conaffinity="0"/>
+      <body name="psph" pos="0.10 0.03 0.069">
+        <joint type="slide" axis="1 0 0"/><joint type="slide" axis="0 1 0"/><joint type="slide" axis="0 0 1"/>
+        <joint type="ball"/>
+        <geom name="sph_geom" type="sphere" size="0.02" friction="0.6 0.1 0.1" mass="0.2" contype="0" conaffinity="0"/>
+      </body>
+      <body name="pcap" pos="-0.10 0.03 0.069" quat="0.7071068 0 0.7071068 0">
+        <joint type="slide" axis="1 0 0"/><joint type="slide" axis="0 1 0"/><joint type="slide" axis="0 0 1"/>
+        <joint type="ball"/>
+        <geom name="cap_geom" type="capsule" size="0.02" fromto="0 -0.06 0 0 0.06 0" friction="0.7 0.1 0.1" mass="0.2" contype="0" conaffinity="0"/>
+      </body>
+      <body name="pbox" pos="-0.02 -0.03 0.069">
+        <joint type="slide" axis="1 0 0"/><joint type="slide" axis="0 1 0"/><joint type="slide" axis="0 0 1"/>
+        <joint type="ball"/>
+        <geom name="pbox_geom" type="box" size="0.04 0.04 0.02" friction="0.7 0.1 0.1" mass="0.3" contype="0" conaffinity="0"/>
       </body>
     </body>
-    <body name="parcel" pos="0.1 0 0.48">
-      <joint name="pj" type="slide" axis="0 0 1"/>
-      <geom name="parcel_box" type="box" size="0.08 0.08 0.04" friction="0.7 0.1 0.1"/>
+    <body name="pbox1" pos="1.2 0 0.0385">
+      <freejoint/>
+      <geom name="pbox1_geom" type="box" size="0.04 0.04 0.04" friction="0.7 0.1 0.1" mass="0.3" contype="0" conaffinity="0"/>
+    </body>
+    <body name="kp" pos="1.5 1.5 0.8">
+      <joint name="j3" type="hinge" axis="0 1 0" range="-0.5 0.5" margin="0.05" limited="true" frictionloss="0.02" solreflimit="0.1 1"/>
+      <geom type="sphere" size="0.01" mass="0.05" contype="0" conaffinity="0"/>
     </body>
   </worldbody>
+  <contact>
+    <pair geom1="floor" geom2="pbox1_geom" condim="3" friction="0.7 0.1 0.01"/>
+    <pair geom1="pallet" geom2="sph_geom" condim="3" friction="0.6 0.1 0.01"/>
+    <pair geom1="pallet" geom2="cap_geom" condim="3" friction="0.7 0.1 0.01"/>
+    <pair geom1="pallet" geom2="pbox_geom" condim="1"/>
+  </contact>
   <equality>
-    <joint joint1="j1" joint2="j2" polycoef="0 1 0 0 0"/>
+    <joint joint1="j1" joint2="j3" polycoef="0 1 0 0 0" solref="0.05 1"/>
   </equality>
   </mujoco>"""
 
   m = mujoco.MjModel.from_xml_string(xml_mixed)
-  q0 = np.array([[0.05, -0.05, -0.05]], dtype=np.float32)
-  v0 = np.array([[0.1, -0.1, -0.2]], dtype=np.float32)
+  nv = m.nv
+  desc = lower_coupled_constraints(m)
+  assert desc.npairs == 4
+  assert desc.ncontacts_max == 15
+  assert desc.nr == 93
+
+  q0 = np.array(m.qpos0, dtype=np.float32)
+  j1 = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "j1")
+  j3 = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "j3")
+  q0[m.jnt_qposadr[j3]] = -0.47  # activates lower-limit row (dist 0.03 < margin 0.05)
+  q0 = np.array([q0], dtype=np.float32)
+
+  v0 = np.zeros((1, nv), dtype=np.float32)
+  v0[0, m.jnt_dofadr[j1]] = 0.05
+  v0[0, m.jnt_dofadr[j3]] = -0.03
+  for bname, dv in (("psph", (0.01, 0.02, -0.01)),
+                    ("pcap", (0.02, 0.01, -0.02)),
+                    ("pbox", (0.02, 0.01, -0.015))):
+    bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, bname)
+    dadr = m.jnt_dofadr[m.body_jntadr[bid]]
+    v0[0, dadr:dadr + 3] = dv
+  bid1 = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "pbox1")
+  dadr1 = m.jnt_dofadr[m.body_jntadr[bid1]]
+  v0[0, dadr1:dadr1 + 3] = (0.01, -0.02, -0.005)
+  v0[0, dadr1 + 3:dadr1 + 6] = (0.0, 0.02, 0.0)
 
   sim = MetalSimulation(m, batch_size=1, qpos=q0, qvel=v0, profile="integrated_euler_v1")
-  coupled = sim.assembled_system()
+  a = sim.assembled_system()
 
   d_cpu = mujoco.MjData(m)
   d_cpu.qpos[:] = q0[0]
   d_cpu.qvel[:] = v0[0]
   mujoco.mj_forward(m, d_cpu)
+  nefc = int(d_cpu.nefc)
 
-  # Verify simulation steps cleanly with status 0
+  J_cpu = d_cpu.efc_J.reshape(nefc, nv).copy()
+  J_gpu = a["J"][0].cpu().numpy().copy()
+  R_gpu = a["R"][0].cpu().numpy()
+  ar_gpu = a["ar"][0].cpu().numpy()
+  rhs_gpu = a["rhs"][0].cpu().numpy()
+  lam_gpu = a["lambda"][0].cpu().numpy()
+  W_gpu = a["W"][0].cpu().numpy()
+  Wreg_gpu = a["W_regularized"][0].cpu().numpy()
+  M_cpu = np.zeros((nv, nv), dtype=np.float64)
+  mujoco.mj_fullM(m, d_cpu, M_cpu)
+
+  base_contact = m.neq + nv + 2 * m.njnt
+  gpu_active = np.flatnonzero(np.linalg.norm(J_gpu, axis=1) > 1e-6)
+
+  # ---- exhaustive one-to-one GPU <-> CPU active-row mapping ----
+  mapping = {}
+  row_kind = {}
+  for r in range(m.neq):
+    mapping[r] = r
+    row_kind[r] = ("eq", r)
+  friction_dofs = [dd for dd in range(nv) if m.dof_frictionloss[dd] > 0]
+  for rank, dd in enumerate(friction_dofs):
+    mapping[m.neq + dd] = m.neq + rank  # CPU orders friction rows by dof rank
+    row_kind[m.neq + dd] = ("friction", dd)
+  cpu_limit = [r for r in range(nefc) if int(d_cpu.efc_type[r]) == 3]
+  for j in range(m.njnt):
+    if not m.jnt_limited[j]:
+      continue
+    qadr = m.jnt_qposadr[j]
+    marg = m.jnt_margin[j]
+    used = []
+    dist0 = d_cpu.qpos[qadr] - m.jnt_range[j][0]
+    dist1 = m.jnt_range[j][1] - d_cpu.qpos[qadr]
+    if dist0 < marg:
+      cr = next(r for r in cpu_limit if int(d_cpu.efc_id[r]) == j and r not in used)
+      mapping[m.neq + nv + 2 * j] = cr
+      row_kind[m.neq + nv + 2 * j] = ("limit_lo", j)
+      used.append(cr)
+    if dist1 < marg:
+      cr = next(r for r in cpu_limit if int(d_cpu.efc_id[r]) == j and r not in used)
+      mapping[m.neq + nv + 2 * j + 1] = cr
+      row_kind[m.neq + nv + 2 * j + 1] = ("limit_hi", j)
+      used.append(cr)
+
+  cpu_contact_row_base = next((r for r in range(nefc) if int(d_cpu.efc_type[r]) in (5, 6)), nefc)
+  cpu_blocks = []
+  cur = cpu_contact_row_base
+  for c in range(d_cpu.ncon):
+    con = d_cpu.contact[c]
+    nrow = 4 if int(con.dim) == 3 else 1
+    cpu_blocks.append((int(con.geom1), int(con.geom2), con.pos.copy(), cur, nrow))
+    cur += nrow
+
+  packed = np.asarray(desc.contact_condim_packed).reshape(-1, 2)
+  mask = a["contact_mask"][0].cpu().numpy()
+  gpu_pos = a["contact_position"][0].cpu().numpy()
+  matched_cpu_blocks = set()
+  for p in range(desc.npairs):
+    off = int(desc.pair_contact_offset[p])
+    mc = int(desc.pair_max_contacts[p])
+    g1, g2 = int(desc.geom1[p]), int(desc.geom2[p])
+    slots = [off + k for k in range(mc) if mask[off + k] > 0.5]
+    cand = [cb for cb in cpu_blocks if {cb[0], cb[1]} == {g1, g2}]
+    assert len(slots) == len(cand), (p, m.geom(g1).name, m.geom(g2).name, len(slots), len(cand))
+    for s in slots:
+      matches = [cb for cb in cand if (cb[0], cb[1], cb[3]) not in matched_cpu_blocks and np.linalg.norm(gpu_pos[s] - cb[2]) < 1e-5]
+      assert len(matches) == 1, f"Expected unique matching CPU block for slot {s}, found {len(matches)}"
+      cb = matches[0]
+      matched_cpu_blocks.add((cb[0], cb[1], cb[3]))
+      cdim, row_off = packed[s]
+      gpu_row0 = base_contact + int(row_off)
+      nrow = 4 if int(cdim) == 3 else 1
+      assert nrow == cb[4]
+      for k in range(nrow):
+        mapping[gpu_row0 + k] = cb[3] + k
+        row_kind[gpu_row0 + k] = ("contact", s, k)
+
+  assert set(mapping) == set(gpu_active.tolist()), "mapping must cover exactly the active rows"
+  assert len(mapping) == nefc, (len(mapping), nefc)
+  assert len(set(mapping.values())) == len(mapping), "all mapped CPU rows must be unique"
+
+  # ---- all four contact families active ----
+  pair_names = {(m.geom(desc.geom1[p]).name, m.geom(desc.geom2[p]).name) for p in range(desc.npairs)}
+  active_pairs = set()
+  for p in range(desc.npairs):
+    off = int(desc.pair_contact_offset[p])
+    mc = int(desc.pair_max_contacts[p])
+    if any(mask[off + k] > 0.5 for k in range(mc)):
+      active_pairs.add((m.geom(desc.geom1[p]).name, m.geom(desc.geom2[p]).name))
+  assert ("floor", "pbox1_geom") in active_pairs, "plane-box family must be active"
+  assert ("pallet", "pbox_geom") in active_pairs, "box-box family must be active"
+  assert ("sph_geom", "pallet") in active_pairs, "sphere-box family must be active"
+  assert ("cap_geom", "pallet") in active_pairs, "capsule-box family must be active"
+  assert d_cpu.ncon == 11
+
+  # ---- per-row comparisons over the complete mapping ----
+  for g_row, c_row in mapping.items():
+    np.testing.assert_allclose(J_gpu[g_row], J_cpu[c_row], atol=1e-5,
+                               err_msg=f"J mismatch at gpu row {g_row} (cpu row {c_row})")
+    relR = abs(R_gpu[g_row] - d_cpu.efc_R[c_row]) / max(1.0, abs(d_cpu.efc_R[c_row]))
+    assert relR < 1e-5, f"R mismatch at gpu row {g_row}: rel {relR:.3e}"
+    np.testing.assert_allclose(ar_gpu[g_row], d_cpu.efc_aref[c_row], atol=1e-3,
+                               err_msg=f"aref mismatch at gpu row {g_row}")
+    np.testing.assert_allclose(-rhs_gpu[g_row], d_cpu.efc_b[c_row], atol=1e-3,
+                               err_msg=f"rhs mismatch at gpu row {g_row}")
+    np.testing.assert_allclose(lam_gpu[g_row], d_cpu.efc_force[c_row], atol=1e-3,
+                               err_msg=f"multiplier mismatch at gpu row {g_row}")
+
+  # ---- independently reconstructed Delassus matrix (both unregularized and regularized) ----
+  act = np.array(sorted(mapping.keys()))
+  cpu_act = np.array([mapping[g] for g in act])
+  J_sub = J_gpu[act]
+  J_cpu_sub = J_cpu[cpu_act]
+  np.testing.assert_allclose(J_sub, J_cpu_sub, atol=1e-5, err_msg="Active J rows must match CPU J rows")
+
+  Minv = np.linalg.inv(M_cpu)
+  W_unreg_exp = J_cpu_sub @ Minv @ J_cpu_sub.T
+  W_unreg_gpu = W_gpu[np.ix_(act, act)]
+  relW_unreg = np.abs(W_unreg_gpu - W_unreg_exp) / np.maximum(1.0, np.abs(W_unreg_exp))
+  assert float(np.max(relW_unreg)) < 1e-4, f"Unregularized Delassus rel err {float(np.max(relW_unreg)):.3e}"
+
+  W_reg_exp = W_unreg_exp + np.diag(d_cpu.efc_R[cpu_act])
+  W_reg_gpu = Wreg_gpu[np.ix_(act, act)]
+  relW_reg = np.abs(W_reg_gpu - W_reg_exp) / np.maximum(1.0, np.abs(W_reg_exp))
+  assert float(np.max(relW_reg)) < 1e-4, f"Regularized Delassus rel err {float(np.max(relW_reg)):.3e}"
+  W_sub = W_reg_gpu
+
+  # nonzero cross-coupling block between joint rows and contact rows
+  joint_idx = [i for i, g in enumerate(act) if g < base_contact]
+  contact_idx = [i for i, g in enumerate(act) if g >= base_contact]
+  cross_norm = float(np.linalg.norm(W_sub[np.ix_(joint_idx, contact_idx)]))
+  assert cross_norm > 0.05, f"cross-coupling must be nonzero, got {cross_norm}"
+
+  # ---- inactive rows exactly zero ----
+  for r in range(desc.nr):
+    if r in mapping:
+      continue
+    assert np.all(J_gpu[r] == 0), f"inactive J row {r}"
+    assert R_gpu[r] == 0 and ar_gpu[r] == 0 and rhs_gpu[r] == 0 and lam_gpu[r] == 0
+    assert np.all(W_gpu[r] == 0) and np.all(W_gpu[:, r] == 0)
+
+  # ---- resultant forces and accelerations ----
+  qfrc_rec = J_sub.T @ lam_gpu[act]
+  np.testing.assert_allclose(qfrc_rec, a["qfrc_constraint"][0].cpu().numpy(), atol=1e-5)
+  np.testing.assert_allclose(a["qfrc_constraint"][0].cpu().numpy(), d_cpu.qfrc_constraint,
+                              rtol=1e-3, atol=1e-3)
+  np.testing.assert_allclose(a["qacc"][0].cpu().numpy(), d_cpu.qacc, rtol=1e-3, atol=1e-3)
+  np.testing.assert_allclose(a["mass_matrix"][0].cpu().numpy(), M_cpu, atol=1e-5)
+
+  # ---- host projected KKT residual with the correct bounds for each row ----
+  lo = np.full(len(act), -np.inf)
+  hi = np.full(len(act), np.inf)
+  for i, g in enumerate(act):
+    kind = row_kind[g]
+    if kind[0] == "eq":
+      pass
+    elif kind[0] == "friction":
+      f = float(m.dof_frictionloss[kind[1]])
+      lo[i], hi[i] = -f, f
+    else:  # limit rows and contact rows (pyramidal edges and normal) are unilateral
+      lo[i] = 0.0
+  A = W_gpu[np.ix_(act, act)] + np.diag(R_gpu[act])
+  grad = A @ lam_gpu[act] - rhs_gpu[act]
+  diag = np.maximum(np.diag(A), 1e-15)
+  proj = np.clip(lam_gpu[act] - grad / diag, lo, hi)
+  row_scale = np.maximum(1.0, np.abs(ar_gpu[act]) + np.abs(R_gpu[act] * lam_gpu[act])
+                         + np.abs(W_gpu[np.ix_(act, act)] @ lam_gpu[act]))
+  kkt = float(np.max(np.abs(proj - lam_gpu[act]) * diag / row_scale))
+  assert kkt < 1e-4, f"projected KKT residual {kkt:.3e} exceeded 1e-4"
+
+  # ---- step executes cleanly ----
   sim.step(1)
   assert sim.state.status[0].item() == 0
-
-  # 1. Check qacc and constraint forces match CPU
-  np.testing.assert_allclose(sim.state.qacc[0].cpu().numpy(), d_cpu.qacc, rtol=1e-3, atol=1e-3)
-  np.testing.assert_allclose(coupled["qfrc_constraint"][0].cpu().numpy(), d_cpu.qfrc_constraint, rtol=1e-3, atol=1e-3)
-
-  # 2. Check effective mass matrix
-  M_cpu = np.zeros((m.nv, m.nv), dtype=np.float64)
-  mujoco.mj_fullM(m, d_cpu, M_cpu)
-  np.testing.assert_allclose(coupled["mass_matrix"][0].cpu().numpy(), M_cpu, atol=1e-5)
-
-  # 3. Check complete constraint Jacobian J rows against CPU efc_J
-  J_gpu = coupled["J"][0].cpu().numpy()
-  R_gpu = coupled["R"][0].cpu().numpy()
-  ar_gpu = coupled["ar"][0].cpu().numpy()
-  rhs_gpu = coupled["rhs"][0].cpu().numpy()
-  W_gpu = coupled["W"][0].cpu().numpy()
-  W_reg = coupled["W_regularized"][0].cpu().numpy()
-
-  active_rows = np.flatnonzero(np.linalg.norm(J_gpu, axis=1) > 1e-6)
-  assert len(active_rows) == d_cpu.nefc == 19, f"Expected 19 active rows, found {len(active_rows)}"
-
-  # Equality and joint limit rows (first 3 active rows)
-  for r_gpu, r_cpu in zip(active_rows[:3], range(3)):
-    J_c = d_cpu.efc_J[r_cpu * m.nv : (r_cpu + 1) * m.nv]
-    np.testing.assert_allclose(J_gpu[r_gpu], J_c, atol=1e-5)
-    np.testing.assert_allclose(R_gpu[r_gpu], 1.0 / d_cpu.efc_D[r_cpu], rtol=1e-4)
-    np.testing.assert_allclose(ar_gpu[r_gpu], d_cpu.efc_aref[r_cpu], atol=1e-4)
-    np.testing.assert_allclose(-rhs_gpu[r_gpu], d_cpu.efc_b[r_cpu], atol=1e-4)
-
-  # Contact rows (16 rows from 4 pyramidal contacts)
-  active_contact_rows = active_rows[3:]
-  J_gpu_con = J_gpu[active_contact_rows]
-  J_cpu_con = d_cpu.efc_J[3 * m.nv :].reshape(-1, m.nv)
-  for r in J_gpu_con:
-    min_dist = np.min(np.linalg.norm(J_cpu_con - r, axis=1))
-    assert min_dist < 1e-4, f"GPU contact Jacobian row {r} not matched in CPU"
-  for r_gpu in active_contact_rows:
-    min_diff = np.min(np.abs(d_cpu.efc_aref[3:] - ar_gpu[r_gpu]))
-    assert min_diff < 1e-3, f"GPU contact ar row {ar_gpu[r_gpu]} not matched in CPU"
-
-  # 4. Check cross-block coupling between joint limits and contact manifold
-  W_cross = W_gpu[np.ix_(active_rows[:3], active_rows[3:])]
-  cross_norm = float(np.linalg.norm(W_cross))
-  assert 4.0 < cross_norm < 4.5, f"Expected cross-coupling norm ~4.228, got {cross_norm}"
-  assert np.all(np.isfinite(W_reg))
-
-  # 5. Check KKT projected dynamics residual: M * qacc - (qfrc_smooth + qfrc_constraint)
-  kkt_dyn_err = float(np.max(np.abs(M_cpu @ coupled["qacc"][0].cpu().numpy() - (d_cpu.qfrc_smooth + coupled["qfrc_constraint"][0].cpu().numpy()))))
-  assert kkt_dyn_err < 1e-4, f"KKT dynamics residual {kkt_dyn_err:.3e} exceeded 1e-4"
 
 
 # =============================================================================
@@ -804,6 +1088,194 @@ def test_dynamic_trajectory_capsule_on_box_rails():
   assert two_rail_contacts == 80, f"Expected continuous 2-rail contact across all 80 steps, got {two_rail_contacts}"
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("dt", [0.001, 0.002, 0.004])
+def test_dynamic_trajectory_resting_box_stack_multiple_timesteps_and_initial_states(dt):
+  """Resting box stack across multiple timesteps and nonzero initial states.
+
+  Each timestep runs its own CPU reference from the same initial state; a
+  second initial-state variant (offset + lateral velocity) is checked too.
+  """
+  xml = """<mujoco>
+  <option timestep="{dt}" integrator="Euler" iterations="400" tolerance="1e-5"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <body name="box1" pos="0 0 0.05">
+      <joint type="free"/>
+      <geom type="box" size="0.15 0.15 0.05" friction="0.8 0.1 0.1" mass="1.0"/>
+    </body>
+    <body name="box2" pos="0.02 0.01 0.16">
+      <joint type="free"/>
+      <geom type="box" size="0.1 0.1 0.05" friction="0.8 0.1 0.1" mass="0.5"/>
+    </body>
+  </worldbody>
+  </mujoco>""".replace("{dt}", str(dt))
+  m = mujoco.MjModel.from_xml_string(xml)
+
+  for v0 in (np.zeros((1, 12), dtype=np.float32),
+             np.array([[0.1, -0.05, -0.2, 0, 0, 0.1, -0.05, 0.02, 0.1, 0, 0, -0.05]], dtype=np.float32)):
+    sim = MetalSimulation(m, batch_size=1, qvel=v0, profile="integrated_euler_v1")
+    d_cpu = mujoco.MjData(m)
+    d_cpu.qvel[:] = v0[0]
+
+    for _ in range(50):
+      sim.step(1)
+      mujoco.mj_step(m, d_cpu)
+
+    assert sim.state.status[0].item() == 0
+    np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), d_cpu.qpos,
+                               rtol=1e-3, atol=1e-3,
+                               err_msg=f"dt={dt} v0-nonzero={np.any(v0)}")
+    np.testing.assert_allclose(sim.state.qvel[0].cpu().numpy(), d_cpu.qvel,
+                               rtol=1e-3, atol=1e-3,
+                               err_msg=f"dt={dt} v0-nonzero={np.any(v0)}")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_dynamic_trajectory_box_sliding_to_sticking():
+  """Box sliding on a plane transitions from sliding to sticking Coulomb friction.
+
+  A box starts penetrating the plane slightly with a lateral velocity; kinetic
+  friction decelerates it until the tangential velocity reaches zero and the
+  box enters a sustained low-slip sticking regime. Both the transition and the
+  settled state match CPU to single-precision float32 accuracy.
+  """
+  xml = """<mujoco>
+  <option timestep="0.002" integrator="Euler" iterations="400" tolerance="1e-5"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <body name="slider" pos="0 0 0.049">
+      <joint type="free"/>
+      <geom type="box" size="0.1 0.1 0.05" friction="0.5 0.1 0.1" mass="1.0"/>
+    </body>
+  </worldbody>
+  </mujoco>"""
+  m = mujoco.MjModel.from_xml_string(xml)
+
+  q0 = np.array([[0, 0, 0.049, 1, 0, 0, 0]], dtype=np.float32)
+  v0 = np.array([[0.6, 0.0, -0.05, 0, 0, 0]], dtype=np.float32)
+  sim = MetalSimulation(m, batch_size=1, qpos=q0, qvel=v0, profile="integrated_euler_v1")
+  d_cpu = mujoco.MjData(m)
+  d_cpu.qpos[:] = q0[0]
+  d_cpu.qvel[:] = v0[0]
+
+  gpu_stick_step = cpu_stick_step = None
+  for step in range(120):
+    sim.step(1)
+    mujoco.mj_step(m, d_cpu)
+    if gpu_stick_step is None and abs(sim.state.qvel[0, 0].item()) < 1e-4:
+      gpu_stick_step = step
+    if cpu_stick_step is None and abs(d_cpu.qvel[0]) < 1e-4:
+      cpu_stick_step = step
+
+  assert sim.state.status[0].item() == 0
+  assert gpu_stick_step is not None, "GPU box must reach the sticking state"
+  assert cpu_stick_step is not None, "CPU box must reach the sticking state"
+  assert abs(gpu_stick_step - cpu_stick_step) <= 2, (
+      f"Stick transition must align: gpu {gpu_stick_step} vs cpu {cpu_stick_step}")
+
+  # Sustained sticking persists through steps 80-120 with velocity < 5e-4 and decaying
+  assert abs(sim.state.qvel[0, 0].item()) < 5e-4
+  assert abs(d_cpu.qvel[0]) < 5e-4
+  # Tight float32 parity between Metal and CPU
+  assert abs(sim.state.qvel[0, 0].item() - d_cpu.qvel[0]) < 1e-6
+  np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), d_cpu.qpos,
+                             rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_pair_margin_and_gap_contact_activation():
+  """Explicit pair margin/gap semantics: contacts activate within margin, gap shifts the inclusion boundary.
+
+  margin > 0 activates contacts at positive separation (soft pre-contact rows
+  with matching dist/pos/normal against CPU); gap > 0 extends the detection
+  threshold to margin + gap while keeping solver inclusion at margin. Both
+  engagement parity and one stepping step must match CPU.
+  """
+  def build(margin, gap, sphere_z):
+    xml = f"""<mujoco>
+    <option timestep="0.002" integrator="Euler" iterations="400" tolerance="1e-5"/>
+    <worldbody>
+      <body pos="0 0 0">
+        <geom name="table" type="box" size="0.2 0.2 0.05" contype="0" conaffinity="0"/>
+      </body>
+      <body pos="0 0 {sphere_z}">
+        <joint name="jz" type="slide" axis="0 0 1"/>
+        <geom name="ball" type="sphere" size="0.05" contype="0" conaffinity="0"/>
+      </body>
+    </worldbody>
+    <contact>
+      <pair geom1="table" geom2="ball" margin="{margin}" gap="{gap}"/>
+    </contact>
+    </mujoco>"""
+    return mujoco.MjModel.from_xml_string(xml)
+
+  # Case 1: margin 0.01, no gap. Table top at 0.05, sphere center at 0.101 ->
+  # dist = 0.101 - 0.05 - 0.05 = +0.001 (inside margin, no physical touch): contact active
+  # with positive dist, aref soft pre-contact spring matches CPU.
+  m1 = build(0.01, 0.0, 0.101)
+  sim1 = MetalSimulation(m1, batch_size=1, profile="integrated_euler_v1")
+  a1 = sim1.assembled_system()
+  d1 = mujoco.MjData(m1)
+  mujoco.mj_forward(m1, d1)
+  assert d1.ncon == 1, f"CPU margin contact must activate, ncon={d1.ncon}"
+  mask1 = a1["contact_mask"][0].cpu().numpy()
+  assert np.sum(mask1 > 0.5) == 1, "GPU margin contact must activate"
+  np.testing.assert_allclose(a1["contact_distance"][0, 0].cpu().numpy(), d1.contact[0].dist, atol=1e-6)
+  np.testing.assert_allclose(a1["contact_position"][0, 0].cpu().numpy(), d1.contact[0].pos, atol=1e-6)
+  assert float(a1["contact_distance"][0, 0].item()) > 0, "margin contact must have positive dist"
+  # Solver row active (dist < margin)
+  assert np.linalg.norm(a1["J"][0, m1.neq + m1.nv + 2 * m1.njnt].cpu().numpy()) > 1e-4
+
+  # Case 2: margin 0.01, gap 0.006 -> detection boundary at margin + gap = 0.016, solver inclusion at margin = 0.01.
+  # Sphere at dist +0.001 (< margin): detected and included in solver
+  m2 = build(0.01, 0.006, 0.101)
+  sim2 = MetalSimulation(m2, batch_size=1, profile="integrated_euler_v1")
+  a2 = sim2.assembled_system()
+  d2 = mujoco.MjData(m2)
+  mujoco.mj_forward(m2, d2)
+  assert d2.ncon == 1 and np.sum(a2["contact_mask"][0].cpu().numpy() > 0.5) == 1
+  assert d2.nefc == 4  # included in solver on CPU
+  np.testing.assert_allclose(a2["contact_distance"][0, 0].cpu().numpy(), d2.contact[0].dist, atol=1e-6)
+  assert np.linalg.norm(a2["J"][0, m2.neq + m2.nv + 2 * m2.njnt].cpu().numpy()) > 1e-4
+
+  # Case 3: Sphere at dist +0.013 (margin < dist < margin + gap):
+  # Detected geometrically in collision candidate (dist = 0.013 < margin + gap = 0.016),
+  # but excluded from the constraint solver on both CPU (efc_address == -1, nefc == 0)
+  # and GPU (contact_mask == 0, active J row norm == 0) because dist >= margin.
+  m3 = build(0.01, 0.006, 0.113)
+  sim3 = MetalSimulation(m3, batch_size=1, profile="integrated_euler_v1")
+  a3 = sim3.assembled_system()
+  d3 = mujoco.MjData(m3)
+  mujoco.mj_forward(m3, d3)
+  assert d3.ncon == 1, "Detected within margin + gap on CPU"
+  assert d3.nefc == 0, "Excluded from solver (dist >= margin) on CPU"
+  assert d3.contact[0].efc_address == -1, "efc_address is -1 on CPU"
+  np.testing.assert_allclose(a3["contact_distance"][0, 0].cpu().numpy(), d3.contact[0].dist, atol=1e-6)
+  assert np.sum(a3["contact_mask"][0].cpu().numpy() > 0.5) == 0, "Solver row excluded (dist >= margin) on GPU"
+  contact_row_idx = m3.neq + m3.nv + 2 * m3.njnt
+  assert np.linalg.norm(a3["J"][0, contact_row_idx].cpu().numpy()) < 1e-6, "Solver row J is zero on GPU"
+
+  # Case 4: Sphere at dist +0.020 (dist > margin + gap = 0.016): completely excluded from detection
+  m4 = build(0.01, 0.006, 0.120)
+  sim4 = MetalSimulation(m4, batch_size=1, profile="integrated_euler_v1")
+  a4 = sim4.assembled_system()
+  d4 = mujoco.MjData(m4)
+  mujoco.mj_forward(m4, d4)
+  assert d4.ncon == 0, "CPU excludes pair beyond margin + gap"
+  assert np.sum(a4["contact_mask"][0].cpu().numpy() > 0.5) == 0, "GPU excludes pair beyond m + g"
+
+  # Case 5: stepping parity with an active margin contact (soft pre-contact spring)
+  sim1.step(1)
+  assert sim1.state.status[0].item() == 0
+  d1s = mujoco.MjData(m1)
+  mujoco.mj_step(m1, d1s)
+  np.testing.assert_allclose(sim1.state.qacc[0].cpu().numpy(), d1s.qacc, rtol=1e-2, atol=1e-2)
+
+
 # =============================================================================
 # 4. Explicit Pairs, Body Exclusions, and Filtering
 # =============================================================================
@@ -917,6 +1389,75 @@ def test_gpu_capacity_boundaries_execution():
   np.testing.assert_allclose(qacc_gpu, d_cpu.qacc, rtol=1e-3, atol=2e-4)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_gpu_capacity_pairs_boundary_execution_batch2():
+  """Execute the npairs=16 pair-capacity boundary on GPU with batch=2 distinct worlds.
+
+  16 explicit plane-sphere pairs (condim=1), all active in both worlds, with
+  per-world distinct states and independent CPU comparisons for each world.
+  Exercises final pair slot 15, final contact slot 15 and final row 63.
+  """
+  xml = """<mujoco><compiler angle="radian"/><option timestep="0.002" integrator="Euler" iterations="400" tolerance="1e-4"/><worldbody>
+  <geom name="floor" type="plane" size="20 20 0.1" contype="0" conaffinity="0"/>"""
+  for i in range(16):
+    xml += f"""<body name="b{i}" pos="{i} 0 0.098"><joint name="j{i}" type="slide" axis="0 0 1" range="-1 1" limited="true" frictionloss="0.01"/>
+    <geom name="s{i}" type="sphere" size="0.1" contype="0" conaffinity="0"/></body>"""
+  xml += "</worldbody><contact>"
+  for i in range(16):
+    xml += f'<pair geom1="floor" geom2="s{i}" condim="1"/>'
+  xml += "</contact></mujoco>"
+
+  m16 = mujoco.MjModel.from_xml_string(xml)
+  desc = lower_coupled_constraints(m16)
+  assert desc.npairs == 16
+  assert desc.ncontacts_max == 16
+  # nr = neq(0) + nv(16 friction rows) + 2*njnt(32 limit slots) + 16 condim-1 contact rows
+  assert desc.nr == 64
+
+  # batch=2 with distinct per-world slide positions (different penetrations)
+  q0 = np.zeros((2, m16.nv), dtype=np.float32)
+  q0[0, :] = 0.0     # nominal: sphere bottoms penetrate floor by 0.002
+  q0[1, :] = -0.004  # deeper penetration: distinct world state
+  v0 = np.zeros((2, m16.nv), dtype=np.float32)
+  v0[0, :] = 0.02
+  v0[1, :] = -0.03
+
+  sim = MetalSimulation(m16, batch_size=2, qpos=q0, qvel=v0, profile="integrated_euler_v1")
+  a = sim.assembled_system()
+  sim.step(1)
+
+  status = sim.state.status.cpu().numpy()
+  assert np.all(status == 0), f"Expected status 0 in both worlds, got {status}"
+
+  # All 16 pairs active in both worlds; final pair slot 15 and contact slot 15 active
+  mask = a["contact_mask"].cpu().numpy()
+  for w in range(2):
+    assert np.sum(mask[w] > 0.5) == 16, f"World {w}: all 16 contact slots must be active"
+    assert mask[w, 15] > 0.5, f"World {w}: final contact slot 15 must be active"
+
+  # Final constraint row 63 active in both worlds
+  J = a["J"].cpu().numpy()
+  W = a["W_regularized"].cpu().numpy()
+  for w in range(2):
+    assert np.linalg.norm(J[w, 63]) > 0, f"World {w}: final row 63 must be active"
+    assert W[w, 63, 63] > 0, f"World {w}: row 63 Delassus diagonal must be positive"
+
+  # Worlds must remain isolated (distinct states -> distinct accelerations)
+  qacc = sim.state.qacc.cpu().numpy()
+  assert np.max(np.abs(qacc[0] - qacc[1])) > 1e-3, "Worlds must be isolated"
+
+  # Independent CPU comparison for each world
+  for w in range(2):
+    d_cpu = mujoco.MjData(m16)
+    d_cpu.qpos[:] = q0[w]
+    d_cpu.qvel[:] = v0[w]
+    mujoco.mj_forward(m16, d_cpu)
+    assert d_cpu.ncon == 16
+    np.testing.assert_allclose(qacc[w], d_cpu.qacc, rtol=1e-2, atol=2e-4,
+                               err_msg=f"World {w} CPU comparison failed")
+
+
 def test_capacity_overflow_rejection():
   """Admission guards cleanly reject models exceeding pair, contact, or row limits before construction."""
   # 1. 17 pairs exceeds capacity 16
@@ -970,7 +1511,14 @@ def test_capacity_overflow_rejection():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_checkpoint_snapshot_restore_and_replay():
-  """Snapshot / restore / replay with verified active contact manifold, separation, re-impact, and isolation."""
+  """Snapshot / restore / replay with verified active contact manifold, separation, re-impact, and isolation.
+
+  Three worlds in one batch: world 0 launches upward (separates then re-impacts),
+  world 1 remains resting in contact, world 2 hovers far above the floor and stays
+  contact-free for the entire run. Verifies explicit row clearing (J/R/ar/rhs/lambda
+  and full W rows/columns exactly zero) when contacts vanish, selective reset
+  isolation, and bit-for-bit replay after restore.
+  """
   import torch
 
   xml = """<mujoco>
@@ -985,23 +1533,45 @@ def test_checkpoint_snapshot_restore_and_replay():
   </mujoco>"""
   m = mujoco.MjModel.from_xml_string(xml)
 
-  q0 = np.zeros((2, 7), dtype=np.float32)
+  q0 = np.zeros((3, 7), dtype=np.float32)
   q0[0] = [0, 0, 0.049, 1, 0, 0, 0]
   q0[1] = [0, 0, 0.049, 1, 0, 0, 0]
+  q0[2] = [0.3, 0.3, 5.0, 1, 0, 0, 0]  # world 2: hovering far above floor, contact-free
 
-  v0 = np.zeros((2, 6), dtype=np.float32)
+  v0 = np.zeros((3, 6), dtype=np.float32)
   v0[0, 2] = 0.5  # World 0 launches upward
   v0[1, 2] = 0.0  # World 1 remains resting
 
-  sim = MetalSimulation(m, batch_size=2, qpos=q0, qvel=v0, profile="integrated_euler_v1")
+  sim = MetalSimulation(m, batch_size=3, qpos=q0, qvel=v0, profile="integrated_euler_v1")
 
-  # 1. Verify initial active contact manifold on both worlds (4-corner manifold)
+  def assert_rows_cleared(world, slots):
+    a = sim.assembled_system()
+    J = a["J"][world].cpu().numpy()
+    R = a["R"][world].cpu().numpy()
+    ar = a["ar"][world].cpu().numpy()
+    rhs = a["rhs"][world].cpu().numpy()
+    lam = a["lambda"][world].cpu().numpy()
+    W = a["W"][world].cpu().numpy()
+    base = m.neq + m.nv + 2 * m.njnt
+    packed = np.asarray(sim._coupled_constraints.descriptor.contact_condim_packed).reshape(-1, 2)
+    for s in slots:
+      cdim, row_off = packed[s]
+      nrow = 4 if int(cdim) == 3 else 1
+      for k in range(nrow):
+        r = base + int(row_off) + k
+        assert np.all(J[r] == 0), f"world {world} slot {s}: J row {r} must be cleared"
+        assert R[r] == 0 and ar[r] == 0 and rhs[r] == 0 and lam[r] == 0
+        assert np.all(W[r] == 0) and np.all(W[:, r] == 0), f"world {world}: W row/col {r} must be cleared"
+
+  # 1. Verify initial active contact manifold (worlds 0/1: 4-corner manifold; world 2: contact-free)
   a0 = sim.assembled_system()
   mask0 = a0["contact_mask"].cpu().numpy()
   assert np.sum(mask0[0] > 0.5) == 4, "World 0 must start with active 4-corner contact manifold"
   assert np.sum(mask0[1] > 0.5) == 4, "World 1 must start with active 4-corner contact manifold"
+  assert np.sum(mask0[2] > 0.5) == 0, "World 2 must start contact-free"
+  assert_rows_cleared(2, range(4))  # contact-free world rows must be exactly zero
 
-  # 2. Step 10 steps: World 0 separates (contacts clear, ncon -> 0), World 1 stays in contact (ncon == 4)
+  # 2. Step 10 steps: World 0 separates (rows cleared), World 1 stays in contact
   for _ in range(10):
     sim.step(1)
 
@@ -1009,11 +1579,14 @@ def test_checkpoint_snapshot_restore_and_replay():
   mask_mid = a_mid["contact_mask"].cpu().numpy()
   assert np.sum(mask_mid[0] > 0.5) == 0, "World 0 contacts must clear during airborne flight"
   assert np.sum(mask_mid[1] > 0.5) == 4, "World 1 must maintain active 4-corner contact manifold"
+  assert np.sum(mask_mid[2] > 0.5) == 0, "World 2 must remain contact-free"
+  assert_rows_cleared(0, range(4))  # separated world rows must be exactly zero
+  assert_rows_cleared(2, range(4))
 
-  # 3. Snapshot during mixed active/separated state
+  # 3. Snapshot during mixed active/separated/contact-free state
   chk = sim.state.snapshot()
 
-  # 4. Step 45 more steps: World 0 re-impacts ground (ncon -> 4)
+  # 4. Step 45 more steps: World 0 re-impacts ground (rows re-activated)
   for _ in range(45):
     sim.step(1)
 
@@ -1021,15 +1594,17 @@ def test_checkpoint_snapshot_restore_and_replay():
   mask_end = a_end["contact_mask"].cpu().numpy()
   assert np.sum(mask_end[0] > 0.5) == 4, "World 0 must re-impact and re-establish 4 contacts"
   assert np.sum(mask_end[1] > 0.5) == 4, "World 1 must maintain 4 contacts"
+  assert np.sum(mask_end[2] > 0.5) == 0, "World 2 must remain contact-free"
 
   qpos_target = sim.state.qpos.clone()
   qvel_target = sim.state.qvel.clone()
   qacc_target = sim.state.qacc.clone()
 
-  # 5. Test selective reset isolation: reset World 1, World 0 unaffected
+  # 5. Test selective reset isolation: reset World 2, Worlds 0/1 unaffected
   qpos_before = sim.state.qpos.clone()
-  sim.state.reset(env_ids=[1])
-  assert torch.equal(sim.state.qpos[0], qpos_before[0]), "Selective reset of World 1 must isolate World 0"
+  sim.state.reset(env_ids=[2])
+  assert torch.equal(sim.state.qpos[0], qpos_before[0]), "Selective reset of World 2 must isolate World 0"
+  assert torch.equal(sim.state.qpos[1], qpos_before[1]), "Selective reset of World 2 must isolate World 1"
 
   # 6. Test restore and replay
   sim.state.restore(chk)
@@ -1043,6 +1618,91 @@ def test_checkpoint_snapshot_restore_and_replay():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_primitive_contact_failure_isolation_and_recovery():
+  """Failed primitive-contact worlds: sticky failure, rollback, per-world reset recovery.
+
+  Batch has 2 worlds:
+  - World 0: failing primitive-contact world (boxes penetrating plane, conflicting joint
+    equality, tight tolerance, iteration exhaustion -> status 3, state rolled back).
+  - World 1: healthy contact-free world (boxes elevated with equality satisfied ->
+    status 0, steps forward normally).
+  Failed world rolls back state, remains sticky on subsequent steps, and recovers via
+  selective per-world reset while the healthy world's continuous stepping is preserved.
+  """
+  import torch
+
+  xml = """<mujoco>
+  <option timestep="0.002" integrator="Euler" iterations="2" tolerance="1e-6"/>
+  <worldbody>
+    <geom type="plane" size="1 1 0.1"/>
+    <body pos="0 0 0.049">
+      <joint name="j1" type="slide" axis="0 0 1"/>
+      <geom type="box" size="0.1 0.1 0.05" friction="1 0.1 0.1" mass="1.0"/>
+    </body>
+    <body pos="0 1 0.049">
+      <joint name="j2" type="slide" axis="0 0 1"/>
+      <geom type="box" size="0.1 0.1 0.05" friction="1 0.1 0.1" mass="1.0"/>
+    </body>
+  </worldbody>
+  <equality>
+    <joint joint1="j1" joint2="j2" polycoef="0.05 1 0 0 0"/>
+  </equality>
+  </mujoco>"""
+  m = mujoco.MjModel.from_xml_string(xml)
+
+  # World 0: j1=0, j2=0 (active 8-contact box-plane manifold, equality residual 0.05 -> iteration exhaustion)
+  # World 1: j1=0.5, j2=0.55 (contact-free, equality exactly satisfied j2 - j1 = 0.05 -> convergent status 0)
+  q0 = np.array([
+      [0.0, 0.0],
+      [0.5, 0.55]
+  ], dtype=np.float32)
+
+  sim = MetalSimulation(m, batch_size=2, qpos=q0, profile="integrated_euler_v1")
+
+  # Verify initial contact states: World 0 has 8 contacts (4 per box), World 1 has 0 contacts
+  a0 = sim.assembled_system()
+  mask0 = a0["contact_mask"].cpu().numpy()
+  assert np.sum(mask0[0] > 0.5) == 8, f"World 0 must engage 8 box-plane contacts (4 per box), got {np.sum(mask0[0] > 0.5)}"
+  assert np.sum(mask0[1] > 0.5) == 0, f"World 1 must be contact-free, got {np.sum(mask0[1] > 0.5)}"
+
+  qpos_initial = sim.state.qpos.clone()
+  sim.step(1)
+
+  # Step 1: World 0 fails (status 3), World 1 succeeds (status 0)
+  status1 = sim.state.status.cpu().numpy()
+  assert status1[0] == 3, f"World 0 must fail with status 3 (nonconvergence), got {status1[0]}"
+  assert status1[1] == 0, f"World 1 must succeed with status 0, got {status1[1]}"
+  assert torch.equal(sim.state.qpos[0], qpos_initial[0]), "Failed World 0 must roll back state"
+  assert not torch.equal(sim.state.qpos[1], qpos_initial[1]), "Healthy World 1 must advance state"
+  qpos_w1_step1 = sim.state.qpos[1].clone()
+
+  # Step 2: Sticky failure on World 0; World 1 advances again
+  sim.step(1)
+  status2 = sim.state.status.cpu().numpy()
+  assert status2[0] == 3, "World 0 failure must remain sticky"
+  assert status2[1] == 0, "World 1 must continue stepping successfully"
+  assert torch.equal(sim.state.qpos[0], qpos_initial[0]), "World 0 state must remain rolled back"
+  assert not torch.equal(sim.state.qpos[1], qpos_w1_step1), "World 1 must advance on step 2"
+
+  # Selective per-world reset of World 0 into an admissible convergent state
+  admissible_qpos = np.array([[0.3, 0.35]], dtype=np.float32)
+  sim.state.reset(env_ids=[0], qpos=admissible_qpos)
+  assert sim.state.status[0].item() == 0, "Reset World 0 must clear status"
+  assert sim.state.status[1].item() == 0, "World 1 status must remain 0"
+  np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), admissible_qpos[0], atol=1e-6)
+
+  # Step 3: Both worlds now succeed with status 0
+  qpos_w1_step2 = sim.state.qpos[1].clone()
+  sim.step(1)
+  status3 = sim.state.status.cpu().numpy()
+  assert status3[0] == 0, f"Recovered World 0 must step successfully, got status {status3[0]}"
+  assert status3[1] == 0, f"Healthy World 1 must step successfully, got status {status3[1]}"
+  assert not torch.equal(sim.state.qpos[0], torch.from_numpy(admissible_qpos[0]).to(sim.state.qpos.device))
+  assert not torch.equal(sim.state.qpos[1], qpos_w1_step2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_clockwork_parcel_sorter_demo_check():
   """Clockwork parcel sorter demo runs headless check with real physical routing."""
   import sys
@@ -1052,16 +1712,22 @@ def test_clockwork_parcel_sorter_demo_check():
     sys.path.insert(0, str(examples_dir))
   from clockwork_parcel_sorter import run
 
-  metrics = run(steps=500, mode="metal", check=True)
+  metrics = run(steps=600, mode="metal", check=True)
   assert metrics["box_routed_left"] is True
   assert metrics["cap_routed_right"] is True
   assert metrics["sph_routed_center"] is True
-  assert metrics["active_contact_steps"] >= 200
-  assert metrics["native_active_contact_steps"] >= 200
-  assert metrics["peak_contacts"] >= 3
-  assert metrics["native_peak_contacts"] >= 3
+  assert metrics["active_contact_steps"] >= 400
+  assert metrics["native_active_contact_steps"] >= 400
+  assert metrics["peak_contacts"] >= 5
+  assert metrics["native_peak_contacts"] >= 5
   assert len(metrics["unique_contact_pairs"]) >= 4
   assert metrics["max_stage_sensor_error"] <= 1e-6
   assert metrics["max_early_qpos_error"] <= 5e-5
-  assert metrics["max_full_qpos_error"] <= 0.15
+  assert metrics["max_early_qvel_error"] <= 1e-3
+  assert metrics["max_parcel_trans_error_m"] <= 0.03
+  assert metrics["max_parcel_lin_vel_error_mps"] <= 0.10
+  assert metrics["max_hinge_pos_error_rad"] <= 0.005
+  assert metrics["max_hinge_vel_error_radps"] <= 0.5
+  assert metrics["max_parcel_rot_error_rad"] <= 1.0
+  assert metrics["max_parcel_ang_vel_error_radps"] <= 2.5
 

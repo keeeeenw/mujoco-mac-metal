@@ -92,10 +92,26 @@ def run(steps=600, mode="metal", check=False, record=None):
   div1_dof = int(model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "diverter1_hinge")])
   div2_dof = int(model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "diverter2_hinge")])
 
+  # Joint addresses for unit-aware physical error decomposition
+  hinge_qpos_adr = [int(model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)])
+                    for n in ("diverter1_hinge", "diverter2_hinge", "damper_hinge")]
+  hinge_dof_adr = [int(model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)])
+                   for n in ("diverter1_hinge", "diverter2_hinge", "damper_hinge")]
+  free_qpos_adr = [int(model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)])
+                   for n in ("parcel_box_free", "parcel_cap_free", "parcel_sph_free")]
+  free_dof_adr = [int(model.jnt_dofadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)])
+                  for n in ("parcel_box_free", "parcel_cap_free", "parcel_sph_free")]
+
   max_early_qpos_error = 0.0
   max_early_qvel_error = 0.0
   max_full_qpos_error = 0.0
   max_full_qvel_error = 0.0
+  max_parcel_trans_error = 0.0
+  max_parcel_rot_error = 0.0
+  max_parcel_lin_vel_error = 0.0
+  max_parcel_ang_vel_error = 0.0
+  max_hinge_pos_error = 0.0
+  max_hinge_vel_error = 0.0
   max_stage_sensor_error = 0.0
   equality_max_residual = 0.0
   cpu_equality_max_residual = 0.0
@@ -145,9 +161,30 @@ def run(steps=600, mode="metal", check=False, record=None):
     if step <= 200:
       max_early_qpos_error = max(max_early_qpos_error, q_err)
       max_early_qvel_error = max(max_early_qvel_error, v_err)
-    # 2. Full rollout (all steps through post-impact channel separation)
+    # 2. Full rollout aggregate maximums
     max_full_qpos_error = max(max_full_qpos_error, q_err)
     max_full_qvel_error = max(max_full_qvel_error, v_err)
+
+    # 3. Unit-aware physical decompositions
+    for ha, hda in zip(hinge_qpos_adr, hinge_dof_adr):
+      max_hinge_pos_error = max(max_hinge_pos_error, abs(float(actual.qpos[ha] - reference.qpos[ha])))
+      max_hinge_vel_error = max(max_hinge_vel_error, abs(float(actual.qvel[hda] - reference.qvel[hda])))
+
+    for fqa, fda in zip(free_qpos_adr, free_dof_adr):
+      trans_d = float(np.linalg.norm(actual.qpos[fqa:fqa+3] - reference.qpos[fqa:fqa+3]))
+      max_parcel_trans_error = max(max_parcel_trans_error, trans_d)
+
+      q_act = actual.qpos[fqa+3:fqa+7]
+      q_ref = reference.qpos[fqa+3:fqa+7]
+      dot = float(np.clip(abs(np.dot(q_act, q_ref)), -1.0, 1.0))
+      rot_d = 2.0 * float(np.arccos(dot))
+      max_parcel_rot_error = max(max_parcel_rot_error, rot_d)
+
+      lin_v_d = float(np.linalg.norm(actual.qvel[fda:fda+3] - reference.qvel[fda:fda+3]))
+      max_parcel_lin_vel_error = max(max_parcel_lin_vel_error, lin_v_d)
+
+      ang_v_d = float(np.linalg.norm(actual.qvel[fda+3:fda+6] - reference.qvel[fda+3:fda+6]))
+      max_parcel_ang_vel_error = max(max_parcel_ang_vel_error, ang_v_d)
 
     # Equality constraint residual: diverter2 - diverter1 == 0
     eq_res = abs(float(actual.qpos[div2_dof] - actual.qpos[div1_dof]))
@@ -223,6 +260,12 @@ def run(steps=600, mode="metal", check=False, record=None):
       "sph_routed_center": sph_routed_center,
       "max_early_qpos_error": max_early_qpos_error,
       "max_early_qvel_error": max_early_qvel_error,
+      "max_parcel_trans_error_m": max_parcel_trans_error,
+      "max_parcel_rot_error_rad": max_parcel_rot_error,
+      "max_parcel_lin_vel_error_mps": max_parcel_lin_vel_error,
+      "max_parcel_ang_vel_error_radps": max_parcel_ang_vel_error,
+      "max_hinge_pos_error_rad": max_hinge_pos_error,
+      "max_hinge_vel_error_radps": max_hinge_vel_error,
       "max_full_qpos_error": max_full_qpos_error,
       "max_full_qvel_error": max_full_qvel_error,
       "max_stage_sensor_error": max_stage_sensor_error,
@@ -240,6 +283,18 @@ def run(steps=600, mode="metal", check=False, record=None):
       raise AssertionError(f"early qpos error {max_early_qpos_error} exceeded 5e-5")
     if max_early_qvel_error > 1e-3:
       raise AssertionError(f"early qvel error {max_early_qvel_error} exceeded 1e-3")
+    if max_parcel_trans_error > 0.03:
+      raise AssertionError(f"parcel translation error {max_parcel_trans_error} exceeded 0.03 m")
+    if max_parcel_lin_vel_error > 0.10:
+      raise AssertionError(f"parcel linear velocity error {max_parcel_lin_vel_error} exceeded 0.10 m/s")
+    if max_hinge_pos_error > 0.005:
+      raise AssertionError(f"hinge joint angle error {max_hinge_pos_error} exceeded 0.005 rad")
+    if max_hinge_vel_error > 0.5:
+      raise AssertionError(f"hinge joint velocity error {max_hinge_vel_error} exceeded 0.5 rad/s")
+    if max_parcel_rot_error > 1.0:
+      raise AssertionError(f"parcel rotation geodesic error {max_parcel_rot_error} exceeded 1.0 rad")
+    if max_parcel_ang_vel_error > 2.5:
+      raise AssertionError(f"parcel angular velocity error {max_parcel_ang_vel_error} exceeded 2.5 rad/s")
     if max_full_qpos_error > 0.20:
       raise AssertionError(f"full rollout qpos error {max_full_qpos_error} exceeded 0.20")
     if max_full_qvel_error > 2.0:
@@ -277,7 +332,7 @@ def main(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--mode", choices=("metal", "cpu"), default="metal")
   parser.add_argument("--headless", action="store_true")
-  parser.add_argument("--steps", type=int, default=500)
+  parser.add_argument("--steps", type=int, default=600)
   parser.add_argument(
       "--check", action="store_true", help="check an independent native/CPU rollout"
   )

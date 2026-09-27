@@ -39,6 +39,13 @@ MUJOCO_METAL_RUN_GPU=1 PYTHONPATH=metal:metal/examples python metal/examples/clo
 ![Native Metal clockwork parcel sorter beside CPU MuJoCo](assets/clockwork_parcel_sorter.gif)
 
 The 600-step native run exercises all primitive collision families simultaneously.
-Pre-impact trajectory error against CPU MuJoCo was `2.86e-6` m position and `1.30e-4` velocity; stage sensor error was `0.0`, and equality impedance matched CPU within `3.2e-5` rad.
-The run recorded 540 active contact steps, peak 7 simultaneous contacts, 441 active joint limit steps, and 9 unique contact pairs (`box_parcel_geom <-> cap_parcel_geom`, `box_parcel_geom <-> chute_left`, `box_parcel_geom <-> diverter1_flap`, `box_parcel_geom <-> ramp`, `cap_parcel_geom <-> chute_right`, `cap_parcel_geom <-> diverter2_flap`, `cap_parcel_geom <-> ramp`, `floor <-> sph_parcel_geom`, and `ramp <-> sph_parcel_geom`).
-Physical routing successfully dispatched the box parcel to the left channel ($Y = -0.391$ m), the capsule parcel to the right channel ($Y = +0.405$ m), and the sphere parcel down the center ($Y = 0.000$ m).
+Pre-impact trajectory error against CPU MuJoCo was `3.74e-6` m position and `1.30e-4` velocity; stage sensor error was `0.0`, and equality residual matched CPU within `3.2e-5` rad.
+Across the full 600 steps (1.2 seconds of multi-contact impacts, chaotic bouncing, and sorting), unit-aware errors remain tightly bounded:
+- Parcel translation error: `1.64e-2` m (1.64 cm)
+- Parcel linear velocity error: `4.79e-2` m/s
+- Hinge joint angle error: `2.07e-3` rad
+- Hinge joint velocity error: `4.00e-1` rad/s
+- Parcel rotation geodesic error: `5.44e-1` rad
+- Parcel angular velocity error: `1.82` rad/s
+The run recorded 536 native active contact steps (537 CPU steps), peak 7 simultaneous contacts, 443 active joint limit steps, and 9 unique contact pairs (`box_parcel_geom <-> cap_parcel_geom`, `box_parcel_geom <-> chute_left`, `box_parcel_geom <-> diverter1_flap`, `box_parcel_geom <-> ramp`, `cap_parcel_geom <-> chute_right`, `cap_parcel_geom <-> diverter2_flap`, `cap_parcel_geom <-> ramp`, `floor <-> sph_parcel_geom`, and `ramp <-> sph_parcel_geom`).
+Physical routing successfully dispatched the box parcel to the left channel ($Y = -0.405$ m), the capsule parcel to the right channel ($Y = +0.402$ m), and the sphere parcel down the center ($Y = 1.38 \times 10^{-9}$ m).
