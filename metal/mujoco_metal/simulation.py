@@ -406,16 +406,23 @@ class MetalSimulation:
         state._qpos, state._qvel, state._time, poses
     ).clone()
 
-  def assembled_system(self, *, recompute=False):
+  def assembled_system(self, *, ctrl=None, qfrc_applied=None, recompute=False):
     """Return the coupled constraint system tensors on MPS.
 
-    If `recompute` is True or no step has been run yet, evaluates the forward
-    smooth dynamics and coupled constraint assembly at the current device state.
+    If `recompute` is True, `ctrl` is given, `qfrc_applied` is given, or no step
+    has been run yet, evaluates the forward smooth dynamics and coupled constraint
+    assembly at the current device state with the provided control and applied forces.
     Returns dict containing 'J', 'W', 'W_regularized', 'R', 'ar', 'rhs', 'lambda',
     'qacc', 'qfrc_constraint', 'mass_matrix', 'status'.
     """
     if self._coupled_constraints is None:
       raise ValueError("assembled_system requires a coupled constraint stepping profile")
+    if ctrl is not None:
+      self._prepare_control(ctrl)
+      recompute = True
+    if qfrc_applied is not None:
+      self._prepare_force(qfrc_applied)
+      recompute = True
     if not recompute and hasattr(self, "_last_coupled") and self._last_coupled is not None:
       return self._last_coupled
     state = self._state
