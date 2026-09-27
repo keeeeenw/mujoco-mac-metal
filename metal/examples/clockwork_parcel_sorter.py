@@ -94,12 +94,16 @@ def run(steps=600, mode="metal", check=False, record=None):
 
   max_early_qpos_error = 0.0
   max_early_qvel_error = 0.0
+  max_full_qpos_error = 0.0
+  max_full_qvel_error = 0.0
   max_stage_sensor_error = 0.0
   equality_max_residual = 0.0
   cpu_equality_max_residual = 0.0
   active_joint_limit_steps = 0
   active_contact_steps = 0
+  native_active_contact_steps = 0
   peak_contacts = 0
+  native_peak_contacts = 0
   unique_contact_pairs = set()
   cpu_detected_contact_pairs = set()
   dt = float(model.opt.timestep)
@@ -126,10 +130,24 @@ def run(steps=600, mode="metal", check=False, record=None):
       actual.time = float(state.time[0])
       sensor_vals = native.sensor_values().cpu().numpy()[0]
 
-    # Pre-impact trajectory parity check (during ramp descent, steps 0..200)
+      # Direct native contact telemetry from assembled_system
+      assembled = native.assembled_system()
+      native_mask = assembled["contact_mask"][0].cpu().numpy()
+      native_ncon = int(np.sum(native_mask > 0.5))
+      if native_ncon > 0:
+        native_active_contact_steps += 1
+        native_peak_contacts = max(native_peak_contacts, native_ncon)
+
+    # Trajectory parity checks:
+    # 1. Early rollout (ramp descent, pre-diverter impact, steps 0..200)
+    q_err = float(np.max(np.abs(actual.qpos - reference.qpos)))
+    v_err = float(np.max(np.abs(actual.qvel - reference.qvel)))
     if step <= 200:
-      max_early_qpos_error = max(max_early_qpos_error, float(np.max(np.abs(actual.qpos - reference.qpos))))
-      max_early_qvel_error = max(max_early_qvel_error, float(np.max(np.abs(actual.qvel - reference.qvel))))
+      max_early_qpos_error = max(max_early_qpos_error, q_err)
+      max_early_qvel_error = max(max_early_qvel_error, v_err)
+    # 2. Full rollout (all steps through post-impact channel separation)
+    max_full_qpos_error = max(max_full_qpos_error, q_err)
+    max_full_qvel_error = max(max_full_qvel_error, v_err)
 
     # Equality constraint residual: diverter2 - diverter1 == 0
     eq_res = abs(float(actual.qpos[div2_dof] - actual.qpos[div1_dof]))
@@ -205,10 +223,14 @@ def run(steps=600, mode="metal", check=False, record=None):
       "sph_routed_center": sph_routed_center,
       "max_early_qpos_error": max_early_qpos_error,
       "max_early_qvel_error": max_early_qvel_error,
+      "max_full_qpos_error": max_full_qpos_error,
+      "max_full_qvel_error": max_full_qvel_error,
       "max_stage_sensor_error": max_stage_sensor_error,
       "equality_max_residual": equality_max_residual,
       "active_contact_steps": active_contact_steps,
+      "native_active_contact_steps": native_active_contact_steps,
       "peak_contacts": peak_contacts,
+      "native_peak_contacts": native_peak_contacts,
       "active_joint_limit_steps": active_joint_limit_steps,
       "unique_contact_pairs": sorted(list(unique_contact_pairs)),
   }
@@ -218,6 +240,14 @@ def run(steps=600, mode="metal", check=False, record=None):
       raise AssertionError(f"early qpos error {max_early_qpos_error} exceeded 5e-5")
     if max_early_qvel_error > 1e-3:
       raise AssertionError(f"early qvel error {max_early_qvel_error} exceeded 1e-3")
+    if max_full_qpos_error > 0.20:
+      raise AssertionError(f"full rollout qpos error {max_full_qpos_error} exceeded 0.20")
+    if max_full_qvel_error > 2.0:
+      raise AssertionError(f"full rollout qvel error {max_full_qvel_error} exceeded 2.0")
+    if native_active_contact_steps < 200:
+      raise AssertionError(f"native direct contact steps {native_active_contact_steps} < 200")
+    if native_peak_contacts < 3:
+      raise AssertionError(f"native peak contacts {native_peak_contacts} < 3")
     if max_stage_sensor_error > 1e-6:
       raise AssertionError(f"stage sensor error {max_stage_sensor_error} exceeded 1e-6")
     if abs(equality_max_residual - cpu_equality_max_residual) > 1e-4:
@@ -247,7 +277,7 @@ def main(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--mode", choices=("metal", "cpu"), default="metal")
   parser.add_argument("--headless", action="store_true")
-  parser.add_argument("--steps", type=int, default=600)
+  parser.add_argument("--steps", type=int, default=500)
   parser.add_argument(
       "--check", action="store_true", help="check an independent native/CPU rollout"
   )

@@ -460,309 +460,680 @@ inline int collide_capsule_box(
   return n;
 }
 
-// 9. Box - Box
-inline int clipHalfPlane(int nin, thread float in[MJBOXBOX_MAXVERT][3], thread float out[MJBOXBOX_MAXVERT][3], int coord, float sign_val, float limit) {
-  float d[MJBOXBOX_MAXVERT];
-  bool all_inside = true;
-  for (int k = 0; k < nin; ++k) {
-    d[k] = sign_val * in[k][coord] - limit;
-    if (d[k] > 0.0f) all_inside = false;
+// 9. Box - Box (MuJoCo 3.10.0 algorithm matching mjc_BoxBox)
+struct RawPreContact {
+  float dist;
+  float pos[3];
+  float normal[3];
+  float tangent[3];
+};
+
+inline void bb_zero(thread float* v, int n) {
+  for (int i = 0; i < n; ++i) v[i] = 0.0f;
+}
+
+inline void bb_zero3(thread float* v) { v[0] = 0.0f; v[1] = 0.0f; v[2] = 0.0f; }
+inline void bb_copy3(thread float* d, thread const float* s) { d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; }
+inline void bb_add3(thread float* d, thread const float* a, thread const float* b) {
+  d[0] = a[0] + b[0]; d[1] = a[1] + b[1]; d[2] = a[2] + b[2];
+}
+inline void bb_sub3(thread float* d, thread const float* a, thread const float* b) {
+  d[0] = a[0] - b[0]; d[1] = a[1] - b[1]; d[2] = a[2] - b[2];
+}
+inline void bb_addTo3(thread float* d, thread const float* a) {
+  d[0] += a[0]; d[1] += a[1]; d[2] += a[2];
+}
+inline void bb_scl3(thread float* d, thread const float* a, float s) {
+  d[0] = a[0] * s; d[1] = a[1] * s; d[2] = a[2] * s;
+}
+inline void bb_addToScl3(thread float* d, thread const float* a, float s) {
+  d[0] += a[0] * s; d[1] += a[1] * s; d[2] += a[2] * s;
+}
+inline float bb_dot3(thread const float* a, thread const float* b) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+inline float bb_normalize3(thread float* v) {
+  float n = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  if (n > 1e-15f) {
+    float inv = 1.0f / n;
+    v[0] *= inv; v[1] *= inv; v[2] *= inv;
   }
-  if (all_inside) {
-    for (int k = 0; k < nin; ++k) {
-      out[k][0] = in[k][0]; out[k][1] = in[k][1]; out[k][2] = in[k][2];
+  return n;
+}
+inline void bb_mulMatVec3(thread float* res, thread const float* mat, thread const float* vec) {
+  float tmp[3] = {
+    mat[0] * vec[0] + mat[1] * vec[1] + mat[2] * vec[2],
+    mat[3] * vec[0] + mat[4] * vec[1] + mat[5] * vec[2],
+    mat[6] * vec[0] + mat[7] * vec[1] + mat[8] * vec[2]
+  };
+  res[0] = tmp[0]; res[1] = tmp[1]; res[2] = tmp[2];
+}
+inline void bb_mulMatTVec3(thread float* res, thread const float* mat, thread const float* vec) {
+  float tmp[3] = {
+    mat[0] * vec[0] + mat[3] * vec[1] + mat[6] * vec[2],
+    mat[1] * vec[0] + mat[4] * vec[1] + mat[7] * vec[2],
+    mat[2] * vec[0] + mat[5] * vec[1] + mat[8] * vec[2]
+  };
+  res[0] = tmp[0]; res[1] = tmp[1]; res[2] = tmp[2];
+}
+inline void bb_mulMatTMat3(thread float* res, thread const float* mat1, thread const float* mat2) {
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++) {
+      res[3 * i + j] = mat1[0 + i] * mat2[0 + j] + mat1[3 + i] * mat2[3 + j] + mat1[6 + i] * mat2[6 + j];
     }
-    return nin;
   }
-  int nout = 0;
-  for (int k = 0; k < nin; ++k) {
-    int k1 = (k + 1 == nin) ? 0 : k + 1;
-    float dp = d[k], dq = d[k1];
-    if (dp <= 0.0f && nout < MJBOXBOX_MAXVERT) {
-      out[nout][0] = in[k][0]; out[nout][1] = in[k][1]; out[nout][2] = in[k][2];
-      nout++;
-    }
-    if (((dp < 0.0f && dq > 0.0f) || (dp > 0.0f && dq < 0.0f)) && nout < MJBOXBOX_MAXVERT) {
-      float t = dp / (dp - dq);
-      out[nout][0] = in[k][0] + t * (in[k1][0] - in[k][0]);
-      out[nout][1] = in[k][1] + t * (in[k1][1] - in[k][1]);
-      out[nout][2] = in[k][2] + t * (in[k1][2] - in[k][2]);
-      nout++;
+}
+inline void bb_mulMatMatT3(thread float* res, thread const float* mat1, thread const float* mat2) {
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++) {
+      res[3 * i + j] = mat1[3 * i + 0] * mat2[3 * j + 0] + mat1[3 * i + 1] * mat2[3 * j + 1] + mat1[3 * i + 2] * mat2[3 * j + 2];
     }
   }
-  return nout;
+}
+inline void bb_transpose3(thread float* res, thread const float* mat) {
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 3; c++) {
+      res[c * 3 + r] = mat[r * 3 + c];
+    }
+  }
+}
+inline int bb_outsideBox(thread const float point[3], thread const float pos[3], thread const float mat[9],
+                         thread const float size[3], float inflate) {
+  float vec[3] = {point[0] - pos[0], point[1] - pos[1], point[2] - pos[2]};
+  bb_mulMatTVec3(vec, mat, vec);
+  float big[3] = {size[0] * inflate, size[1] * inflate, size[2] * inflate};
+  if (vec[0] > big[0] || vec[0] < -big[0] ||
+      vec[1] > big[1] || vec[1] < -big[1] ||
+      vec[2] > big[2] || vec[2] < -big[2]) {
+    return 1;
+  }
+  if (inflate == 1.0f) return -1;
+  float small[3] = {size[0] / inflate, size[1] / inflate, size[2] / inflate};
+  if (vec[0] < small[0] && vec[0] > -small[0] &&
+      vec[1] < small[1] && vec[1] > -small[1] &&
+      vec[2] < small[2] && vec[2] > -small[2]) {
+    return -1;
+  }
+  return 0;
+}
+
+inline void quat_to_mat_row_major(float4 q, thread float mat[9]) {
+  float w = q.x, x = q.y, y = q.z, z = q.w;
+  mat[0] = 1.0f - 2.0f * (y * y + z * z);
+  mat[1] = 2.0f * (x * y - w * z);
+  mat[2] = 2.0f * (x * z + w * y);
+
+  mat[3] = 2.0f * (x * y + w * z);
+  mat[4] = 1.0f - 2.0f * (x * x + z * z);
+  mat[5] = 2.0f * (y * z - w * x);
+
+  mat[6] = 2.0f * (x * z - w * y);
+  mat[7] = 2.0f * (y * z + w * x);
+  mat[8] = 1.0f - 2.0f * (x * x + y * y);
+}
+
+inline int _boxbox_metal(
+    thread RawPreContact* con,
+    thread const float pos1[3], thread const float mat1[9], thread const float size1[3],
+    thread const float pos2[3], thread const float mat2[9], thread const float size2[3],
+    float margin) {
+  float pos12[3], pos21[3], rot[9], rott[9], rotabs[9], rottabs[9], tmp1[3], tmp2[3], plen1[3], plen2[3];
+  float rotmore[9], p[3], r[9], s[3], ss[3], lp[3], rt[9], points[8][3];
+  float depth[8], pts[6][3], ppts2[4][2], pu[4][3], axi[3][3];
+  float linesu[4][6], lines[4][6], clnorm[3], rnorm[3];
+  float penetration, c1, c2, c3, a, b, c, d, lx, ly, hz, l, x, y, u, v, llx, lly, innorm, margin2;
+
+  int i0 = 0, i1 = 1, i2 = 2;
+  float f0 = 1.0f, f1 = 1.0f, f2 = 1.0f;
+  int i, j, q, code = -1, q1, q2, clcorner, n = 0, m, k;
+  int cle1 = 0, cle2 = 0, in = 0, ax1 = 0, ax2 = 0, pax1 = 0, pax2 = 0, clface = 0, nl, nf;
+
+  margin2 = margin * margin;
+
+  bb_sub3(tmp1, pos2, pos1);
+  bb_mulMatTVec3(pos21, mat1, tmp1);
+
+  bb_sub3(tmp1, pos1, pos2);
+  bb_mulMatTVec3(pos12, mat2, tmp1);
+
+  bb_mulMatTMat3(rot, mat1, mat2);
+  bb_transpose3(rott, rot);
+
+  for (i = 0; i < 9; i++) rotabs[i] = abs(rot[i]);
+  for (i = 0; i < 9; i++) rottabs[i] = abs(rott[i]);
+
+  bb_mulMatVec3(plen2, rotabs, size2);
+  bb_mulMatTVec3(plen1, rotabs, size1);
+
+  for (i = 0, penetration = margin; i < 3; i++)
+    penetration += size1[i] * 3.0f + size2[i] * 3.0f;
+
+  for (i = 0; i < 3; i++) {
+    c1 = -abs(pos21[i]) + size1[i] + plen2[i];
+    c2 = -abs(pos12[i]) + size2[i] + plen1[i];
+
+    if (c1 < -margin || c2 < -margin)
+      return 0;
+
+    if (c1 < penetration) {
+      penetration = c1;
+      code = i + 3 * (pos21[i] < 0.0f) + 0;
+    }
+    if (c2 < penetration) {
+      penetration = c2;
+      code = i + 3 * (pos12[i] < 0.0f) + 6;
+    }
+  }
+
+  for (i = 0; i < 3; i++) {
+    for (j = 0; j < 3; j++) {
+      bb_zero3(tmp2);
+      if (i == 0) {
+        tmp2[1] = -rott[3 * j + 2];
+        tmp2[2] = +rott[3 * j + 1];
+      } else if (i == 1) {
+        tmp2[0] = +rott[3 * j + 2];
+        tmp2[2] = -rott[3 * j + 0];
+      } else if (i == 2) {
+        tmp2[0] = -rott[3 * j + 1];
+        tmp2[1] = +rott[3 * j + 0];
+      }
+
+      c1 = bb_normalize3(tmp2);
+      if (c1 < 1e-15f) continue;
+
+      c2 = bb_dot3(pos21, tmp2);
+      c3 = 0.0f;
+
+      for (k = 0; k < 3; k++)
+        if (k != i)
+          c3 += size1[k] * abs(tmp2[k]);
+      for (k = 0; k < 3; k++)
+        if (k != j)
+          c3 += size2[k] * rotabs[3 * i + 3 - k - j] / c1;
+
+      c3 -= abs(c2);
+      if (c3 < -margin) return 0;
+
+      if (c3 < penetration * (1.0f - 1e-6f)) {
+        penetration = c3;
+        for (k = cle1 = 0; k < 3; k++)
+          if (k != i)
+            if ((tmp2[k] > 0.0f) ^ (c2 < 0.0f))
+              cle1 += 1 << k;
+        for (k = cle2 = 0; k < 3; k++)
+          if (k != j)
+            if ((rot[3 * i + 3 - k - j] > 0.0f) ^ (c2 < 0.0f) ^ ((k - j + 3) % 3 == 1))
+              cle2 += 1 << k;
+
+        code = 12 + i * 3 + j;
+        bb_copy3(clnorm, tmp2);
+        in = c2 < 0.0f;
+      }
+    }
+  }
+
+  if (code == -1) return 0;
+
+  if (code < 12) {
+    q1 = code % 6;
+    q2 = code / 6;
+
+    bb_zero(rotmore, 9);
+    if (q1 == 0)      { rotmore[2] = -1.0f; rotmore[4] = +1.0f; rotmore[6] = +1.0f; }
+    else if (q1 == 1) { rotmore[0] = +1.0f; rotmore[5] = -1.0f; rotmore[7] = +1.0f; }
+    else if (q1 == 2) { rotmore[0] = +1.0f; rotmore[4] = +1.0f; rotmore[8] = +1.0f; }
+    else if (q1 == 3) { rotmore[2] = +1.0f; rotmore[4] = +1.0f; rotmore[6] = -1.0f; }
+    else if (q1 == 4) { rotmore[0] = +1.0f; rotmore[5] = +1.0f; rotmore[7] = -1.0f; }
+    else if (q1 == 5) { rotmore[0] = -1.0f; rotmore[4] = +1.0f; rotmore[8] = -1.0f; }
+
+    i0 = 0; i1 = 1; i2 = 2;
+    f0 = 1.0f; f1 = 1.0f; f2 = 1.0f;
+    if (q1 == 0)      { i0 = 2; f0 = -1.0f; i2 = 0; }
+    else if (q1 == 1) { i1 = 2; f1 = -1.0f; i2 = 1; }
+    else if (q1 == 2) {}
+    else if (q1 == 3) { i0 = 2; i2 = 0; f2 = -1.0f; }
+    else if (q1 == 4) { i1 = 2; i2 = 1; f2 = -1.0f; }
+    else if (q1 == 5) { f0 = -1.0f; f2 = -1.0f; }
+
+    if (q2) {
+      bb_mulMatMatT3(r, rotmore, rot);
+      p[0] = pos12[i0] * f0; p[1] = pos12[i1] * f1; p[2] = pos12[i2] * f2;
+      tmp1[0] = size2[i0] * f0; tmp1[1] = size2[i1] * f1; tmp1[2] = size2[i2] * f2;
+      bb_copy3(s, size1);
+    } else {
+      bb_scl3(r + 0, rot + i0 * 3, f0);
+      bb_scl3(r + 3, rot + i1 * 3, f1);
+      bb_scl3(r + 6, rot + i2 * 3, f2);
+      p[0] = pos21[i0] * f0; p[1] = pos21[i1] * f1; p[2] = pos21[i2] * f2;
+      tmp1[0] = size1[i0] * f0; tmp1[1] = size1[i1] * f1; tmp1[2] = size1[i2] * f2;
+      bb_copy3(s, size2);
+    }
+
+    bb_transpose3(rt, r);
+    for (i = 0; i < 3; i++) ss[i] = abs(tmp1[i]);
+    lx = ss[0]; ly = ss[1]; hz = ss[2];
+    p[2] -= hz;
+
+    bb_copy3(lp, p);
+    clcorner = 0;
+    for (i = 0; i < 3; i++)
+      if (r[6 + i] < 0.0f) clcorner += 1 << i;
+
+    bb_addToScl3(lp, rt + 0, s[0] * ((clcorner & 1) ? 1.0f : -1.0f));
+    bb_addToScl3(lp, rt + 3, s[1] * ((clcorner & 2) ? 1.0f : -1.0f));
+    bb_addToScl3(lp, rt + 6, s[2] * ((clcorner & 4) ? 1.0f : -1.0f));
+
+    m = 0; k = 0;
+    bb_copy3(pts[m++], lp);
+    for (i = 0; i < 3; i++)
+      if (abs(r[6 + i]) < 0.5f)
+        bb_scl3(pts[m++], rt + 3 * i, s[i] * ((clcorner & (1 << i)) ? -2.0f : 2.0f));
+
+    bb_add3(pts[3], pts[0], pts[1]);
+    bb_add3(pts[4], pts[0], pts[2]);
+    bb_add3(pts[5], pts[3], pts[2]);
+
+    if (m > 1) {
+      bb_copy3(lines[k] + 0, pts[0]);
+      bb_copy3(lines[k++] + 3, pts[1]);
+    }
+    if (m > 2) {
+      bb_copy3(lines[k] + 0, pts[0]);
+      bb_copy3(lines[k++] + 3, pts[2]);
+      bb_copy3(lines[k] + 0, pts[3]);
+      bb_copy3(lines[k++] + 3, pts[2]);
+      bb_copy3(lines[k] + 0, pts[4]);
+      bb_copy3(lines[k++] + 3, pts[1]);
+    }
+
+    for (i = 0; i < k; i++) {
+      for (q = 0; q < 2; q++) {
+        a = lines[i][0 + q];
+        b = lines[i][3 + q];
+        c = lines[i][1 - q];
+        d = lines[i][4 - q];
+        if (abs(b) > 1e-15f) {
+          for (j = -1; j <= 1; j += 2) {
+            l = ss[q] * float(j);
+            c1 = (l - a) * (1.0f / b);
+            if (c1 < 0.0f || c1 > 1.0f) continue;
+            c2 = c + d * c1;
+            if (abs(c2) > ss[1 - q]) continue;
+            if (n < 8) {
+              bb_copy3(points[n], lines[i]);
+              bb_addToScl3(points[n++], lines[i] + 3, c1);
+            }
+          }
+        }
+      }
+    }
+
+    a = pts[1][0]; b = pts[2][0];
+    c = pts[1][1]; d = pts[2][1];
+    c1 = a * d - b * c;
+
+    if (m > 2) {
+      for (i = 0; i < 4; i++) {
+        llx = (i / 2) ? lx : -lx;
+        lly = (i % 2) ? ly : -ly;
+        x = llx - pts[0][0];
+        y = lly - pts[0][1];
+        u = (x * d - y * b) * (1.0f / c1);
+        v = (y * a - x * c) * (1.0f / c1);
+        if (u <= 0.0f || v <= 0.0f || u >= 1.0f || v >= 1.0f) continue;
+        if (n < 8) {
+          points[n][0] = llx;
+          points[n][1] = lly;
+          points[n][2] = (pts[0][2] + u * pts[1][2] + v * pts[2][2]);
+          n++;
+        }
+      }
+    }
+
+    for (i = 0; i < (1 << (m - 1)); i++) {
+      bb_copy3(tmp1, pts[i == 0 ? 0 : i + 2]);
+      if (i) {
+        if (tmp1[0] <= -lx || tmp1[0] >= lx) continue;
+        if (tmp1[1] <= -ly || tmp1[1] >= ly) continue;
+      }
+      if (n < 8) {
+        bb_copy3(points[n++], tmp1);
+      }
+    }
+
+    m = n;
+    n = 0;
+    for (i = 0; i < m; i++) {
+      if (points[i][2] > margin) continue;
+      if (n != i) bb_copy3(points[n], points[i]);
+      depth[n] = points[n][2];
+      points[n][2] *= 0.5f;
+      n++;
+    }
+
+    bb_mulMatMatT3(r, q2 ? mat2 : mat1, rotmore);
+    bb_copy3(p, q2 ? pos2 : pos1);
+
+    tmp2[0] = (q2 ? -1.0f : 1.0f) * r[2];
+    tmp2[1] = (q2 ? -1.0f : 1.0f) * r[5];
+    tmp2[2] = (q2 ? -1.0f : 1.0f) * r[8];
+
+    bb_copy3(con[0].normal, tmp2);
+    bb_zero3(con[0].tangent);
+
+    for (i = 0; i < n; i++) {
+      con[i].dist = 2.0f * points[i][2];
+      points[i][2] += hz;
+      bb_mulMatVec3(tmp2, r, points[i]);
+      bb_add3(con[i].pos, tmp2, p);
+      if (i) {
+        bb_copy3(con[i].normal, con[0].normal);
+        bb_zero3(con[i].tangent);
+      }
+    }
+    return n;
+  } else {
+    // Edge - Edge
+    code -= 12;
+    q1 = code / 3;
+    q2 = code % 3;
+
+    if (q2 == 0) { ax1 = 1; ax2 = 2; }
+    if (q2 == 1) { ax1 = 0; ax2 = 2; }
+    if (q2 == 2) { ax1 = 1; ax2 = 0; }
+    if (q1 == 0) { pax1 = 1; pax2 = 2; }
+    if (q1 == 1) { pax1 = 0; pax2 = 2; }
+    if (q1 == 2) { pax1 = 1; pax2 = 0; }
+
+    if (rotabs[3 * q1 + ax1] < rotabs[3 * q1 + ax2]) {
+      ax1 = ax2;
+      ax2 = 3 - q2 - ax1;
+    }
+    if (rottabs[3 * q2 + pax1] < rottabs[3 * q2 + pax2]) {
+      pax1 = pax2;
+      pax2 = 3 - q1 - pax1;
+    }
+
+    if (cle1 & (1 << pax2)) clface = pax2;
+    else clface = pax2 + 3;
+
+    bb_zero(rotmore, 9);
+    if (clface == 0)      { rotmore[2] = -1.0f; rotmore[4] = +1.0f; rotmore[6] = +1.0f; }
+    else if (clface == 1) { rotmore[0] = +1.0f; rotmore[5] = -1.0f; rotmore[7] = +1.0f; }
+    else if (clface == 2) { rotmore[0] = +1.0f; rotmore[4] = +1.0f; rotmore[8] = +1.0f; }
+    else if (clface == 3) { rotmore[2] = +1.0f; rotmore[4] = +1.0f; rotmore[6] = -1.0f; }
+    else if (clface == 4) { rotmore[0] = +1.0f; rotmore[5] = +1.0f; rotmore[7] = -1.0f; }
+    else if (clface == 5) { rotmore[0] = -1.0f; rotmore[4] = +1.0f; rotmore[8] = -1.0f; }
+
+    i0 = 0; i1 = 1; i2 = 2;
+    f0 = 1.0f; f1 = 1.0f; f2 = 1.0f;
+    if (clface == 0)      { i0 = 2; f0 = -1.0f; i2 = 0; }
+    else if (clface == 1) { i1 = 2; f1 = -1.0f; i2 = 1; }
+    else if (clface == 2) {}
+    else if (clface == 3) { i0 = 2; i2 = 0; f2 = -1.0f; }
+    else if (clface == 4) { i1 = 2; i2 = 1; f2 = -1.0f; }
+    else if (clface == 5) { f0 = -1.0f; f2 = -1.0f; }
+
+    p[0] = pos21[i0] * f0; p[1] = pos21[i1] * f1; p[2] = pos21[i2] * f2;
+    rnorm[0] = clnorm[i0] * f0; rnorm[1] = clnorm[i1] * f1; rnorm[2] = clnorm[i2] * f2;
+
+    bb_scl3(r + 0, rot + i0 * 3, f0);
+    bb_scl3(r + 3, rot + i1 * 3, f1);
+    bb_scl3(r + 6, rot + i2 * 3, f2);
+
+    bb_mulMatTVec3(tmp1, rotmore, size1);
+    for (i = 0; i < 3; i++) s[i] = abs(tmp1[i]);
+    bb_transpose3(rt, r);
+
+    lx = s[0]; ly = s[1]; hz = s[2];
+    p[2] -= hz;
+
+    n = 0;
+    bb_copy3(points[n], p);
+    bb_addToScl3(points[n], rt + 3 * ax1, size2[ax1] * ((cle2 & (1 << ax1)) ? 1.0f : -1.0f));
+    bb_addToScl3(points[n], rt + 3 * ax2, size2[ax2] * ((cle2 & (1 << ax2)) ? 1.0f : -1.0f));
+    bb_copy3(points[n + 1], points[n]);
+    bb_addToScl3(points[n], rt + 3 * q2, size2[q2]);
+    n = 1;
+    bb_addToScl3(points[n], rt + 3 * q2, -size2[q2]);
+    n = 2;
+
+    bb_copy3(points[n], p);
+    bb_addToScl3(points[n], rt + 3 * ax1, size2[ax1] * ((cle2 & (1 << ax1)) ? -1.0f : 1.0f));
+    bb_addToScl3(points[n], rt + 3 * ax2, size2[ax2] * ((cle2 & (1 << ax2)) ? 1.0f : -1.0f));
+    bb_copy3(points[n + 1], points[n]);
+    bb_addToScl3(points[n], rt + 3 * q2, size2[q2]);
+    n = 3;
+    bb_addToScl3(points[n], rt + 3 * q2, -size2[q2]);
+    n = 4;
+
+    bb_copy3(axi[0], points[0]);
+    bb_sub3(axi[1], points[1], points[0]);
+    bb_sub3(axi[2], points[2], points[0]);
+
+    if (abs(rnorm[2]) < 1e-15f) return 0;
+    innorm = (1.0f / rnorm[2]) * (in ? -1.0f : 1.0f);
+
+    for (i = 0; i < 4; i++) {
+      c1 = -points[i][2] * (1.0f / rnorm[2]);
+      bb_copy3(pu[i], points[i]);
+      bb_addToScl3(points[i], rnorm, c1);
+      ppts2[i][0] = points[i][0];
+      ppts2[i][1] = points[i][1];
+    }
+
+    bb_copy3(pts[0], points[0]);
+    bb_sub3(pts[1], points[1], points[0]);
+    bb_sub3(pts[2], points[2], points[0]);
+
+    m = 3; k = 0; n = 0;
+    if (m > 1) {
+      bb_copy3(lines[k] + 0, pts[0]);
+      bb_copy3(lines[k] + 3, pts[1]);
+      bb_copy3(linesu[k] + 0, axi[0]);
+      bb_copy3(linesu[k++] + 3, axi[1]);
+    }
+    if (m > 2) {
+      bb_copy3(lines[k] + 0, pts[0]);
+      bb_copy3(lines[k] + 3, pts[2]);
+      bb_copy3(linesu[k] + 0, axi[0]);
+      bb_copy3(linesu[k++] + 3, axi[2]);
+
+      bb_add3(lines[k] + 0, pts[0], pts[1]);
+      bb_copy3(lines[k] + 3, pts[2]);
+      bb_add3(linesu[k] + 0, axi[0], axi[1]);
+      bb_copy3(linesu[k++] + 3, axi[2]);
+
+      bb_add3(lines[k] + 0, pts[0], pts[2]);
+      bb_copy3(lines[k] + 3, pts[1]);
+      bb_add3(linesu[k] + 0, axi[0], axi[2]);
+      bb_copy3(linesu[k++] + 3, axi[1]);
+    }
+
+    for (i = 0; i < k; i++) {
+      for (q = 0; q < 2; q++) {
+        a = lines[i][0 + q];
+        b = lines[i][3 + q];
+        c = lines[i][1 - q];
+        d = lines[i][4 - q];
+        if (abs(b) > 1e-15f) {
+          for (j = -1; j <= 1; j += 2) {
+            if (n < 8) {
+              l = s[q] * float(j);
+              c1 = (l - a) * (1.0f / b);
+              if (c1 < 0.0f || c1 > 1.0f) continue;
+              c2 = c + d * c1;
+              if (abs(c2) > s[1 - q]) continue;
+              if ((linesu[i][2] + linesu[i][5] * c1) * innorm > margin) continue;
+
+              bb_scl3(points[n], linesu[i], 0.5f);
+              bb_addToScl3(points[n], linesu[i] + 3, 0.5f * c1);
+              points[n][0 + q] += 0.5f * l;
+              points[n][1 - q] += 0.5f * c2;
+              depth[n] = points[n][2] * innorm * 2.0f;
+              n++;
+            }
+          }
+        }
+      }
+    }
+
+    nl = n;
+    a = pts[1][0]; b = pts[2][0];
+    c = pts[1][1]; d = pts[2][1];
+    c1 = a * d - b * c;
+
+    for (i = 0; i < 4; i++) {
+      if (n < 8) {
+        llx = (i / 2) ? lx : -lx;
+        lly = (i % 2) ? ly : -ly;
+        x = llx - pts[0][0];
+        y = lly - pts[0][1];
+        u = (x * d - y * b) * (1.0f / c1);
+        v = (y * a - x * c) * (1.0f / c1);
+        if (nl == 0) {
+          if ((u < 0.0f || u > 1.0f) && (v < 0.0f || v > 1.0f)) continue;
+        } else {
+          if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) continue;
+        }
+        if (u < 0.0f) u = 0.0f;
+        if (u > 1.0f) u = 1.0f;
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+
+        bb_scl3(tmp1, pu[0], 1.0f - u - v);
+        bb_addToScl3(tmp1, pu[1], u);
+        bb_addToScl3(tmp1, pu[2], v);
+
+        points[n][0] = llx;
+        points[n][1] = lly;
+        points[n][2] = 0.0f;
+
+        bb_sub3(tmp2, points[n], tmp1);
+        c1 = bb_dot3(tmp2, tmp2);
+        if (tmp1[2] > 0.0f)
+          if (c1 > margin2) continue;
+
+        bb_addTo3(points[n], tmp1);
+        bb_scl3(points[n], points[n], 0.5f);
+        depth[n] = sqrt(c1) * (tmp1[2] < 0.0f ? -1.0f : 1.0f);
+        n++;
+      }
+    }
+
+    nf = n;
+    for (i = 0; i < 4; i++) {
+      if (n < 8) {
+        x = ppts2[i][0];
+        y = ppts2[i][1];
+        if (nl == 0) {
+          if (nf != 0) {
+            if (x < -lx || x > lx)
+              if (y < -ly || y > ly) continue;
+          }
+        } else {
+          if (x < -lx || x > lx || y < -ly || y > ly) continue;
+        }
+
+        c1 = 0.0f;
+        for (j = 0; j < 2; j++) {
+          if (ppts2[i][j] < -s[j])
+            c1 += (ppts2[i][j] + s[j]) * (ppts2[i][j] + s[j]);
+          else if (ppts2[i][j] > s[j])
+            c1 += (ppts2[i][j] - s[j]) * (ppts2[i][j] - s[j]);
+        }
+        c1 += pu[i][2] * innorm * pu[i][2] * innorm;
+        if (pu[i][2] > 0.0f)
+          if (c1 > margin2) continue;
+
+        tmp1[0] = ppts2[i][0] * 0.5f;
+        tmp1[1] = ppts2[i][1] * 0.5f;
+        tmp1[2] = 0.0f;
+        for (j = 0; j < 2; j++) {
+          if (ppts2[i][j] < -s[j]) tmp1[j] = -s[j] * 0.5f;
+          else if (ppts2[i][j] > s[j]) tmp1[j] = +s[j] * 0.5f;
+        }
+        bb_addToScl3(tmp1, pu[i], 0.5f);
+        bb_copy3(points[n], tmp1);
+        depth[n] = sqrt(c1) * (pu[i][2] < 0.0f ? -1.0f : 1.0f);
+        n++;
+      }
+    }
+
+    bb_mulMatMatT3(r, mat1, rotmore);
+    bb_mulMatVec3(tmp1, r, rnorm);
+    bb_scl3(con[0].normal, tmp1, in ? -1.0f : 1.0f);
+    bb_zero3(con[0].tangent);
+
+    for (i = 0; i < n; i++) {
+      con[i].dist = depth[i];
+      points[i][2] += hz;
+      bb_mulMatVec3(tmp2, r, points[i]);
+      bb_add3(con[i].pos, tmp2, pos1);
+      bb_copy3(con[i].normal, con[0].normal);
+      bb_zero3(con[i].tangent);
+    }
+    return n;
+  }
 }
 
 inline int collide_box_box(
     float3 p1, float4 q1, float3 sz1,
     float3 p2, float4 q2, float3 sz2,
     float margin, thread ContactGeom* con) {
-  float3x3 mat1 = quat_to_mat(q1);
-  float3x3 mat2 = quat_to_mat(q2);
+  float mat1[9], mat2[9];
+  quat_to_mat_row_major(q1, mat1);
+  quat_to_mat_row_major(q2, mat2);
 
-  float3 pos21 = transpose(mat1) * (p2 - p1);
-  float3 pos12 = transpose(mat2) * (p1 - p2);
+  float pos1[3] = {p1.x, p1.y, p1.z};
+  float pos2[3] = {p2.x, p2.y, p2.z};
+  float size1[3] = {sz1.x, sz1.y, sz1.z};
+  float size2[3] = {sz2.x, sz2.y, sz2.z};
 
-  float rot[9], rotabs[9];
-  float3x3 R = transpose(mat1) * mat2;
-  // Store rot in row-major: rot[3*r + c] = R[c][r] (since R[col][row])
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 3; ++c) {
-      rot[3 * r + c] = R[c][r];
-      rotabs[3 * r + c] = abs(rot[3 * r + c]);
+  RawPreContact tmp_con[8];
+  int num = _boxbox_metal(tmp_con, pos1, mat1, size1, pos2, mat2, size2, margin);
+  if (num <= 0) return 0;
+
+  int dupe[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  float sz1_m[3] = {size1[0] + margin, size1[1] + margin, size1[2] + margin};
+  float sz2_m[3] = {size2[0] + margin, size2[1] + margin, size2[2] + margin};
+  float kRemoveRatio = 1.01f;
+
+  for (int i = 0; i < num; ++i) {
+    int out1 = bb_outsideBox(tmp_con[i].pos, pos1, mat1, sz1_m, kRemoveRatio);
+    int out2 = bb_outsideBox(tmp_con[i].pos, pos2, mat2, sz2_m, kRemoveRatio);
+    if ((out1 == 1 && out2 != -1) || (out2 == 1 && out1 != -1)) {
+      dupe[i] = -1;
     }
   }
 
-  float septol = margin + MJBOXBOX_SEPEPS * (sz1.x + sz1.y + sz1.z + sz2.x + sz2.y + sz2.z);
-  float sep_best = -1e30f;
-  float sep_face = -1e30f;
-  int code = -1;
-
-  // Face axes of box 1
-  for (int i = 0; i < 3; ++i) {
-    float radius2 = rotabs[3 * i + 0] * sz2.x + rotabs[3 * i + 1] * sz2.y + rotabs[3 * i + 2] * sz2.z;
-    float sep = abs(pos21[i]) - sz1[i] - radius2;
-    if (sep > septol) return 0;
-    if (sep > sep_best) { sep_best = sep; code = i; }
-  }
-
-  // Face axes of box 2
-  for (int j = 0; j < 3; ++j) {
-    float radius1 = rotabs[0 + j] * sz1.x + rotabs[3 + j] * sz1.y + rotabs[6 + j] * sz1.z;
-    float sep = abs(pos12[j]) - sz2[j] - radius1;
-    if (sep > septol) return 0;
-    if (sep > sep_best) { sep_best = sep; code = 3 + j; }
-  }
-  sep_face = sep_best;
-  int code_face = code;
-
-  // Edge-cross axes
-  for (int i = 0; i < 3; ++i) {
-    for (int j = 0; j < 3; ++j) {
-      int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
-      float ax1 = -rot[3 * i2 + j];
-      float ax2 = rot[3 * i1 + j];
-      float norm2 = ax1 * ax1 + ax2 * ax2;
-      if (norm2 < MJBOXBOX_PAREPS) continue;
-      float inv = rsqrt(norm2);
-      ax1 *= inv; ax2 *= inv;
-
-      float radius1 = sz1[i1] * abs(ax1) + sz1[i2] * abs(ax2);
-      int j1 = (j + 1) % 3, j2 = (j + 2) % 3;
-      float a2_1 = ax1 * rot[3 * i1 + j1] + ax2 * rot[3 * i2 + j1];
-      float a2_2 = ax1 * rot[3 * i1 + j2] + ax2 * rot[3 * i2 + j2];
-      float radius2 = sz2[j1] * abs(a2_1) + sz2[j2] * abs(a2_2);
-
-      float sep = abs(ax1 * pos21[i1] + ax2 * pos21[i2]) - radius1 - radius2;
-      if (sep > septol) return 0;
-      if (sep - MJBOXBOX_EDGEBIAS * abs(sep) > sep_best && sep > sep_face) {
-        sep_best = sep;
-        code = 6 + 3 * i + j;
+  for (int i = 0; i < num - 1; ++i) {
+    if (dupe[i] == -1) continue;
+    for (int j = i + 1; j < num; ++j) {
+      if (dupe[j] == -1) continue;
+      if (tmp_con[i].pos[0] == tmp_con[j].pos[0] &&
+          tmp_con[i].pos[1] == tmp_con[j].pos[1] &&
+          tmp_con[i].pos[2] == tmp_con[j].pos[2]) {
+        dupe[i] = -1;
+        break;
       }
     }
   }
 
-  if (code < 0) return 0;
-
-  if (code >= 6) {
-    int i = (code - 6) / 3;
-    int j = (code - 6) % 3;
-    int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
-    float3 ax = float3(0.0f);
-    ax[i1] = -rot[3 * i2 + j];
-    ax[i2] = rot[3 * i1 + j];
-    ax = normalize(ax);
-    float face_dot;
-    if (code_face < 3) {
-      face_dot = abs(ax[code_face]);
-    } else {
-      int f = code_face - 3;
-      face_dot = abs(ax[0] * rot[0 + f] + ax[1] * rot[3 + f] + ax[2] * rot[6 + f]);
-    }
-    if (face_dot > 0.99f && sep_best < sep_face + 0.05f * abs(sep_face) + MJ_MINVAL) {
-      code = code_face;
-      sep_best = sep_face;
+  int ncon = 0;
+  for (int j = 0; j < num; ++j) {
+    if (dupe[j] == 0) {
+      con[ncon].dist = tmp_con[j].dist;
+      con[ncon].pos = float3(tmp_con[j].pos[0], tmp_con[j].pos[1], tmp_con[j].pos[2]);
+      con[ncon].normal = float3(tmp_con[j].normal[0], tmp_con[j].normal[1], tmp_con[j].normal[2]);
+      con[ncon].t1 = float3(0.0f);
+      make_frame(con[ncon].normal, con[ncon].t1, con[ncon].t2);
+      ncon++;
+      if (ncon >= 8) break;
     }
   }
-
-  // Stage 2a: Edge-edge contact
-  if (code >= 6) {
-    int i = (code - 6) / 3;
-    int j = (code - 6) % 3;
-    int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
-    int j1 = (j + 1) % 3, j2 = (j + 2) % 3;
-
-    float3 axis = float3(0.0f);
-    axis[i1] = -rot[3 * i2 + j];
-    axis[i2] = rot[3 * i1 + j];
-    axis = normalize(axis);
-    if (dot(axis, pos21) < 0.0f) axis = -axis;
-
-    float a2[3] = {
-      axis[0] * rot[0 + 0] + axis[1] * rot[3 + 0] + axis[2] * rot[6 + 0],
-      axis[0] * rot[0 + 1] + axis[1] * rot[3 + 1] + axis[2] * rot[6 + 1],
-      axis[0] * rot[0 + 2] + axis[1] * rot[3 + 2] + axis[2] * rot[6 + 2],
-    };
-    int amb1 = -1, amb2 = -1;
-    if (abs(axis[i1]) < MJBOXBOX_SGNEPS) amb1 = i1;
-    else if (abs(axis[i2]) < MJBOXBOX_SGNEPS) amb1 = i2;
-    if (abs(a2[j1]) < MJBOXBOX_SGNEPS) amb2 = j1;
-    else if (abs(a2[j2]) < MJBOXBOX_SGNEPS) amb2 = j2;
-
-    float d2[3] = {rot[0 + j], rot[3 + j], rot[6 + j]};
-    float b = d2[i];
-    float denom = 1.0f - b * b;
-
-    float3 w1 = float3(0.0f), w2 = float3(0.0f);
-    float best_d2 = 1e30f;
-    for (int v1 = 0; v1 < (amb1 >= 0 ? 2 : 1); ++v1) {
-      for (int v2 = 0; v2 < (amb2 >= 0 ? 2 : 1); ++v2) {
-        float3 c1 = float3(0.0f);
-        c1[i1] = axis[i1] >= 0.0f ? sz1[i1] : -sz1[i1];
-        c1[i2] = axis[i2] >= 0.0f ? sz1[i2] : -sz1[i2];
-        if (amb1 >= 0 && v1) c1[amb1] = -c1[amb1];
-
-        float3 cc = float3(0.0f);
-        cc[j1] = a2[j1] >= 0.0f ? -sz2[j1] : sz2[j1];
-        cc[j2] = a2[j2] >= 0.0f ? -sz2[j2] : sz2[j2];
-        if (amb2 >= 0 && v2) cc[amb2] = -cc[amb2];
-
-        float3 c2 = float3(
-            rot[0] * cc[0] + rot[1] * cc[1] + rot[2] * cc[2] + pos21[0],
-            rot[3] * cc[0] + rot[4] * cc[1] + rot[5] * cc[2] + pos21[1],
-            rot[6] * cc[0] + rot[7] * cc[1] + rot[8] * cc[2] + pos21[2]
-        );
-
-        float3 e = c2 - c1;
-        float d1e = e[i];
-        float d2e = d2[0] * e[0] + d2[1] * e[1] + d2[2] * e[2];
-        float s = denom < MJ_MINVAL ? 0.0f : (d1e - b * d2e) / denom;
-        s = mju_clip(s, -sz1[i], sz1[i]);
-        float t = mju_clip(b * s - d2e, -sz2[j], sz2[j]);
-        s = mju_clip(d1e + b * t, -sz1[i], sz1[i]);
-
-        float3 p1_pt = c1; p1_pt[i] += s;
-        float3 p2_pt = c2 + float3(d2[0], d2[1], d2[2]) * t;
-        float3 gap = p2_pt - p1_pt;
-        float gap2 = dot(gap, gap);
-        if (gap2 < best_d2) {
-          best_d2 = gap2;
-          w1 = p1_pt;
-          w2 = p2_pt;
-        }
-      }
-    }
-
-    float3 gap = w2 - w1;
-    float dist = dot(gap, axis);
-    if (dist > septol) return 0;
-
-    float3 mid = 0.5f * (w1 + w2);
-    con[0].dist = dist;
-    con[0].pos = p1 + mat1 * mid;
-    con[0].normal = mat1 * axis;
-    con[0].t1 = float3(0.0f);
-    make_frame(con[0].normal, con[0].t1, con[0].t2);
-    return 1;
-  }
-
-  // Stage 2b: Face contact
-  bool ref1 = code < 3;
-  int a = ref1 ? code : code - 3;
-  float3 sizeref = ref1 ? sz1 : sz2;
-  float3 sizeinc = ref1 ? sz2 : sz1;
-  float3 posref = ref1 ? p1 : p2;
-  float3x3 matref = ref1 ? mat1 : mat2;
-  float3 posoi = ref1 ? pos21 : pos12;
-
-  float rinc[9];
-  if (ref1) {
-    for (int k = 0; k < 9; ++k) rinc[k] = rot[k];
-  } else {
-    for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 3; ++c) rinc[3 * r + c] = rot[3 * c + r];
-    }
-  }
-
-  float sgn = posoi[a] >= 0.0f ? 1.0f : -1.0f;
-  int binc = 0;
-  for (int k = 1; k < 3; ++k) {
-    if (abs(rinc[3 * a + k]) > abs(rinc[3 * a + binc])) binc = k;
-  }
-  float tinc = sgn * rinc[3 * a + binc] > 0.0f ? -1.0f : 1.0f;
-
-  int ax = (a + 1) % 3, ay = (a + 2) % 3;
-  int bu = (binc + 1) % 3, bv = (binc + 2) % 3;
-
-  float poly0[MJBOXBOX_MAXVERT][3];
-  float poly1[MJBOXBOX_MAXVERT][3];
-
-  float cx[3], du[3], dv[3];
-  for (int r = 0; r < 3; ++r) {
-    int c = (r == 0) ? ax : ((r == 1) ? ay : a);
-    cx[r] = posoi[c] + tinc * sizeinc[binc] * rinc[3 * c + binc];
-    du[r] = sizeinc[bu] * rinc[3 * c + bu];
-    dv[r] = sizeinc[bv] * rinc[3 * c + bv];
-  }
-  cx[2] = sgn * cx[2] - sizeref[a];
-  du[2] *= sgn;
-  dv[2] *= sgn;
-
-  const float corner_sign[4][2] = {{1.0f, 1.0f}, {-1.0f, 1.0f}, {-1.0f, -1.0f}, {1.0f, -1.0f}};
-  for (int k = 0; k < 4; ++k) {
-    float su = corner_sign[k][0], sv = corner_sign[k][1];
-    poly0[k][0] = cx[0] + su * du[0] + sv * dv[0];
-    poly0[k][1] = cx[1] + su * du[1] + sv * dv[1];
-    poly0[k][2] = cx[2] + su * du[2] + sv * dv[2];
-  }
-
-  int nvert = 4;
-  nvert = clipHalfPlane(nvert, poly0, poly1, 0, 1.0f, sizeref[ax]);
-  nvert = clipHalfPlane(nvert, poly1, poly0, 0, -1.0f, sizeref[ax]);
-  nvert = clipHalfPlane(nvert, poly0, poly1, 1, 1.0f, sizeref[ay]);
-  nvert = clipHalfPlane(nvert, poly1, poly0, 1, -1.0f, sizeref[ay]);
-
-  float accepted[MJBOXBOX_MAXVERT][3];
-  int naccept = 0;
-  float dupe2 = MJBOXBOX_DUPEPS * (sizeref[ax] * sizeref[ax] + sizeref[ay] * sizeref[ay]);
-  for (int k = 0; k < nvert; ++k) {
-    if (poly0[k][2] > margin) continue;
-    bool dupe = false;
-    for (int q = 0; q < naccept; ++q) {
-      float dx = accepted[q][0] - poly0[k][0];
-      float dy = accepted[q][1] - poly0[k][1];
-      if (dx * dx + dy * dy < dupe2) { dupe = true; break; }
-    }
-    if (!dupe && naccept < 8) {
-      accepted[naccept][0] = poly0[k][0];
-      accepted[naccept][1] = poly0[k][1];
-      accepted[naccept][2] = poly0[k][2];
-      naccept++;
-    }
-  }
-
-  if (naccept == 0) return 0;
-
-  float nsign = ref1 ? sgn : -sgn;
-  float3 normal = float3(
-      nsign * matref[a][0],
-      nsign * matref[a][1],
-      nsign * matref[a][2]
-  );
-
-  for (int k = 0; k < naccept; ++k) {
-    float posc[3];
-    posc[ax] = accepted[k][0];
-    posc[ay] = accepted[k][1];
-    posc[a] = sgn * (sizeref[a] + 0.5f * accepted[k][2]);
-
-    con[k].dist = accepted[k][2];
-    con[k].pos = posref + matref * float3(posc[0], posc[1], posc[2]);
-    con[k].normal = normal;
-    con[k].t1 = float3(0.0f);
-    make_frame(con[k].normal, con[k].t1, con[k].t2);
-  }
-  return naccept;
+  return ncon;
 }
 
 // Unified Pair Dispatcher
