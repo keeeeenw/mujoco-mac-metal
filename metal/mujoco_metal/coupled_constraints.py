@@ -423,13 +423,17 @@ class MetalCoupledConstraints:
     self._solve_kernel = self._library.solve_coupled_constraints
 
     d = self.descriptor
+    joint_limit_params = (
+        np.hstack([d.joint_range, d.joint_margin[:, None]]).astype(np.float32)
+        if d.njnt
+        else np.zeros((1, 3), dtype=np.float32)
+    )
     self._constants = {
         "joint_qposadr": self._tensor(d.joint_qposadr),
         "qpos0": self._tensor(d.qpos0),
         "joint_dofadr": self._tensor(d.joint_dofadr),
         "joint_limited": self._tensor(d.joint_limited),
-        "joint_range": self._tensor(d.joint_range.reshape(-1)),
-        "joint_margin": self._tensor(d.joint_margin),
+        "joint_limit_params": self._tensor(joint_limit_params.reshape(-1)),
         "joint_sol_params": self._tensor(d.joint_sol_params.reshape(-1)),
         "dof_frictionloss": self._tensor(d.dof_frictionloss),
         "dof_invweight0": self._tensor(d.dof_invweight0),
@@ -490,6 +494,7 @@ class MetalCoupledConstraints:
         "contact_frame": empty(b * nc * 12),
         "contact_jacobian": empty(b * nc * 5 * nv),
         "workspace_J": empty(b * nr * nv),
+        "workspace_debug": empty(b * (nr * nr + 4 * nr)),
         "out_force": empty(b * nv),
         "out_acc": empty(b * nv),
         "out_status": torch.zeros(b, dtype=torch.int32, device=self._device),
@@ -560,7 +565,7 @@ class MetalCoupledConstraints:
         eq_active_tensor.reshape(-1),
         self._constants["joint_qposadr"], self._constants["qpos0"],
         self._constants["joint_dofadr"], self._constants["joint_limited"],
-        self._constants["joint_range"], self._constants["joint_margin"],
+        self._constants["joint_limit_params"],
         self._constants["joint_sol_params"],
         self._constants["dof_frictionloss"], self._constants["dof_invweight0"],
         self._constants["dof_sol_params"],
@@ -571,6 +576,7 @@ class MetalCoupledConstraints:
         self._constants["solver_dims"], self._constants["solver_params"],
         w["out_force"], w["out_acc"], w["out_status"], w["out_diagnostics"],
         w["out_contact_force"], w["out_joint_force"], w["workspace_J"],
+        w["workspace_debug"],
         threads=(b,), group_size=(1,),
     )
 
@@ -585,6 +591,24 @@ class MetalCoupledConstraints:
         "status": status,
         "solver_diagnostics": diagnostics,
     }
+
+    if nr > 0:
+      w_debug = w["workspace_debug"][: b * (nr * nr + 4 * nr)].reshape(b, nr * nr + 4 * nr)
+      W = w_debug[:, : nr * nr].reshape(b, nr, nr)
+      R = w_debug[:, nr * nr : nr * nr + nr].reshape(b, nr)
+      ar = w_debug[:, nr * nr + nr : nr * nr + 2 * nr].reshape(b, nr)
+      rhs = w_debug[:, nr * nr + 2 * nr : nr * nr + 3 * nr].reshape(b, nr)
+      lam = w_debug[:, nr * nr + 3 * nr : nr * nr + 4 * nr].reshape(b, nr)
+      J = w["workspace_J"][: b * nr * nv].reshape(b, nr, nv)
+      result.update({
+          "J": J,
+          "W": W,
+          "W_regularized": W + torch.diag_embed(R),
+          "R": R,
+          "ar": ar,
+          "rhs": rhs,
+          "lambda": lam,
+      })
 
     if nc > 0:
       contact_rows = w["contact_row_data"][: b * nc * 5 * 6].reshape(b, nc, 5, 6)

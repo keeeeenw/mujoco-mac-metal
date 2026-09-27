@@ -369,6 +369,7 @@ class MetalSimulation:
       entries.extend([
           {"name": "_eq_active_default", "residency": "MPS device-resident", "lifetime": "persistent preallocated", "shape": f"({b}, {max(d.neq, 1)})", "dtype": str(self._coupled_constraints._eq_active_default.dtype).replace("torch.", "")},
           {"name": "workspace_J", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nr}, {d.nv})", "dtype": "float32"},
+          {"name": "workspace_debug", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nr * d.nr + 4 * d.nr})", "dtype": "float32"},
           {"name": "out_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nv})", "dtype": "float32"},
           {"name": "out_acc", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nv})", "dtype": "float32"},
           {"name": "out_status", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b},)", "dtype": str(self._coupled_constraints._workspace["out_status"].dtype).replace("torch.", "")},
@@ -403,6 +404,47 @@ class MetalSimulation:
     return self._sensors.run_device(
         state._qpos, state._qvel, state._time, poses
     ).clone()
+
+  def assembled_system(self, *, recompute=False):
+    """Return the coupled constraint system tensors on MPS.
+
+    If `recompute` is True or no step has been run yet, evaluates the forward
+    smooth dynamics and coupled constraint assembly at the current device state.
+    Returns dict containing 'J', 'W', 'W_regularized', 'R', 'ar', 'rhs', 'lambda',
+    'qacc', 'qfrc_constraint', 'mass_matrix', 'status'.
+    """
+    if self._coupled_constraints is None:
+      raise ValueError("assembled_system requires a coupled constraint stepping profile")
+    if not recompute and hasattr(self, "_last_coupled") and self._last_coupled is not None:
+      return self._last_coupled
+    state = self._state
+    qpos, qvel = state._qpos, state._qvel
+    dynamics = self._smooth.run_device(qpos, qvel)
+    torch = state._torch
+    rhs = torch.neg(dynamics["qfrc_bias"])
+    if self._applied_force is not None:
+      rhs.add_(self._applied_force)
+    if self._passive is not None:
+      passive, _ = self._passive.run_device(
+          qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True
+      )
+      rhs.add_(passive)
+    if self._fluid is not None:
+      rhs.add_(self._fluid.run_device(qpos, qvel, dynamics))
+    if self._tendons is not None:
+      tendon_force, _, tendon_armature = self._tendons.run_device(qpos, qvel)
+      rhs.add_(tendon_force)
+      dynamics["mass_matrix"].add_(tendon_armature)
+    if self._transmissions is not None:
+      rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
+    if self._motor is not None:
+      rhs.add_(self._motor.run_device(self._control))
+    coupled = self._coupled_constraints.run_device(
+        dynamics["poses"], dynamics["mass_matrix"], rhs, qpos, qvel
+    )
+    coupled["mass_matrix"] = dynamics["mass_matrix"]
+    self._last_coupled = coupled
+    return coupled
 
   def _prepare_force(self, qfrc_applied):
     torch = self._state._torch
@@ -531,6 +573,8 @@ class MetalSimulation:
       coupled = self._coupled_constraints.run_device(
           dynamics["poses"], dynamics["mass_matrix"], self._rhs, qpos, qvel
       )
+      coupled["mass_matrix"] = dynamics["mass_matrix"]
+      self._last_coupled = coupled
       status = self._state._torch.where(
           status == 0, coupled["status"], status
       )

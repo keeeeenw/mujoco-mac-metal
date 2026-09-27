@@ -491,6 +491,112 @@ def test_integrated_simulation_capacity_boundary_and_overflow_rejection():
   with pytest.raises(ValueError, match="total candidate constraint rows \\(97\\) exceeds capacity 96"):
     lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_nr97))
 
+  # If running in GPU mode, execute the accepted capacity boundaries on MPS
+  if os.getenv("MUJOCO_METAL_RUN_GPU") == "1":
+    _run_gpu_capacity_boundary_qualification()
+
+
+def _run_gpu_capacity_boundary_qualification():
+  """Execute accepted capacity boundaries nv=32, nc=16, nr=96 on GPU."""
+  # 1. nv=32 boundary execution on GPU
+  xml_nv32 = """<mujoco><compiler angle="radian"/><option timestep="0.002" integrator="Euler"/><worldbody>"""
+  for i in range(32):
+    xml_nv32 += f"""<body pos="{i} 0 0"><joint type="hinge" axis="0 0 1"/><geom type="sphere" size="0.1" conaffinity="0"/></body>"""
+  xml_nv32 += "</worldbody></mujoco>"
+  m32 = mujoco.MjModel.from_xml_string(xml_nv32)
+  q0_32 = np.zeros((2, 32), dtype=np.float32)
+  q0_32[0] = 0.02 * np.arange(32, dtype=np.float32)
+  q0_32[1] = -0.01 * np.arange(32, dtype=np.float32)
+  sim32 = MetalSimulation(m32, batch_size=2, qpos=q0_32, profile="integrated_euler_v1")
+  sim32.step(3)
+  st32 = sim32.state.status.cpu().numpy()
+  qp32 = sim32.state.qpos.cpu().numpy()
+  assert np.all(st32 == 0), f"nv=32 GPU step failed: {st32}"
+  assert np.all(np.isfinite(qp32)), "nv=32 outputs must be finite float32"
+  assert np.max(np.abs(qp32[0] - qp32[1])) > 0.01, "nv=32 worlds must be isolated"
+  d_cpu32 = mujoco.MjData(m32)
+  d_cpu32.qpos[:] = q0_32[0]
+  for _ in range(3):
+    mujoco.mj_step(m32, d_cpu32)
+  np.testing.assert_allclose(qp32[0], d_cpu32.qpos, atol=1e-5)
+
+  # 2. nc=16 boundary execution on GPU (16 candidate contact pairs, 8 active contacts)
+  xml_nc16 = """<mujoco><compiler angle="radian"/><option timestep="0.002" integrator="Euler" iterations="100" tolerance="1e-5"/><worldbody>
+  <geom type="plane" size="10 10 0.1"/>"""
+  for i in range(8):
+    xml_nc16 += f"""<body pos="{i} 0 0.08"><joint type="slide" axis="0 0 1"/>
+    <geom type="sphere" size="0.1" pos="0 0 0" friction="0.8 0.1 0.1" conaffinity="0"/>
+    <geom type="sphere" size="0.1" pos="0 0 0.5" friction="0.8 0.1 0.1" conaffinity="0"/>
+    </body>"""
+  xml_nc16 += "</worldbody></mujoco>"
+  m16 = mujoco.MjModel.from_xml_string(xml_nc16)
+  q0_16 = np.zeros((2, 8), dtype=np.float32)
+  q0_16[0] = -0.005 * np.ones(8, dtype=np.float32)
+  q0_16[1] = -0.010 * np.ones(8, dtype=np.float32)
+  sim16 = MetalSimulation(m16, batch_size=2, qpos=q0_16, profile="integrated_euler_v1")
+  sim16.step(1)
+  st16 = sim16.state.status.cpu().numpy()
+  qp16 = sim16.state.qpos.cpu().numpy()
+  qa16 = sim16.state.qacc.cpu().numpy()
+  assert np.all(st16 == 0), f"nc=16 GPU step failed: {st16}"
+  assert np.all(np.isfinite(qp16)) and np.all(np.isfinite(qa16)), "nc=16 outputs must be finite float32"
+  assert np.max(np.abs(qp16[0] - qp16[1])) > 0.001, "nc=16 worlds must be isolated"
+  d_cpu16 = mujoco.MjData(m16)
+  d_cpu16.qpos[:] = q0_16[0]
+  mujoco.mj_step(m16, d_cpu16)
+  np.testing.assert_allclose(qa16[0], d_cpu16.qacc, rtol=1e-3, atol=1e-2)
+
+  # 3. nr=96 boundary execution on GPU exercising row slot 95 and maximum workspace extents
+  # Note: not all 96 candidate rows can be physically active simultaneously because
+  # joints cannot simultaneously violate mutually exclusive upper and lower limits.
+  # We explicitly exercise row slot 95 (the 96th row) via active contact pair 15.
+  xml_nr96_base = """<mujoco><compiler angle="radian"/><option timestep="0.002" integrator="Euler" iterations="400" tolerance="1e-4"/><worldbody>
+  <geom type="plane" size="10 10 0.1"/>"""
+  for i in range(8):
+    xml_nr96_base += f"""<body pos="{i} 0 0.08"><joint name="j{i}" type="slide" axis="0 0 1" range="-0.6 0.5" limited="true" frictionloss="0.05"/>
+    <geom type="sphere" size="0.1" pos="0 0 0" friction="0.8 0.1 0.1" conaffinity="0"/>
+    <geom type="sphere" size="0.1" pos="0 0 0.5" friction="0.8 0.1 0.1" conaffinity="0"/>
+    </body>"""
+  xml_nr96_base += "</worldbody><equality>"
+  xml_nr96 = xml_nr96_base
+  for i in range(8):
+    xml_nr96 += f"""<joint joint1="j{i}" polycoef="0 1 0 0 0"/>"""
+  xml_nr96 += "</equality></mujoco>"
+  m96 = mujoco.MjModel.from_xml_string(xml_nr96)
+  q0_96 = np.zeros((2, 8), dtype=np.float32)
+  q0_96[0, :7] = 0.0
+  q0_96[1, :7] = 0.005
+  q0_96[0, 7] = -0.50
+  q0_96[1, 7] = -0.49
+  sim96 = MetalSimulation(m96, batch_size=2, qpos=q0_96, profile="integrated_euler_v1")
+  assembled96 = sim96.assembled_system()
+  sim96.step(1)
+  st96 = sim96.state.status.cpu().numpy()
+  qp96 = sim96.state.qpos.cpu().numpy()
+  qa96 = sim96.state.qacc.cpu().numpy()
+  assert np.all(st96 == 0), f"nr=96 GPU step failed: {st96}"
+  assert np.all(np.isfinite(qp96)) and np.all(np.isfinite(qa96)), "nr=96 outputs must be finite float32"
+  assert np.max(np.abs(qp96[0] - qp96[1])) > 0.001, "nr=96 worlds must be isolated"
+  # Exercise row slot 95 (the 96th row)
+  J96 = assembled96["J"].cpu().numpy()
+  W96 = assembled96["W"].cpu().numpy()
+  assert np.linalg.norm(J96[0, 95]) > 0, "Row slot 95 must be active in World 0"
+  assert np.linalg.norm(J96[1, 95]) > 0, "Row slot 95 must be active in World 1"
+  assert W96[0, 95, 95] > 0, "Row slot 95 diagonal Delassus must be positive"
+  # Verify against CPU reference
+  d_cpu96 = mujoco.MjData(m96)
+  d_cpu96.qpos[:] = q0_96[0]
+  mujoco.mj_step(m96, d_cpu96)
+  np.testing.assert_allclose(qa96[0], d_cpu96.qacc, rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_integrated_simulation_gpu_capacity_boundaries_execution():
+  _run_gpu_capacity_boundary_qualification()
+
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
@@ -715,20 +821,38 @@ def test_integrated_simulation_control_clipping():
   np.testing.assert_allclose(q_neg12, q_neg5, atol=1e-6)
   np.testing.assert_allclose(q_neg12, d_cpu_neg.qpos, atol=1e-5)
 
-  # 3. mjDSBL_CLAMPCTRL unclips control, producing distinct motion matching CPU
+  # 3. Same-time physical effect of mjDSBL_CLAMPCTRL:
+  # Run both clamped and unclamped simulations from identical initial states for the
+  # SAME step count (50 steps) and control sequence (ctrl=10.0, where ctrlrange is [-5, 5]).
   m_noclamp = mujoco.MjModel.from_xml_string(INTEGRATED_XML)
   m_noclamp.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CLAMPCTRL)
   sim_noclamp = MetalSimulation(m_noclamp, batch_size=1, profile="integrated_euler_v1")
   d_cpu_noclamp = mujoco.MjData(m_noclamp)
 
+  sim_clamp = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  d_cpu_clamp = mujoco.MjData(model)
+
   for _ in range(50):
     sim_noclamp.step(1, ctrl=ctrl10)
+    sim_clamp.step(1, ctrl=ctrl10)
     d_cpu_noclamp.ctrl[0] = 10.0
+    d_cpu_clamp.ctrl[0] = 10.0
     mujoco.mj_step(m_noclamp, d_cpu_noclamp)
+    mujoco.mj_step(model, d_cpu_clamp)
+
+  assert sim_noclamp.state.status[0].item() == 0, "Unclamped simulation should succeed with status 0"
+  assert sim_clamp.state.status[0].item() == 0, "Clamped simulation should succeed with status 0"
 
   q_noclamp = sim_noclamp.state.qpos[0].cpu().numpy()
+  q_clamp = sim_clamp.state.qpos[0].cpu().numpy()
+
   np.testing.assert_allclose(q_noclamp, d_cpu_noclamp.qpos, atol=1e-5)
-  assert abs(q_noclamp[0] - q10[0]) > 0.02, "Unclamped control should differ from clamped control"
+  np.testing.assert_allclose(q_clamp, d_cpu_clamp.qpos, atol=1e-5)
+
+  measured_diff = abs(float(q_noclamp[0] - q_clamp[0]))
+  # Measured physical difference at identical elapsed time t=0.1s is ~0.03632 > 0.02
+  assert measured_diff > 0.02, f"Expected same-time clipping effect > 0.02, got {measured_diff}"
+  np.testing.assert_allclose(measured_diff, 0.0363218, rtol=1e-3, atol=1e-4)
 
 
 @pytest.mark.gpu
@@ -738,34 +862,190 @@ def test_integrated_simulation_control_clipping():
 def test_integrated_simulation_assembled_system_matches_cpu():
   import torch
 
-  model = mujoco.MjModel.from_xml_string(INTEGRATED_XML)
-  q0 = np.array([[0.5, 0.0, -1.41]], dtype=np.float32)
-  v0 = np.array([[0.2, -0.1, 0.05]], dtype=np.float32)
+  # -------------------------------------------------------------------------
+  # Part A: Deterministic mixed-contact/joint fixture with nontrivial 3D
+  # rotational and tangential Jacobians (not purely axis-aligned)
+  # -------------------------------------------------------------------------
+  xml_mixed = """<mujoco>
+  <compiler angle="radian"/>
+  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <body name="body1" pos="0 0 0.5">
+      <joint name="j1" type="hinge" pos="0 0 0" axis="0.6 0.8 0" range="-0.2 0.5" margin="0.05" limited="true" frictionloss="0.1"/>
+      <geom name="geom1" type="sphere" size="0.1" pos="0 0 0.2"/>
+      <body name="body2" pos="0.2 0.1 -0.2">
+        <joint name="j2" type="hinge" pos="0 0 0" axis="0.8 -0.6 0" range="-0.3 0.5" margin="0.05" limited="true" frictionloss="0.05"/>
+        <geom name="geom2" type="sphere" size="0.18" pos="0 -0.1 -0.17" friction="0.8 0.1 0.1"/>
+      </body>
+    </body>
+  </worldbody>
+  <tendon>
+    <fixed name="t1">
+      <joint joint="j1" coef="1.5"/>
+      <joint joint="j2" coef="-0.8"/>
+    </fixed>
+  </tendon>
+  <equality>
+    <joint joint1="j1" joint2="j2" polycoef="0.02 0.5 0 0 0"/>
+  </equality>
+</mujoco>"""
 
-  sim = MetalSimulation(model, batch_size=1, qpos=q0, qvel=v0, profile="integrated_euler_v1")
-  sim.step(1)
+  m_mixed = mujoco.MjModel.from_xml_string(xml_mixed)
+  q0_mixed = np.array([[-0.18, 0.05]], dtype=np.float32)
+  v0_mixed = np.array([[0.1, -0.2]], dtype=np.float32)
 
-  d_cpu = mujoco.MjData(model)
-  d_cpu.qpos[:] = q0[0]
-  d_cpu.qvel[:] = v0[0]
-  mujoco.mj_forward(model, d_cpu)
+  sim_mixed = MetalSimulation(m_mixed, batch_size=1, qpos=q0_mixed, qvel=v0_mixed, profile="integrated_euler_v1")
+  assembled_mixed = sim_mixed.assembled_system()
 
-  # Assembled system comparisons
-  w = sim._coupled_constraints._workspace
-  metal_qacc = w["out_acc"][:model.nv].cpu().numpy()
-  metal_qfrc = w["out_force"][:model.nv].cpu().numpy()
+  d_cpu_mixed = mujoco.MjData(m_mixed)
+  d_cpu_mixed.qpos[:] = q0_mixed[0]
+  d_cpu_mixed.qvel[:] = v0_mixed[0]
+  mujoco.mj_forward(m_mixed, d_cpu_mixed)
 
-  np.testing.assert_allclose(metal_qacc, d_cpu.qacc, rtol=1e-3, atol=1e-2)
-  np.testing.assert_allclose(metal_qfrc, d_cpu.qfrc_constraint, rtol=1e-3, atol=1e-2)
+  J_gpu = assembled_mixed["J"][0].cpu().numpy()
+  W_gpu = assembled_mixed["W"][0].cpu().numpy()
+  W_reg_gpu = assembled_mixed["W_regularized"][0].cpu().numpy()
+  R_gpu = assembled_mixed["R"][0].cpu().numpy()
+  ar_gpu = assembled_mixed["ar"][0].cpu().numpy()
+  rhs_gpu = assembled_mixed["rhs"][0].cpu().numpy()
+  lam_gpu = assembled_mixed["lambda"][0].cpu().numpy()
+  M_gpu = assembled_mixed["mass_matrix"][0].cpu().numpy()
 
-  # Verify assembled contact Jacobian non-zero rows match contact normals
-  c_mask = (d_cpu.efc_type == mujoco.mjtConstraint.mjCNSTR_CONTACT_PYRAMIDAL)
-  J_contact_cpu = d_cpu.efc_J.reshape(d_cpu.nefc, model.nv)[c_mask]
-  nc = sim._coupled_constraints.descriptor.nc
-  J_contact_metal = w["contact_jacobian"][:nc * 5 * model.nv].cpu().numpy().reshape(-1, model.nv)
-  active_metal_normals = J_contact_metal[np.any(J_contact_metal != 0, axis=1)]
-  assert len(active_metal_normals) > 0
-  np.testing.assert_allclose(active_metal_normals[0], J_contact_cpu[0], atol=1e-5)
+  # 1. Effective mass comparison (including tendon armature assembled separately as J^T armature J)
+  M_cpu = np.zeros((m_mixed.nv, m_mixed.nv), dtype=np.float64)
+  mujoco.mj_fullM(m_mixed, d_cpu_mixed, M_cpu)
+  max_M_err = np.max(np.abs(M_gpu - M_cpu))
+  assert max_M_err < 1e-6, f"Effective mass mismatch: {max_M_err}"
+
+  # 2. Map active CPU rows to GPU rows:
+  # CPU row 0: equality (eq 0) -> GPU row 0
+  # CPU row 1: frictionloss DOF 0 -> GPU row 1
+  # CPU row 2: frictionloss DOF 1 -> GPU row 2
+  # CPU row 3: joint limit j1 lower -> GPU row 3 (neq + nv + 2*0 = 1 + 2 + 0 = 3)
+  # CPU rows 4..7: pyramidal contact edges between floor and geom2 (candidate pair 1) -> GPU rows 11, 12, 13, 14
+  mapped_rows = [0, 1, 2, 3, 11, 12, 13, 14]
+  J_cpu = d_cpu_mixed.efc_J.reshape(d_cpu_mixed.nefc, m_mixed.nv)
+  R_cpu = d_cpu_mixed.efc_R
+  ar_cpu = d_cpu_mixed.efc_aref
+  rhs_cpu = -d_cpu_mixed.efc_b
+
+  # Compare active Jacobian rows (nontrivial 3D rotational and tangential Jacobians)
+  max_J_err = np.max(np.abs(J_gpu[mapped_rows] - J_cpu))
+  assert max_J_err < 1e-6, f"Jacobian mismatch: {max_J_err}"
+  # Ensure contact rows have non-zero components in both DOFs (tangential & rotational coupling)
+  contact_J = J_gpu[11:15]
+  assert np.all(np.abs(contact_J[:, 0]) > 0.05), "DOF 0 contact coupling must be non-zero"
+  assert np.all(np.abs(contact_J[:, 1]) > 0.05), "DOF 1 contact coupling must be non-zero"
+
+  # Compare regularizer R
+  max_R_err = np.max(np.abs(R_gpu[mapped_rows] - R_cpu))
+  assert max_R_err < 1e-6, f"Regularizer mismatch: {max_R_err}"
+
+  # Compare acceleration reference ar and RHS
+  max_ar_err = np.max(np.abs(ar_gpu[mapped_rows] - ar_cpu))
+  max_rhs_err = np.max(np.abs(rhs_gpu[mapped_rows] - rhs_cpu))
+  assert max_ar_err < 1e-3, f"aref mismatch: {max_ar_err}"
+  assert max_rhs_err < 1e-3, f"rhs mismatch: {max_rhs_err}"
+
+  # Compare Delassus matrix W = J M^-1 J^T + R
+  W_sub = W_reg_gpu[np.ix_(mapped_rows, mapped_rows)]
+  W_expected = J_cpu @ np.linalg.inv(M_cpu) @ J_cpu.T + np.diag(R_cpu)
+  max_W_err = np.max(np.abs(W_sub - W_expected))
+  assert max_W_err < 1e-6, f"Assembled Delassus mismatch: {max_W_err}"
+
+  # Verify nonzero off-diagonal cross-coupling block W_cj between joint rows (0..3) and contact rows (4..7)
+  cross_block = W_sub[4:8, 0:4]
+  cross_norm = float(np.linalg.norm(cross_block))
+  assert cross_norm > 0.1, f"Cross-coupling block must be non-trivial, got norm {cross_norm}"
+
+  # Verify inactive rows in GPU matrices and vectors are all exactly 0
+  inactive_rows = [r for r in range(sim_mixed._coupled_constraints.descriptor.nr) if r not in mapped_rows]
+  assert len(inactive_rows) > 0
+  for r in inactive_rows:
+    assert np.all(J_gpu[r] == 0), f"Inactive J[{r}] must be 0"
+    assert R_gpu[r] == 0, f"Inactive R[{r}] must be 0"
+    assert ar_gpu[r] == 0, f"Inactive ar[{r}] must be 0"
+    assert rhs_gpu[r] == 0, f"Inactive rhs[{r}] must be 0"
+    assert np.all(W_gpu[r] == 0), f"Inactive W[{r}, :] must be 0"
+    assert np.all(W_gpu[:, r] == 0), f"Inactive W[:, {r}] must be 0"
+
+  # Step on GPU and verify step completion, status 0, and KKT complementarity
+  sim_mixed.step(1)
+  assert sim_mixed.state.status[0].item() == 0, "GPU stepping must succeed with status 0"
+  np.testing.assert_allclose(sim_mixed.state.qacc[0].cpu().numpy(), d_cpu_mixed.qacc, rtol=1e-3, atol=1e-2)
+  np.testing.assert_allclose(sim_mixed._last_coupled["qfrc_constraint"][0].cpu().numpy(), d_cpu_mixed.qfrc_constraint, rtol=1e-3, atol=1e-2)
+
+  # Independent KKT complementarity and projected gradient residual check evaluated on host CPU from device outputs:
+  lam_sub = lam_gpu[mapped_rows]
+  grad = W_sub @ lam_sub - rhs_cpu
+  lo = np.array([-np.inf, -0.1, -0.05, 0.0, 0.0, 0.0, 0.0, 0.0])
+  hi = np.array([np.inf, 0.1, 0.05, np.inf, np.inf, np.inf, np.inf, np.inf])
+  diag_W = np.diag(W_sub)
+  proj = np.clip(lam_sub - grad / diag_W, lo, hi)
+  row_scale = np.maximum(1.0, np.abs(rhs_cpu) + np.abs(W_sub @ lam_sub))
+  kkt_res = np.max(np.abs(proj - lam_sub) * diag_W / row_scale)
+  assert kkt_res <= 1e-4, f"KKT projected residual exceeds tolerance: {kkt_res}"
+
+  # -------------------------------------------------------------------------
+  # Part B: Axis-aligned fixture (INTEGRATED_XML)
+  # -------------------------------------------------------------------------
+  model_aa = mujoco.MjModel.from_xml_string(INTEGRATED_XML)
+  q0_aa = np.array([[0.5, 0.0, -1.41]], dtype=np.float32)
+  v0_aa = np.array([[0.2, -0.1, 0.05]], dtype=np.float32)
+
+  sim_aa = MetalSimulation(model_aa, batch_size=1, qpos=q0_aa, qvel=v0_aa, profile="integrated_euler_v1")
+  assembled_aa = sim_aa.assembled_system()
+
+  d_cpu_aa = mujoco.MjData(model_aa)
+  d_cpu_aa.qpos[:] = q0_aa[0]
+  d_cpu_aa.qvel[:] = v0_aa[0]
+  mujoco.mj_forward(model_aa, d_cpu_aa)
+
+  J_aa_gpu = assembled_aa["J"][0].cpu().numpy()
+  W_aa_gpu = assembled_aa["W"][0].cpu().numpy()
+  W_aa_reg = assembled_aa["W_regularized"][0].cpu().numpy()
+  R_aa_gpu = assembled_aa["R"][0].cpu().numpy()
+  ar_aa_gpu = assembled_aa["ar"][0].cpu().numpy()
+  rhs_aa_gpu = assembled_aa["rhs"][0].cpu().numpy()
+  M_aa_gpu = assembled_aa["mass_matrix"][0].cpu().numpy()
+
+  M_aa_cpu = np.zeros((model_aa.nv, model_aa.nv), dtype=np.float64)
+  mujoco.mj_fullM(model_aa, d_cpu_aa, M_aa_cpu)
+  np.testing.assert_allclose(M_aa_gpu, M_aa_cpu, atol=1e-6)
+
+  # Map active CPU rows for axis-aligned model:
+  # CPU row 0: equality -> GPU row 0
+  # CPU rows 1, 2: frictionloss -> GPU rows 1, 2
+  # CPU rows 3..6: contact pair 2 (floor vs sphere, base_contact=10 + 4*2 = 18) -> GPU rows 18..21
+  mapped_aa = [0, 1, 2, 18, 19, 20, 21]
+  J_aa_cpu = d_cpu_aa.efc_J.reshape(d_cpu_aa.nefc, model_aa.nv)
+  R_aa_cpu = d_cpu_aa.efc_R
+  ar_aa_cpu = d_cpu_aa.efc_aref
+  rhs_aa_cpu = -d_cpu_aa.efc_b
+
+  np.testing.assert_allclose(J_aa_gpu[mapped_aa], J_aa_cpu, atol=1e-6)
+  np.testing.assert_allclose(R_aa_gpu[mapped_aa], R_aa_cpu, atol=1e-6)
+  np.testing.assert_allclose(ar_aa_gpu[mapped_aa], ar_aa_cpu, atol=1e-3)
+  np.testing.assert_allclose(rhs_aa_gpu[mapped_aa], rhs_aa_cpu, atol=1e-3)
+
+  W_aa_sub = W_aa_reg[np.ix_(mapped_aa, mapped_aa)]
+  W_aa_expected = J_aa_cpu @ np.linalg.inv(M_aa_cpu) @ J_aa_cpu.T + np.diag(R_aa_cpu)
+  np.testing.assert_allclose(W_aa_sub, W_aa_expected, atol=1e-6)
+
+  inactive_aa = [r for r in range(sim_aa._coupled_constraints.descriptor.nr) if r not in mapped_aa]
+  for r in inactive_aa:
+    assert np.all(J_aa_gpu[r] == 0)
+    assert R_aa_gpu[r] == 0
+    assert ar_aa_gpu[r] == 0
+    assert rhs_aa_gpu[r] == 0
+    assert np.all(W_aa_gpu[r] == 0)
+    assert np.all(W_aa_gpu[:, r] == 0)
+
+  sim_aa.step(1)
+  assert sim_aa.state.status[0].item() == 0
+  np.testing.assert_allclose(sim_aa.state.qacc[0].cpu().numpy(), d_cpu_aa.qacc, rtol=1e-3, atol=1e-2)
+  np.testing.assert_allclose(sim_aa._last_coupled["qfrc_constraint"][0].cpu().numpy(), d_cpu_aa.qfrc_constraint, rtol=1e-3, atol=1e-2)
 
 
 @pytest.mark.gpu

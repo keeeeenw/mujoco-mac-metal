@@ -331,28 +331,28 @@ kernel void solve_coupled_constraints(
     device const float* qpos0 [[buffer(6)]],
     device const int* joint_dadr [[buffer(7)]],
     device const uchar* joint_limited [[buffer(8)]],
-    device const float* joint_range [[buffer(9)]],
-    device const float* joint_margin [[buffer(10)]],
-    device const float* joint_sol_params [[buffer(11)]],
-    device const float* frictionloss [[buffer(12)]],
-    device const float* invweight [[buffer(13)]],
-    device const float* dof_sol_params [[buffer(14)]],
-    device const int* eq_obj [[buffer(15)]],
-    device const float* eq_data [[buffer(16)]],
-    device const float* eq_sol_params [[buffer(17)]],
-    device const float* contact_jacobian [[buffer(18)]],
-    device const float* contact_row_data [[buffer(19)]],
-    device const float* contact_friction [[buffer(20)]],
-    device const int* contact_condim [[buffer(21)]],
-    constant int* dims [[buffer(22)]],
-    constant float* params [[buffer(23)]],
-    device float* out_force [[buffer(24)]],
-    device float* out_acc [[buffer(25)]],
-    device int* out_status [[buffer(26)]],
-    device float* out_diagnostics [[buffer(27)]],
-    device float* out_contact_force [[buffer(28)]],
-    device float* out_joint_force [[buffer(29)]],
-    device float* workspace_J [[buffer(30)]],
+    device const float* joint_limit_params [[buffer(9)]],
+    device const float* joint_sol_params [[buffer(10)]],
+    device const float* frictionloss [[buffer(11)]],
+    device const float* invweight [[buffer(12)]],
+    device const float* dof_sol_params [[buffer(13)]],
+    device const int* eq_obj [[buffer(14)]],
+    device const float* eq_data [[buffer(15)]],
+    device const float* eq_sol_params [[buffer(16)]],
+    device const float* contact_jacobian [[buffer(17)]],
+    device const float* contact_row_data [[buffer(18)]],
+    device const float* contact_friction [[buffer(19)]],
+    device const int* contact_condim [[buffer(20)]],
+    constant int* dims [[buffer(21)]],
+    constant float* params [[buffer(22)]],
+    device float* out_force [[buffer(23)]],
+    device float* out_acc [[buffer(24)]],
+    device int* out_status [[buffer(25)]],
+    device float* out_diagnostics [[buffer(26)]],
+    device float* out_contact_force [[buffer(27)]],
+    device float* out_joint_force [[buffer(28)]],
+    device float* workspace_J [[buffer(29)]],
+    device float* workspace_debug [[buffer(30)]],
     uint world [[thread_position_in_grid]]) {
   int nq = dims[0];
   int nv = dims[1];
@@ -373,6 +373,10 @@ kernel void solve_coupled_constraints(
   out_diagnostics[world * 2] = 0.0f;
   out_diagnostics[world * 2 + 1] = 0.0f;
   for (int i = 0; i < nv; ++i) { out_force[qb + i] = 0.0f; out_acc[qb + i] = 0.0f; }
+  if (workspace_debug && nr > 0) {
+    device float* dbg = workspace_debug + world * (nr * nr + 4 * nr);
+    for (int i = 0; i < nr * nr + 4 * nr; ++i) dbg[i] = 0.0f;
+  }
   if (nv == 0) return;
   if (nv > 32 || nr > 96) { out_status[world] = 2; return; }
 
@@ -385,8 +389,9 @@ kernel void solve_coupled_constraints(
   thread float R[96], ar[96], lo[96], hi[96], lam[96], rhs[96];
   thread bool enabled[96];
   thread float y[32], x[32];
+  for (int i = 0; i < nr * nr; ++i) W[i] = 0.0f;
   for (int i = 0; i < nr; ++i) {
-    R[i] = 1.0f; ar[i] = 0.0f; lo[i] = 0.0f; hi[i] = 0.0f; lam[i] = 0.0f; enabled[i] = false;
+    R[i] = 0.0f; ar[i] = 0.0f; lo[i] = 0.0f; hi[i] = 0.0f; lam[i] = 0.0f; enabled[i] = false;
   }
 
   int base_contact = neq + nv + 2 * nj;
@@ -447,10 +452,10 @@ kernel void solve_coupled_constraints(
       if (joint_limited[j] == 0) continue;
       int d = joint_dadr[j];
       int q = joint_qadr[j];
-      float margin = joint_margin[j];
+      float margin = joint_limit_params[j * 3 + 2];
       // Lower limit
       int row0 = neq + nv + 2 * j;
-      float dist0 = qpos[pb + q] - joint_range[j * 2 + 0];
+      float dist0 = qpos[pb + q] - joint_limit_params[j * 3 + 0];
       if ((flags & 8) == 0 && dist0 < margin) {
         J_world[row0 * nv + d] = 1.0f;
         reference_params(joint_sol_params + j * 7, joint_sol_params + j * 7 + 2, 0, dist0, margin, qvel[qb + d], invweight[d], false, params[0], refsafe, R[row0], ar[row0]);
@@ -460,7 +465,7 @@ kernel void solve_coupled_constraints(
       }
       // Upper limit
       int row1 = neq + nv + 2 * j + 1;
-      float dist1 = joint_range[j * 2 + 1] - qpos[pb + q];
+      float dist1 = joint_limit_params[j * 3 + 1] - qpos[pb + q];
       if ((flags & 8) == 0 && dist1 < margin) {
         J_world[row1 * nv + d] = -1.0f;
         reference_params(joint_sol_params + j * 7, joint_sol_params + j * 7 + 2, 0, dist1, margin, -qvel[qb + d], invweight[d], false, params[0], refsafe, R[row1], ar[row1]);
@@ -686,6 +691,20 @@ kernel void solve_coupled_constraints(
         fn += v;
       }
       out_contact_force[ofb] = fn;
+    }
+  }
+
+  // 13. Write debug matrices and vectors if workspace_debug is provided
+  if (workspace_debug && nr > 0) {
+    device float* dbg = workspace_debug + world * (nr * nr + 4 * nr);
+    for (int a = 0; a < nr; ++a) {
+      for (int b = 0; b < nr; ++b) {
+        dbg[a * nr + b] = W[a * nr + b];
+      }
+      dbg[nr * nr + a] = R[a];
+      dbg[nr * nr + nr + a] = ar[a];
+      dbg[nr * nr + 2 * nr + a] = rhs[a];
+      dbg[nr * nr + 3 * nr + a] = enabled[a] ? lam[a] : 0.0f;
     }
   }
 }
