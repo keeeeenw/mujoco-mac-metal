@@ -7,7 +7,6 @@ import os
 import mujoco
 import numpy as np
 import pytest
-import torch
 
 from mujoco_metal.coupled_constraints import (
     CoupledConstraintDescriptor,
@@ -103,9 +102,6 @@ def test_coupled_oracle_matches_mujoco():
 
 def test_decoupled_vs_coupled_divergence():
   """Demonstrates that solving decoupled produces substantial error vs coupled solve."""
-  from mujoco_metal.joint_constraints import JointConstraintProgram
-  from mujoco_metal.contact import MetalContact
-
   model = mujoco.MjModel.from_xml_string(COUPLED_XML)
   d_cpu = mujoco.MjData(model)
   d_cpu.qpos[model.jnt_qposadr[model.joint("ball_z").id]] = -0.25
@@ -114,19 +110,48 @@ def test_decoupled_vs_coupled_divergence():
   # Coupled reference acceleration
   coupled_acc = d_cpu.qacc.copy()
 
-  # Decoupled sequence: contacts first, then joint constraints
-  desc = load_model(model)
-  mass = np.empty((model.nv, model.nv), dtype=np.float64)
-  mujoco.mj_fullM(model, d_cpu, mass)
-  mass_t = torch.tensor(mass.reshape(1, model.nv, model.nv), dtype=torch.float32)
-  qfrc_smooth = torch.tensor((d_cpu.qfrc_applied + d_cpu.qfrc_passive - d_cpu.qfrc_bias).reshape(1, model.nv), dtype=torch.float32)
-  free_acc = torch.tensor(np.linalg.solve(mass, qfrc_smooth[0].numpy()).reshape(1, model.nv), dtype=torch.float32)
+  # Decoupled sequence:
+  # Step 1: Solve contacts independently (disable equality, limits, frictionloss)
+  m_contact = mujoco.MjModel.from_xml_string(COUPLED_XML)
+  m_contact.opt.disableflags |= (
+      mujoco.mjtDisableBit.mjDSBL_EQUALITY
+      | mujoco.mjtDisableBit.mjDSBL_LIMIT
+      | mujoco.mjtDisableBit.mjDSBL_FRICTIONLOSS
+  )
+  d_contact = mujoco.MjData(m_contact)
+  d_contact.qpos[:] = d_cpu.qpos
+  d_contact.qvel[:] = d_cpu.qvel
+  mujoco.mj_forward(m_contact, d_contact)
+  f_contact = d_contact.qfrc_constraint.copy()
 
-  # Approximate decoupled error
-  # By solving constraints sequentially with independent Delassus blocks, coupling is neglected
-  # Verify coupled vs decoupled solve difference is non-trivial (> 5% relative difference)
-  rel_error = 0.1569  # Measured 15.69% relative error
-  assert rel_error > 0.05
+  # Step 2: Joint constraints solve with f_contact injected as external force
+  m_joint = mujoco.MjModel.from_xml_string(COUPLED_XML)
+  m_joint.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+  d_joint = mujoco.MjData(m_joint)
+  d_joint.qpos[:] = d_cpu.qpos
+  d_joint.qvel[:] = d_cpu.qvel
+  d_joint.qfrc_applied[:] = f_contact
+  mujoco.mj_forward(m_joint, d_joint)
+  decoupled_acc = d_joint.qacc.copy()
+
+  # Verify Delassus cross-coupling block norm is substantial
+  M = np.zeros((model.nv, model.nv), dtype=np.float64)
+  mujoco.mj_fullM(model, d_cpu, M)
+  Minv = np.linalg.inv(M)
+  J = d_cpu.efc_J.reshape(d_cpu.nefc, model.nv)
+  c_mask = (d_cpu.efc_type == mujoco.mjtConstraint.mjCNSTR_CONTACT_PYRAMIDAL) | (
+      d_cpu.efc_type == mujoco.mjtConstraint.mjCNSTR_CONTACT_FRICTIONLESS
+  )
+  J_c = J[c_mask]
+  J_j = J[~c_mask]
+  W_cj = J_c @ Minv @ J_j.T
+  cross_norm = float(np.linalg.norm(W_cj))
+  assert cross_norm > 5.0, f"Expected strong Delassus cross-term coupling, got {cross_norm}"
+
+  # Calculate relative acceleration difference
+  rel_error = float(np.linalg.norm(decoupled_acc - coupled_acc) / np.linalg.norm(coupled_acc))
+  assert rel_error > 0.10, f"Expected decoupled relative error > 10%, got {rel_error * 100:.2f}%"
+  assert np.isclose(rel_error, 0.15688, atol=1e-3), f"Expected ~15.69% relative error, got {rel_error}"
 
 
 @pytest.mark.gpu
@@ -134,6 +159,8 @@ def test_decoupled_vs_coupled_divergence():
     os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
 )
 def test_metal_coupled_constraints_matches_cpu():
+  import torch
+
   model = mujoco.MjModel.from_xml_string(COUPLED_XML)
   batch = 2
   qpos = np.array([[0.0, 0.0, -0.25], [0.05, 0.075, -0.23]], dtype=np.float32)
@@ -164,6 +191,8 @@ def test_metal_coupled_constraints_matches_cpu():
     os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
 )
 def test_metal_coupled_constraints_zero_contact():
+  import torch
+
   xml = COUPLED_XML.replace('type="sphere" size="0.1"', 'type="sphere" size="0.01"').replace('pos="0.5 0 1.5"', 'pos="10 10 10"')
   model = mujoco.MjModel.from_xml_string(xml)
   coupled = MetalCoupledConstraints(model, batch_size=1)
@@ -174,3 +203,36 @@ def test_metal_coupled_constraints_zero_contact():
   dyn = smooth.run_device(qpos, qvel)
   res = coupled.run_device(dyn["poses"], dyn["mass_matrix"], -dyn["qfrc_bias"], qpos, qvel)
   assert res["status"].item() == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_hot_loop_device_resident_invariants():
+  """Verifies that running coupled constraints in a hot loop preserves device resident state."""
+  import torch
+
+  model = mujoco.MjModel.from_xml_string(COUPLED_XML)
+  batch = 2
+  qpos = torch.zeros((batch, model.nq), device="mps", dtype=torch.float32)
+  qvel = torch.zeros((batch, model.nv), device="mps", dtype=torch.float32)
+
+  stage = MetalCoupledConstraints(model, batch_size=batch)
+  desc = load_model(model)
+  smooth = MetalSmoothDynamics(desc, batch_size=batch)
+
+  # Check preallocated default equality state on device
+  assert hasattr(stage, "_eq_active_default")
+  assert stage._eq_active_default.device.type == "mps"
+  assert stage._eq_active_default.dtype == torch.int32
+  assert stage._eq_active_default.shape == (batch, max(1, stage.descriptor.neq))
+
+  dyn = smooth.run_device(qpos, qvel)
+
+  for _ in range(5):
+    res = stage.run_device(
+        dyn["poses"], dyn["mass_matrix"], -dyn["qfrc_bias"], qpos, qvel
+    )
+    assert res["status"].device.type == "mps"
+    assert res["qacc"].device.type == "mps"

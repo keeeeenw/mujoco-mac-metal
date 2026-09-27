@@ -18,6 +18,7 @@ kernel void fixed_tendon_dynamics(
     device float* qfrc [[buffer(11)]],
     device float* damping_matrix [[buffer(12)]],
     device float* armature_matrix [[buffer(13)]],
+    device const float* ancestor_mask [[buffer(14)]],
     uint world [[thread_position_in_grid]]) {
   int nq=dims[0], nv=dims[1], ntendon=dims[2], batch=dims[3];
   int spring_disabled=dims[4], damper_disabled=dims[5];
@@ -68,7 +69,7 @@ kernel void fixed_tendon_dynamics(
         float jj=moment_map[t*nv+j];
         uint index=mbase+uint(i*nv+j);
         damping_matrix[index]+=damper_tangent*ji*jj;
-        armature_matrix[index]+=armature[t]*ji*jj;
+        armature_matrix[index]+=armature[t]*ji*jj*ancestor_mask[i*nv+j];
       }
     }
   }

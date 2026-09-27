@@ -213,11 +213,41 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
     raise ValueError(f"total candidate constraint rows ({nr}) exceeds capacity {_MAX_ROWS}")
 
   # Assemble packed joint parameters
-  joint_sol_params = np.hstack([model.jnt_solref.reshape(model.njnt, 2), model.jnt_solimp.reshape(model.njnt, 5)]).astype(np.float32)
-  dof_sol_params = np.hstack([model.dof_solref.reshape(model.nv, 2), model.dof_solimp.reshape(model.nv, 5)]).astype(np.float32)
-  eq_sol_params = np.hstack([model.eq_solref.reshape(model.neq, 2), model.eq_solimp.reshape(model.neq, 5)]).astype(np.float32) if model.neq else np.zeros((1, 7), dtype=np.float32)
-  eq_obj = np.vstack([model.eq_obj1id, model.eq_obj2id]).T.astype(np.int32) if model.neq else np.zeros((1, 2), dtype=np.int32)
-  eq_data = np.asarray(model.eq_data).reshape(max(model.neq, 1), 11).astype(np.float32)
+  joint_sol_params = (
+      np.hstack([model.jnt_solref.reshape(model.njnt, 2), model.jnt_solimp.reshape(model.njnt, 5)]).astype(np.float32)
+      if model.njnt
+      else np.zeros((1, 7), dtype=np.float32)
+  )
+  dof_sol_params = (
+      np.hstack([model.dof_solref.reshape(model.nv, 2), model.dof_solimp.reshape(model.nv, 5)]).astype(np.float32)
+      if model.nv
+      else np.zeros((1, 7), dtype=np.float32)
+  )
+  eq_sol_params = (
+      np.hstack([model.eq_solref.reshape(model.neq, 2), model.eq_solimp.reshape(model.neq, 5)]).astype(np.float32)
+      if model.neq
+      else np.zeros((1, 7), dtype=np.float32)
+  )
+  eq_obj = (
+      np.vstack([model.eq_obj1id, model.eq_obj2id]).T.astype(np.int32)
+      if model.neq
+      else np.zeros((1, 2), dtype=np.int32)
+  )
+  eq_data = (
+      np.asarray(model.eq_data).reshape(model.neq, 11).astype(np.float32)
+      if model.neq
+      else np.zeros((1, 11), dtype=np.float32)
+  )
+  eq_active0 = (
+      model.eq_active0.astype(np.uint8)
+      if model.neq
+      else np.zeros(1, dtype=np.uint8)
+  )
+  joint_range = (
+      model.jnt_range.reshape(model.njnt, 2).astype(np.float32)
+      if model.njnt
+      else np.zeros((1, 2), dtype=np.float32)
+  )
 
   # Assemble contact arrays
   if pairs:
@@ -252,7 +282,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       qpos0=_frozen(model.qpos0, np.float32),
       joint_dofadr=_frozen(model.jnt_dofadr, np.int32),
       joint_limited=_frozen(model.jnt_limited, np.uint8),
-      joint_range=_frozen(model.jnt_range.reshape(model.njnt, 2), np.float32),
+      joint_range=_frozen(joint_range, np.float32),
       joint_margin=_frozen(model.jnt_margin, np.float32),
       joint_sol_params=_frozen(joint_sol_params, np.float32),
       dof_frictionloss=_frozen(model.dof_frictionloss, np.float32),
@@ -261,7 +291,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       eq_obj=_frozen(eq_obj, np.int32),
       eq_data=_frozen(eq_data, np.float32),
       eq_sol_params=_frozen(eq_sol_params, np.float32),
-      eq_active0=_frozen(model.eq_active0, np.uint8),
+      eq_active0=_frozen(eq_active0, np.uint8),
       geom1=_frozen(g1, np.int32),
       geom2=_frozen(g2, np.int32),
       radius1=_frozen(r1, np.float32),
@@ -424,6 +454,11 @@ class MetalCoupledConstraints:
         "out_contact_force": empty(b * nc * 5),
         "out_joint_force": empty(b * max(d.nr_joint, 1)),
     }
+    if d.neq > 0:
+      init_eq = np.broadcast_to(d.eq_active0.astype(np.int32), (b, d.neq)).copy()
+    else:
+      init_eq = np.zeros((b, 1), dtype=np.int32)
+    self._eq_active_default = torch.as_tensor(init_eq, dtype=torch.int32, device=self._device)
     self._constants["c_dims"][2] = b
     self._constants["solver_dims"][5] = b
     return self._workspace
@@ -440,11 +475,22 @@ class MetalCoupledConstraints:
     b, nv, nc, nr = self.batch_size, d.nv, d.nc, d.nr
 
     if eq_active is None:
-      eq_active_tensor = self._tensor(
-          np.broadcast_to(d.eq_active0.astype(np.int32), (b, max(d.neq, 1)))
-      )
+      eq_active_tensor = self._eq_active_default
     else:
-      eq_active_tensor = eq_active.to(dtype=torch.int32, device=self._device)
+      if not isinstance(eq_active, torch.Tensor):
+        raise TypeError("eq_active must be a torch.Tensor")
+      expected_shape = (b, d.neq) if d.neq > 0 else (b, 1)
+      if eq_active.shape != expected_shape:
+        raise ValueError(
+            f"eq_active must have shape {expected_shape}, got {eq_active.shape}"
+        )
+      if eq_active.dtype != torch.int32:
+        raise TypeError("eq_active must have dtype torch.int32")
+      if eq_active.device.type != "mps":
+        raise ValueError("eq_active must be on MPS device")
+      if not eq_active.is_contiguous():
+        raise ValueError("eq_active must be contiguous")
+      eq_active_tensor = eq_active
 
     # 1. Contact normal kernel (if candidate contact pairs exist)
     if nc > 0:

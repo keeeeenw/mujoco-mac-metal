@@ -7,7 +7,6 @@ import os
 import mujoco
 import numpy as np
 import pytest
-import torch
 
 from mujoco_metal.simulation import MetalSimulation
 from mujoco_metal.stepping import validate_stepping_profile
@@ -133,9 +132,9 @@ def test_integrated_simulation_trajectory_matches_cpu():
       s_err = np.max(np.abs(gpu_sensors[b] - d_check.sensordata))
       max_sensor_err = max(max_sensor_err, s_err)
 
-  assert max_pos_err < 0.02, f"Position error {max_pos_err} exceeded 0.02"
-  assert max_vel_err < 0.3, f"Velocity error {max_vel_err} exceeded 0.3"
-  assert max_sensor_err < 0.1, f"Sensor error {max_sensor_err} exceeded 0.1"
+  assert max_pos_err < 1e-5, f"Position error {max_pos_err} exceeded 1e-5"
+  assert max_vel_err < 1e-4, f"Velocity error {max_vel_err} exceeded 1e-4"
+  assert max_sensor_err < 1e-4, f"Sensor error {max_sensor_err} exceeded 1e-4"
 
 
 @pytest.mark.gpu
@@ -143,6 +142,8 @@ def test_integrated_simulation_trajectory_matches_cpu():
     os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
 )
 def test_integrated_simulation_snapshot_and_reset():
+  import torch
+
   model = mujoco.MjModel.from_xml_string(INTEGRATED_XML)
   batch = 2
   q0 = np.array([[0.0, 0.0, -0.25], [0.05, 0.06, -0.2]], dtype=np.float32)
@@ -175,6 +176,8 @@ def test_integrated_simulation_snapshot_and_reset():
     os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
 )
 def test_integrated_simulation_sticky_failure_isolation():
+  import torch
+
   model = mujoco.MjModel.from_xml_string(INTEGRATED_XML)
   batch = 2
   sim = MetalSimulation(model, batch_size=batch, profile="integrated_euler_v1")
@@ -197,3 +200,127 @@ def test_integrated_simulation_sticky_failure_isolation():
   assert not torch.allclose(sim.state.qpos[0], qpos0_before)
   assert torch.allclose(sim.state.qpos[1], qpos1_before)
   assert sim.state.status[1] != 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_zero_equality_model_gpu():
+  xml = """<mujoco model="zero_equality">
+    <compiler angle="radian"/>
+    <option timestep="0.002" integrator="Euler"/>
+    <worldbody>
+      <geom name="floor" type="plane" size="5 5 0.1"/>
+      <body name="ball" pos="0 0 1">
+        <joint name="j" type="slide" axis="0 0 1"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+      </body>
+    </worldbody>
+  </mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  assert model.neq == 0
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  d_cpu = [mujoco.MjData(model) for _ in range(2)]
+
+  for _ in range(20):
+    sim.step(1)
+    for b in range(2):
+      mujoco.mj_step(model, d_cpu[b])
+
+  for b in range(2):
+    np.testing.assert_allclose(sim.state.qpos[b].cpu().numpy(), d_cpu[b].qpos, atol=1e-5)
+    np.testing.assert_allclose(sim.state.qvel[b].cpu().numpy(), d_cpu[b].qvel, atol=1e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_zero_contact_model_gpu():
+  xml = """<mujoco model="zero_contact">
+    <compiler angle="radian"/>
+    <option timestep="0.002" integrator="Euler"/>
+    <worldbody>
+      <body name="b1" pos="0 0 1">
+        <joint name="j1" type="hinge" axis="0 1 0"/>
+        <geom type="sphere" size="0.01" mass="1" contype="0" conaffinity="0"/>
+      </body>
+      <body name="b2" pos="0 1 1">
+        <joint name="j2" type="hinge" axis="0 1 0"/>
+        <geom type="sphere" size="0.01" mass="1" contype="0" conaffinity="0"/>
+      </body>
+    </worldbody>
+    <equality>
+      <joint joint1="j2" joint2="j1" polycoef="0 1 0 0 0"/>
+    </equality>
+  </mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  d_cpu = [mujoco.MjData(model) for _ in range(2)]
+
+  for _ in range(20):
+    sim.step(1)
+    for b in range(2):
+      mujoco.mj_step(model, d_cpu[b])
+
+  for b in range(2):
+    np.testing.assert_allclose(sim.state.qpos[b].cpu().numpy(), d_cpu[b].qpos, atol=1e-5)
+    np.testing.assert_allclose(sim.state.qvel[b].cpu().numpy(), d_cpu[b].qvel, atol=1e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_empty_fixed_world_gpu():
+  xml = """<mujoco model="empty_world">
+    <compiler angle="radian"/>
+    <option timestep="0.002" integrator="Euler"/>
+    <worldbody>
+      <geom type="sphere" size="0.1"/>
+    </worldbody>
+  </mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  assert model.nv == 0
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  sim.step(5)
+  assert sim.state.qpos.shape == (2, 0)
+  assert sim.state.qvel.shape == (2, 0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+)
+def test_minimal_actuated_model_gpu():
+  xml = """<mujoco model="minimal_actuated">
+    <compiler angle="radian"/>
+    <option timestep="0.002" integrator="Euler"/>
+    <worldbody>
+      <body name="arm" pos="0 0 1">
+        <joint name="j" type="hinge" axis="0 1 0"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+      </body>
+    </worldbody>
+    <actuator>
+      <motor joint="j"/>
+    </actuator>
+    <sensor>
+      <jointpos joint="j"/>
+    </sensor>
+  </mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  d_cpu = [mujoco.MjData(model) for _ in range(2)]
+
+  ctrl = np.array([[1.0], [-0.5]], dtype=np.float32)
+  for _ in range(20):
+    sim.step(1, ctrl=ctrl)
+    for b in range(2):
+      d_cpu[b].ctrl[0] = ctrl[b, 0]
+      mujoco.mj_step(model, d_cpu[b])
+
+  for b in range(2):
+    np.testing.assert_allclose(sim.state.qpos[b].cpu().numpy(), d_cpu[b].qpos, atol=1e-5)
+    np.testing.assert_allclose(sim.state.qvel[b].cpu().numpy(), d_cpu[b].qvel, atol=1e-4)

@@ -655,7 +655,7 @@ kernel void solve_coupled_constraints(
     }
   }
 
-  if (!converged && max_res > tol) out_status[world] = (max_res > 1e-3f ? 3 : 1);
+  if (!converged && max_res > max(tol, 1e-3f)) out_status[world] = 3;
 
   // 10. Reconstruct forces and acceleration
   for (int row = 0; row < nr; ++row) if (enabled[row]) {

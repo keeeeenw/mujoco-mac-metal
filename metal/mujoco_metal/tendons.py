@@ -79,6 +79,14 @@ class FixedTendonModel:
       raise ValueError("tendon armature and damping must be nonnegative")
     self.disable_spring = bool(int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
     self.disable_damper = bool(int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
+    ancestor_mask = np.zeros((self.nv, self.nv), dtype=np.float32)
+    for dof in range(self.nv):
+      anc = dof
+      while anc >= 0:
+        ancestor_mask[dof, anc] = 1.0
+        ancestor_mask[anc, dof] = 1.0
+        anc = int(model.dof_parentid[anc])
+    self.ancestor_mask = _frozen(ancestor_mask)
 
   def _state(self, qpos, qvel):
     qpos, qvel = np.asarray(qpos, dtype=np.float64), np.asarray(qvel, dtype=np.float64)
@@ -137,6 +145,7 @@ class FixedTendonModel:
       force += (spring_force + damper_force)[:, None] * jac[None, :]
       damping_matrix += damper_tangent[:, None, None] * np.outer(jac, jac)[None, :, :]
       armature_matrix += self.armature[tendon] * np.outer(jac, jac)
+    armature_matrix *= self.ancestor_mask
     return force, damping_matrix, armature_matrix
 
 
@@ -177,6 +186,7 @@ class MetalFixedTendonDynamics:
     self._dampingpoly = tensor(meta.dampingpoly.reshape(-1))
     self._spring_range = tensor(meta.spring_range.reshape(-1))
     self._armature = tensor(meta.armature)
+    self._ancestor_mask = tensor(meta.ancestor_mask.reshape(-1))
     self._dims = tensor([meta.nq, meta.nv, meta.ntendon, batch_size, int(meta.disable_spring), int(meta.disable_damper)], torch.int32)
     self._qfrc = torch.empty((batch_size, meta.nv), dtype=torch.float32, device=self._device)
     self._damping_matrix = torch.empty((batch_size, meta.nv, meta.nv), dtype=torch.float32, device=self._device)
@@ -201,6 +211,7 @@ class MetalFixedTendonDynamics:
         self._qfrc.reshape(-1) if meta.nv else self._dummy,
         self._damping_matrix.reshape(-1) if meta.nv else self._dummy,
         self._armature_matrix.reshape(-1) if meta.nv else self._dummy,
+        self._ancestor_mask,
         threads=(self.batch_size,), group_size=(1,),
     )
     return self._qfrc, self._damping_matrix, self._armature_matrix
