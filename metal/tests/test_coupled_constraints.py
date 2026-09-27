@@ -66,10 +66,11 @@ def test_coupled_lowering_and_immutability():
 
 
 def test_coupled_lowering_unsupported_geoms_rejected():
-  xml = COUPLED_XML.replace('type="sphere" size="0.2"', 'type="box" size="0.1 0.1 0.1"')
+  xml = COUPLED_XML.replace('type="sphere" size="0.2"', 'type="cylinder" size="0.1 0.1"')
   m = mujoco.MjModel.from_xml_string(xml)
-  with pytest.raises(ValueError, match="only sphere-plane and sphere-sphere"):
+  with pytest.raises(ValueError, match="only plane, sphere, capsule, and box"):
     lower_coupled_constraints(m)
+
 
 
 def test_coupled_lowering_unsupported_condim_rejected():

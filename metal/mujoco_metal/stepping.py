@@ -310,10 +310,11 @@ def _build_integrated_execution_plan(
     ])
     if coupled_desc.nc > 0:
       audit.extend([
-          {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc}, 5, 6)", "dtype": "float32"},
-          {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc}, 5, {model.nv})", "dtype": "float32"},
-          {"name": "out_contact_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nc * 5})", "dtype": "float32"},
+          {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.ncontacts_max}, 5, 6)", "dtype": "float32"},
+          {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.ncontacts_max}, 5, {model.nv})", "dtype": "float32"},
+          {"name": "out_contact_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.ncontacts_max * 5})", "dtype": "float32"},
       ])
+
     if coupled_desc.nr_joint > 0:
       audit.append({"name": "out_joint_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {max(coupled_desc.nr_joint, 1)})", "dtype": "float32"})
   if model.nsensor > 0:
@@ -434,7 +435,7 @@ def validate_stepping_profile(
     from mujoco_metal.coupled_constraints import lower_coupled_constraints
     coupled_desc = lower_coupled_constraints(model)
     if coupled_desc.nc > 0 or coupled_desc.nr_joint > 0:
-      supported_list.append("coupled constraint solve for contacts, joint limits, dry friction, and equalities")
+      supported_list.append("coupled constraint solve for primitive contacts (plane, sphere, capsule, box), joint limits, dry friction, and equalities")
 
     implicit_euler_damping = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP))
     passive_damping_enabled = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
@@ -463,7 +464,7 @@ def validate_stepping_profile(
             "mocap bodies",
             "spatial/wrapping tendons, tendon limits, and tendon frictionloss",
             "non-scalar/non-fixed-tendon actuators, activation state, and muscles",
-            "non-sphere collision geoms",
+            "non-primitive collision geoms (supported: plane, sphere, capsule, box)",
             "sleep mode",
             "non-Euler integrators",
             "global callbacks",

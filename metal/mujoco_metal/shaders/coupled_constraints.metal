@@ -15,10 +15,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-inline float3 rotate_q(float4 q, float3 v) {
-  float3 u = q.yzw;
-  return v + 2.0f * cross(u, cross(u, v) + q.x * v);
-}
 inline float3 cross3(float3 a, float3 b) { return cross(a, b); }
 
 inline float impedance_at(device const float* imp, int index, float pos, float margin) {
@@ -128,195 +124,219 @@ inline float solve_contact_block(
   return best_error;
 }
 
-// Geometric contact detection and Jacobian generation
+// Geometric contact detection and Jacobian generation for all 9 primitive pairs
 kernel void contact_normal(
     device const float* geom_pos [[buffer(0)]],
     device const float* geom_quat [[buffer(1)]],
-    device const float* body_pos [[buffer(2)]],
-    device const float* body_quat [[buffer(3)]],
-    device const float* anchors [[buffer(4)]],
-    device const float* axes [[buffer(5)]],
-    device const float* qvel [[buffer(6)]],
-    device const int* geom1 [[buffer(7)]],
-    device const int* geom2 [[buffer(8)]],
-    device const float* radius1 [[buffer(9)]],
-    device const float* radius2 [[buffer(10)]],
-    device const float* margin [[buffer(11)]],
-    device const float* gap [[buffer(12)]],
-    device const float* solref [[buffer(13)]],
-    device const float* solimp [[buffer(14)]],
-    device const int* condim [[buffer(15)]],
-    device const float* friction [[buffer(16)]],
-    device const int* geom_bodyid [[buffer(17)]],
-    device const int* body_parentid [[buffer(18)]],
-    device const int* body_jntadr [[buffer(19)]],
-    device const int* body_jntnum [[buffer(20)]],
-    device const int* jnt_type [[buffer(21)]],
-    device const int* jnt_dofadr [[buffer(22)]],
-    device const float* body_invweight0 [[buffer(23)]],
-    device float* row_data [[buffer(24)]],
-    device float* frame [[buffer(25)]],
-    device float* jacobian [[buffer(26)]],
-    constant int* dims [[buffer(27)]],
+    device const float* geom_size [[buffer(2)]],
+    device const int* geom_type [[buffer(3)]],
+    device const int* geom_bodyid [[buffer(4)]],
+    device const float* body_pos [[buffer(5)]],
+    device const float* body_quat [[buffer(6)]],
+    device const float* anchors [[buffer(7)]],
+    device const float* axes [[buffer(8)]],
+    device const float* qvel [[buffer(9)]],
+    device const int* body_parentid [[buffer(10)]],
+    device const int* body_jntadr [[buffer(11)]],
+    device const int* body_jntnum [[buffer(12)]],
+    device const int* jnt_type [[buffer(13)]],
+    device const int* jnt_dofadr [[buffer(14)]],
+    device const float* body_invweight0 [[buffer(15)]],
+    device const int* pair_geoms [[buffer(16)]],
+    device const float* pair_margin_gap [[buffer(17)]],
+    device const float* pair_solref [[buffer(18)]],
+    device const float* pair_solimp [[buffer(19)]],
+    device const int* pair_condim [[buffer(20)]],
+    device const float* pair_friction [[buffer(21)]],
+    device const int* pair_contact_offset [[buffer(22)]],
+    device float* row_data [[buffer(23)]],
+    device float* frame [[buffer(24)]],
+    device float* jacobian [[buffer(25)]],
+    constant int* dims [[buffer(26)]],
     uint tid [[thread_position_in_grid]]) {
   int nv = dims[0];
-  int nc = dims[1];
-  int batch = dims[2];
-  int nbody = dims[3];
-  int njnt = dims[4];
-  int ngeom = dims[5];
-  int world = int(tid) / max(nc, 1);
-  int slot = int(tid) % max(nc, 1);
-  if (uint(world) >= uint(batch) || slot >= nc) return;
+  int npairs = dims[1];
+  int ncontacts_max = dims[2];
+  int batch = dims[3];
+  int nbody = dims[4];
+  int njnt = dims[5];
+  int ngeom = dims[6];
 
-  int out = world * nc + slot;
-  int jbase = out * 5 * nv;
-  int rb = out * 5 * 6;
-  int fb = out * 12;
-  for (int k = 0; k < 5 * 6; ++k) row_data[rb + k] = 0.0f;
-  for (int k = 0; k < 5 * nv; ++k) jacobian[jbase + k] = 0.0f;
-  for (int k = 0; k < 12; ++k) frame[fb + k] = 0.0f;
+  int world = int(tid) / max(npairs, 1);
+  int pair_idx = int(tid) % max(npairs, 1);
+  if (uint(world) >= uint(batch) || pair_idx >= npairs) return;
 
-  int a = geom1[slot];
-  int b = geom2[slot];
+  int a = pair_geoms[pair_idx * 2 + 0];
+  int b = pair_geoms[pair_idx * 2 + 1];
+  int ta = geom_type[a];
+  int tb = geom_type[b];
+  float3 sza = float3(geom_size[a * 3], geom_size[a * 3 + 1], geom_size[a * 3 + 2]);
+  float3 szb = float3(geom_size[b * 3], geom_size[b * 3 + 1], geom_size[b * 3 + 2]);
+
   int go = world * ngeom;
   float3 pa = float3(geom_pos[(go + a) * 3], geom_pos[(go + a) * 3 + 1], geom_pos[(go + a) * 3 + 2]);
   float3 pb = float3(geom_pos[(go + b) * 3], geom_pos[(go + b) * 3 + 1], geom_pos[(go + b) * 3 + 2]);
   float4 qa = float4(geom_quat[(go + a) * 4], geom_quat[(go + a) * 4 + 1], geom_quat[(go + a) * 4 + 2], geom_quat[(go + a) * 4 + 3]);
   float4 qb = float4(geom_quat[(go + b) * 4], geom_quat[(go + b) * 4 + 1], geom_quat[(go + b) * 4 + 2], geom_quat[(go + b) * 4 + 3]);
-  float d = 0.0f;
-  float3 n = float3(0.0f);
-  float3 point = float3(0.0f);
-  if (radius1[slot] < 0.0f) {
-    float3 pn = rotate_q(qa, float3(0, 0, 1));
-    d = dot(pb - pa, pn) - radius2[slot];
-    n = pn;
-    point = pb - n * (d * 0.5f + radius2[slot]);
-  } else if (radius2[slot] < 0.0f) {
-    float3 pn = rotate_q(qb, float3(0, 0, 1));
-    d = dot(pa - pb, pn) - radius1[slot];
-    n = -pn;
-    point = pa - pn * (d * 0.5f + radius1[slot]);
-  } else {
-    float3 delta = pb - pa;
-    float distance = length(delta);
-    if (!(distance > 1e-12f)) return;
-    n = delta / distance;
-    d = distance - radius1[slot] - radius2[slot];
-    point = pa + n * (radius1[slot] + 0.5f * d);
-  }
-  float m = margin[slot];
-  float g = gap[slot];
-  if (d > m + g) return;
 
-  float3 t1 = (n.y < 0.5f && n.y > -0.5f) ? float3(0, 1, 0) : float3(0, 0, 1);
-  t1 = normalize(t1 - n * dot(n, t1));
-  float3 t2 = cross(n, t1);
+  float m = pair_margin_gap[pair_idx * 2 + 0];
+  float g = pair_margin_gap[pair_idx * 2 + 1];
+  int dim = pair_condim[pair_idx];
+  float mu0 = pair_friction[pair_idx * 2 + 0];
+  float mu1 = pair_friction[pair_idx * 2 + 1];
+
+  int offset = pair_contact_offset[pair_idx];
+  int max_con = pair_contact_offset[pair_idx + 1] - offset;
+
+  // Run collision algorithm
+  ContactGeom con[8];
+  for (int k = 0; k < 8; ++k) {
+    con[k].dist = 1e30f;
+    con[k].pos = float3(0.0f);
+    con[k].normal = float3(0.0f);
+    con[k].t1 = float3(0.0f);
+    con[k].t2 = float3(0.0f);
+  }
+  int ncon = collide_pair(ta, pa, qa, sza, tb, pb, qb, szb, m + g, con);
+  ncon = min(ncon, max_con);
 
   int ba = geom_bodyid[a];
   int bb = geom_bodyid[b];
   int bo = world * nbody;
   int jo = world * njnt;
-  float3 rel = point;
-  for (int side = 0; side < 2; ++side) {
-    int body = side == 0 ? ba : bb;
-    float sign = side == 0 ? -1.0f : 1.0f;
-    while (body > 0 && body < nbody) {
-      int ja = body_jntadr[body];
-      int jn = body_jntnum[body];
-      for (int jj = 0; jj < jn; ++jj) {
-        int j = ja + jj;
-        int da = jnt_dofadr[j];
-        int typ = jnt_type[j];
-        int nd = typ == 0 ? 6 : typ == 1 ? 3 : 1;
-        for (int q = 0; q < nd; ++q) {
-          int dof = da + q;
-          if (dof < 0 || dof >= nv) continue;
-          float3 col = float3(0.0f);
-          if (typ == 2) {
-            col = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
-          } else if (typ == 3) {
-            float3 axis = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
-            col = cross3(axis, rel - float3(anchors[(jo + j) * 3], anchors[(jo + j) * 3 + 1], anchors[(jo + j) * 3 + 2]));
-          } else if (typ == 0 || typ == 1) {
-            if (typ == 0 && q < 3) {
-              col = float3(q == 0, q == 1, q == 2);
-            } else {
-              int qrot = typ == 0 ? q - 3 : q;
-              float4 bq = float4(body_quat[(bo + body) * 4], body_quat[(bo + body) * 4 + 1], body_quat[(bo + body) * 4 + 2], body_quat[(bo + body) * 4 + 3]);
-              float3 axis = rotate_q(bq, float3(qrot == 0, qrot == 1, qrot == 2));
-              float3 pivot = typ == 0 ? float3(body_pos[(bo + body) * 3], body_pos[(bo + body) * 3 + 1], body_pos[(bo + body) * 3 + 2])
-                                      : float3(anchors[(jo + j) * 3], anchors[(jo + j) * 3 + 1], anchors[(jo + j) * 3 + 2]);
-              col = cross3(axis, rel - pivot);
-            }
-          }
-          jacobian[jbase + dof] += sign * dot(n, col);
-          jacobian[jbase + nv + dof] += sign * dot(t1, col);
-          jacobian[jbase + 2 * nv + dof] += sign * dot(t2, col);
-        }
-      }
-      body = body_parentid[body];
-    }
-  }
+  float diag_approx = body_invweight0[ba * 2] + body_invweight0[bb * 2];
 
-  int dim = condim[slot];
-  float mu0 = friction[slot * 2];
-  float mu1 = friction[slot * 2 + 1];
-  if (dim == 3) {
-    for (int i = 0; i < nv; ++i) {
-      float jn = jacobian[jbase + i];
-      float jt1 = jacobian[jbase + nv + i];
-      float jt2 = jacobian[jbase + 2 * nv + i];
-      jacobian[jbase + nv + i] = jn + mu0 * jt1;
-      jacobian[jbase + 2 * nv + i] = jn - mu0 * jt1;
-      jacobian[jbase + 3 * nv + i] = jn + mu1 * jt2;
-      jacobian[jbase + 4 * nv + i] = jn - mu1 * jt2;
-    }
-  }
+  float d0 = pair_solimp[pair_idx * 5 + 0];
+  float d1 = pair_solimp[pair_idx * 5 + 1];
+  float width = pair_solimp[pair_idx * 5 + 2];
+  float mid = pair_solimp[pair_idx * 5 + 3];
+  float power = pair_solimp[pair_idx * 5 + 4];
 
-  float d0 = solimp[slot * 5];
-  float d1 = solimp[slot * 5 + 1];
-  float width = solimp[slot * 5 + 2];
-  float mid = solimp[slot * 5 + 3];
-  float power = solimp[slot * 5 + 4];
-  float impedance;
-  float x = width > 1e-15f ? abs((d - m) / width) : 1.0f;
-  if (d0 == d1 || width <= 1e-15f) impedance = 0.5f * (d0 + d1);
-  else if (x <= 0.0f) impedance = d0;
-  else if (x >= 1.0f) impedance = d1;
-  else {
-    float y;
-    if (power == 1.0f) y = x;
-    else if (x <= mid) y = pow(x, power) / pow(mid, power - 1.0f);
-    else y = 1.0f - pow(1.0f - x, power) / pow(1.0f - mid, power - 1.0f);
-    impedance = d0 + y * (d1 - d0);
-  }
-
-  float r0 = solref[slot * 2];
-  float r1 = solref[slot * 2 + 1];
+  float r0 = pair_solref[pair_idx * 2 + 0];
+  float r1 = pair_solref[pair_idx * 2 + 1];
   float K, B;
   if (r0 > 0.0f) K = 1.0f / max(1e-15f, d1 * d1 * r0 * r0 * r1 * r1);
   else K = -r0 / max(1e-15f, d1 * d1);
   if (r1 > 0.0f) B = 2.0f / max(1e-15f, d1 * r0);
   else B = -r1 / max(1e-15f, d1);
 
-  float diag_approx = body_invweight0[ba * 2] + body_invweight0[bb * 2];
-  for (int row = 0; row < (dim == 3 ? 5 : 1); ++row) {
-    float vel = 0.0f;
-    for (int i = 0; i < nv; ++i) vel += jacobian[jbase + row * nv + i] * qvel[world * nv + i];
-    int r = rb + row * 6;
-    row_data[r] = (d < m && (dim == 1 || row > 0)) ? 1.0f : 0.0f;
-    row_data[r + 1] = d;
-    row_data[r + 2] = vel;
-    row_data[r + 3] = -B * vel - K * impedance * (d - m);
-    row_data[r + 4] = impedance;
-    row_data[r + 5] = diag_approx;
+  // For each detected contact:
+  for (int k = 0; k < ncon; ++k) {
+    int slot = offset + k;
+    if (slot >= ncontacts_max) break;
+    int out = world * ncontacts_max + slot;
+    int jbase = out * 5 * nv;
+    int rb = out * 5 * 6;
+    int fb = out * 12;
+
+    float d = con[k].dist;
+    float3 n = con[k].normal;
+    float3 t1 = con[k].t1;
+    float3 t2 = con[k].t2;
+    float3 point = con[k].pos;
+
+    // Zero out buffers
+    for (int i = 0; i < 5 * 6; ++i) row_data[rb + i] = 0.0f;
+    for (int i = 0; i < 5 * nv; ++i) jacobian[jbase + i] = 0.0f;
+    for (int i = 0; i < 12; ++i) frame[fb + i] = 0.0f;
+
+    // Compute Kinematics Jacobian
+    float3 rel = point;
+    for (int side = 0; side < 2; ++side) {
+      int body = side == 0 ? ba : bb;
+      float sign = side == 0 ? -1.0f : 1.0f;
+      while (body > 0 && body < nbody) {
+        int ja = body_jntadr[body];
+        int jn = body_jntnum[body];
+        for (int jj = 0; jj < jn; ++jj) {
+          int j = ja + jj;
+          int da = jnt_dofadr[j];
+          int typ = jnt_type[j];
+          int nd = typ == 0 ? 6 : typ == 1 ? 3 : 1;
+          for (int q = 0; q < nd; ++q) {
+            int dof = da + q;
+            if (dof < 0 || dof >= nv) continue;
+            float3 col = float3(0.0f);
+            if (typ == 2) {
+              col = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
+            } else if (typ == 3) {
+              float3 axis = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
+              col = cross(axis, rel - float3(anchors[(jo + j) * 3], anchors[(jo + j) * 3 + 1], anchors[(jo + j) * 3 + 2]));
+            } else if (typ == 0 || typ == 1) {
+              if (typ == 0 && q < 3) {
+                col = float3(q == 0, q == 1, q == 2);
+              } else {
+                int qrot = typ == 0 ? q - 3 : q;
+                float4 bq = float4(body_quat[(bo + body) * 4], body_quat[(bo + body) * 4 + 1], body_quat[(bo + body) * 4 + 2], body_quat[(bo + body) * 4 + 3]);
+                float3 axis = rotate_q(bq, float3(qrot == 0, qrot == 1, qrot == 2));
+                float3 pivot = typ == 0 ? float3(body_pos[(bo + body) * 3], body_pos[(bo + body) * 3 + 1], body_pos[(bo + body) * 3 + 2])
+                                        : float3(anchors[(jo + j) * 3], anchors[(jo + j) * 3 + 1], anchors[(jo + j) * 3 + 2]);
+                col = cross(axis, rel - pivot);
+              }
+            }
+            jacobian[jbase + dof] += sign * dot(n, col);
+            jacobian[jbase + nv + dof] += sign * dot(t1, col);
+            jacobian[jbase + 2 * nv + dof] += sign * dot(t2, col);
+          }
+        }
+        body = body_parentid[body];
+      }
+    }
+
+    if (dim == 3) {
+      for (int i = 0; i < nv; ++i) {
+        float jn = jacobian[jbase + i];
+        float jt1 = jacobian[jbase + nv + i];
+        float jt2 = jacobian[jbase + 2 * nv + i];
+        jacobian[jbase + nv + i] = jn + mu0 * jt1;
+        jacobian[jbase + 2 * nv + i] = jn - mu0 * jt1;
+        jacobian[jbase + 3 * nv + i] = jn + mu1 * jt2;
+        jacobian[jbase + 4 * nv + i] = jn - mu1 * jt2;
+      }
+    }
+
+    float impedance;
+    float x = width > 1e-15f ? abs((d - m) / width) : 1.0f;
+    if (d0 == d1 || width <= 1e-15f) impedance = 0.5f * (d0 + d1);
+    else if (x <= 0.0f) impedance = d0;
+    else if (x >= 1.0f) impedance = d1;
+    else {
+      float y;
+      if (power == 1.0f) y = x;
+      else if (x <= mid) y = pow(x, power) / pow(mid, power - 1.0f);
+      else y = 1.0f - pow(1.0f - x, power) / pow(1.0f - mid, power - 1.0f);
+      impedance = d0 + y * (d1 - d0);
+    }
+
+    for (int row = 0; row < (dim == 3 ? 5 : 1); ++row) {
+      float vel = 0.0f;
+      for (int i = 0; i < nv; ++i) vel += jacobian[jbase + row * nv + i] * qvel[world * nv + i];
+      int r = rb + row * 6;
+      row_data[r] = (d < m && (dim == 1 || row > 0)) ? 1.0f : 0.0f;
+      row_data[r + 1] = d;
+      row_data[r + 2] = vel;
+      row_data[r + 3] = -B * vel - K * impedance * (d - m);
+      row_data[r + 4] = impedance;
+      row_data[r + 5] = diag_approx;
+    }
+
+    frame[fb + 0] = n.x; frame[fb + 1] = n.y; frame[fb + 2] = n.z;
+    frame[fb + 3] = t1.x; frame[fb + 4] = t1.y; frame[fb + 5] = t1.z;
+    frame[fb + 6] = t2.x; frame[fb + 7] = t2.y; frame[fb + 8] = t2.z;
+    frame[fb + 9] = point.x; frame[fb + 10] = point.y; frame[fb + 11] = point.z;
   }
-  for (int k = 0; k < 3; ++k) {
-    frame[fb + k] = n[k];
-    frame[fb + 3 + k] = t1[k];
-    frame[fb + 6 + k] = t2[k];
-    frame[fb + 9 + k] = point[k];
+
+  // Clear unpopulated slots for this pair
+  for (int k = ncon; k < max_con; ++k) {
+    int slot = offset + k;
+    if (slot >= ncontacts_max) break;
+    int out = world * ncontacts_max + slot;
+    int jbase = out * 5 * nv;
+    int rb = out * 5 * 6;
+    int fb = out * 12;
+    for (int i = 0; i < 5 * 6; ++i) row_data[rb + i] = 0.0f;
+    for (int i = 0; i < 5 * nv; ++i) jacobian[jbase + i] = 0.0f;
+    for (int i = 0; i < 12; ++i) frame[fb + i] = 0.0f;
   }
 }
 
@@ -358,7 +378,7 @@ kernel void solve_coupled_constraints(
   int nv = dims[1];
   int nj = dims[2];
   int neq = dims[3];
-  int nc = dims[4];
+  int ncontacts_max = dims[4];
   int batch = dims[5];
   int flags = dims[6];
   bool refsafe = dims[7] != 0;
@@ -477,17 +497,24 @@ kernel void solve_coupled_constraints(
   }
 
   // 2. Contacts (if not disabled by mjDSBL_CONSTRAINT bit 0 or mjDSBL_CONTACT bit 4)
+  thread int contact_block_start[24];
+  thread int contact_block_count = 0;
+
   if ((flags & 1) == 0 && (flags & 16) == 0) {
-    for (int c = 0; c < nc; ++c) {
-      int cdim = contact_condim[c];
-      int cb = world * nc + c;
+    for (int s = 0; s < ncontacts_max; ++s) {
+      int cdim = contact_condim[s * 2 + 0];
+      int row_offset = contact_condim[s * 2 + 1];
+      int row_start = base_contact + row_offset;
+      int cb = world * ncontacts_max + s;
       int cjbase = cb * 5 * nv;
       int crbase = cb * 5 * 6;
-      float mu0 = contact_friction[c * 2];
+      float mu0 = contact_friction[s * 2 + 0];
+
       if (cdim == 1) {
-        int row = base_contact + c * 4;
         int r = crbase;
         if (contact_row_data[r] > 0.5f) {
+          if (row_start + 1 > nr) { out_status[world] = 2; return; }
+          int row = row_start;
           for (int i = 0; i < nv; ++i) J_world[row * nv + i] = contact_jacobian[cjbase + i];
           float imp = clamp(contact_row_data[r + 4], 1e-6f, 0.999999f);
           float diag_approx = max(contact_row_data[r + 5], 1e-15f);
@@ -498,11 +525,16 @@ kernel void solve_coupled_constraints(
           enabled[row] = true;
         }
       } else if (cdim == 3) {
-        for (int k = 0; k < 4; ++k) {
-          int row = base_contact + c * 4 + k;
-          int subrow = k + 1;
-          int r = crbase + subrow * 6;
-          if (contact_row_data[r] > 0.5f) {
+        int r1 = crbase + 1 * 6;
+        if (contact_row_data[r1] > 0.5f) {
+          if (row_start + 4 > nr) { out_status[world] = 2; return; }
+          if (contact_block_count < 24) {
+            contact_block_start[contact_block_count++] = row_start;
+          }
+          for (int k = 0; k < 4; ++k) {
+            int row = row_start + k;
+            int subrow = k + 1;
+            int r = crbase + subrow * 6;
             for (int i = 0; i < nv; ++i) J_world[row * nv + i] = contact_jacobian[cjbase + subrow * nv + i];
             float imp = clamp(contact_row_data[r + 4], 1e-6f, 0.999999f);
             float diag_approx = max(contact_row_data[r + 5], 1e-15f);
@@ -518,6 +550,9 @@ kernel void solve_coupled_constraints(
       }
     }
   }
+
+  int total_nr = nr;
+
 
   // 3. Dense Cholesky factorization of M
   for (int i = 0; i < nv; ++i) for (int j = 0; j < nv; ++j) L[i * nv + j] = 0.0f;
@@ -546,7 +581,7 @@ kernel void solve_coupled_constraints(
   for (int i = 0; i < nv; ++i) out_acc[qb + i] = x[i];
 
   // 5. Solve M Z_r = J_r^T for all active rows
-  for (int row = 0; row < nr; ++row) if (enabled[row]) {
+  for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
     for (int i = 0; i < nv; ++i) {
       float v = J_world[row * nv + i];
       for (int k = 0; k < i; ++k) v -= L[i * nv + k] * y[k];
@@ -561,8 +596,8 @@ kernel void solve_coupled_constraints(
   }
 
   // 6. Form Delassus matrix W = J M^-1 J^T
-  for (int a = 0; a < nr; ++a) if (enabled[a]) {
-    for (int b = 0; b < nr; ++b) if (enabled[b]) {
+  for (int a = 0; a < total_nr; ++a) if (enabled[a]) {
+    for (int b = 0; b < total_nr; ++b) if (enabled[b]) {
       float v = 0.0f;
       for (int k = 0; k < nv; ++k) v += J_world[a * nv + k] * Z[b * nv + k];
       W[a * nr + b] = v;
@@ -570,7 +605,7 @@ kernel void solve_coupled_constraints(
   }
 
   // 7. Form RHS: ar - J q0
-  for (int row = 0; row < nr; ++row) {
+  for (int row = 0; row < total_nr; ++row) {
     if (enabled[row]) {
       float ja = 0.0f;
       for (int k = 0; k < nv; ++k) ja += J_world[row * nv + k] * out_acc[qb + k];
@@ -585,23 +620,23 @@ kernel void solve_coupled_constraints(
   bool converged = false;
   float max_res = 0.0f;
   for (int it = 0; it < maxiter; ++it) {
-    for (int row = 0; row < nr; ++row) if (enabled[row]) {
+    for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
       float diag = max(1e-15f, W[row * nr + row] + R[row]);
       float v = rhs[row];
-      for (int col = 0; col < nr; ++col) if (enabled[col] && col != row) {
+      for (int col = 0; col < total_nr; ++col) if (enabled[col] && col != row) {
         v -= W[row * nr + col] * lam[col];
       }
       lam[row] = clamp(v / diag, lo[row], hi[row]);
     }
     max_res = 0.0f;
-    for (int row = 0; row < nr; ++row) if (enabled[row]) {
+    for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
       float grad = -rhs[row];
-      for (int col = 0; col < nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
+      for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
       grad += R[row] * lam[row];
       float diag = max(1e-15f, W[row * nr + row] + R[row]);
       float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
       float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
-      for (int col = 0; col < nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
+      for (int col = 0; col < total_nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
       row_scale = max(1.0f, row_scale);
       max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
     }
@@ -611,14 +646,14 @@ kernel void solve_coupled_constraints(
   }
 
   // 9. Contact Block Refinement (if not converged and contacts exist)
-  if (!converged && nc > 0) {
+  if (!converged && contact_block_count > 0) {
     for (int ref = 0; ref < 64; ++ref) {
-      for (int c = 0; c < nc; ++c) {
-        if (contact_condim[c] != 3) continue;
+      for (int b = 0; b < contact_block_count; ++b) {
+        int row_start = contact_block_start[b];
         int local_rows[4];
         int nlocal = 0;
         for (int k = 0; k < 4; ++k) {
-          int row = base_contact + c * 4 + k;
+          int row = row_start + k;
           if (enabled[row]) local_rows[nlocal++] = row;
         }
         if (nlocal == 0) continue;
@@ -628,7 +663,7 @@ kernel void solve_coupled_constraints(
         for (int i = 0; i < nlocal; ++i) {
           int row = local_rows[i];
           float v = -rhs[row];
-          for (int col = 0; col < nr; ++col) if (enabled[col] && (col < base_contact + c * 4 || col >= base_contact + (c + 1) * 4)) {
+          for (int col = 0; col < total_nr; ++col) if (enabled[col] && (col < row_start || col >= row_start + 4)) {
             v += W[row * nr + col] * lam[col];
           }
           local_b[i] = v;
@@ -643,14 +678,14 @@ kernel void solve_coupled_constraints(
         }
       }
       max_res = 0.0f;
-      for (int row = 0; row < nr; ++row) if (enabled[row]) {
+      for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
         float grad = -rhs[row];
-        for (int col = 0; col < nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
+        for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
         grad += R[row] * lam[row];
         float diag = max(1e-15f, W[row * nr + row] + R[row]);
         float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
         float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
-        for (int col = 0; col < nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
+        for (int col = 0; col < total_nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
         row_scale = max(1.0f, row_scale);
         max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
       }
@@ -663,10 +698,10 @@ kernel void solve_coupled_constraints(
   if (!converged && max_res > tol) out_status[world] = 3;
 
   // 10. Reconstruct forces and acceleration
-  for (int row = 0; row < nr; ++row) if (enabled[row]) {
+  for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
     for (int i = 0; i < nv; ++i) out_force[qb + i] += J_world[row * nv + i] * lam[row];
   }
-  for (int row = 0; row < nr; ++row) if (enabled[row]) {
+  for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
     for (int i = 0; i < nv; ++i) out_acc[qb + i] += Z[row * nv + i] * lam[row];
   }
 
@@ -676,35 +711,46 @@ kernel void solve_coupled_constraints(
   }
 
   // 12. Write contact forces
-  for (int c = 0; c < nc; ++c) {
-    int cdim = contact_condim[c];
-    int ofb = (world * nc + c) * 5;
-    if (cdim == 1) {
-      int row = base_contact + c * 4;
-      out_contact_force[ofb] = enabled[row] ? lam[row] : 0.0f;
-    } else if (cdim == 3) {
-      float fn = 0.0f;
-      for (int k = 0; k < 4; ++k) {
-        int row = base_contact + c * 4 + k;
-        float v = enabled[row] ? lam[row] : 0.0f;
-        out_contact_force[ofb + 1 + k] = v;
-        fn += v;
+  for (int s = 0; s < ncontacts_max; ++s) {
+    int cdim = contact_condim[s * 2 + 0];
+    int row_offset = contact_condim[s * 2 + 1];
+    int row_start = base_contact + row_offset;
+    int ofb = (world * ncontacts_max + s) * 5;
+    if (enabled[row_start]) {
+      if (cdim == 1) {
+        out_contact_force[ofb + 0] = lam[row_start];
+        out_contact_force[ofb + 1] = 0.0f;
+        out_contact_force[ofb + 2] = 0.0f;
+        out_contact_force[ofb + 3] = 0.0f;
+        out_contact_force[ofb + 4] = 0.0f;
+      } else if (cdim == 3) {
+        float f0 = lam[row_start + 0];
+        float f1 = lam[row_start + 1];
+        float f2 = lam[row_start + 2];
+        float f3 = lam[row_start + 3];
+        out_contact_force[ofb + 0] = f0 + f1 + f2 + f3;
+        out_contact_force[ofb + 1] = f0;
+        out_contact_force[ofb + 2] = f1;
+        out_contact_force[ofb + 3] = f2;
+        out_contact_force[ofb + 4] = f3;
       }
-      out_contact_force[ofb] = fn;
+    } else {
+      for (int k = 0; k < 5; ++k) out_contact_force[ofb + k] = 0.0f;
     }
   }
+
 
   // 13. Write debug matrices and vectors if workspace_debug is provided
   if (workspace_debug && nr > 0) {
     device float* dbg = workspace_debug + world * (nr * nr + 4 * nr);
     for (int a = 0; a < nr; ++a) {
       for (int b = 0; b < nr; ++b) {
-        dbg[a * nr + b] = W[a * nr + b];
+        dbg[a * nr + b] = (a < total_nr && b < total_nr) ? W[a * nr + b] : 0.0f;
       }
-      dbg[nr * nr + a] = R[a];
-      dbg[nr * nr + nr + a] = ar[a];
-      dbg[nr * nr + 2 * nr + a] = rhs[a];
-      dbg[nr * nr + 3 * nr + a] = enabled[a] ? lam[a] : 0.0f;
+      dbg[nr * nr + a] = a < total_nr ? R[a] : 0.0f;
+      dbg[nr * nr + nr + a] = a < total_nr ? ar[a] : 0.0f;
+      dbg[nr * nr + 2 * nr + a] = a < total_nr ? rhs[a] : 0.0f;
+      dbg[nr * nr + 3 * nr + a] = (a < total_nr && enabled[a]) ? lam[a] : 0.0f;
     }
   }
 }

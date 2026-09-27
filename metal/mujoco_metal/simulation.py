@@ -377,10 +377,11 @@ class MetalSimulation:
       ])
       if d.nc > 0:
         entries.extend([
-            {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nc}, 5, 6)", "dtype": "float32"},
-            {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nc}, 5, {d.nv})", "dtype": "float32"},
-            {"name": "out_contact_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nc * 5})", "dtype": "float32"},
+            {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max}, 5, 6)", "dtype": "float32"},
+            {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max}, 5, {d.nv})", "dtype": "float32"},
+            {"name": "out_contact_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max * 5})", "dtype": "float32"},
         ])
+
       if d.nr_joint > 0:
         entries.append({"name": "out_joint_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {max(d.nr_joint, 1)})", "dtype": "float32"})
     if self._sensors is not None:
