@@ -19,19 +19,14 @@ available alongside the optional package.
   per-step host state readback, per-world failure handling, selected-row reset,
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
-- **Validation and reproducible measurements:** the development checkpoint passed
-  **270 tests with native GPU execution enabled**; independent CPU-reference
-  trajectory and solve checks supplement the
-  suite. Benchmarks include actual eight-thread CPU measurements at every tested
-  batch through 524,288 worlds.
+- **Validation and reproducible measurements:** 307 tests pass with native GPU execution enabled; independent CPU-reference trajectory and solve checks supplement the suite. Benchmarks include actual eight-thread CPU measurements at every tested batch through 524,288 worlds.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
   plus bounded hinge/slide motors with clipping and disable flags. Separate
   profiles preserve the original unforced baseline.
 - **Development physics coverage:** an integrated Euler pipeline (`integrated_euler_v1`)
-  combining motor actuation, fixed-joint tendons, passive spring/damping forces, fluid drag,
-  sphere contacts, joint constraints, and sensor queries with one coupled Delassus constraint solve;
+  combining complete primitive collision manifolds (all 9 valid pairs among planes, spheres, capsules, and boxes with up to 8 contact points per pair, SAT collision detection, Sutherland-Hodgman polygon clipping, and Coulomb friction), motor actuation, fixed-joint tendons, passive spring/damping forces, fluid drag, joint limits/frictionloss, polynomial joint equality, and sensor queries with one coupled Delassus constraint solve;
   RK4 and bounded implicitfast; springs and body forces; inertia-box fluid drag; fixed-tendon dynamics;
-  selected sensor queries; sphere contact and joint constraints have CPU-reference checks. See the [precise development coverage](metal/DEVELOPMENT.md).
+  selected sensor queries have CPU-reference checks. See the [precise development coverage](metal/DEVELOPMENT.md).
 - **Tools and documentation:** creative simulation demos, capability inventory,
   runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.
 - **Upstream regression coverage:** an `mj_setConst` inertial-update roundtrip test
@@ -82,6 +77,12 @@ execution speed. Rendering uses MuJoCo OpenGL. Most examples offer headless
 checks and GIF recording; interactive viewing is documented where available.
 The [compact gallery](metal/examples/demo_gallery.md) maps each demo to its
 physics capability.
+
+### [Clockwork parcel sorter](metal/examples/clockwork_parcel_sorter.md)
+
+Real box parcels, capsule rollers, and swinging diverter gates routing parcels to bins demonstrate complete primitive collisions: multi-contact manifolds across all pairs of planes, spheres, capsules, and boxes coupled with joint equality, tendons, actuation, limits, and live sensor queries in one unified solve.
+
+![Clockwork parcel sorter: native Metal beside CPU MuJoCo](metal/examples/assets/clockwork_parcel_sorter.gif)
 
 ### [Robotic marble music machine](metal/examples/marble_music_machine.md)
 

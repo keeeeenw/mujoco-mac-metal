@@ -1,0 +1,132 @@
+<mujoco model="clockwork_parcel_sorter">
+  <compiler angle="radian" inertiafromgeom="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler" iterations="800" tolerance="1e-5" density="1.2" viscosity="0.00002">
+    <flag contact="enable" equality="enable" limit="enable" frictionloss="enable"/>
+  </option>
+
+  <asset>
+    <texture name="checker" type="2d" builtin="checker" width="512" height="512"
+      rgb1="0.12 0.15 0.20" rgb2="0.22 0.28 0.35"/>
+    <material name="floor_mat" texture="checker" texrepeat="8 8" reflectance="0.1"/>
+    <material name="ramp_mat" rgba="0.32 0.38 0.46 1" specular="0.6" shininess="0.4"/>
+    <material name="chute_mat" rgba="0.24 0.28 0.34 1" specular="0.5" shininess="0.3"/>
+    <material name="diverter_mat" rgba="0.95 0.65 0.15 1" specular="0.8" shininess="0.6"/>
+    <material name="roller_mat" rgba="0.35 0.75 0.85 1" specular="0.8" shininess="0.7"/>
+    <material name="box_parcel_mat" rgba="0.92 0.25 0.20 1" specular="0.8" shininess="0.8"/>
+    <material name="cap_parcel_mat" rgba="0.25 0.80 0.35 1" specular="0.8" shininess="0.8"/>
+    <material name="sph_parcel_mat" rgba="0.20 0.55 0.95 1" specular="0.9" shininess="0.9"/>
+  </asset>
+
+  <default>
+    <geom condim="3" friction="0.35 0.05 0.05" solref="0.015 1.0" solimp="0.9 0.95 0.001 0.5 2"/>
+  </default>
+
+  <worldbody>
+    <light directional="true" pos="0 -2 5" dir="0 0.3 -1" diffuse="0.9 0.9 0.9" specular="0.3 0.3 0.3"/>
+    
+    <!-- Foundation Table / Catch Floor -->
+    <geom name="floor" type="plane" size="3 3 0.1" pos="0 0 -0.1" material="floor_mat" contype="0" conaffinity="0"/>
+
+    <!-- Incline Solid Box Feed Ramp -->
+    <geom name="ramp" type="box" size="0.28 0.16 0.02" pos="0 0 0.45"
+      quat="0.9659258 0 0.258819 0" material="ramp_mat" contype="0" conaffinity="0"/>
+    
+    <!-- Capsule Guide Rollers at the head of the ramp -->
+    <geom name="roller" type="capsule" size="0.022 0.14" pos="-0.20 0 0.55"
+      quat="0.7071068 0.7071068 0 0" material="roller_mat" contype="0" conaffinity="0"/>
+
+    <!-- Actuated Hinged Diverter Gate (Swinging guide arm) -->
+    <body name="diverter1" pos="0.28 -0.05 0.30">
+      <joint name="diverter1_hinge" type="hinge" axis="0 0 1" range="-0.65 0.65" limited="true" frictionloss="0.02" damping="0.05"/>
+      <geom name="diverter1_flap" type="capsule" size="0.018 0.07" pos="0.07 0 0" material="diverter_mat" mass="0.2" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Linked Follower Guide Flap (Symmetrically linked by joint equality) -->
+    <body name="diverter2" pos="0.28 0.05 0.30">
+      <joint name="diverter2_hinge" type="hinge" axis="0 0 1" range="-0.65 0.65" limited="true" frictionloss="0.02" damping="0.05"/>
+      <geom name="diverter2_flap" type="capsule" size="0.018 0.07" pos="0.07 0 0" material="diverter_mat" mass="0.2" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Diverter Damper lever -->
+    <body name="damper_lever" pos="0.18 0 0.25">
+      <joint name="damper_hinge" type="hinge" axis="0 0 1" range="-0.5 0.5" limited="true" stiffness="15.0" damping="0.2" springref="0.0"/>
+      <geom name="damper_body" type="capsule" size="0.015 0.05" pos="0 0 0" material="chute_mat" contype="0" conaffinity="0" mass="0.1"/>
+    </body>
+
+    <!-- Left Chute / Guide Rail (Negative Y) -->
+    <geom name="chute_left" type="capsule" size="0.02 0.14" pos="0.28 -0.12 0.15"
+      quat="0.9238795 -0.3826834 0 0" material="chute_mat" contype="0" conaffinity="0"/>
+
+    <!-- Right Chute / Guide Rail (Positive Y) -->
+    <geom name="chute_right" type="capsule" size="0.02 0.14" pos="0.28 0.12 0.15"
+      quat="0.9238795 0.3826834 0 0" material="chute_mat" contype="0" conaffinity="0"/>
+
+    <!-- Mixed Parcel Feed -->
+    <!-- Parcel 1: Red Box Parcel -->
+    <body name="parcel_box" pos="-0.10 -0.03 0.60">
+      <freejoint name="parcel_box_free"/>
+      <geom name="box_parcel_geom" type="box" size="0.04 0.04 0.03" mass="0.4"
+        material="box_parcel_mat" friction="0.35 0.05 0.05" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Parcel 2: Green Capsule Parcel -->
+    <body name="parcel_cap" pos="-0.14 0.03 0.72">
+      <freejoint name="parcel_cap_free"/>
+      <geom name="cap_parcel_geom" type="capsule" size="0.028 0.04" mass="0.3"
+        material="cap_parcel_mat" friction="0.30 0.05 0.05" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Parcel 3: Blue Sphere Parcel -->
+    <body name="parcel_sph" pos="-0.04 0.0 0.85">
+      <freejoint name="parcel_sph_free"/>
+      <geom name="sph_parcel_geom" type="sphere" size="0.035" mass="0.25"
+        material="sph_parcel_mat" friction="0.25 0.05 0.05" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+
+  <contact>
+    <!-- Explicit candidate pairs with mixed condim=3 and condim=1 -->
+    <!-- Parcel 1 (Box) contacts: ramp (box-box manifold), diverter (box-capsule), chute_left (box-capsule) -->
+    <pair geom1="box_parcel_geom" geom2="ramp" condim="3" friction="0.35 0.35 0.01"/>
+    <pair geom1="box_parcel_geom" geom2="diverter1_flap" condim="1"/>
+    <pair geom1="box_parcel_geom" geom2="chute_left" condim="1"/>
+
+    <!-- Parcel 2 (Capsule) contacts: ramp (capsule-box), diverter2 (capsule-capsule), chute_right -->
+    <pair geom1="cap_parcel_geom" geom2="ramp" condim="3" friction="0.30 0.30 0.01"/>
+    <pair geom1="cap_parcel_geom" geom2="diverter2_flap" condim="1"/>
+    <pair geom1="cap_parcel_geom" geom2="chute_right" condim="1"/>
+
+    <!-- Parcel 3 (Sphere) contacts: ramp (sphere-box), roller (sphere-capsule), floor (sphere-plane) -->
+    <pair geom1="sph_parcel_geom" geom2="ramp" condim="3" friction="0.25 0.25 0.01"/>
+    <pair geom1="sph_parcel_geom" geom2="roller" condim="1"/>
+    <pair geom1="sph_parcel_geom" geom2="floor" condim="1"/>
+
+    <!-- Parcel-to-parcel physical interaction -->
+    <pair geom1="box_parcel_geom" geom2="cap_parcel_geom" condim="1"/>
+  </contact>
+
+  <equality>
+    <!-- Counter-rotating diverter gates linked by joint equality -->
+    <joint joint1="diverter2_hinge" joint2="diverter1_hinge" polycoef="0 1.0 0 0 0"/>
+  </equality>
+
+  <tendon>
+    <!-- Fixed tendon coupling diverter to damper lever -->
+    <fixed name="diverter_tendon" stiffness="6.0" damping="0.1" armature="0.005">
+      <joint joint="diverter1_hinge" coef="0.5"/>
+      <joint joint="damper_hinge" coef="0.4"/>
+    </fixed>
+  </tendon>
+
+  <actuator>
+    <!-- Actuator switching the diverter between left and right sorting paths -->
+    <motor name="diverter_motor" joint="diverter1_hinge" ctrlrange="-1.5 1.5"/>
+  </actuator>
+
+  <sensor>
+    <jointpos joint="diverter1_hinge" name="diverter_angle"/>
+    <jointvel joint="diverter1_hinge" name="diverter_vel"/>
+    <jointpos joint="diverter2_hinge" name="diverter2_angle"/>
+    <jointpos joint="damper_hinge" name="damper_angle"/>
+  </sensor>
+</mujoco>

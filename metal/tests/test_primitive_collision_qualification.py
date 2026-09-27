@@ -816,3 +816,20 @@ def test_checkpoint_snapshot_restore_and_replay():
     sim.step(1)
 
   assert torch.equal(sim.state.qpos, qpos_stepped), "Snapshot restore and replay must match bit-for-bit"
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_clockwork_parcel_sorter_demo_check():
+  """Clockwork parcel sorter demo runs headless check with real physical routing."""
+  from clockwork_parcel_sorter import run
+
+  metrics = run(steps=500, mode="metal", check=True)
+  assert metrics["box_routed_left"] is True
+  assert metrics["cap_routed_right"] is True
+  assert metrics["sph_routed_center"] is True
+  assert metrics["active_contact_steps"] >= 200
+  assert metrics["peak_contacts"] >= 3
+  assert len(metrics["unique_contact_pairs"]) >= 4
+  assert metrics["max_stage_sensor_error"] <= 1e-6
+

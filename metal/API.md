@@ -78,7 +78,8 @@ The `integrated_euler_v1` stepping profile composes the native Metal Euler physi
 - **Passive forces:** Rigid joint springs, linear and polynomial joint damping, body gravity compensation, and applied body wrenches (`xfrc_applied`).
 - **Fluid forces:** Inertia-box body fluid drag, fluid viscosity, and wind.
 - **Sensors:** Stateless current-state sensor queries (`sim.sensor_values()`) evaluated on GPU.
-- **Unified coupled constraint solve:** Combines plane–sphere and sphere–sphere contacts (condim 1 and pyramidal condim 3), scalar joint limits, dry frictionloss, and polynomial joint equality constraints into a single coupled Delassus system $W = J M^{-1} J^T + R$ solved via projected Gauss-Seidel with active-set block refinement.
+- **Unified coupled constraint solve:** Combines complete primitive collision manifolds across all 9 valid pairs among planes, spheres, capsules, and boxes (condim 1 and pyramidal condim 3 with pair-defined Coulomb friction), scalar joint limits, dry frictionloss, and polynomial joint equality constraints into a single coupled Delassus system $W = J M^{-1} J^T + R$ solved via projected Gauss-Seidel with active-set block refinement.
+- **Full primitive collision support:** Real multi-contact manifolds generated entirely on GPU via Separating Axis Theorem (SAT 15 candidate axes), Sutherland-Hodgman polygon clipping, and closest segment points. Box-box produces up to 8 contact points, plane-box up to 4, capsule-box / capsule-capsule / plane-capsule up to 2, and sphere pairs 1 point. Both $(A, B)$ and $(B, A)$ geometry orderings, explicit `<pair>`, `<exclude>`, and parent/welded body filtering are fully respected.
 
 Solving contact and joint constraints in one coupled Delassus system prevents the numerical divergence (exceeding 15% error) that occurs when constraints are solved sequentially or decoupled.
 
@@ -91,11 +92,12 @@ sensor_data = sim.sensor_values()
 ### Capacity limits and guards
 The integrated Euler pipeline enforces explicit hardware-tailored capacity bounds:
 - Generalized velocities: $nv \le 32$.
-- Candidate contact pairs: $nc \le 16$.
-- Total candidate constraint rows: $nr = n_{\text{eq}} + nv + 2 \cdot n_{\text{jnt}} + 4 \cdot nc \le 96$.
-Models exceeding these bounds or requesting unsupported features (e.g. non-sphere collision geoms, non-Euler integrators, flex, plugins, or mocap bodies) are rejected cleanly during profile validation.
+- Candidate collision pairs: $npairs \le 16$.
+- Candidate contact point slots: $ncontacts \le 24$.
+- Total candidate constraint rows: $nr \le 96$.
+- Supported primitive geometries: plane, sphere, capsule, box. Models exceeding these bounds or requesting non-primitive geometries (meshes, cylinders, ellipsoids, heightfields, SDFs), non-Euler integrators, flex, or plugins are rejected cleanly during profile validation before GPU execution.
 
-Try the [robotic marble music machine demo](examples/marble_music_machine.md) or the [spacecraft force-control demo](examples/space_docking.md), or use the
+Try the [clockwork parcel sorter demo](examples/clockwork_parcel_sorter.md), the [robotic marble music machine demo](examples/marble_music_machine.md) or the [spacecraft force-control demo](examples/space_docking.md), or use the
 [installation and diagnostic guide](INSTALL.md) for `pip install mujoco-mac-metal`
 and `mujoco-metal doctor --gpu`. Install version 0.4.0 for the additional bounded profiles.
 

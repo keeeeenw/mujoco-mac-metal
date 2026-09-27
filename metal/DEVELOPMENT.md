@@ -6,12 +6,12 @@ The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
 
-The current regression checkpoint passed **282 tests with native GPU execution
-enabled**. A separate environment without Torch passed **155 CPU tests**, with
-127 GPU checks skipped. These counts describe the source snapshot and do not
+The current regression checkpoint passed **307 tests with native GPU execution
+enabled**. A separate environment without Torch passed **151 CPU tests**, with
+153 GPU checks skipped. These counts describe the source snapshot and do not
 establish coverage of every MuJoCo feature.
 
-The source checkpoint is `feature/problem-001-integrated-euler`; documentation-only revisions do not change
+The source checkpoint is `feature/problem-002-primitive-collision`; documentation-only revisions do not change
 these results. Tests ran on an M1 Max with 32 GB unified memory. Numerical
 qualification is separate from performance qualification: the older pendulum
 benchmark has not been rerun for the additional profiles.
@@ -20,7 +20,7 @@ benchmark has not been rerun for the additional profiles.
 
 | Capability | Explicit simulation profile | Evidence and creative demo |
 |---|---|---|
-| Integrated Euler physics pipeline: unified coupled constraint solve (plane–sphere and sphere–sphere contacts, condim 1 and pyramidal condim 3, scalar limits, dry frictionloss, polynomial joint equality) with motor actuation, fixed-joint tendons, rigid passive forces, fluid drag, and live current-state sensor queries | `integrated_euler_v1` | Coupled Delassus PGS solve, multi-batch rollouts, CPU oracle parity, and snapshot replay; [robotic marble music machine](examples/marble_music_machine.md) |
+| Integrated Euler physics pipeline: complete primitive collision support (all 9 valid pairs among planes, spheres, capsules, boxes, multi-contact manifolds up to 8 points per pair, condim 1 and pyramidal condim 3) with coupled Delassus PGS solve, motor actuation, fixed-joint tendons, rigid passive forces, fluid drag, joint limits/frictionloss, polynomial joint equality, and live sensor queries | `integrated_euler_v1` | Complete primitive manifolds, Delassus PGS solve, multi-batch rollouts, CPU oracle parity, and snapshot replay; [clockwork parcel sorter](examples/clockwork_parcel_sorter.md) and [robotic marble music machine](examples/marble_music_machine.md) |
 | Quaternion-aware RK4 | `contact_free_rk4_v1`, force/motor/passive/sensor/transmission RK4 variants | Mixed-joint trajectories; [tumbling toys](examples/tumbling_toys.md) |
 | Rigid joint springs, polynomial damping, body gravity compensation and Cartesian body forces | `contact_free_passive_euler_v1`, `contact_free_passive_rk4_v1` | Euler/RK4 trajectories, disable flags and applied-wrench checks; [spring flower](examples/kinetic_sculpture.md) |
 | Stateless scalar servos, fixed/affine gain and affine bias, fixed-joint tendon transmissions plus spring/damping/armature | `contact_free_transmission_euler_v1`, `contact_free_transmission_rk4_v1` | Force stage and 400-step trajectories against CPU; [cable plotter](examples/cable_plotter.md) |
@@ -57,7 +57,7 @@ The pipeline consists of ten sequential integration stages plus an explicit on-d
 5. `actuation`: Stateless scalar motor actuators and transmissions with `ctrlrange` clipping.
 6. `smooth_assembly`: Aggregates unconstrained forces and tendon armature.
 7. `unconstrained_solve`: Unconstrained acceleration solve $M \hat{a} = \tau_{\text{smooth}}$.
-8. `coupled_constraints`: Unified Delassus Projected Gauss-Seidel (PGS) constraint solve simultaneously coupling plane–sphere and sphere–sphere contacts (condim 1 and pyramidal condim 3), scalar joint limits, dry joint frictionloss, and polynomial equality constraints.
+8. `coupled_constraints`: Unified Delassus Projected Gauss-Seidel (PGS) constraint solve simultaneously coupling complete primitive collision manifolds across planes, spheres, capsules, and boxes (condim 1 and pyramidal condim 3), scalar joint limits, dry joint frictionloss, and polynomial equality constraints.
 9. `euler_damping`: Semi-implicit velocity damping solve $(M + h D) v^+ = M v^*$.
 10. `euler_integration`: Semi-implicit Euler state integration with sticky failure rollback.
 
@@ -72,9 +72,9 @@ The coupled solver enforces an explicit, validated convergence contract:
 - Solver status codes: 0 = converged, 2 = non-finite / divergence, 3 = iteration exhaustion / non-convergence. If any world fails to converge, its state stickily rolls back to its previous valid state without advancing, while healthy worlds continue. Recovery is achieved via selective per-world reset (`sim.state.reset(env_ids, qpos=..., qvel=...)`).
 - Device residency & buffer audit: Hot path physics execute on MPS with preallocated workspace buffers (`workspace_J`, `workspace_debug`, `contact_row_data`, `contact_jacobian`, `out_force`, `out_acc`, etc.) and persistent preallocated default equality state, avoiding CPU physics and host-device state synchronization. Intermediate PyTorch MPS operations (e.g. status mask selection) execute within device memory. Buffer specifications are grounded in real allocations via `sim.buffer_audit()`. On the 100-step coupled verification fixture, native Metal matches CPU MuJoCo with maximum position error `1.50e-7`, velocity error `1.67e-6`, and sensor error `1.07e-6`.
 - Full assembled system qualification: Tested via `test_integrated_simulation_assembled_system_matches_cpu` across both deterministic mixed 3D fixture (nontrivial 3D rotational and tangential Jacobians with non-axial hinge axes) and axis-aligned fixture. Compares complete active $J$ (max error $< 10^{-6}$), effective $M$ with tendon armature ($< 10^{-6}$), regularizer $R$ ($< 10^{-6}$), $a_r$ ($< 10^{-3}$), $\text{rhs}$ ($< 10^{-3}$), assembled Delassus $W = J M^{-1} J^T + R$ ($< 10^{-6}$), nonzero cross-coupling blocks ($W_{cj}$ norm $0.5902$), zero inactive rows, and host KKT projected residual ($< 10^{-4}$).
-- Capacity boundaries vs. admission guards: Distinguishes admission guards (CPU lowering and overflow rejection: $nv=33, nc=17, nr=97$ rejected with `ValueError`) from GPU capacity execution ($nv=32, nc=16, nr=96$ executed on GPU with status 0, isolated worlds, finite float32 outputs, slot 95 exercised via active contact pair 15, and verified against CPU MuJoCo references).
+- Capacity boundaries vs. admission guards: Distinguishes admission guards (CPU lowering and overflow rejection: $nv=33, npairs=17, ncontacts=25, nr=97$ rejected with `ValueError`) from GPU capacity execution ($nv=32, npairs=16, ncontacts=24, nr=96$ executed on GPU with status 0, isolated worlds, finite float32 outputs, slot 15 exercised for pairs, slot 23 for contacts, row 95 for constraint rows, and verified against CPU MuJoCo references).
 - Control clipping: Evaluates same-time physical effect of `mjDSBL_CLAMPCTRL` over identical 50 steps from identical initial states ($|q_{\text{noclamp}} - q_{\text{clamp}}| = 0.03632 > 0.02$, with status 0 and CPU parity for both).
-- Test suite: **288 passed** with GPU enabled (`MUJOCO_METAL_RUN_GPU=1`), **150 passed** (135 skipped) in real no-Torch environment.
+- Test suite: **307 passed** with GPU enabled (`MUJOCO_METAL_RUN_GPU=1`), **151 passed** (153 skipped) in real no-Torch environment.
 
 ## Demo evidence
 
@@ -102,6 +102,7 @@ not throughput measurements. [Explore the gallery](examples/demo_gallery.md).
 - Sensor scanning rig: 2,000 steps (four simulated seconds); maximum qpos/qvel
   differences `6.53e-6` / `6.64e-6`, maximum current sensor difference `7.49e-5`
   across the fixture's mixed sensor units, including accumulated float32 time.
+- Clockwork parcel sorter: 600 steps; pre-impact trajectory error against CPU MuJoCo `2.86e-6` m position and `1.30e-4` velocity; stage sensor difference `0.0`, equality impedance match within `3.2e-5` rad; exercises complete primitive collisions with 540 active contact steps, peak 7 simultaneous contacts, 441 active joint limit steps, and 9 unique contact pairs; demonstrates actual physical routing sending box parcels to the left chute (Y = -0.391 m), capsule parcels to the right chute (Y = +0.405 m), and sphere parcels down the center (Y = 0.000 m).
 - Robotic marble music machine: 400 steps; maximum absolute qpos/qvel differences
   `8.94e-6` / `1.97e-4`; stage sensor difference `0.0`, trajectory sensor difference `8.57e-6`; exercises all Euler feature families simultaneously in one coupled Delassus solve (211 active joint limit steps, 238 near limit steps, chime oscillations 0.091 rad / 0.066 rad, 4 active contact pairs).
 
