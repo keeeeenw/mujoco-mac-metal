@@ -1176,3 +1176,165 @@ def test_integrated_simulation_independent_row_recovery_and_replay():
   assert torch.equal(sim.state.qpos, qpos_stepped), "Replay must reproduce exact state trajectory"
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_elliptic_condim6_contact_couples_with_joint_constraints_and_actuation():
+  """Qualify high-dimensional friction in a genuinely mixed constraint system."""
+  import torch
+
+  xml = """<mujoco><option timestep=".002" gravity="0 0 -9.81"
+      cone="elliptic" iterations="1000" tolerance="1e-6">
+    <flag contact="enable" equality="enable" limit="enable" frictionloss="enable"/>
+    </option>
+    <worldbody>
+      <geom name="floor" type="plane" size="3 3 .1" condim="6" friction=".8 .6 .07"/>
+      <body name="contact-slider" pos="0 0 .095">
+        <joint name="jz" type="slide" axis="0 0 1" range="-1 0"
+            limited="true" margin=".02" frictionloss=".2"/>
+        <geom type="sphere" size=".1" mass=".3" condim="6" friction=".8 .6 .07"/>
+      </body>
+      <body name="linked-slider" pos="1 0 1">
+        <joint name="jx" type="slide" axis="1 0 0" range="-1 0"
+            limited="true" margin=".02" frictionloss=".2"/>
+        <geom type="sphere" size=".1" mass=".3" contype="0" conaffinity="0"/>
+      </body>
+    </worldbody>
+    <equality><joint joint1="jz" joint2="jx" polycoef="0 1 0 0 0"/></equality>
+    <actuator><motor joint="jx" ctrlrange="-1 1"/></actuator>
+  </mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos0 = np.array([[0.0, 0.0], [3.0, -0.5]], dtype=np.float32)
+  qvel0 = np.array([[0.3, 0.2], [0.0, 0.0]], dtype=np.float32)
+  sim = MetalSimulation(model, 2, qpos=qpos0, qvel=qvel0, profile="integrated_euler_v1")
+
+  assembled = sim.assembled_system(ctrl=np.zeros((2, 1), dtype=np.float32))
+  assert assembled["status"].cpu().numpy().tolist() == [0, 0]
+  assert assembled["contact_mask"].cpu().numpy().tolist() == [[1.0], [0.0]]
+  reference = mujoco.MjData(model)
+  reference.qpos[:], reference.qvel[:] = qpos0[0], qvel0[0]
+  mujoco.mj_forward(model, reference)
+  assert reference.ncon == 1 and reference.contact[0].dim == 6
+  types = set(int(t) for t in reference.efc_type[: reference.nefc])
+  assert int(mujoco.mjtConstraint.mjCNSTR_EQUALITY) in types
+  assert int(mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT) in types
+  assert int(mujoco.mjtConstraint.mjCNSTR_FRICTION_DOF) in types
+  np.testing.assert_allclose(assembled["qacc"][0].cpu().numpy(), reference.qacc,
+                             rtol=5e-4, atol=2e-3)
+  np.testing.assert_allclose(assembled["qfrc_constraint"][0].cpu().numpy(),
+                             reference.qfrc_constraint, rtol=5e-4, atol=2e-3)
+
+  cpu = [mujoco.MjData(model) for _ in range(2)]
+  for env, data in enumerate(cpu):
+    data.qpos[:], data.qvel[:] = qpos0[env], qvel0[env]
+    mujoco.mj_forward(model, data)
+  controls = [np.array([[0.15], [0.0]], dtype=np.float32),
+              np.array([[-0.1], [0.0]], dtype=np.float32)] * 4
+  for ctrl in controls[:4]:
+    sim.step(1, ctrl=ctrl)
+    for env, data in enumerate(cpu):
+      data.ctrl[:] = ctrl[env]
+      mujoco.mj_step(model, data)
+  checkpoint = sim.state.snapshot()
+  for ctrl in controls[4:]:
+    sim.step(1, ctrl=ctrl)
+    for env, data in enumerate(cpu):
+      data.ctrl[:] = ctrl[env]
+      mujoco.mj_step(model, data)
+  expected_qpos = sim.state.qpos.clone()
+  expected_qvel = sim.state.qvel.clone()
+  sim.state.restore(checkpoint)
+  for ctrl in controls[4:]:
+    sim.step(1, ctrl=ctrl)
+  assert torch.equal(sim.state.qpos, expected_qpos)
+  assert torch.equal(sim.state.qvel, expected_qvel)
+  np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[0], cpu[0].qpos,
+                             rtol=1e-3, atol=2e-3)
+  np.testing.assert_allclose(sim.state.qvel.cpu().numpy()[0], cpu[0].qvel,
+                             rtol=1e-3, atol=3e-2)
+  assert torch.isfinite(sim.state.qpos).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_condim6_contact_cardinality_restore_reset_and_clear():
+  """Contact/no-contact worlds survive deterministic restore and selected reset."""
+  import torch
+
+  xml = """<mujoco><option timestep=".002" gravity="0 0 -9.81"
+      cone="elliptic" iterations="1000" tolerance="1e-6"/>
+    <worldbody><geom type="plane" size="3 3 .1" condim="6" friction=".8 .6 .07"/>
+      <body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1"
+          mass=".3" condim="6" friction=".8 .6 .07"/></body>
+    </worldbody></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  contact = np.asarray(model.qpos0, dtype=np.float32).copy()
+  empty = contact.copy()
+  empty[:3] = [3.0, 0.0, 0.3]
+  qpos = np.stack([contact, empty, contact])
+  qvel = np.zeros((3, model.nv), dtype=np.float32)
+  qvel[0, 0], qvel[2, 1] = 0.15, -0.1
+  sim = MetalSimulation(model, 3, qpos=qpos, qvel=qvel, profile="integrated_euler_v1")
+  before = sim.assembled_system()
+  assert before["contact_mask"].cpu().numpy().tolist() == [[1.0], [0.0], [1.0]]
+  sim.step(3)
+  checkpoint = sim.state.snapshot()
+  sim.step(5)
+  final_qpos = sim.state.qpos.clone()
+  final_qvel = sim.state.qvel.clone()
+  sim.state.restore(checkpoint)
+  sim.step(5)
+  assert torch.equal(sim.state.qpos, final_qpos)
+  assert torch.equal(sim.state.qvel, final_qvel)
+
+  # Swap contact cardinality in only environments 0 and 1; world 2 is untouched.
+  stable_world2 = sim.state.qpos[2].clone()
+  sim.state.reset(env_ids=[0, 1], qpos=[empty, contact],
+                  qvel=np.zeros((2, model.nv), dtype=np.float32))
+  after = sim.assembled_system(recompute=True)
+  assert after["contact_mask"].cpu().numpy().tolist() == [[0.0], [1.0], [1.0]]
+  assert torch.equal(sim.state.qpos[2], stable_world2)
+  assert torch.count_nonzero(after["contact_force"][0]).item() == 0
+  assert np.all(np.isfinite(sim.state.qpos.cpu().numpy()))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_condim6_contact_failure_rolls_back_and_recovers_per_world():
+  """A failed elliptic-contact solve rolls back without stopping healthy worlds."""
+  import torch
+
+  xml = """<mujoco><option timestep=".002" gravity="0 0 -9.81"
+      cone="elliptic" iterations="2" tolerance="1e-6"/>
+    <worldbody><geom type="plane" size="3 3 .1" condim="6" friction=".8 .6 .07"/>
+      <body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1"
+          mass=".3" condim="6" friction=".8 .6 .07"/></body>
+    </worldbody></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  contact = np.asarray(model.qpos0, dtype=np.float32).copy()
+  empty = contact.copy()
+  empty[:3] = [3.0, 0.0, 0.3]
+  qpos = np.stack([contact, empty, contact])
+  qvel = np.zeros((3, model.nv), dtype=np.float32)
+  qvel[0, 0] = 0.3
+  qvel[2, 0], qvel[2, 3:6] = 5.0, [1.0, -2.0, 3.0]
+  sim = MetalSimulation(model, 3, qpos=qpos, qvel=qvel, profile="integrated_euler_v1")
+  sim.step(1)
+  assert sim.state.status.cpu().numpy().tolist() == [3, 0, 3]
+  np.testing.assert_allclose(sim.state.qpos[[0, 2]].cpu().numpy(), qpos[[0, 2]], atol=0)
+  np.testing.assert_allclose(sim.state.qvel[[0, 2]].cpu().numpy(), qvel[[0, 2]], atol=0)
+  assert not torch.equal(sim.state.qpos[1], torch.as_tensor(empty, device="mps"))
+  stable_healthy = sim.state.qpos[1].clone()
+  sim.step(1)
+  assert sim.state.status.cpu().numpy().tolist() == [3, 0, 3]
+  assert not torch.equal(sim.state.qpos[1], stable_healthy)
+
+  raised = empty.copy()
+  sim.state.reset(env_ids=[0, 2], qpos=[raised, raised],
+                  qvel=np.zeros((2, model.nv), dtype=np.float32))
+  assert sim.state.status.cpu().numpy().tolist() == [0, 0, 0]
+  cleared = sim.assembled_system(recompute=True)
+  assert cleared["contact_mask"].cpu().numpy().tolist() == [[0.0], [0.0], [0.0]]
+  assert torch.count_nonzero(cleared["contact_force"]).item() == 0
+  sim.step(1)
+  assert sim.state.status.cpu().numpy().tolist() == [0, 0, 0]
+  assert torch.isfinite(sim.state.qpos).all()
