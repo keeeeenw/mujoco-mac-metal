@@ -460,51 +460,6 @@ inline float elliptic_projected_residual(thread const float* A,
   return residual;
 }
 
-inline float solve_elliptic_block(thread const float* A, thread const float* g,
-    thread const float* friction, int dim, thread float* force) {
-  thread float scale[6], H[36], linear[6], y[6], z[6], next[6];
-  for (int i = 0; i < 6; ++i) {
-    scale[i] = i == 0 ? 1.0f : max(friction[i - 1], 0.0f);
-    y[i] = z[i] = next[i] = 0.0f;
-    linear[i] = 0.0f;
-  }
-  for (int i = 0; i < 36; ++i) H[i] = 0.0f;
-  y[0] = max(0.0f, force[0]);
-  for (int i = 1; i < dim; ++i)
-    y[i] = scale[i] > 1e-12f ? force[i] / scale[i] : 0.0f;
-  project_lorentz(y, dim);
-  for (int i = 0; i < dim; ++i) z[i] = y[i];
-  for (int i = 0; i < dim; ++i) {
-    linear[i] = scale[i] * g[i];
-    for (int j = 0; j < dim; ++j) H[i * 6 + j] = scale[i] * A[i * 6 + j] * scale[j];
-  }
-  float lipschitz = 1e-15f;
-  for (int i = 0; i < dim; ++i) {
-    float row_sum = 0.0f;
-    for (int j = 0; j < dim; ++j) row_sum += abs(H[i * 6 + j]);
-    lipschitz = max(lipschitz, row_sum);
-  }
-  float momentum = 1.0f;
-  for (int iteration = 0; iteration < 24; ++iteration) {
-    for (int i = 0; i < dim; ++i) {
-      float gradient = linear[i];
-      for (int j = 0; j < dim; ++j) gradient += H[i * 6 + j] * z[j];
-      next[i] = z[i] - gradient / lipschitz;
-    }
-    project_lorentz(next, dim);
-    float next_momentum = 0.5f * (1.0f + sqrt(1.0f + 4.0f * momentum * momentum));
-    float beta = (momentum - 1.0f) / next_momentum;
-    for (int i = 0; i < dim; ++i) {
-      float previous = y[i];
-      y[i] = next[i];
-      z[i] = next[i] + beta * (next[i] - previous);
-    }
-    momentum = next_momentum;
-  }
-  for (int i = 0; i < dim; ++i) force[i] = scale[i] * y[i];
-  return elliptic_projected_residual(A, g, friction, dim, force);
-}
-
 kernel void solve_coupled_constraints(
     device const float* mass [[buffer(0)]],
     device const float* qfrc [[buffer(1)]],
@@ -857,79 +812,222 @@ kernel void solve_coupled_constraints(
   float tol = params[2];
   bool converged = false;
   float max_res = 0.0f;
-  for (int it = 0; it < maxiter; ++it) {
+  if (elliptic_count > 0) {
+    // Elliptic contacts are cone blocks in scaled coordinates. Solve the full
+    // coupled quadratic with projected FISTA so interactions between multiple
+    // manifold points are handled globally, rather than by slowly converging
+    // local contact updates. Scalar joint/pyramid rows keep their own bounds.
+    thread float dscale[96], z[96], extrapolated[96], candidate[96], gradient_z[96];
+    for (int row = 0; row < 96; ++row) {
+      dscale[row] = 1.0f;
+      z[row] = extrapolated[row] = candidate[row] = 0.0f;
+      gradient_z[row] = 0.0f;
+    }
+    for (int block = 0; block < elliptic_count; ++block) {
+      int start = elliptic_start[block];
+      int dim = elliptic_dim[block];
+      for (int k = 1; k < dim; ++k)
+        dscale[start + k] = max(elliptic_friction[block * 5 + k - 1], 0.0f);
+    }
+    float lipschitz = 1e-15f;
+    int enabled_count = 0;
     for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
-      if (elliptic_member[row]) {
-        int block = -1;
-        for (int b = 0; b < elliptic_count; ++b) if (elliptic_start[b] == row) block = b;
-        if (block < 0) continue;
-        int dim = elliptic_dim[block];
-        thread float A[36], g[6], mu[5], force[6];
-        for (int i = 0; i < 36; ++i) A[i] = 0.0f;
-        for (int i = 0; i < 6; ++i) { g[i] = 0.0f; force[i] = 0.0f; }
-        for (int i = 0; i < 5; ++i) mu[i] = elliptic_friction[block * 5 + i];
-        for (int i = 0; i < dim; ++i) {
-          int ri = row + i;
-          force[i] = lam[ri];
-          g[i] = -rhs[ri];
-          for (int col = 0; col < total_nr; ++col) {
-            if (enabled[col] && (col < row || col >= row + dim)) g[i] += W[ri * nr + col] * lam[col];
-          }
-          for (int j = 0; j < dim; ++j) {
-            int rj = row + j;
-            A[i * 6 + j] = W[ri * nr + rj] + (i == j ? R[ri] : 0.0f);
+      ++enabled_count;
+      float row_sum = 0.0f;
+      for (int col = 0; col < total_nr; ++col) if (enabled[col]) {
+        float value = dscale[row] * W[row * nr + col] * dscale[col];
+        if (row == col) value += dscale[row] * R[row] * dscale[col];
+        row_sum += abs(value);
+      }
+      lipschitz = max(lipschitz, row_sum);
+      float scale = dscale[row];
+      z[row] = scale > 1e-12f ? lam[row] / scale : 0.0f;
+      extrapolated[row] = z[row];
+    }
+    float gershgorin_bound = lipschitz;
+    // The row-sum bound is safe but can be overly conservative for manifold
+    // blocks. Estimate the dominant eigenvalue of the symmetric PSD scaled
+    // Delassus matrix and retain a 10% safety margin for the global step.
+    thread float power_vector[96], power_product[96];
+    float inv_norm = rsqrt(float(max(enabled_count, 1)));
+    for (int row = 0; row < 96; ++row)
+      power_vector[row] = row < total_nr && enabled[row] ? inv_norm : 0.0f;
+    for (int iteration = 0; iteration < 24; ++iteration) {
+      float norm_sq = 0.0f;
+      for (int row = 0; row < total_nr; ++row) {
+        float value = 0.0f;
+        if (enabled[row]) {
+          for (int col = 0; col < total_nr; ++col) if (enabled[col]) {
+            float entry = dscale[row] * W[row * nr + col] * dscale[col];
+            if (row == col) entry += dscale[row] * R[row] * dscale[col];
+            value += entry * power_vector[col];
           }
         }
-        solve_elliptic_block(A, g, mu, dim, force);
-        for (int i = 0; i < dim; ++i) lam[row + i] = force[i];
-        continue;
+        power_product[row] = value;
+        norm_sq += value * value;
       }
-      float diag = max(1e-15f, W[row * nr + row] + R[row]);
-      float v = rhs[row];
-      for (int col = 0; col < total_nr; ++col) if (enabled[col] && col != row) {
-        v -= W[row * nr + col] * lam[col];
-      }
-      lam[row] = clamp(v / diag, lo[row], hi[row]);
+      float inv_power_norm = rsqrt(max(norm_sq, 1e-30f));
+      for (int row = 0; row < total_nr; ++row)
+        power_vector[row] = power_product[row] * inv_power_norm;
     }
-    max_res = 0.0f;
+    float rayleigh = 0.0f;
     for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
-      if (elliptic_member[row]) {
-        int block = -1;
-        for (int b = 0; b < elliptic_count; ++b) if (elliptic_start[b] == row) block = b;
-        if (block < 0) continue;
-        int dim = elliptic_dim[block];
-        thread float A[36], g[6], mu[5], force[6];
-        for (int i = 0; i < 36; ++i) A[i] = 0.0f;
-        for (int i = 0; i < 6; ++i) { g[i] = 0.0f; force[i] = 0.0f; }
-        for (int i = 0; i < 5; ++i) mu[i] = elliptic_friction[block * 5 + i];
-        for (int i = 0; i < dim; ++i) {
-          int ri = row + i;
-          force[i] = lam[ri];
-          g[i] = -rhs[ri];
-          for (int col = 0; col < total_nr; ++col) {
-            if (enabled[col] && (col < row || col >= row + dim)) g[i] += W[ri * nr + col] * lam[col];
-          }
-          for (int j = 0; j < dim; ++j) {
-            int rj = row + j;
-            A[i * 6 + j] = W[ri * nr + rj] + (i == j ? R[ri] : 0.0f);
-          }
-        }
-        max_res = max(max_res, elliptic_projected_residual(A, g, mu, dim, force));
-        continue;
+      float value = 0.0f;
+      for (int col = 0; col < total_nr; ++col) if (enabled[col]) {
+        float entry = dscale[row] * W[row * nr + col] * dscale[col];
+        if (row == col) entry += dscale[row] * R[row] * dscale[col];
+        value += entry * power_vector[col];
       }
-      float grad = -rhs[row];
-      for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
-      grad += R[row] * lam[row];
-      float diag = max(1e-15f, W[row * nr + row] + R[row]);
-      float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
-      float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
-      for (int col = 0; col < total_nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
-      row_scale = max(1.0f, row_scale);
-      max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
+      rayleigh += power_vector[row] * value;
     }
-    out_diagnostics[world * 2] = max_res;
-    out_diagnostics[world * 2 + 1] = float(it + 1);
-    if (max_res <= tol) { converged = true; break; }
+    lipschitz = min(gershgorin_bound, max(1e-15f, rayleigh * 1.1f));
+    float momentum = 1.0f;
+    for (int it = 0; it < maxiter; ++it) {
+      for (int row = 0; row < total_nr; ++row)
+        lam[row] = enabled[row] ? dscale[row] * extrapolated[row] : 0.0f;
+      for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+        float gradient = -rhs[row];
+        for (int col = 0; col < total_nr; ++col) if (enabled[col])
+          gradient += W[row * nr + col] * lam[col];
+        gradient += R[row] * lam[row];
+        gradient_z[row] = dscale[row] * gradient;
+      } else {
+        gradient_z[row] = 0.0f;
+      }
+      // Backtracking makes the power-iteration step estimate safe even when
+      // the transformed Delassus spectrum is clustered. The quadratic model
+      // check guarantees that the accepted projected-gradient step majorizes
+      // the actual coupled objective at this extrapolated point.
+      bool step_accepted = false;
+      for (int backtrack = 0; backtrack < 12; ++backtrack) {
+        for (int row = 0; row < total_nr; ++row)
+          candidate[row] = enabled[row]
+              ? extrapolated[row] - gradient_z[row] / lipschitz : 0.0f;
+        for (int block = 0; block < elliptic_count; ++block) {
+          int start = elliptic_start[block];
+          int dim = elliptic_dim[block];
+          thread float cone_value[6];
+          for (int k = 0; k < 6; ++k) cone_value[k] = k < dim ? candidate[start + k] : 0.0f;
+          project_lorentz(cone_value, dim);
+          for (int k = 0; k < dim; ++k) candidate[start + k] = cone_value[k];
+        }
+        for (int row = 0; row < total_nr; ++row)
+          if (enabled[row] && !elliptic_member[row])
+            candidate[row] = clamp(candidate[row], lo[row], hi[row]);
+
+        float objective_base = 0.0f, objective_candidate = 0.0f;
+        float linear_delta = 0.0f, delta_norm_sq = 0.0f;
+        for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+          float base_lambda = dscale[row] * extrapolated[row];
+          float candidate_lambda = dscale[row] * candidate[row];
+          float base_product = 0.0f;
+          float candidate_product = 0.0f;
+          for (int col = 0; col < total_nr; ++col) if (enabled[col]) {
+            float base_col = dscale[col] * extrapolated[col];
+            float candidate_col = dscale[col] * candidate[col];
+            base_product += W[row * nr + col] * base_col;
+            candidate_product += W[row * nr + col] * candidate_col;
+          }
+          base_product += R[row] * base_lambda;
+          candidate_product += R[row] * candidate_lambda;
+          objective_base += 0.5f * base_lambda * base_product - rhs[row] * base_lambda;
+          objective_candidate += 0.5f * candidate_lambda * candidate_product - rhs[row] * candidate_lambda;
+          float delta = candidate[row] - extrapolated[row];
+          linear_delta += gradient_z[row] * delta;
+          delta_norm_sq += delta * delta;
+        }
+        float majorizer = objective_base + linear_delta + 0.5f * lipschitz * delta_norm_sq;
+        if (objective_candidate <= majorizer + 1e-6f * max(1.0f, abs(objective_candidate))) {
+          step_accepted = true;
+          break;
+        }
+        lipschitz *= 2.0f;
+      }
+      if (!step_accepted) { out_status[world] = 2; return; }
+
+      float next_momentum = 0.5f * (1.0f + sqrt(1.0f + 4.0f * momentum * momentum));
+      float beta = (momentum - 1.0f) / next_momentum;
+      float restart_dot = 0.0f;
+      for (int row = 0; row < total_nr; ++row) if (enabled[row])
+        restart_dot += (candidate[row] - z[row]) * (extrapolated[row] - candidate[row]);
+      if (restart_dot > 0.0f) {
+        next_momentum = 1.0f;
+        beta = 0.0f;
+      }
+      for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+        float previous = z[row];
+        z[row] = candidate[row];
+        extrapolated[row] = candidate[row] + beta * (candidate[row] - previous);
+        lam[row] = dscale[row] * z[row];
+      }
+      momentum = next_momentum;
+
+      max_res = 0.0f;
+      for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+        if (elliptic_member[row]) {
+          int block = -1;
+          for (int b = 0; b < elliptic_count; ++b) if (elliptic_start[b] == row) block = b;
+          if (block < 0) continue;
+          int dim = elliptic_dim[block];
+          thread float A[36], g[6], mu[5], force[6];
+          for (int i = 0; i < 36; ++i) A[i] = 0.0f;
+          for (int i = 0; i < 6; ++i) { g[i] = 0.0f; force[i] = 0.0f; }
+          for (int i = 0; i < 5; ++i) mu[i] = elliptic_friction[block * 5 + i];
+          for (int i = 0; i < dim; ++i) {
+            int ri = row + i;
+            force[i] = lam[ri];
+            g[i] = -rhs[ri];
+            for (int col = 0; col < total_nr; ++col)
+              if (enabled[col] && (col < row || col >= row + dim))
+                g[i] += W[ri * nr + col] * lam[col];
+            for (int j = 0; j < dim; ++j) {
+              int rj = row + j;
+              A[i * 6 + j] = W[ri * nr + rj] + (i == j ? R[ri] : 0.0f);
+            }
+          }
+          max_res = max(max_res, elliptic_projected_residual(A, g, mu, dim, force));
+          continue;
+        }
+        float grad = -rhs[row];
+        for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
+        grad += R[row] * lam[row];
+        float diag = max(1e-15f, W[row * nr + row] + R[row]);
+        float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
+        float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
+        for (int col = 0; col < total_nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
+        row_scale = max(1.0f, row_scale);
+        max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
+      }
+      out_diagnostics[world * 2] = max_res;
+      out_diagnostics[world * 2 + 1] = float(it + 1);
+      if (max_res <= tol) { converged = true; break; }
+    }
+  } else {
+    // Preserve the established pyramidal PGS update order and arithmetic.
+    for (int it = 0; it < maxiter; ++it) {
+      for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+        float diag = max(1e-15f, W[row * nr + row] + R[row]);
+        float v = rhs[row];
+        for (int col = 0; col < total_nr; ++col) if (enabled[col] && col != row)
+          v -= W[row * nr + col] * lam[col];
+        lam[row] = clamp(v / diag, lo[row], hi[row]);
+      }
+      max_res = 0.0f;
+      for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+        float grad = -rhs[row];
+        for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
+        grad += R[row] * lam[row];
+        float diag = max(1e-15f, W[row * nr + row] + R[row]);
+        float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
+        float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
+        for (int col = 0; col < total_nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
+        row_scale = max(1.0f, row_scale);
+        max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
+      }
+      out_diagnostics[world * 2] = max_res;
+      out_diagnostics[world * 2 + 1] = float(it + 1);
+      if (max_res <= tol) { converged = true; break; }
+    }
   }
 
   // 9. Contact Block Refinement (if not converged and contacts exist)

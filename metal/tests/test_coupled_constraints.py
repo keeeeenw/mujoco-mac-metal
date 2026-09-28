@@ -90,6 +90,28 @@ def test_coupled_lowering_elliptic_cone_is_recorded():
   assert desc.cone_type == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
 
 
+def test_coupled_lowering_rejects_nondefault_noslip_iterations():
+  xml = '''<mujoco><option cone="elliptic" noslip_iterations="5"/>
+    <worldbody><geom type="plane" size="1 1 .1"/>
+      <body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1"
+        condim="6"/></body></worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  assert model.opt.noslip_iterations == 5
+  with pytest.raises(ValueError, match="noslip_iterations is unsupported"):
+    lower_coupled_constraints(model)
+
+
+def test_coupled_lowering_rejects_unimplemented_solver_selection():
+  xml = '''<mujoco><option solver="CG"/>
+    <worldbody><geom type="plane" size="1 1 .1"/>
+      <body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1"/>
+      </body></worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  assert model.opt.solver == mujoco.mjtSolver.mjSOL_CG
+  with pytest.raises(ValueError, match="CG solver selection is unsupported"):
+    lower_coupled_constraints(model)
+
+
 @pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
 @pytest.mark.parametrize("condim", [1, 3, 4, 6])
 def test_coupled_lowering_allocates_exact_cone_dimensions(cone, condim):
@@ -336,6 +358,100 @@ def test_native_contact_cone_dimension_matrix(cone, condim):
     assert residual <= 2e-5, (cone, condim, residual)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("condim", [3, 4, 6])
+@pytest.mark.parametrize("yaw", [0.0, 0.37])
+def test_native_elliptic_multicontact_residual_uses_returned_global_lambda(condim, yaw):
+  """A four-point box manifold must converge at the returned coupled solution."""
+  import torch
+
+  xml = f'''<mujoco><option timestep=".002" gravity="0 0 -9.81" cone="elliptic"
+      iterations="1000" tolerance="1e-8"/>
+    <worldbody><geom type="plane" size="2 2 .1" condim="{condim}"
+        friction=".8 .6 .07"/>
+      <body pos="0 0 .095" euler="0 0 {yaw}"><freejoint/>
+        <geom type="box" size=".2 .15 .1" mass="1" condim="{condim}"
+            friction=".8 .6 .07"/>
+      </body></worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = model.qpos0[None, :].astype(np.float32)
+  qvel = np.array([[.3, -.2, .1, 1.3, -2.1, 3.4]], dtype=np.float32)
+  desc = lower_coupled_constraints(model)
+  device = torch.device("mps")
+  qpos_mps = torch.as_tensor(qpos, device=device)
+  qvel_mps = torch.as_tensor(qvel, device=device)
+  model_desc = load_model(model)
+  poses = MetalKinematics(model_desc, 1).run_device(qpos_mps)
+  dynamics = MetalSmoothDynamics(model_desc, 1).run_device(qpos_mps, qvel_mps)
+  result = MetalCoupledConstraints(model, 1).run_device(
+      poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
+  )
+
+  reference = mujoco.MjData(model)
+  reference.qpos[:], reference.qvel[:] = qpos[0], qvel[0]
+  mujoco.mj_forward(model, reference)
+  assert reference.ncon == 4
+  assert int(result["status"][0]) == 0, result["solver_diagnostics"].cpu().numpy()
+
+  lam = result["lambda"][0].cpu().numpy().astype(np.float64)
+  Wreg = result["W_regularized"][0].cpu().numpy().astype(np.float64)
+  rhs = result["rhs"][0].cpu().numpy().astype(np.float64)
+  active_slots = np.flatnonzero(result["contact_mask"][0].cpu().numpy() > 0.5)
+  assert len(active_slots) == 4
+  block_residuals = []
+  for slot in active_slots:
+    dim, offset, cone = desc.contact_condim_packed[3 * slot : 3 * slot + 3]
+    assert dim == condim and cone == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
+    rows = np.arange(desc.nr_joint + offset, desc.nr_joint + offset + condim)
+    scale = np.concatenate([[1.0], desc.contact_friction[slot, : condim - 1].astype(np.float64)])
+    y = lam[rows] / scale
+    assert y[0] >= 0.0
+    assert np.linalg.norm(y[1:]) <= y[0] + 1e-4
+    block = Wreg[np.ix_(rows, rows)]
+    hessian = scale[:, None] * block * scale[None, :]
+    gradient = Wreg[np.ix_(rows, np.arange(len(lam)))] @ lam - rhs[rows]
+    linear = scale * (gradient - block @ lam[rows])
+    lipschitz = np.linalg.norm(hessian, ord=np.inf)
+    projected = _elliptic_project(y - (hessian @ y + linear) / lipschitz)
+    residual = np.linalg.norm(y - projected) * lipschitz / max(
+        1.0, np.linalg.norm(linear) + np.linalg.norm(hessian @ y)
+    )
+    block_residuals.append(float(residual))
+  assert max(block_residuals) <= 2e-5, block_residuals
+  np.testing.assert_allclose(result["qacc"][0].cpu().numpy(), reference.qacc,
+                             rtol=5e-4, atol=2e-2)
+  np.testing.assert_allclose(result["qfrc_constraint"][0].cpu().numpy(),
+                             reference.qfrc_constraint, rtol=5e-4, atol=8e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_native_elliptic_multicontact_iteration_exhaustion_is_reported():
+  """A one-sweep coupled solve must report the residual at returned lambda."""
+  import torch
+
+  xml = '''<mujoco><option timestep=".002" gravity="0 0 -9.81" cone="elliptic"
+      iterations="1" tolerance="1e-8"/>
+    <worldbody><geom type="plane" size="2 2 .1" condim="3" friction=".8 .6 .07"/>
+      <body pos="0 0 .095"><freejoint/><geom type="box" size=".2 .15 .1"
+          mass="1" condim="3" friction=".8 .6 .07"/></body>
+    </worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = model.qpos0[None, :].astype(np.float32)
+  qvel = np.array([[.3, -.2, .1, 1.3, -2.1, 3.4]], dtype=np.float32)
+  qpos_mps = torch.as_tensor(qpos, device="mps")
+  qvel_mps = torch.as_tensor(qvel, device="mps")
+  model_desc = load_model(model)
+  poses = MetalKinematics(model_desc, 1).run_device(qpos_mps)
+  dynamics = MetalSmoothDynamics(model_desc, 1).run_device(qpos_mps, qvel_mps)
+  result = MetalCoupledConstraints(model, 1).run_device(
+      poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
+  )
+  diagnostic = result["solver_diagnostics"][0].cpu().numpy()
+  assert int(result["status"][0]) == 3, diagnostic
+  assert diagnostic[1] == 1
+  assert diagnostic[0] > 1e-6, diagnostic
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 @pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])

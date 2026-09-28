@@ -188,6 +188,16 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
     raise RuntimeError(f"coupled constraint lowering requires MuJoCo 3.10.0; found {mujoco.__version__}")
   if model.nv > _MAX_NV:
     raise ValueError(f"coupled constraint stage bounds nv to {_MAX_NV}; found {model.nv}")
+  if int(model.opt.noslip_iterations) != 0:
+    raise ValueError(
+        "noslip_iterations is unsupported by integrated_euler_v1; "
+        "MuJoCo's separate no-slip post-solver is not implemented"
+    )
+  if int(model.opt.solver) == int(mujoco.mjtSolver.mjSOL_CG):
+    raise ValueError(
+        "the MuJoCo CG solver selection is unsupported by integrated_euler_v1; "
+        "use the default Newton selection or PGS"
+    )
 
   # 1. Joint constraint validation
   scalar_types = (_HINGE, _SLIDE)
