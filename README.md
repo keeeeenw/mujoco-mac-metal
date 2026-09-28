@@ -19,7 +19,7 @@ available alongside the optional package.
   per-step host state readback, per-world failure handling, selected-row reset,
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
-- **Validation and reproducible measurements:** 374 tests pass with native GPU execution enabled; independent CPU-reference trajectory and solve checks supplement the suite. Benchmarks include actual eight-thread CPU measurements at every tested batch through 524,288 worlds.
+- **Validation and reproducible measurements:** 402 tests pass with native GPU execution enabled on the qualified M1 Max; independent CPU-reference trajectory and solve checks supplement the suite. Benchmarks include actual eight-thread CPU measurements at every tested batch through 524,288 worlds.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
   plus bounded hinge/slide motors with clipping and disable flags. Separate
   profiles preserve the original unforced baseline.
