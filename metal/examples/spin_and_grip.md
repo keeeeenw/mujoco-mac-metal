@@ -60,15 +60,21 @@ To run the targeted native contact qualification matrix:
 ```sh
 MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal \
   .venv-metal/bin/python -m pytest -q metal/tests/test_coupled_constraints.py \
-  -k 'native_contact_cone_dimension_matrix or native_friction_contact_capsule_and_box or native_condim6_contact_engages_rolling_friction or native_explicit_pair_anisotropic or native_zero_and_near_zero_friction or native_contact_final_valid_row_capacity'
+  metal/tests/test_integrated_simulation.py \
+  -k 'native_contact_cone_dimension_matrix or native_friction_contact_capsule_and_box or native_condim6_contact_engages_rolling_friction or native_explicit_pair_anisotropic or native_zero_and_near_zero_friction or native_contact_final_valid_row_capacity or high_dimensional_friction_couples_with_articulated_constraints or friction_failure_isolated_from_active_and_empty_worlds or high_dimensional_spin_slip_separation_and_reimpact or high_dimensional_nonplane_pairs_compare_both_moving_bodies'
 ```
 
 The native friction increment is on the Problem 003 development branch. It is
 not included in the released 0.4.0 wheel. The current qualification covers the
 four accepted primitive shapes across the prior collision matrix and tests
 plane contacts against spheres, capsules and boxes for higher dimensions. This
-does not establish every shape-pair/cone/dimension combination, arbitrary
-models or full MuJoCo compatibility. The integrated pipeline still enforces
+is now supplemented by condim-4/6 representatives for the six non-plane pairs,
+including CPU Jacobians and wrenches from both moving bodies. A separate
+four-case mixed articulated matrix combines those friction rows with equality,
+an active limit, frictionloss and controls. Three-world rollback/recovery and
+spin/slip/roll separation/re-impact checks cover both cones, condim 4/6 and 1/4 ms
+timesteps. This still does not test every Cartesian shape-pair/cone/dimension
+combination, arbitrary models or full MuJoCo compatibility. The integrated pipeline still enforces
 the documented candidate pair, contact-slot, row and generalized-velocity
 limits. Contact assembly, solving and integration remain separate from
 rendering, which uses MuJoCo OpenGL.

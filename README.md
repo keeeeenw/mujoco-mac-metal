@@ -31,7 +31,9 @@ available alongside the optional package.
   to condim 1/3/4/6 with pyramidal and elliptic cones, including sliding,
   torsional and rolling friction. It adds explicit-pair overrides and the
   Spin-and-Grip demo. The corrected globally coupled elliptic solve and added
-  mixed-constraint/lifecycle cases pass the bounded native suite; this increment
+  mixed-constraint, per-world recovery and multi-timestep spin/slip/roll cases
+  pass the bounded native suite. High-dimensional representatives now cover all
+  accepted non-plane primitive pairs with both bodies moving. This increment
   awaits independent review and is not included in the 0.4.0 wheel.
 - **Tools and documentation:** creative simulation demos, capability inventory,
   runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.

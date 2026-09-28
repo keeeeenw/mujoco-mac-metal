@@ -1,7 +1,27 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
 
-"""Integration and numerical qualification tests for integrated_euler_v1 pipeline."""
+"""Integration and numerical qualification tests for integrated_euler_v1 pipeline.
+
+Problem 003 review acceptance matrix (each row names an executable test):
+
+* Coupled condim/cone solve and host KKT bound: ``test_native_contact_cone_dimension_matrix``
+  (host projected residual <= 2e-5; CPU force/acceleration comparisons).
+* High-dim friction with equality, active limit, frictionloss and controls:
+  ``test_high_dimensional_friction_couples_with_articulated_constraints``
+  (4 cone/dimension cases; host residual <= 2e-5; qacc <= 2e-2 abs, 1e-3 rel).
+* Rollback, healthy contact, empty batch peer, reset, clearing and replay:
+  ``test_friction_failure_isolated_from_active_and_empty_worlds``
+  (4 cone/dimension cases; failed qpos/qvel/time exact; healthy state CPU matched).
+* Spin/slip/roll, separation and re-impact:
+  ``test_high_dimensional_spin_slip_separation_and_reimpact``
+  (16 cone/dimension/timestep/initial-sign cases; dt in {1,4} ms;
+  qpos <= 2e-5, qvel <= 2e-4, qacc <= 3e-2, force <= 8e-2).
+* High-dimensional non-plane primitive pairs:
+  ``test_high_dimensional_nonplane_pairs_compare_both_moving_bodies`` in
+  ``test_coupled_constraints.py`` (all six non-plane pairs; both bodies' rotational
+  Jacobians and physical wrenches compared; box-box W tolerance 5e-3).
+"""
 
 import os
 import mujoco

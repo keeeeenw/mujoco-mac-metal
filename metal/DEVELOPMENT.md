@@ -8,9 +8,9 @@ The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
 
-The full source suite passed **374 tests with native MPS execution enabled** and
+The full source suite passed **402 tests with native MPS execution enabled** and
 fallback disabled. An isolated environment with Torch removed passed **175 tests**
-and skipped **196 GPU-dependent tests**. These results describe this source
+and skipped **224 GPU-dependent tests**. These results describe this source
 snapshot and do not establish coverage of every MuJoCo feature.
 
 This branch is based on accepted source checkpoint `370606776`; Problem 003 changes
@@ -98,6 +98,26 @@ float32 tolerances. Capsule-plane and box-plane condim-4/6 fixtures pass under
 both cones. Together with the earlier condim-1/3 primitive-family suite, this
 covers the accepted plane/sphere/capsule/box families without claiming every
 shape-pair/cone/dimension cross-product was tested.
+
+R2 completion adds the missing interacting-friction checks. Each accepted
+non-plane primitive pair now has a condim-4/6 representative; six native cases
+compare both moving bodies' rotational Jacobians, physical contact wrenches,
+mapped contact rows, full Delassus operators and CPU accelerations. The most
+sensitive box-box W comparison differed by `2.60e-3` (relative maximum
+`3.67e-3`); its explicit tolerance is `5e-3`, while the other pair fixtures
+remain within substantially tighter bounds.
+
+| Original acceptance item | Executable qualification | Bound or observed result |
+|---|---|---|
+| Friction directions participate with articulated scalar constraints | `test_high_dimensional_friction_couples_with_articulated_constraints` | 4 cone/condim cases; rotational Jacobians, torsion/roll moments, active equality/limit/frictionloss and nonzero cross blocks; host projected residual `<=2e-5`; `qacc` `rtol=1e-3, atol=2e-2` |
+| Failure rollback is isolated beside active and empty peers | `test_friction_failure_isolated_from_active_and_empty_worlds` | 4 cone/condim cases; statuses `[3,0,0]`; failed `qpos/qvel/time` exact; healthy contact and empty worlds match CPU; reset clears stale force and exact replay succeeds |
+| Non-plane high-dimensional primitive friction | `test_high_dimensional_nonplane_pairs_compare_both_moving_bodies` | 6 pair families; both bodies' rotational Jacobians nonzero and CPU-matched; physical moments asserted; box-box max `J` difference `5.84e-6`, max `W` difference `2.60e-3` |
+| Dynamic spin/roll/slip and contact events | `test_high_dimensional_spin_slip_separation_and_reimpact` | 16 cone/condim/timestep/spin-sign cases; `dt=1,4 ms`; all show contact → separation → re-impact; max bounds `qpos<2e-5`, `qvel<2e-4`, `qacc<3e-2`, constraint-force `<8e-2` |
+
+These cases complement the earlier eight-case cone/dimension matrix, transformed
+plane contact matrix, capacity boundaries, anisotropic and near-zero coefficient
+checks, and Spin-and-Grip demo. They close the specific R2 qualification gaps but
+do not form an exhaustive Cartesian product of every contact and model option.
 
 The final admitted row-layout checks run ten elliptic condim-6 contacts (90
 contact rows) and seven pyramidal condim-6 contacts (70 contact rows plus
