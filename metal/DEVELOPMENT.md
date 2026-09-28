@@ -102,10 +102,10 @@ shape-pair/cone/dimension cross-product was tested.
 R2 completion adds the missing interacting-friction checks. Each accepted
 non-plane primitive pair now has a condim-4/6 representative; six native cases
 compare both moving bodies' rotational Jacobians, physical contact wrenches,
-mapped contact rows, full Delassus operators and CPU accelerations. The most
-sensitive box-box W comparison differed by `2.60e-3` (relative maximum
-`3.67e-3`); its explicit tolerance is `5e-3`, while the other pair fixtures
-remain within substantially tighter bounds.
+mapped contact rows, full Delassus operators and CPU accelerations. All six W
+comparisons enforce the same `rtol=5e-3, atol=3e-3`. The largest observed
+box-box W difference was `2.60e-3` (relative maximum `3.67e-3`); the other pairs
+had smaller observed differences, but do not use tighter assertion bounds.
 
 | Original acceptance item | Executable qualification | Bound or observed result |
 |---|---|---|
@@ -119,18 +119,23 @@ plane contact matrix, capacity boundaries, anisotropic and near-zero coefficient
 checks, and Spin-and-Grip demo. They close the specific R2 qualification gaps but
 do not form an exhaustive Cartesian product of every contact and model option.
 
-The final admitted row-layout checks run ten elliptic condim-6 contacts (90
-contact rows) and seven pyramidal condim-6 contacts (70 contact rows plus
-21 joint rows), both compared with CPU references. A further contact over the
-row budget is rejected during lowering. A new elliptic condim-6 qualification
-also runs contact simultaneously with polynomial equality, an active joint
-limit, two frictionloss rows, nonzero Delassus cross-coupling, and changing
-motor input; its forward solve and 8-step native trajectory are compared with
-MuJoCo CPU. Condim-6 lifecycle tests cover contact/no-contact batch worlds,
-deterministic checkpoint replay, selected reset, buffer clearing after explicit
-recomputation, and an under-iterated failing contact world alongside a healthy
-contact-free world. Failed worlds retain their original `qpos`/`qvel` while the
-healthy world advances and remains healthy.
+The final admitted row-layout checks run ten elliptic condim-6 contacts (60
+contact rows plus 30 reserved joint rows, 90 total) and seven pyramidal
+condim-6 contacts (70 contact rows plus 21 joint rows, 91 total), both compared
+with CPU references. A further contact over the row budget is rejected during
+lowering.
+
+The articulated friction matrix covers both cones and condim 4/6. It engages
+rotational contact friction with a scalar equality coupling hinges `j1` and
+`j2`, an active limit on `j1` only, one frictionloss row on `j1`, and six
+time-varying controls; mapped rows, cross-coupling, physical wrenches and the
+short native trajectory are checked against CPU MuJoCo. Failure isolation is
+tested in a three-world batch: a failing condim-4/6 contact, a successful
+condim-1 normal-contact peer, and a contact-free peer. Statuses are `[3,0,0]`;
+the failed world's state and time roll back exactly while both peers advance
+against CPU references. A targeted reset, cleared diagnostics and replay are
+also checked. The successful peer validates active-contact isolation, not
+high-dimensional moments.
 
 A review-discovered four-contact elliptic box case now checks projected
 stationarity at the retained global multipliers after every coupled iteration.

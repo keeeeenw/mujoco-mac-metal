@@ -20,7 +20,9 @@ Problem 003 review acceptance matrix (each row names an executable test):
 * High-dimensional non-plane primitive pairs:
   ``test_high_dimensional_nonplane_pairs_compare_both_moving_bodies`` in
   ``test_coupled_constraints.py`` (all six non-plane pairs; both bodies' rotational
-  Jacobians and physical wrenches compared; box-box W tolerance 5e-3).
+  Jacobians and physical wrenches compared; all six use W ``rtol=5e-3, atol=3e-3``;
+  box-box has the largest observed error, while the other smaller observations
+  do not have tighter assertion bounds).
 """
 
 import os
@@ -1229,7 +1231,7 @@ def test_high_dimensional_friction_couples_with_articulated_constraints(cone, co
   </mujoco>'''
   model = mujoco.MjModel.from_xml_string(xml)
   qpos0 = model.qpos0.astype(np.float32).copy()
-  qpos0[7:9] = [.18, .18]  # both hinge stops and the scalar equality are active.
+  qpos0[7:9] = [.18, .18]  # j1 is at its limit; j2 couples through equality.
   qvel0 = np.zeros(model.nv, dtype=np.float32)
   qvel0[:6] = [.03, -.02, .01, .05, -.04, .3]  # slide, spin and roll engagement.
   qvel0[6:] = [.02, -.01]  # the active j1 friction-loss row couples through the equality.
@@ -1545,7 +1547,7 @@ def test_condim6_contact_cardinality_restore_reset_and_clear():
 @pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
 @pytest.mark.parametrize("condim", [4, 6])
 def test_friction_failure_isolated_from_active_and_empty_worlds(cone, condim):
-  """One under-iterated high-dim row rolls back beside healthy contact and empty rows."""
+  """A failing high-dim contact rolls back beside condim-1 contact and empty worlds."""
   import torch
 
   xml = f'''<mujoco><option timestep=".002" gravity="0 0 -9.81" cone="{cone}"

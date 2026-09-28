@@ -489,8 +489,9 @@ def test_high_dimensional_nonplane_pairs_compare_both_moving_bodies(
                              rtol=2e-5, atol=4e-6)
   cpu_W = cpu_J @ np.linalg.solve(cpu_mass, cpu_J.T) + np.diag(cpu_R)
   native_W = result["W_regularized"][0].cpu().numpy()[np.ix_(gpu_rows, gpu_rows)]
-  # The box-box manifold uses separately ordered float32 contact points. Its
-  # measured max W difference was 2.60e-3, while simpler pairs stay much tighter.
+  # All six pair fixtures use this same tolerance. Box-box is most sensitive:
+  # its observed max W difference was 2.60e-3, while other observed errors were
+  # smaller; those smaller results do not have tighter assertion bounds.
   np.testing.assert_allclose(native_W, cpu_W, rtol=5e-3, atol=3e-3)
   np.testing.assert_allclose(result["qacc"][0].cpu().numpy(), reference.qacc,
                              rtol=8e-4, atol=2e-2)
