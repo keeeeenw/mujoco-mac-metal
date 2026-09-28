@@ -1761,10 +1761,11 @@ def test_clockwork_parcel_sorter_matched_states_and_sensitivity_audit():
      contact distances (within 1 mm), acceleration max difference (< 2e-3, relative
      error < 1e-4), constraint forces (< 1e-4), and 1-step velocity error (< 3e-6 m/s).
   3. Controlled CPU float32 rounding experiment over 600 steps showing that pure
-     CPU float64 vs float32 rounding produces the same physical deviations
+     CPU float64 vs float32 rounding closely reproduces similar physical deviations
      (max trans <= 0.03 m, rot <= 1.0 rad, lin_vel <= 0.10 m/s, ang_vel <= 2.5 rad/s,
-     and final qpos diff ~0.165) while maintaining identical physical sorting,
-     rigorously justifying the unit-aware demo bounds as IEEE 754 precision dynamics.
+     and final qpos diff ~0.165) while maintaining the same sorting outcome. This
+     supports sensitivity to float32 rounding as the dominant explanation for this
+     demo's divergence; it does not isolate every source of trajectory error.
   """
   import sys
   from pathlib import Path
@@ -1899,7 +1900,8 @@ def test_clockwork_parcel_sorter_matched_states_and_sensitivity_audit():
       ang_v_d = float(np.linalg.norm(d32.qvel[fda+3:fda+6] - d64.qvel[fda+3:fda+6]))
       max_ang_v_cpu32 = max(max_ang_v_cpu32, ang_v_d)
 
-  # Justifies demo physical thresholds from CPU float32 rounding behavior
+  # The CPU32 comparison supports these demo-specific bounds; it is not a universal
+  # bound or a proof that rounding is the only source of trajectory differences.
   assert max_trans_cpu32 <= 0.03
   assert max_rot_cpu32 <= 1.0
   assert max_lin_v_cpu32 <= 0.10
