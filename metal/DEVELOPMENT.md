@@ -138,8 +138,8 @@ rolling travel `0.2040 m` versus `1.0507 m` in the low-friction CPU case, and
 torsional spin `2.057 rad/s` versus `5.774 rad/s`. The press held with zero
 measured drift and the released block moved `0.0972 m`. These are demo-specific
 measurements, not general tolerance guarantees. No performance comparison was
-run for this feature. The four-contact convergence correction required 26 to
-135 native outer sweeps for elliptic cases in the bounded fixture; this is
+run for this feature. The four-contact convergence correction required 31 to
+136 outer iterations for elliptic cases in the bounded fixture; this is
 convergence evidence, not a performance claim.
 
 **Release status:** these friction extensions are not present in the 0.4.0
