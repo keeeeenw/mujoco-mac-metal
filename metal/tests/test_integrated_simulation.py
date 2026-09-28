@@ -1178,79 +1178,207 @@ def test_integrated_simulation_independent_row_recovery_and_replay():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_elliptic_condim6_contact_couples_with_joint_constraints_and_actuation():
-  """Qualify high-dimensional friction in a genuinely mixed constraint system."""
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [4, 6])
+def test_high_dimensional_friction_couples_with_articulated_constraints(cone, condim):
+  """Map and qualify active spin/roll rows coupled to equality, limits and dry friction."""
   import torch
 
-  xml = """<mujoco><option timestep=".002" gravity="0 0 -9.81"
-      cone="elliptic" iterations="1000" tolerance="1e-6">
+  xml = f'''<mujoco><option timestep=".002" gravity="0 0 -9.81" cone="{cone}" impratio=".25"
+      iterations="2048" tolerance="4e-6">
     <flag contact="enable" equality="enable" limit="enable" frictionloss="enable"/>
-    </option>
-    <worldbody>
-      <geom name="floor" type="plane" size="3 3 .1" condim="6" friction=".8 .6 .07"/>
-      <body name="contact-slider" pos="0 0 .095">
-        <joint name="jz" type="slide" axis="0 0 1" range="-1 0"
-            limited="true" margin=".02" frictionloss=".2"/>
-        <geom type="sphere" size=".1" mass=".3" condim="6" friction=".8 .6 .07"/>
-      </body>
-      <body name="linked-slider" pos="1 0 1">
-        <joint name="jx" type="slide" axis="1 0 0" range="-1 0"
-            limited="true" margin=".02" frictionloss=".2"/>
-        <geom type="sphere" size=".1" mass=".3" contype="0" conaffinity="0"/>
+    </option><worldbody>
+      <geom name="floor" type="plane" size="3 3 .1" condim="{condim}" friction=".8 .8 .8"/>
+      <body name="floating-base" pos=".03 -.02 .095"><freejoint/>
+        <geom name="contact" type="sphere" size=".1" mass=".5" condim="{condim}" friction=".8 .8 .8"/>
+        <body name="link1" pos="0 .3 0">
+          <joint name="j1" type="hinge" axis="1 0 0" range="-.2 .2"
+              limited="true" margin=".02" frictionloss=".15"/>
+          <geom type="capsule" fromto="0 0 0 0 .25 0" size=".035" mass=".2"
+              contype="0" conaffinity="0"/>
+          <body name="link2" pos="0 .25 0">
+            <joint name="j2" type="hinge" axis="0 0 1"/>
+            <geom type="sphere" pos="0 .15 0" size=".05" mass=".1"
+                contype="0" conaffinity="0"/>
+          </body>
+        </body>
       </body>
     </worldbody>
-    <equality><joint joint1="jz" joint2="jx" polycoef="0 1 0 0 0"/></equality>
-    <actuator><motor joint="jx" ctrlrange="-1 1"/></actuator>
-  </mujoco>"""
+    <equality><joint name="couple" joint1="j1" joint2="j2" polycoef="0 1 0 0 0"/></equality>
+    <actuator><motor joint="j1" ctrlrange="-2 2"/><motor joint="j2" ctrlrange="-2 2"/></actuator>
+  </mujoco>'''
   model = mujoco.MjModel.from_xml_string(xml)
-  qpos0 = np.array([[0.0, 0.0], [3.0, -0.5]], dtype=np.float32)
-  qvel0 = np.array([[0.3, 0.2], [0.0, 0.0]], dtype=np.float32)
-  sim = MetalSimulation(model, 2, qpos=qpos0, qvel=qvel0, profile="integrated_euler_v1")
+  qpos0 = model.qpos0.astype(np.float32).copy()
+  qpos0[7:9] = [.18, .18]  # both hinge stops and the scalar equality are active.
+  qvel0 = np.zeros(model.nv, dtype=np.float32)
+  qvel0[:6] = [.03, -.02, .01, .05, -.04, .3]  # slide, spin and roll engagement.
+  qvel0[6:] = [.02, -.01]  # the active j1 friction-loss row couples through the equality.
+  control0 = np.array([.005, -.002], dtype=np.float32)
+  sim = MetalSimulation(model, 1, qpos=qpos0[None, :], qvel=qvel0[None, :],
+                        profile="integrated_euler_v1")
+  assembled = sim.assembled_system(ctrl=control0[None, :])
+  assert assembled["status"].cpu().numpy().tolist() == [0], assembled["solver_diagnostics"].cpu().numpy().tolist()
+  assert assembled["contact_mask"].cpu().numpy().tolist() == [[1.0]]
 
-  assembled = sim.assembled_system(ctrl=np.zeros((2, 1), dtype=np.float32))
-  assert assembled["status"].cpu().numpy().tolist() == [0, 0]
-  assert assembled["contact_mask"].cpu().numpy().tolist() == [[1.0], [0.0]]
   reference = mujoco.MjData(model)
-  reference.qpos[:], reference.qvel[:] = qpos0[0], qvel0[0]
+  reference.qpos[:], reference.qvel[:], reference.ctrl[:] = qpos0, qvel0, control0
   mujoco.mj_forward(model, reference)
-  assert reference.ncon == 1 and reference.contact[0].dim == 6
+  assert reference.ncon == 1 and reference.contact[0].dim == condim
   types = set(int(t) for t in reference.efc_type[: reference.nefc])
   assert int(mujoco.mjtConstraint.mjCNSTR_EQUALITY) in types
   assert int(mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT) in types
   assert int(mujoco.mjtConstraint.mjCNSTR_FRICTION_DOF) in types
-  np.testing.assert_allclose(assembled["qacc"][0].cpu().numpy(), reference.qacc,
-                             rtol=5e-4, atol=2e-3)
-  np.testing.assert_allclose(assembled["qfrc_constraint"][0].cpu().numpy(),
-                             reference.qfrc_constraint, rtol=5e-4, atol=2e-3)
+  assert int(mujoco.mjtConstraint.mjCNSTR_CONTACT_ELLIPTIC if cone == "elliptic"
+             else mujoco.mjtConstraint.mjCNSTR_CONTACT_PYRAMIDAL) in types
 
-  cpu = [mujoco.MjData(model) for _ in range(2)]
-  for env, data in enumerate(cpu):
-    data.qpos[:], data.qvel[:] = qpos0[env], qvel0[env]
-    mujoco.mj_forward(model, data)
-  controls = [np.array([[0.15], [0.0]], dtype=np.float32),
-              np.array([[-0.1], [0.0]], dtype=np.float32)] * 4
-  for ctrl in controls[:4]:
-    sim.step(1, ctrl=ctrl)
-    for env, data in enumerate(cpu):
-      data.ctrl[:] = ctrl[env]
-      mujoco.mj_step(model, data)
-  checkpoint = sim.state.snapshot()
-  for ctrl in controls[4:]:
-    sim.step(1, ctrl=ctrl)
-    for env, data in enumerate(cpu):
-      data.ctrl[:] = ctrl[env]
-      mujoco.mj_step(model, data)
-  expected_qpos = sim.state.qpos.clone()
-  expected_qvel = sim.state.qvel.clone()
-  sim.state.restore(checkpoint)
-  for ctrl in controls[4:]:
-    sim.step(1, ctrl=ctrl)
-  assert torch.equal(sim.state.qpos, expected_qpos)
-  assert torch.equal(sim.state.qvel, expected_qvel)
-  np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[0], cpu[0].qpos,
-                             rtol=1e-3, atol=2e-3)
-  np.testing.assert_allclose(sim.state.qvel.cpu().numpy()[0], cpu[0].qvel,
-                             rtol=1e-3, atol=3e-2)
+  # The contact must engage rotational friction, and those rows must couple
+  # through the articulated mass matrix to equality/limit/friction-loss rows.
+  cpu_J = reference.efc_J.reshape(reference.nefc, model.nv)
+  contact_rows = np.flatnonzero(np.isin(reference.efc_type, [
+      int(mujoco.mjtConstraint.mjCNSTR_CONTACT_ELLIPTIC),
+      int(mujoco.mjtConstraint.mjCNSTR_CONTACT_PYRAMIDAL),
+  ]))
+  joint_rows = np.flatnonzero(~np.isin(reference.efc_type, [
+      int(mujoco.mjtConstraint.mjCNSTR_CONTACT_ELLIPTIC),
+      int(mujoco.mjtConstraint.mjCNSTR_CONTACT_PYRAMIDAL),
+  ]))
+  assert len(contact_rows) == (condim if cone == "elliptic" else 2 * (condim - 1))
+  assert np.linalg.norm(cpu_J[contact_rows[1:]]) > .1
+  cpu_mass = np.zeros((model.nv, model.nv), dtype=np.float64)
+  mujoco.mj_fullM(model, reference, cpu_mass)
+  cpu_W = cpu_J @ np.linalg.solve(cpu_mass, cpu_J.T) + np.diag(reference.efc_R)
+  assert np.linalg.norm(cpu_W[np.ix_(contact_rows[1:], joint_rows)]) > .1
+
+  # Map each CPU active row to its native row by the complete row signature.
+  # The signature preserves cone-specific edge/block layouts while remaining
+  # independent of their differing row order.
+  gpu_J = assembled["J"][0].cpu().numpy()
+  gpu_R = assembled["R"][0].cpu().numpy()
+  gpu_ar = assembled["ar"][0].cpu().numpy()
+  gpu_rhs = assembled["rhs"][0].cpu().numpy()
+  active_gpu = np.flatnonzero(np.linalg.norm(gpu_J, axis=1) > 1e-6)
+  assert len(active_gpu) == reference.nefc
+  gpu_for_cpu = []
+  unused = set(map(int, active_gpu))
+  for cpu_row in range(reference.nefc):
+    costs = []
+    for gpu_row in unused:
+      costs.append((
+          np.linalg.norm(gpu_J[gpu_row] - cpu_J[cpu_row])
+          + abs(gpu_R[gpu_row] - reference.efc_R[cpu_row])
+          + abs(gpu_ar[gpu_row] - reference.efc_aref[cpu_row])
+          + abs(gpu_rhs[gpu_row] + reference.efc_b[cpu_row]),
+          gpu_row,
+      ))
+    cost, gpu_row = min(costs)
+    assert cost < 2e-2, (cone, condim, cpu_row, gpu_row, cost)
+    gpu_for_cpu.append(gpu_row)
+    unused.remove(gpu_row)
+  gpu_for_cpu = np.asarray(gpu_for_cpu, dtype=np.int64)
+  np.testing.assert_allclose(gpu_J[gpu_for_cpu], cpu_J, rtol=2e-5, atol=2e-5)
+  np.testing.assert_allclose(gpu_R[gpu_for_cpu], reference.efc_R, rtol=2e-4, atol=2e-5)
+  np.testing.assert_allclose(gpu_ar[gpu_for_cpu], reference.efc_aref, rtol=2e-4, atol=2e-3)
+  np.testing.assert_allclose(gpu_rhs[gpu_for_cpu], -reference.efc_b, rtol=2e-4, atol=2e-3)
+
+  M_gpu = assembled["mass_matrix"][0].cpu().numpy()
+  np.testing.assert_allclose(M_gpu, cpu_mass, rtol=2e-5, atol=3e-6)
+  mapped_W = assembled["W_regularized"][0].cpu().numpy()[np.ix_(gpu_for_cpu, gpu_for_cpu)]
+  np.testing.assert_allclose(mapped_W, cpu_W, rtol=3e-5, atol=5e-5)
+  friction_cross = mapped_W[np.ix_(contact_rows[1:], joint_rows)]
+  assert np.linalg.norm(friction_cross) > .1
+
+  # Explicit frame Jacobian and physical wrench checks make torsional and
+  # rolling engagement observable, rather than relying on condim metadata.
+  point_jac = np.zeros((3, model.nv))
+  rotation_jac = np.zeros((3, model.nv))
+  body = int(model.geom_bodyid[reference.contact[0].geom[1]])
+  mujoco.mj_jac(model, reference, point_jac, rotation_jac,
+                reference.contact[0].pos, body)
+  axes = np.asarray(reference.contact[0].frame).reshape(3, 3)
+  expected_contact_jac = np.vstack([axes @ point_jac, axes @ rotation_jac])
+  native_contact_jac = assembled["contact_jacobian"][0, 0].cpu().numpy()
+  np.testing.assert_allclose(native_contact_jac, expected_contact_jac, rtol=2e-5, atol=3e-6)
+  assert np.linalg.norm(native_contact_jac[3:]) > .1
+  native_wrench = assembled["contact_wrench"][0, 0].cpu().numpy()
+  cpu_wrench = np.zeros(6)
+  mujoco.mj_contactForce(model, reference, 0, cpu_wrench)
+  np.testing.assert_allclose(native_wrench, cpu_wrench, rtol=5e-4, atol=8e-2)
+  assert abs(native_wrench[3]) > .1
+  if condim == 6:
+    assert np.linalg.norm(native_wrench[4:]) > .1
+
+  np.testing.assert_allclose(assembled["qacc"][0].cpu().numpy(), reference.qacc,
+                             rtol=1e-3, atol=2e-2)
+  np.testing.assert_allclose(assembled["qfrc_constraint"][0].cpu().numpy(),
+                             reference.qfrc_constraint, rtol=1e-3, atol=3e-2)
+
+  # Independent product-cone projected stationarity at the returned lambda.
+  lam = assembled["lambda"][0].cpu().numpy().astype(np.float64)[gpu_for_cpu]
+  W = mapped_W.astype(np.float64)
+  rhs = (-reference.efc_b).astype(np.float64)
+  scale = np.ones(reference.nefc, dtype=np.float64)
+  is_elliptic_contact = np.isin(reference.efc_type, [
+      int(mujoco.mjtConstraint.mjCNSTR_CONTACT_ELLIPTIC),
+  ])
+  if cone == "elliptic":
+    for j, cpu_row in enumerate(contact_rows):
+      if j == 0:
+        continue
+      scale[cpu_row] = np.asarray([.8, .8, .8, .8, .8])[j - 1]
+  y = lam / scale
+  H = scale[:, None] * W * scale[None, :]
+  gradient = H @ y - scale * rhs
+  lipschitz = max(1e-12, float(np.max(np.sum(np.abs(H), axis=1))))
+  projected = y - gradient / lipschitz
+  lower = np.full(reference.nefc, -np.inf)
+  upper = np.full(reference.nefc, np.inf)
+  for cpu_row, gpu_row in enumerate(gpu_for_cpu):
+    kind = int(reference.efc_type[cpu_row])
+    if kind == int(mujoco.mjtConstraint.mjCNSTR_FRICTION_DOF):
+      dof = int(np.argmax(np.abs(cpu_J[cpu_row])))
+      lower[cpu_row], upper[cpu_row] = -model.dof_frictionloss[dof], model.dof_frictionloss[dof]
+    elif kind == int(mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT) or (
+        kind == int(mujoco.mjtConstraint.mjCNSTR_CONTACT_PYRAMIDAL)
+    ):
+      lower[cpu_row] = 0.0
+  projected = np.clip(projected, lower, upper)
+  if cone == "elliptic":
+    for start in range(min(contact_rows), max(contact_rows) + 1, condim):
+      rows = np.arange(start, start + condim)
+      if not np.all(is_elliptic_contact[rows]):
+        continue
+      block = projected[rows]
+      tail = np.linalg.norm(block[1:])
+      if tail > block[0]:
+        if tail <= -block[0]:
+          projected[rows] = 0
+        else:
+          head = .5 * (tail + block[0])
+          projected[rows] = np.r_[head, block[1:] * (head / tail)]
+  host_residual = np.linalg.norm(y - projected, ord=np.inf) * lipschitz / max(
+      1.0, np.linalg.norm(H @ y, ord=np.inf) + np.linalg.norm(scale * rhs, ord=np.inf)
+  )
+  assert host_residual <= 2e-5, (cone, condim, host_residual)
+
+  # Short varying-control trajectory against the CPU oracle.
+  cpu = mujoco.MjData(model)
+  cpu.qpos[:], cpu.qvel[:] = qpos0, qvel0
+  controls = [np.array([.005, -.002]), np.array([-.003, .004]),
+              np.array([.001, .002]), np.array([-.002, -.001]),
+              np.array([.004, -.003]), np.array([-.001, .003])]
+  max_qpos_err = max_qvel_err = max_qacc_err = 0.0
+  for control in controls:
+    control = control.astype(np.float32)
+    sim.step(1, ctrl=control[None, :])
+    cpu.ctrl[:] = control
+    mujoco.mj_step(model, cpu)
+    assert sim.state.status[0].item() == 0, (control, sim._last_coupled["solver_diagnostics"][0].cpu().numpy().tolist())
+    max_qpos_err = max(max_qpos_err, float(np.max(np.abs(sim.state.qpos[0].cpu().numpy() - cpu.qpos))))
+    max_qvel_err = max(max_qvel_err, float(np.max(np.abs(sim.state.qvel[0].cpu().numpy() - cpu.qvel))))
+    max_qacc_err = max(max_qacc_err, float(np.max(np.abs(sim.state.qacc[0].cpu().numpy() - cpu.qacc))))
+  assert max_qpos_err < 2e-3, (cone, condim, max_qpos_err)
+  assert max_qvel_err < 3e-2, (cone, condim, max_qvel_err)
+  assert max_qacc_err < 3e-1, (cone, condim, max_qacc_err)
   assert torch.isfinite(sim.state.qpos).all()
 
 
