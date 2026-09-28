@@ -1384,6 +1384,101 @@ def test_high_dimensional_friction_couples_with_articulated_constraints(cone, co
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [4, 6])
+@pytest.mark.parametrize("dt", [0.001, 0.004])
+@pytest.mark.parametrize("spin_sign", [-1.0, 1.0])
+def test_high_dimensional_spin_slip_separation_and_reimpact(cone, condim, dt, spin_sign):
+  """Match CPU spin/roll/slip while a high-dimensional contact leaves and returns."""
+  xml = f'''<mujoco><option timestep="{dt}" gravity="0 0 -9.81" cone="{cone}"
+      iterations="1000" tolerance="1e-6"/>
+    <worldbody><geom name="floor" type="plane" size="3 3 .1" condim="{condim}"
+        friction=".8 .6 .07"/>
+      <body name="ball" pos="0 0 .0999"><freejoint name="free"/>
+        <geom name="ballg" type="sphere" size=".1" mass=".3"
+            condim="{condim}" friction=".8 .6 .07"/>
+      </body>
+    </worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos0 = np.asarray(model.qpos0, dtype=np.float32).copy()
+  qvel0 = np.array([.02, -.01, .08,
+                    .3 * spin_sign, -.5, 1.2 * spin_sign], dtype=np.float32)
+  sim = MetalSimulation(model, 1, qpos=qpos0[None, :], qvel=qvel0[None, :],
+                        profile="integrated_euler_v1")
+  cpu = mujoco.MjData(model)
+  cpu.qpos[:], cpu.qvel[:] = qpos0, qvel0
+
+  transitions = []
+  max_qpos_error = max_qvel_error = max_qacc_error = max_force_error = 0.0
+  max_torsion = max_rolling = 0.0
+  max_slip_velocity = max_spin_velocity = max_roll_velocity = 0.0
+  nsteps = int(round(.04 / dt)) + 2
+  for step in range(nsteps):
+    native = sim.assembled_system(recompute=True)
+    mujoco.mj_forward(model, cpu)
+    assert int(native["status"][0]) == 0
+    native_contact = bool(native["contact_mask"][0, 0].item() > .5)
+    cpu_contact = cpu.ncon > 0
+    assert native_contact == cpu_contact
+    if not transitions or transitions[-1][1] != native_contact:
+      transitions.append((step, native_contact))
+
+    if native_contact:
+      assert cpu.ncon == 1
+      native_wrench = native["contact_wrench"][0, 0].cpu().numpy()
+      cpu_wrench = np.zeros(6)
+      mujoco.mj_contactForce(model, cpu, 0, cpu_wrench)
+      np.testing.assert_allclose(native_wrench, cpu_wrench, rtol=8e-4, atol=8e-2)
+      max_torsion = max(max_torsion, abs(float(native_wrench[3])))
+      max_rolling = max(max_rolling, float(np.linalg.norm(native_wrench[4:])))
+
+      # Verify the active velocity includes tangential slip and rotational
+      # spin; condim=6 additionally exposes both rolling-axis velocities.
+      point_jac = np.zeros((3, model.nv))
+      rotation_jac = np.zeros((3, model.nv))
+      body = int(model.geom_bodyid[cpu.contact[0].geom[1]])
+      mujoco.mj_jac(model, cpu, point_jac, rotation_jac, cpu.contact[0].pos, body)
+      axes = np.asarray(cpu.contact[0].frame).reshape(3, 3)
+      contact_jac = np.vstack([axes @ point_jac, axes @ rotation_jac])
+      contact_velocity = contact_jac @ cpu.qvel
+      max_slip_velocity = max(max_slip_velocity,
+                              float(np.linalg.norm(contact_velocity[1:3])))
+      max_spin_velocity = max(max_spin_velocity, abs(float(contact_velocity[3])))
+      max_roll_velocity = max(max_roll_velocity,
+                              float(np.linalg.norm(contact_velocity[4:])))
+
+    np.testing.assert_allclose(native["qacc"][0].cpu().numpy(), cpu.qacc,
+                               rtol=1e-3, atol=3e-2)
+    np.testing.assert_allclose(native["qfrc_constraint"][0].cpu().numpy(),
+                               cpu.qfrc_constraint, rtol=1e-3, atol=8e-2)
+    max_qacc_error = max(max_qacc_error, float(np.max(np.abs(native["qacc"][0].cpu().numpy() - cpu.qacc))))
+    max_force_error = max(max_force_error, float(np.max(np.abs(native["qfrc_constraint"][0].cpu().numpy() - cpu.qfrc_constraint))))
+
+    if step + 1 < nsteps:
+      sim.step(1)
+      mujoco.mj_step(model, cpu)
+      assert sim.state.status[0].item() == 0
+      max_qpos_error = max(max_qpos_error, float(np.max(np.abs(sim.state.qpos[0].cpu().numpy() - cpu.qpos))))
+      max_qvel_error = max(max_qvel_error, float(np.max(np.abs(sim.state.qvel[0].cpu().numpy() - cpu.qvel))))
+
+  assert transitions[0][1] is True
+  assert any(not contact for _, contact in transitions)
+  first_separation = next(index for index, contact in transitions if not contact)
+  assert any(contact for index, contact in transitions if index > first_separation)
+  assert max_torsion > .05
+  assert max_slip_velocity > .015
+  assert max_spin_velocity > .5
+  if condim == 6:
+    assert max_rolling > .005
+    assert max_roll_velocity > .5
+  assert max_qpos_error < 2e-5, (cone, condim, dt, max_qpos_error)
+  assert max_qvel_error < 2e-4, (cone, condim, dt, max_qvel_error)
+  assert max_qacc_error < 3e-2, (cone, condim, dt, max_qacc_error)
+  assert max_force_error < 8e-2, (cone, condim, dt, max_force_error)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_condim6_contact_cardinality_restore_reset_and_clear():
   """Contact/no-contact worlds survive deterministic restore and selected reset."""
   import torch
