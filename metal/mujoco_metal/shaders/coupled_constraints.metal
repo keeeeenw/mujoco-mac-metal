@@ -419,6 +419,47 @@ inline void project_lorentz(thread float* x, int dim) {
   for (int i = 1; i < dim; ++i) x[i] *= scale;
 }
 
+inline float elliptic_projected_residual(thread const float* A,
+    thread const float* g, thread const float* friction, int dim,
+    thread const float* force) {
+  thread float scale[6], H[36], linear[6], y[6], projected[6];
+  for (int i = 0; i < 6; ++i) {
+    scale[i] = i == 0 ? 1.0f : max(friction[i - 1], 0.0f);
+    y[i] = projected[i] = 0.0f;
+    linear[i] = 0.0f;
+  }
+  for (int i = 0; i < 36; ++i) H[i] = 0.0f;
+  y[0] = force[0];
+  for (int i = 1; i < dim; ++i) {
+    y[i] = scale[i] > 1e-12f ? force[i] / scale[i] : 0.0f;
+  }
+  for (int i = 0; i < dim; ++i) {
+    linear[i] = scale[i] * g[i];
+    for (int j = 0; j < dim; ++j) H[i * 6 + j] = scale[i] * A[i * 6 + j] * scale[j];
+  }
+  float lipschitz = 1e-15f;
+  for (int i = 0; i < dim; ++i) {
+    float row_sum = 0.0f;
+    for (int j = 0; j < dim; ++j) row_sum += abs(H[i * 6 + j]);
+    lipschitz = max(lipschitz, row_sum);
+  }
+  // Measure stationarity at the retained global force. A convergence check
+  // must not run a second local optimizer whose result is thrown away, since
+  // coupled contacts can change this block's optimum.
+  float residual = 0.0f, scale_ref = 1.0f;
+  for (int i = 0; i < dim; ++i) {
+    float gradient = linear[i];
+    for (int j = 0; j < dim; ++j) gradient += H[i * 6 + j] * y[j];
+    projected[i] = y[i] - gradient / lipschitz;
+    scale_ref += abs(linear[i]);
+    for (int j = 0; j < dim; ++j) scale_ref += abs(H[i * 6 + j] * y[j]);
+  }
+  project_lorentz(projected, dim);
+  for (int i = 0; i < dim; ++i)
+    residual = max(residual, abs(y[i] - projected[i]) * lipschitz / scale_ref);
+  return residual;
+}
+
 inline float solve_elliptic_block(thread const float* A, thread const float* g,
     thread const float* friction, int dim, thread float* force) {
   thread float scale[6], H[36], linear[6], y[6], z[6], next[6];
@@ -429,9 +470,8 @@ inline float solve_elliptic_block(thread const float* A, thread const float* g,
   }
   for (int i = 0; i < 36; ++i) H[i] = 0.0f;
   y[0] = max(0.0f, force[0]);
-  for (int i = 1; i < dim; ++i) {
+  for (int i = 1; i < dim; ++i)
     y[i] = scale[i] > 1e-12f ? force[i] / scale[i] : 0.0f;
-  }
   project_lorentz(y, dim);
   for (int i = 0; i < dim; ++i) z[i] = y[i];
   for (int i = 0; i < dim; ++i) {
@@ -462,17 +502,7 @@ inline float solve_elliptic_block(thread const float* A, thread const float* g,
     momentum = next_momentum;
   }
   for (int i = 0; i < dim; ++i) force[i] = scale[i] * y[i];
-  float residual = 0.0f, scale_ref = 1.0f;
-  for (int i = 0; i < dim; ++i) {
-    float gradient = linear[i];
-    for (int j = 0; j < dim; ++j) gradient += H[i * 6 + j] * y[j];
-    next[i] = y[i] - gradient / lipschitz;
-    scale_ref += abs(linear[i]);
-    for (int j = 0; j < dim; ++j) scale_ref += abs(H[i * 6 + j] * y[j]);
-  }
-  project_lorentz(next, dim);
-  for (int i = 0; i < dim; ++i) residual = max(residual, abs(y[i] - next[i]) * lipschitz / scale_ref);
-  return residual;
+  return elliptic_projected_residual(A, g, friction, dim, force);
 }
 
 kernel void solve_coupled_constraints(
@@ -884,7 +914,7 @@ kernel void solve_coupled_constraints(
             A[i * 6 + j] = W[ri * nr + rj] + (i == j ? R[ri] : 0.0f);
           }
         }
-        max_res = max(max_res, solve_elliptic_block(A, g, mu, dim, force));
+        max_res = max(max_res, elliptic_projected_residual(A, g, mu, dim, force));
         continue;
       }
       float grad = -rhs[row];
