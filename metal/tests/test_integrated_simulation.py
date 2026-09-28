@@ -1427,42 +1427,125 @@ def test_condim6_contact_cardinality_restore_reset_and_clear():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_condim6_contact_failure_rolls_back_and_recovers_per_world():
-  """A failed elliptic-contact solve rolls back without stopping healthy worlds."""
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [4, 6])
+def test_friction_failure_isolated_from_active_and_empty_worlds(cone, condim):
+  """One under-iterated high-dim row rolls back beside healthy contact and empty rows."""
   import torch
 
-  xml = """<mujoco><option timestep=".002" gravity="0 0 -9.81"
-      cone="elliptic" iterations="2" tolerance="1e-6"/>
-    <worldbody><geom type="plane" size="3 3 .1" condim="6" friction=".8 .6 .07"/>
-      <body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1"
-          mass=".3" condim="6" friction=".8 .6 .07"/></body>
-    </worldbody></mujoco>"""
+  xml = f'''<mujoco><option timestep=".002" gravity="0 0 -9.81" cone="{cone}"
+      iterations="2" tolerance="1e-6"/>
+    <worldbody><geom name="floor" type="plane" size="5 5 .1"/>
+      <body name="simple-body" pos="0 0 .095"><freejoint name="simple-free"/>
+        <geom name="simple" type="sphere" size=".1" mass=".3" condim="1"
+            contype="0" conaffinity="0"/>
+      </body>
+      <body name="friction-body" pos="1 0 .095"><freejoint name="friction-free"/>
+        <geom name="friction" type="sphere" size=".1" mass=".3"
+            condim="{condim}" friction=".8 .8 .8" contype="0" conaffinity="0"/>
+      </body>
+    </worldbody>
+    <contact>
+      <pair geom1="floor" geom2="simple" condim="1"/>
+      <pair geom1="floor" geom2="friction" condim="{condim}" friction=".8 .8 .8"/>
+    </contact>
+  </mujoco>'''
   model = mujoco.MjModel.from_xml_string(xml)
-  contact = np.asarray(model.qpos0, dtype=np.float32).copy()
-  empty = contact.copy()
-  empty[:3] = [3.0, 0.0, 0.3]
-  qpos = np.stack([contact, empty, contact])
+  simple_joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "simple-free")
+  friction_joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "friction-free")
+  simple_qadr = int(model.jnt_qposadr[simple_joint])
+  friction_qadr = int(model.jnt_qposadr[friction_joint])
+  simple_dadr = int(model.jnt_dofadr[simple_joint])
+  friction_dadr = int(model.jnt_dofadr[friction_joint])
+  default = np.asarray(model.qpos0, dtype=np.float32).copy()
+  failed = default.copy()
+  failed[simple_qadr : simple_qadr + 3] = [3.0, 0.0, 0.3]
+  failed[friction_qadr : friction_qadr + 3] = [0.0, 0.0, 0.095]
+  active = default.copy()
+  active[simple_qadr : simple_qadr + 3] = [0.0, 0.0, 0.095]
+  active[friction_qadr : friction_qadr + 3] = [3.0, 0.0, 0.3]
+  empty = default.copy()
+  empty[simple_qadr : simple_qadr + 3] = [3.0, 0.0, 0.3]
+  empty[friction_qadr : friction_qadr + 3] = [6.0, 0.0, 0.3]
+  qpos = np.stack([failed, active, empty])
   qvel = np.zeros((3, model.nv), dtype=np.float32)
-  qvel[0, 0] = 0.3
-  qvel[2, 0], qvel[2, 3:6] = 5.0, [1.0, -2.0, 3.0]
+  qvel[0, friction_dadr : friction_dadr + 6] = [.01, -.005, 0, .01, -.01, .03]
+  qvel[1, simple_dadr : simple_dadr + 6] = [.03, -.01, 0, 0, 0, 0]
   sim = MetalSimulation(model, 3, qpos=qpos, qvel=qvel, profile="integrated_euler_v1")
+  time0 = sim.state.time.clone()
   sim.step(1)
-  assert sim.state.status.cpu().numpy().tolist() == [3, 0, 3]
-  np.testing.assert_allclose(sim.state.qpos[[0, 2]].cpu().numpy(), qpos[[0, 2]], atol=0)
-  np.testing.assert_allclose(sim.state.qvel[[0, 2]].cpu().numpy(), qvel[[0, 2]], atol=0)
-  assert not torch.equal(sim.state.qpos[1], torch.as_tensor(empty, device="mps"))
-  stable_healthy = sim.state.qpos[1].clone()
-  sim.step(1)
-  assert sim.state.status.cpu().numpy().tolist() == [3, 0, 3]
-  assert not torch.equal(sim.state.qpos[1], stable_healthy)
+  assert sim.state.status.cpu().numpy().tolist() == [3, 0, 0]
+  assert sim._last_coupled["solver_diagnostics"][0, 0].item() > 1e-6
+  np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), qpos[0], atol=0)
+  np.testing.assert_allclose(sim.state.qvel[0].cpu().numpy(), qvel[0], atol=0)
+  assert sim.state.time[0].item() == time0[0].item()
+  assert sim.state.time[1].item() > time0[1].item()
+  assert sim.state.time[2].item() > time0[2].item()
+  desc = sim._coupled_constraints.descriptor
+  simple_slot = int(desc.pair_contact_offset[0])
+  friction_slot = int(desc.pair_contact_offset[1])
+  mask = sim._last_coupled["contact_mask"].cpu().numpy()
+  assert mask[0, friction_slot] == 1.0
+  assert mask[1, simple_slot] == 1.0
+  assert np.count_nonzero(mask[2]) == 0
+  healthy_wrench = sim._last_coupled["contact_wrench"][1, simple_slot].cpu().numpy()
+  assert healthy_wrench[0] > .1
 
-  raised = empty.copy()
-  sim.state.reset(env_ids=[0, 2], qpos=[raised, raised],
-                  qvel=np.zeros((2, model.nv), dtype=np.float32))
+  # Match the successful active-contact and contact-free rows against CPU;
+  # the failed world is expected to exhaust the deliberately tiny budget.
+  cpu = [mujoco.MjData(model) for _ in range(3)]
+  for env, data in enumerate(cpu):
+    data.qpos[:], data.qvel[:] = qpos[env], qvel[env]
+    mujoco.mj_step(model, data)
+  np.testing.assert_allclose(sim.state.qpos[1].cpu().numpy(), cpu[1].qpos, rtol=1e-5, atol=2e-5)
+  np.testing.assert_allclose(sim.state.qvel[1].cpu().numpy(), cpu[1].qvel, rtol=1e-4, atol=2e-4)
+  np.testing.assert_allclose(sim.state.qacc[1].cpu().numpy(), cpu[1].qacc, rtol=1e-4, atol=2e-3)
+  np.testing.assert_allclose(sim._last_coupled["qfrc_constraint"][1].cpu().numpy(),
+                             cpu[1].qfrc_constraint, rtol=1e-4, atol=2e-3)
+  np.testing.assert_allclose(sim.state.qpos[2].cpu().numpy(), cpu[2].qpos, rtol=1e-5, atol=2e-5)
+  healthy_after_first = sim.state.qpos[1].clone()
+  empty_after_first = sim.state.qpos[2].clone()
+
+  # Failure remains sticky while the two healthy neighbors continue.
+  sim.step(1)
+  assert sim.state.status.cpu().numpy().tolist() == [3, 0, 0]
+  np.testing.assert_array_equal(sim.state.qpos[0].cpu().numpy(), qpos[0])
+  np.testing.assert_array_equal(sim.state.qvel[0].cpu().numpy(), qvel[0])
+  assert sim.state.time[0].item() == time0[0].item()
+  assert not torch.equal(sim.state.qpos[1], healthy_after_first)
+  assert not torch.equal(sim.state.qpos[2], empty_after_first)
+  for env in (1, 2):
+    mujoco.mj_step(model, cpu[env])
+    np.testing.assert_allclose(sim.state.qpos[env].cpu().numpy(), cpu[env].qpos,
+                               rtol=1e-5, atol=3e-5)
+    np.testing.assert_allclose(sim.state.qvel[env].cpu().numpy(), cpu[env].qvel,
+                               rtol=1e-4, atol=3e-4)
+
+  recovered = qpos[0].copy()
+  recovered[friction_qadr : friction_qadr + 3] = [6.0, 0.0, 0.3]
+  healthy_before_reset = sim.state.qpos[1].clone()
+  empty_before_reset = sim.state.qpos[2].clone()
+  sim.state.reset(env_ids=[0], qpos=[recovered], qvel=np.zeros((1, model.nv), dtype=np.float32))
   assert sim.state.status.cpu().numpy().tolist() == [0, 0, 0]
+  assert torch.equal(sim.state.qpos[1], healthy_before_reset)
+  assert torch.equal(sim.state.qpos[2], empty_before_reset)
   cleared = sim.assembled_system(recompute=True)
-  assert cleared["contact_mask"].cpu().numpy().tolist() == [[0.0], [0.0], [0.0]]
-  assert torch.count_nonzero(cleared["contact_force"]).item() == 0
+  assert np.count_nonzero(cleared["contact_mask"][0].cpu().numpy()) == 0
+  assert cleared["contact_mask"][1, simple_slot].item() == 1.0
+  assert torch.count_nonzero(cleared["contact_wrench"][0]).item() == 0
+  assert cleared["contact_wrench"][1, simple_slot, 0].item() > .1
+  assert cleared["solver_diagnostics"][0, 1].item() == 1.0
+  assert cleared["solver_diagnostics"][0, 0].item() == 0.0
+
+  # Restore and replay from a mixed active/empty cardinality snapshot.
+  snapshot = sim.state.snapshot()
+  sim.step(3)
+  replay_qpos, replay_qvel, replay_time = sim.state.qpos.clone(), sim.state.qvel.clone(), sim.state.time.clone()
+  sim.state.restore(snapshot)
+  sim.step(3)
+  assert torch.equal(sim.state.qpos, replay_qpos)
+  assert torch.equal(sim.state.qvel, replay_qvel)
+  assert torch.equal(sim.state.time, replay_time)
   sim.step(1)
   assert sim.state.status.cpu().numpy().tolist() == [0, 0, 0]
   assert torch.isfinite(sim.state.qpos).all()
