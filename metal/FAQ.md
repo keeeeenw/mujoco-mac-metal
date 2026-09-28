@@ -131,7 +131,12 @@ inertial/gravity bias, dense SPD solves, joint-coordinate integration, and the
 bounded `contact_free_euler_v1` pipeline on local M1 fixtures compared with
 MuJoCo 3.10. Additional 0.4.0 profiles cover bounded springs, fluids,
 servos/fixed tendons, RK4/implicitfast, sphere contact, joint constraints and
-current-state sensors. [Development coverage](DEVELOPMENT.md) lists each subset,
+current-state sensors. Current main additionally qualifies integrated Euler with
+primitive collision manifolds, pyramidal/elliptic condim1/3/4/6 friction and
+coupled scalar constraints. Those additions require the
+[source installation](INSTALL.md#development-source); they are not included in
+the published 0.4.0 wheel. Connect/weld equalities and runtime equality activation
+remain unsupported. [Development coverage](DEVELOPMENT.md) lists each subset,
 its CPU-reference evidence and the substantial remaining gaps. Native rendering,
 training and full-library coverage remain unsupported. Features outside the selected profile are rejected.
 Validation of a separate robot-specific backend does not extend this

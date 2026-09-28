@@ -35,9 +35,11 @@ it does not qualify every model or MuJoCo feature.
 
 ## Development source
 
-The **0.4.0** wheel contains the physics package and all shaders. Clone the
-repository for the milestone demo scripts, XML models and GIFs, or to modify
-the source. The following installs an editable checkout in an isolated environment:
+The published **0.4.0** wheel contains the earlier physics profiles and their
+shaders. Integrated Euler, expanded primitive collisions and condim-1/3/4/6
+friction are qualified in current `main` and require a source installation.
+Clone the repository for those features and the demo scripts, XML models and GIFs.
+The following installs an editable checkout in an isolated environment:
 
 ```sh
 git clone https://github.com/keeeeenw/mujoco-mac-metal.git
@@ -71,9 +73,11 @@ PYTHONPATH=metal python -m pytest -q metal/tests
 MUJOCO_METAL_RUN_GPU=1 PYTHONPATH=metal python -m pytest -q metal/tests
 ```
 
-Keep the GPU idle for qualification. The current source checkpoint passed 257
+Keep the GPU idle for qualification. Source revision `18acd8cab` passed 402
 tests with GPU execution enabled. A separate environment without Torch passed
-138 CPU tests, with 116 checks skipped. Optional Torch dependencies change
+175 CPU tests, with 224 checks skipped. The final assertion/documentation update
+at `6730f849e` passed 19 focused native tests with the implementation unchanged.
+Optional Torch dependencies change
 test collection, so the two totals are not directly additive.
 
 ## Local distribution build
@@ -90,12 +94,13 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal doctor --gpu
 ```
 
 The filename follows `metal/pyproject.toml`; update it when changing versions.
-The 0.4.0 wheel was installed in a clean Python 3.12 environment on the M1 Max
+The published 0.4.0 wheel was installed in a clean Python 3.12 environment on the M1 Max
 and passed the GPU doctor check plus all 257 package tests with native GPU
 execution enabled and MPS fallback disabled. The installed module path was
 checked to exclude the source checkout. All 39 packaged Python/shader files
 matched the tested installation. The wheel includes all 15 shader resources. Building
-or pushing source does not publish a release.
+or pushing source does not publish a release. Those installed-wheel results
+describe the published release, not a new wheel built from current main.
 
 ## PyPI release
 

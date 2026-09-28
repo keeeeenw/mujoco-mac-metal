@@ -10,7 +10,7 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Tumbling toys](tumbling_toys.md) | Colorful asymmetric objects spin around three different axes | Quaternion-aware RK4 |
 | [Marble cascade](marble_cascade.md) | Three marbles collide on a tilted plane | Normal plane–sphere and sphere–sphere contact |
 | [Friction laboratory](friction_laboratory.md) | Low, medium, and high friction turn sliding into rolling at different rates | Pyramidal condim-3 contact |
-| [Spin-and-Grip arcade](spin_and_grip.md) | A rolling ball slows, a top loses spin, and an actuated press holds and releases a sliding block | Integrated elliptic condim-4/6 torsional and rolling friction |
+| [Spin-and-Grip arcade](spin_and_grip.md) | A rolling sphere slows, a spinning sphere loses spin, and an actuated press holds and releases a sliding block | Integrated elliptic condim-4/6 torsional and rolling friction; condim-3 press contact |
 | [Sensor scanning rig](scanning_rig.md) | A pan/tilt scanner plots its measured pose and direction | Current-state frame, gyro and velocity sensors |
 | [Cable plotter](cable_plotter.md) | Crossed tendons guide an XY pen around a figure eight | Fixed-joint tendon servos |
 | [Clockwork automaton](clockwork_automaton.md) | Counter-rotating gears and a sequenced pawl | Polynomial joint equality, limits and dry joint friction |
@@ -21,8 +21,9 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Clockwork parcel sorter](clockwork_parcel_sorter.md) | Real box parcels, capsule rollers, and swinging diverter gates routing parcels to bins | Complete primitive collisions: multi-contact manifolds across planes, spheres, capsules, boxes, coupled Euler solve |
 | [Chaotic pendulum](README.md) | Four connected arms swing and tumble | Generalized rigid-body mass and bias |
 
-Use version **0.4.0 or newer** and the [demo/source setup](../INSTALL.md#development-source).
-Demo scripts and assets live in the repository; the wheel supplies the physics
-package.
+Use current `main` and the [demo/source setup](../INSTALL.md#development-source).
+Spin-and-Grip, the parcel sorter and the marble music machine require the source
+physics package; the published 0.4.0 wheel does not include integrated Euler.
+Demo scripts, XML models and GIFs live in the repository.
 Follow the command in each guide. Most new demos produce numerical reports
 and optional GIFs; an interactive viewer is available only where documented. Rendering currently uses MuJoCo OpenGL.

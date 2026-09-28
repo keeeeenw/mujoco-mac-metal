@@ -1,20 +1,23 @@
 # Native physics development coverage
 
-The released **0.4.0** package provides the bounded profiles below. The in-progress
-`feature/problem-003-contact-friction` branch additionally develops condim-1/3/4/6
-contact friction; this unreleased change requires review before it ships. Use the
-[source setup](INSTALL.md#development-source) for branch demos and assets.
+Current `main` includes independently qualified integrated Euler physics,
+primitive collision manifolds and condim-1/3/4/6 contact friction. These additions
+are available from source and are **not in the published 0.4.0 wheel**, which
+contains the earlier separate bounded profiles. Use the
+[source setup](INSTALL.md#development-source) for the integrated demos and assets.
 The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
 
-The full source suite passed **402 tests with native MPS execution enabled** and
+At source revision `18acd8cab`, the full suite passed **402 tests with native MPS execution enabled** and
 fallback disabled. An isolated environment with Torch removed passed **175 tests**
 and skipped **224 GPU-dependent tests**. These results describe this source
 snapshot and do not establish coverage of every MuJoCo feature.
 
-This branch is based on accepted source checkpoint `370606776`; Problem 003 changes
-are isolated on `feature/problem-003-contact-friction`. Tests ran on an M1 Max with 32 GB unified memory. Numerical
+Final source revision `6730f849e` restores an independent elliptic residual
+assertion and corrects documentation; **19 focused native tests passed** on that
+revision. The physics implementation is unchanged from the full-suite run.
+Tests ran on an M1 Max with 32 GB unified memory. Numerical
 qualification is separate from performance qualification: the older pendulum
 benchmark has not been rerun for the additional profiles.
 
@@ -77,9 +80,9 @@ The coupled solver enforces an explicit, validated convergence contract:
 - Capacity boundaries vs. admission guards: Distinguishes admission guards (CPU lowering and overflow rejection: $nv=33, npairs=17, ncontacts=25, nr=97$ rejected with `ValueError`) from GPU capacity execution ($nv=32, npairs=16, ncontacts=24, nr=96$ executed on GPU with status 0, isolated worlds, finite float32 outputs, slot 15 exercised for pairs, slot 23 for contacts, row 95 for constraint rows, and verified against CPU MuJoCo references).
 - Control clipping: Evaluates same-time physical effect of `mjDSBL_CLAMPCTRL` over identical 50 steps from identical initial states ($|q_{\text{noclamp}} - q_{\text{clamp}}| = 0.03632 > 0.02$, with status 0 and CPU parity for both).
 
-## Problem 003 contact-friction qualification
+## Contact-friction qualification
 
-This is an unreleased development-branch result, run on an **M1 Max with 32 GB
+This is an independently qualified source result, run on an **M1 Max with 32 GB
 unified memory**, MuJoCo 3.10.0, Python 3.12 and Torch 2.9.1. `PYTORCH_ENABLE_MPS_FALLBACK=0`
 was set for native checks. The eight cone/condim cases use a transformed plane
 and sphere, nonzero sliding/angular velocities, asserted contact engagement,
@@ -99,8 +102,8 @@ both cones. Together with the earlier condim-1/3 primitive-family suite, this
 covers the accepted plane/sphere/capsule/box families without claiming every
 shape-pair/cone/dimension cross-product was tested.
 
-R2 completion adds the missing interacting-friction checks. Each accepted
-non-plane primitive pair now has a condim-4/6 representative; six native cases
+Each accepted non-plane primitive pair has a condim-4/6 representative in the
+interacting-friction qualification; six native cases
 compare both moving bodies' rotational Jacobians, physical contact wrenches,
 mapped contact rows, full Delassus operators and CPU accelerations. All six W
 comparisons enforce the same `rtol=5e-3, atol=3e-3`. The largest observed
@@ -114,9 +117,9 @@ had smaller observed differences, but do not use tighter assertion bounds.
 | Non-plane high-dimensional primitive friction | `test_high_dimensional_nonplane_pairs_compare_both_moving_bodies` | 6 pair families; both bodies' rotational Jacobians nonzero and CPU-matched; physical moments asserted; box-box max `J` difference `5.84e-6`, max `W` difference `2.60e-3` |
 | Dynamic spin/roll/slip and contact events | `test_high_dimensional_spin_slip_separation_and_reimpact` | 16 cone/condim/timestep/spin-sign cases; `dt=1,4 ms`; all show contact → separation → re-impact; max bounds `qpos<2e-5`, `qvel<2e-4`, `qacc<3e-2`, constraint-force `<8e-2` |
 
-These cases complement the earlier eight-case cone/dimension matrix, transformed
+These cases complement the eight-case cone/dimension matrix, transformed
 plane contact matrix, capacity boundaries, anisotropic and near-zero coefficient
-checks, and Spin-and-Grip demo. They close the specific R2 qualification gaps but
+checks, and Spin-and-Grip demo. They exercise the bounded feature set but
 do not form an exhaustive Cartesian product of every contact and model option.
 
 The final admitted row-layout checks run ten elliptic condim-6 contacts (60

@@ -2,6 +2,8 @@
 
 Use the [shared source setup](../INSTALL.md#development-source), with its Python
 environment active, and run these commands from the repository root.
+This integrated demo requires current main source; it is not supported by the
+published 0.4.0 wheel alone.
 
 This example showcases the integrated native Metal Euler physics pipeline (`integrated_euler_v1`),
 combining motor actuation, fixed-joint tendons, passive spring/damping resonators,
@@ -27,7 +29,7 @@ PYTHONPATH=metal python metal/examples/marble_music_machine.py --mode cpu --head
 Run the native Metal comparison check on an Apple Silicon Mac:
 
 ```bash
-MUJOCO_METAL_RUN_GPU=1 PYTHONPATH=metal python metal/examples/marble_music_machine.py --headless --check --steps 400
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal python metal/examples/marble_music_machine.py --headless --check --steps 400
 ```
 
 Record the side-by-side native Metal and CPU MuJoCo renders:

@@ -2,6 +2,8 @@
 
 Use the [shared source setup](../INSTALL.md#development-source), with its Python
 environment active, and run these commands from the repository root.
+This integrated demo requires current main source; it is not supported by the
+published 0.4.0 wheel alone.
 
 This example showcases complete primitive collision support in the integrated native Metal Euler pipeline (`integrated_euler_v1`),
 combining multi-contact manifolds across planes, spheres, capsules, and boxes with motor actuation,
@@ -14,7 +16,7 @@ The sorter features:
 - An actuated swinging diverter gate driven by a rhythmic clockwork motor torque.
 - A follower diverter gate synchronized symmetrically via a polynomial joint equality constraint.
 - A passive spring/damper lever coupled to the diverter mechanism via a fixed tendon.
-- Multi-contact primitive manifolds in the demo mechanism: box-box face/edge contact (up to 8 points), capsule-box (2 points), capsule-capsule (2 points), sphere-box (1 point), and sphere-plane (1 point). (The complete qualification test suite in `metal/tests/test_primitive_collision_qualification.py` verifies all 9 valid primitive collision pairs, including plane-plane, plane-capsule, plane-box, sphere-sphere, and sphere-capsule).
+- Multi-contact primitive manifolds in the demo mechanism: box-box face/edge contact (up to 8 points), capsule-box (2 points), capsule-capsule (2 points), sphere-box (1 point), and sphere-plane (1 point). (The complete qualification test suite in `metal/tests/test_primitive_collision_qualification.py` verifies all 9 valid primitive collision pairs, including plane-capsule, plane-box, sphere-sphere, and sphere-capsule; plane-plane does not generate contacts).
 - Dynamic parcel-to-parcel interactions (`box_parcel_geom <-> cap_parcel_geom`) demonstrating stacking and collision deflection.
 - Actual physical routing directing the box parcel to the left chute ($Y < -0.1$), the capsule parcel to the right chute ($Y > 0.1$), and the sphere parcel along the center track ($|Y| < 0.05$).
 
@@ -27,13 +29,13 @@ PYTHONPATH=metal python metal/examples/clockwork_parcel_sorter.py --mode cpu --h
 Run the native Metal comparison check on an Apple Silicon Mac:
 
 ```bash
-MUJOCO_METAL_RUN_GPU=1 PYTHONPATH=metal:metal/examples python metal/examples/clockwork_parcel_sorter.py --headless --check --steps 600
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/clockwork_parcel_sorter.py --headless --check --steps 600
 ```
 
 Record the side-by-side native Metal and CPU MuJoCo renders:
 
 ```bash
-MUJOCO_METAL_RUN_GPU=1 PYTHONPATH=metal:metal/examples python metal/examples/clockwork_parcel_sorter.py --record metal/examples/assets/clockwork_parcel_sorter.gif --steps 600
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/clockwork_parcel_sorter.py --record metal/examples/assets/clockwork_parcel_sorter.gif --steps 600
 ```
 
 ![Native Metal clockwork parcel sorter beside CPU MuJoCo](assets/clockwork_parcel_sorter.gif)

@@ -19,22 +19,27 @@ available alongside the optional package.
   per-step host state readback, per-world failure handling, selected-row reset,
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
-- **Validation and reproducible measurements:** 402 tests pass with native GPU execution enabled on the qualified M1 Max; independent CPU-reference trajectory and solve checks supplement the suite. Benchmarks include actual eight-thread CPU measurements at every tested batch through 524,288 worlds.
+- **Independent qualification:** 402 native GPU tests and 175 CPU-only tests passed
+  on an M1 Max with 32 GB unified memory. The final contact-friction assertion
+  update also passed 19 focused GPU tests. These are bounded physics checks;
+  [qualification details](metal/DEVELOPMENT.md) identify the tested revisions.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
   plus bounded hinge/slide motors with clipping and disable flags. Separate
   profiles preserve the original unforced baseline.
-- **Development physics coverage:** an integrated Euler pipeline (`integrated_euler_v1`)
-  combining complete primitive collision manifolds (all 9 valid pairs among planes, spheres, capsules, and boxes with up to 8 contact points per pair, SAT collision detection, Sutherland-Hodgman polygon clipping, and Coulomb friction), motor actuation, fixed-joint tendons, passive spring/damping forces, fluid drag, joint limits/frictionloss, polynomial joint equality, and sensor queries with one coupled Delassus constraint solve;
-  RK4 and bounded implicitfast; springs and body forces; inertia-box fluid drag; fixed-tendon dynamics;
-  selected sensor queries have CPU-reference checks. See the [precise development coverage](metal/DEVELOPMENT.md).
-  The current Problem 003 development branch extends integrated Euler contacts
-  to condim 1/3/4/6 with pyramidal and elliptic cones, including sliding,
-  torsional and rolling friction. It adds explicit-pair overrides and the
-  Spin-and-Grip demo. The corrected globally coupled elliptic solve and added
-  mixed-constraint, per-world recovery and multi-timestep spin/slip/roll cases
-  pass the bounded native suite. High-dimensional representatives now cover all
-  accepted non-plane primitive pairs with both bodies moving. This increment
-  awaits independent review and is not included in the 0.4.0 wheel.
+- **Integrated physics on main:** `integrated_euler_v1` combines contacts,
+  actuation, fixed tendons, passive forces, fluid drag, scalar joint constraints
+  and sensor queries in one pipeline. Primitive collisions cover all nine valid
+  pairs among planes, spheres, capsules and boxes, including multi-point manifolds.
+- **Sliding, spinning and rolling friction:** contact dimensions 1/3/4/6 support
+  pyramidal and elliptic cones, anisotropic coefficients and explicit contact
+  pairs. Contact and joint constraints share one coupled solve, with independent
+  force, residual, trajectory and failure-recovery checks. Try the new
+  [Spin-and-Grip arcade](metal/examples/spin_and_grip.md).
+- **Additional bounded profiles:** RK4 and implicitfast, springs and body forces,
+  inertia-box fluid drag, fixed-tendon servos and selected sensor queries.
+  See [precise coverage and limits](metal/DEVELOPMENT.md). Integrated physics and
+  expanded primitive/friction support require the source checkout; they are not
+  included in the published 0.4.0 wheel.
 - **Tools and documentation:** creative simulation demos, capability inventory,
   runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.
 - **Upstream regression coverage:** an `mj_setConst` inertial-update roundtrip test
@@ -67,7 +72,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal doctor --gpu
 ```
 
 [Version 0.4.0](https://pypi.org/project/mujoco-mac-metal/0.4.0/) includes the
-new bounded physics profiles. Existing installations can upgrade with
+earlier bounded physics profiles. Existing installations can upgrade with
 `python -m pip install --upgrade mujoco-mac-metal`. Clone the repository for
 the demo scripts and assets using the [source setup](metal/INSTALL.md#development-source).
 See [installation and diagnostics](metal/INSTALL.md) for requirements and status.
@@ -76,7 +81,9 @@ See [installation and diagnostics](metal/INSTALL.md) for requirements and status
 
 We built these demos to explore Metal physics on the Mac—give them a try!
 Each guide includes runnable commands and an independent CPU MuJoCo comparison.
-Use **0.4.0 or newer** and the [demo/source setup](metal/INSTALL.md#development-source).
+Use the current `main` checkout and the [demo/source setup](metal/INSTALL.md#development-source).
+Spin-and-Grip, the parcel sorter and the marble music machine require this source
+installation; installing the published 0.4.0 wheel alone is insufficient.
 The repository contains the scripts, models and GIFs; the wheel contains the
 physics package and its shaders.
 
@@ -124,9 +131,9 @@ Three marbles with different friction coefficients transition from sliding to ro
 
 ### [Spin-and-Grip arcade](metal/examples/spin_and_grip.md)
 
-A rolling sphere, spinning top and actuated press demonstrate rolling
-resistance, torsional friction and frictional hold/release with elliptic
-condim-4/6 contacts.
+A rolling sphere, spinning sphere and actuated press demonstrate rolling
+resistance, torsional friction and frictional hold/release. The elliptic scene
+uses condim 6 for rolling, 4 for spin and 3 for the press/object contact.
 
 ![Spin-and-Grip arcade: native Metal beside CPU MuJoCo](metal/examples/assets/spin_and_grip.gif)
 
@@ -190,8 +197,11 @@ surrounding MuJoCo source version as the qualified runtime.
 
 Version **0.4.0** supports bounded Euler, RK4/implicitfast, passive and fluid forces, fixed-tendon
 servos, sensor queries, sphere contact and joint-constraint profiles, each with
-explicit guards. The in-progress Problem 003 branch adds a bounded integrated
-contact-friction subset, but it has not shipped in a PyPI release. Remaining
+explicit guards. Current `main` adds independently qualified integrated Euler,
+primitive manifolds and expanded friction; these source features have not shipped
+in a new PyPI release. Integrated stepping is bounded to 32 velocities, 16 candidate
+pairs, 24 contact slots and 96 constraint rows. Connect/weld equalities and runtime
+equality activation are not implemented yet. Remaining
 contact/constraint families, stateful actuation, spatial tendons,
 geom-level fluid models, full implicit integration and broader sensors/model/API coverage still need
 implementation and qualification. Native rendering and training integration

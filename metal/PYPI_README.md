@@ -9,6 +9,12 @@ servos/dynamics; sphere contact and friction; scalar joint constraints; and
 selected current-state sensors. Persistent GPU state supports row reset,
 checkpoint replay and per-world failure handling.
 
+The repository's current main source additionally includes integrated Euler,
+expanded primitive collisions and sliding/torsional/rolling friction with both
+cone types. Those features and their newer demos require a
+[source installation](https://github.com/keeeeenw/mujoco-mac-metal/blob/main/metal/INSTALL.md#development-source);
+they are not part of the published 0.4.0 wheel.
+
 These are explicitly validated model subsets, not full MuJoCo compatibility or
 a transparent replacement for `mj_step`. Rendering still uses MuJoCo OpenGL.
 The package uses custom Metal shaders through PyTorch MPS; it does not use JAX
@@ -23,7 +29,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal doctor --gpu
 
 Dependencies pin MuJoCo 3.10.0 and Torch 2.9.1 on that platform. The diagnostic
 GPU smoke test covers one small force/Euler fixture, not every feature. The
-physics source checkpoint passed 257 tests with native GPU execution enabled
+published 0.4.0 source checkpoint passed 257 tests with native GPU execution enabled
 on an M1 Max with 32 GB unified memory; broader hardware validation is pending.
 No speed claim for the new profiles follows from those checks.
 

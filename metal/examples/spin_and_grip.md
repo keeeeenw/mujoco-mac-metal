@@ -12,12 +12,12 @@ pair uses condim 3 and demonstrates sliding friction. The comparison on the
 right is a separate MuJoCo CPU rollout from the same initial state. The GIF is
 rendered at presentation speed; it does not represent physics throughput.
 
-Use the isolated source environment described in the
+Activate the isolated source environment described in the
 [development setup](../INSTALL.md#development-source). From the repository root,
 run the native numerical check with MPS fallback disabled:
 
 ```sh
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal .venv-metal/bin/python \
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal python \
   metal/examples/spin_and_grip.py --headless --check --steps 400
 ```
 
@@ -42,7 +42,7 @@ These are fixture-specific numerical checks, not universal tolerances. Run the
 CPU baseline separately with:
 
 ```sh
-PYTHONPATH=metal .venv-metal/bin/python metal/examples/spin_and_grip.py \
+PYTHONPATH=metal python metal/examples/spin_and_grip.py \
   --mode cpu --headless --steps 400
 ```
 
@@ -50,7 +50,7 @@ Record a side-by-side comparison GIF (Pillow and a working MuJoCo OpenGL
 context are required):
 
 ```sh
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal .venv-metal/bin/python \
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal python \
   metal/examples/spin_and_grip.py --headless --steps 400 \
   --record metal/examples/assets/spin_and_grip.gif
 ```
@@ -59,13 +59,13 @@ To run the targeted native contact qualification matrix:
 
 ```sh
 MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal \
-  .venv-metal/bin/python -m pytest -q metal/tests/test_coupled_constraints.py \
+  python -m pytest -q metal/tests/test_coupled_constraints.py \
   metal/tests/test_integrated_simulation.py \
   -k 'native_contact_cone_dimension_matrix or native_friction_contact_capsule_and_box or native_condim6_contact_engages_rolling_friction or native_explicit_pair_anisotropic or native_zero_and_near_zero_friction or native_contact_final_valid_row_capacity or high_dimensional_friction_couples_with_articulated_constraints or friction_failure_isolated_from_active_and_empty_worlds or high_dimensional_spin_slip_separation_and_reimpact or high_dimensional_nonplane_pairs_compare_both_moving_bodies'
 ```
 
-The native friction increment is on the Problem 003 development branch. It is
-not included in the released 0.4.0 wheel. The current qualification covers the
+The native friction increment is independently qualified in the main source
+checkout. It is not included in the released 0.4.0 wheel. The current qualification covers the
 four accepted primitive shapes across the prior collision matrix and tests
 plane contacts against spheres, capsules and boxes for higher dimensions. This
 is now supplemented by condim-4/6 representatives for the six non-plane pairs,

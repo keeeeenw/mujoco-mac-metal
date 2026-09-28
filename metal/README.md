@@ -1,6 +1,6 @@
 # Metal package documentation
 
-The [main project README](../README.md) is the overview for **0.4.0**, including
+The [main project README](../README.md) covers current source and the **0.4.0** release, including
 contributions, installation, all demo GIFs, measured performance and limitations.
 This directory contains the optional experimental package and its technical guides.
 
