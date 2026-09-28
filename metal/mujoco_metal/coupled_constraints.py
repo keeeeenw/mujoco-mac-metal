@@ -86,7 +86,7 @@ class CoupledSolverSettings:
   effective_iterations: int
   requested_tolerance: float
   effective_tolerance: float
-  max_refinement_sweeps: int = 64
+  max_refinement_sweeps: int = 256
   metric: str = "max_normalized_projected_gradient"
 
 
@@ -131,6 +131,7 @@ class CoupledConstraintDescriptor:
   eq_active0: np.ndarray
 
   # Contact constants
+  cone_type: int
   geom1: np.ndarray
   geom2: np.ndarray
   pair_contact_offset: np.ndarray
@@ -138,6 +139,7 @@ class CoupledConstraintDescriptor:
   contact_condim: np.ndarray
   contact_condim_packed: np.ndarray
   contact_friction: np.ndarray
+  contact_solreffriction: np.ndarray
   radius1: np.ndarray
 
   radius2: np.ndarray
@@ -147,6 +149,7 @@ class CoupledConstraintDescriptor:
   solimp: np.ndarray
   condim: np.ndarray
   friction: np.ndarray
+  solreffriction: np.ndarray
   geom_bodyid: np.ndarray
   geom_size: np.ndarray
   geom_type: np.ndarray
@@ -232,10 +235,8 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
         g1, g2 = g2, g1
         t1, t2 = t2, t1
       cdim = int(model.pair_dim[p])
-      if cdim not in (1, 3):
-        raise ValueError(f"explicit pair ({g1}, {g2}) has unsupported condim {cdim}; only 1 and 3 are supported")
-      if cdim == 3 and int(model.opt.cone) != int(mujoco.mjtCone.mjCONE_PYRAMIDAL):
-        raise ValueError("condim=3 contact requires pyramidal cone")
+      if cdim not in (1, 3, 4, 6):
+        raise ValueError(f"explicit pair ({g1}, {g2}) has unsupported condim {cdim}; only 1, 3, 4 and 6 are supported")
 
       solref = model.pair_solref[p].copy()
       if solref[0] == 0.0 and solref[1] == 0.0:
@@ -248,9 +249,14 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       solimp = model.pair_solimp[p].copy()
       margin = float(model.pair_margin[p])
       gap = float(model.pair_gap[p])
-      friction = model.pair_friction[p, :2].copy()
+      solreffriction = model.pair_solreffriction[p].copy()
+      if bool(solreffriction[0] > 0) != bool(solreffriction[1] > 0):
+        solreffriction[:] = 0.0
+      if not (int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)) and solreffriction[0] > 0:
+        solreffriction[0] = max(float(solreffriction[0]), 2.0 * float(model.opt.timestep))
+      friction = model.pair_friction[p].copy()
 
-      pairs.append((g1, g2, solref, solimp, cdim, friction, margin, gap))
+      pairs.append((g1, g2, solref, solimp, cdim, friction, solreffriction, margin, gap))
       pair_signatures.add((min(g1, g2) << 16) + max(g1, g2))
 
   # Body exclusions (<exclude ...>)
@@ -312,10 +318,8 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
           int(model.geom_condim[g2]) if p2 > p1 else
           max(int(model.geom_condim[g1]), int(model.geom_condim[g2]))
       )
-      if condim not in (1, 3):
-        raise ValueError(f"contact pair ({g1}, {g2}) has unsupported condim {condim}; only 1 and 3 are supported")
-      if condim == 3 and int(model.opt.cone) != int(mujoco.mjtCone.mjCONE_PYRAMIDAL):
-        raise ValueError("condim=3 contact requires pyramidal cone")
+      if condim not in (1, 3, 4, 6):
+        raise ValueError(f"contact pair ({g1}, {g2}) has unsupported condim {condim}; only 1, 3, 4 and 6 are supported")
 
       solref, solimp, friction = _mix_contact_parameters(model, g1, g2)
       if bool(solref[0] > 0) != bool(solref[1] > 0):
@@ -326,7 +330,8 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       margin = float(model.geom_margin[g1] + model.geom_margin[g2])
       gap = float(model.geom_gap[g1] + model.geom_gap[g2])
 
-      pairs.append((g1, g2, solref, solimp, condim, np.repeat(friction[0], 2), margin, gap))
+      friction5 = np.array([friction[0], friction[0], friction[1], friction[2], friction[2]])
+      pairs.append((g1, g2, solref, solimp, condim, friction5, np.zeros(2), margin, gap))
 
   npairs = len(pairs)
   if npairs > _MAX_PAIRS:
@@ -338,20 +343,27 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
   total_candidate_contacts = 0
   contact_condim_list = []
   contact_friction_list = []
+  contact_solreffriction_list = []
   contact_condim_packed = []
 
   row_offset = 0
   for p in pairs:
-    g1, g2, solref, solimp, condim, friction, margin, gap = p
+    g1, g2, solref, solimp, condim, friction, solreffriction, margin, gap = p
     mc = pair_max_contacts(int(geoms[g1]), int(geoms[g2]))
     pair_max_c.append(mc)
     total_candidate_contacts += mc
     pair_contact_offset.append(total_candidate_contacts)
-    rows_per_con = 4 if condim == 3 else 1
+    cone_type = int(model.opt.cone)
+    rows_per_con = (
+        1 if condim == 1 else
+        2 * (condim - 1) if cone_type == int(mujoco.mjtCone.mjCONE_PYRAMIDAL) else
+        condim
+    )
     for _ in range(mc):
       contact_condim_list.append(condim)
       contact_friction_list.append(friction)
-      contact_condim_packed.extend([condim, row_offset])
+      contact_solreffriction_list.append(solreffriction)
+      contact_condim_packed.extend([condim, row_offset, cone_type])
       row_offset += rows_per_con
 
   if total_candidate_contacts > _MAX_CONTACTS:
@@ -408,28 +420,32 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
     sr = np.array([p[2] for p in pairs], dtype=np.float32).reshape(-1, 2)
     si = np.array([p[3] for p in pairs], dtype=np.float32).reshape(-1, 5)
     cd = np.array([p[4] for p in pairs], dtype=np.int32)
-    fr = np.array([p[5] for p in pairs], dtype=np.float32).reshape(-1, 2)
-    margin = np.array([p[6] for p in pairs], dtype=np.float32)
-    gap = np.array([p[7] for p in pairs], dtype=np.float32)
+    fr = np.array([p[5] for p in pairs], dtype=np.float32).reshape(-1, 5)
+    srfr = np.array([p[6] for p in pairs], dtype=np.float32).reshape(-1, 2)
+    margin = np.array([p[7] for p in pairs], dtype=np.float32)
+    gap = np.array([p[8] for p in pairs], dtype=np.float32)
     r1 = np.where(geoms[g1] == _PLANE, -1.0, model.geom_size[g1, 0]).astype(np.float32)
     r2 = np.where(geoms[g2] == _PLANE, -1.0, model.geom_size[g2, 0]).astype(np.float32)
     p_offset = np.array(pair_contact_offset, dtype=np.int32)
     p_max_c = np.array(pair_max_c, dtype=np.int32)
     c_condim = np.array(contact_condim_list, dtype=np.int32)
-    c_friction = np.array(contact_friction_list, dtype=np.float32).reshape(-1, 2)
+    c_friction = np.array(contact_friction_list, dtype=np.float32).reshape(-1, 5)
+    c_solreffriction = np.array(contact_solreffriction_list, dtype=np.float32).reshape(-1, 2)
     c_condim_packed = np.array(contact_condim_packed, dtype=np.int32)
   else:
     g1 = g2 = np.empty(0, dtype=np.int32)
     sr = np.empty((0, 2), dtype=np.float32)
     si = np.empty((0, 5), dtype=np.float32)
     cd = np.empty(0, dtype=np.int32)
-    fr = np.empty((0, 2), dtype=np.float32)
+    fr = np.empty((0, 5), dtype=np.float32)
+    srfr = np.empty((0, 2), dtype=np.float32)
     r1 = r2 = margin = gap = np.empty(0, dtype=np.float32)
     p_offset = np.zeros(1, dtype=np.int32)
     p_max_c = np.empty(0, dtype=np.int32)
     c_condim = np.empty(0, dtype=np.int32)
-    c_friction = np.empty((0, 2), dtype=np.float32)
-    c_condim_packed = np.zeros(2, dtype=np.int32)
+    c_friction = np.empty((0, 5), dtype=np.float32)
+    c_solreffriction = np.empty((0, 2), dtype=np.float32)
+    c_condim_packed = np.zeros(3, dtype=np.int32)
 
 
   geom_size_mat = np.asarray(model.geom_size, dtype=np.float32).reshape(model.ngeom, 3)
@@ -451,7 +467,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       effective_iterations=iter_req,
       requested_tolerance=tol_req,
       effective_tolerance=eff_tol,
-      max_refinement_sweeps=64,
+      max_refinement_sweeps=256,
       metric="max_normalized_projected_gradient",
   )
 
@@ -463,6 +479,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       timestep=float(model.opt.timestep),
       refsafe=not bool(int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)),
       impratio=float(model.opt.impratio),
+      cone_type=int(model.opt.cone),
       disableflags=int(model.opt.disableflags),
       iterations=iter_req,
       tolerance=eff_tol,
@@ -489,6 +506,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       contact_condim=_frozen(c_condim, np.int32),
       contact_condim_packed=_frozen(c_condim_packed, np.int32),
       contact_friction=_frozen(c_friction, np.float32),
+      contact_solreffriction=_frozen(c_solreffriction, np.float32),
       radius1=_frozen(r1, np.float32),
       radius2=_frozen(r2, np.float32),
 
@@ -498,6 +516,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       solimp=_frozen(si, np.float32),
       condim=_frozen(cd, np.int32),
       friction=_frozen(fr, np.float32),
+      solreffriction=_frozen(srfr, np.float32),
       geom_bodyid=_frozen(model.geom_bodyid, np.int32),
       geom_size=_frozen(geom_size_mat, np.float32),
       geom_type=_frozen(model.geom_type, np.int32),
@@ -635,7 +654,11 @@ class MetalCoupledConstraints:
     contact_friction_arr = (
         d.contact_friction.reshape(-1)
         if d.ncontacts_max
-        else np.zeros(2, dtype=np.float32)
+        else np.zeros(5, dtype=np.float32)
+    )
+    contact_solreffriction_arr = (
+        d.contact_solreffriction.reshape(-1)
+        if d.ncontacts_max else np.zeros(2, dtype=np.float32)
     )
     contact_condim_arr = (
         d.contact_condim
@@ -670,17 +693,19 @@ class MetalCoupledConstraints:
         "pair_solref": self._tensor(d.solref.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
         "pair_solimp": self._tensor(d.solimp.reshape(-1) if d.npairs else np.zeros(5, dtype=np.float32)),
         "pair_condim": self._tensor(d.condim if d.npairs else np.zeros(1, dtype=np.int32)),
-        "pair_friction": self._tensor(d.friction.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
+        "pair_friction": self._tensor(d.friction.reshape(-1) if d.npairs else np.zeros(5, dtype=np.float32)),
+        "pair_solreffriction": self._tensor(d.solreffriction.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
         "pair_contact_offset": self._tensor(d.pair_contact_offset),
         "contact_friction": self._tensor(contact_friction_arr),
-        "contact_condim": self._tensor(d.contact_condim_packed if d.ncontacts_max else np.zeros(2, dtype=np.int32)),
+        "contact_solreffriction": self._tensor(contact_solreffriction_arr),
+        "contact_condim": self._tensor(d.contact_condim_packed if d.ncontacts_max else np.zeros(3, dtype=np.int32)),
         "c_dims": torch.tensor(
 
-            [d.nv, d.npairs, d.ncontacts_max, self.batch_size, d.nbody, d.njnt, d.ngeom],
+            [d.nv, d.npairs, d.ncontacts_max, self.batch_size, d.nbody, d.njnt, d.ngeom, d.cone_type],
             dtype=torch.int32, device=self._device,
         ),
         "solver_dims": torch.tensor(
-            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr],
+            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type],
             dtype=torch.int32, device=self._device,
         ),
         "solver_params": torch.tensor(
@@ -707,16 +732,16 @@ class MetalCoupledConstraints:
       return torch.zeros(max(size, 1), dtype=torch.float32, device=self._device)
 
     self._workspace = {
-        "contact_row_data": empty(b * nc * 5 * 6),
+        "contact_row_data": empty(b * nc * 6 * 6),
         "contact_frame": empty(b * nc * 12),
-        "contact_jacobian": empty(b * nc * 5 * nv),
+        "contact_jacobian": empty(b * nc * 6 * nv),
         "workspace_J": empty(b * nr * nv),
         "workspace_debug": empty(b * (nr * nr + 4 * nr)),
         "out_force": empty(b * nv),
         "out_acc": empty(b * nv),
         "out_status": torch.zeros(b, dtype=torch.int32, device=self._device),
         "out_diagnostics": empty(b * 2),
-        "out_contact_force": empty(b * nc * 5),
+        "out_contact_force": empty(b * nc * 11),
         "out_joint_force": empty(b * max(d.nr_joint, 1)),
     }
     if d.neq > 0:
@@ -770,7 +795,7 @@ class MetalCoupledConstraints:
           self._constants["pair_geoms"], self._constants["pair_margin_gap"],
           self._constants["pair_solref"], self._constants["pair_solimp"],
           self._constants["pair_condim"], self._constants["pair_friction"],
-          self._constants["pair_contact_offset"],
+          self._constants["pair_solreffriction"], self._constants["pair_contact_offset"],
           w["contact_row_data"], w["contact_frame"], w["contact_jacobian"],
           self._constants["c_dims"],
           threads=(b * d.npairs,), group_size=(1,),
@@ -828,11 +853,21 @@ class MetalCoupledConstraints:
       })
 
     if nc > 0:
-      contact_rows = w["contact_row_data"][: b * nc * 5 * 6].reshape(b, nc, 5, 6)
+      contact_rows = w["contact_row_data"][: b * nc * 6 * 6].reshape(b, nc, 6, 6)
       contact_frames = w["contact_frame"][: b * nc * 12].reshape(b, nc, 12)
-      contact_forces = w["out_contact_force"][: b * nc * 5].reshape(b, nc, 5)
-      condim_tensor = self._constants["contact_condim"][0::2].reshape(1, -1)
-      detected = torch.where(condim_tensor == 3, contact_rows[:, :, 1, 0], contact_rows[:, :, 0, 0])
+      contact_forces = w["out_contact_force"][: b * nc * 11].reshape(b, nc, 11)
+      contact_jacobians = w["contact_jacobian"][: b * nc * 6 * nv].reshape(b, nc, 6, nv)
+      friction_tensor = self._constants["contact_friction"].reshape(nc, 5)
+      detected = contact_rows[:, :, 0, 0]
+      if d.cone_type == int(mujoco.mjtCone.mjCONE_ELLIPTIC):
+        contact_wrench = contact_forces[:, :, :6]
+      else:
+        wrench_axes = [contact_forces[:, :, 0]]
+        for axis in range(5):
+          plus = contact_forces[:, :, 1 + 2 * axis]
+          minus = contact_forces[:, :, 2 + 2 * axis]
+          wrench_axes.append(friction_tensor[None, :, axis] * (plus - minus))
+        contact_wrench = torch.stack(wrench_axes, dim=-1)
 
       result.update({
           "contact_mask": detected,
@@ -845,7 +880,10 @@ class MetalCoupledConstraints:
           "contact_tangent2": contact_frames[:, :, 6:9],
           "contact_position": contact_frames[:, :, 9:12],
           "contact_force": contact_forces[:, :, 0],
-          "contact_force_rows": contact_forces,
+          "contact_force_rows": contact_forces[:, :, :5],
+          "contact_solver_rows": contact_forces,
+          "contact_wrench": contact_wrench,
+          "contact_jacobian": contact_jacobians,
       })
 
     if d.nr_joint > 0:

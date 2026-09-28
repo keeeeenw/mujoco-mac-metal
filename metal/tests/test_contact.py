@@ -13,6 +13,7 @@ import pytest
 from mujoco_metal.contact import _get_impedance
 from mujoco_metal.contact import lower_contacts
 from mujoco_metal.contact import MetalContact
+from mujoco_metal.coupled_constraints import lower_coupled_constraints
 from mujoco_metal.metal_kinematics import MetalKinematics
 from mujoco_metal.model import load_model
 from mujoco_metal.smooth_metal import MetalSmoothDynamics
@@ -94,11 +95,13 @@ def test_contact_guards_reject_unsupported_families_and_parameters():
     )
   assert lower_contacts(frictional).condim.tolist() == [3]
   elliptic = mujoco.MjModel.from_xml_string(
-      _plane_sphere_xml()
-      .replace('condim="1"', 'condim="3"')
-      .replace("<mujoco>", '<mujoco><option cone="elliptic"/>')
+    _plane_sphere_xml()
+    .replace('condim="1"', 'condim="3"')
+    .replace("<mujoco>", '<mujoco><option cone="elliptic"/>')
   )
-  with pytest.raises(ValueError, match="pyramidal cone"):
+  # The legacy normal-contact profile still rejects elliptic friction; the
+  # integrated coupled profile's expanded support is qualified separately.
+  with pytest.raises(ValueError, match="requires the pyramidal cone"):
     lower_contacts(elliptic)
 
   explicit_pair = mujoco.MjModel.from_xml_string(
@@ -154,6 +157,41 @@ def test_pyramidal_condim3_friction_mixing_matches_contact_record():
   assert desc.friction[0].tolist() == pytest.approx([0.4, 0.4])
   np.testing.assert_allclose(desc.solref[0], data.contact[0].solref, atol=1e-7)
   np.testing.assert_allclose(desc.solimp[0], data.contact[0].solimp, atol=1e-7)
+
+
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [1, 3, 4, 6])
+def test_lowering_allocates_mujo_co_cone_rows_and_full_pair_friction(cone, condim):
+  xml = f"""<mujoco><option cone="{cone}" timestep=".002"/><worldbody>
+    <geom name="floor" type="plane" size="2 2 .1"/>
+    <body pos="0 0 .09"><freejoint/><geom name="ball" type="sphere" size=".1"/>
+    </body></worldbody><contact><pair geom1="floor" geom2="ball" condim="{condim}"
+    friction=".8 .7 .06 .03 .04" solreffriction=".02 1"/></contact></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  desc = lower_coupled_constraints(model)
+  expected_rows = 1 if condim == 1 else (2 * (condim - 1) if cone == "pyramidal" else condim)
+  assert desc.cone_type == (0 if cone == "pyramidal" else 1)
+  assert desc.contact_condim.tolist() == [condim]
+  assert desc.nr == desc.nr_joint + expected_rows
+  assert desc.contact_condim_packed.tolist() == [condim, 0, desc.cone_type]
+  np.testing.assert_allclose(desc.friction[0], [.8, .7, .06, .03, .04], atol=1e-7, rtol=1e-7)
+  np.testing.assert_allclose(desc.contact_friction[0], [.8, .7, .06, .03, .04], atol=1e-7, rtol=1e-7)
+  np.testing.assert_allclose(desc.solreffriction[0], [.02, 1], atol=1e-7, rtol=1e-7)
+  assert desc.contact_solreffriction.shape == (1, 2)
+
+
+def test_implicit_geom_friction_expands_sliding_torsion_and_rolling_axes():
+  xml = """<mujoco><option cone="elliptic"/><worldbody>
+    <geom name="floor" type="plane" size="2 2 .1" condim="6" friction=".4 .03 .02"/>
+    <body pos="0 0 .09"><freejoint/><geom name="ball" type="sphere" size=".1"
+      condim="6" friction=".7 .05 .04"/></body>
+  </worldbody></mujoco>"""
+  model = mujoco.MjModel.from_xml_string(xml)
+  desc = lower_coupled_constraints(model)
+  np.testing.assert_allclose(desc.friction[0], [.7, .7, .05, .04, .04])
+  np.testing.assert_allclose(desc.contact_friction[0], [.7, .7, .05, .04, .04])
+  np.testing.assert_array_equal(desc.solreffriction, np.zeros((1, 2), np.float32))
+  assert desc.nr == desc.nr_joint + 6
 
 
 def _mps(array):
