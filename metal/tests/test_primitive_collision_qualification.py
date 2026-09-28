@@ -696,10 +696,9 @@ def test_coupled_system_mixed_primitive_manifolds():
   Fixture activates plane-box (floor <-> pbox1, 4-point face manifold, condim=3),
   box-box (pallet <-> pbox, 4-point manifold, condim=1), sphere-box (sph_geom <->
   pallet, condim=3) and capsule-box (cap_geom <-> pallet, 2-point manifold,
-  condim=3) simultaneously, plus joint equality (j1 <-> j3), two frictionloss rows
-  and one active joint-limit row. Parcels ride on the lever hinge j1 so contact
-  Jacobians share the j1 dof with the equality row, producing nonzero
-  cross-coupling blocks.
+  condim=3) simultaneously, plus joint equality (j1 <-> j3), two frictionloss rows,
+  one active joint-limit row and time-varying motor input on j1. Contact Jacobians
+  share the j1 dof with the equality row, producing nonzero cross-coupling blocks.
 
   Establishes an exhaustive one-to-one GPU<->CPU active-row mapping and compares
   every active J/R/ar/rhs entry, the complete reconstructed Delassus matrix
@@ -751,6 +750,7 @@ def test_coupled_system_mixed_primitive_manifolds():
   <equality>
     <joint joint1="j1" joint2="j3" polycoef="0 1 0 0 0" solref="0.05 1"/>
   </equality>
+  <actuator><motor joint="j1" ctrlrange="-2 2"/></actuator>
   </mujoco>"""
 
   m = mujoco.MjModel.from_xml_string(xml_mixed)
@@ -838,11 +838,12 @@ def test_coupled_system_mixed_primitive_manifolds():
   cur = cpu_contact_row_base
   for c in range(d_cpu.ncon):
     con = d_cpu.contact[c]
-    nrow = 4 if int(con.dim) == 3 else 1
+    cdim = int(con.dim)
+    nrow = 1 if cdim == 1 else (cdim if int(desc.cone_type) == int(mujoco.mjtCone.mjCONE_ELLIPTIC) else 2 * (cdim - 1))
     cpu_blocks.append((int(con.geom1), int(con.geom2), con.pos.copy(), cur, nrow))
     cur += nrow
 
-  packed = np.asarray(desc.contact_condim_packed).reshape(-1, 2)
+  packed = np.asarray(desc.contact_condim_packed).reshape(-1, 3)
   mask = a["contact_mask"][0].cpu().numpy()
   gpu_pos = a["contact_position"][0].cpu().numpy()
   matched_cpu_blocks = set()
@@ -858,9 +859,9 @@ def test_coupled_system_mixed_primitive_manifolds():
       assert len(matches) == 1, f"Expected unique matching CPU block for slot {s}, found {len(matches)}"
       cb = matches[0]
       matched_cpu_blocks.add((cb[0], cb[1], cb[3]))
-      cdim, row_off = packed[s]
+      cdim, row_off, _cone = packed[s]
       gpu_row0 = base_contact + int(row_off)
-      nrow = 4 if int(cdim) == 3 else 1
+      nrow = 1 if int(cdim) == 1 else (int(cdim) if int(desc.cone_type) == int(mujoco.mjtCone.mjCONE_ELLIPTIC) else 2 * (int(cdim) - 1))
       assert nrow == cb[4]
       for k in range(nrow):
         mapping[gpu_row0 + k] = cb[3] + k
@@ -959,9 +960,14 @@ def test_coupled_system_mixed_primitive_manifolds():
   kkt = float(np.max(np.abs(proj - lam_gpu[act]) * diag / row_scale))
   assert kkt < 1e-4, f"projected KKT residual {kkt:.3e} exceeded 1e-4"
 
-  # ---- step executes cleanly ----
-  sim.step(1)
-  assert sim.state.status[0].item() == 0
+  # ---- time-varying actuation remains coupled to contact and joint rows ----
+  for ctrl in (0.0, 0.5, -0.4, 0.3):
+    sim.step(1, ctrl=np.array([[ctrl]], dtype=np.float32))
+    d_cpu.ctrl[0] = ctrl
+    mujoco.mj_step(m, d_cpu)
+    assert sim.state.status[0].item() == 0
+    np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), d_cpu.qpos, rtol=2e-3, atol=1e-3)
+    np.testing.assert_allclose(sim.state.qvel[0].cpu().numpy(), d_cpu.qvel, rtol=2e-3, atol=2e-2)
 
 
 # =============================================================================
@@ -1898,4 +1904,3 @@ def test_clockwork_parcel_sorter_matched_states_and_sensitivity_audit():
   assert max_rot_cpu32 <= 1.0
   assert max_lin_v_cpu32 <= 0.10
   assert max_ang_v_cpu32 <= 2.5
-

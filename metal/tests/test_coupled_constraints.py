@@ -16,6 +16,7 @@ from mujoco_metal.coupled_constraints import (
     MetalCoupledConstraints,
 )
 from mujoco_metal.model import load_model
+from mujoco_metal.metal_kinematics import MetalKinematics
 from mujoco_metal.smooth_metal import MetalSmoothDynamics
 
 COUPLED_XML = """<mujoco model="coupled_test">
@@ -73,18 +74,482 @@ def test_coupled_lowering_unsupported_geoms_rejected():
 
 
 
-def test_coupled_lowering_unsupported_condim_rejected():
+def test_coupled_lowering_condim4_and6_supported():
   xml = COUPLED_XML.replace('<compiler angle="radian"/>', '<compiler angle="radian"/><default><geom condim="4"/></default>')
   m = mujoco.MjModel.from_xml_string(xml)
-  with pytest.raises(ValueError, match="condim"):
-    lower_coupled_constraints(m)
+  assert lower_coupled_constraints(m).contact_condim.max() == 4
+  xml = COUPLED_XML.replace('<compiler angle="radian"/>', '<compiler angle="radian"/><default><geom condim="6"/></default>')
+  m = mujoco.MjModel.from_xml_string(xml)
+  assert lower_coupled_constraints(m).contact_condim.max() == 6
 
 
-def test_coupled_lowering_elliptic_cone_rejected_for_condim3():
+def test_coupled_lowering_elliptic_cone_is_recorded():
   xml = COUPLED_XML.replace('tolerance="1e-6">', 'tolerance="1e-6" cone="elliptic">')
   m = mujoco.MjModel.from_xml_string(xml)
-  with pytest.raises(ValueError, match="pyramidal"):
-    lower_coupled_constraints(m)
+  desc = lower_coupled_constraints(m)
+  assert desc.cone_type == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
+
+
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [1, 3, 4, 6])
+def test_coupled_lowering_allocates_exact_cone_dimensions(cone, condim):
+  xml = f'''<mujoco><option cone="{cone}"/>
+    <worldbody><geom type="plane" size="2 2 .1" condim="{condim}"
+      friction=".8 .6 .07"/>
+      <body pos="0 0 .15"><freejoint/><geom type="sphere" size=".2"
+        condim="{condim}" friction=".8 .6 .07"/></body>
+    </worldbody></mujoco>'''
+  desc = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml))
+  assert desc.ncontacts_max == 1
+  assert desc.contact_condim.tolist() == [condim]
+  assert desc.contact_friction[0].tolist() == pytest.approx([.8, .8, .6, .07, .07])
+  expected_rows = (
+      1 if condim == 1 else
+      2 * (condim - 1) if cone == "pyramidal" else
+      condim
+  )
+  assert desc.nr == desc.nr_joint + expected_rows
+  assert desc.contact_condim_packed.tolist() == [condim, 0, int(desc.cone_type)]
+
+
+def test_coupled_explicit_pair_preserves_five_friction_and_solreffriction():
+  xml = '''<mujoco><option cone="elliptic"/>
+    <worldbody><geom name="floor" type="plane" size="2 2 .1"/>
+      <body pos="0 0 .15"><freejoint/><geom name="ball" type="sphere"
+        size=".2"/></body></worldbody>
+    <contact><pair geom1="floor" geom2="ball" condim="6"
+      friction=".8 .6 .07 .04 .03" solreffriction=".03 1"/></contact>
+  </mujoco>'''
+  desc = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml))
+  np.testing.assert_allclose(desc.friction[0], [.8, .6, .07, .04, .03])
+  np.testing.assert_allclose(desc.contact_friction[0], [.8, .6, .07, .04, .03])
+  np.testing.assert_allclose(desc.solreffriction[0], [.03, 1.0])
+  np.testing.assert_allclose(desc.contact_solreffriction[0], [.03, 1.0])
+
+
+def test_contact_friction_priority_and_equal_priority_mixing():
+  xml = '''<mujoco><option cone="elliptic"/><worldbody>
+    <geom name="floor" type="plane" size="2 2 .1" condim="6"
+      priority="2" friction=".2 .03 .004"/>
+    <body pos="0 0 .15"><freejoint/><geom name="ball" type="sphere"
+      size=".2" condim="4" priority="1" friction=".8 .6 .07"/></body>
+  </worldbody></mujoco>'''
+  prioritized = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml))
+  assert prioritized.contact_condim.tolist() == [6]
+  np.testing.assert_allclose(prioritized.contact_friction[0], [.2, .2, .03, .004, .004])
+
+  xml = xml.replace('priority="2"', 'priority="0"').replace('priority="1"', 'priority="0"')
+  mixed = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml))
+  assert mixed.contact_condim.tolist() == [6]
+  np.testing.assert_allclose(mixed.contact_friction[0], [.8, .8, .6, .07, .07])
+
+
+def test_contact_friction_lowering_preserves_zero_and_near_zero_coefficients():
+  xml = '''<mujoco><option cone="elliptic"/><worldbody>
+    <geom type="plane" size="2 2 .1" condim="6" friction="0 .0000001 0"/>
+    <body pos="0 0 .15"><freejoint/><geom type="sphere" size=".2"
+      condim="6" friction=".0000001 0 .0000002"/></body>
+  </worldbody></mujoco>'''
+  desc = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml))
+  np.testing.assert_allclose(desc.contact_friction[0], [1e-7, 1e-7, 1e-7, 2e-7, 2e-7])
+
+
+def _row_capacity_model(cone, contact_count):
+  condim = 6
+  root = [
+      f'<mujoco><option cone="{cone}"/><worldbody>',
+      '<geom name="floor" type="plane" size="10 10 .1" condim="6" '
+      'friction=".8 .6 .07" contype="1" conaffinity="1"/>',
+  ]
+  for index in range(contact_count):
+    root.append(
+        f'<body pos="{index * .4} 0 .095"><joint type="slide" axis="0 0 1"/>'
+        '<geom type="sphere" size=".1" condim="6" friction=".8 .6 .07" '
+        'contype="1" conaffinity="0"/></body>'
+    )
+  root.append("</worldbody></mujoco>")
+  return mujoco.MjModel.from_xml_string("".join(root))
+
+
+@pytest.mark.parametrize(("cone", "max_contacts", "overflow_contacts"), [
+    ("elliptic", 10, 11),
+    ("pyramidal", 7, 8),
+])
+def test_contact_row_capacity_boundary_rejects_overflow(cone, max_contacts, overflow_contacts):
+  desc = lower_coupled_constraints(_row_capacity_model(cone, max_contacts))
+  rows_per_contact = 6 if cone == "elliptic" else 10
+  assert desc.nr <= 96
+  assert desc.contact_condim_packed[-2] + rows_per_contact == (max_contacts - 1) * rows_per_contact + rows_per_contact
+  with pytest.raises(ValueError, match="total candidate constraint rows"):
+    lower_coupled_constraints(_row_capacity_model(cone, overflow_contacts))
+
+
+def _elliptic_project(x):
+  """Euclidean projection onto the standard second-order cone."""
+  x = np.asarray(x, dtype=np.float64)
+  tail = np.linalg.norm(x[1:])
+  if tail <= x[0]:
+    return x.copy()
+  if tail <= -x[0]:
+    return np.zeros_like(x)
+  projected = np.zeros_like(x)
+  projected[0] = 0.5 * (tail + x[0])
+  projected[1:] = projected[0] * x[1:] / tail
+  return projected
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [1, 3, 4, 6])
+def test_native_contact_cone_dimension_matrix(cone, condim):
+  """Check actual cone engagement, physical wrench, and an independent KKT residual."""
+  import torch
+
+  xml = f'''<mujoco><option timestep=".002" gravity="0 0 0" cone="{cone}"
+      iterations="1000" tolerance="1e-10"/>
+    <worldbody><geom type="plane" size="2 2 .1" euler="0 .28 .11"
+        condim="{condim}" friction=".8 .6 .07"/>
+      <body pos=".02 -.01 .18" euler=".2 -.1 .3"><freejoint/>
+        <geom type="sphere" pos=".045 .02 0" size=".2" condim="{condim}"
+            friction=".8 .6 .07"/>
+      </body></worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = model.qpos0[None, :].astype(np.float32)
+  qvel = np.zeros((1, model.nv), dtype=np.float32)
+  qvel[0, :3] = [.3, -.2, .1]
+  qvel[0, 3:6] = [1.3, -2.1, 3.4]
+  descriptor = lower_coupled_constraints(model)
+  device = torch.device("mps")
+  qpos_mps = torch.as_tensor(qpos, device=device)
+  qvel_mps = torch.as_tensor(qvel, device=device)
+  model_descriptor = load_model(model)
+  poses = MetalKinematics(model_descriptor, 1).run_device(qpos_mps)
+  dynamics = MetalSmoothDynamics(model_descriptor, 1).run_device(qpos_mps, qvel_mps)
+  result = MetalCoupledConstraints(model, 1).run_device(
+      poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
+  )
+
+  reference = mujoco.MjData(model)
+  reference.qpos[:], reference.qvel[:] = qpos[0], qvel[0]
+  mujoco.mj_forward(model, reference)
+  assert reference.ncon == 1 and int(result["status"][0]) == 0
+
+  # Compare the full active contact block and its Delassus operator against
+  # MuJoCo's rows, including cone-specific row count, R, reference and rhs.
+  cpu_contact_base = next(
+      r for r in range(reference.nefc) if int(reference.efc_type[r]) in (5, 6, 7)
+  )
+  row_count = (
+      1 if condim == 1 else
+      2 * (condim - 1) if cone == "pyramidal" else
+      condim
+  )
+  gpu_row_base = descriptor.nr_joint + int(descriptor.contact_condim_packed[1])
+  gpu_rows = np.arange(gpu_row_base, gpu_row_base + row_count)
+  cpu_rows = np.arange(cpu_contact_base, cpu_contact_base + row_count)
+  cpu_J = reference.efc_J.reshape(reference.nefc, model.nv)
+  np.testing.assert_allclose(result["J"][0, gpu_rows].cpu().numpy(), cpu_J[cpu_rows], atol=3e-6)
+  np.testing.assert_allclose(result["R"][0, gpu_rows].cpu().numpy(), reference.efc_R[cpu_rows], rtol=2e-5, atol=1e-5)
+  np.testing.assert_allclose(result["ar"][0, gpu_rows].cpu().numpy(), reference.efc_aref[cpu_rows], rtol=2e-4, atol=2e-3)
+  np.testing.assert_allclose(-result["rhs"][0, gpu_rows].cpu().numpy(), reference.efc_b[cpu_rows], rtol=2e-4, atol=2e-3)
+  cpu_mass = np.zeros((model.nv, model.nv))
+  mujoco.mj_fullM(model, reference, cpu_mass)
+  np.testing.assert_allclose(dynamics["mass_matrix"][0].cpu().numpy(), cpu_mass, rtol=2e-5, atol=3e-6)
+  cpu_W = cpu_J[cpu_rows] @ np.linalg.solve(cpu_mass, cpu_J[cpu_rows].T)
+  np.testing.assert_allclose(
+      result["W"][0][np.ix_(gpu_rows, gpu_rows)].cpu().numpy(),
+      cpu_W,
+      rtol=2e-5,
+      atol=3e-6,
+  )
+
+  point_jac = np.zeros((3, model.nv))
+  rotation_jac = np.zeros((3, model.nv))
+  moving_body = int(model.geom_bodyid[reference.contact[0].geom[1]])
+  mujoco.mj_jac(
+      model, reference, point_jac, rotation_jac,
+      reference.contact[0].pos, moving_body,
+  )
+  frame_axes = np.asarray(reference.contact[0].frame).reshape(3, 3)
+  expected_jacobian = np.vstack([
+      frame_axes @ point_jac,
+      frame_axes @ rotation_jac,
+  ])
+  np.testing.assert_allclose(
+      result["contact_jacobian"][0, 0].cpu().numpy(),
+      expected_jacobian,
+      rtol=2e-5,
+      atol=3e-6,
+  )
+  np.testing.assert_allclose(
+      result["qacc"][0].cpu().numpy(), reference.qacc,
+      rtol=5e-4, atol=2e-2,
+  )
+  np.testing.assert_allclose(
+      result["qfrc_constraint"][0].cpu().numpy(), reference.qfrc_constraint,
+      rtol=5e-4, atol=8e-2,
+  )
+  np.testing.assert_array_equal(result["contact_mask"][0].cpu().numpy(), [1.0])
+
+  native_wrench = result["contact_wrench"][0, 0].cpu().numpy()
+  cpu_wrench = np.zeros(6)
+  mujoco.mj_contactForce(model, reference, 0, cpu_wrench)
+  np.testing.assert_allclose(native_wrench, cpu_wrench, rtol=5e-4, atol=8e-2)
+  if condim == 4:
+    assert abs(native_wrench[3]) > 1.0  # torsional friction is engaged
+
+  lam = result["lambda"][0].cpu().numpy().astype(np.float64)
+  Wreg = result["W_regularized"][0].cpu().numpy().astype(np.float64)
+  rhs = result["rhs"][0].cpu().numpy().astype(np.float64)
+  row_start = descriptor.nr_joint + int(descriptor.contact_condim_packed[1])
+  if cone == "elliptic" and condim > 1:
+    rows = np.arange(row_start, row_start + condim)
+    friction = descriptor.contact_friction[0, : condim - 1].astype(np.float64)
+    scale = np.concatenate([[1.0], friction])
+    y = lam[rows] / scale
+    block = Wreg[np.ix_(rows, rows)]
+    hessian = scale[:, None] * block * scale[None, :]
+    gradient = Wreg[np.ix_(rows, np.arange(len(lam)))] @ lam - rhs[rows]
+    linear = scale * (gradient - block @ lam[rows])
+    assert y[0] >= 0.0
+    assert np.linalg.norm(y[1:]) <= y[0] + 1e-4
+    lipschitz = np.linalg.norm(hessian, ord=np.inf)
+    projected = _elliptic_project(y - (hessian @ y + linear) / lipschitz)
+    residual = np.linalg.norm(y - projected) * lipschitz / max(
+        1.0, np.linalg.norm(linear) + np.linalg.norm(hessian @ y)
+    )
+    assert residual <= 2e-5, (cone, condim, residual)
+  elif condim > 1:
+    edge_count = 2 * (condim - 1)
+    rows = np.arange(row_start, row_start + edge_count)
+    assert np.all(lam[rows] >= -2e-5)
+    gradient = Wreg[np.ix_(rows, np.arange(len(lam)))] @ lam - rhs[rows]
+    diagonal = np.maximum(np.diag(Wreg)[rows], 1e-12)
+    projected = np.maximum(0.0, lam[rows] - gradient / diagonal)
+    scale = np.maximum(
+        1.0,
+        np.abs(rhs[rows])
+        + np.abs(Wreg[np.ix_(rows, np.arange(len(lam)))] @ lam),
+    )
+    residual = np.max(np.abs(projected - lam[rows]) * diagonal / scale)
+    assert residual <= 2e-5, (cone, condim, residual)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [4, 6])
+@pytest.mark.parametrize("shape", ["capsule", "box"])
+def test_native_friction_contact_capsule_and_box(cone, condim, shape):
+  """Qualify rotational contact blocks on the remaining admitted geom families."""
+  import torch
+
+  if shape == "capsule":
+    geom = '<geom type="capsule" size=".08 .12" condim="{}" friction=".8 .6 .07"/>'.format(condim)
+    position = 'pos=".02 -.01 .19" euler=".1 .2 .3"'
+  else:
+    geom = '<geom type="box" size=".1 .12 .08" condim="{}" friction=".8 .6 .07"/>'.format(condim)
+    position = 'pos=".02 -.01 .07" euler=".1 .2 .3"'
+  xml = f'''<mujoco><option timestep=".002" gravity="0 0 0" cone="{cone}"
+      iterations="1000" tolerance="1e-10"/>
+    <worldbody><geom type="plane" size="2 2 .1" condim="{condim}"
+        friction=".8 .6 .07"/>
+      <body {position}><freejoint/>{geom}</body>
+    </worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = model.qpos0[None, :].astype(np.float32)
+  qvel = np.array([[.12, -.08, .03, .4, -.7, 1.1]], dtype=np.float32)
+  device = torch.device("mps")
+  qpos_mps = torch.as_tensor(qpos, device=device)
+  qvel_mps = torch.as_tensor(qvel, device=device)
+  model_descriptor = load_model(model)
+  poses = MetalKinematics(model_descriptor, 1).run_device(qpos_mps)
+  dynamics = MetalSmoothDynamics(model_descriptor, 1).run_device(qpos_mps, qvel_mps)
+  result = MetalCoupledConstraints(model, 1).run_device(
+      poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
+  )
+  reference = mujoco.MjData(model)
+  reference.qpos[:], reference.qvel[:] = qpos[0], qvel[0]
+  mujoco.mj_forward(model, reference)
+  assert reference.ncon > 0, shape
+  assert int(result["status"][0]) == 0, result["solver_diagnostics"].cpu().numpy()
+  assert int((result["contact_mask"][0] > 0).sum()) == reference.ncon
+  np.testing.assert_allclose(
+      result["qacc"][0].cpu().numpy(), reference.qacc, rtol=1e-3, atol=5e-2
+  )
+  np.testing.assert_allclose(
+      result["qfrc_constraint"][0].cpu().numpy(),
+      reference.qfrc_constraint,
+      rtol=1e-3,
+      atol=1e-1,
+  )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+def test_native_condim6_contact_engages_rolling_friction(cone):
+  """Use an independent contact-force oracle and require a real roll moment."""
+  import torch
+
+  xml = f'''<mujoco><option timestep=".002" gravity="0 0 0" cone="{cone}"
+      iterations="1000" tolerance="1e-10"/>
+    <worldbody><geom type="plane" size="2 2 .1" condim="6"
+        friction=".8 .6 .07"/>
+      <body pos="0 0 .15"><freejoint/>
+        <geom type="sphere" size=".2" condim="6" friction=".8 .6 .07"/>
+      </body></worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = model.qpos0[None, :].astype(np.float32)
+  qvel = np.array([[.3, -.2, .1, 1.3, -2.1, 3.4]], dtype=np.float32)
+  device = torch.device("mps")
+  qpos_mps = torch.as_tensor(qpos, device=device)
+  qvel_mps = torch.as_tensor(qvel, device=device)
+  model_descriptor = load_model(model)
+  poses = MetalKinematics(model_descriptor, 1).run_device(qpos_mps)
+  dynamics = MetalSmoothDynamics(model_descriptor, 1).run_device(qpos_mps, qvel_mps)
+  result = MetalCoupledConstraints(model, 1).run_device(
+      poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
+  )
+  reference = mujoco.MjData(model)
+  reference.qpos[:], reference.qvel[:] = qpos[0], qvel[0]
+  mujoco.mj_forward(model, reference)
+  cpu_wrench = np.zeros(6)
+  mujoco.mj_contactForce(model, reference, 0, cpu_wrench)
+  native_wrench = result["contact_wrench"][0, 0].cpu().numpy()
+  assert np.linalg.norm(cpu_wrench[4:6]) > 1.0, cpu_wrench
+  assert np.linalg.norm(native_wrench[4:6]) > 1.0, native_wrench
+  np.testing.assert_allclose(native_wrench, cpu_wrench, rtol=5e-4, atol=8e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("solreffriction", [".03 1", "-.03 -1"])
+def test_native_explicit_elliptic_pair_preserves_anisotropic_friction(solreffriction):
+  """Exercise pair-specific five-axis friction and standard/direct friction refs."""
+  import torch
+
+  xml = f'''<mujoco><option timestep=".002" gravity="0 0 0" cone="elliptic"
+      iterations="1000" tolerance="1e-10"/>
+    <worldbody><geom name="floor" type="plane" size="2 2 .1"
+        euler="0 .28 .11"/>
+      <body name="ball" pos=".02 -.01 .18" euler=".2 -.1 .3"><freejoint/>
+        <geom name="sphere" type="sphere" pos=".045 .02 0" size=".2"/>
+      </body></worldbody>
+    <contact><pair geom1="floor" geom2="sphere" condim="6"
+        friction=".8 .6 .07 .04 .03" solreffriction="{solreffriction}"/>
+    </contact></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  descriptor = lower_coupled_constraints(model)
+  np.testing.assert_allclose(descriptor.contact_friction[0], [.8, .6, .07, .04, .03])
+  qpos = model.qpos0[None, :].astype(np.float32)
+  qvel = np.array([[.3, -.2, .1, 1.3, -2.1, 3.4]], dtype=np.float32)
+  device = torch.device("mps")
+  qpos_mps = torch.as_tensor(qpos, device=device)
+  qvel_mps = torch.as_tensor(qvel, device=device)
+  model_descriptor = load_model(model)
+  poses = MetalKinematics(model_descriptor, 1).run_device(qpos_mps)
+  dynamics = MetalSmoothDynamics(model_descriptor, 1).run_device(qpos_mps, qvel_mps)
+  result = MetalCoupledConstraints(model, 1).run_device(
+      poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
+  )
+  reference = mujoco.MjData(model)
+  reference.qpos[:], reference.qvel[:] = qpos[0], qvel[0]
+  mujoco.mj_forward(model, reference)
+  assert reference.ncon == 1 and int(result["status"][0]) == 0
+  np.testing.assert_allclose(
+      result["qacc"][0].cpu().numpy(), reference.qacc, rtol=5e-4, atol=2e-2
+  )
+  native_wrench = result["contact_wrench"][0, 0].cpu().numpy()
+  cpu_wrench = np.zeros(6)
+  mujoco.mj_contactForce(model, reference, 0, cpu_wrench)
+  np.testing.assert_allclose(native_wrench, cpu_wrench, rtol=5e-4, atol=8e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_native_elliptic_contact_handles_zero_and_near_zero_friction():
+  import torch
+
+  xml = '''<mujoco><option timestep=".002" gravity="0 0 0" cone="elliptic"
+      iterations="1000" tolerance="1e-10"/>
+    <worldbody><geom type="plane" size="2 2 .1" condim="6"
+        friction="0 .0000001 0"/>
+      <body pos="0 0 .15"><freejoint/>
+        <geom type="sphere" size=".2" condim="6"
+            friction=".0000001 0 .0000002"/>
+      </body></worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = model.qpos0[None, :].astype(np.float32)
+  qvel = np.array([[.3, -.2, .1, 1.3, -2.1, 3.4]], dtype=np.float32)
+  device = torch.device("mps")
+  qpos_mps = torch.as_tensor(qpos, device=device)
+  qvel_mps = torch.as_tensor(qvel, device=device)
+  model_descriptor = load_model(model)
+  poses = MetalKinematics(model_descriptor, 1).run_device(qpos_mps)
+  dynamics = MetalSmoothDynamics(model_descriptor, 1).run_device(qpos_mps, qvel_mps)
+  result = MetalCoupledConstraints(model, 1).run_device(
+      poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
+  )
+  reference = mujoco.MjData(model)
+  reference.qpos[:], reference.qvel[:] = qpos[0], qvel[0]
+  mujoco.mj_forward(model, reference)
+  assert reference.ncon == 1 and int(result["status"][0]) == 0
+  assert torch.isfinite(result["qacc"]).all()
+  assert torch.isfinite(result["contact_wrench"]).all()
+  native = result["contact_wrench"][0, 0].cpu().numpy()
+  cpu = np.zeros(6)
+  mujoco.mj_contactForce(model, reference, 0, cpu)
+  assert native[0] > 0 and cpu[0] > 0
+  assert np.linalg.norm(native[1:]) < 1e-3 * native[0]
+  np.testing.assert_allclose(native, cpu, rtol=2e-3, atol=5e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize(("cone", "contact_count"), [("elliptic", 10), ("pyramidal", 7)])
+def test_native_contact_final_valid_row_capacity(cone, contact_count):
+  """Fill the last admitted slot in one world beside a contact-free world."""
+  import torch
+
+  model = _row_capacity_model(cone, contact_count)
+  descriptor = lower_coupled_constraints(model)
+  assert descriptor.nv == contact_count
+  assert descriptor.nr <= 96
+  qpos = np.tile(model.qpos0, (2, 1)).astype(np.float32)
+  for j in range(model.njnt):
+    qpos[1, model.jnt_qposadr[j]] = 0.2  # Keep the second world's spheres above the floor.
+  qvel = np.zeros((2, model.nv), dtype=np.float32)
+  device = torch.device("mps")
+  qpos_mps = torch.as_tensor(qpos, device=device)
+  qvel_mps = torch.as_tensor(qvel, device=device)
+  model_descriptor = load_model(model)
+  poses = MetalKinematics(model_descriptor, 2).run_device(qpos_mps)
+  dynamics = MetalSmoothDynamics(model_descriptor, 2).run_device(qpos_mps, qvel_mps)
+  result = MetalCoupledConstraints(model, 2).run_device(
+      poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
+  )
+  references = []
+  for world in range(2):
+    reference = mujoco.MjData(model)
+    reference.qpos[:], reference.qvel[:] = qpos[world], qvel[world]
+    mujoco.mj_forward(model, reference)
+    references.append(reference)
+  assert [ref.ncon for ref in references] == [contact_count, 0]
+  assert torch.all(result["status"] == 0)
+  np.testing.assert_array_equal(
+      result["contact_mask"][0].cpu().numpy(), np.ones(contact_count)
+  )
+  np.testing.assert_array_equal(
+      result["contact_mask"][1].cpu().numpy(), np.zeros(contact_count)
+  )
+  np.testing.assert_allclose(
+      result["qacc"][0].cpu().numpy(), references[0].qacc, rtol=5e-4, atol=2e-2
+  )
+  np.testing.assert_allclose(
+      result["qacc"][1].cpu().numpy(), references[1].qacc, rtol=5e-4, atol=2e-2
+  )
 
 
 def test_coupled_oracle_matches_mujoco():
@@ -249,7 +714,7 @@ def test_coupled_solver_settings_range_contracts():
   assert settings.effective_iterations == 1000
   assert settings.requested_tolerance == 1e-6
   assert settings.effective_tolerance == 1e-6
-  assert settings.max_refinement_sweeps == 64
+  assert settings.max_refinement_sweeps == 256
   assert settings.metric == "max_normalized_projected_gradient"
 
   # Iterations contract: [1, 2048]
@@ -291,4 +756,3 @@ def test_coupled_solver_settings_range_contracts():
     mtol_bad.opt.tolerance = bad_tol
     with pytest.raises(ValueError, match="model.opt.tolerance must be finite and positive"):
       lower_coupled_constraints(mtol_bad)
-

@@ -124,6 +124,55 @@ inline float solve_contact_block(
   return best_error;
 }
 
+inline float solve_contact_block_iterative(
+    thread const float* A, thread const float* b, int n,
+    thread float* solution) {
+  thread float x[10], z[10], next[10];
+  float lipschitz = 1e-15f;
+  for (int i = 0; i < 10; ++i) x[i] = z[i] = next[i] = 0.0f;
+  for (int i = 0; i < n; ++i) {
+    x[i] = z[i] = max(0.0f, solution[i]);
+    float row_sum = 0.0f;
+    for (int j = 0; j < n; ++j) row_sum += abs(A[i * 10 + j]);
+    lipschitz = max(lipschitz, row_sum);
+  }
+  float momentum = 1.0f;
+  float residual = INFINITY;
+  for (int iteration = 0; iteration < 1024; ++iteration) {
+    for (int i = 0; i < n; ++i) {
+      float gradient = b[i];
+      for (int j = 0; j < n; ++j) gradient += A[i * 10 + j] * z[j];
+      next[i] = max(0.0f, z[i] - gradient / lipschitz);
+    }
+    float next_momentum = 0.5f * (1.0f + sqrt(1.0f + 4.0f * momentum * momentum));
+    float beta = (momentum - 1.0f) / next_momentum;
+    for (int i = 0; i < n; ++i) {
+      float previous = x[i];
+      x[i] = next[i];
+      z[i] = next[i] + beta * (next[i] - previous);
+    }
+    momentum = next_momentum;
+
+    if ((iteration & 15) == 15 || iteration == 1023) {
+      residual = 0.0f;
+      for (int i = 0; i < n; ++i) {
+        float gradient = b[i];
+        float row_scale = abs(b[i]);
+        for (int j = 0; j < n; ++j) {
+          float value = A[i * 10 + j] * x[j];
+          gradient += value;
+          row_scale += abs(value);
+        }
+        float projected = max(0.0f, x[i] - gradient / max(A[i * 10 + i], 1e-15f));
+        residual = max(residual, abs(projected - x[i]) * A[i * 10 + i] / max(1.0f, row_scale));
+      }
+      if (residual <= 5e-7f) break;
+    }
+  }
+  for (int i = 0; i < n; ++i) solution[i] = x[i];
+  return residual;
+}
+
 // Geometric contact detection and Jacobian generation for all 9 primitive pairs
 kernel void contact_normal(
     device const float* geom_pos [[buffer(0)]],
@@ -148,11 +197,12 @@ kernel void contact_normal(
     device const float* pair_solimp [[buffer(19)]],
     device const int* pair_condim [[buffer(20)]],
     device const float* pair_friction [[buffer(21)]],
-    device const int* pair_contact_offset [[buffer(22)]],
-    device float* row_data [[buffer(23)]],
-    device float* frame [[buffer(24)]],
-    device float* jacobian [[buffer(25)]],
-    constant int* dims [[buffer(26)]],
+    device const float* pair_solreffriction [[buffer(22)]],
+    device const int* pair_contact_offset [[buffer(23)]],
+    device float* row_data [[buffer(24)]],
+    device float* frame [[buffer(25)]],
+    device float* jacobian [[buffer(26)]],
+    constant int* dims [[buffer(27)]],
     uint tid [[thread_position_in_grid]]) {
   int nv = dims[0];
   int npairs = dims[1];
@@ -182,8 +232,7 @@ kernel void contact_normal(
   float m = pair_margin_gap[pair_idx * 2 + 0];
   float g = pair_margin_gap[pair_idx * 2 + 1];
   int dim = pair_condim[pair_idx];
-  float mu0 = pair_friction[pair_idx * 2 + 0];
-  float mu1 = pair_friction[pair_idx * 2 + 1];
+  float cone = float(dims[7]);
 
   int offset = pair_contact_offset[pair_idx];
   int max_con = pair_contact_offset[pair_idx + 1] - offset;
@@ -225,8 +274,8 @@ kernel void contact_normal(
     int slot = offset + k;
     if (slot >= ncontacts_max) break;
     int out = world * ncontacts_max + slot;
-    int jbase = out * 5 * nv;
-    int rb = out * 5 * 6;
+    int jbase = out * 6 * nv;
+    int rb = out * 6 * 6;
     int fb = out * 12;
 
     float d = con[k].dist;
@@ -236,8 +285,8 @@ kernel void contact_normal(
     float3 point = con[k].pos;
 
     // Zero out buffers
-    for (int i = 0; i < 5 * 6; ++i) row_data[rb + i] = 0.0f;
-    for (int i = 0; i < 5 * nv; ++i) jacobian[jbase + i] = 0.0f;
+    for (int i = 0; i < 6 * 6; ++i) row_data[rb + i] = 0.0f;
+    for (int i = 0; i < 6 * nv; ++i) jacobian[jbase + i] = 0.0f;
     for (int i = 0; i < 12; ++i) frame[fb + i] = 0.0f;
 
     // Compute Kinematics Jacobian
@@ -251,47 +300,41 @@ kernel void contact_normal(
         for (int jj = 0; jj < jn; ++jj) {
           int j = ja + jj;
           int da = jnt_dofadr[j];
-          int typ = jnt_type[j];
-          int nd = typ == 0 ? 6 : typ == 1 ? 3 : 1;
-          for (int q = 0; q < nd; ++q) {
-            int dof = da + q;
-            if (dof < 0 || dof >= nv) continue;
-            float3 col = float3(0.0f);
-            if (typ == 2) {
-              col = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
-            } else if (typ == 3) {
-              float3 axis = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
-              col = cross(axis, rel - float3(anchors[(jo + j) * 3], anchors[(jo + j) * 3 + 1], anchors[(jo + j) * 3 + 2]));
-            } else if (typ == 0 || typ == 1) {
+            int typ = jnt_type[j];
+            int nd = typ == 0 ? 6 : typ == 1 ? 3 : 1;
+            for (int q = 0; q < nd; ++q) {
+              int dof = da + q;
+              if (dof < 0 || dof >= nv) continue;
+              float3 col = float3(0.0f);
+              float3 angular = float3(0.0f);
+              if (typ == 2) {
+                col = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
+              } else if (typ == 3) {
+                float3 axis = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
+                angular = axis;
+                col = cross(axis, rel - float3(anchors[(jo + j) * 3], anchors[(jo + j) * 3 + 1], anchors[(jo + j) * 3 + 2]));
+              } else if (typ == 0 || typ == 1) {
               if (typ == 0 && q < 3) {
                 col = float3(q == 0, q == 1, q == 2);
               } else {
                 int qrot = typ == 0 ? q - 3 : q;
                 float4 bq = float4(body_quat[(bo + body) * 4], body_quat[(bo + body) * 4 + 1], body_quat[(bo + body) * 4 + 2], body_quat[(bo + body) * 4 + 3]);
                 float3 axis = rotate_q(bq, float3(qrot == 0, qrot == 1, qrot == 2));
+                angular = axis;
                 float3 pivot = typ == 0 ? float3(body_pos[(bo + body) * 3], body_pos[(bo + body) * 3 + 1], body_pos[(bo + body) * 3 + 2])
                                         : float3(anchors[(jo + j) * 3], anchors[(jo + j) * 3 + 1], anchors[(jo + j) * 3 + 2]);
                 col = cross(axis, rel - pivot);
               }
             }
-            jacobian[jbase + dof] += sign * dot(n, col);
-            jacobian[jbase + nv + dof] += sign * dot(t1, col);
-            jacobian[jbase + 2 * nv + dof] += sign * dot(t2, col);
+              jacobian[jbase + dof] += sign * dot(n, col);
+              jacobian[jbase + nv + dof] += sign * dot(t1, col);
+              jacobian[jbase + 2 * nv + dof] += sign * dot(t2, col);
+              jacobian[jbase + 3 * nv + dof] += sign * dot(n, angular);
+              jacobian[jbase + 4 * nv + dof] += sign * dot(t1, angular);
+              jacobian[jbase + 5 * nv + dof] += sign * dot(t2, angular);
           }
         }
         body = body_parentid[body];
-      }
-    }
-
-    if (dim == 3) {
-      for (int i = 0; i < nv; ++i) {
-        float jn = jacobian[jbase + i];
-        float jt1 = jacobian[jbase + nv + i];
-        float jt2 = jacobian[jbase + 2 * nv + i];
-        jacobian[jbase + nv + i] = jn + mu0 * jt1;
-        jacobian[jbase + 2 * nv + i] = jn - mu0 * jt1;
-        jacobian[jbase + 3 * nv + i] = jn + mu1 * jt2;
-        jacobian[jbase + 4 * nv + i] = jn - mu1 * jt2;
       }
     }
 
@@ -308,14 +351,34 @@ kernel void contact_normal(
       impedance = d0 + y * (d1 - d0);
     }
 
-    for (int row = 0; row < (dim == 3 ? 5 : 1); ++row) {
+    float friction_B = B;
+    if (cone > 0.5f &&
+        (pair_solreffriction[pair_idx * 2] != 0.0f || pair_solreffriction[pair_idx * 2 + 1] != 0.0f)) {
+      float fr0 = pair_solreffriction[pair_idx * 2];
+      float fr1 = pair_solreffriction[pair_idx * 2 + 1];
+      friction_B = fr1 > 0.0f ? 2.0f / max(1e-15f, d1 * fr0) : -fr1 / max(1e-15f, d1);
+    }
+
+    for (int row = 0; row < 6; ++row) {
       float vel = 0.0f;
-      for (int i = 0; i < nv; ++i) vel += jacobian[jbase + row * nv + i] * qvel[world * nv + i];
+      if (dim == 3 && cone < 0.5f && row > 0 && row < 5) {
+        int axis = (row - 1) / 2 + 1;
+        float sign = ((row - 1) & 1) == 0 ? 1.0f : -1.0f;
+        float mu = pair_friction[pair_idx * 5 + axis - 1];
+        for (int i = 0; i < nv; ++i) {
+          float edge_jac = jacobian[jbase + i] + sign * mu * jacobian[jbase + axis * nv + i];
+          vel += edge_jac * qvel[world * nv + i];
+        }
+      } else {
+        for (int i = 0; i < nv; ++i) vel += jacobian[jbase + row * nv + i] * qvel[world * nv + i];
+      }
       int r = rb + row * 6;
-      row_data[r] = (d < m && (dim == 1 || row > 0)) ? 1.0f : 0.0f;
+      row_data[r] = d < m ? 1.0f : 0.0f;
       row_data[r + 1] = d;
       row_data[r + 2] = vel;
-      row_data[r + 3] = -B * vel - K * impedance * (d - m);
+      row_data[r + 3] = (row == 0 || (dim == 3 && cone < 0.5f))
+          ? -B * vel - K * impedance * (d - m)
+          : -((cone > 0.5f) ? friction_B : B) * vel;
       row_data[r + 4] = impedance;
       row_data[r + 5] = diag_approx;
     }
@@ -331,16 +394,87 @@ kernel void contact_normal(
     int slot = offset + k;
     if (slot >= ncontacts_max) break;
     int out = world * ncontacts_max + slot;
-    int jbase = out * 5 * nv;
-    int rb = out * 5 * 6;
+    int jbase = out * 6 * nv;
+    int rb = out * 6 * 6;
     int fb = out * 12;
-    for (int i = 0; i < 5 * 6; ++i) row_data[rb + i] = 0.0f;
-    for (int i = 0; i < 5 * nv; ++i) jacobian[jbase + i] = 0.0f;
+    for (int i = 0; i < 6 * 6; ++i) row_data[rb + i] = 0.0f;
+    for (int i = 0; i < 6 * nv; ++i) jacobian[jbase + i] = 0.0f;
     for (int i = 0; i < 12; ++i) frame[fb + i] = 0.0f;
   }
 }
 
 // Coupled projected constraint solve
+inline void project_lorentz(thread float* x, int dim) {
+  float norm = 0.0f;
+  for (int i = 1; i < dim; ++i) norm += x[i] * x[i];
+  norm = sqrt(norm);
+  if (norm <= x[0]) return;
+  if (norm <= -x[0]) {
+    for (int i = 0; i < dim; ++i) x[i] = 0.0f;
+    return;
+  }
+  float head = 0.5f * (norm + x[0]);
+  float scale = head / max(norm, 1e-20f);
+  x[0] = head;
+  for (int i = 1; i < dim; ++i) x[i] *= scale;
+}
+
+inline float solve_elliptic_block(thread const float* A, thread const float* g,
+    thread const float* friction, int dim, thread float* force) {
+  thread float scale[6], H[36], linear[6], y[6], z[6], next[6];
+  for (int i = 0; i < 6; ++i) {
+    scale[i] = i == 0 ? 1.0f : max(friction[i - 1], 0.0f);
+    y[i] = z[i] = next[i] = 0.0f;
+    linear[i] = 0.0f;
+  }
+  for (int i = 0; i < 36; ++i) H[i] = 0.0f;
+  y[0] = max(0.0f, force[0]);
+  for (int i = 1; i < dim; ++i) {
+    y[i] = scale[i] > 1e-12f ? force[i] / scale[i] : 0.0f;
+  }
+  project_lorentz(y, dim);
+  for (int i = 0; i < dim; ++i) z[i] = y[i];
+  for (int i = 0; i < dim; ++i) {
+    linear[i] = scale[i] * g[i];
+    for (int j = 0; j < dim; ++j) H[i * 6 + j] = scale[i] * A[i * 6 + j] * scale[j];
+  }
+  float lipschitz = 1e-15f;
+  for (int i = 0; i < dim; ++i) {
+    float row_sum = 0.0f;
+    for (int j = 0; j < dim; ++j) row_sum += abs(H[i * 6 + j]);
+    lipschitz = max(lipschitz, row_sum);
+  }
+  float momentum = 1.0f;
+  for (int iteration = 0; iteration < 24; ++iteration) {
+    for (int i = 0; i < dim; ++i) {
+      float gradient = linear[i];
+      for (int j = 0; j < dim; ++j) gradient += H[i * 6 + j] * z[j];
+      next[i] = z[i] - gradient / lipschitz;
+    }
+    project_lorentz(next, dim);
+    float next_momentum = 0.5f * (1.0f + sqrt(1.0f + 4.0f * momentum * momentum));
+    float beta = (momentum - 1.0f) / next_momentum;
+    for (int i = 0; i < dim; ++i) {
+      float previous = y[i];
+      y[i] = next[i];
+      z[i] = next[i] + beta * (next[i] - previous);
+    }
+    momentum = next_momentum;
+  }
+  for (int i = 0; i < dim; ++i) force[i] = scale[i] * y[i];
+  float residual = 0.0f, scale_ref = 1.0f;
+  for (int i = 0; i < dim; ++i) {
+    float gradient = linear[i];
+    for (int j = 0; j < dim; ++j) gradient += H[i * 6 + j] * y[j];
+    next[i] = y[i] - gradient / lipschitz;
+    scale_ref += abs(linear[i]);
+    for (int j = 0; j < dim; ++j) scale_ref += abs(H[i * 6 + j] * y[j]);
+  }
+  project_lorentz(next, dim);
+  for (int i = 0; i < dim; ++i) residual = max(residual, abs(y[i] - next[i]) * lipschitz / scale_ref);
+  return residual;
+}
+
 kernel void solve_coupled_constraints(
     device const float* mass [[buffer(0)]],
     device const float* qfrc [[buffer(1)]],
@@ -384,6 +518,7 @@ kernel void solve_coupled_constraints(
   bool refsafe = dims[7] != 0;
   int maxiter = dims[8];
   int nr = dims[9];
+  int cone_type = dims[10];
   if (world >= uint(batch)) return;
 
   int mb = world * nv * nv;
@@ -498,17 +633,23 @@ kernel void solve_coupled_constraints(
 
   // 2. Contacts (if not disabled by mjDSBL_CONSTRAINT bit 0 or mjDSBL_CONTACT bit 4)
   thread int contact_block_start[24];
+  thread int contact_block_size[24];
   thread int contact_block_count = 0;
+  thread int elliptic_start[24];
+  thread int elliptic_dim[24];
+  thread float elliptic_friction[24 * 5];
+  thread int elliptic_count = 0;
+  thread bool elliptic_member[96];
+  for (int i = 0; i < 96; ++i) elliptic_member[i] = false;
 
   if ((flags & 1) == 0 && (flags & 16) == 0) {
     for (int s = 0; s < ncontacts_max; ++s) {
-      int cdim = contact_condim[s * 2 + 0];
-      int row_offset = contact_condim[s * 2 + 1];
+      int cdim = contact_condim[s * 3 + 0];
+      int row_offset = contact_condim[s * 3 + 1];
       int row_start = base_contact + row_offset;
       int cb = world * ncontacts_max + s;
-      int cjbase = cb * 5 * nv;
-      int crbase = cb * 5 * 6;
-      float mu0 = contact_friction[s * 2 + 0];
+      int cjbase = cb * 6 * nv;
+      int crbase = cb * 6 * 6;
 
       if (cdim == 1) {
         int r = crbase;
@@ -524,27 +665,94 @@ kernel void solve_coupled_constraints(
           hi[row] = INFINITY;
           enabled[row] = true;
         }
-      } else if (cdim == 3) {
-        int r1 = crbase + 1 * 6;
-        if (contact_row_data[r1] > 0.5f) {
-          if (row_start + 4 > nr) { out_status[world] = 2; return; }
-          if (contact_block_count < 24) {
-            contact_block_start[contact_block_count++] = row_start;
+      } else if (contact_row_data[crbase] > 0.5f) {
+        int edge_count = 2 * (cdim - 1);
+        int block_rows = cone_type == 0 ? edge_count : cdim;
+        if (row_start + block_rows > nr) { out_status[world] = 2; return; }
+        float imp = clamp(contact_row_data[crbase + 4], 1e-6f, 0.999999f);
+        float diag_approx = max(contact_row_data[crbase + 5], 1e-15f);
+        float normal_R = max(1e-15f, (1.0f - imp) * diag_approx / imp);
+        if (cone_type == 1) {
+          if (elliptic_count < 24) {
+            elliptic_start[elliptic_count] = row_start;
+            elliptic_dim[elliptic_count] = cdim;
+            for (int k = 0; k < 5; ++k) elliptic_friction[elliptic_count * 5 + k] = contact_friction[s * 5 + k];
+            ++elliptic_count;
           }
+          for (int k = 0; k < cdim; ++k) {
+            int row = row_start + k;
+            elliptic_member[row] = true;
+            int r = crbase + k * 6;
+            for (int i = 0; i < nv; ++i) J_world[row * nv + i] = contact_jacobian[cjbase + k * nv + i];
+            if (k == 0) {
+              R[row] = normal_R;
+              lo[row] = 0.0f;
+              hi[row] = INFINITY;
+            } else {
+              float mu = contact_friction[s * 5 + k - 1];
+              float mu0 = contact_friction[s * 5];
+              float tangent_R = normal_R / max(params[1], 1e-15f);
+              R[row] = tangent_R * mu0 * mu0 / max(mu * mu, 1e-12f);
+              lo[row] = -INFINITY;
+              hi[row] = INFINITY;
+            }
+            ar[row] = contact_row_data[r + 3];
+            enabled[row] = true;
+          }
+        } else if (cdim == 3) {
+          if (contact_block_count < 24) {
+            contact_block_start[contact_block_count] = row_start;
+            contact_block_size[contact_block_count++] = 4;
+          }
+          float mu0 = contact_friction[s * 5];
           for (int k = 0; k < 4; ++k) {
             int row = row_start + k;
-            int subrow = k + 1;
-            int r = crbase + subrow * 6;
-            for (int i = 0; i < nv; ++i) J_world[row * nv + i] = contact_jacobian[cjbase + subrow * nv + i];
-            float imp = clamp(contact_row_data[r + 4], 1e-6f, 0.999999f);
-            float diag_approx = max(contact_row_data[r + 5], 1e-15f);
-            float normal_R = max(1e-15f, (1.0f - imp) * diag_approx / imp);
-            float edge_R = normal_R * (1.0f + mu0 * mu0);
+            int r = crbase + (k + 1) * 6;
+            int axis = k / 2 + 1;
+            float sign = (k & 1) == 0 ? 1.0f : -1.0f;
+            float mu = contact_friction[s * 5 + axis - 1];
+            for (int i = 0; i < nv; ++i) {
+              J_world[row * nv + i] = contact_jacobian[cjbase + i]
+                  + sign * mu * contact_jacobian[cjbase + axis * nv + i];
+            }
+            float edge_imp = clamp(contact_row_data[r + 4], 1e-6f, 0.999999f);
+            float edge_diag = max(contact_row_data[r + 5], 1e-15f);
+            float edge_R = max(1e-15f, (1.0f - edge_imp) * edge_diag / edge_imp) * (1.0f + mu0 * mu0);
             R[row] = 2.0f * mu0 * mu0 / max(params[1], 1e-15f) * edge_R;
             ar[row] = contact_row_data[r + 3];
             lo[row] = 0.0f;
             hi[row] = INFINITY;
             enabled[row] = true;
+          }
+        } else {
+          if (cdim > 1 && contact_block_count < 24) {
+            contact_block_start[contact_block_count] = row_start;
+            contact_block_size[contact_block_count++] = 2 * (cdim - 1);
+          }
+          float mu0 = contact_friction[s * 5];
+          float mu_master = mu0 / sqrt(max(params[1], 1e-15f));
+          // MuJoCo 3.10 first builds the first pyramid edge diagonal as
+          // Rnormal * (1 + mu0^2), then derives its common Rpy from that row.
+          // Every edge shares this regularizer; each edge Jacobian carries its
+          // own friction coefficient.
+          float pyramid_R = max(1e-15f, 2.0f * mu_master * mu_master * normal_R * (1.0f + mu0 * mu0));
+          for (int axis = 0; axis < cdim - 1; ++axis) {
+            float mu = contact_friction[s * 5 + axis];
+            for (int side = 0; side < 2; ++side) {
+              int k = axis * 2 + side;
+              int row = row_start + k;
+              float sign = side == 0 ? 1.0f : -1.0f;
+              int r0 = crbase;
+              int rt = crbase + (axis + 1) * 6;
+              for (int i = 0; i < nv; ++i) {
+                J_world[row * nv + i] = contact_jacobian[cjbase + i] + sign * mu * contact_jacobian[cjbase + (axis + 1) * nv + i];
+              }
+              R[row] = pyramid_R;
+              ar[row] = contact_row_data[r0 + 3] + sign * mu * contact_row_data[rt + 3];
+              lo[row] = 0.0f;
+              hi[row] = INFINITY;
+              enabled[row] = true;
+            }
           }
         }
       }
@@ -621,6 +829,31 @@ kernel void solve_coupled_constraints(
   float max_res = 0.0f;
   for (int it = 0; it < maxiter; ++it) {
     for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+      if (elliptic_member[row]) {
+        int block = -1;
+        for (int b = 0; b < elliptic_count; ++b) if (elliptic_start[b] == row) block = b;
+        if (block < 0) continue;
+        int dim = elliptic_dim[block];
+        thread float A[36], g[6], mu[5], force[6];
+        for (int i = 0; i < 36; ++i) A[i] = 0.0f;
+        for (int i = 0; i < 6; ++i) { g[i] = 0.0f; force[i] = 0.0f; }
+        for (int i = 0; i < 5; ++i) mu[i] = elliptic_friction[block * 5 + i];
+        for (int i = 0; i < dim; ++i) {
+          int ri = row + i;
+          force[i] = lam[ri];
+          g[i] = -rhs[ri];
+          for (int col = 0; col < total_nr; ++col) {
+            if (enabled[col] && (col < row || col >= row + dim)) g[i] += W[ri * nr + col] * lam[col];
+          }
+          for (int j = 0; j < dim; ++j) {
+            int rj = row + j;
+            A[i * 6 + j] = W[ri * nr + rj] + (i == j ? R[ri] : 0.0f);
+          }
+        }
+        solve_elliptic_block(A, g, mu, dim, force);
+        for (int i = 0; i < dim; ++i) lam[row + i] = force[i];
+        continue;
+      }
       float diag = max(1e-15f, W[row * nr + row] + R[row]);
       float v = rhs[row];
       for (int col = 0; col < total_nr; ++col) if (enabled[col] && col != row) {
@@ -630,6 +863,30 @@ kernel void solve_coupled_constraints(
     }
     max_res = 0.0f;
     for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+      if (elliptic_member[row]) {
+        int block = -1;
+        for (int b = 0; b < elliptic_count; ++b) if (elliptic_start[b] == row) block = b;
+        if (block < 0) continue;
+        int dim = elliptic_dim[block];
+        thread float A[36], g[6], mu[5], force[6];
+        for (int i = 0; i < 36; ++i) A[i] = 0.0f;
+        for (int i = 0; i < 6; ++i) { g[i] = 0.0f; force[i] = 0.0f; }
+        for (int i = 0; i < 5; ++i) mu[i] = elliptic_friction[block * 5 + i];
+        for (int i = 0; i < dim; ++i) {
+          int ri = row + i;
+          force[i] = lam[ri];
+          g[i] = -rhs[ri];
+          for (int col = 0; col < total_nr; ++col) {
+            if (enabled[col] && (col < row || col >= row + dim)) g[i] += W[ri * nr + col] * lam[col];
+          }
+          for (int j = 0; j < dim; ++j) {
+            int rj = row + j;
+            A[i * 6 + j] = W[ri * nr + rj] + (i == j ? R[ri] : 0.0f);
+          }
+        }
+        max_res = max(max_res, solve_elliptic_block(A, g, mu, dim, force));
+        continue;
+      }
       float grad = -rhs[row];
       for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
       grad += R[row] * lam[row];
@@ -646,33 +903,51 @@ kernel void solve_coupled_constraints(
   }
 
   // 9. Contact Block Refinement (if not converged and contacts exist)
-  if (!converged && contact_block_count > 0) {
-    for (int ref = 0; ref < 64; ++ref) {
+  if (!converged && contact_block_count > 0 && elliptic_count == 0) {
+    for (int ref = 0; ref < 256; ++ref) {
       for (int b = 0; b < contact_block_count; ++b) {
         int row_start = contact_block_start[b];
-        int local_rows[4];
+        int block_size = contact_block_size[b];
+        // Preserve the original four-edge pyramid refinement budget. The
+        // expanded condim-4/6 blocks need the larger bound qualified below.
+        if (block_size <= 4 && ref >= 64) continue;
+        int local_rows[10];
         int nlocal = 0;
-        for (int k = 0; k < 4; ++k) {
+        for (int k = 0; k < block_size; ++k) {
           int row = row_start + k;
           if (enabled[row]) local_rows[nlocal++] = row;
         }
         if (nlocal == 0) continue;
-        thread float local_A[16], local_b[4], local_sol[4];
-        for (int i = 0; i < 16; ++i) local_A[i] = 0.0f;
-        for (int i = 0; i < 4; ++i) { local_b[i] = 0.0f; local_sol[i] = 0.0f; }
+        thread float local_A[100], local_b[10], local_sol[10];
+        for (int i = 0; i < 100; ++i) local_A[i] = 0.0f;
+        for (int i = 0; i < 10; ++i) { local_b[i] = 0.0f; local_sol[i] = 0.0f; }
         for (int i = 0; i < nlocal; ++i) {
           int row = local_rows[i];
           float v = -rhs[row];
-          for (int col = 0; col < total_nr; ++col) if (enabled[col] && (col < row_start || col >= row_start + 4)) {
+          for (int col = 0; col < total_nr; ++col) if (enabled[col] && (col < row_start || col >= row_start + block_size)) {
             v += W[row * nr + col] * lam[col];
           }
           local_b[i] = v;
+          local_sol[i] = lam[row];
           for (int j = 0; j < nlocal; ++j) {
             int other = local_rows[j];
-            local_A[i * 4 + j] = W[row * nr + other] + (i == j ? R[row] : 0.0f);
+            local_A[i * 10 + j] = W[row * nr + other] + (i == j ? R[row] : 0.0f);
           }
         }
-        float b_err = solve_contact_block(local_A, local_b, nlocal, local_sol);
+        float b_err;
+        if (nlocal <= 4) {
+          thread float small_A[16], small_b[4], small_sol[4];
+          for (int i = 0; i < 16; ++i) small_A[i] = 0.0f;
+          for (int i = 0; i < 4; ++i) { small_b[i] = 0.0f; small_sol[i] = 0.0f; }
+          for (int i = 0; i < nlocal; ++i) {
+            small_b[i] = local_b[i];
+            for (int j = 0; j < nlocal; ++j) small_A[i * 4 + j] = local_A[i * 10 + j];
+          }
+          b_err = solve_contact_block(small_A, small_b, nlocal, small_sol);
+          for (int i = 0; i < nlocal; ++i) local_sol[i] = small_sol[i];
+        } else {
+          b_err = solve_contact_block_iterative(local_A, local_b, nlocal, local_sol);
+        }
         if (b_err < 1e-5f) {
           for (int i = 0; i < nlocal; ++i) lam[local_rows[i]] = max(0.0f, local_sol[i]);
         }
@@ -712,30 +987,25 @@ kernel void solve_coupled_constraints(
 
   // 12. Write contact forces
   for (int s = 0; s < ncontacts_max; ++s) {
-    int cdim = contact_condim[s * 2 + 0];
-    int row_offset = contact_condim[s * 2 + 1];
+    int cdim = contact_condim[s * 3 + 0];
+    int row_offset = contact_condim[s * 3 + 1];
     int row_start = base_contact + row_offset;
-    int ofb = (world * ncontacts_max + s) * 5;
-    if (enabled[row_start]) {
-      if (cdim == 1) {
-        out_contact_force[ofb + 0] = lam[row_start];
-        out_contact_force[ofb + 1] = 0.0f;
-        out_contact_force[ofb + 2] = 0.0f;
-        out_contact_force[ofb + 3] = 0.0f;
-        out_contact_force[ofb + 4] = 0.0f;
-      } else if (cdim == 3) {
-        float f0 = lam[row_start + 0];
-        float f1 = lam[row_start + 1];
-        float f2 = lam[row_start + 2];
-        float f3 = lam[row_start + 3];
-        out_contact_force[ofb + 0] = f0 + f1 + f2 + f3;
-        out_contact_force[ofb + 1] = f0;
-        out_contact_force[ofb + 2] = f1;
-        out_contact_force[ofb + 3] = f2;
-        out_contact_force[ofb + 4] = f3;
-      }
+    int ofb = (world * ncontacts_max + s) * 11;
+    for (int k = 0; k < 11; ++k) out_contact_force[ofb + k] = 0.0f;
+    if (cdim == 0 || !enabled[row_start]) continue;
+    if (cdim == 1) {
+      out_contact_force[ofb] = lam[row_start];
+    } else if (cone_type == 1) {
+      for (int k = 0; k < cdim; ++k) out_contact_force[ofb + k] = enabled[row_start + k] ? lam[row_start + k] : 0.0f;
     } else {
-      for (int k = 0; k < 5; ++k) out_contact_force[ofb + k] = 0.0f;
+      int edge_count = 2 * (cdim - 1);
+      float normal = 0.0f;
+      for (int k = 0; k < edge_count; ++k) {
+        float value = lam[row_start + k];
+        normal += value;
+        out_contact_force[ofb + 1 + k] = value;
+      }
+      out_contact_force[ofb] = normal;
     }
   }
 
