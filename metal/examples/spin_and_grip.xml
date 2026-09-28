@@ -1,0 +1,54 @@
+<mujoco model="spin and grip arcade">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler"
+          cone="elliptic" iterations="512" tolerance="1e-5"/>
+  <visual>
+    <global offwidth="960" offheight="640"/>
+    <quality shadowsize="2048"/>
+    <map znear="0.01" zfar="30"/>
+  </visual>
+  <default>
+    <joint damping="0" armature="0"/>
+    <geom condim="3" friction="0.8 0.12 0.03" solref="0.004 1"
+          solimp="0.95 0.99 0.001" rgba="0.8 0.8 0.8 1"/>
+  </default>
+  <worldbody>
+    <light pos="0 0 6" dir="0 0 -1" diffuse="0.9 0.9 0.9"/>
+    <geom name="table" type="plane" size="5 3 .1" rgba=".10 .13 .18 1"
+          contype="1" conaffinity="22" friction=".01 .001 .001"/>
+
+    <body name="roll_runner" pos="-1.15 0 .11">
+      <freejoint name="roll_free"/>
+      <geom name="roll_geom" type="sphere" size=".115" mass=".35"
+            condim="6" friction=".9 .12 .18" contype="2" conaffinity="1"
+            rgba=".13 .72 .95 1"/>
+    </body>
+
+    <body name="spin_top" pos="0 0 .104" euler=".15 -.1 .1">
+      <freejoint name="spin_free"/>
+      <geom name="spin_geom" type="sphere" size=".105" mass=".5"
+            condim="4" friction=".9 .48 .04" contype="4" conaffinity="1"
+            rgba=".98 .38 .16 1"/>
+      <geom name="spin_marker" type="box" pos="0 0 .08" size=".012 .012 .08"
+            contype="0" conaffinity="0" rgba="1 .86 .25 1"/>
+    </body>
+
+    <body name="grip_object" pos="1.05 0 .105">
+      <joint name="grip_slide" type="slide" axis="1 0 0"/>
+      <geom name="grip_geom" type="box" size=".14 .12 .1" mass=".5"
+            condim="3" friction=".02 .005 .001" contype="16" conaffinity="9"
+            rgba=".98 .76 .17 1"/>
+    </body>
+
+    <body name="press_pad" pos="1.05 0 .72">
+      <joint name="pad_slide" type="slide" axis="0 0 -1" range="0 .62"
+             limited="true"/>
+      <geom name="pad_geom" type="capsule" size=".14 .045" mass=".3"
+            condim="3" friction=".9 .12 .03" contype="8" conaffinity="16"
+            rgba=".35 .88 .42 1"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="press_motor" joint="pad_slide" ctrlrange="-25 25"/>
+  </actuator>
+</mujoco>

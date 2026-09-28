@@ -10,6 +10,7 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Tumbling toys](tumbling_toys.md) | Colorful asymmetric objects spin around three different axes | Quaternion-aware RK4 |
 | [Marble cascade](marble_cascade.md) | Three marbles collide on a tilted plane | Normal plane–sphere and sphere–sphere contact |
 | [Friction laboratory](friction_laboratory.md) | Low, medium, and high friction turn sliding into rolling at different rates | Pyramidal condim-3 contact |
+| [Spin-and-Grip arcade](spin_and_grip.md) | A rolling ball slows, a top loses spin, and an actuated press holds and releases a sliding block | Integrated elliptic condim-4/6 torsional and rolling friction |
 | [Sensor scanning rig](scanning_rig.md) | A pan/tilt scanner plots its measured pose and direction | Current-state frame, gyro and velocity sensors |
 | [Cable plotter](cable_plotter.md) | Crossed tendons guide an XY pen around a figure eight | Fixed-joint tendon servos |
 | [Clockwork automaton](clockwork_automaton.md) | Counter-rotating gears and a sequenced pawl | Polynomial joint equality, limits and dry joint friction |

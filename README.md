@@ -19,7 +19,7 @@ available alongside the optional package.
   per-step host state readback, per-world failure handling, selected-row reset,
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
-- **Validation and reproducible measurements:** 307 tests pass with native GPU execution enabled; independent CPU-reference trajectory and solve checks supplement the suite. Benchmarks include actual eight-thread CPU measurements at every tested batch through 524,288 worlds.
+- **Validation and reproducible measurements:** 362 tests pass with native GPU execution enabled; independent CPU-reference trajectory and solve checks supplement the suite. Benchmarks include actual eight-thread CPU measurements at every tested batch through 524,288 worlds.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
   plus bounded hinge/slide motors with clipping and disable flags. Separate
   profiles preserve the original unforced baseline.
@@ -27,6 +27,11 @@ available alongside the optional package.
   combining complete primitive collision manifolds (all 9 valid pairs among planes, spheres, capsules, and boxes with up to 8 contact points per pair, SAT collision detection, Sutherland-Hodgman polygon clipping, and Coulomb friction), motor actuation, fixed-joint tendons, passive spring/damping forces, fluid drag, joint limits/frictionloss, polynomial joint equality, and sensor queries with one coupled Delassus constraint solve;
   RK4 and bounded implicitfast; springs and body forces; inertia-box fluid drag; fixed-tendon dynamics;
   selected sensor queries have CPU-reference checks. See the [precise development coverage](metal/DEVELOPMENT.md).
+  The current Problem 003 development branch extends integrated Euler contacts
+  to condim 1/3/4/6 with pyramidal and elliptic cones, including sliding,
+  torsional and rolling friction. It adds explicit-pair overrides and the
+  Spin-and-Grip demo. This increment has passed its bounded qualification suite
+  and awaits independent review; it is not included in the 0.4.0 wheel.
 - **Tools and documentation:** creative simulation demos, capability inventory,
   runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.
 - **Upstream regression coverage:** an `mj_setConst` inertial-update roundtrip test
@@ -114,6 +119,14 @@ Three marbles with different friction coefficients transition from sliding to ro
 
 ![Friction laboratory: native Metal beside CPU MuJoCo](metal/examples/assets/friction_laboratory.gif)
 
+### [Spin-and-Grip arcade](metal/examples/spin_and_grip.md)
+
+A rolling sphere, spinning top and actuated press demonstrate rolling
+resistance, torsional friction and frictional hold/release with elliptic
+condim-4/6 contacts.
+
+![Spin-and-Grip arcade: native Metal beside CPU MuJoCo](metal/examples/assets/spin_and_grip.gif)
+
 ### [Marble cascade](metal/examples/marble_cascade.md)
 
 Marbles slide and collide on a tilted plane using plane–sphere and sphere–sphere normal contacts.
@@ -174,8 +187,9 @@ surrounding MuJoCo source version as the qualified runtime.
 
 Version **0.4.0** supports bounded Euler, RK4/implicitfast, passive and fluid forces, fixed-tendon
 servos, sensor queries, sphere contact and joint-constraint profiles, each with
-explicit guards. These are partial implementations:
-remaining contact/constraint families, stateful actuation, spatial tendons,
+explicit guards. The in-progress Problem 003 branch adds a bounded integrated
+contact-friction subset, but it has not shipped in a PyPI release. Remaining
+contact/constraint families, stateful actuation, spatial tendons,
 geom-level fluid models, full implicit integration and broader sensors/model/API coverage still need
 implementation and qualification. Native rendering and training integration
 remain outside the implemented scope. Per-environment model randomization is not connected to

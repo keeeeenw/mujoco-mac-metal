@@ -78,7 +78,8 @@ The `integrated_euler_v1` stepping profile composes the native Metal Euler physi
 - **Passive forces:** Rigid joint springs, linear and polynomial joint damping, body gravity compensation, and applied body wrenches (`xfrc_applied`).
 - **Fluid forces:** Inertia-box body fluid drag, fluid viscosity, and wind.
 - **Sensors:** Stateless current-state sensor queries (`sim.sensor_values()`) evaluated on GPU.
-- **Unified coupled constraint solve:** Combines complete primitive collision manifolds across all 9 valid pairs among planes, spheres, capsules, and boxes (condim 1 and pyramidal condim 3 with pair-defined Coulomb friction), scalar joint limits, dry frictionloss, and polynomial joint equality constraints into a single coupled Delassus system $W = J M^{-1} J^T + R$ solved via projected Gauss-Seidel with active-set block refinement.
+- **Unified coupled constraint solve:** Combines complete primitive collision manifolds across all 9 valid pairs among planes, spheres, capsules, and boxes, scalar joint limits, dry frictionloss, and polynomial joint equality constraints in one coupled Delassus system $W = J M^{-1} J^T + R$. On the Problem 003 development branch, integrated Euler lowers condim 1/3/4/6 for pyramidal and elliptic cones, with anisotropic sliding, torsional and rolling friction. Pyramidal cone rows are expanded by dimension; elliptic contact blocks are solved together with their normal row. Both use contact-frame rotational Jacobians and reconstruct physical contact force/torque. This added subset is not in the released 0.4.0 wheel pending completion and independent review.
+- Contact friction lowering expands MuJoCo geom friction `[slide, torsion, rolling]` to per-axis `[slide1, slide2, torsion, roll1, roll2]`; `<pair>` overrides retain their five coefficients. Standard geom mixing and pair priority are applied before lowering. `solreffriction` is honored for elliptic cones; MuJoCo defines it as ineffective for pyramidal cones. Unsupported dimensions and capacity overflow fail during construction.
 - **Full primitive collision support:** Real multi-contact manifolds generated entirely on GPU via Separating Axis Theorem (SAT 15 candidate axes), Sutherland-Hodgman polygon clipping, and closest segment points. Box-box produces up to 8 contact points, plane-box up to 4, capsule-box / capsule-capsule / plane-capsule up to 2, and sphere pairs 1 point. Both $(A, B)$ and $(B, A)$ geometry orderings, explicit `<pair>`, `<exclude>`, and parent/welded body filtering are fully respected.
 
 Solving contact and joint constraints in one coupled Delassus system prevents the numerical divergence (exceeding 15% error) that occurs when constraints are solved sequentially or decoupled.
@@ -95,10 +96,9 @@ The integrated Euler pipeline enforces explicit hardware-tailored capacity bound
 - Candidate collision pairs: $npairs \le 16$.
 - Candidate contact point slots: $ncontacts \le 24$.
 - Total candidate constraint rows: $nr \le 96$.
+- Contact row counts depend on cone and `condim`: pyramidal condim 1/3/4/6 expands to 1/4/6/10 rows; elliptic condim 1/3/4/6 uses 1/3/4/6 coupled rows. Lowering calculates row offsets and rejects models that exceed the total row cap before GPU execution.
 - Supported primitive geometries: plane, sphere, capsule, box. Models exceeding these bounds or requesting non-primitive geometries (meshes, cylinders, ellipsoids, heightfields, SDFs), non-Euler integrators, flex, or plugins are rejected cleanly during profile validation before GPU execution.
 
 Try the [clockwork parcel sorter demo](examples/clockwork_parcel_sorter.md), the [robotic marble music machine demo](examples/marble_music_machine.md) or the [spacecraft force-control demo](examples/space_docking.md), or use the
 [installation and diagnostic guide](INSTALL.md) for `pip install mujoco-mac-metal`
 and `mujoco-metal doctor --gpu`. Install version 0.4.0 for the additional bounded profiles.
-
-
