@@ -341,6 +341,7 @@ def test_native_contact_cone_dimension_matrix(cone, condim):
     residual = np.linalg.norm(y - projected) * lipschitz / max(
         1.0, np.linalg.norm(linear) + np.linalg.norm(hessian @ y)
     )
+    assert residual <= 2e-5, (cone, condim, residual)
   elif condim > 1:
     edge_count = 2 * (condim - 1)
     rows = np.arange(row_start, row_start + edge_count)
