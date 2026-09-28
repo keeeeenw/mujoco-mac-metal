@@ -27,7 +27,7 @@ counterfactuals for rolling and torsional friction. Its current validation
 metrics on the M1 Max with 32 GB unified memory are:
 
 - Maximum native/CPU absolute `qpos` difference: `4.75e-6` (mixed coordinate
-  units); maximum `qvel` difference: `6.27e-4` (mixed units).
+  units); maximum `qvel` difference: `3.37e-4` (mixed units).
 - High rolling resistance traveled `0.2040 m`; the low-friction CPU
   counterfactual traveled `1.0507 m`.
 - High torsional friction ended at `2.057 rad/s`; the low-friction CPU

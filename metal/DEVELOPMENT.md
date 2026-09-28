@@ -153,7 +153,7 @@ selector. `iterations` and `tolerance` feed the native coupled solver, and the
 effective float32 tolerance floor is exposed through `CoupledSolverSettings`.
 
 The [Spin-and-Grip guide](examples/spin_and_grip.md) records a 400-step matched
-native/CPU run: max qpos difference `4.75e-6`, max qvel difference `6.27e-4`,
+native/CPU run: max qpos difference `4.75e-6`, max qvel difference `3.37e-4`,
 rolling travel `0.2040 m` versus `1.0507 m` in the low-friction CPU case, and
 torsional spin `2.057 rad/s` versus `5.774 rad/s`. The press held with zero
 measured drift and the released block moved `0.0972 m`. These are demo-specific
