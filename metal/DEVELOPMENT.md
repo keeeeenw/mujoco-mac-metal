@@ -8,9 +8,9 @@ The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
 
-The full source suite passed **362 tests with native MPS execution enabled** and
-fallback disabled. An isolated environment with Torch removed passed **173 tests**
-and skipped **186 GPU-dependent tests**. These results describe this source
+The full source suite passed **374 tests with native MPS execution enabled** and
+fallback disabled. An isolated environment with Torch removed passed **175 tests**
+and skipped **196 GPU-dependent tests**. These results describe this source
 snapshot and do not establish coverage of every MuJoCo feature.
 
 This branch is based on accepted source checkpoint `370606776`; Problem 003 changes
@@ -88,11 +88,11 @@ and host-computed projected cone residual.
 
 | Cone | condim 1 max absolute qacc error | condim 3 | condim 4 | condim 6 |
 |---|---:|---:|---:|---:|
-| Pyramidal | `5.02e-6` | `6.42e-5` | `1.11e-4` | `6.31e-5` |
-| Elliptic | `5.02e-6` | `1.78e-5` | `1.169e-2` (`2.85e-5` relative) | `7.18e-3` (`1.88e-5` relative) |
+| Pyramidal | `5.02e-6` | `5.86e-5` | `1.05e-4` | `1.05e-4` |
+| Elliptic | `5.02e-6` | `4.68e-5` | `2.53e-3` (`6.19e-6` relative) | `4.78e-3` (`1.14e-5` relative) |
 
 Across that matrix, the largest absolute generalized constraint-force error was
-`0.074` for the high-impulse elliptic condim-6 case. The projected KKT/cone
+`0.0296` for the high-impulse elliptic condim-6 case. The projected KKT/cone
 residual assertion is `2e-5`; CPU contact force/torque checks use scaled
 float32 tolerances. Capsule-plane and box-plane condim-4/6 fixtures pass under
 both cones. Together with the earlier condim-1/3 primitive-family suite, this
@@ -102,9 +102,35 @@ shape-pair/cone/dimension cross-product was tested.
 The final admitted row-layout checks run ten elliptic condim-6 contacts (90
 contact rows) and seven pyramidal condim-6 contacts (70 contact rows plus
 21 joint rows), both compared with CPU references. A further contact over the
-row budget is rejected during lowering. The pre-existing mixed articulated
-fixture separately exercises contact manifolds with equality, active limits,
-two frictionloss rows, nonzero Delassus cross-coupling and varying motor input.
+row budget is rejected during lowering. A new elliptic condim-6 qualification
+also runs contact simultaneously with polynomial equality, an active joint
+limit, two frictionloss rows, nonzero Delassus cross-coupling, and changing
+motor input; its forward solve and 8-step native trajectory are compared with
+MuJoCo CPU. Condim-6 lifecycle tests cover contact/no-contact batch worlds,
+deterministic checkpoint replay, selected reset, buffer clearing after explicit
+recomputation, and an under-iterated failing contact world alongside a healthy
+contact-free world. Failed worlds retain their original `qpos`/`qvel` while the
+healthy world advances and remains healthy.
+
+A review-discovered four-contact elliptic box case now checks projected
+stationarity at the retained global multipliers after every coupled iteration.
+This replaces the previous convergence check, which re-optimized temporary
+contact blocks and could report success for a different point. Elliptic systems
+now use globally coupled cone-projected FISTA with an adaptive restart; the
+pyramidal PGS update path is preserved. On the saved four-contact box fixture,
+elliptic condim 3/4/6 converges in 31/118/136 iterations, respectively;
+host-projected residual maxima across the four contacts are `2.48e-6`,
+`3.44e-6`, and `3.86e-6`, with maximum absolute `qacc` differences of
+`1.27e-3`, `2.90e-3`, and `2.90e-3`. These are bounded float32 fixture results.
+No speedup has been measured for this solver change.
+
+The separate MuJoCo no-slip post-solver remains unsupported. Models with
+nonzero `noslip_iterations` are rejected during lowering; `noslip_tolerance`
+has no effect while the no-slip solver is disabled. `solver="CG"` is rejected;
+the native profile chooses its own projected algorithms (pyramidal PGS or
+elliptic global FISTA), regardless of the accepted default Newton or PGS CPU
+selector. `iterations` and `tolerance` feed the native coupled solver, and the
+effective float32 tolerance floor is exposed through `CoupledSolverSettings`.
 
 The [Spin-and-Grip guide](examples/spin_and_grip.md) records a 400-step matched
 native/CPU run: max qpos difference `4.75e-6`, max qvel difference `6.27e-4`,
@@ -112,7 +138,9 @@ rolling travel `0.2040 m` versus `1.0507 m` in the low-friction CPU case, and
 torsional spin `2.057 rad/s` versus `5.774 rad/s`. The press held with zero
 measured drift and the released block moved `0.0972 m`. These are demo-specific
 measurements, not general tolerance guarantees. No performance comparison was
-run for this feature.
+run for this feature. The four-contact convergence correction required 26 to
+135 native outer sweeps for elliptic cases in the bounded fixture; this is
+convergence evidence, not a performance claim.
 
 **Release status:** these friction extensions are not present in the 0.4.0
 PyPI wheel. They remain bounded to `integrated_euler_v1`, primitive contacts,

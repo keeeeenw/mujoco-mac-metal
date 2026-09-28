@@ -19,7 +19,7 @@ available alongside the optional package.
   per-step host state readback, per-world failure handling, selected-row reset,
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
-- **Validation and reproducible measurements:** 362 tests pass with native GPU execution enabled; independent CPU-reference trajectory and solve checks supplement the suite. Benchmarks include actual eight-thread CPU measurements at every tested batch through 524,288 worlds.
+- **Validation and reproducible measurements:** 374 tests pass with native GPU execution enabled; independent CPU-reference trajectory and solve checks supplement the suite. Benchmarks include actual eight-thread CPU measurements at every tested batch through 524,288 worlds.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
   plus bounded hinge/slide motors with clipping and disable flags. Separate
   profiles preserve the original unforced baseline.
@@ -30,8 +30,9 @@ available alongside the optional package.
   The current Problem 003 development branch extends integrated Euler contacts
   to condim 1/3/4/6 with pyramidal and elliptic cones, including sliding,
   torsional and rolling friction. It adds explicit-pair overrides and the
-  Spin-and-Grip demo. This increment has passed its bounded qualification suite
-  and awaits independent review; it is not included in the 0.4.0 wheel.
+  Spin-and-Grip demo. The corrected globally coupled elliptic solve and added
+  mixed-constraint/lifecycle cases pass the bounded native suite; this increment
+  awaits independent review and is not included in the 0.4.0 wheel.
 - **Tools and documentation:** creative simulation demos, capability inventory,
   runtime/shader provenance, Apple Silicon FAQ, and a portable benchmark runner.
 - **Upstream regression coverage:** an `mj_setConst` inertial-update roundtrip test

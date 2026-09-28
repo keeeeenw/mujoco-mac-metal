@@ -33,7 +33,10 @@ metrics on the M1 Max with 32 GB unified memory are:
 - High torsional friction ended at `2.057 rad/s`; the low-friction CPU
   counterfactual ended at `5.774 rad/s`.
 - The pad first contacted the block at step 42 and maintained contact for 139
-  steps. Hold drift was `0 m`; after release the block traveled `0.0972 m`.
+  steps in the CPU reference rollout. Hold drift was `0 m`; after release the
+  block traveled `0.0972 m` in that same CPU reference. The current check uses
+  these CPU event values to qualify the demo's contact timing and release; they
+  are not yet asserted as native contact-event diagnostics.
 
 These are fixture-specific numerical checks, not universal tolerances. Run the
 CPU baseline separately with:
