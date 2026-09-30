@@ -35,10 +35,7 @@ from mujoco_metal.registry import FEATURES
 from mujoco_metal.registry import INVENTORY_COMPLETE
 from mujoco_metal.registry import TARGET_MUJOCO_VERSION
 
-_INSTALL_COMMAND = (
-    "python -m pip install 'mujoco-mac-metal[metal] @ git+"
-    "https://github.com/keeeeenw/mujoco-mac-metal.git@main#subdirectory=metal'"
-)
+_INSTALL_COMMAND = "python -m pip install -e ./metal[metal,test]"
 
 
 def _jsonable(value):
