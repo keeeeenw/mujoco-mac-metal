@@ -341,3 +341,61 @@ def test_act_lifecycle_native_gpu():
     sim.state.restore(v3)
   with pytest.raises(ValueError):
     sim.reset(act=np.array([[0.0, 1.0]], dtype=np.float32))
+
+
+def test_muscle_dynamics_transition_band_cpu():
+  # R5 regression: pinned mju_sigmoid is a quintic smootherstep over [0,1],
+  # not a logistic. The transition band must match the CPU oracle tightly.
+  import mujoco
+  import numpy as np
+  from mujoco_metal.stateful_actuation import ActuatorModel, act_dot_reference
+  m = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.002"/><worldbody>'
+      '<body pos="0 0 1"><joint name="j" type="hinge" axis="0 1 0"/>'
+      '<geom type="sphere" size="0.1" mass="1"/></body>'
+      '</worldbody><actuator>'
+      '<general joint="j" dyntype="muscle" dynprm="0.01 0.04 0.01"/>'
+      '</actuator></mujoco>')
+  meta = ActuatorModel(m)
+  d = mujoco.MjData(m)
+  d.act[0] = 0.2
+  mujoco.mj_forward(m, d)
+  length = np.asarray(d.actuator_length)
+  vel = np.asarray(d.actuator_velocity)
+  for dc in [-0.005, -0.002, -0.001, -0.0005, 0.0005, 0.001, 0.002, 0.005]:
+    ctrl = np.array([0.2 + dc])
+    d.ctrl[0] = 0.2 + dc
+    mujoco.mj_forward(m, d)
+    ref = act_dot_reference(meta, ctrl, np.asarray(d.act), length, vel)
+    np.testing.assert_allclose(ref[0], float(d.act_dot[0]), rtol=1e-6, atol=1e-9)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_muscle_dynamics_transition_band_gpu():
+  # R5 regression (native): one native step from matched states must match
+  # CPU act_dot in the transition band, not just in saturated regimes.
+  import mujoco
+  import numpy as np
+  from mujoco_metal import MetalSimulation
+  m = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.002"/><worldbody>'
+      '<body pos="0 0 1"><joint name="j" type="hinge" axis="0 1 0"/>'
+      '<geom type="sphere" size="0.1" mass="1"/></body>'
+      '</worldbody><actuator>'
+      '<general joint="j" dyntype="muscle" dynprm="0.01 0.04 0.01"/>'
+      '</actuator></mujoco>')
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  cpu = mujoco.MjData(m)
+  cpu.act[0] = 0.2
+  mujoco.mj_forward(m, cpu)
+  worst = 0.0
+  for dc in [-0.002, -0.001, 0.001, 0.002]:
+    cpu.ctrl[0] = 0.2 + dc
+    mujoco.mj_forward(m, cpu)
+    cpu_dot = float(np.asarray(cpu.act_dot)[0])
+    sim.reset(act=np.array([[0.2]], dtype=np.float32))
+    sim.step(1, ctrl=np.array([[0.2 + dc]], dtype=np.float32))
+    nat_dot = float(sim._act_dot.cpu().numpy()[0, 0])
+    worst = max(worst, abs(nat_dot - cpu_dot))
+  assert worst < 1e-5, worst

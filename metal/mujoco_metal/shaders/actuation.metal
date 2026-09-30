@@ -79,7 +79,10 @@ kernel void scalar_motor_force(
 inline float ad_clip(float x, float lo, float hi) {
   return min(max(x, lo), hi);
 }
-inline float ad_sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
+inline float ad_sigmoid(float x) {
+  float xc = clamp(x, 0.0f, 1.0f);
+  return xc * xc * xc * (xc * (xc * 6.0f - 15.0f) + 10.0f);
+}
 
 inline float ad_muscle_len_gain(float L, float lmin, float lmax) {
   if (L < lmin || L > lmax) return 0.0f;
@@ -98,7 +101,10 @@ inline float ad_muscle_len_gain(float L, float lmin, float lmax) {
 inline float ad7_clip(float x, float lo, float hi) {
   return min(max(x, lo), hi);
 }
-inline float ad7_sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
+inline float ad7_sigmoid(float x) {
+  float xc = clamp(x, 0.0f, 1.0f);
+  return xc * xc * xc * (xc * (xc * 6.0f - 15.0f) + 10.0f);
+}
 
 inline float ad7_muscle_len_gain(float L, float lmin, float lmax) {
   if (L < lmin || L > lmax) return 0.0f;

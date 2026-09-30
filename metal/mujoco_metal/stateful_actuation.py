@@ -158,7 +158,9 @@ def muscle_bias(length, lengthrange, acc0, prm):
 
 
 def _sigmoid(x):
-  return 1.0 / (1.0 + np.exp(-x))
+  # Pinned mju_sigmoid (3.10.0): quintic smootherstep over [0, 1], clamped.
+  xc = min(max(x, 0.0), 1.0)
+  return xc * xc * xc * (xc * (xc * 6.0 - 15.0) + 10.0)
 
 
 def muscle_dynamics(ctrl, act, prm):
