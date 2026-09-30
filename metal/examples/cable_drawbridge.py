@@ -224,7 +224,7 @@ def run_viewer(steps=1400, seconds=0):
   Steps the native simulation with the open-loop haul schedule and shows
   native state live, with the CPU oracle tracked alongside for the report.
   With seconds > 0 the viewer auto-closes after that wall time (used for
-  explicit visual checks); 0 keeps it open until closed.
+  explicit visual checks); 0 runs the full finite rollout (steps), then closes.
   """
   import time
   from mujoco import viewer as mj_viewer
@@ -276,7 +276,7 @@ def main():
   parser.add_argument("--record", help="record native/CPU renders to a GIF")
   parser.add_argument("--json", help="write numerical report to JSON")
   parser.add_argument("--viewer-seconds", type=float, default=0,
-                      help="interactive native viewer; auto-close after this wall time (0 keeps open, requires a display)")
+                      help="interactive native viewer; auto-close after this wall time (0 runs the finite rollout, requires a display)")
   args = parser.parse_args()
   if args.steps <= 0 or (args.check and not args.headless):
     raise SystemExit("use --headless --check for verification")

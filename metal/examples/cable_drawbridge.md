@@ -44,7 +44,9 @@ verification uses `--headless --check` plus the GIF above):
 ```
 
 Add `--viewer-seconds 20` to auto-close after 20 s of wall time for explicit
-visual checks.
+visual checks (without it, the viewer runs the finite `steps` rollout, then
+closes; interactive visual validation additionally requires a display and is
+otherwise unverified here).
 
 ![Cable drawbridge](assets/cable_drawbridge.gif)
 

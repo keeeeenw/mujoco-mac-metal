@@ -48,7 +48,9 @@ verification uses `--headless --check` plus the GIF below):
 ```
 
 Add `--viewer-seconds 20` to auto-close after 20 s of wall time for explicit
-visual checks. The viewer steps the native simulation with the deterministic
+visual checks (without it, the viewer runs the finite `steps` rollout, then
+closes; interactive visual validation additionally requires a display and is
+otherwise unverified here). The viewer steps the native simulation with the deterministic
 schedule and reports native/CPU divergence live.
 
 ![Muscle gripper](assets/muscle_gripper.gif)
