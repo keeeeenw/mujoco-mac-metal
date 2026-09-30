@@ -47,20 +47,20 @@ renderer), not future physics work.
 | REQ-TEN-001 | fixed-joint tendons with spring/damping/armature | device | native_gpu/gpu_qualified | baseline | accept fixed joint tendons | test_tendons.py |
 | REQ-TEN-002 | spatial tendons, wrapping, limits, friction, equality | none | not_implemented/unqualified | 008 | reject spatial/wrapped/limited tendons | — |
 | REQ-TRN-001 | joint/jointinparent/tendon transmissions | device | native_gpu/gpu_qualified | baseline | accept listed transmissions | test_transmissions.py |
-| REQ-TRN-002 | slidercrank/site/body transmissions | none | not_implemented/unqualified | 007 | reject slidercrank/site/body | — |
+| REQ-TRN-002 | slidercrank/site/body transmissions | device | native_gpu/gpu_qualified | 007 | general kinematics + BODY adhesion from same-step candidates | test_actuators_007.py |
 | REQ-TRN-003 | undefined transmission sentinel | none | not_implemented/unqualified | 005 | reject undefined | — |
 | REQ-DYN-001 | stateless (none) actuator dynamics | device | native_gpu/gpu_qualified | baseline | accept dyntype none | test_actuation.py |
-| REQ-DYN-002 | stateful activation dynamics | none | not_implemented/unqualified | 007 | reject non-none dyntypes | — |
+| REQ-DYN-002 | stateful activation dynamics | device | native_gpu/gpu_qualified | 007 | act_dot switch + exact-slot advance, schema-4 state | test_actuators_007.py |
 | REQ-GAIN-001 | fixed/affine gains | device | native_gpu/gpu_qualified | baseline | accept fixed/affine | test_actuation.py |
-| REQ-GAIN-002 | muscle/DC-motor/user gains | none | not_implemented/unqualified | 007 | reject muscle/dcmotor/user | — |
+| REQ-GAIN-002 | muscle/DC-motor/user gains | device | native_gpu/gpu_qualified | 007 | muscle FLV + DC resistance/voltage paths | test_actuators_007.py |
 | REQ-BIAS-001 | none/affine biases | device | native_gpu/gpu_qualified | baseline | accept none/affine | test_actuation.py |
-| REQ-BIAS-002 | muscle/DC-motor/user biases | none | not_implemented/unqualified | 007 | reject muscle/dcmotor/user | — |
+| REQ-BIAS-002 | muscle/DC-motor/user biases | device | native_gpu/gpu_qualified | 007 | bias switch + post-clamp DC mechanics | test_actuators_007.py |
 | REQ-SENS-001 | current-state kinematic/clock/gyro/velocimeter queries | device | native_gpu/gpu_qualified | baseline | accept the 14 listed types | test_sensors.py |
 | REQ-SENS-002 | remaining sensor families | none | not_implemented/unqualified | 016 | reject unlisted sensor types | — |
 | REQ-STATE-001 | time/qpos/qvel/eq_active/mocap state ownership | device | native_gpu/gpu_qualified | 006 | accept matching snapshots, reject v1-into-neq and <v3-into-mocap | test_device_state.py, test_equality_activity.py, test_mocap_state.py |
 | REQ-STATE-002 | control/applied-force state ownership | device | native_gpu/gpu_qualified | baseline | accept finite host/device inputs | test_simulation.py |
 | REQ-STATE-003 | mocap position/quaternion inputs | device | native_gpu/gpu_qualified | 006 | accept valid mocap, reject non-world-child | test_mocap_state.py |
-| REQ-STATE-004 | actuator activation state | none | not_implemented/unqualified | 007 | reject models requiring act state | — |
+| REQ-STATE-004 | actuator activation state | device | native_gpu/gpu_qualified | 007 | na rows with actearly/actrange semantics | test_actuators_007.py |
 | REQ-STATE-005 | warmstart state | none | not_implemented/unqualified | 014 | ignore warmstart content | — |
 | REQ-STATE-006 | history state | none | not_implemented/unqualified | 015 | reject history-dependent models | — |
 | REQ-STATE-007 | userdata/plugin state | none | not_implemented/unqualified | 019 | reject stateful plugins | — |
