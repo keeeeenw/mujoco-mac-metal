@@ -40,11 +40,16 @@ right CPU):
 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/muscle_gripper.py --record metal/examples/assets/muscle_gripper.gif --steps 2700
 ```
 
-Launch the interactive viewer on a Mac:
+Launch the interactive viewer on a Mac (requires a display; headless
+verification uses `--headless --check` plus the GIF below):
 
 ```bash
 ./run mjpython metal/examples/muscle_gripper.py --steps 2700
 ```
+
+Add `--viewer-seconds 20` to auto-close after 20 s of wall time for explicit
+visual checks. The viewer steps the native simulation with the deterministic
+schedule and reports native/CPU divergence live.
 
 ![Muscle gripper](assets/muscle_gripper.gif)
 
@@ -53,17 +58,19 @@ state advances on device, finger contacts occur on grasp steps, the released
 ball lands inside the bin footprint while the always-open counterfactual stays
 outside, and the second ball lands on the pedestal top.
 
-Measured CPU results on the qualified run (MuJoCo 3.10.0):
+Measured results on the qualified palm-cage run (MuJoCo 3.10.0, native
+`--headless --check --steps 2700`, exit 0):
 
-- Ball delivered `(x, z)`: (`0.591`, `0.135`) inside bin footprint; always-open `(x, z)`: (`-3.667`, `0.055`) on floor.
-- Second ball placed `(x, z)`: (`-0.056`, `0.255`) on pedestal top (z=0.2); always-open stays at (`0.300`, `0.055`).
-- Ball-bin contact steps: `1416`; finger contact steps: `356`.
+- Ball delivered `(x, z)`: (`0.673`, `0.135`) inside bin footprint; always-open `(x, z)`: (`-3.667`, `0.055`) on floor.
+- Second ball placed `(x, z)`: (`-0.133`, `0.255`) on pedestal top (z=0.2); always-open stays at (`0.300`, `0.055`).
+- Ball-bin contact steps: `1600`; finger contact steps: `1463`.
+- Pre-grasp native parity: qpos `7.4e-08`, qvel `1.4e-05`.
 - Full-run native/CPU parity on focused actuator fixtures (see milestone 007
   report): integrator/filter/filter-exact qpos `1.6e-07`, muscle `2e-03`.
 
-Known gap: the full two-grasp demo currently diverges between native GPU and
-CPU during the contact-rich carry (GPU ejects the first ball;
-`results/milestone-007/failures/gpu-demo-divergence.log`). Focused
-actuator/transmission fixtures pass native parity; the full-demo native check
-is deferred until the contact-divergence root cause is addressed. The demo is
-CPU-qualified; native demo parity remains open.
+Superseded gap (preserved in the private archive): the pre-palm-cage
+friction-only pinch diverged during the contact-rich carry (GPU ejected the
+first ball; `results/milestone-007/failures/gpu-demo-divergence.log`). The
+palm contact cage (three-sided grasp) resolved the chaos: CPU ±2 mm
+perturbations now deliver identically. The demo is CPU- and
+natively qualified; `assets/muscle_gripper.gif` shows the passing run.

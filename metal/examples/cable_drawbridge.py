@@ -218,6 +218,55 @@ def run(steps=1400, mode="metal", check=False, record=None):
   return result
 
 
+def run_viewer(steps=1400, seconds=0):
+  """Interactive native viewer (requires a display; headless uses --headless).
+
+  Steps the native simulation with the open-loop haul schedule and shows
+  native state live, with the CPU oracle tracked alongside for the report.
+  With seconds > 0 the viewer auto-closes after that wall time (used for
+  explicit visual checks); 0 keeps it open until closed.
+  """
+  import time
+  from mujoco import viewer as mj_viewer
+  from mujoco_metal import MetalSimulation
+  model = _load_model()
+  qpos0 = model.qpos0.copy().astype(np.float32)
+  qvel0 = np.zeros(model.nv, dtype=np.float32)
+  native = MetalSimulation(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :],
+                           profile=PROFILE)
+  native.reset_to_keyframe(0)
+  cpu = mujoco.MjData(model)
+  mujoco.mj_resetDataKeyframe(model, cpu, 0)
+  mujoco.mj_forward(model, cpu)
+  actual = mujoco.MjData(model)
+  mujoco.mj_resetDataKeyframe(model, actual, 0)
+  mujoco.mj_forward(model, actual)
+  max_err = 0.0
+  with mj_viewer.launch_passive(model, actual) as viewer:
+    viewer.cam.lookat[:] = [0.2, 0, 0.5]
+    viewer.cam.distance = 3.0
+    viewer.cam.azimuth = 135
+    viewer.cam.elevation = -15
+    deadline = time.monotonic() + seconds
+    for step in range(steps):
+      if not viewer.is_running():
+        break
+      if seconds > 0 and time.monotonic() >= deadline:
+        break
+      ctrl = _sched(step)
+      native.step(1, ctrl=np.asarray(ctrl, dtype=np.float32).reshape(1, 1))
+      cpu.ctrl[:] = ctrl
+      mujoco.mj_step(model, cpu)
+      gq = native.state.qpos[0].cpu().numpy()
+      max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+      with viewer.lock():
+        actual.qpos[:] = gq
+        actual.qvel[:] = native.state.qvel[0].cpu().numpy()
+        actual.time = float(native.state.time[0].cpu().numpy())
+      viewer.sync()
+  return {"max_qpos_err": max_err, "steps": steps}
+
+
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--steps", type=int, default=1400)
@@ -226,9 +275,17 @@ def main():
   parser.add_argument("--check", action="store_true", help="check native/CPU rollout")
   parser.add_argument("--record", help="record native/CPU renders to a GIF")
   parser.add_argument("--json", help="write numerical report to JSON")
+  parser.add_argument("--viewer-seconds", type=float, default=0,
+                      help="interactive native viewer; auto-close after this wall time (0 keeps open, requires a display)")
   args = parser.parse_args()
   if args.steps <= 0 or (args.check and not args.headless):
     raise SystemExit("use --headless --check for verification")
+  if not args.headless and args.record is None and args.mode == "metal":
+    out = run_viewer(steps=args.steps, seconds=args.viewer_seconds)
+    print(json.dumps(out, indent=2))
+    if args.json:
+      Path(args.json).write_text(json.dumps(out, indent=2))
+    return
   out = run(steps=args.steps, mode=args.mode, check=args.check, record=args.record)
   print(json.dumps(out, indent=2))
   if args.json:

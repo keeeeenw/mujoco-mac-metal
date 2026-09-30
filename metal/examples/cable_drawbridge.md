@@ -36,11 +36,15 @@ right CPU):
 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/cable_drawbridge.py --record metal/examples/assets/cable_drawbridge.gif --steps 1400
 ```
 
-Launch the interactive viewer on a Mac:
+Launch the interactive viewer on a Mac (requires a display; headless
+verification uses `--headless --check` plus the GIF above):
 
 ```bash
 ./run mjpython metal/examples/cable_drawbridge.py --steps 1400
 ```
+
+Add `--viewer-seconds 20` to auto-close after 20 s of wall time for explicit
+visual checks.
 
 ![Cable drawbridge](assets/cable_drawbridge.gif)
 
