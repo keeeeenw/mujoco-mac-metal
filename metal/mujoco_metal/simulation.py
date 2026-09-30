@@ -747,6 +747,12 @@ class MetalSimulation:
       skin = self._spatial_kin
       sforce, _, sarm = self._spatial_tendons.run_forces(skin)
       rhs.add_(sforce.reshape(rhs.shape))
+      sbias, _ = self._spatial_tendons.run_armature_bias(
+          skin, qvel, dynamics["poses"], dynamics.get("cvel", None),
+          dynamics.get("root_com", None))
+      # Armature bias is a bias force (pinned mj_tendonBias accumulates into
+      # qfrc_bias), so it subtracts from rhs like Coriolis/gravity.
+      rhs.sub_(sbias.reshape(rhs.shape))
       dynamics["mass_matrix"].add_(sarm.reshape(dynamics["mass_matrix"].shape))
     if self._transmissions is not None:
       rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
@@ -959,6 +965,12 @@ class MetalSimulation:
       skin = self._spatial_kin
       sforce, sdamp, sarm = self._spatial_tendons.run_forces(skin)
       self._rhs.add_(sforce.reshape(self._rhs.shape))
+      sbias, _ = self._spatial_tendons.run_armature_bias(
+          skin, qvel, dynamics["poses"], dynamics.get("cvel", None),
+          dynamics.get("root_com", None))
+      # Armature bias is a bias force (pinned mj_tendonBias accumulates into
+      # qfrc_bias), so it subtracts from rhs like Coriolis/gravity.
+      self._rhs.sub_(sbias.reshape(self._rhs.shape))
       dynamics["mass_matrix"].add_(sarm.reshape(dynamics["mass_matrix"].shape))
     if self._transmissions is not None:
       self._rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))

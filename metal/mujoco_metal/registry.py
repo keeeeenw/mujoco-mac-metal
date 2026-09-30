@@ -687,8 +687,8 @@ REQUIREMENTS = (
     Requirement(
         "REQ-TEN-002", "spatial tendons, wrapping, limits, friction, equality",
         Stage.DYNAMICS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "pulley/site/sphere/cylinder paths; tendon limits, friction loss and tendon equality as coupled rows",
-        "mujoco_metal/spatial_tendons.py", "spatial kinematics + tendon_constraint_rows",
+        Execution.DEVICE, "pulley/site/sphere/cylinder paths; tendon limits, friction loss and tendon equality as coupled rows; site-only armature with Jdot bias (wrapped armature rejected upstream)",
+        "mujoco_metal/spatial_tendons.py", "spatial kinematics + tendon_constraint_rows + armature_dots",
         "MetalSimulation", "008", ("test_spatial_tendons_008.py",),
     ),
     Requirement(

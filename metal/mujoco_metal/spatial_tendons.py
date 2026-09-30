@@ -287,18 +287,19 @@ class SpatialTendonModel:
       self.paths.append({"start": start, "count": count, "types": types,
                          "objids": objids, "prms": prms})
     self.has_spatial = any(p is not None for p in self.paths)
-    # Armature contract (R3): fixed paths have constant Jacobians (Jdot = 0,
+    # Armature contract (F1): fixed paths have constant Jacobians (Jdot = 0,
     # no bias). Wrapped paths with armature are rejected by the compiler
     # itself ("geom wrapping not supported by tendon armature"); the guard
-    # below agrees for programmatic models. Site-only spatial paths with
-    # armature need pinned Jdot machinery (mj_jacDot, owned by 015): rejected
-    # for now so no wrong-bias physics ships; REQ-TEN-003 stays open.
+    # below agrees for programmatic models. Site-only spatial paths
+    # (sites/pulleys, no wrap geoms) admit armature with the pinned Jdot bias
+    # (mj_tendonDot/mj_tendonBias): mass via J'AJ plus qfrc += J'·arm·(Jdot·qvel).
     arm = np.asarray(model.tendon_armature, dtype=np.float64)
     for tendon in range(ntendon):
       if arm[tendon] > 0 and self.paths[tendon] is not None:
-        raise ValueError(
-            f"tendon {tendon}: spatial tendon armature is unsupported "
-            f"(wrapped: rejected upstream; site-only: owned by milestone 015)")
+        if any(t in (wrap_sphere, wrap_cyl) for t in self.paths[tendon]["types"]):
+          raise ValueError(
+              f"tendon {tendon}: wrapped spatial tendon armature is unsupported "
+              f"(rejected upstream; site-only armature is supported)")
     # Flat device storage: concatenated spatial wraps with explicit per-tendon
     # offsets (no row stride, so unequal path lengths are exact). Total
     # flattened wraps are capped for workspace sizing (R2 bound, disclosed).
@@ -424,6 +425,7 @@ class MetalSpatialTendonDynamics:
     lib = torch.mps.compile_shader(
         (_Path(__file__).parent / "shaders" / "tendons.metal").read_text())
     self._kin_kernel = lib.spatial_tendon_kinematics
+    self._dots_kernel = lib.spatial_armature_dots
 
     def tensor(values, dtype=torch.float32):
       arr = np.array(values, dtype=np.int32 if dtype == torch.int32 else np.float32,
@@ -447,6 +449,7 @@ class MetalSpatialTendonDynamics:
     self._geom_size = tensor(np.asarray(model.geom_size).reshape(-1)
                              if ngeom0(model) else np.zeros(3, dtype=np.float32))
     self._site_bodyid = tensor(model.site_bodyid if meta.nsite else np.zeros(1, dtype=np.int32), torch.int32)
+    self._body_rootid = tensor(model.body_rootid, torch.int32)
     self._jnt_type = tensor(model.jnt_type if njnt else np.zeros(1, dtype=np.int32), torch.int32)
     self._jnt_dofadr = tensor(model.jnt_dofadr if njnt else np.zeros(1, dtype=np.int32), torch.int32)
     self._body_parentid = tensor(model.body_parentid, torch.int32)
@@ -477,6 +480,7 @@ class MetalSpatialTendonDynamics:
         "length": torch.zeros(b * max(nt, 1), dtype=torch.float32, device=self._device),
         "velocity": torch.zeros(b * max(nt, 1), dtype=torch.float32, device=self._device),
         "jacobian": torch.zeros(b * max(nt, 1) * max(nv, 1), dtype=torch.float32, device=self._device),
+        "dots": torch.zeros(b * max(nt, 1), dtype=torch.float32, device=self._device),
         "qfrc": torch.zeros(b * max(nv, 1), dtype=torch.float32, device=self._device),
         "damping": torch.zeros(b * max(nv, 1) * max(nv, 1), dtype=torch.float32, device=self._device),
         "armature": torch.zeros(b * max(nv, 1) * max(nv, 1), dtype=torch.float32, device=self._device),
@@ -632,6 +636,49 @@ class MetalSpatialTendonDynamics:
     w["damping"].copy_(damp_mat.reshape(-1))
     w["armature"].copy_(arm_mat.reshape(-1))
     return w["qfrc"].reshape(b, nv), w["damping"].reshape(b, nv, nv), w["armature"].reshape(b, nv, nv)
+
+  def run_armature_bias(self, kin, qvel, poses, cvel, root_com):
+    """Armature bias force for site-only spatial paths (F1).
+
+    Computes per-tendon dots = Jdot(qvel) (pinned mj_tendonDot) on device,
+    returns ``(bias_qfrc [B, nv], dots [B, nt])`` with
+    bias = J'·armature·dots (pinned mj_tendonBias). Wrapped paths carry no
+    armature (rejected at admission); their dots stay zero. When no tendon
+    has armature, returns zeros without launching work.
+
+    NOTE: the returned bias accumulates into qfrc_bias (pinned convention),
+    so callers subtract it from the rhs vector.
+    """
+    torch = self._torch
+    meta = self._meta
+    b, nv, nt = self.batch_size, meta.nv, meta.ntendon
+    w = self._ws
+    J = kin["jacobian"].reshape(b, max(nt, 1), max(nv, 1))
+    if (nt == 0 or nv == 0 or cvel is None or root_com is None
+            or not bool((np.asarray(meta.armature) > 0).any())):
+      return (torch.zeros((b, max(nv, 1)), dtype=torch.float32, device=self._device),
+              torch.zeros((b, max(nt, 1)), dtype=torch.float32, device=self._device))
+    site_pos = poses["site_pos"].reshape(-1) if meta.nsite else self._dummy
+    self._dots_kernel(
+        qvel.reshape(-1),
+        site_pos,
+        poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),
+        cvel.reshape(-1), root_com.reshape(-1),
+        poses["joint_anchor"].reshape(-1), poses["joint_axis"].reshape(-1),
+        self._types.reshape(-1), self._objids.reshape(-1), self._prms.reshape(-1),
+        self._offset, self._count,
+        self._site_bodyid, self._body_rootid,
+        self._jnt_type, self._jnt_dofadr,
+        self._body_parentid, self._body_jntadr, self._body_jntnum,
+        self._armature.reshape(-1),
+        self._dims,
+        w["dots"],
+        threads=(b,), group_size=(1,),
+    )
+    dots = w["dots"].reshape(b, max(nt, 1))
+    coef = self._armature.reshape(1, max(nt, 1)) * dots  # [B,T]
+    bias = (coef.unsqueeze(-1) * J).sum(dim=1)  # [B,V]
+    return bias.reshape(b, nv), dots
 
 
 def ngeom0(model):

@@ -466,3 +466,174 @@ kernel void spatial_tendon_kinematics(
     for (int d=0;d<nv;++d) out_jacobian[(tbase+uint(t))*uint(max(nv,1))+uint(d)]=row[d];
   }
 }
+
+// Site velocity from COM-based body spatial velocity (cvel is [ang, lin]
+// measured at the subtree COM, like pinned; see sensors.metal).
+inline float3 st8_site_vel(float3 p, int body,
+    device const float* cvel, device const float* root_com,
+    device const int* body_rootid,
+    int nbody, int bo) {
+  int b = (body >= 0 && body < nbody) ? body : 0;
+  int rc = body_rootid[b];
+  rc = (rc >= 0 && rc < nbody) ? rc : 0;
+  float3 w = float3(cvel[(bo+b)*6], cvel[(bo+b)*6+1], cvel[(bo+b)*6+2]);
+  float3 v = float3(cvel[(bo+b)*6+3], cvel[(bo+b)*6+4], cvel[(bo+b)*6+5]);
+  float3 com = float3(root_com[(bo+rc)*3], root_com[(bo+rc)*3+1], root_com[(bo+rc)*3+2]);
+  return v + cross(w, p - com);
+}
+
+// Jdot(qvel) 3-vector for a site: d/dt(point Jacobian) dotted with qvel.
+// Pinned source: engine_core_util.c mj_jacDot, restricted to the dense
+// translational path. Hinge/slide axes rotate with the parent body;
+// ball/free rotation axes rotate with the joint body itself.
+inline float3 st8_point_jacdot(float3 point, float3 v_point, int body,
+    device const float* body_pos, device const float* body_quat,
+    device const float* cvel, device const float* root_com,
+    device const int* body_rootid,
+    device const float* joint_anchor, device const float* joint_axis,
+    device const int* body_parentid, device const int* body_jntadr,
+    device const int* body_jntnum, device const int* jnt_type,
+    device const int* jnt_dofadr,
+    device const float* qvel,
+    int nbody, int njnt, int nv, int bo, int jo, int vbase) {
+  float3 A = float3(0.0f);
+  if (nv == 0) return A;
+  int b = body;
+  while (b > 0 && b < nbody) {
+    int P = body_parentid[b];
+    int pc = (P >= 0 && P < nbody) ? P : 0;
+    int rcP = body_rootid[pc];
+    rcP = (rcP >= 0 && rcP < nbody) ? rcP : 0;
+    float3 wP = float3(cvel[(bo+pc)*6], cvel[(bo+pc)*6+1], cvel[(bo+pc)*6+2]);
+    float3 linP = float3(cvel[(bo+pc)*6+3], cvel[(bo+pc)*6+4], cvel[(bo+pc)*6+5]);
+    float3 comP = float3(root_com[(bo+rcP)*3], root_com[(bo+rcP)*3+1], root_com[(bo+rcP)*3+2]);
+    float3 wC = float3(cvel[(bo+b)*6], cvel[(bo+b)*6+1], cvel[(bo+b)*6+2]);
+    float3 linC = float3(cvel[(bo+b)*6+3], cvel[(bo+b)*6+4], cvel[(bo+b)*6+5]);
+    float3 posC = float3(body_pos[(bo+b)*3], body_pos[(bo+b)*3+1], body_pos[(bo+b)*3+2]);
+    float3 v_c = linC + cross(wC, posC - comP);
+    float4 bq = float4(body_quat[(bo+b)*4], body_quat[(bo+b)*4+1],
+                       body_quat[(bo+b)*4+2], body_quat[(bo+b)*4+3]);
+    float nq = length(bq); bq = nq > 1e-30f ? bq / nq : float4(1,0,0,0);
+    float3x3 bm = st8_quat2mat(bq);
+    int ja = body_jntadr[b], jn = body_jntnum[b];
+    for (int jj = 0; jj < jn; ++jj) {
+      int j = ja + jj;
+      if (j < 0 || j >= njnt) continue;
+      int da = jnt_dofadr[j], typ = jnt_type[j];
+      float3 r = float3(joint_anchor[(jo+j)*3], joint_anchor[(jo+j)*3+1], joint_anchor[(jo+j)*3+2]);
+      float3 a = float3(joint_axis[(jo+j)*3], joint_axis[(jo+j)*3+1], joint_axis[(jo+j)*3+2]);
+      float3 v_r = linP + cross(wP, r - comP);
+      if (typ == 2) {  // slide
+        int dof = da;
+        if (dof >= 0 && dof < nv) A += cross(wP, a) * qvel[vbase+dof];
+      } else if (typ == 3) {  // hinge
+        int dof = da;
+        if (dof >= 0 && dof < nv)
+          A += (cross(cross(wP, a), point - r) + cross(a, v_point - v_r)) * qvel[vbase+dof];
+      } else if (typ == 1) {  // ball
+        for (int q = 0; q < 3; ++q) {
+          int dof = da + q;
+          if (dof < 0 || dof >= nv) continue;
+          float3 e = bm[q];
+          A += (cross(cross(wC, e), point - r) + cross(e, v_point - v_r)) * qvel[vbase+dof];
+        }
+      } else if (typ == 0) {  // free: translation dofs constant, rotation as ball
+        for (int q = 0; q < 3; ++q) {
+          int dof = da + 3 + q;
+          if (dof < 0 || dof >= nv) continue;
+          float3 e = bm[q];
+          A += (cross(cross(wC, e), point - posC) + cross(e, v_point - v_c)) * qvel[vbase+dof];
+        }
+      }
+    }
+    b = body_parentid[b];
+  }
+  return A;
+}
+
+// Per-tendon Jdot(qvel) (tendon-space bias velocity) for site-only paths.
+// Pinned source: engine_core_smooth.c mj_tendonDot, dense site-only path.
+// Wrapped paths carry no armature (rejected at admission); their dots stay 0.
+kernel void spatial_armature_dots(
+    device const float* qvel [[buffer(0)]],
+    device const float* site_pos [[buffer(1)]],
+    device const float* body_pos [[buffer(2)]],
+    device const float* body_quat [[buffer(3)]],
+    device const float* cvel [[buffer(4)]],
+    device const float* root_com [[buffer(5)]],
+    device const float* joint_anchor [[buffer(6)]],
+    device const float* joint_axis [[buffer(7)]],
+    device const int* path_types [[buffer(8)]],
+    device const int* path_objids [[buffer(9)]],
+    device const float* path_prms [[buffer(10)]],
+    device const int* path_offset [[buffer(11)]],
+    device const int* path_count [[buffer(12)]],
+    device const int* site_bodyid [[buffer(13)]],
+    device const int* body_rootid [[buffer(14)]],
+    device const int* jnt_type [[buffer(15)]],
+    device const int* jnt_dofadr [[buffer(16)]],
+    device const int* body_parentid [[buffer(17)]],
+    device const int* body_jntadr [[buffer(18)]],
+    device const int* body_jntnum [[buffer(19)]],
+    device const float* armature [[buffer(20)]],
+    constant int* dims [[buffer(21)]],
+    device float* out_dots [[buffer(22)]],
+    uint world [[thread_position_in_grid]]) {
+  int nv=dims[0], nt=dims[1], nsite=dims[2];
+  int nbody=dims[4], njnt=dims[5], batch=dims[7];
+  if (uint(world)>=uint(batch)) return;
+  uint vbase=uint(world)*uint(max(nv,1)), tbase=uint(world)*uint(max(nt,1));
+  int bo=world*nbody, jo=world*max(njnt,1), so=world*max(nsite,1);
+  for (int t=0;t<nt;++t) {
+    float tdot=0.0f;
+    if (armature[t] != 0.0f) {
+      int off=path_offset[t], count=path_count[t];
+      bool wrapped=false;
+      for (int k=0;k<count;++k) {
+        int wt=path_types[off+k];
+        if (wt==4||wt==5) { wrapped=true; break; }
+      }
+      if (!wrapped && count>0) {
+        float divisor=1.0f;
+        int j=0;
+        while (j<count-1) {
+          int t0=path_types[off+j], t1=path_types[off+j+1];
+          int id0=path_objids[off+j], id1=path_objids[off+j+1];
+          if (t0==2||t1==2) {  // mjWRAP_PULLEY
+            if (t0==2) divisor=path_prms[off+j];
+            j++;
+            continue;
+          }
+          // site-site segment (site-only paths admitted with armature)
+          if (t0==3&&t1==3) {
+            float3 p0=float3(site_pos[(so+id0)*3],site_pos[(so+id0)*3+1],site_pos[(so+id0)*3+2]);
+            float3 p1=float3(site_pos[(so+id1)*3],site_pos[(so+id1)*3+1],site_pos[(so+id1)*3+2]);
+            int b0=(id0>=0&&id0<nsite)?site_bodyid[id0]:0;
+            int b1=(id1>=0&&id1<nsite)?site_bodyid[id1]:0;
+            if (b0!=b1) {
+              float3 d=p1-p0;
+              float n=length(d);
+              if (n>1e-9f) {
+                float3 dpnt=d/n;
+                float3 v0=st8_site_vel(p0,b0,cvel,root_com,body_rootid,nbody,bo);
+                float3 v1=st8_site_vel(p1,b1,cvel,root_com,body_rootid,nbody,bo);
+                float3 dv=v1-v0;
+                float s=dot(dpnt,dv);
+                float3 dvel=(dv-dpnt*s)/n;
+                float3 A0=st8_point_jacdot(p0,v0,b0,body_pos,body_quat,cvel,root_com,
+                  body_rootid,joint_anchor,joint_axis,body_parentid,body_jntadr,body_jntnum,
+                  jnt_type,jnt_dofadr,qvel,nbody,njnt,nv,bo,jo,vbase);
+                float3 A1=st8_point_jacdot(p1,v1,b1,body_pos,body_quat,cvel,root_com,
+                  body_rootid,joint_anchor,joint_axis,body_parentid,body_jntadr,body_jntnum,
+                  jnt_type,jnt_dofadr,qvel,nbody,njnt,nv,bo,jo,vbase);
+                tdot+=(dot(dpnt,A1-A0)+dot(dvel,v1-v0))/divisor;
+              }
+            }
+          }
+          j+=1;
+        }
+      }
+    }
+    out_dots[tbase+uint(t)]=tdot;
+  }
+}
