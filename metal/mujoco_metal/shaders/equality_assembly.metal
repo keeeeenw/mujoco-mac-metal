@@ -26,6 +26,24 @@ using namespace metal;
 inline float3 eq_qrot(float4 q, float3 v) {
   return v + 2.0f * cross(q.yzw, cross(q.yzw, v) + q.x * v);
 }
+inline float4 eq_qmul(float4 a, float4 b) {
+  return float4(a.x * b.x - dot(a.yzw, b.yzw),
+      a.x * b.yzw + b.x * a.yzw + cross(a.yzw, b.yzw));
+}
+inline float4 eq_qneg(float4 q) {
+  return float4(q.x, -q.y, -q.z, -q.w);
+}
+inline float4 eq_qmul_axis(float4 q, float3 axis) {
+  return float4(-dot(q.yzw, axis),
+      q.x * axis + cross(q.yzw, axis));
+}
+inline float4 eq_qderiv(float4 q, float3 vel) {
+  return float4(
+    0.5f * (-vel.x * q.y - vel.y * q.z - vel.z * q.w),
+    0.5f * ( vel.x * q.x + vel.y * q.w - vel.z * q.z),
+    0.5f * (-vel.x * q.w + vel.y * q.x + vel.z * q.y),
+    0.5f * ( vel.x * q.z - vel.y * q.y + vel.z * q.x));
+}
 
 inline float eq_impedance(device const float* imp, float pos, float margin) {
   float d0 = imp[0];
@@ -43,7 +61,8 @@ inline float eq_impedance(device const float* imp, float pos, float margin) {
 }
 
 // Point Jacobian via parent traversal (dense, like contact_normal kernel).
-// Computes translational Jacobian Jp (3 x nv) for global point attached to body.
+// Computes translational Jacobian Jp (3 x nv) and rotational Jacobian Jr (3 x nv)
+// for global point attached to body. Jr is independent of point (joint axes).
 inline void eq_point_jac(
     float3 point, int body,
     device const float* body_pos, device const float* body_quat,
@@ -52,8 +71,8 @@ inline void eq_point_jac(
     device const int* body_jntnum, device const int* jnt_type,
     device const int* jnt_dofadr,
     int nbody, int njnt, int nv, int bo, int jo,
-    thread float* Jp) {
-  for (int i = 0; i < 3 * 32; ++i) Jp[i] = 0.0f;
+    thread float* Jp, thread float* Jr) {
+  for (int i = 0; i < 3 * 32; ++i) { Jp[i] = 0.0f; Jr[i] = 0.0f; }
   if (nv == 0) return;
   // Traverse ancestors, accumulating contributions (opposite sign handled by caller).
   // This fills Jp for the single body point (caller differences two bodies).
@@ -71,12 +90,14 @@ inline void eq_point_jac(
         int dof = da + q;
         if (dof < 0 || dof >= nv) continue;
         float3 col = float3(0.0f);
+        float3 ang = float3(0.0f);
         if (typ == 2) {
           col = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
         } else if (typ == 3) {
           float3 axis = float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1], axes[(jo + j) * 3 + 2]);
           float3 anchor = float3(anchors[(jo + j) * 3], anchors[(jo + j) * 3 + 1], anchors[(jo + j) * 3 + 2]);
           col = cross(axis, point - anchor);
+          ang = axis;
         } else if (typ == 0 || typ == 1) {
           if (typ == 0 && q < 3) {
             col = float3(q == 0, q == 1, q == 2);
@@ -87,6 +108,7 @@ inline void eq_point_jac(
             // Rotate unit axis by body quat (free/ball angular).
             float3 unit = float3(qr == 0, qr == 1, qr == 2);
             float3 axis = eq_qrot(bq, unit);
+            ang = axis;
             float3 pivot;
             if (typ == 0) {
               pivot = float3(body_pos[(bo + b) * 3], body_pos[(bo + b) * 3 + 1], body_pos[(bo + b) * 3 + 2]);
@@ -99,6 +121,9 @@ inline void eq_point_jac(
         Jp[0 * 32 + dof] += col.x;
         Jp[1 * 32 + dof] += col.y;
         Jp[2 * 32 + dof] += col.z;
+        Jr[0 * 32 + dof] += ang.x;
+        Jr[1 * 32 + dof] += ang.y;
+        Jr[2 * 32 + dof] += ang.z;
       }
     }
     b = body_parentid[b];
@@ -136,6 +161,7 @@ kernel void equality_assembly(
     device const float* cvel [[buffer(27)]],
     device float* workspace_J [[buffer(28)]],
     device float* workspace_debug [[buffer(29)]],
+    device const float* site_quat [[buffer(30)]],
     uint world [[thread_position_in_grid]]) {
   int nq = dims[0];
   int nv = dims[1];
@@ -260,14 +286,14 @@ kernel void equality_assembly(
       }
       float3 cpos = pos1 - pos2;
 
-      // Jacobians J1, J2 (3 x nv) via parent traversal.
-      thread float J1[96], J2[96];
+      // Jacobians J1, J2 (3 x nv) via parent traversal (plus unused Jr for weld reuse).
+      thread float J1[96], J2[96], Jr1_dummy[96], Jr2_dummy[96];
       eq_point_jac(pos1, b1, body_pos, body_quat, joint_anchor, joint_axis,
                    body_parentid, body_jntadr, body_jntnum, jnt_type, jnt_dofadr,
-                   nbody, njnt, nv, bo, jo, J1);
+                   nbody, njnt, nv, bo, jo, J1, Jr1_dummy);
       eq_point_jac(pos2, b2, body_pos, body_quat, joint_anchor, joint_axis,
                    body_parentid, body_jntadr, body_jntnum, jnt_type, jnt_dofadr,
-                   nbody, njnt, nv, bo, jo, J2);
+                   nbody, njnt, nv, bo, jo, J2, Jr2_dummy);
 
       // Velocities v1, v2 and difference vel.
       float3 v1 = float3(0.0f), v2 = float3(0.0f);
@@ -332,14 +358,171 @@ kernel void equality_assembly(
         dbg[nr * nr + nr + row] = ar;
       }
     } else {
-      // Weld (not yet implemented in this commit): reserve rows as inactive zeros.
-      // Full weld assembly with pinned rotation semantics follows in next commit.
-      for (int k = 0; k < span; ++k) {
+      // Weld (6 rows): translational (3) + rotational (3) with pinned
+      // MuJoCo 3.10 quaternion error, torquescale, and reference semantics.
+      int o1 = eq_obj[e * 2];
+      int o2 = eq_obj[e * 2 + 1];
+      float torquescale = eq_data[e * 11 + 10];
+      float3 pos1 = float3(0.0f), pos2 = float3(0.0f);
+      int b1 = 0, b2 = 0;
+      float4 q0_full = float4(1,0,0,0), q1_full = float4(1,0,0,0);
+      float4 relpose = float4(1,0,0,0);
+      bool is_site = (objtype == 6);
+      if (!is_site) {
+        b1 = o1; b2 = o2;
+        float3 l1 = float3(eq_data[e * 11 + 3], eq_data[e * 11 + 4], eq_data[e * 11 + 5]);
+        float3 l2 = float3(eq_data[e * 11], eq_data[e * 11 + 1], eq_data[e * 11 + 2]);
+        float4 qb1 = b1 >= 0 && b1 < nbody ? float4(body_quat[(bo + b1) * 4], body_quat[(bo + b1) * 4 + 1], body_quat[(bo + b1) * 4 + 2], body_quat[(bo + b1) * 4 + 3]) : float4(1,0,0,0);
+        float4 qb2 = b2 >= 0 && b2 < nbody ? float4(body_quat[(bo + b2) * 4], body_quat[(bo + b2) * 4 + 1], body_quat[(bo + b2) * 4 + 2], body_quat[(bo + b2) * 4 + 3]) : float4(1,0,0,0);
+        float3 p1 = b1 >= 0 && b1 < nbody ? float3(body_pos[(bo + b1) * 3], body_pos[(bo + b1) * 3 + 1], body_pos[(bo + b1) * 3 + 2]) : float3(0.0f);
+        float3 p2 = b2 >= 0 && b2 < nbody ? float3(body_pos[(bo + b2) * 3], body_pos[(bo + b2) * 3 + 1], body_pos[(bo + b2) * 3 + 2]) : float3(0.0f);
+        pos1 = eq_qrot(qb1, l1) + p1;
+        pos2 = eq_qrot(qb2, l2) + p2;
+        q0_full = qb1;
+        q1_full = qb2;
+        relpose = float4(eq_data[e * 11 + 6], eq_data[e * 11 + 7], eq_data[e * 11 + 8], eq_data[e * 11 + 9]);
+      } else {
+        float3 s1 = o1 >= 0 && o1 < nsite ? float3(site_pos[(so + o1) * 3], site_pos[(so + o1) * 3 + 1], site_pos[(so + o1) * 3 + 2]) : float3(0.0f);
+        float3 s2 = o2 >= 0 && o2 < nsite ? float3(site_pos[(so + o2) * 3], site_pos[(so + o2) * 3 + 1], site_pos[(so + o2) * 3 + 2]) : float3(0.0f);
+        pos1 = s1; pos2 = s2;
+        b1 = o1 >= 0 && o1 < nsite ? site_bodyid[o1] : 0;
+        b2 = o2 >= 0 && o2 < nsite ? site_bodyid[o2] : 0;
+        float4 sq1 = o1 >= 0 && o1 < nsite ? float4(site_quat[(so + o1) * 4], site_quat[(so + o1) * 4 + 1], site_quat[(so + o1) * 4 + 2], site_quat[(so + o1) * 4 + 3]) : float4(1,0,0,0);
+        float4 sq2 = o2 >= 0 && o2 < nsite ? float4(site_quat[(so + o2) * 4], site_quat[(so + o2) * 4 + 1], site_quat[(so + o2) * 4 + 2], site_quat[(so + o2) * 4 + 3]) : float4(1,0,0,0);
+        q0_full = sq1;
+        q1_full = sq2;
+        relpose = float4(1,0,0,0);
+      }
+      float3 cpos_t = pos1 - pos2;
+      // Orientation error: quat = q0*rel (body) or sq1 (site); quat1 = neg(q1 or sq2).
+      float4 quat = is_site ? q0_full : eq_qmul(q0_full, relpose);
+      float4 quat1 = eq_qneg(q1_full);
+      float4 quat2 = eq_qmul(quat1, quat);
+      float3 cpos_r = torquescale * quat2.yzw;
+
+      // Translational + rotational Jacobians via parent traversal.
+      thread float Jp1[96], Jr1[96], Jp2[96], Jr2[96];
+      eq_point_jac(pos1, b1, body_pos, body_quat, joint_anchor, joint_axis,
+                   body_parentid, body_jntadr, body_jntnum, jnt_type, jnt_dofadr,
+                   nbody, njnt, nv, bo, jo, Jp1, Jr1);
+      eq_point_jac(pos2, b2, body_pos, body_quat, joint_anchor, joint_axis,
+                   body_parentid, body_jntadr, body_jntnum, jnt_type, jnt_dofadr,
+                   nbody, njnt, nv, bo, jo, Jp2, Jr2);
+
+      float3 v1 = float3(0.0f), v2 = float3(0.0f);
+      for (int i = 0; i < nv; ++i) {
+        float qv = qvel[qb + i];
+        v1.x += Jp1[0 * 32 + i] * qv; v1.y += Jp1[1 * 32 + i] * qv; v1.z += Jp1[2 * 32 + i] * qv;
+        v2.x += Jp2[0 * 32 + i] * qv; v2.y += Jp2[1 * 32 + i] * qv; v2.z += Jp2[2 * 32 + i] * qv;
+      }
+      float3 vel_t = v1 - v2;
+      float3 jdv_t = float3(0.0f);
+      {
+        float3 o1w = float3(0.0f), vcom1 = float3(0.0f);
+        float3 o2w = float3(0.0f), vcom2 = float3(0.0f);
+        if (b1 > 0 && b1 < nbody) {
+          o1w = float3(cvel[(bo + b1) * 6], cvel[(bo + b1) * 6 + 1], cvel[(bo + b1) * 6 + 2]);
+          vcom1 = float3(cvel[(bo + b1) * 6 + 3], cvel[(bo + b1) * 6 + 4], cvel[(bo + b1) * 6 + 5]);
+        }
+        if (b2 > 0 && b2 < nbody) {
+          o2w = float3(cvel[(bo + b2) * 6], cvel[(bo + b2) * 6 + 1], cvel[(bo + b2) * 6 + 2]);
+          vcom2 = float3(cvel[(bo + b2) * 6 + 3], cvel[(bo + b2) * 6 + 4], cvel[(bo + b2) * 6 + 5]);
+        }
+        jdv_t = cross(o1w, v1 - vcom1) - cross(o2w, v2 - vcom2);
+      }
+
+      // Rotational Jacobian: 0.5 * neg(q1) * (Jr1-Jr2) * quat * torquescale.
+      thread float Jrot[96];
+      for (int i = 0; i < 96; ++i) Jrot[i] = 0.0f;
+      for (int i = 0; i < nv; ++i) {
+        float3 axis = float3(Jr1[0 * 32 + i] - Jr2[0 * 32 + i],
+                             Jr1[1 * 32 + i] - Jr2[1 * 32 + i],
+                             Jr1[2 * 32 + i] - Jr2[2 * 32 + i]);
+        float4 t1 = eq_qmul_axis(quat1, axis);
+        float4 t2 = eq_qmul(t1, quat);
+        Jrot[0 * 32 + i] = 0.5f * t2.y * torquescale;
+        Jrot[1 * 32 + i] = 0.5f * t2.z * torquescale;
+        Jrot[2 * 32 + i] = 0.5f * t2.w * torquescale;
+      }
+      float3 vel_r = float3(0.0f);
+      for (int i = 0; i < nv; ++i) {
+        float qv = qvel[qb + i];
+        vel_r.x += Jrot[0 * 32 + i] * qv;
+        vel_r.y += Jrot[1 * 32 + i] * qv;
+        vel_r.z += Jrot[2 * 32 + i] * qv;
+      }
+
+      // diagA: translational uses body trans invweights, rotational uses rot invweights.
+      float w1t = 0.0f, w2t = 0.0f, w1r = 0.0f, w2r = 0.0f;
+      if (b1 >= 0 && b1 < nbody) { w1t = body_invweight[b1 * 2]; w1r = body_invweight[b1 * 2 + 1]; }
+      if (b2 >= 0 && b2 < nbody) { w2t = body_invweight[b2 * 2]; w2r = body_invweight[b2 * 2 + 1]; }
+      float diag_t = max(w1t + w2t, 1e-15f);
+      float diag_r = max(w1r + w2r, 1e-15f);
+
+      float pos_norm = sqrt(dot(cpos_t, cpos_t) + dot(cpos_r, cpos_r));
+      float imp = eq_impedance(eq_sol + e * 7 + 2, pos_norm, 0.0f);
+      imp = clamp(imp, 1e-6f, 0.999999f);
+      float d_width = max(1e-15f, eq_sol[e * 7 + 3]);
+      float r0 = eq_sol[e * 7];
+      float r1 = eq_sol[e * 7 + 1];
+      if (refsafe && r0 > 0.0f) r0 = max(r0, 2.0f * timestep);
+      float K = r0 > 0.0f ? 1.0f / max(1e-15f, d_width * d_width * r0 * r0 * r1 * r1)
+                          : -r0 / max(1e-15f, d_width * d_width);
+      float B = r1 > 0.0f ? 2.0f / max(1e-15f, d_width * r0) : -r1 / d_width;
+      float R_t = max(1e-15f, (1.0f - imp) * diag_t / imp);
+      float R_r = max(1e-15f, (1.0f - imp) * diag_r / imp);
+
+      for (int k = 0; k < 3; ++k) {
         int row = rowadr + k;
         if (row < 0 || row >= nr) continue;
-        for (int i = 0; i < nv; ++i) J_world[row * nv + i] = 0.0f;
-        dbg[nr * nr + row] = 0.0f;
-        dbg[nr * nr + nr + row] = 0.0f;
+        float c = k == 0 ? cpos_t.x : (k == 1 ? cpos_t.y : cpos_t.z);
+        float v = k == 0 ? vel_t.x : (k == 1 ? vel_t.y : vel_t.z);
+        float jd = k == 0 ? jdv_t.x : (k == 1 ? jdv_t.y : jdv_t.z);
+        float ar = -B * v - K * imp * c - jd;
+        for (int i = 0; i < nv; ++i) {
+          float a = k == 0 ? Jp1[0 * 32 + i] : (k == 1 ? Jp1[1 * 32 + i] : Jp1[2 * 32 + i]);
+          float b_ = k == 0 ? Jp2[0 * 32 + i] : (k == 1 ? Jp2[1 * 32 + i] : Jp2[2 * 32 + i]);
+          J_world[row * nv + i] = a - b_;
+        }
+        dbg[nr * nr + row] = R_t;
+        dbg[nr * nr + nr + row] = ar;
+      }
+      // Rotational Jdot correction (pinned 3-term without djrdv term).
+      // For free/single-hinge-to-world fixtures (no moving-parent rotational
+      // chains), jrdv=0 exactly (omega x omega=0), so omitting term2 is exact.
+      // Term1+term3 use cvel omegas and quaternion derivatives.
+      float3 rot_corr = float3(0.0f);
+      {
+        float3 w1 = float3(0.0f), w2 = float3(0.0f);
+        if (b1 > 0 && b1 < nbody) {
+          w1 = float3(cvel[(bo + b1) * 6], cvel[(bo + b1) * 6 + 1], cvel[(bo + b1) * 6 + 2]);
+        }
+        if (b2 > 0 && b2 < nbody) {
+          w2 = float3(cvel[(bo + b2) * 6], cvel[(bo + b2) * 6 + 1], cvel[(bo + b2) * 6 + 2]);
+        }
+        float3 dom = w1 - w2;
+        float4 qd0 = eq_qderiv(q0_full, w1);
+        float4 qd0r = is_site ? qd0 : eq_qmul(qd0, relpose);
+        float4 qd1 = eq_qderiv(q1_full, w2);
+        float4 nqd1 = eq_qneg(qd1);
+        float4 t1a = eq_qmul_axis(nqd1, dom);
+        float4 t1 = eq_qmul(t1a, quat);
+        float4 t3a = eq_qmul_axis(quat1, dom);
+        float4 t3 = eq_qmul(t3a, qd0r);
+        rot_corr = 0.5f * (t1.yzw + t3.yzw) * torquescale;
+      }
+      for (int k = 0; k < 3; ++k) {
+        int row = rowadr + 3 + k;
+        if (row < 0 || row >= nr) continue;
+        float c = k == 0 ? cpos_r.x : (k == 1 ? cpos_r.y : cpos_r.z);
+        float v = k == 0 ? vel_r.x : (k == 1 ? vel_r.y : vel_r.z);
+        float jd = k == 0 ? rot_corr.x : (k == 1 ? rot_corr.y : rot_corr.z);
+        float ar = -B * v - K * imp * c - jd;
+        for (int i = 0; i < nv; ++i) {
+          J_world[row * nv + i] = Jrot[k * 32 + i];
+        }
+        dbg[nr * nr + row] = R_r;
+        dbg[nr * nr + nr + row] = ar;
       }
     }
   }

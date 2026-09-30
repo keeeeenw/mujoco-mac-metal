@@ -1000,11 +1000,15 @@ class MetalCoupledConstraints:
         if not isinstance(cvel, torch.Tensor):
           raise TypeError("cvel must be a torch.Tensor")
         cvel_flat = cvel.reshape(-1)
-      # site_pos may be empty when nsite==0; pass dummy non-null buffer.
+      # site_pos/site_quat may be empty when nsite==0; pass dummy non-null buffers.
       try:
         site_pos_tensor = poses["site_pos"]
       except KeyError:
         site_pos_tensor = torch.zeros((b, 1, 3), dtype=torch.float32, device=self._device)
+      try:
+        site_quat_tensor = poses["site_quat"]
+      except KeyError:
+        site_quat_tensor = torch.zeros((b, 1, 4), dtype=torch.float32, device=self._device)
       self._equality_kernel(
           self._constants["eq_obj"], self._constants["eq_data"],
           self._constants["eq_sol_params"], eq_active_tensor.reshape(-1),
@@ -1023,6 +1027,7 @@ class MetalCoupledConstraints:
           poses["joint_anchor"].reshape(-1), poses["joint_axis"].reshape(-1),
           site_pos_tensor.reshape(-1), cvel_flat,
           w["workspace_J"], w["workspace_debug"],
+          site_quat_tensor.reshape(-1),
           threads=(b,), group_size=(1,),
       )
 

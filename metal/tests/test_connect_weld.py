@@ -326,3 +326,147 @@ def test_native_connect_trajectory_matches_cpu():
         max_vel = max(max_vel, float(np.max(np.abs(sim.state.qvel[0].cpu().numpy() - cpu.qvel))))
     assert max_pos < 1e-5, max_pos
     assert max_vel < 1e-4, max_vel
+
+
+def _native_weld_result(model, qpos, qvel):
+    import torch
+
+    from mujoco_metal.metal_kinematics import MetalKinematics
+    from mujoco_metal.smooth_metal import MetalSmoothDynamics
+    from mujoco_metal.coupled_constraints import MetalCoupledConstraints
+    from mujoco_metal.model import load_model
+
+    qpos = np.asarray(qpos, dtype=np.float32)
+    qvel = np.asarray(qvel, dtype=np.float32)
+    qpos_mps = torch.as_tensor(qpos, device="mps")
+    qvel_mps = torch.as_tensor(qvel, device="mps")
+    md = load_model(model)
+    poses = MetalKinematics(md, qpos.shape[0]).run_device(qpos_mps)
+    dyn = MetalSmoothDynamics(md, qpos.shape[0]).run_device(qpos_mps, qvel_mps)
+    res = MetalCoupledConstraints(model, qpos.shape[0]).run_device(
+        poses, dyn["mass_matrix"], -dyn["qfrc_bias"], qpos_mps, qvel_mps,
+        cvel=dyn["cvel"],
+    )
+    return res
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("form", ["body-body", "body-world", "site-site"])
+def test_native_weld_forms_match_cpu(form):
+    if form == "body-body":
+        xml = """<mujoco><option timestep="0.002" gravity="0 0 0" iterations="1000" tolerance="1e-10"/>
+        <worldbody>
+        <body name="b1" pos="0 0 1"><freejoint/><geom type="sphere" size="0.1"/></body>
+        <body name="b2" pos="1 0.15 1.05"><freejoint/><geom type="sphere" size="0.1"/></body>
+        </worldbody><equality><weld body1="b1" body2="b2"/></equality></mujoco>"""
+    elif form == "body-world":
+        xml = """<mujoco><option timestep="0.002" gravity="0 0 0" iterations="1000" tolerance="1e-10"/>
+        <worldbody>
+        <body name="b1" pos="0.2 -0.1 1.1"><freejoint/><geom type="sphere" size="0.1"/></body>
+        </worldbody><equality><weld body1="b1"/></equality></mujoco>"""
+    else:
+        xml = """<mujoco><option timestep="0.002" gravity="0 0 0" iterations="1000" tolerance="1e-10"/>
+        <worldbody>
+        <body name="b1" pos="0 0 1"><freejoint/><site name="s1" pos="0.1 0 0" quat="1 0 0 0"/><geom type="sphere" size="0.1"/></body>
+        <body name="b2" pos="1 0.1 0.95"><freejoint/><site name="s2" pos="-0.1 0.05 0" quat="0.9239 0 0 0.3827"/><geom type="sphere" size="0.1"/></body>
+        </worldbody><equality><weld site1="s1" site2="s2"/></equality></mujoco>"""
+    m = mujoco.MjModel.from_xml_string(xml)
+    d = lower_coupled_constraints(m)
+    assert d.n_eq_rows == 6
+    qpos = m.qpos0[None, :].astype(np.float32)
+    qpos[0, 0] += 0.008
+    qvel = np.zeros((1, m.nv), dtype=np.float32)
+    qvel[0, 0] = 0.15
+    if m.nv >= 6:
+        qvel[0, 3] = 0.4
+    res = _native_weld_result(m, qpos, qvel)
+    assert int(res["status"][0]) == 0
+    ref = mujoco.MjData(m)
+    ref.qpos[:] = qpos[0]
+    ref.qvel[:] = qvel[0]
+    mujoco.mj_forward(m, ref)
+    assert ref.nefc == 6, (form, ref.nefc)
+    np.testing.assert_allclose(res["J"][0, :6].cpu().numpy(), ref.efc_J.reshape(6, m.nv), atol=5e-6)
+    np.testing.assert_allclose(res["R"][0, :6].cpu().numpy(), ref.efc_R, rtol=2e-5, atol=2e-5)
+    np.testing.assert_allclose(res["ar"][0, :6].cpu().numpy(), ref.efc_aref, rtol=2e-4, atol=5e-3)
+    np.testing.assert_allclose(-res["rhs"][0, :6].cpu().numpy(), ref.efc_b, rtol=2e-4, atol=5e-3)
+    np.testing.assert_allclose(res["qacc"][0].cpu().numpy(), ref.qacc, rtol=5e-4, atol=2e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_native_weld_rotation_semantics():
+    # Small vs substantial angular error, q vs -q, torquescale 0/positive.
+    base = """<mujoco><option timestep="0.002" gravity="0 0 0" iterations="1000" tolerance="1e-10"/>
+    <worldbody>
+    <body name="b1" pos="0 0 1"><freejoint/><geom type="sphere" size="0.1"/></body>
+    <body name="b2" pos="1 0 1"><freejoint/><geom type="sphere" size="0.1"/></body>
+    </worldbody><equality><weld body1="b1" body2="b2" {extra}/></equality></mujoco>"""
+    # Small angular error via perturbed free quat (rotation ~0.02 rad about x).
+    m_small = mujoco.MjModel.from_xml_string(base.format(extra=""))
+    qpos = m_small.qpos0[None, :].astype(np.float32)
+    # Perturb b2 quat slightly (w,x,y,z with x small).
+    qpos[0, 10] = 0.99995
+    qpos[0, 11] = 0.01
+    qvel = np.zeros((1, m_small.nv), dtype=np.float32)
+    res = _native_weld_result(m_small, qpos, qvel)
+    ref = mujoco.MjData(m_small)
+    ref.qpos[:] = qpos[0]
+    mujoco.mj_forward(m_small, ref)
+    np.testing.assert_allclose(res["J"][0, :6].cpu().numpy(), ref.efc_J.reshape(6, m_small.nv), atol=5e-6)
+    np.testing.assert_allclose(res["qacc"][0].cpu().numpy(), ref.qacc, atol=2e-2)
+
+    # Substantial angular error (45 deg about z via relpose) with velocity.
+    m_sub = mujoco.MjModel.from_xml_string(
+        base.format(extra='relpose="0.1 0.2 0.3 0.9239 0 0 0.3827"')
+    )
+    qpos2 = m_sub.qpos0[None, :].astype(np.float32)
+    qpos2[0, 0] += 0.01
+    qvel2 = np.zeros((1, m_sub.nv), dtype=np.float32)
+    qvel2[0, :] = [0.2, -0.1, 0.05, 0.5, -0.3, 0.4, -0.1, 0.2, -0.05, -0.4, 0.3, 0.5]
+    res2 = _native_weld_result(m_sub, qpos2, qvel2)
+    ref2 = mujoco.MjData(m_sub)
+    ref2.qpos[:] = qpos2[0]
+    ref2.qvel[:] = qvel2[0]
+    mujoco.mj_forward(m_sub, ref2)
+    np.testing.assert_allclose(res2["J"][0, :6].cpu().numpy(), ref2.efc_J.reshape(6, m_sub.nv), atol=1e-5)
+    np.testing.assert_allclose(res2["qacc"][0].cpu().numpy(), ref2.qacc, rtol=1e-3, atol=2e-2)
+
+    # q vs -q (same rotation, opposite signs) must both match CPU (no ad-hoc flip).
+    for quat in ("1 0 0 0", "-1 0 0 0"):
+        m_q = mujoco.MjModel.from_xml_string(base.format(extra=f'relpose="0 0 0 {quat}"'))
+        q = m_q.qpos0[None, :].astype(np.float32)
+        v = np.zeros((1, m_q.nv), dtype=np.float32)
+        r = _native_weld_result(m_q, q, v)
+        dref = mujoco.MjData(m_q)
+        dref.qpos[:] = q[0]
+        mujoco.mj_forward(m_q, dref)
+        np.testing.assert_allclose(r["qacc"][0].cpu().numpy(), dref.qacc, atol=2e-2)
+
+    # Zero torquescale behaves like connect for rotation (zero rotational J/force).
+    m_zero = mujoco.MjModel.from_xml_string(base.format(extra='torquescale="0" anchor="0 -2 0"'))
+    qz = m_zero.qpos0[None, :].astype(np.float32)
+    vz = np.zeros((1, m_zero.nv), dtype=np.float32)
+    rz = _native_weld_result(m_zero, qz, vz)
+    assert int(rz["status"][0]) == 0
+    Jz = rz["J"][0, :6].cpu().numpy()
+    assert np.allclose(Jz[3:], 0.0, atol=1e-7)
+    assert np.linalg.norm(Jz[:3]) > 0.5
+
+    # Near-half-turn stress (170 deg) stays finite with CPU parity (no silent invalid).
+    m_half = mujoco.MjModel.from_xml_string(base.format(extra=""))
+    qh = m_half.qpos0[None, :].astype(np.float32)
+    # b2 quat ~170 deg about x: w=cos(85deg)=0.0872, x=sin(85deg)=0.9962
+    qh[0, 7 + 3] = 0.0872
+    qh[0, 7 + 4] = 0.9962
+    qh[0, 7 + 5] = 0.0
+    qh[0, 7 + 6] = 0.0
+    vh = np.zeros((1, m_half.nv), dtype=np.float32)
+    rh = _native_weld_result(m_half, qh, vh)
+    assert np.all(np.isfinite(rh["J"][0].cpu().numpy()))
+    assert np.all(np.isfinite(rh["qacc"][0].cpu().numpy()))
+    drefh = mujoco.MjData(m_half)
+    drefh.qpos[:] = qh[0]
+    mujoco.mj_forward(m_half, drefh)
+    np.testing.assert_allclose(rh["qacc"][0].cpu().numpy(), drefh.qacc, rtol=2e-3, atol=5e-2)
