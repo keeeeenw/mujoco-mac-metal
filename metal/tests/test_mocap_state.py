@@ -216,3 +216,76 @@ def test_mocap_keyframe_copy_snapshot_gpu():
     sim.reset_to_keyframe(7)
   with pytest.raises(ValueError):
     sim.set_mocap(np.array([[0, 0, 1]]), np.array([[0, 0, 0, 0]]))
+
+
+XML_KEYCTRL = """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
+<worldbody>
+<body pos="0 0 1" mocap="true"><geom type="sphere" size="0.05"/></body>
+<body pos="0 0 0.8"><joint name="j" type="hinge" axis="0 1 0"/><geom type="sphere" size="0.08" mass="0.5"/></body>
+</worldbody>
+<actuator><general joint="j" dyntype="filter" dynprm="0.05 0 0" gainprm="2 0 0"/></actuator>
+<keyframe><key name="k0" qpos="0.3" qvel="0.1" act="0.2" mpos="0.1 0 1.05" mquat="1 0 0 0" ctrl="0.7" time="1.5"/></keyframe>
+</mujoco>"""
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_keyframe_reset_atomic_on_invalid_ctrl_gpu():
+  # R4: an invalid keyframe payload must fail before ANY mutation: state,
+  # time, activation, mocap, held controls, generation and caches.
+  import torch
+  from mujoco_metal import MetalSimulation
+  m = mujoco.MjModel.from_xml_string(XML_KEYCTRL)
+  sim = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
+  sim.reset(qpos=np.array([[0.2], [0.25]], dtype=np.float32),
+            act=np.array([[0.0], [0.0]], dtype=np.float32))
+  sim.step(2, ctrl=np.array([[3.0], [4.0]], dtype=np.float32))
+  before = {
+      "qpos": sim.state.qpos.cpu().numpy().copy(),
+      "time": sim.state.time.cpu().numpy().copy(),
+      "act": sim.state.act.cpu().numpy().copy(),
+      "mpos": sim.state.mocap_pos.cpu().numpy().copy(),
+      "ctrl": sim._control.cpu().numpy().copy(),
+      "gen": sim.state.generation,
+  }
+  m.key_ctrl[0, 0] = float("nan")
+  with pytest.raises(ValueError, match="keyframe ctrl must be finite"):
+    sim.reset_to_keyframe(0)
+  np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), before["qpos"])
+  np.testing.assert_array_equal(sim.state.time.cpu().numpy(), before["time"])
+  np.testing.assert_array_equal(sim.state.act.cpu().numpy(), before["act"])
+  np.testing.assert_array_equal(sim.state.mocap_pos.cpu().numpy(), before["mpos"])
+  np.testing.assert_array_equal(sim._control.cpu().numpy(), before["ctrl"])
+  assert sim.state.generation == before["gen"]
+  # Valid recovery after failure applies the keyframe to all worlds.
+  m.key_ctrl[0, 0] = 0.7
+  sim.reset_to_keyframe(0)
+  np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[:, 0], [0.3, 0.3], atol=1e-6)
+  np.testing.assert_allclose(sim.state.act.cpu().numpy()[:, 0], [0.2, 0.2], atol=1e-6)
+  np.testing.assert_allclose(sim._control.cpu().numpy()[:, 0], [0.7, 0.7], atol=1e-6)
+  assert float(sim.state.time.cpu().numpy()[0]) == 1.5
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_keyframe_reset_partial_env_and_time_overflow_gpu():
+  # R4: partial selection isolates unselected worlds; unrepresentable key
+  # time fails before mutation.
+  from mujoco_metal import MetalSimulation
+  m = mujoco.MjModel.from_xml_string(XML_KEYCTRL)
+  sim = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
+  sim.step(2, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
+  sim.reset_to_keyframe(0, env_ids=[0])
+  np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[0], [0.3], atol=1e-6)
+  assert float(sim.state.time.cpu().numpy()[0]) == 1.5
+  t1_before = float(sim.state.time.cpu().numpy()[1])
+  q1_before = sim.state.qpos.cpu().numpy()[1].copy()
+  m.key_time[0] = 1e300
+  with pytest.raises(ValueError, match="float32-representable"):
+    sim.reset_to_keyframe(0, env_ids=[0])
+  assert float(sim.state.time.cpu().numpy()[0]) == 1.5
+  assert float(sim.state.time.cpu().numpy()[1]) == t1_before
+  np.testing.assert_array_equal(sim.state.qpos.cpu().numpy()[1], q1_before)
+  m.key_time[0] = 1.5
+  sim.reset_to_keyframe(0, env_ids=[0])  # valid recovery
+  assert float(sim.state.time.cpu().numpy()[0]) == 1.5

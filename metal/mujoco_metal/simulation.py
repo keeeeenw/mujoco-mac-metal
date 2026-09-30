@@ -483,6 +483,21 @@ class MetalSimulation:
     key_time = float(np.asarray(model.key_time).reshape(int(model.nkey))[key_id])
     if not np.isfinite(key_time) or key_time < 0:
       raise ValueError("keyframe time must be finite and nonnegative")
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+      key_time32 = np.float32(key_time)
+    if not np.isfinite(key_time32):
+      raise ValueError("keyframe time must be float32-representable")
+    # R4: validate held-control payload BEFORE any state mutation so that an
+    # invalid keyframe fails atomically (state, held inputs, generation and
+    # caches all untouched). _apply_key_ctrl re-checks defensively.
+    if nu and self._control is not None:
+      pre_ctrl = np.asarray(model.key_ctrl).reshape(int(model.nkey), nu)[key_id]
+      if not np.all(np.isfinite(pre_ctrl)):
+        raise ValueError("keyframe ctrl must be finite")
+      with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        pre_ctrl32 = np.asarray(pre_ctrl, dtype=np.float32)
+      if not np.all(np.isfinite(pre_ctrl32)):
+        raise ValueError("keyframe ctrl must be float32-representable")
     na = int(model.na)
     if na:
       key_act = np.asarray(model.key_act).reshape(int(model.nkey), na)[key_id]
@@ -537,10 +552,17 @@ class MetalSimulation:
     model = self._mjmodel
     nu = int(model.nu)
     key_ctrl = np.asarray(model.key_ctrl).reshape(int(model.nkey), nu)[key_id] if nu else None
-    self._clear_held_inputs(env_ids)
     if key_ctrl is not None and self._control is not None:
+      # R4: validate before clearing/applying so failures leave held inputs
+      # and state untouched.
       if not np.all(np.isfinite(key_ctrl)):
         raise ValueError("keyframe ctrl must be finite")
+      with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        ctrl32 = np.asarray(key_ctrl, dtype=np.float32)
+      if not np.all(np.isfinite(ctrl32)):
+        raise ValueError("keyframe ctrl must be float32-representable")
+    self._clear_held_inputs(env_ids)
+    if key_ctrl is not None and self._control is not None:
       ids = None if env_ids is None else self._state._env_ids(env_ids)
       ctrl32 = np.asarray(key_ctrl, dtype=np.float32)
       if ids is None:
