@@ -49,6 +49,8 @@ def lower_implicitfast(model, *, external_derivative=False):
     raise ValueError("implicitfast stage currently excludes flex dynamics")
   if model.nplugin or model.nmocap:
     raise ValueError("implicitfast stage excludes MuJoCo plugins and mocap bodies")
+  if int(model.na) > 0:
+    raise ValueError("implicitfast stage excludes activation state (owned by milestone 015)")
   if not external_derivative and model.ntendon:
     raise ValueError("implicitfast tendon derivatives require an external full qDeriv")
   if not external_derivative and (model.opt.density != 0 or model.opt.viscosity != 0):

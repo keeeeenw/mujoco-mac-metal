@@ -261,6 +261,8 @@ class MetalPassiveForces:
       )
     self._body_mass = tensor(self._meta.body_mass)
     self._body_gravcomp = tensor(self._meta.body_gravcomp)
+    self._unit_gravcomp = tensor(
+        np.ones_like(np.asarray(self._meta.body_gravcomp, dtype=np.float32)))
     self._gravity = tensor(self._meta.gravity)
     gravity_disabled = bool(
         self._meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_GRAVITY)
@@ -271,6 +273,16 @@ class MetalPassiveForces:
             self._meta.njnt,
             self._meta.nv,
             int(gravity_disabled),
+        ],
+        torch.int32,
+    )
+    self._gravcomp_dims = tensor(
+        [
+            self._meta.nbody,
+            self._meta.njnt,
+            self._meta.nv,
+            int(bool(
+                self._meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_GRAVITY))),
         ],
         torch.int32,
     )
@@ -378,3 +390,52 @@ class MetalPassiveForces:
           group_size=(1,),
       )
     return (out, deriv) if return_damping else out
+
+  def gravcomp_device(self, qpos, mocap_pos=None, mocap_quat=None):
+    """Return borrowed MPS per-dof gravity generalized forces (qfrc_gravcomp).
+
+    Unit-scale projection of body weights, matching pinned qfrc_gravcomp used
+    for actuator gravity-compensation routing (milestone 007). Zeros when
+    gravity is disabled, zero, or the model has no DOFs. Never reads values
+    back to the host.
+    """
+    torch = self._torch
+    b = qpos.shape[0] if qpos.ndim == 2 else -1
+    nv = self._meta.nv
+    if b <= 0 or tuple(qpos.shape) != (b, self._meta.nq):
+      raise ValueError("qpos has invalid batch dimensions")
+    if qpos.device.type != "mps" or qpos.dtype != torch.float32 or not qpos.is_contiguous():
+      raise ValueError("qpos must be contiguous float32 MPS")
+    out = torch.zeros((b, max(nv, 1)), dtype=torch.float32, device=self._device)
+    gravity = np.asarray(self._meta.gravity, dtype=np.float64)
+    gravity_disabled = bool(
+        self._meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_GRAVITY)
+    )
+    if nv == 0 or gravity_disabled or not np.any(gravity != 0):
+      return out.reshape(b, max(nv, 1)) if nv else out.reshape(b, 1) * 0
+    if self._fk._workspace["batch_size"] != b:
+      self._fk.prepare_workspace(b)
+    poses = self._fk.run_device(qpos, mocap_pos, mocap_quat)
+    if self._meta.nbody <= 1:
+      return out
+    self._projection_kernel(
+        self._body_parentid,
+        self._body_jntadr,
+        self._body_jntnum,
+        self._jnt_bodyid,
+        self._type,
+        self._dadr,
+        poses["body_quat"].reshape(-1),
+        poses["inertial_pos"].reshape(-1),
+        poses["joint_anchor"].reshape(-1),
+        poses["joint_axis"].reshape(-1),
+        self._body_mass,
+        self._unit_gravcomp,
+        self._gravity,
+        torch.zeros((b * self._meta.nbody * 6,), dtype=torch.float32, device=self._device),
+        self._gravcomp_dims,
+        out.reshape(-1),
+        threads=(b,),
+        group_size=(1,),
+    )
+    return out

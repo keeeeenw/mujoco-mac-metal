@@ -851,6 +851,10 @@ class MetalCoupledConstraints:
             [d.nv, d.npairs, d.ncontacts_max, self.batch_size, d.nbody, d.njnt, d.ngeom, d.cone_type],
             dtype=torch.int32, device=self._device,
         ),
+        "body_dims": torch.tensor(
+            [d.ncontacts_max, d.npairs, d.nv, 0, self.batch_size],
+            dtype=torch.int32, device=self._device,
+        ),
         "solver_dims": torch.tensor(
             [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows],
             dtype=torch.int32, device=self._device,
@@ -898,7 +902,57 @@ class MetalCoupledConstraints:
     self._eq_active_default = torch.as_tensor(init_eq, dtype=torch.int32, device=self._device)
     self._constants["c_dims"][3] = b
     self._constants["solver_dims"][5] = b
+    self._constants["body_dims"][3] = 0
+    self._constants["body_dims"][4] = b
     return self._workspace
+
+  def generate_candidates(self, poses, qvel):
+    """Run only the contact candidate kernel into persistent workspace buffers.
+
+    Used for same-step BODY-transmission adhesion moments (milestone 007),
+    which require candidate contacts before actuator-force assembly. The
+    buffers are zeroed first so unwritten slots read exact zero. `run_device`
+    calls this internally; behavior is unchanged.
+    """
+    w, d = self._workspace, self.descriptor
+    b, nc = self.batch_size, d.ncontacts_max
+    if d.npairs > 0 and nc > 0:
+      w["contact_row_data"].zero_()
+      w["contact_frame"].zero_()
+      w["contact_jacobian"].zero_()
+      self._contact_kernel(
+          poses["geom_pos"], poses["geom_quat"],
+          self._constants["geom_size"], self._constants["geom_type"],
+          self._constants["geom_bodyid"], poses["body_pos"], poses["body_quat"],
+          poses["joint_anchor"], poses["joint_axis"], qvel.reshape(-1),
+          self._constants["body_parentid"], self._constants["body_jntadr"],
+          self._constants["body_jntnum"], self._constants["jnt_type"],
+          self._constants["jnt_dofadr"], self._constants["body_invweight0"],
+          self._constants["pair_geoms"], self._constants["pair_margin_gap"],
+          self._constants["pair_solref"], self._constants["pair_solimp"],
+          self._constants["pair_condim"], self._constants["pair_friction"],
+          self._constants["pair_solreffriction"], self._constants["pair_contact_offset"],
+          w["contact_row_data"], w["contact_frame"], w["contact_jacobian"],
+          self._constants["c_dims"],
+          threads=(b * d.npairs,), group_size=(1,),
+      )
+
+  def contact_buffers(self):
+    """Return borrowed candidate-contact workspace views for BODY adhesion."""
+    w, d = self._workspace, self.descriptor
+    b, nc, nv = self.batch_size, d.ncontacts_max, max(d.nv, 1)
+    import torch as _torch
+    zeros = _torch.zeros(1, dtype=_torch.float32, device=self._device)
+    frame = w["contact_frame"] if nc else zeros
+    jacobian = w["contact_jacobian"] if nc else zeros
+    return {
+        "frame": frame,
+        "jacobian": jacobian,
+        "pair_geoms": self._constants["pair_geoms"],
+        "geom_bodyid": self._constants["geom_bodyid"],
+        "pair_offset": self._constants["pair_contact_offset"],
+        "dims": self._constants["body_dims"],
+    }
 
   def run_device(self, poses, mass, qfrc_smooth, qpos, qvel, eq_active=None, cvel=None):
     """Solve coupled contacts, limits, dry friction, and equalities on MPS.
@@ -933,23 +987,7 @@ class MetalCoupledConstraints:
       eq_active_tensor = eq_active
 
     # 1. Contact normal kernel (if candidate contact pairs exist)
-    if d.npairs > 0 and nc > 0:
-      self._contact_kernel(
-          poses["geom_pos"], poses["geom_quat"],
-          self._constants["geom_size"], self._constants["geom_type"],
-          self._constants["geom_bodyid"], poses["body_pos"], poses["body_quat"],
-          poses["joint_anchor"], poses["joint_axis"], qvel.reshape(-1),
-          self._constants["body_parentid"], self._constants["body_jntadr"],
-          self._constants["body_jntnum"], self._constants["jnt_type"],
-          self._constants["jnt_dofadr"], self._constants["body_invweight0"],
-          self._constants["pair_geoms"], self._constants["pair_margin_gap"],
-          self._constants["pair_solref"], self._constants["pair_solimp"],
-          self._constants["pair_condim"], self._constants["pair_friction"],
-          self._constants["pair_solreffriction"], self._constants["pair_contact_offset"],
-          w["contact_row_data"], w["contact_frame"], w["contact_jacobian"],
-          self._constants["c_dims"],
-          threads=(b * d.npairs,), group_size=(1,),
-      )
+    self.generate_candidates(poses, qvel)
 
     # 1b. Equality assembly kernel (joint/connect; weld reserved as zeros).
     # Writes equality J into workspace_J rows [0, n_eq_rows) and R/ar into

@@ -156,6 +156,7 @@ class MetalSimulation:
         else None
     )
     self._transmissions = None
+    self._actuators = None
     self._tendons = None
     self._tendon_damping = None
     self._passive = None
@@ -170,8 +171,14 @@ class MetalSimulation:
     if is_integrated:
       plan = profile.execution_plan
       if plan.is_stage_enabled("actuation"):
-        from mujoco_metal.transmissions import MetalTransmissions
-        self._transmissions = MetalTransmissions(model)
+        from mujoco_metal.stateful_actuation import ActuatorModel
+        from mujoco_metal.stateful_actuation import MetalActuators
+        actuator_meta = ActuatorModel(model)
+        if actuator_meta.needs_general_path:
+          self._actuators = MetalActuators(model, batch_size)
+        else:
+          from mujoco_metal.transmissions import MetalTransmissions
+          self._transmissions = MetalTransmissions(model)
       if plan.is_stage_enabled("fixed_tendons"):
         from mujoco_metal.tendons import MetalFixedTendonDynamics
         self._tendons = MetalFixedTendonDynamics(model, batch_size)
@@ -326,6 +333,16 @@ class MetalSimulation:
     self._next_qacc = torch.empty_like(self._state._qacc)
     self._next_time = torch.empty_like(self._state._time)
     self._next_status = torch.empty_like(self._state._status)
+    na = int(getattr(self._state, "_na", 0))
+    nu = int(model.nu)
+    if na > 0 and self._actuators is None:
+      raise ValueError("activation state requires the general actuator stage")
+    self._act_dot = torch.zeros(
+        (batch_size, max(na, 1)), dtype=torch.float32, device=self._state._device)
+    self._act_vel = torch.zeros(
+        (batch_size, max(nu, 1)), dtype=torch.float32, device=self._state._device)
+    self._next_act = (torch.empty_like(self._state._act)
+                      if na > 0 else None)
     if "rk4" in profile.name:
       from mujoco_metal.runge_kutta import MetalRungeKutta
 
@@ -420,11 +437,11 @@ class MetalSimulation:
     return gen
 
   def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
-            mocap_pos=None, mocap_quat=None):
+            mocap_pos=None, mocap_quat=None, act=None):
     """Reset selected worlds, clear held per-call inputs, invalidate cache."""
     gen = self._state.reset(
         env_ids=env_ids, qpos=qpos, qvel=qvel, eq_active=eq_active,
-        mocap_pos=mocap_pos, mocap_quat=mocap_quat,
+        mocap_pos=mocap_pos, mocap_quat=mocap_quat, act=act,
     )
     self._clear_held_inputs(env_ids)
     if hasattr(self, "_last_coupled"):
@@ -459,10 +476,17 @@ class MetalSimulation:
     key_time = float(np.asarray(model.key_time).reshape(int(model.nkey))[key_id])
     if not np.isfinite(key_time) or key_time < 0:
       raise ValueError("keyframe time must be finite and nonnegative")
+    na = int(model.na)
+    if na:
+      key_act = np.asarray(model.key_act).reshape(int(model.nkey), na)[key_id]
+      if not np.all(np.isfinite(np.asarray(key_act, dtype=np.float32))):
+        raise ValueError("keyframe act must be finite float32")
+    else:
+      key_act = None
     # Validate key payloads through the same paths as reset before mutating.
     gen = self._state.reset(
         env_ids=env_ids, qpos=key_qpos, qvel=key_qvel,
-        mocap_pos=key_mpos, mocap_quat=key_mquat,
+        mocap_pos=key_mpos, mocap_quat=key_mquat, act=key_act,
     )
     # mj_resetDataKeyframe sets time after _resetData; mirror per selected world.
     if env_ids is None:
@@ -546,6 +570,9 @@ class MetalSimulation:
     if getattr(self._state, "_nmocap", 0) > 0:
       entries.append({"name": "state.mocap_pos", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._state._nmocap}, 3)", "dtype": "float32"})
       entries.append({"name": "state.mocap_quat", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._state._nmocap}, 4)", "dtype": "float32"})
+    if getattr(self._state, "_na", 0) > 0:
+      entries.append({"name": "state.act", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._state._na})", "dtype": "float32"})
+      entries.append({"name": "act_dot", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._na})", "dtype": "float32"})
     if self._euler_solver is not None:
       entries.append({"name": "effective_mass", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._model.nv}, {self._state._model.nv})", "dtype": "float32"})
     if self._coupled_constraints is not None:
@@ -639,6 +666,8 @@ class MetalSimulation:
       dynamics["mass_matrix"].add_(tendon_armature)
     if self._transmissions is not None:
       rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
+    if self._actuators is not None:
+      rhs.add_(self._actuation_force(qpos, qvel, dynamics["poses"]))
     if self._motor is not None:
       rhs.add_(self._motor.run_device(self._control))
     eq_active = getattr(state, "_eq_active", None)
@@ -743,6 +772,43 @@ class MetalSimulation:
       raise ValueError("ctrl must be finite and representable as float32")
     self._control.copy_(torch.tensor(array, device=self._state._device))
 
+  def _actuation_force(self, qpos, qvel, poses):
+    """General actuator force stage with pinned mj_fwdActuation ordering.
+
+    Runs candidate-contact generation first when BODY adhesion transmissions
+    exist (same-step contacts, mirroring mj_fwdPosition order), then
+    transmission kinematics, gravity-compensation routing, and the fused
+    dynamics/force kernel. Stashes per-step act_dot/velocity for the
+    activation advance. Returns borrowed MPS qfrc_actuator.
+    """
+    actuators = self._actuators
+    state = self._state
+    contacts = None
+    if actuators.meta.has_body_transmission:
+      if self._coupled_constraints is None:
+        raise ValueError("BODY transmissions require the coupled constraint stage")
+      self._coupled_constraints._constants["body_dims"][3] = actuators.meta.nu
+      self._coupled_constraints.generate_candidates(poses, qvel)
+      contacts = self._coupled_constraints.contact_buffers()
+    kin = actuators.run_kinematics(qpos, qvel, poses, contacts)
+    gravcomp = None
+    if self._passive is not None and bool(
+        np.any(np.asarray(actuators.meta.jnt_actgravcomp))):
+      gravcomp = self._passive.gravcomp_device(
+          qpos, getattr(state, "_mpos", None), getattr(state, "_mquat", None))
+    act = getattr(state, "_act", None)
+    if actuators.meta.na > 0 and act is None:
+      raise ValueError("activation state is missing")
+    out = actuators.run_forces(self._control, act, kin, gravcomp)
+    na, nu = actuators.meta.na, actuators.meta.nu
+    if na > 0:
+      self._act_dot.copy_(out["act_dot"].reshape(self._act_dot.shape))
+    if nu > 0:
+      self._act_vel.copy_(kin["velocity"].reshape(self._act_vel.shape))
+    if actuators.meta.nv == 0:
+      return self._state._torch.zeros_like(self._rhs)
+    return out["qfrc"].reshape(self._rhs.shape)
+
   def _acceleration(self, qpos, qvel):
     mpos = getattr(self._state, "_mpos", None)
     mquat = getattr(self._state, "_mquat", None)
@@ -772,6 +838,8 @@ class MetalSimulation:
       dynamics["mass_matrix"].add_(tendon_armature)
     if self._transmissions is not None:
       self._rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
+    if self._actuators is not None:
+      self._rhs.add_(self._actuation_force(qpos, qvel, dynamics["poses"]))
     if self._motor is not None:
       self._rhs.add_(self._motor.run_device(self._control))
     acceleration, status = self._solver.run_device(
@@ -919,6 +987,8 @@ class MetalSimulation:
       self._next_qvel.copy_(qvel)
       self._next_time.copy_(time)
       self._next_status.copy_(status)
+      if self._actuators is not None and getattr(state, "_na", 0) > 0:
+        self._advance_activations(state)
 
       # Ping-pong owned tensors keep live state disjoint from borrowed stage
       # outputs and make each new current-state reference safe for the next
@@ -928,5 +998,25 @@ class MetalSimulation:
       state._qacc, self._next_qacc = self._next_qacc, state._qacc
       state._time, self._next_time = self._next_time, state._time
       state._status, self._next_status = self._next_status, state._status
+      if self._actuators is not None and getattr(state, "_na", 0) > 0:
+        state._act, self._next_act = self._next_act, state._act
       state._generation += 1
     return state._status
+
+  def _advance_activations(self, state):
+    """Advance activation state with pinned mj_nextActivation semantics.
+
+    Skipped under mjDSBL_ACTUATION (pinned advance guard). Failed worlds keep
+    their previous activation, matching the qpos/qvel rollback contract.
+    """
+    import mujoco as _mj
+    torch = state._torch
+    if int(self._mjmodel.opt.disableflags) & int(_mj.mjtDisableBit.mjDSBL_ACTUATION):
+      return
+    new_act = self._actuators.advance(state._act, self._act_dot, self._act_vel)
+    torch.where(
+        self._success.unsqueeze(1),
+        new_act,
+        state._act,
+        out=self._next_act,
+    )

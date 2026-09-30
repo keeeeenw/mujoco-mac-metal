@@ -417,9 +417,14 @@ def validate_stepping_profile(
       supported_list.append("native per-environment mocap bodies and inputs")
 
     if model.nu > 0:
-      from mujoco_metal.transmissions import TransmissionModel
-      TransmissionModel(model)
-      supported_list.append("stateless scalar actuators and transmissions")
+      from mujoco_metal.stateful_actuation import ActuatorModel
+      actuator_model = ActuatorModel(model)
+      if actuator_model.needs_general_path:
+        supported_list.append(
+            "full-family actuators: stateful activation, muscle/DC-motor, "
+            "non-scalar gears, slider-crank/site/body transmissions, limits, gravcomp routing")
+      else:
+        supported_list.append("stateless scalar actuators and transmissions")
     if model.ntendon > 0:
       from mujoco_metal.tendons import FixedTendonModel
       FixedTendonModel(model)
@@ -469,7 +474,8 @@ def validate_stepping_profile(
             "flex/deformable elements",
             "MuJoCo plugins",
             "spatial/wrapping tendons, tendon limits, and tendon frictionloss",
-            "non-scalar/non-fixed-tendon actuators, activation state, and muscles",
+            "user-callback actuators, actuator delay/history, armature/damping "
+            "(owned by milestones 015/019)",
             "non-primitive collision geoms (supported: plane, sphere, capsule, box)",
             "sleep mode",
             "non-Euler integrators",

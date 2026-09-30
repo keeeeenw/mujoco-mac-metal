@@ -84,9 +84,11 @@ class StateSnapshot:
   nmocap: int = 0
   mpos: np.ndarray | None = None
   mquat: np.ndarray | None = None
+  nact: int = 0
+  act: np.ndarray | None = None
 
   def __post_init__(self):
-    if self.schema_version not in (1, 2, 3):
+    if self.schema_version not in (1, 2, 3, 4):
       raise ValueError("unsupported state snapshot schema")
     if self.batch_size <= 0 or self.nq < 0 or self.nv < 0 or self.neq < 0:
       raise ValueError("invalid state snapshot dimensions")
@@ -122,11 +124,15 @@ class StateSnapshot:
         raise ValueError("schema 1 snapshots must not carry equality activity")
       if self.nmocap != 0 or self.mpos is not None or self.mquat is not None:
         raise ValueError("schema 1 snapshots must not carry mocap poses")
+      if self.nact != 0 or self.act is not None:
+        raise ValueError("schema 1 snapshots must not carry activation state")
       object.__setattr__(self, "neq", 0)
       object.__setattr__(self, "eq_active", None)
       object.__setattr__(self, "nmocap", 0)
       object.__setattr__(self, "mpos", None)
       object.__setattr__(self, "mquat", None)
+      object.__setattr__(self, "nact", 0)
+      object.__setattr__(self, "act", None)
     else:
       if self.neq < 0:
         raise ValueError("invalid equality dimensions")
@@ -149,6 +155,10 @@ class StateSnapshot:
         object.__setattr__(self, "nmocap", 0)
         object.__setattr__(self, "mpos", None)
         object.__setattr__(self, "mquat", None)
+        if self.nact != 0 or self.act is not None:
+          raise ValueError("schema 2 snapshots must not carry activation state")
+        object.__setattr__(self, "nact", 0)
+        object.__setattr__(self, "act", None)
       else:
         if self.nmocap < 0:
           raise ValueError("invalid mocap dimensions")
@@ -177,6 +187,23 @@ class StateSnapshot:
               self, "mquat",
               np.frombuffer(quat.tobytes(), dtype=np.float32).reshape(
                   (batch, self.nmocap, 4)),
+          )
+      # Activation state (schema 4). Schemas <4 never carry it.
+      if self.schema_version < 4:
+        if self.nact != 0 or self.act is not None:
+          raise ValueError(f"schema {self.schema_version} snapshots must not carry activation state")
+        object.__setattr__(self, "nact", 0)
+        object.__setattr__(self, "act", None)
+      else:
+        if self.nact < 0:
+          raise ValueError("invalid activation dimensions")
+        if self.nact == 0:
+          if self.act is not None:
+            raise ValueError("snapshots without activation state must not carry act")
+          object.__setattr__(self, "act", None)
+        else:
+          object.__setattr__(
+              self, "act", _freeze_float32(self.act, (batch, self.nact), "act")
           )
 
 
@@ -338,7 +365,27 @@ class DeviceState:
     else:
       self._mpos = None
       self._mquat = None
+    # Activation state: MuJoCo zeroes act on reset; keyframes override.
+    if isinstance(model, mujoco.MjModel):
+      self._na = int(model.na)
+    else:
+      self._na = 0
+    if self._na > 0:
+      init_act = np.zeros((self.batch_size, self._na), dtype=np.float32)
+      self._act = torch.as_tensor(init_act, dtype=torch.float32, device=self._device).clone()
+    else:
+      self._act = None
     self._generation = 0
+
+  @property
+  def na(self):
+    return self._na
+
+  @property
+  def act(self):
+    if self._act is None:
+      return None
+    return self._act.detach().clone()
 
   @property
   def nmocap(self):
@@ -630,7 +677,7 @@ class DeviceState:
     return self._generation
 
   def copy_environment(self, src, dst):
-    """Copy every state row (qpos/qvel/qacc/time/status/eq/mocap) src -> dst."""
+    """Copy every state row (qpos/qvel/qacc/time/status/eq/mocap/act) src -> dst."""
     for name, value in (("src", src), ("dst", dst)):
       raw = np.asarray(value)
       if raw.shape != () or raw.dtype.kind not in "iu":
@@ -653,17 +700,23 @@ class DeviceState:
       pos[dst_i] = self._mpos[src_i]
       quat[dst_i] = self._mquat[src_i]
       self._mpos, self._mquat = pos, quat
+    if self._act is not None:
+      act_t = self._act.clone()
+      act_t[dst_i] = self._act[src_i]
+      self._act = act_t
     self._generation += 1
     return self._generation
 
   def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
-            mocap_pos=None, mocap_quat=None):
+            mocap_pos=None, mocap_quat=None, act=None):
     """Reset selected rows atomically from checked host arrays or model defaults.
 
     `eq_active=None` restores compiled defaults for selected worlds; pass an
     explicit `(neq,)` or `(len(env_ids), neq)` boolean/integer array to override.
     `mocap_pos`/`mocap_quat=None` restore compiled reference frames; pass
     explicit `(nmocap, 3/4)` or `(len(env_ids), nmocap, 3/4)` arrays to override.
+    `act=None` zeroes activation state for selected worlds; pass explicit
+    `(na,)` or `(len(env_ids), na)` arrays to override.
     Unselected worlds keep their activity. Validation is atomic.
     """
     ids = self._env_ids(env_ids)
@@ -726,6 +779,18 @@ class DeviceState:
           raise ValueError(
               f"eq_active must have shape ({self._neq},) or ({count}, {self._neq}), got {arr.shape}"
           )
+    if self._na == 0:
+      if act is not None:
+        raise ValueError("model has no activation state")
+      act_checked = None
+    else:
+      if act is None:
+        act_checked = np.zeros((count, self._na), dtype=np.float32)
+      else:
+        arr = np.asarray(act)
+        if arr.shape == (self._na,):
+          arr = np.broadcast_to(arr, (count, self._na)).copy()
+        act_checked = self._host_values(arr, (count, self._na), "act")
 
     index = self._torch.as_tensor(ids, dtype=self._torch.int64, device=self._device)
     pos_tensor = self._torch.as_tensor(
@@ -769,12 +834,18 @@ class DeviceState:
           0, index,
           self._torch.as_tensor(mocap_checked[1], dtype=self._torch.float32, device=self._device))
       self._mpos, self._mquat = next_pos, next_quat
+    if self._na > 0:
+      next_act = self._act.clone()
+      next_act.index_copy_(
+          0, index,
+          self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device))
+      self._act = next_act
     self._generation += 1
     return self._generation
 
   def snapshot(self):
     """Copy all state to an immutable host checkpoint outside the step loop."""
-    if self._neq == 0 and self._nmocap == 0:
+    if self._neq == 0 and self._nmocap == 0 and self._na == 0:
       return StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
@@ -791,7 +862,7 @@ class DeviceState:
         neq=0,
         eq_active=None,
       )
-    if self._nmocap == 0:
+    if self._nmocap == 0 and self._na == 0:
       return StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
@@ -808,7 +879,8 @@ class DeviceState:
         neq=self._neq,
         eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
       )
-    return StateSnapshot(
+    if self._na == 0:
+      return StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
         timestep=self.profile.timestep,
@@ -827,12 +899,33 @@ class DeviceState:
         mpos=self._mpos.detach().cpu().numpy(),
         mquat=self._mquat.detach().cpu().numpy(),
     )
+    return StateSnapshot(
+        model_fingerprint=self._model_fingerprint,
+        profile_fingerprint=self._profile_fingerprint,
+        timestep=self.profile.timestep,
+        nq=self._model.nq,
+        nv=self._model.nv,
+        batch_size=self.batch_size,
+        qpos=self._qpos.detach().cpu().numpy(),
+        qvel=self._qvel.detach().cpu().numpy(),
+        qacc=self._qacc.detach().cpu().numpy(),
+        time=self._time.detach().cpu().numpy(),
+        status=self._status.detach().cpu().numpy(),
+        schema_version=4,
+        neq=self._neq,
+        eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
+        nmocap=self._nmocap,
+        mpos=self._mpos.detach().cpu().numpy() if self._nmocap else None,
+        mquat=self._mquat.detach().cpu().numpy() if self._nmocap else None,
+        nact=self._na,
+        act=self._act.detach().cpu().numpy(),
+    )
 
   def restore(self, snapshot):
     """Restore a matching checkpoint only after validating every field."""
     if not isinstance(snapshot, StateSnapshot):
       raise TypeError("snapshot must be a StateSnapshot")
-    if snapshot.schema_version not in (1, 2, 3):
+    if snapshot.schema_version not in (1, 2, 3, 4):
       raise ValueError("unsupported state snapshot schema")
     if (
         snapshot.model_fingerprint != self._model_fingerprint
@@ -861,7 +954,7 @@ class DeviceState:
       )
     # Mocap compatibility: never silently lose prescribed poses.
     if self._nmocap == 0:
-      if snapshot.schema_version == 3 and (
+      if snapshot.schema_version >= 3 and (
           snapshot.nmocap != 0 or snapshot.mpos is not None or snapshot.mquat is not None
       ):
         raise ValueError("snapshot mocap dimensions do not match")
@@ -877,6 +970,23 @@ class DeviceState:
       mocap_checked = self._checked_mocap_pair(
           snapshot.mpos, snapshot.mquat, self.batch_size
       )
+    # Activation compatibility: never silently lose activation state.
+    if self._na == 0:
+      if snapshot.schema_version >= 4 and (
+          snapshot.nact != 0 or snapshot.act is not None
+      ):
+        raise ValueError("snapshot activation dimensions do not match")
+      act_checked = None
+    else:
+      if snapshot.schema_version < 4:
+        raise ValueError(
+            "snapshot schema <4 has no activation state; refusing to restore "
+            "into a model with activation state (would silently lose act)"
+        )
+      if snapshot.nact != self._na:
+        raise ValueError("snapshot activation dimensions do not match")
+      act_checked = self._host_values(
+          snapshot.act, (self.batch_size, self._na), "act")
     qpos = self._validate_qpos(
         self._host_values(snapshot.qpos, (self.batch_size, self._model.nq), "qpos")
     )
@@ -914,6 +1024,8 @@ class DeviceState:
     if self._nmocap > 0:
       self._mpos = self._torch.as_tensor(mocap_checked[0], dtype=self._torch.float32, device=self._device)
       self._mquat = self._torch.as_tensor(mocap_checked[1], dtype=self._torch.float32, device=self._device)
+    if self._na > 0:
+      self._act = self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device)
     self._generation += 1
     return self._generation
 
