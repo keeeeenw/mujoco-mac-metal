@@ -19,10 +19,16 @@ available alongside the optional package.
   per-step host state readback, per-world failure handling, selected-row reset,
   and checkpoint ownership/restore. Host-side lifecycle utilities also cover
   model-constant recomputation and invalidation.
-- **Independent qualification:** 402 native GPU tests and 175 CPU-only tests passed
-  on an M1 Max with 32 GB unified memory. The final contact-friction assertion
-  update also passed 19 focused GPU tests. These are bounded physics checks;
-  [qualification details](metal/DEVELOPMENT.md) identify the tested revisions.
+- **Expanded source coverage:** connect/weld equalities with runtime activation,
+  per-environment mocap and keyframe/state restoration, stateful actuator families,
+  spatial tendons with wrapping and site-only armature bias, and ball-joint limits.
+  These features extend the bounded integrated Euler profile; they do not imply
+  full MuJoCo compatibility.
+- **Qualification:** **518 native GPU tests passed** in the recorded physics
+  qualification, and **211 CPU tests passed** in the final publication check
+  (304 GPU-dependent checks skipped in the no-Torch environment). See the
+  [validation results and limits](metal/QUALIFICATION.md) for test scope,
+  reproducibility and outstanding checks.
 - **Forces and controls:** explicit generalized-force and linear-damping support,
   plus bounded hinge/slide motors with clipping and disable flags. Separate
   profiles preserve the original unforced baseline.
@@ -82,8 +88,8 @@ See [installation and diagnostics](metal/INSTALL.md) for requirements and status
 We built these demos to explore Metal physics on the Mac—give them a try!
 Each guide includes runnable commands and an independent CPU MuJoCo comparison.
 Use the current `main` checkout and the [demo/source setup](metal/INSTALL.md#development-source).
-Spin-and-Grip, the parcel sorter and the marble music machine require this source
-installation; installing the published 0.4.0 wheel alone is insufficient.
+The integrated demos below, including the new crane, gripper and drawbridge,
+require this source installation; the published 0.4.0 wheel is insufficient.
 The repository contains the scripts, models and GIFs; the wheel contains the
 physics package and its shaders.
 
@@ -92,6 +98,43 @@ execution speed. Rendering uses MuJoCo OpenGL. Most examples offer headless
 checks and GIF recording; interactive viewing is documented where available.
 The [compact gallery](metal/examples/demo_gallery.md) maps each demo to its
 physics capability.
+
+### [Muscle-powered gripper](metal/examples/muscle_gripper.md)
+
+A three-sided gripper delivers a ball into a bin and places a second ball on a
+pedestal, exercising stateful actuation and contact-rich manipulation. The guide
+reports both successful behavior and numerical comparison boundaries.
+
+![Muscle gripper: native Metal beside CPU MuJoCo](metal/examples/assets/muscle_gripper.gif)
+
+### [Cable drawbridge](metal/examples/cable_drawbridge.md)
+
+A winch hauls, releases and re-tensions a routed cable around a cylindrical
+bollard and pulley, lifting a deck and its payload. This demonstrates spatial
+tendon wrapping, spring/damping forces and a stateful actuator.
+
+![Cable drawbridge: native Metal beside CPU MuJoCo](metal/examples/assets/cable_drawbridge.gif)
+
+### [Magnetic crane](metal/examples/magnetic_crane.md)
+
+A prescribed mocap hook carries welded cargo and releases it into a bin,
+combining mocap inputs, runtime equality activation and keyframe reset.
+
+![Magnetic crane: native Metal beside CPU MuJoCo](metal/examples/assets/magnetic_crane.gif)
+
+### [Latch-and-release cargo bridge](metal/examples/cargo_bridge.md)
+
+Two connected deck sections release a weld brace and tip a payload into a tray,
+exercising coupled connect/weld constraints and contact dynamics.
+
+![Cargo bridge: native Metal beside CPU MuJoCo](metal/examples/assets/cargo_bridge.gif)
+
+### [Suspension platform](metal/examples/suspension_platform.md)
+
+A cable-supported platform and payload exercise tendon constraints and
+ball-joint limits. See the guide for the bounded configuration and comparison.
+
+![Suspension platform: native Metal beside CPU MuJoCo](metal/examples/assets/suspension_platform.gif)
 
 ### [Clockwork parcel sorter](metal/examples/clockwork_parcel_sorter.md)
 
@@ -195,26 +238,33 @@ The optional package targets Python 3.12, MuJoCo **3.10.0** and Torch **2.9.1**;
 use its isolated installation instructions rather than treating the newer
 surrounding MuJoCo source version as the qualified runtime.
 
-Version **0.4.0** supports bounded Euler, RK4/implicitfast, passive and fluid forces, fixed-tendon
-servos, sensor queries, sphere contact and joint-constraint profiles, each with
-explicit guards. Current `main` adds independently qualified integrated Euler,
-primitive manifolds and expanded friction; these source features have not shipped
-in a new PyPI release. Integrated stepping is bounded to 32 velocities, 16 candidate
-pairs, 24 contact slots and 96 constraint rows. Connect/weld equalities and runtime
-equality activation are not implemented yet. Remaining
-contact/constraint families, stateful actuation, spatial tendons,
-geom-level fluid models, full implicit integration and broader sensors/model/API coverage still need
-implementation and qualification. Native rendering and training integration
-remain outside the implemented scope. Per-environment model randomization is not connected to
-native stepping. Linux/CUDA integration and other Apple hardware/OS combinations
-have not been validated for this Metal package. Full upstream-core and
-single-precision compatibility are not established.
+Version **0.4.0** contains earlier bounded profiles. Current `main` additionally
+includes integrated primitive contact/friction, connect/weld and tendon
+constraints, equality activation, mocap/keyframe support, stateful actuation,
+spatial tendon wrapping, site-only tendon armature and ball-joint limits.
+These additions require a source installation and have not been released to PyPI.
 
-Next milestones extend collision geometry and coupled constraints, actuator
-state and spatial tendons, full implicit integration, and remaining sensor and
-model/API behavior. RL integration and broader Mac hardware validation are
-deferred. See the [development coverage](metal/DEVELOPMENT.md) for the current
-qualified subsets; the pendulum timing results do not qualify the new profiles.
+Integrated stepping remains bounded to **32 velocities, 16 candidate pairs,
+24 contact slots and 96 constraint rows**. Contacts cover planes, spheres,
+capsules and boxes. Cylinder and ellipsoid **collision support is still in
+progress and is not included on main**; cylinder tendon wrapping is a
+separate supported operation. Mesh, heightfield and SDF contacts, flex/deformables,
+no-slip solving, full implicit integration, and remaining sensor/model/API
+features still need implementation or qualification. Wrapped tendon armature
+remains unsupported. Sensor queries do not reproduce every stored step-stage
+sensor timing behavior.
+
+The closeout has source-level shader inventory checks; built-wheel content
+validation for these new features is still pending. Interactive viewer validation
+requires a display and remains a separate qualification step. Native rendering,
+RL training integration, robot deployment, Linux/CUDA integration and broad Mac
+hardware/OS validation remain outside this qualification. Per-environment model
+randomization is not connected to native stepping. No new speedup is claimed.
+
+Next work completes collision geometry, solver/integrator coverage, sensors,
+model/API behavior and scalable workspaces. See the
+[development coverage](metal/DEVELOPMENT.md) and
+[pinned support inventory](metal/COVERAGE.md) for exact feature boundaries.
 See the [API contracts](metal/API.md) and [Apple Silicon FAQ](metal/FAQ.md)
 for usage details and common questions.
 

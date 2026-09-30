@@ -7,11 +7,10 @@ this file contains the generated output verbatim between the markers. Change
 the contract in `registry.py`, regenerate, and paste the result here.
 
 ```sh
-./run --cpu python -m mujoco_metal coverage
+PYTHONPATH=metal python -m mujoco_metal coverage
 ```
 
-Owner milestones `006`–`020` are defined in the full-coverage roadmap; each
-owns the implementation and qualification of its rows. `baseline`/`004` rows
+Owner milestone identifiers track implementation and qualification groups. `baseline`/`004` rows
 are implemented; `out-of-scope` rows are explicit project exclusions (RL/PPO,
 deployment targets, broad hardware testing, extra MuJoCo versions, Metal
 renderer), not future physics work.

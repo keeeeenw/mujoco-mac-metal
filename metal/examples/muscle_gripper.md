@@ -44,7 +44,7 @@ Launch the interactive viewer on a Mac (requires a display; headless
 verification uses `--headless --check` plus the GIF below):
 
 ```bash
-./run mjpython metal/examples/muscle_gripper.py --steps 2700
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples mjpython metal/examples/muscle_gripper.py --steps 2700
 ```
 
 Add `--viewer-seconds 20` to auto-close after 20 s of wall time for explicit
@@ -70,9 +70,5 @@ Measured results on the qualified palm-cage run (MuJoCo 3.10.0, native
 - Full-run native/CPU parity on focused actuator fixtures (see milestone 007
   report): integrator/filter/filter-exact qpos `1.6e-07`, muscle `2e-03`.
 
-Superseded gap (preserved in the private archive): the pre-palm-cage
-friction-only pinch diverged during the contact-rich carry (GPU ejected the
-first ball; `results/milestone-007/failures/gpu-demo-divergence.log`). The
-palm contact cage (three-sided grasp) resolved the chaos: CPU ±2 mm
-perturbations now deliver identically. The demo is CPU- and
-natively qualified; `assets/muscle_gripper.gif` shows the passing run.
+The qualified scene uses a three-sided palm cage. These results do not establish
+reliable friction-only pinch grasps or arbitrary manipulation trajectories.

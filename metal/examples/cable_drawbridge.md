@@ -40,7 +40,7 @@ Launch the interactive viewer on a Mac (requires a display; headless
 verification uses `--headless --check` plus the GIF above):
 
 ```bash
-./run mjpython metal/examples/cable_drawbridge.py --steps 1400
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples mjpython metal/examples/cable_drawbridge.py --steps 1400
 ```
 
 Add `--viewer-seconds 20` to auto-close after 20 s of wall time for explicit

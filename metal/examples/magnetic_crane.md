@@ -38,7 +38,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examp
 Launch the interactive viewer on a Mac:
 
 ```bash
-./run mjpython metal/examples/magnetic_crane.py --steps 900
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples mjpython metal/examples/magnetic_crane.py --steps 900
 ```
 
 ![Magnetic crane](assets/magnetic_crane.gif)

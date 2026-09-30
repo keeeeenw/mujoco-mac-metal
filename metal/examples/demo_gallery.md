@@ -21,6 +21,9 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Clockwork parcel sorter](clockwork_parcel_sorter.md) | Real box parcels, capsule rollers, and swinging diverter gates routing parcels to bins | Complete primitive collisions: multi-contact manifolds across planes, spheres, capsules, boxes, coupled Euler solve |
 | [Latch-and-release cargo bridge](cargo_bridge.md) | Two deck sections joined by a connect constraint unlatch a weld brace and spill a payload into a tray | Connect/weld equalities with per-environment activation, coupled contact solve |
 | [Magnetic crane](magnetic_crane.md) | A mocap hook carries a welded cargo box to a bin and releases it | Per-environment mocap inputs, weld attach/release, keyframe reset |
+| [Muscle-powered gripper](muscle_gripper.md) | Palm-cage grasp, bin delivery and pedestal placement | Stateful actuation and contact-rich manipulation |
+| [Cable drawbridge](cable_drawbridge.md) | A routed cable hauls, goes slack and re-tensions a loaded deck | Spatial tendon wrapping, pulley division and spring/damping forces |
+| [Suspension platform](suspension_platform.md) | A suspended platform and payload | Tendon constraints and ball-joint limits |
 | [Chaotic pendulum](README.md) | Four connected arms swing and tumble | Generalized rigid-body mass and bias |
 
 Use current `main` and the [demo/source setup](../INSTALL.md#development-source).

@@ -38,7 +38,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examp
 Launch the interactive viewer on a Mac:
 
 ```bash
-./run mjpython metal/examples/cargo_bridge.py --steps 900
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples mjpython metal/examples/cargo_bridge.py --steps 900
 ```
 
 ![Latch-and-release cargo bridge](assets/cargo_bridge.gif)

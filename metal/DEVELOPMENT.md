@@ -21,6 +21,19 @@ Tests ran on an M1 Max with 32 GB unified memory. Numerical
 qualification is separate from performance qualification: the older pendulum
 benchmark has not been rerun for the additional profiles.
 
+## Current source capabilities
+
+Current source adds connect/weld activation, mocap/keyframe lifecycle,
+stateful actuation, spatial tendon wrapping and site-only armature bias, tendon
+constraint rows and ball-joint limits.
+
+The recorded native qualification passed **518 GPU tests**, including the
+gripper and drawbridge headless checks. The final no-Torch publication check
+passed **211 tests, 304 skipped**. The GPU suite was not repeated for the
+publication check, and no new performance measurements were taken.
+[Validation results and reproducibility](QUALIFICATION.md) describe the scope
+of these results. Cylinder/ellipsoid collision support remains in development.
+
 ## Qualified increments
 
 | Capability | Explicit simulation profile | Evidence and creative demo |
@@ -58,8 +71,8 @@ The pipeline consists of ten sequential integration stages plus an explicit on-d
 1. `smooth_dynamics`: Forward kinematics, body inertias, CRBA generalized mass matrix, and bias forces.
 2. `passive_forces`: Joint springs, polynomial damping, gravity compensation, and Cartesian body wrenches.
 3. `fluid_forces`: Inertia-box fluid drag, viscosity, and wind forces.
-4. `fixed_tendons`: Fixed-joint tendon lengths, Jacobian, spring/damping forces, and tendon armature matrix.
-5. `actuation`: Stateless scalar motor actuators and transmissions with `ctrlrange` clipping.
+4. Tendon stages: fixed-joint and spatial tendon kinematics, spring/damping forces, armature mass and site-only armature bias; wrapped armature remains rejected.
+5. `actuation`: Integrated stateful actuator dynamics and supported rigid/spatial-tendon transmissions, with clipping and disable-flag semantics; separate legacy profiles retain their narrower contracts.
 6. `smooth_assembly`: Aggregates unconstrained forces and tendon armature.
 7. `unconstrained_solve`: Unconstrained acceleration solve $M \hat{a} = \tau_{\text{smooth}}$.
 8. `coupled_constraints`: Unified Delassus projected solve simultaneously coupling complete primitive collision manifolds across planes, spheres, capsules, and boxes (condim 1/3/4/6 with pyramidal or elliptic cones), scalar joint limits, dry frictionloss, and joint/connect/weld equality constraints (1/3/6 rows per equality with explicit `eq_rowadr`/`eq_rownum` spans, body-body/body-world/site-site forms, pinned weld quaternion error with `torquescale`, per-step Metal assembly with Jdot correction, persistent per-environment `eq_active` masks). Pyramidal contacts allocate dimension-dependent edge rows; elliptic contacts solve normal, slide, torsion and rolling components in a coupled block.
@@ -214,13 +227,14 @@ These measured errors describe the fixtures, not universal tolerances.
 
 ## Still required for full coverage
 
-Remaining work includes wider collision geometry, friction and constraint
-families, warm starting and solver settings, spatial/wrapped tendon dynamics,
-stateful and muscle actuators, geom-level fluid/lift models, full implicit and wider velocity derivatives, remaining sensor
-families and exact stage/history semantics, mocap, flex, plugins, mutable model
-and broader API behavior. Each needs its own source-derived implementation,
-negative capability guards and CPU-reference numerical qualification. A small
-working contact or sensor subset does not complete these categories.
+Remaining work includes cylinder/ellipsoid, mesh, heightfield and SDF collision,
+additional solver settings and warm starting/no-slip, geom-level fluid/lift,
+full implicit integration and wider velocity derivatives, remaining sensors and
+exact stage/history semantics, flex, plugins and broader model/API behavior.
+Integrated source now includes stateful/muscle actuation, mocap and the bounded
+spatial-tendon features described above; their unimplemented combinations remain
+explicitly guarded (including wrapped tendon armature). The support inventory
+identifies the admitted families without claiming arbitrary combinations.
 
 RL integration and validation on other Mac hardware are deferred. No new
 speedup claim follows from the feature checks here.
