@@ -25,10 +25,12 @@ class FixedTendonModel:
 
   Tendon lengths use the MuJoCo 3.10 definition, ``sum(coef * qpos)``. Spatial
   wraps, tendon limits/friction, actuator-inherited armature/damping, and other
-  passive subsystems are rejected explicitly.
+  passive subsystems are rejected explicitly. With ``spatial_ok=True`` (mixed
+  pipeline use only), site-led spatial paths produce zero rows here instead of
+  raising; the spatial stage owns those tendon ids.
   """
 
-  def __init__(self, model):
+  def __init__(self, model, spatial_ok=False):
     if mujoco.__version__ != "3.10.0":
       raise RuntimeError(f"fixed tendon lowering requires MuJoCo 3.10.0; found {mujoco.__version__}")
     if not isinstance(model, mujoco.MjModel):
@@ -42,21 +44,35 @@ class FixedTendonModel:
       raise ValueError("actuator-inherited tendon armature is unsupported")
     if np.any(np.asarray(model.actuator_damping) != 0) or np.any(np.asarray(model.actuator_dampingpoly) != 0):
       raise ValueError("actuator-inherited tendon damping is unsupported")
-    if np.any(np.asarray(model.tendon_limited)):
+    if np.any(np.asarray(model.tendon_limited)) and not spatial_ok:
       raise ValueError("tendon limits are unsupported")
-    if np.any(np.asarray(model.tendon_frictionloss) != 0):
+    if np.any(np.asarray(model.tendon_frictionloss) != 0) and not spatial_ok:
       raise ValueError("tendon friction loss is unsupported")
-    if np.any(np.asarray(model.tendon_actfrclimited)):
+    if np.any(np.asarray(model.tendon_actfrclimited)) and not spatial_ok:
       raise ValueError("tendon actuator-force limits are unsupported")
 
     hinge, slide = int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)
     wrap_joint = int(mujoco.mjtWrap.mjWRAP_JOINT)
+    wrap_site = int(mujoco.mjtWrap.mjWRAP_SITE)
+    wrap_pulley = int(mujoco.mjtWrap.mjWRAP_PULLEY)
+    wrap_sphere = int(mujoco.mjtWrap.mjWRAP_SPHERE)
+    wrap_cyl = int(mujoco.mjtWrap.mjWRAP_CYLINDER)
     length_map = np.zeros((self.ntendon, self.nq), dtype=np.float64)
     moment_map = np.zeros((self.ntendon, self.nv), dtype=np.float64)
     for tendon in range(self.ntendon):
       start, count = int(model.tendon_adr[tendon]), int(model.tendon_num[tendon])
       if count <= 0:
         raise ValueError("tendons must contain at least one fixed joint wrap")
+      first = int(model.wrap_type[start])
+      if first != wrap_joint:
+        if not spatial_ok:
+          raise ValueError("only fixed tendons made of joint wraps are supported")
+        # Spatial path: zero rows here; the spatial stage owns this tendon.
+        for wrap in range(start, start+count):
+          if int(model.wrap_type[wrap]) not in (
+              wrap_site, wrap_pulley, wrap_sphere, wrap_cyl):
+            raise ValueError("only fixed tendons made of joint wraps are supported")
+        continue
       for wrap in range(start, start+count):
         if int(model.wrap_type[wrap]) != wrap_joint:
           raise ValueError("only fixed tendons made of joint wraps are supported")
@@ -152,8 +168,8 @@ class FixedTendonModel:
 class MetalFixedTendonDynamics:
   """Native MPS fixed-tendon passive-force and rank-one dynamics stage."""
 
-  def __init__(self, model, batch_size=1):
-    self._meta = FixedTendonModel(model)
+  def __init__(self, model, batch_size=1, spatial_ok=False):
+    self._meta = FixedTendonModel(model, spatial_ok=spatial_ok)
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
       raise ValueError("batch_size must be a positive integer")
     self.batch_size = batch_size

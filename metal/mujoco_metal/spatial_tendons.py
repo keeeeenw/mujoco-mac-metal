@@ -363,3 +363,212 @@ def spatial_length_reference(model, tendon, site_xpos, geom_xpos=None, geom_xmat
       length += float(np.linalg.norm(np.asarray(site_xpos[id1]) - p0)) / divisor
       j += 1
   return length
+
+
+_MAX_WRAP = 8
+
+
+class MetalSpatialTendonDynamics:
+  """Native MPS spatial tendon kinematics + passive-force stage (milestone 008)."""
+
+  def __init__(self, model, batch_size=1):
+    import torch
+    from pathlib import Path as _Path
+    self._torch = torch
+    self._meta = SpatialTendonModel(model)
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+      raise ValueError("batch_size must be a positive integer")
+    self.batch_size = batch_size
+    meta = self._meta
+    nq, nv, nt = meta.nq, meta.nv, meta.ntendon
+    if nv > 32:
+      raise ValueError("spatial tendon kinematics bounds nv to 32")
+    self._device = torch.device("mps")
+    lib = torch.mps.compile_shader(
+        (_Path(__file__).parent / "shaders" / "tendons.metal").read_text())
+    self._kin_kernel = lib.spatial_tendon_kinematics
+
+    def tensor(values, dtype=torch.float32):
+      arr = np.array(values, dtype=np.int32 if dtype == torch.int32 else np.float32,
+                     order="C", copy=True)
+      if arr.dtype == np.float32 and not np.all(np.isfinite(arr)):
+        raise ValueError("spatial tendon constants must be finite float32")
+      if arr.size == 0:
+        arr = np.zeros(1, dtype=arr.dtype)
+      return torch.as_tensor(arr, dtype=dtype, device=self._device)
+
+    self._types = tensor(np.zeros((nt, _MAX_WRAP), dtype=np.int32)
+                         if nt == 0 else np.stack([
+                             np.asarray(p["types"] + [0] * (_MAX_WRAP - len(p["types"])), dtype=np.int32)
+                             if p is not None else np.zeros(_MAX_WRAP, dtype=np.int32)
+                             for p in meta.paths]), torch.int32)
+    self._objids = tensor(np.zeros((nt, _MAX_WRAP), dtype=np.int32)
+                          if nt == 0 else np.stack([
+                              np.asarray(p["objids"] + [-1] * (_MAX_WRAP - len(p["objids"])), dtype=np.int32)
+                              if p is not None else -np.ones(_MAX_WRAP, dtype=np.int32)
+                              for p in meta.paths]), torch.int32)
+    self._prms = tensor(np.zeros((nt, _MAX_WRAP), dtype=np.float32)
+                        if nt == 0 else np.stack([
+                            np.asarray(p["prms"] + [0.0] * (_MAX_WRAP - len(p["prms"])), dtype=np.float32)
+                            if p is not None else np.zeros(_MAX_WRAP, dtype=np.float32)
+                            for p in meta.paths]))
+    self._start = tensor([p["start"] if p is not None else 0 for p in meta.paths]
+                         if nt else np.zeros(1, dtype=np.int32), torch.int32)
+    self._count = tensor([p["count"] if p is not None else 0 for p in meta.paths]
+                         if nt else np.zeros(1, dtype=np.int32), torch.int32)
+    nbody, njnt = int(model.nbody), int(model.njnt)
+    self._geom_type = tensor(model.geom_type if ngeom0(model) else np.zeros(1, dtype=np.int32), torch.int32)
+    self._geom_bodyid = tensor(model.geom_bodyid if ngeom0(model) else np.zeros(1, dtype=np.int32), torch.int32)
+    self._geom_size = tensor(np.asarray(model.geom_size).reshape(-1)
+                             if ngeom0(model) else np.zeros(3, dtype=np.float32))
+    self._site_bodyid = tensor(model.site_bodyid if meta.nsite else np.zeros(1, dtype=np.int32), torch.int32)
+    self._jnt_type = tensor(model.jnt_type if njnt else np.zeros(1, dtype=np.int32), torch.int32)
+    self._jnt_dofadr = tensor(model.jnt_dofadr if njnt else np.zeros(1, dtype=np.int32), torch.int32)
+    self._body_parentid = tensor(model.body_parentid, torch.int32)
+    self._body_jntadr = tensor(model.body_jntadr, torch.int32)
+    self._body_jntnum = tensor(model.body_jntnum, torch.int32)
+    self._dims = tensor([nv, nt, meta.nsite, ngeom0(model), nbody, njnt, _MAX_WRAP, batch_size],
+                        torch.int32)
+    self._stiffness = tensor(meta.stiffness)
+    self._stiffnesspoly = tensor(meta.stiffnesspoly.reshape(-1))
+    self._damping = tensor(meta.damping)
+    self._dampingpoly = tensor(meta.dampingpoly.reshape(-1))
+    self._spring_range = tensor(meta.spring_range.reshape(-1))
+    self._armature = tensor(meta.armature)
+    dis = int(model.opt.disableflags)
+    self._spring_off = bool(dis & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
+    self._damper_off = bool(dis & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
+    ancestor = np.zeros((max(nv, 1), max(nv, 1)), dtype=np.float32)
+    for dof in range(nv):
+      anc = dof
+      while anc >= 0:
+        ancestor[dof, anc] = 1.0
+        ancestor[anc, dof] = 1.0
+        anc = int(model.dof_parentid[anc])
+    self._ancestor = tensor(ancestor.reshape(-1))
+    b = batch_size
+    self._ws = {
+        "length": torch.zeros(b * max(nt, 1), dtype=torch.float32, device=self._device),
+        "velocity": torch.zeros(b * max(nt, 1), dtype=torch.float32, device=self._device),
+        "jacobian": torch.zeros(b * max(nt, 1) * max(nv, 1), dtype=torch.float32, device=self._device),
+        "qfrc": torch.zeros(b * max(nv, 1), dtype=torch.float32, device=self._device),
+        "damping": torch.zeros(b * max(nv, 1) * max(nv, 1), dtype=torch.float32, device=self._device),
+        "armature": torch.zeros(b * max(nv, 1) * max(nv, 1), dtype=torch.float32, device=self._device),
+    }
+    self._dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
+
+  def actuator_moment_overlay(self, actuator_meta, spatial_jac):
+    """Gear-scaled moment rows for TENDON actuators on spatial tendons.
+
+    Returns [B, nu, nv] (zeros except qualifying actuators) or None when no
+    actuator targets a spatial tendon. Fixed-tendon rows stay zero here; the
+    actuator stage owns those maps.
+    """
+    import mujoco as _mj
+    torch = self._torch
+    meta = self._meta
+    trn_tendon = int(_mj.mjtTrn.mjTRN_TENDON)
+    rows = []
+    for a in range(actuator_meta.nu):
+      if int(np.asarray(actuator_meta.trntype)[a]) != trn_tendon:
+        continue
+      tid = int(np.asarray(actuator_meta.trnid)[a, 0])
+      if tid < 0 or tid >= meta.ntendon:
+        continue
+      if meta.paths[tid] is None:
+        continue  # fixed tendon: owned by the actuator stage maps
+      gear = float(np.asarray(actuator_meta.gear)[a, 0])
+      rows.append((a, tid, gear))
+    if not rows:
+      return None
+    b = self.batch_size
+    nv = max(meta.nv, 1)
+    out = torch.zeros((b, actuator_meta.nu, nv), dtype=torch.float32, device=self._device)
+    for a, tid, gear in rows:
+      out[:, a, :] = gear * spatial_jac[:, tid, :nv]
+    return out
+
+  def _check(self, value, name, shape):
+    torch = self._torch
+    if (not isinstance(value, torch.Tensor) or tuple(value.shape) != tuple(shape)
+        or value.dtype != torch.float32 or value.device.type != "mps"
+        or not value.is_contiguous()):
+      raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
+
+  def run_kinematics(self, qvel, poses):
+    """Compute per-tendon length/velocity/dense Jacobian from FK poses."""
+    torch = self._torch
+    meta = self._meta
+    b, nv, nt = self.batch_size, meta.nv, meta.ntendon
+    self._check(qvel, "qvel", (b, max(nv, 1)))
+    w = self._ws
+    site_pos = poses["site_pos"].reshape(-1) if meta.nsite else self._dummy
+    self._kin_kernel(
+        qvel.reshape(-1) if nv else self._dummy, site_pos,
+        poses["geom_pos"].reshape(-1), poses["geom_quat"].reshape(-1),
+        self._geom_size,
+        poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),
+        poses["joint_anchor"].reshape(-1), poses["joint_axis"].reshape(-1),
+        self._types.reshape(-1), self._objids.reshape(-1), self._prms.reshape(-1),
+        self._start, self._count,
+        self._geom_type, self._geom_bodyid, self._site_bodyid,
+        self._jnt_type, self._jnt_dofadr,
+        self._body_parentid, self._body_jntadr, self._body_jntnum,
+        self._dims,
+        w["length"], w["velocity"], w["jacobian"],
+        threads=(b,), group_size=(1,),
+    )
+    return {"length": w["length"].reshape(b, max(nt, 1)),
+            "velocity": w["velocity"].reshape(b, max(nt, 1)),
+            "jacobian": w["jacobian"].reshape(b, max(nt, 1), max(nv, 1))}
+
+  def run_forces(self, kin):
+    """Passive spring/damper forces + damping/armature matrices (torch ops)."""
+    torch = self._torch
+    meta = self._meta
+    b, nv, nt = self.batch_size, meta.nv, meta.ntendon
+    w = self._ws
+    dev = self._device
+    L = kin["length"].reshape(b, max(nt, 1))
+    V = kin["velocity"].reshape(b, max(nt, 1))
+    J = kin["jacobian"].reshape(b, max(nt, 1), max(nv, 1))
+    if nt == 0 or nv == 0:
+      w["qfrc"].zero_()
+      w["damping"].zero_()
+      w["armature"].zero_()
+      return w["qfrc"].reshape(b, max(nv, 1)), None, None
+    lo = self._spring_range.reshape(max(nt, 1), 2)[:, 0]
+    hi = self._spring_range.reshape(max(nt, 1), 2)[:, 1]
+    disp = torch.where(L > hi, L - hi, torch.where(L < lo, L - lo, torch.zeros_like(L)))
+    if self._spring_off:
+      spring_f = torch.zeros_like(L)
+    else:
+      k = (self._stiffness.reshape(1, max(nt, 1))
+           + self._stiffnesspoly.reshape(max(nt, 1), 2)[:, 0] * disp
+           + self._stiffnesspoly.reshape(max(nt, 1), 2)[:, 1] * disp * disp)
+      spring_f = -disp * k
+    if self._damper_off:
+      damper_f = torch.zeros_like(V)
+      tangent = torch.zeros_like(V)
+    else:
+      speed = V.abs()
+      c = (self._damping.reshape(1, max(nt, 1))
+           + self._dampingpoly.reshape(max(nt, 1), 2)[:, 0] * speed
+           + self._dampingpoly.reshape(max(nt, 1), 2)[:, 1] * V * V)
+      damper_f = -V * c
+      tangent = (self._damping.reshape(1, max(nt, 1))
+                 + 2 * self._dampingpoly.reshape(max(nt, 1), 2)[:, 0] * speed
+                 + 3 * self._dampingpoly.reshape(max(nt, 1), 2)[:, 1] * V * V)
+    f = (spring_f + damper_f).unsqueeze(-1)  # [B,T,1]
+    qfrc = (f * J).sum(dim=1)  # [B,V]
+    w["qfrc"].copy_(qfrc.reshape(-1))
+    damp_mat = (tangent.unsqueeze(-1) * J).transpose(1, 2) @ J  # [B,V,V]
+    arm_mat = ((self._armature.reshape(1, max(nt, 1), 1) * J).transpose(1, 2) @ J
+               * self._ancestor.reshape(1, max(nv, 1), max(nv, 1)))
+    w["damping"].copy_(damp_mat.reshape(-1))
+    w["armature"].copy_(arm_mat.reshape(-1))
+    return w["qfrc"].reshape(b, nv), w["damping"].reshape(b, nv, nv), w["armature"].reshape(b, nv, nv)
+
+
+def ngeom0(model):
+  return int(model.ngeom)

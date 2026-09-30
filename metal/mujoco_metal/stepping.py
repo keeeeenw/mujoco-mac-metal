@@ -426,8 +426,12 @@ def validate_stepping_profile(
       else:
         supported_list.append("stateless scalar actuators and transmissions")
     if model.ntendon > 0:
+      from mujoco_metal.spatial_tendons import SpatialTendonModel
       from mujoco_metal.tendons import FixedTendonModel
-      FixedTendonModel(model)
+      spatial_model = SpatialTendonModel(model)
+      FixedTendonModel(model, spatial_ok=True)
+      if spatial_model.has_spatial:
+        supported_list.append("spatial tendons: pulley/site/sphere/cylinder paths with wrapping, limits, friction loss and equality")
       supported_list.append("fixed-joint tendons with spring, damping, and armature")
 
     from mujoco_metal.passive import PassiveForceModel
@@ -767,10 +771,12 @@ def validate_stepping_profile(
   if model.ntendon:
     if not with_transmissions:
       raise ValueError("tendons, including tendon armature, are unsupported")
+    from mujoco_metal.spatial_tendons import SpatialTendonModel
+    SpatialTendonModel(model)
     if np.any(model.tendon_limited) or np.any(model.tendon_actfrclimited):
-      raise ValueError("tendon armature and tendon limits are unsupported")
-    if np.any(model.wrap_type != int(mujoco.mjtWrap.mjWRAP_JOINT)):
-      raise ValueError("only fixed joint tendons are supported")
+      raise ValueError("tendon limits are unsupported by this profile (no coupled constraint stage)")
+    if np.any(model.tendon_frictionloss):
+      raise ValueError("tendon friction loss is unsupported by this profile (no coupled constraint stage)")
   if model.neq and not with_joint_constraints:
     raise ValueError("equality constraints are unsupported")
   if np.any(model.jnt_limited) and not with_joint_constraints:

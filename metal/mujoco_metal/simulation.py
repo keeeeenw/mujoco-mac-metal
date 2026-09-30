@@ -158,6 +158,9 @@ class MetalSimulation:
     self._transmissions = None
     self._actuators = None
     self._tendons = None
+    self._spatial_tendons = None
+    self._spatial_kin = None
+    self._spatial_cache_key = None
     self._tendon_damping = None
     self._passive = None
     self._damping_tangent = None
@@ -181,7 +184,11 @@ class MetalSimulation:
           self._transmissions = MetalTransmissions(model)
       if plan.is_stage_enabled("fixed_tendons"):
         from mujoco_metal.tendons import MetalFixedTendonDynamics
-        self._tendons = MetalFixedTendonDynamics(model, batch_size)
+        self._tendons = MetalFixedTendonDynamics(model, batch_size, spatial_ok=True)
+        from mujoco_metal.spatial_tendons import SpatialTendonModel
+        from mujoco_metal.spatial_tendons import MetalSpatialTendonDynamics
+        if SpatialTendonModel(model).has_spatial:
+          self._spatial_tendons = MetalSpatialTendonDynamics(model, batch_size)
       if plan.is_stage_enabled("passive_forces"):
         from mujoco_metal.passive import MetalPassiveForces
         self._passive = MetalPassiveForces(model)
@@ -200,7 +207,7 @@ class MetalSimulation:
         self._transmissions = MetalTransmissions(model)
       if with_transmissions and model.ntendon:
         from mujoco_metal.tendons import MetalFixedTendonDynamics
-        self._tendons = MetalFixedTendonDynamics(model, batch_size)
+        self._tendons = MetalFixedTendonDynamics(model, batch_size, spatial_ok=True)
       if (
           with_transmissions
           or "joint_constraints" in profile.name
@@ -664,6 +671,12 @@ class MetalSimulation:
       tendon_force, _, tendon_armature = self._tendons.run_device(qpos, qvel)
       rhs.add_(tendon_force)
       dynamics["mass_matrix"].add_(tendon_armature)
+    if self._spatial_tendons is not None:
+      sjac = self._spatial_jacobian(qvel, dynamics["poses"])
+      skin = self._spatial_kin
+      sforce, _, sarm = self._spatial_tendons.run_forces(skin)
+      rhs.add_(sforce.reshape(rhs.shape))
+      dynamics["mass_matrix"].add_(sarm.reshape(dynamics["mass_matrix"].shape))
     if self._transmissions is not None:
       rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
     if self._actuators is not None:
@@ -772,6 +785,22 @@ class MetalSimulation:
       raise ValueError("ctrl must be finite and representable as float32")
     self._control.copy_(torch.tensor(array, device=self._state._device))
 
+  def _spatial_jacobian(self, qvel, poses):
+    """Run spatial tendon kinematics once per assembly; stash for reuse.
+
+    Returns the borrowed dense Jacobian [B, nt, nv] or None. Both the
+    actuator-moment overlay and the spatial passive forces share this result
+    within one assembly (pinned mj_tendon runs once in mj_fwdPosition).
+    """
+    if self._spatial_tendons is None:
+      return None
+    gen = (self._state.generation, id(qvel), id(poses.get("body_pos", None)))
+    if getattr(self, "_spatial_cache_key", None) != gen:
+      kin = self._spatial_tendons.run_kinematics(qvel, poses)
+      self._spatial_cache_key = gen
+      self._spatial_kin = kin
+    return self._spatial_kin["jacobian"]
+
   def _actuation_force(self, qpos, qvel, poses):
     """General actuator force stage with pinned mj_fwdActuation ordering.
 
@@ -791,6 +820,15 @@ class MetalSimulation:
       self._coupled_constraints.generate_candidates(poses, qvel)
       contacts = self._coupled_constraints.contact_buffers()
     kin = actuators.run_kinematics(qpos, qvel, poses, contacts)
+    spatial_jac = self._spatial_jacobian(qvel, poses)
+    if spatial_jac is not None:
+      # Spatial tendon moment rows for TENDON-transmission actuators: the
+      # actuator kinematics stage only holds fixed-tendon maps, so add
+      # gear*ten_J rows for actuators targeting spatial tendons.
+      overlay = self._spatial_tendons.actuator_moment_overlay(
+          actuators.meta, spatial_jac)
+      if overlay is not None:
+        kin["moment"] = kin["moment"] + overlay
     gravcomp = None
     if self._passive is not None and bool(
         np.any(np.asarray(actuators.meta.jnt_actgravcomp))):
@@ -836,6 +874,12 @@ class MetalSimulation:
       )
       self._rhs.add_(tendon_force)
       dynamics["mass_matrix"].add_(tendon_armature)
+    if self._spatial_tendons is not None:
+      sjac = self._spatial_jacobian(qvel, dynamics["poses"])
+      skin = self._spatial_kin
+      sforce, sdamp, sarm = self._spatial_tendons.run_forces(skin)
+      self._rhs.add_(sforce.reshape(self._rhs.shape))
+      dynamics["mass_matrix"].add_(sarm.reshape(dynamics["mass_matrix"].shape))
     if self._transmissions is not None:
       self._rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
     if self._actuators is not None:
