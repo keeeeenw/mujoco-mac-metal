@@ -44,7 +44,19 @@ _CAPSULE = int(mujoco.mjtGeom.mjGEOM_CAPSULE)
 _BOX = int(mujoco.mjtGeom.mjGEOM_BOX)
 _HINGE = int(mujoco.mjtJoint.mjJNT_HINGE)
 _SLIDE = int(mujoco.mjtJoint.mjJNT_SLIDE)
+_EQ_CONNECT = int(mujoco.mjtEq.mjEQ_CONNECT)
+_EQ_WELD = int(mujoco.mjtEq.mjEQ_WELD)
 _EQ_JOINT = int(mujoco.mjtEq.mjEQ_JOINT)
+_OBJ_BODY = int(mujoco.mjtObj.mjOBJ_BODY)
+_OBJ_SITE = int(mujoco.mjtObj.mjOBJ_SITE)
+
+_EQ_ROWS = {
+    _EQ_JOINT: 1,
+    _EQ_CONNECT: 3,
+    _EQ_WELD: 6,
+}
+
+_SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_CONNECT, _EQ_WELD)
 
 _SUPPORTED_GEOM_TYPES = (_PLANE, _SPHERE, _CAPSULE, _BOX)
 
@@ -105,6 +117,7 @@ class CoupledConstraintDescriptor:
   nr: int
   nbody: int
   ngeom: int
+  nsite: int
   timestep: float
   refsafe: bool
   impratio: float
@@ -112,6 +125,7 @@ class CoupledConstraintDescriptor:
   iterations: int
   tolerance: float
   solver_settings: CoupledSolverSettings
+  n_eq_rows: int
 
   # Joint constraint constants
   joint_type: np.ndarray
@@ -129,6 +143,10 @@ class CoupledConstraintDescriptor:
   eq_data: np.ndarray
   eq_sol_params: np.ndarray
   eq_active0: np.ndarray
+  eq_type: np.ndarray
+  eq_objtype: np.ndarray
+  eq_rowadr: np.ndarray
+  eq_rownum: np.ndarray
 
   # Contact constants
   cone_type: int
@@ -199,21 +217,131 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
         "use the default Newton selection or PGS"
     )
 
-  # 1. Joint constraint validation
+  # 1. Equality and joint constraint validation (joint/connect/weld, mixed order)
   scalar_types = (_HINGE, _SLIDE)
-  if model.neq and np.any(np.asarray(model.eq_type) != _EQ_JOINT):
-    bad = int(np.flatnonzero(np.asarray(model.eq_type) != _EQ_JOINT)[0])
-    raise ValueError(f"equality {bad}: only polynomial joint equality is supported")
+  if model.neq:
+    eq_types = np.asarray(model.eq_type)
+    for eid in range(model.neq):
+      et = int(eq_types[eid])
+      if et not in _SUPPORTED_EQ_TYPES:
+        raise ValueError(
+            f"equality {eid}: only joint, connect and weld equalities are supported "
+            f"(found type {et})"
+        )
   limited = np.asarray(model.jnt_limited, dtype=bool)
   for jid in range(model.njnt):
     if limited[jid] and int(model.jnt_type[jid]) not in scalar_types:
       raise ValueError(f"joint {jid}: only scalar hinge/slide limits are supported")
+  # Per-equality validation with explicit row spans; inactive equalities are
+  # still validated and reserved (a model is not supported merely because a
+  # new equality is initially inactive).
+  eq_types_arr = np.asarray(model.eq_type) if model.neq else np.zeros(0, dtype=np.int32)
+  eq_objtype_arr = np.asarray(model.eq_objtype) if model.neq else np.zeros(0, dtype=np.int32)
+  eq_rowadr_list = []
+  eq_rownum_list = []
+  eq_row_cursor = 0
   for eid in range(model.neq):
-    j1, j2 = int(model.eq_obj1id[eid]), int(model.eq_obj2id[eid])
-    if not 0 <= j1 < model.njnt or int(model.jnt_type[j1]) not in scalar_types:
-      raise ValueError(f"equality {eid}: object 1 must be a scalar hinge/slide joint")
-    if j2 >= 0 and (j2 >= model.njnt or int(model.jnt_type[j2]) not in scalar_types):
-      raise ValueError(f"equality {eid}: object 2 must be a scalar hinge/slide joint")
+    et = int(eq_types_arr[eid])
+    ot = int(eq_objtype_arr[eid])
+    span = int(_EQ_ROWS[et])
+    eq_rowadr_list.append(eq_row_cursor)
+    eq_rownum_list.append(span)
+    eq_row_cursor += span
+    if et == _EQ_JOINT:
+      j1, j2 = int(model.eq_obj1id[eid]), int(model.eq_obj2id[eid])
+      if not 0 <= j1 < model.njnt or int(model.jnt_type[j1]) not in scalar_types:
+        raise ValueError(f"equality {eid}: object 1 must be a scalar hinge/slide joint")
+      if j2 >= 0 and (j2 >= model.njnt or int(model.jnt_type[j2]) not in scalar_types):
+        raise ValueError(f"equality {eid}: object 2 must be a scalar hinge/slide joint")
+    elif et == _EQ_CONNECT:
+      if ot not in (_OBJ_BODY, _OBJ_SITE):
+        raise ValueError(f"equality {eid}: connect requires body or site objects")
+      o1, o2 = int(model.eq_obj1id[eid]), int(model.eq_obj2id[eid])
+      if ot == _OBJ_BODY:
+        if not 0 <= o1 < model.nbody:
+          raise ValueError(f"equality {eid}: body1 id out of range")
+        if not 0 <= o2 < model.nbody:
+          raise ValueError(f"equality {eid}: body2 id out of range (world 0 allowed)")
+        if o1 == o2:
+          raise ValueError(f"equality {eid}: connect bodies must differ")
+        # Mocap bodies are out of scope; world (0) and ordinary
+        # hinge/slide/ball/free bodies are in scope.
+        if model.nmocap:
+          try:
+            mocap = np.asarray(model.body_mocapid)
+            if (o1 < len(mocap) and int(mocap[o1]) >= 0) or (
+                o2 < len(mocap) and int(mocap[o2]) >= 0
+            ):
+              raise ValueError(f"equality {eid}: mocap bodies are unsupported")
+          except AttributeError:
+            pass
+      else:
+        if not 0 <= o1 < model.nsite or not 0 <= o2 < model.nsite:
+          raise ValueError(f"equality {eid}: site ids out of range")
+        if o1 == o2:
+          raise ValueError(f"equality {eid}: connect sites must differ")
+        if model.nmocap:
+          try:
+            site_body = np.asarray(model.site_bodyid)
+            mocap = np.asarray(model.body_mocapid)
+            for sid in (o1, o2):
+              bid = int(site_body[sid])
+              if 0 <= bid < len(mocap) and int(mocap[bid]) >= 0:
+                raise ValueError(f"equality {eid}: mocap bodies are unsupported")
+          except AttributeError:
+            pass
+      # Connect eq_data anchors/ Hogan: validate finite float32 below via _frozen;
+      # site-based connect ignores eq_data (must still be finite).
+    else:  # _EQ_WELD
+      if ot not in (_OBJ_BODY, _OBJ_SITE):
+        raise ValueError(f"equality {eid}: weld requires body or site objects")
+      o1, o2 = int(model.eq_obj1id[eid]), int(model.eq_obj2id[eid])
+      if ot == _OBJ_BODY:
+        if not 0 <= o1 < model.nbody:
+          raise ValueError(f"equality {eid}: body1 id out of range")
+        if not 0 <= o2 < model.nbody:
+          raise ValueError(f"equality {eid}: body2 id out of range (world 0 allowed)")
+        if o1 == o2:
+          raise ValueError(f"equality {eid}: weld bodies must differ")
+        if model.nmocap:
+          try:
+            mocap = np.asarray(model.body_mocapid)
+            if (o1 < len(mocap) and int(mocap[o1]) >= 0) or (
+                o2 < len(mocap) and int(mocap[o2]) >= 0
+            ):
+              raise ValueError(f"equality {eid}: mocap bodies are unsupported")
+          except AttributeError:
+            pass
+      else:
+        if not 0 <= o1 < model.nsite or not 0 <= o2 < model.nsite:
+          raise ValueError(f"equality {eid}: site ids out of range")
+        if o1 == o2:
+          raise ValueError(f"equality {eid}: weld sites must differ")
+        if model.nmocap:
+          try:
+            site_body = np.asarray(model.site_bodyid)
+            mocap = np.asarray(model.body_mocapid)
+            for sid in (o1, o2):
+              bid = int(site_body[sid])
+              if 0 <= bid < len(mocap) and int(mocap[bid]) >= 0:
+                raise ValueError(f"equality {eid}: mocap bodies are unsupported")
+          except AttributeError:
+            pass
+      # Weld torquescale (eq_data[10]) must be finite float32; zero is valid
+      # (behaves like connect for rotation) and is explicitly reserved.
+      try:
+        ts = float(np.asarray(model.eq_data).reshape(model.neq, 11)[eid, 10])
+      except Exception:
+        ts = float("nan")
+      if not math.isfinite(ts):
+        raise ValueError(f"equality {eid}: weld torquescale must be finite")
+      with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        ts32 = np.float32(ts)
+      if not np.isfinite(ts32):
+        raise ValueError(f"equality {eid}: weld torquescale must be float32-representable")
+  n_eq_rows = int(eq_row_cursor)
+  eq_rowadr = np.asarray(eq_rowadr_list, dtype=np.int32) if model.neq else np.zeros(0, dtype=np.int32)
+  eq_rownum = np.asarray(eq_rownum_list, dtype=np.int32) if model.neq else np.zeros(0, dtype=np.int32)
   if model.ntendon and (np.any(model.tendon_limited) or np.any(model.tendon_frictionloss)):
     raise ValueError("tendon limits and frictionloss are unsupported")
 
@@ -379,8 +507,11 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
   if total_candidate_contacts > _MAX_CONTACTS:
     raise ValueError(f"total candidate contact slots ({total_candidate_contacts}) exceeds capacity {_MAX_CONTACTS}")
 
-  # 4. Capacity calculation
-  nr_joint = int(model.neq + model.nv + 2 * model.njnt)
+  # 4. Capacity calculation from explicit equality spans plus joint/contact spans.
+  # The activity array still has one entry per equality; row mapping is
+  # deterministic via eq_rowadr/eq_rownum. Do not replace all uses of neq
+  # indiscriminately.
+  nr_joint = int(n_eq_rows + model.nv + 2 * model.njnt)
   nr_contact = int(row_offset)
   nr = int(nr_joint + nr_contact)
   if nr > _MAX_ROWS:
@@ -481,11 +612,21 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       metric="max_normalized_projected_gradient",
   )
 
+  eq_type_arr = (
+      np.asarray(model.eq_type, dtype=np.int32)
+      if model.neq
+      else np.zeros(0, dtype=np.int32)
+  )
+  eq_objtype_arr = (
+      np.asarray(model.eq_objtype, dtype=np.int32)
+      if model.neq
+      else np.zeros(0, dtype=np.int32)
+  )
   return CoupledConstraintDescriptor(
       nq=int(model.nq), nv=int(model.nv), njnt=int(model.njnt),
       neq=int(model.neq), nc=npairs, npairs=npairs, ncontacts_max=total_candidate_contacts,
       nr_joint=nr_joint, nr=nr,
-      nbody=int(model.nbody), ngeom=int(model.ngeom),
+      nbody=int(model.nbody), ngeom=int(model.ngeom), nsite=int(model.nsite),
       timestep=float(model.opt.timestep),
       refsafe=not bool(int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)),
       impratio=float(model.opt.impratio),
@@ -494,6 +635,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       iterations=iter_req,
       tolerance=eff_tol,
       solver_settings=solver_settings,
+      n_eq_rows=n_eq_rows,
       joint_type=_frozen(model.jnt_type, np.int32),
       joint_qposadr=_frozen(model.jnt_qposadr, np.int32),
       qpos0=_frozen(model.qpos0, np.float32),
@@ -509,6 +651,10 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       eq_data=_frozen(eq_data, np.float32),
       eq_sol_params=_frozen(eq_sol_params, np.float32),
       eq_active0=_frozen(eq_active0, np.uint8),
+      eq_type=_frozen(eq_type_arr, np.int32),
+      eq_objtype=_frozen(eq_objtype_arr, np.int32),
+      eq_rowadr=_frozen(eq_rowadr, np.int32),
+      eq_rownum=_frozen(eq_rownum, np.int32),
       geom1=_frozen(g1, np.int32),
       geom2=_frozen(g2, np.int32),
       pair_contact_offset=_frozen(p_offset, np.int32),
