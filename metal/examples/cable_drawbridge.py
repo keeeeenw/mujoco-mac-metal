@@ -84,13 +84,19 @@ def run(steps=1400, mode="metal", check=False, record=None):
   max_act_err = 0.0
   max_pos_err = 0.0
   max_quat_err = 0.0
+  max_geodesic_err = 0.0
   end_pos_err = 0.0
   end_quat_err = 0.0
+  end_geodesic_err = 0.0
   deck_min = float("inf")
   deck_slack = None
   crate_peak = 0.0
   slack_steps = 0
   taut_steps = 0
+  nat_slack_steps = 0
+  nat_taut_steps = 0
+  nat_deck_min = float("inf")
+  nat_crate_peak = 0.0
 
   for step in range(steps):
     ctrl = _sched(step)
@@ -106,6 +112,19 @@ def run(steps=1400, mode="metal", check=False, record=None):
       slack_steps += 1
     else:
       taut_steps += 1
+    # Native feature activity comes from native state/kinematics, never the
+    # CPU oracle (review gap). CPU counters above remain the oracle baseline.
+    if native is not None:
+      nat_kin = native._spatial_kin
+      nat_len = float(nat_kin["length"].cpu().numpy()[0, 0]) if nat_kin is not None else length
+      nat_stretch = nat_len - rest
+      if nat_stretch <= 0:
+        nat_slack_steps += 1
+      else:
+        nat_taut_steps += 1
+      nat_q = native.state.qpos[0].cpu().numpy()
+      nat_deck_min = min(nat_deck_min, float(nat_q[deck_idx]))
+      nat_crate_peak = max(nat_crate_peak, float(nat_q[crate_z]))
     deck_min = min(deck_min, float(cpu_haul.qpos[deck_idx]))
     if 800 <= step < 1100:
       if deck_slack is None:
@@ -121,12 +140,16 @@ def run(steps=1400, mode="metal", check=False, record=None):
       # [winch, hinge, crate(7: x,y,z,qw,qx,qy,qz)].
       epos = float(np.max(np.abs(gq[[0, 1, 2, 3, 4]] - cpu_haul.qpos[[0, 1, 2, 3, 4]])))
       equat = float(np.max(np.abs(gq[[5, 6, 7, 8]] - cpu_haul.qpos[[5, 6, 7, 8]])))
+      # Geodesic orientation error: angle between unit quats, robust to sign.
+      dot = float(np.clip(abs(np.dot(gq[[5, 6, 7, 8]], cpu_haul.qpos[[5, 6, 7, 8]])), -1.0, 1.0))
+      geo = float(2.0 * np.arccos(dot))
       max_pos_err = max(max_pos_err, epos)
       max_quat_err = max(max_quat_err, equat)
+      max_geodesic_err = max(max_geodesic_err, geo)
       max_qpos_err = max(max_qpos_err, float(np.max(np.abs(gq - cpu_haul.qpos))))
       max_act_err = max(max_act_err, float(np.max(np.abs(ga - cpu_haul.act))))
       if step == steps - 1:
-        end_pos_err, end_quat_err = epos, equat
+        end_pos_err, end_quat_err, end_geodesic_err = epos, equat, geo
     if recorder and native is not None:
       actual = mujoco.MjData(model)
       actual.qpos[:] = native.state.qpos[0].cpu().numpy()
@@ -157,13 +180,19 @@ def run(steps=1400, mode="metal", check=False, record=None):
       "max_act_err": max_act_err,
       "max_pos_err": max_pos_err,
       "max_quat_err": max_quat_err,
+      "max_geodesic_err": max_geodesic_err,
       "end_pos_err": end_pos_err,
       "end_quat_err": end_quat_err,
+      "end_geodesic_err": end_geodesic_err,
       "deck_min": deck_min,
       "deck_slack": deck_slack,
       "crate_peak": crate_peak,
       "slack_steps": slack_steps,
       "taut_steps": taut_steps,
+      "nat_slack_steps": nat_slack_steps,
+      "nat_taut_steps": nat_taut_steps,
+      "nat_deck_min": nat_deck_min,
+      "nat_crate_peak": nat_crate_peak,
       "released": released,
       "latched": latched,
       "steps": steps,
@@ -171,11 +200,18 @@ def run(steps=1400, mode="metal", check=False, record=None):
   if check and mode == "metal":
     assert max_pos_err < 1.5e-2, max_pos_err
     assert max_quat_err < 0.1, max_quat_err
+    assert max_geodesic_err < 0.1, max_geodesic_err
     assert end_pos_err < 5e-3 and end_quat_err < 5e-3, (end_pos_err, end_quat_err)
+    assert end_geodesic_err < 5e-3, end_geodesic_err
     assert max_act_err < 5e-4, max_act_err
     assert deck_min < -0.3, deck_min  # hauled up
     assert deck_slack is not None and deck_slack > 0.05, deck_slack  # slack while lowered
     assert slack_steps > 20 and taut_steps > 100, (slack_steps, taut_steps)
+    # Native-side feature counters must agree the demo exercised slack/taut
+    # and lifted the payload (review gap: previously CPU-oracle only).
+    assert nat_slack_steps > 20 and nat_taut_steps > 100, (nat_slack_steps, nat_taut_steps)
+    assert nat_deck_min < -0.3, nat_deck_min
+    assert nat_crate_peak > 0.35, nat_crate_peak
     assert crate_peak > 0.35, crate_peak  # payload lifted with the deck
     assert released[0] < -0.3, released  # ends raised after re-haul
     assert latched[0] > -0.05, latched  # hold-only run never raises
