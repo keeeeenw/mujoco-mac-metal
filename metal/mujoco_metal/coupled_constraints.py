@@ -38,6 +38,8 @@ _MAX_CONTACTS = 24
 _MAX_ROWS = 96
 _MAX_ITERATIONS = 2048
 _TOLERANCE = 1e-6
+# G3: hard cap for adaptive PGS extension; must match the kernel constant.
+_ADAPTIVE_MAX_ITERATIONS = 1024
 
 _PLANE = int(mujoco.mjtGeom.mjGEOM_PLANE)
 _SPHERE = int(mujoco.mjtGeom.mjGEOM_SPHERE)
@@ -97,11 +99,21 @@ def _frozen(value, dtype=np.float32):
 
 @dataclass(frozen=True)
 class CoupledSolverSettings:
-  """Explicit configuration for the native coupled Delassus constraint solver."""
+  """Explicit configuration for the native coupled Delassus constraint solver.
+
+  `requested_iterations` is the model's outer PGS budget. When a budgeted
+  window ends close to certification (residual <= 1e-3) and improved over
+  the window start, the solver adaptively extends up to
+  `adaptive_max_iterations` (G3 contract); `solver_diagnostics[1]` reports
+  the actual iteration count, separately from the configured budgets.
+  `max_refinement_sweeps` bounds the exact per-block contact refinement
+  (64 rounds for blocks of <= 4 rows).
+  """
   requested_iterations: int
   effective_iterations: int
   requested_tolerance: float
   effective_tolerance: float
+  adaptive_max_iterations: int = 1024
   max_refinement_sweeps: int = 256
   metric: str = "max_normalized_projected_gradient"
 
@@ -660,6 +672,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       effective_iterations=iter_req,
       requested_tolerance=tol_req,
       effective_tolerance=eff_tol,
+      adaptive_max_iterations=_ADAPTIVE_MAX_ITERATIONS,
       max_refinement_sweeps=256,
       metric="max_normalized_projected_gradient",
   )

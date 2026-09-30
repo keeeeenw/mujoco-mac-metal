@@ -1152,3 +1152,5 @@ def test_solver_failure_is_sticky_until_reset_gpu():
   assert int(sim.state.status.cpu().numpy()[0]) == 0
 
 
+  # G3: adaptive budget contract is explicit and separate from the request.
+  assert settings.adaptive_max_iterations == 1024
