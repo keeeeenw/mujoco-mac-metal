@@ -973,6 +973,8 @@ def test_coupled_solver_settings_range_contracts():
   assert settings.effective_tolerance == 1e-6
   assert settings.max_refinement_sweeps == 256
   assert settings.metric == "max_normalized_projected_gradient"
+  # G3: adaptive budget contract is explicit and separate from the request.
+  assert settings.adaptive_max_iterations == 1024
 
   # Iterations contract: [1, 2048]
   # Value 100 is NOT silently overridden to 1024
@@ -1150,7 +1152,3 @@ def test_solver_failure_is_sticky_until_reset_gpu():
   # Reset clears it.
   sim.reset()
   assert int(sim.state.status.cpu().numpy()[0]) == 0
-
-
-  # G3: adaptive budget contract is explicit and separate from the request.
-  assert settings.adaptive_max_iterations == 1024
