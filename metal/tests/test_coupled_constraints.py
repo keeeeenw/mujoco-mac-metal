@@ -989,6 +989,12 @@ def test_coupled_solver_settings_range_contracts():
   m2048.opt.iterations = 2048
   d2048 = lower_coupled_constraints(m2048)
   assert d2048.solver_settings.effective_iterations == 2048
+  # PGS work bound is max(effective, adaptive): the adaptive ceiling never
+  # reduces a larger requested budget, and refinement has its own allowance.
+  s2048 = d2048.solver_settings
+  assert max(s2048.effective_iterations, s2048.adaptive_max_iterations) == 2048
+  s100 = d100.solver_settings
+  assert max(s100.effective_iterations, s100.adaptive_max_iterations) == 1024
 
   # <= 0 or > 2048 rejected
   for bad_iter in [0, -1, 2049]:
