@@ -1,0 +1,33 @@
+<mujoco model="magnetic_crane">
+  <compiler angle="radian"/>
+  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6" gravity="0 0 -9.81">
+    <flag contact="enable" equality="enable" limit="disable" frictionloss="disable"/>
+  </option>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1" pos="0 0 0" condim="3"/>
+    <body name="binL" pos="-0.7 0 0">
+      <geom name="binL_geom" type="box" size="0.18 0.25 0.05" pos="0 0 0.1" rgba="0.2 0.5 0.9 1" mass="0" contype="1" conaffinity="0" condim="3"/>
+    </body>
+    <body name="binR" pos="0.7 0 0">
+      <geom name="binR_geom" type="box" size="0.18 0.25 0.05" pos="0 0 0.1" rgba="0.1 0.7 0.2 1" mass="0" contype="1" conaffinity="0" condim="3"/>
+    </body>
+    <body name="hook" pos="0 0 1.0" mocap="true">
+      <geom name="hook_geom" type="sphere" size="0.05" rgba="0.9 0.5 0.1 1" mass="0.2" contype="0" conaffinity="0" condim="1"/>
+    </body>
+    <body name="cargo" pos="0 0 0.85">
+      <freejoint name="cargo_free"/>
+      <geom name="cargo_geom" type="box" size="0.05 0.05 0.05" rgba="0.9 0.1 0.1 1" mass="0.4" friction="0.4 0.05 0.02" contype="1" conaffinity="1" condim="3"/>
+    </body>
+  </worldbody>
+  <contact>
+    <pair geom1="cargo_geom" geom2="binL_geom"/>
+    <pair geom1="cargo_geom" geom2="binR_geom"/>
+    <pair geom1="cargo_geom" geom2="floor"/>
+  </contact>
+  <equality>
+    <weld name="magnet" body1="hook" body2="cargo"/>
+  </equality>
+  <keyframe>
+    <key name="start" qpos="0 0 0.85 1 0 0 0" mpos="0 0 1.0" mquat="1 0 0 0"/>
+  </keyframe>
+</mujoco>

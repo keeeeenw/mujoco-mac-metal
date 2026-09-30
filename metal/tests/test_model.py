@@ -120,6 +120,10 @@ def test_rejects_mocap_and_malformed_source_model():
   mocap = mujoco.MjModel.from_xml_string(
       '<mujoco><worldbody><body mocap="true"><geom type="sphere" size=".1"/></body></worldbody></mujoco>'
   )
+  # Valid world-child mocap bodies are supported (006); malformed mocap ids still fail.
+  descriptor = load_model(mocap)
+  assert descriptor.nmocap == 1
+  mocap.body_mocapid[1] = 5
   with pytest.raises(ValueError, match="mocap"):
     load_model(mocap)
 

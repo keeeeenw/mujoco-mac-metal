@@ -20,6 +20,7 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Robotic marble music machine](marble_music_machine.md) | Dual selector gates and resonant chime bars struck by descending marbles | Integrated Euler pipeline: coupled constraints, contacts, limits, equality, tendons, actuation, fluid, and sensors |
 | [Clockwork parcel sorter](clockwork_parcel_sorter.md) | Real box parcels, capsule rollers, and swinging diverter gates routing parcels to bins | Complete primitive collisions: multi-contact manifolds across planes, spheres, capsules, boxes, coupled Euler solve |
 | [Latch-and-release cargo bridge](cargo_bridge.md) | Two deck sections joined by a connect constraint unlatch a weld brace and spill a payload into a tray | Connect/weld equalities with per-environment activation, coupled contact solve |
+| [Magnetic crane](magnetic_crane.md) | A mocap hook carries a welded cargo box to a bin and releases it | Per-environment mocap inputs, weld attach/release, keyframe reset |
 | [Chaotic pendulum](README.md) | Four connected arms swing and tumble | Generalized rigid-body mass and bias |
 
 Use current `main` and the [demo/source setup](../INSTALL.md#development-source).

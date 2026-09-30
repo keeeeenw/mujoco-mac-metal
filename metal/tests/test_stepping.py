@@ -245,7 +245,12 @@ def test_rejects_passives_fluid_mocap_sleep_callbacks_and_plugins():
   mocap = _model(
       body="<body mocap='true'><geom type='sphere' size='.1'/></body>"
   )
-  with pytest.raises(ValueError, match="mocap"):
+  # Valid world-child mocap bodies are supported (006); admission succeeds.
+  profile = validate_stepping_profile(mocap)
+  assert "mocap" not in profile.rejected
+  # Non-world-child mocap ids remain rejected at lowering.
+  mocap.body_parentid[1] = 1
+  with pytest.raises(ValueError, match="mocap|parent"):
     validate_stepping_profile(mocap)
 
   model = _model()
