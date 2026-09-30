@@ -727,14 +727,22 @@ REQUIREMENTS = (
         enums=("mjtDyn.mjDYN_NONE",),
     ),
     Requirement(
-        "REQ-DYN-002", "stateful activation dynamics",
+        "REQ-DYN-002", "stateful activation dynamics (built-in)",
         Stage.DYNAMICS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "built-in integrator/filter/filterexact/muscle/dcmotor; USER callbacks stay in 019",
+        Execution.DEVICE, "built-in integrator/filter/filterexact/muscle/dcmotor only",
         "mujoco_metal/stateful_actuation.py", "act_dot switch + exact-slot advance, schema-4 state",
         "MetalSimulation", "007", ("test_actuators_007.py",),
         enums=("mjtDyn.mjDYN_INTEGRATOR", "mjtDyn.mjDYN_FILTER",
                "mjtDyn.mjDYN_FILTEREXACT", "mjtDyn.mjDYN_MUSCLE",
-               "mjtDyn.mjDYN_DCMOTOR", "mjtDyn.mjDYN_USER"),
+               "mjtDyn.mjDYN_DCMOTOR"),
+    ),
+    Requirement(
+        "REQ-DYN-003", "user-callback actuator dynamics",
+        Stage.DYNAMICS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
+        Execution.NONE, "arbitrary callbacks cannot execute as Metal kernels",
+        "engine/engine_forward.c", "reject dyntype user (019 extension contract)",
+        "none", "019", (),
+        enums=("mjtDyn.mjDYN_USER",),
     ),
     Requirement(
         "REQ-GAIN-001", "fixed/affine gains",
@@ -745,13 +753,20 @@ REQUIREMENTS = (
         enums=("mjtGain.mjGAIN_FIXED", "mjtGain.mjGAIN_AFFINE"),
     ),
     Requirement(
-        "REQ-GAIN-002", "muscle/DC-motor/user gains",
+        "REQ-GAIN-002", "muscle/DC-motor gains (built-in)",
         Stage.DYNAMICS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "built-in muscle/dcmotor; USER callbacks stay in 019",
+        Execution.DEVICE, "built-in muscle/dcmotor only",
         "mujoco_metal/stateful_actuation.py", "muscle FLV + DC resistance/voltage paths",
         "MetalSimulation", "007", ("test_actuators_007.py",),
-        enums=("mjtGain.mjGAIN_MUSCLE", "mjtGain.mjGAIN_DCMOTOR",
-               "mjtGain.mjGAIN_USER"),
+        enums=("mjtGain.mjGAIN_MUSCLE", "mjtGain.mjGAIN_DCMOTOR"),
+    ),
+    Requirement(
+        "REQ-GAIN-003", "user-callback actuator gains",
+        Stage.DYNAMICS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
+        Execution.NONE, "arbitrary callbacks cannot execute as Metal kernels",
+        "engine/engine_forward.c", "reject gaintype user (019 extension contract)",
+        "none", "019", (),
+        enums=("mjtGain.mjGAIN_USER",),
     ),
     Requirement(
         "REQ-BIAS-001", "none/affine biases",
@@ -762,13 +777,20 @@ REQUIREMENTS = (
         enums=("mjtBias.mjBIAS_NONE", "mjtBias.mjBIAS_AFFINE"),
     ),
     Requirement(
-        "REQ-BIAS-002", "muscle/DC-motor/user biases",
+        "REQ-BIAS-002", "muscle/DC-motor biases (built-in)",
         Stage.DYNAMICS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "built-in muscle passive + DC back-EMF/cogging/LuGre; USER stays in 019",
+        Execution.DEVICE, "built-in muscle passive + DC back-EMF/cogging/LuGre",
         "mujoco_metal/stateful_actuation.py", "bias switch + post-clamp DC mechanics",
         "MetalSimulation", "007", ("test_actuators_007.py",),
-        enums=("mjtBias.mjBIAS_MUSCLE", "mjtBias.mjBIAS_DCMOTOR",
-               "mjtBias.mjBIAS_USER"),
+        enums=("mjtBias.mjBIAS_MUSCLE", "mjtBias.mjBIAS_DCMOTOR"),
+    ),
+    Requirement(
+        "REQ-BIAS-003", "user-callback actuator biases",
+        Stage.DYNAMICS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
+        Execution.NONE, "arbitrary callbacks cannot execute as Metal kernels",
+        "engine/engine_forward.c", "reject biastype user (019 extension contract)",
+        "none", "019", (),
+        enums=("mjtBias.mjBIAS_USER",),
     ),
     # Sensors: 14 supported, 35 deferred to 016.
     Requirement(
@@ -1233,15 +1255,15 @@ def classify_model_field(name):
 def coverage_table():
   """Render the requirement inventory as a Markdown table."""
   lines = [
-      "| ID | Capability | Execution | Status | Owner | Admission | Tests |",
-      "|---|---|---|---|---|---|---|",
+      "| ID | Capability | Execution | Status | Owner | Limitation | Admission | Tests |",
+      "|---|---|---|---|---|---|---|---|",
   ]
   for req in REQUIREMENTS:
     status = f"{req.implementation.value}/{req.qualification.value}"
     tests = ", ".join(req.tests) if req.tests else "—"
     lines.append(
         f"| {req.id} | {req.name} | {req.execution.value} | {status} | "
-        f"{req.milestone} | {req.admission} | {tests} |"
+        f"{req.milestone} | {req.limitation} | {req.admission} | {tests} |"
     )
   return "\n".join(lines) + "\n"
 

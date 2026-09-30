@@ -9,6 +9,7 @@ from mujoco_metal.registry import (
     FIELD_RULES,
     MILESTONE_IDS,
     REQUIREMENTS,
+    Implementation,
     _ENUMS,
     classify_model_field,
     coverage_table,
@@ -79,3 +80,48 @@ def test_coverage_cli_lists_contract(capsys):
   assert main(["coverage", "--json"]) == 0
   out, _ = capsys.readouterr()
   assert '"REQ-EQ-001"' in out
+
+
+def _user_model(kind):
+  body = ('<body pos="0 0 1"><joint name="j" type="hinge" axis="0 1 0"/>'
+          '<geom type="sphere" size="0.1" mass="1"/></body>')
+  if kind == "dyn":
+    act = '<general joint="j" dyntype="user"/>'
+  elif kind == "gain":
+    act = '<general joint="j" gaintype="user"/>'
+  else:
+    act = '<general joint="j" biastype="user"/>'
+  return mujoco.MjModel.from_xml_string(
+      f'<mujoco><option timestep="0.002"/><worldbody>{body}</worldbody>'
+      f'<actuator>{act}</actuator></mujoco>')
+
+
+def test_user_callbacks_rejected_with_019_owner():
+  # R6: USER variants are explicit 019 rows, rejected at admission.
+  from mujoco_metal.stateful_actuation import ActuatorModel
+  for kind in ("dyn", "gain", "bias"):
+    with pytest.raises(ValueError, match="019"):
+      ActuatorModel(_user_model(kind))
+
+
+def test_supported_builtin_admitted_with_evidence():
+  # R6: a declared-supported combination is admitted AND its row carries
+  # qualified status with test evidence.
+  from mujoco_metal.stateful_actuation import ActuatorModel
+  m = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.002"/><worldbody>'
+      '<body pos="0 0 1"><joint name="j" type="hinge" axis="0 1 0"/>'
+      '<geom type="sphere" size="0.1" mass="1"/></body>'
+      '</worldbody><actuator>'
+      '<general joint="j" dyntype="filter" dynprm="0.05 0 0"/>'
+      '</actuator></mujoco>')
+  meta = ActuatorModel(m)
+  assert meta.na == 1
+  rows = {r.id: r for r in REQUIREMENTS}
+  dyn = rows["REQ-DYN-002"]
+  assert "mjtDyn.mjDYN_FILTER" in dyn.enums
+  assert "mjtDyn.mjDYN_USER" not in dyn.enums
+  assert dyn.tests, "qualified rows must name evidence"
+  user = rows["REQ-DYN-003"]
+  assert user.milestone == "019"
+  assert user.implementation == Implementation.NOT_IMPLEMENTED
