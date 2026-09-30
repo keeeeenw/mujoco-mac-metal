@@ -1069,7 +1069,17 @@ kernel void solve_coupled_constraints(
     // Loose-but-certified solutions are tightened by block refinement in
     // section 9; already-tight ones skip it bit-identically.
     int pgs_cap = maxiter;
-    float win_start = 1e30f;
+    // G3: seed the progress comparison from a real initial residual
+    // (lam starts at zero), not from +inf, so the first extension must
+    // prove improvement over the actual starting point.
+    float win_start = 0.0f;
+    for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+      float grad = -rhs[row];
+      float diag = max(1e-15f, W[row * nr + row] + R[row]);
+      float proj = clamp(-grad / diag, lo[row], hi[row]);
+      float row_scale = max(1.0f, abs(ar[row]));
+      win_start = max(win_start, abs(proj) * diag / row_scale);
+    }
     for (int it = 0; it < pgs_cap; ++it) {
       for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
         float diag = max(1e-15f, W[row * nr + row] + R[row]);
@@ -1109,7 +1119,16 @@ kernel void solve_coupled_constraints(
   // only loosely (res > 1e-7): loose PGS solutions drift on rolling
   // friction while exact block solves match the CPU oracle. Already-tight
   // solutions skip it, bit-identical to before.
+  // G2: refinement changes retained multipliers, so the pre-refinement
+  // certificate must not survive it. Snapshot the certified candidate;
+  // after refinement, re-certify from the FINAL multipliers: revert to the
+  // snapshot if refinement lost certification, fail on nonfinite residuals.
   if ((!converged || max_res > 1e-7f) && contact_block_count > 0 && elliptic_count == 0) {
+    thread float snap_lam[96];
+    for (int r = 0; r < 96; ++r) snap_lam[r] = lam[r];
+    float snap_res = max_res;
+    bool snap_certified = converged;
+    converged = false;
     for (int ref = 0; ref < 256; ++ref) {
       for (int b = 0; b < contact_block_count; ++b) {
         int row_start = contact_block_start[b];
@@ -1174,9 +1193,37 @@ kernel void solve_coupled_constraints(
       out_diagnostics[world * 2 + 1] = float(int(out_diagnostics[world * 2 + 1]) + 1);
       if (max_res <= tol) { converged = true; break; }
     }
+    // G2: certify the FINAL retained multipliers from scratch. Refinement
+    // may have replaced a certified candidate with an uncertified (or
+    // nonfinite) one while other coupled rows stayed fixed: revert to the
+    // snapshot when it was certified, otherwise fail loudly. The status
+    // below therefore always describes the retained solution.
+    if (!isfinite(max_res)) {
+      if (snap_certified) {
+        for (int r = 0; r < 96; ++r) lam[r] = snap_lam[r];
+        max_res = snap_res;
+        converged = true;
+      } else {
+        converged = false;
+      }
+    } else if (max_res > tol) {
+      if (snap_certified) {
+        for (int r = 0; r < 96; ++r) lam[r] = snap_lam[r];
+        max_res = snap_res;
+        converged = true;
+      } else {
+        converged = false;
+      }
+    } else {
+      converged = true;
+    }
+    out_diagnostics[world * 2] = max_res;
   }
 
-  if (!converged && max_res > tol) out_status[world] = 3;
+  // G2: nonfinite residuals fail explicitly (NaN never satisfies `> tol`,
+  // so without this guard a nonfinite solve would report success).
+  if (!isfinite(max_res)) out_status[world] = 3;
+  else if (!converged && max_res > tol) out_status[world] = 3;
 
   // 10. Reconstruct forces and acceleration
   for (int row = 0; row < total_nr; ++row) if (enabled[row]) {

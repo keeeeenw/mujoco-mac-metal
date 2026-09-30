@@ -1013,3 +1013,142 @@ def test_coupled_solver_settings_range_contracts():
     mtol_bad.opt.tolerance = bad_tol
     with pytest.raises(ValueError, match="model.opt.tolerance must be finite and positive"):
       lower_coupled_constraints(mtol_bad)
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_solver_status_matches_final_residual_mixed_gpu():
+  # G2: contact + connect-equality + tendon-limit rows in one coupled solve.
+  # Every step asserts the status/diostics contract (status 0 iff final
+  # residual within tol), an independent CPU recomputation of the equality
+  # block residual, bounded iterations, and trajectory parity.
+  from mujoco_metal import MetalSimulation
+  for tag, xml in (
+      ("eq", """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
+<worldbody>
+<geom name="floor" type="plane" size="5 5 0.1"/>
+<body name="a" pos="0 0 0.1"><freejoint/>
+<geom name="bx" type="box" size="0.05 0.05 0.05" friction="0.8 0.1 0.1"/></body>
+<body name="b" pos="0.3 0 0.3"><freejoint/>
+<geom type="sphere" size="0.04" mass="0.2"/></body>
+</worldbody>
+<equality><connect body1="a" body2="b" anchor="0.15 0 0.2"/></equality>
+</mujoco>"""),
+      ("limit", """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
+<worldbody>
+<geom name="floor" type="plane" size="5 5 0.1" contype="1" conaffinity="1"/>
+<site name="top" pos="0 0 0.9"/>
+<body pos="0 0 0.15"><joint name="j" type="slide" axis="0 0 1"/>
+<geom name="ball" type="sphere" size="0.05" mass="0.5" contype="1" conaffinity="1"/>
+<site name="h" pos="0 0 0"/></body>
+</worldbody>
+<tendon><spatial name="t" limited="true" range="0.5 0.86"><site site="top"/><site site="h"/></spatial></tendon>
+</mujoco>"""),
+  ):
+    m = mujoco.MjModel.from_xml_string(xml)
+    sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+    desc = sim._coupled_constraints.descriptor
+    tol = float(desc.tolerance)
+    neq_rows = int(desc.n_eq_rows)
+    nv, nr = int(desc.nv), int(desc.nr)
+    cpu = mujoco.MjData(m)
+    sim.reset()
+    mujoco.mj_forward(m, cpu)
+    max_err = 0.0
+    saw_contact = False
+    for _ in range(150):
+      sim.step(1)
+      mujoco.mj_step(m, cpu)
+      asm = sim._last_coupled
+      st = int(sim.state.status.cpu().numpy()[0])
+      dg = asm["solver_diagnostics"][0].cpu().numpy()
+      res, iters = float(dg[0]), float(dg[1])
+      assert np.isfinite(res), (tag, res)
+      # G2 invariant: status describes the FINAL residual.
+      assert (st == 0) == (res <= tol), (tag, st, res, tol)
+      # G3 invariant: actual work stays within the adaptive cap.
+      assert iters <= 1024, (tag, iters)
+      if cpu.ncon > 0:
+        saw_contact = True
+      if st == 0 and neq_rows > 0:
+        # Independent CPU recomputation of the unbounded equality block:
+        # residual |grad|/scale over rows [0, neq_rows).
+        W = np.asarray(asm["W"].cpu().numpy()).reshape(nr, nr)
+        R = np.asarray(asm["R"].cpu().numpy()).reshape(nr)
+        rhs = np.asarray(asm["rhs"].cpu().numpy()).reshape(nr)
+        lam = np.asarray(asm["lambda"].cpu().numpy()).reshape(nr)
+        ar = np.asarray(asm["ar"].cpu().numpy()).reshape(nr)
+        worst = 0.0
+        for r in range(neq_rows):
+          grad = -rhs[r] + float(W[r] @ lam) + R[r] * lam[r]
+          scale = max(1.0, abs(ar[r]) + abs(R[r] * lam[r])
+                      + float(np.sum(np.abs(W[r] * lam))))
+          worst = max(worst, abs(grad) / scale)
+        assert worst <= tol, (tag, worst, tol)
+      gq = sim.state.qpos.cpu().numpy()[0]
+      max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+    assert saw_contact, tag  # contact rows actually engaged
+    assert max_err < 5e-3, (tag, max_err)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_low_budget_pyramidal_reports_honestly():
+  # G3: with iterations=1 the pyramidal path may still certify via exact
+  # block refinement; either way the reported status must agree with the
+  # final residual, the residual must be finite, and actual work >= 1.
+  # (Status 3 under true exhaustion is covered by the elliptic test and
+  # the sticky-failure test below.)
+  import torch
+
+  xml = '''<mujoco><option timestep=".002" gravity="0 0 -9.81"
+      iterations="1" tolerance="1e-8"/>
+    <worldbody><geom type="plane" size="2 2 .1" condim="3" friction=".8 .6 .07"/>
+      <body pos="0 0 .095"><freejoint/><geom type="box" size=".2 .15 .1"
+          mass="1" condim="3" friction=".8 .6 .07"/></body>
+    </worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  qpos = model.qpos0[None, :].astype(np.float32)
+  qvel = np.array([[.3, -.2, .1, 1.3, -2.1, 3.4]], dtype=np.float32)
+  qpos_mps = torch.as_tensor(qpos, device="mps")
+  qvel_mps = torch.as_tensor(qvel, device="mps")
+  model_desc = load_model(model)
+  poses = MetalKinematics(model_desc, 1).run_device(qpos_mps)
+  dynamics = MetalSmoothDynamics(model_desc, 1).run_device(qpos_mps, qvel_mps)
+  result = MetalCoupledConstraints(model, 1).run_device(
+      poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
+  )
+  tol = float(MetalCoupledConstraints(model, 1).descriptor.tolerance)
+  diagnostic = result["solver_diagnostics"][0].cpu().numpy()
+  res, iters = float(diagnostic[0]), float(diagnostic[1])
+  assert np.isfinite(res)
+  assert iters >= 1, diagnostic
+  assert (int(result["status"][0]) == 0) == (res <= tol), diagnostic
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_solver_failure_is_sticky_until_reset_gpu():
+  # G2/G3: a failed world keeps status 3 across steps until reset clears it.
+  from mujoco_metal import MetalSimulation
+  xml = '''<mujoco><option timestep=".002" gravity="0 0 -9.81"
+      iterations="1" tolerance="1e-8"/>
+    <worldbody><geom type="plane" size="2 2 .1" condim="3" friction=".8 .6 .07"/>
+      <body pos="0 0 .3"><freejoint/><geom type="box" size=".05 .05 .1"
+          mass="0.5" condim="3" friction=".8 .6 .07"/></body>
+    </worldbody></mujoco>'''
+  m = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  sim.reset()
+  failed_at = None
+  for step in range(150):
+    sim.step(1)
+    if int(sim.state.status.cpu().numpy()[0]) == 3 and failed_at is None:
+      failed_at = step
+  assert failed_at is not None, "expected a solver failure before step 150"
+  # Sticky: further stepping preserves the failure.
+  sim.step(5)
+  assert int(sim.state.status.cpu().numpy()[0]) == 3
+  # Reset clears it.
+  sim.reset()
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+
+
