@@ -204,6 +204,60 @@ def test_tendon_limit_native_parity_gpu():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_spatial_limit_native_parity_gpu():
+  # R8-gap: curved spatial rows through the limit machinery (not fixed).
+  from mujoco_metal import MetalSimulation
+  m = _model(_slide_world(),
+             '<spatial name="t"><site site="s0"/><site site="s2"/><site site="s1"/></spatial>')
+  d0 = mujoco.MjData(m)
+  mujoco.mj_forward(m, d0)
+  l0 = float(np.asarray(d0.ten_length)[0])
+  m.tendon_limited[0] = True
+  m.tendon_range[0] = [l0 - 0.5, l0 + 0.05]
+  m.tendon_margin[0] = 0.02
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  cpu = mujoco.MjData(m)
+  cpu.qpos[0] = 0.3  # stretches the path past the upper limit
+  mujoco.mj_forward(m, cpu)
+  assert cpu.nefc >= 1
+  sim.reset(qpos=np.array([[0.3]], dtype=np.float32),
+            qvel=np.array([[1.0]], dtype=np.float32))
+  cpu.qvel[0] = 1.0
+  max_err = 0.0
+  for _ in range(40):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+    gq = sim.state.qpos.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+  assert max_err < 5e-4, max_err
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_spatial_friction_native_parity_gpu():
+  # R8-gap: frictionloss rows built from curved spatial Jacobians.
+  from mujoco_metal import MetalSimulation
+  m = _model(_slide_world(),
+             '<spatial name="t"><site site="s0"/><site site="s2"/><site site="s1"/></spatial>')
+  m.tendon_frictionloss[0] = 0.5
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  cpu = mujoco.MjData(m)
+  cpu.qpos[0] = 0.0
+  cpu.qvel[0] = 2.0
+  mujoco.mj_forward(m, cpu)
+  sim.reset(qpos=np.array([[0.0]], dtype=np.float32),
+            qvel=np.array([[2.0]], dtype=np.float32))
+  max_err = 0.0
+  for _ in range(40):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+    gq = sim.state.qpos.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+  assert max_err < 5e-4, max_err
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_tendon_friction_native_parity_gpu():
   from mujoco_metal import MetalSimulation
   m = _model(_slide_world(),
@@ -310,17 +364,21 @@ def test_total_wrap_overflow_rejected_cpu():
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_slack_taut_and_mixed_model_gpu():
   from mujoco_metal import MetalSimulation
-  # Spring engages only outside its rest range (slack inside).
+  # Fixed tendon spring with a rest range: force is exactly zero while the
+  # length is inside, nonzero outside (slack/taut with measured force).
   m = _model(_slide_world(),
-             '<fixed name="f"><joint joint="j" coef="1.0"/></fixed>'
+             '<fixed name="f" stiffness="50" springlength="-0.1 0.1"><joint joint="j" coef="1.0"/></fixed>'
              '<spatial name="t"><site site="s0"/><site site="s2"/><site site="s1"/></spatial>')
   assert m.ntendon == 2
   sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
   assert sim._spatial_tendons is not None
   cpu = mujoco.MjData(m)
-  sim.reset(qpos=np.array([[0.1]], dtype=np.float32))
-  cpu.qpos[0] = 0.1
+  sim.reset(qpos=np.array([[0.0]], dtype=np.float32))
+  cpu.qpos[0] = 0.0
   mujoco.mj_forward(m, cpu)
+  # Inside the rest range the spring is slack: zero acceleration.
+  mujoco.mj_forward(m, cpu)
+  np.testing.assert_allclose(float(np.asarray(cpu.qacc)[0]), 0.0, atol=1e-9)
   max_err = 0.0
   for _ in range(40):
     sim.step(1)
@@ -328,6 +386,20 @@ def test_slack_taut_and_mixed_model_gpu():
     gq = sim.state.qpos.cpu().numpy()[0]
     max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
   assert max_err < 5e-4, max_err
+  # Outside the range the spring pulls: displace and compare force + motion.
+  sim.reset(qpos=np.array([[0.5]], dtype=np.float32))
+  cpu.qpos[0] = 0.5
+  mujoco.mj_forward(m, cpu)
+  asm = sim.assembled_system(recompute=True)
+  assert asm is not None
+  for _ in range(40):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+    gq = sim.state.qpos.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+  assert max_err < 5e-4, max_err
+  # Spring actually engaged: displaced run differs from free drift.
+  assert abs(float(sim.state.qpos.cpu().numpy()[0, 0]) - 0.5) > 0.01
 
 
 def test_spatial_armature_contract_cpu():  # R3: wrapped + armature is rejected by the compiler itself; the lowering
