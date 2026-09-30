@@ -154,6 +154,7 @@ def smooth_dynamics(model: ModelDescriptor, qpos, qvel):
           "nq",
           "nv",
           "nu",
+          "nmocap",
           "nbody",
           "njnt",
           "ngeom",

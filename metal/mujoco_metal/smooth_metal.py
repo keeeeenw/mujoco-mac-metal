@@ -128,13 +128,16 @@ class MetalSmoothDynamics:
         ),
     }
 
-  def run_device(self, qpos, qvel):
+  def run_device(self, qpos, qvel, mocap_pos=None, mocap_quat=None):
     """Compute M(q) and bias from borrowed MPS float32 state tensors.
 
     Inputs are trusted to be finite and have finite nonzero free/ball
     quaternions. Device-state reset owns value validation; this hot path checks
     tensor metadata only and never reads a device value back to the host.
     Results borrow persistent workspace and remain valid until its next use.
+
+    Mocap poses follow the `MetalKinematics.run_device` contract (required
+    when the model has mocap bodies, omitted otherwise).
     """
     torch = self._torch
     if not isinstance(qpos, torch.Tensor) or qpos.ndim != 2:
@@ -159,7 +162,7 @@ class MetalSmoothDynamics:
 
     # The kernel only reads qpos/qvel, so flattening is a view. For nv=0 the
     # unused argument gets valid dummy storage for MSL's non-null ABI.
-    poses = self._fk.run_device(qpos)
+    poses = self._fk.run_device(qpos, mocap_pos, mocap_quat)
     w, arrays = self._workspace, self._arrays
     qvel_flat = qvel.reshape(-1) if self.model.nv else w["qvel"]
     args = [
@@ -231,7 +234,7 @@ class MetalSmoothDynamics:
         "cdof_dot": w["cdof_dot"][: batch * nv * 6].reshape(batch, nv, 6),
     }
 
-  def _compute_mass_matrix(self, qpos_batch):
+  def _compute_mass_matrix(self, qpos_batch, mocap_pos=None, mocap_quat=None):
     source = np.asarray(qpos_batch, dtype=np.float64)
     if source.ndim == 1:
       source = source[None, :]
@@ -250,7 +253,7 @@ class MetalSmoothDynamics:
       raise ValueError("qpos cannot be represented as finite float32")
 
     # FK validates and normalizes its own float32 input before allocating MPS.
-    poses = self._fk.run(source)
+    poses = self._fk.run(source, mocap_pos, mocap_quat)
     batch = source.shape[0]
     nv, nb = self.model.nv, self.model.nbody
     torch = self._torch
@@ -314,7 +317,7 @@ class MetalSmoothDynamics:
     """Compute dense generalized inertia for a batch, returning MPS output."""
     return self._compute_mass_matrix(qpos_batch)["mass_matrix"]
 
-  def run(self, qpos_batch, qvel_batch):
+  def run(self, qpos_batch, qvel_batch, mocap_pos=None, mocap_quat=None):
     """Return batched mass matrices and inertial/gravity bias on MPS."""
     qpos = np.asarray(qpos_batch, dtype=np.float64)
     if qpos.ndim == 1:

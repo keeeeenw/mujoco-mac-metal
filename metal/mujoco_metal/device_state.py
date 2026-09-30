@@ -81,9 +81,12 @@ class StateSnapshot:
   schema_version: int = 1
   neq: int = 0
   eq_active: np.ndarray | None = None
+  nmocap: int = 0
+  mpos: np.ndarray | None = None
+  mquat: np.ndarray | None = None
 
   def __post_init__(self):
-    if self.schema_version not in (1, 2):
+    if self.schema_version not in (1, 2, 3):
       raise ValueError("unsupported state snapshot schema")
     if self.batch_size <= 0 or self.nq < 0 or self.nv < 0 or self.neq < 0:
       raise ValueError("invalid state snapshot dimensions")
@@ -112,13 +115,18 @@ class StateSnapshot:
     status = np.asarray(raw_status, dtype=np.int32, order="C")
     frozen = np.frombuffer(status.tobytes(), dtype=np.int32).reshape((batch,))
     object.__setattr__(self, "status", frozen)
-    # Equality activity (schema 2). Version 1 never carries activity and must
+    # Equality activity (schema 2+). Version 1 never carries activity and must
     # never be silently upgraded for models with equalities.
     if self.schema_version == 1:
       if self.neq != 0 or self.eq_active is not None:
         raise ValueError("schema 1 snapshots must not carry equality activity")
+      if self.nmocap != 0 or self.mpos is not None or self.mquat is not None:
+        raise ValueError("schema 1 snapshots must not carry mocap poses")
       object.__setattr__(self, "neq", 0)
       object.__setattr__(self, "eq_active", None)
+      object.__setattr__(self, "nmocap", 0)
+      object.__setattr__(self, "mpos", None)
+      object.__setattr__(self, "mquat", None)
     else:
       if self.neq < 0:
         raise ValueError("invalid equality dimensions")
@@ -135,6 +143,41 @@ class StateSnapshot:
           raise ValueError("eq_active values must be 0 or 1")
         frozen_eq = np.frombuffer(eq.tobytes(), dtype=np.int32).reshape((batch, self.neq))
         object.__setattr__(self, "eq_active", frozen_eq)
+      if self.schema_version == 2:
+        if self.nmocap != 0 or self.mpos is not None or self.mquat is not None:
+          raise ValueError("schema 2 snapshots must not carry mocap poses")
+        object.__setattr__(self, "nmocap", 0)
+        object.__setattr__(self, "mpos", None)
+        object.__setattr__(self, "mquat", None)
+      else:
+        if self.nmocap < 0:
+          raise ValueError("invalid mocap dimensions")
+        if self.nmocap == 0:
+          if self.mpos is not None or self.mquat is not None:
+            raise ValueError("snapshots without mocap bodies must not carry mocap poses")
+          object.__setattr__(self, "mpos", None)
+          object.__setattr__(self, "mquat", None)
+        else:
+          object.__setattr__(
+              self, "mpos", _freeze_float32(self.mpos, (batch, self.nmocap, 3), "mpos")
+          )
+          raw_quat = np.asarray(self.mquat)
+          if raw_quat.shape != (batch, self.nmocap, 4) or raw_quat.dtype.kind not in "fiu":
+            raise ValueError(
+                f"mquat must be numeric with shape ({batch}, {self.nmocap}, 4)"
+            )
+          with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            quat = np.asarray(raw_quat, dtype=np.float32, order="C")
+          if not np.all(np.isfinite(quat)):
+            raise ValueError("mquat must be finite and representable as float32")
+          norms = np.linalg.norm(quat.astype(np.float64).reshape(-1, 4), axis=1)
+          if np.any(~np.isfinite(norms)) or np.any(np.abs(norms - 1) > 1e-5):
+            raise ValueError("mquat must hold unit quaternions")
+          object.__setattr__(
+              self, "mquat",
+              np.frombuffer(quat.tobytes(), dtype=np.float32).reshape(
+                  (batch, self.nmocap, 4)),
+          )
 
 
 class DeviceState:
@@ -209,6 +252,37 @@ class DeviceState:
       eq0 = np.zeros(0, dtype=np.int32)
     self._eq_active0 = np.frombuffer(eq0.tobytes(), dtype=np.int32).reshape(eq0.shape)
 
+    # Prescribed mocap poses: one position/quaternion per mocap body per
+    # environment, initialized from the compiled reference body frames (the
+    # pinned `mj_resetData` defaults). Descriptor inputs carry no mocap
+    # metadata beyond counts and also start from reference frames.
+    if isinstance(model, mujoco.MjModel):
+      self._nmocap = int(model.nmocap)
+      mocapid = np.asarray(model.body_mocapid)
+      ref_pos = np.asarray(model.body_pos)
+      ref_quat = np.asarray(model.body_quat)
+    else:
+      self._nmocap = int(descriptor.nmocap)
+      mocapid = np.asarray(descriptor.body_mocapid)
+      ref_pos = np.asarray(descriptor.body_pos)
+      ref_quat = np.asarray(descriptor.body_quat)
+    mpos0 = np.zeros((self._nmocap, 3), dtype=np.float32)
+    mquat0 = np.zeros((self._nmocap, 4), dtype=np.float32)
+    mquat0[:, 0] = 1.0
+    for bid in range(int(descriptor.nbody)):
+      mid = int(mocapid[bid]) if bid < len(mocapid) else -1
+      if 0 <= mid < self._nmocap:
+        mpos0[mid] = ref_pos[bid]
+        mquat0[mid] = ref_quat[bid]
+    if self._nmocap and (
+        not np.all(np.isfinite(mpos0))
+        or not np.all(np.isfinite(mquat0))
+        or np.any(np.abs(np.linalg.norm(mquat0, axis=1) - 1.0) > 1e-6)
+    ):
+      raise ValueError("compiled mocap reference frames must be finite with unit quaternions")
+    self._mpos0 = np.frombuffer(mpos0.tobytes(), dtype=np.float32).reshape(mpos0.shape)
+    self._mquat0 = np.frombuffer(mquat0.tobytes(), dtype=np.float32).reshape(mquat0.shape)
+
     initial_qpos = np.broadcast_to(
         descriptor.qpos0, (self.batch_size, descriptor.nq)
     ).copy()
@@ -256,7 +330,31 @@ class DeviceState:
       self._eq_active = torch.as_tensor(init_eq, dtype=torch.int32, device=self._device).clone()
     else:
       self._eq_active = None
+    if self._nmocap > 0:
+      init_pos = np.broadcast_to(self._mpos0, (self.batch_size, self._nmocap, 3)).copy()
+      init_quat = np.broadcast_to(self._mquat0, (self.batch_size, self._nmocap, 4)).copy()
+      self._mpos = torch.as_tensor(init_pos, dtype=torch.float32, device=self._device).clone()
+      self._mquat = torch.as_tensor(init_quat, dtype=torch.float32, device=self._device).clone()
+    else:
+      self._mpos = None
+      self._mquat = None
     self._generation = 0
+
+  @property
+  def nmocap(self):
+    return self._nmocap
+
+  @property
+  def mocap_pos(self):
+    if self._mpos is None:
+      return None
+    return self._mpos.detach().clone()
+
+  @property
+  def mocap_quat(self):
+    if self._mquat is None:
+      return None
+    return self._mquat.detach().clone()
 
   @property
   def neq(self):
@@ -418,11 +516,154 @@ class DeviceState:
     self._generation += 1
     return self._generation
 
-  def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None):
+  def _checked_mocap_pair(self, pos, quat, count):
+    """Validate one mocap pose batch; returns float32 copies or raises."""
+    pos_arr = np.asarray(pos, dtype=np.float64)
+    quat_arr = np.asarray(quat, dtype=np.float64)
+    if pos_arr.shape != (count, self._nmocap, 3) or not np.all(np.isfinite(pos_arr)):
+      raise ValueError(
+          f"mocap_pos must be finite with shape ({count}, {self._nmocap}, 3)"
+      )
+    if quat_arr.shape != (count, self._nmocap, 4):
+      raise ValueError(
+          f"mocap_quat must have shape ({count}, {self._nmocap}, 4)"
+      )
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+      pos32 = np.asarray(pos_arr, dtype=np.float32, order="C")
+      quat32 = np.asarray(quat_arr, dtype=np.float32, order="C")
+    if not np.all(np.isfinite(pos32)) or not np.all(np.isfinite(quat32)):
+      raise ValueError("mocap poses must be representable as finite float32")
+    norms = np.linalg.norm(quat32.astype(np.float64).reshape(-1, 4), axis=1)
+    if np.any(~np.isfinite(norms)) or np.any(np.abs(norms - 1) > 1e-5):
+      raise ValueError("mocap_quat must hold unit quaternions")
+    return pos32.copy(), quat32.copy()
+
+  def set_mocap(self, pos, quat=None, env_ids=None):
+    """Update prescribed mocap poses for selected environments.
+
+    Accepts host arrays or contiguous float32 MPS/CPU tensors. Shapes follow
+    the equality-activity convention: ``(nmocap, 3)``/``(nmocap, 4)`` broadcast
+    to all selected worlds, or ``(len(env_ids), nmocap, 3/4)`` per world.
+    Alternatively pass a single ``(len(env_ids), nmocap, 7)`` posquat array as
+    ``pos`` with ``quat=None``. Inputs are copied, never borrowed or modified;
+    validation is atomic and sticky failure status is preserved. Changes take
+    effect on the next step/assembly.
+    """
+    if self._nmocap == 0:
+      raise ValueError("model has no mocap bodies")
+    ids = self._env_ids(env_ids)
+    if not ids.size:
+      return self._generation
+    count = ids.size
+    torch = self._torch
+    if quat is None and isinstance(pos, torch.Tensor):
+      if pos.dtype != torch.float32 or not pos.is_contiguous():
+        raise ValueError("mocap posquat tensor must be contiguous float32")
+      if tuple(pos.shape) == (count, self._nmocap, 7):
+        host = pos.detach().to("cpu").numpy()
+        pos_h, quat_h = host[..., :3], host[..., 3:]
+      elif tuple(pos.shape) == (self._nmocap, 7):
+        host = pos.detach().to("cpu").numpy()
+        pos_h = np.broadcast_to(host[..., :3], (count, self._nmocap, 3)).copy()
+        quat_h = np.broadcast_to(host[..., 3:], (count, self._nmocap, 4)).copy()
+      else:
+        raise ValueError(
+            f"mocap posquat tensor must have shape ({count}, {self._nmocap}, 7)"
+          f" or ({self._nmocap}, 7)"
+        )
+      checked_pos, checked_quat = self._checked_mocap_pair(pos_h, quat_h, count)
+    elif quat is None:
+      arr = np.asarray(pos)
+      if arr.shape == (self._nmocap, 7):
+        pos_h = np.broadcast_to(arr[..., :3], (count, self._nmocap, 3)).copy()
+        quat_h = np.broadcast_to(arr[..., 3:], (count, self._nmocap, 4)).copy()
+      elif arr.shape == (count, self._nmocap, 7):
+        pos_h, quat_h = arr[..., :3].copy(), arr[..., 3:].copy()
+      else:
+        raise ValueError(
+          f"mocap posquat must have shape ({self._nmocap}, 7) or "
+          f"({count}, {self._nmocap}, 7), got {arr.shape}"
+        )
+      checked_pos, checked_quat = self._checked_mocap_pair(pos_h, quat_h, count)
+    else:
+      if isinstance(pos, torch.Tensor) or isinstance(quat, torch.Tensor):
+        if not isinstance(pos, torch.Tensor) or not isinstance(quat, torch.Tensor):
+          raise ValueError("mocap pos and quat must both be tensors or both arrays")
+        for tensor, want, name in (
+            (pos, (count, self._nmocap, 3), "mocap_pos"),
+            (quat, (count, self._nmocap, 4), "mocap_quat"),
+        ):
+          if tensor.dtype != torch.float32 or not tensor.is_contiguous():
+            raise ValueError(f"{name} tensor must be contiguous float32")
+        pos_shapes = [tuple(pos.shape)]
+        quat_shapes = [tuple(quat.shape)]
+        if pos_shapes[0] == (self._nmocap, 3) and quat_shapes[0] == (self._nmocap, 4):
+          pos_h = pos.detach().to("cpu").numpy()
+          quat_h = quat.detach().to("cpu").numpy()
+          pos_h = np.broadcast_to(pos_h, (count, self._nmocap, 3)).copy()
+          quat_h = np.broadcast_to(quat_h, (count, self._nmocap, 4)).copy()
+        elif pos_shapes[0] == (count, self._nmocap, 3) and quat_shapes[0] == (count, self._nmocap, 4):
+          pos_h = pos.detach().to("cpu").numpy()
+          quat_h = quat.detach().to("cpu").numpy()
+        else:
+          raise ValueError(
+            f"mocap pos/quat tensors must have shapes ({count}, {self._nmocap}, 3/4)"
+            f" or ({self._nmocap}, 3/4)"
+          )
+        checked_pos, checked_quat = self._checked_mocap_pair(pos_h, quat_h, count)
+      else:
+        pos_h = np.asarray(pos)
+        quat_h = np.asarray(quat)
+        if pos_h.shape == (self._nmocap, 3) and quat_h.shape == (self._nmocap, 4):
+          pos_h = np.broadcast_to(pos_h, (count, self._nmocap, 3)).copy()
+          quat_h = np.broadcast_to(quat_h, (count, self._nmocap, 4)).copy()
+        checked_pos, checked_quat = self._checked_mocap_pair(pos_h, quat_h, count)
+    index = torch.as_tensor(ids, dtype=torch.int64, device=self._device)
+    pos_tensor = torch.as_tensor(checked_pos, dtype=torch.float32, device=self._device)
+    quat_tensor = torch.as_tensor(checked_quat, dtype=torch.float32, device=self._device)
+    next_pos = self._mpos.clone()
+    next_quat = self._mquat.clone()
+    next_pos.index_copy_(0, index, pos_tensor)
+    next_quat.index_copy_(0, index, quat_tensor)
+    self._mpos, self._mquat = next_pos, next_quat
+    self._generation += 1
+    return self._generation
+
+  def copy_environment(self, src, dst):
+    """Copy every state row (qpos/qvel/qacc/time/status/eq/mocap) src -> dst."""
+    for name, value in (("src", src), ("dst", dst)):
+      raw = np.asarray(value)
+      if raw.shape != () or raw.dtype.kind not in "iu":
+        raise ValueError("src/dst must be integer environment indices")
+    src_i, dst_i = int(np.asarray(src)), int(np.asarray(dst))
+    for index in (src_i, dst_i):
+      if not 0 <= index < self.batch_size:
+        raise ValueError("environment index out of range")
+    for tensor_name in ("_qpos", "_qvel", "_qacc", "_time", "_status"):
+      tensor = getattr(self, tensor_name).clone()
+      tensor[dst_i] = getattr(self, tensor_name)[src_i]
+      setattr(self, tensor_name, tensor)
+    if self._eq_active is not None:
+      tensor = self._eq_active.clone()
+      tensor[dst_i] = self._eq_active[src_i]
+      self._eq_active = tensor
+    if self._mpos is not None:
+      pos = self._mpos.clone()
+      quat = self._mquat.clone()
+      pos[dst_i] = self._mpos[src_i]
+      quat[dst_i] = self._mquat[src_i]
+      self._mpos, self._mquat = pos, quat
+    self._generation += 1
+    return self._generation
+
+  def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
+            mocap_pos=None, mocap_quat=None):
     """Reset selected rows atomically from checked host arrays or model defaults.
 
     `eq_active=None` restores compiled defaults for selected worlds; pass an
     explicit `(neq,)` or `(len(env_ids), neq)` boolean/integer array to override.
+    `mocap_pos`/`mocap_quat=None` restore compiled reference frames; pass
+    explicit `(nmocap, 3/4)` or `(len(env_ids), nmocap, 3/4)` arrays to override.
     Unselected worlds keep their activity. Validation is atomic.
     """
     ids = self._env_ids(env_ids)
@@ -433,13 +674,40 @@ class DeviceState:
         self._model.qpos0, (count, self._model.nq)
     ).copy()
     vel_default = np.zeros((count, self._model.nv), dtype=np.float32)
-    pos = pos_default if qpos is None else self._host_values(
-        qpos, pos_default.shape, "qpos"
-    )
-    vel = vel_default if qvel is None else self._host_values(
-        qvel, vel_default.shape, "qvel"
-    )
+    if qpos is None:
+      pos = pos_default
+    else:
+      arr = np.asarray(qpos)
+      if arr.shape == (self._model.nq,):
+        arr = np.broadcast_to(arr, (count, self._model.nq)).copy()
+      pos = self._host_values(arr, pos_default.shape, "qpos")
+    if qvel is None:
+      vel = vel_default
+    else:
+      arr = np.asarray(qvel)
+      if arr.shape == (self._model.nv,):
+        arr = np.broadcast_to(arr, (count, self._model.nv)).copy()
+      vel = self._host_values(arr, vel_default.shape, "qvel")
     pos = self._validate_qpos(pos)
+    if self._nmocap == 0:
+      if mocap_pos is not None or mocap_quat is not None:
+        raise ValueError("model has no mocap bodies")
+      mocap_checked = None
+    else:
+      if mocap_pos is None and mocap_quat is None:
+        mocap_checked = (
+          np.broadcast_to(self._mpos0, (count, self._nmocap, 3)).copy(),
+          np.broadcast_to(self._mquat0, (count, self._nmocap, 4)).copy(),
+        )
+      elif mocap_pos is None or mocap_quat is None:
+        raise ValueError("mocap_pos and mocap_quat must be given together")
+      else:
+        pos_h = np.asarray(mocap_pos)
+        quat_h = np.asarray(mocap_quat)
+        if pos_h.shape == (self._nmocap, 3) and quat_h.shape == (self._nmocap, 4):
+          pos_h = np.broadcast_to(pos_h, (count, self._nmocap, 3)).copy()
+          quat_h = np.broadcast_to(quat_h, (count, self._nmocap, 4)).copy()
+        mocap_checked = self._checked_mocap_pair(pos_h, quat_h, count)
     if self._neq == 0:
       if eq_active is not None:
         raise ValueError("model has no equalities")
@@ -491,12 +759,22 @@ class DeviceState:
       eq_tensor = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)
       next_eq.index_copy_(0, index, eq_tensor)
       self._eq_active = next_eq
+    if self._nmocap > 0:
+      next_pos = self._mpos.clone()
+      next_quat = self._mquat.clone()
+      next_pos.index_copy_(
+          0, index,
+          self._torch.as_tensor(mocap_checked[0], dtype=self._torch.float32, device=self._device))
+      next_quat.index_copy_(
+          0, index,
+          self._torch.as_tensor(mocap_checked[1], dtype=self._torch.float32, device=self._device))
+      self._mpos, self._mquat = next_pos, next_quat
     self._generation += 1
     return self._generation
 
   def snapshot(self):
     """Copy all state to an immutable host checkpoint outside the step loop."""
-    if self._neq == 0:
+    if self._neq == 0 and self._nmocap == 0:
       return StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
@@ -513,7 +791,8 @@ class DeviceState:
         neq=0,
         eq_active=None,
       )
-    return StateSnapshot(
+    if self._nmocap == 0:
+      return StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
         timestep=self.profile.timestep,
@@ -528,13 +807,32 @@ class DeviceState:
         schema_version=2,
         neq=self._neq,
         eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
+      )
+    return StateSnapshot(
+        model_fingerprint=self._model_fingerprint,
+        profile_fingerprint=self._profile_fingerprint,
+        timestep=self.profile.timestep,
+        nq=self._model.nq,
+        nv=self._model.nv,
+        batch_size=self.batch_size,
+        qpos=self._qpos.detach().cpu().numpy(),
+        qvel=self._qvel.detach().cpu().numpy(),
+        qacc=self._qacc.detach().cpu().numpy(),
+        time=self._time.detach().cpu().numpy(),
+        status=self._status.detach().cpu().numpy(),
+        schema_version=3,
+        neq=self._neq,
+        eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
+        nmocap=self._nmocap,
+        mpos=self._mpos.detach().cpu().numpy(),
+        mquat=self._mquat.detach().cpu().numpy(),
     )
 
   def restore(self, snapshot):
     """Restore a matching checkpoint only after validating every field."""
     if not isinstance(snapshot, StateSnapshot):
       raise TypeError("snapshot must be a StateSnapshot")
-    if snapshot.schema_version not in (1, 2):
+    if snapshot.schema_version not in (1, 2, 3):
       raise ValueError("unsupported state snapshot schema")
     if (
         snapshot.model_fingerprint != self._model_fingerprint
@@ -547,7 +845,7 @@ class DeviceState:
       raise ValueError("snapshot model, profile, timestep, or dimensions do not match")
     # Equality compatibility: never silently lose activity.
     if self._neq == 0:
-      if snapshot.schema_version == 2 and snapshot.neq != 0:
+      if snapshot.schema_version >= 2 and snapshot.neq != 0:
         raise ValueError("snapshot equality dimensions do not match")
       eq_checked = None
     else:
@@ -560,6 +858,24 @@ class DeviceState:
         raise ValueError("snapshot equality dimensions do not match")
       eq_checked = self._validate_eq_active(
           snapshot.eq_active, (self.batch_size, self._neq), "eq_active"
+      )
+    # Mocap compatibility: never silently lose prescribed poses.
+    if self._nmocap == 0:
+      if snapshot.schema_version == 3 and (
+          snapshot.nmocap != 0 or snapshot.mpos is not None or snapshot.mquat is not None
+      ):
+        raise ValueError("snapshot mocap dimensions do not match")
+      mocap_checked = None
+    else:
+      if snapshot.schema_version < 3:
+        raise ValueError(
+            "snapshot schema <3 has no mocap poses; refusing to restore "
+            "into a model with mocap bodies (would silently lose poses)"
+        )
+      if snapshot.nmocap != self._nmocap:
+        raise ValueError("snapshot mocap dimensions do not match")
+      mocap_checked = self._checked_mocap_pair(
+          snapshot.mpos, snapshot.mquat, self.batch_size
       )
     qpos = self._validate_qpos(
         self._host_values(snapshot.qpos, (self.batch_size, self._model.nq), "qpos")
@@ -595,5 +911,12 @@ class DeviceState:
     self._qpos, self._qvel, self._qacc, self._time, self._status = tensors
     if self._neq > 0:
       self._eq_active = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)
+    if self._nmocap > 0:
+      self._mpos = self._torch.as_tensor(mocap_checked[0], dtype=self._torch.float32, device=self._device)
+      self._mquat = self._torch.as_tensor(mocap_checked[1], dtype=self._torch.float32, device=self._device)
     self._generation += 1
     return self._generation
+
+  def reset_to_default(self, env_ids=None):
+    """Reset selected worlds to compiled qpos0/eq_active0/mocap reference frames."""
+    return self.reset(env_ids=env_ids)

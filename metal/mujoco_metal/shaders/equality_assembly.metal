@@ -343,13 +343,25 @@ kernel void equality_assembly(
       float B = r1 > 0.0f ? 2.0f / max(1e-15f, d_width * r0) : -r1 / d_width;
       float R = max(1e-15f, (1.0f - imp) * diag / imp);
 
+      // Degenerate empty Jacobian with zero inverse weight (e.g. both sides
+      // mocap/world-fixed) matches MuJoCo skipping the constraint: force all
+      // rows to exact zero so multipliers stay zero.
+      float jmax = 0.0f;
+      for (int i = 0; i < nv; ++i) {
+        jmax = max(jmax, abs(J1[0 * 32 + i] - J2[0 * 32 + i]));
+        jmax = max(jmax, abs(J1[1 * 32 + i] - J2[1 * 32 + i]));
+        jmax = max(jmax, abs(J1[2 * 32 + i] - J2[2 * 32 + i]));
+      }
+      bool degenerate = (jmax == 0.0f && (w1 + w2) == 0.0f);
+      if (degenerate) R = 0.0f;
+
       for (int k = 0; k < 3; ++k) {
         int row = rowadr + k;
         if (row < 0 || row >= nr) continue;
         float c = k == 0 ? cpos.x : (k == 1 ? cpos.y : cpos.z);
         float v = k == 0 ? vel.x : (k == 1 ? vel.y : vel.z);
         float jd = k == 0 ? jdv.x : (k == 1 ? jdv.y : jdv.z);
-        float ar = -B * v - K * imp * c - jd;
+        float ar = degenerate ? 0.0f : (-B * v - K * imp * c - jd);
         for (int i = 0; i < nv; ++i) {
           float j1v = k == 0 ? J1[0 * 32 + i] : (k == 1 ? J1[1 * 32 + i] : J1[2 * 32 + i]);
           float j2v = k == 0 ? J2[0 * 32 + i] : (k == 1 ? J2[1 * 32 + i] : J2[2 * 32 + i]);
@@ -473,13 +485,27 @@ kernel void equality_assembly(
       float R_t = max(1e-15f, (1.0f - imp) * diag_t / imp);
       float R_r = max(1e-15f, (1.0f - imp) * diag_r / imp);
 
+      // Degenerate empty Jacobian with zero inverse weight on both sides
+      // (e.g. both-mocap weld) matches MuJoCo skipping the constraint.
+      float jmax = 0.0f;
+      for (int i = 0; i < nv; ++i) {
+        jmax = max(jmax, abs(Jp1[0 * 32 + i] - Jp2[0 * 32 + i]));
+        jmax = max(jmax, abs(Jp1[1 * 32 + i] - Jp2[1 * 32 + i]));
+        jmax = max(jmax, abs(Jp1[2 * 32 + i] - Jp2[2 * 32 + i]));
+        jmax = max(jmax, abs(Jrot[0 * 32 + i]));
+        jmax = max(jmax, abs(Jrot[1 * 32 + i]));
+        jmax = max(jmax, abs(Jrot[2 * 32 + i]));
+      }
+      bool degenerate = (jmax == 0.0f && (w1t + w2t) == 0.0f && (w1r + w2r) == 0.0f);
+      if (degenerate) { R_t = 0.0f; R_r = 0.0f; }
+
       for (int k = 0; k < 3; ++k) {
         int row = rowadr + k;
         if (row < 0 || row >= nr) continue;
         float c = k == 0 ? cpos_t.x : (k == 1 ? cpos_t.y : cpos_t.z);
         float v = k == 0 ? vel_t.x : (k == 1 ? vel_t.y : vel_t.z);
         float jd = k == 0 ? jdv_t.x : (k == 1 ? jdv_t.y : jdv_t.z);
-        float ar = -B * v - K * imp * c - jd;
+        float ar = degenerate ? 0.0f : (-B * v - K * imp * c - jd);
         for (int i = 0; i < nv; ++i) {
           float a = k == 0 ? Jp1[0 * 32 + i] : (k == 1 ? Jp1[1 * 32 + i] : Jp1[2 * 32 + i]);
           float b_ = k == 0 ? Jp2[0 * 32 + i] : (k == 1 ? Jp2[1 * 32 + i] : Jp2[2 * 32 + i]);
@@ -518,7 +544,7 @@ kernel void equality_assembly(
         float c = k == 0 ? cpos_r.x : (k == 1 ? cpos_r.y : cpos_r.z);
         float v = k == 0 ? vel_r.x : (k == 1 ? vel_r.y : vel_r.z);
         float jd = k == 0 ? rot_corr.x : (k == 1 ? rot_corr.y : rot_corr.z);
-        float ar = -B * v - K * imp * c - jd;
+        float ar = degenerate ? 0.0f : (-B * v - K * imp * c - jd);
         for (int i = 0; i < nv; ++i) {
           J_world[row * nv + i] = Jrot[k * 32 + i];
         }

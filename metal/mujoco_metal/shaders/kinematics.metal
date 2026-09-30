@@ -73,9 +73,12 @@ kernel void forward_kinematics(
     constant uint* dims [[buffer(26)]],
     device float* joint_anchor [[buffer(27)]],
     device float* joint_axis [[buffer(28)]],
+    device const int* body_mocapid [[buffer(29)]],
+    device const float* mocap_pose [[buffer(30)]],
     uint world [[thread_position_in_grid]]) {
   uint nq = dims[0], nbody = dims[1], njnt = dims[2];
   uint ngeom = dims[3], nsite = dims[4], batch = dims[5];
+  uint nmocap = dims[6];
   if (world >= batch) return;
   uint qbase = world*nq;
   uint posebase = world*nbody;
@@ -86,6 +89,19 @@ kernel void forward_kinematics(
     float3 pos = load3(xpos, (posebase+p)*3) +
                  qrot(load4(xquat, (posebase+p)*4), load3(body_pos, b*3));
     float4 quat = qnorm(qmul(load4(xquat, (posebase+p)*4), load4(body_quat, b*4)));
+    int mid = body_mocapid[b];
+    if (mid >= 0 && uint(mid) < max(nmocap, 1u)) {
+      // Pinned MuJoCo 3.10 mj_kinematics: the prescribed mocap pose replaces
+      // the compiled body frame, composed with the parent frame (the pinned
+      // compiler restricts mocap bodies to jointless world children).
+      // Layout: all positions [batch, nmocap, 3] then all quaternions.
+      uint nm = max(nmocap, 1u);
+      uint mbase = world*nm + uint(mid);
+      float3 mpos = load3(mocap_pose, mbase*3);
+      float4 mquat = qnorm(load4(mocap_pose, batch*nm*3 + mbase*4));
+      pos = load3(xpos, (posebase+p)*3) + qrot(load4(xquat, (posebase+p)*4), mpos);
+      quat = qnorm(qmul(load4(xquat, (posebase+p)*4), mquat));
+    }
     for (uint j=0; j<njnt; ++j) {
       if (uint(jnt_bodyid[j]) != b) continue;
       int typ = jnt_type[j];

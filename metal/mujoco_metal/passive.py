@@ -279,7 +279,8 @@ class MetalPassiveForces:
         (1, self._meta.nbody, 6), dtype=torch.float32, device=self._device
     )
 
-  def run_device(self, qpos, qvel, xfrc_applied=None, return_damping=False):
+  def run_device(self, qpos, qvel, xfrc_applied=None, return_damping=False,
+                 mocap_pos=None, mocap_quat=None):
     """Return borrowed MPS generalized passive forces for device state tensors."""
     torch = self._torch
     if not isinstance(qpos, torch.Tensor) or not isinstance(qvel, torch.Tensor):
@@ -355,7 +356,7 @@ class MetalPassiveForces:
         group_size=(1,),
     )
     if self._meta.nv and self._meta.nbody > 1:
-      poses = self._fk.run_device(qpos)
+      poses = self._fk.run_device(qpos, mocap_pos, mocap_quat)
       self._projection_kernel(
           self._body_parentid,
           self._body_jntadr,

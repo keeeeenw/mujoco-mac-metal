@@ -90,6 +90,7 @@ class ModelDescriptor:
   body_parentid: np.ndarray
   body_jntadr: np.ndarray
   body_jntnum: np.ndarray
+  body_mocapid: np.ndarray
   body_pos: np.ndarray
   body_quat: np.ndarray
   body_ipos: np.ndarray
@@ -116,11 +117,47 @@ class ModelDescriptor:
   site_pos: np.ndarray
   site_quat: np.ndarray
 
-  def forward_kinematics(self, qpos):
-    """Return body, geom, site and inertial world poses for one qpos vector."""
+  def _checked_mocap(self, mocap_pos, mocap_quat):
+    """Validate prescribed mocap poses, defaulting to compiled reference frames."""
+    if self.nmocap == 0:
+      if mocap_pos is not None or mocap_quat is not None:
+        raise ValueError("model has no mocap bodies")
+      return np.zeros((0, 3)), np.zeros((0, 4))
+    if mocap_pos is None and mocap_quat is None:
+      mocap_pos = np.array(
+          [self.body_pos[int(b)] for b in range(self.nbody)
+           if int(self.body_mocapid[b]) >= 0]
+      )
+      mocap_quat = np.array(
+          [self.body_quat[int(b)] for b in range(self.nbody)
+           if int(self.body_mocapid[b]) >= 0]
+      )
+    pos = np.asarray(mocap_pos, dtype=np.float64)
+    quat = np.asarray(mocap_quat, dtype=np.float64)
+    if pos.shape != (self.nmocap, 3) or not np.all(np.isfinite(pos)):
+      raise ValueError(f"mocap_pos must be finite with shape ({self.nmocap}, 3)")
+    if quat.shape != (self.nmocap, 4):
+      raise ValueError(f"mocap_quat must have shape ({self.nmocap}, 4)")
+    norms = np.linalg.norm(quat, axis=1)
+    if np.any(~np.isfinite(norms)) or np.any(norms <= 0):
+      raise ValueError("mocap_quat must be finite and nonzero")
+    return pos, quat / norms[:, None]
+
+  def forward_kinematics(self, qpos, mocap_pos=None, mocap_quat=None):
+    """Return body, geom, site and inertial world poses for one qpos vector.
+
+    `mocap_pos`/`mocap_quat` give the prescribed world poses of the
+    ``nmocap`` mocap bodies, with shapes ``(nmocap, 3)`` and ``(nmocap, 4)``.
+    They replace the corresponding body frames exactly as MuJoCo 3.10
+    ``mj_kinematics`` does (composed with the parent frame, which the pinned
+    compiler restricts to the world). When the model has no mocap bodies both
+    must be ``None``; when it has, omitting them uses the compiled reference
+    body frames, matching ``mj_resetData`` defaults.
+    """
     qpos = np.asarray(qpos, dtype=np.float64)
     if qpos.shape != (self.nq,) or not np.all(np.isfinite(qpos)):
       raise ValueError(f"qpos must be finite with shape ({self.nq},)")
+    mocap_pos, mocap_quat = self._checked_mocap(mocap_pos, mocap_quat)
     bp = np.zeros((self.nbody, 3))
     bq = np.zeros((self.nbody, 4))
     bq[:, 0] = 1.0
@@ -133,6 +170,10 @@ class ModelDescriptor:
       parent = int(self.body_parentid[body])
       bp[body] = bp[parent] + _rotate(bq[parent], self.body_pos[body])
       bq[body] = _unit(_quat_mul(bq[parent], self.body_quat[body]), "body")
+      if int(self.body_mocapid[body]) >= 0:
+        mid = int(self.body_mocapid[body])
+        bp[body] = bp[parent] + _rotate(bq[parent], mocap_pos[mid])
+        bq[body] = _unit(_quat_mul(bq[parent], mocap_quat[mid]), "mocap body")
       for j in joints_by_body[body]:
         typ = int(self.jnt_type[j])
         qa = int(self.jnt_qposadr[j])
@@ -195,6 +236,7 @@ def snapshot_descriptor(model):
           "nq",
           "nv",
           "nu",
+          "nmocap",
           "nbody",
           "njnt",
           "ngeom",
@@ -241,6 +283,7 @@ def _validate_lowered(counts, values):
       "dof_jntid": (nv,),
       "body_jntadr": (nb,),
       "body_jntnum": (nb,),
+      "body_mocapid": (nb,),
       "body_pos": (nb, 3),
       "body_quat": (nb, 4),
       "body_ipos": (nb, 3),
@@ -301,6 +344,15 @@ def _validate_lowered(counts, values):
     raise ValueError("invalid body parent array")
   if np.any(parent[1:] < 0) or np.any(parent[1:] >= np.arange(1, nb)):
     raise ValueError("body parents must precede their children")
+  mocapid = values["body_mocapid"]
+  if np.any(mocapid < -1) or np.any(mocapid >= max(counts["nmocap"], 1)):
+    raise ValueError("invalid body mocap id")
+  if counts["nmocap"] and sorted(int(v) for v in mocapid if int(v) >= 0) != list(
+      range(counts["nmocap"])
+  ):
+    raise ValueError("body mocap ids must densely cover [0, nmocap)")
+  if int(mocapid[0]) >= 0:
+    raise ValueError("world body cannot be a mocap body")
   if values["body_rootid"][0] != 0:
     raise ValueError("invalid world body root")
   for body, root in enumerate(values["body_rootid"]):
@@ -379,6 +431,12 @@ def _validate_lowered(counts, values):
         raise ValueError(f"joint axis must be unit length at joint {i}")
     if typ == 0 and parent[body] != 0:
       raise ValueError("free joint body must be a direct child of world")
+  for body in range(nb):
+    if int(mocapid[body]) >= 0:
+      if int(values["body_jntnum"][body]) != 0:
+        raise ValueError(f"mocap body {body} must not carry joints")
+      if int(parent[body]) != 0:
+        raise ValueError(f"mocap body {body} must be a direct child of world")
   if not np.all(qcovered) or not np.all(dcovered):
     raise ValueError(
         "joint addresses must exhaustively cover qpos and dof arrays"
@@ -421,10 +479,6 @@ def load_model(source):
     m = mujoco.MjModel.from_xml_path(str(source))
   else:
     m = mujoco.MjModel.from_xml_string(str(source))
-  if m.nmocap:
-    raise ValueError(
-        "mocap inputs are unsupported by the current kinematics stage"
-    )
   values = {}
   for name in (
       "body_rootid",
@@ -438,6 +492,7 @@ def load_model(source):
       "body_parentid",
       "body_jntadr",
       "body_jntnum",
+      "body_mocapid",
       "body_pos",
       "body_quat",
       "body_ipos",

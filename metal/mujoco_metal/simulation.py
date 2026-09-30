@@ -385,6 +385,150 @@ class MetalSimulation:
       self._last_coupled_generation = None
     return gen
 
+  def set_mocap(self, pos, quat=None, env_ids=None):
+    """Set prescribed mocap poses for selected environments.
+
+    Mirrors `DeviceState.set_mocap`: host arrays or contiguous float32 MPS
+    tensors, `(nmocap, 3/4)` broadcast or `(len(env_ids), nmocap, 3/4)` per
+    world, or a single `(…, nmocap, 7)` posquat array with `quat=None`.
+    Validation is atomic; sticky failure status is preserved; changes take
+    effect on the next step/assembly and invalidate cached assembly.
+    """
+    if getattr(self._state, "_nmocap", 0) == 0:
+      raise ValueError("model has no mocap bodies")
+    gen = self._state.set_mocap(pos, quat, env_ids=env_ids)
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
+    if hasattr(self, "_last_coupled_generation"):
+      self._last_coupled_generation = None
+    return gen
+
+  def get_mocap(self):
+    """Return `(pos, quat)` copies of prescribed mocap poses, or `(None, None)`."""
+    state = self._state
+    if getattr(state, "_nmocap", 0) == 0:
+      return None, None
+    return state.mocap_pos, state.mocap_quat
+
+  def copy_environment(self, src, dst):
+    """Copy all state rows (qpos/qvel/qacc/time/status/eq/mocap) src -> dst."""
+    gen = self._state.copy_environment(src, dst)
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
+    if hasattr(self, "_last_coupled_generation"):
+      self._last_coupled_generation = None
+    return gen
+
+  def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
+            mocap_pos=None, mocap_quat=None):
+    """Reset selected worlds, clear held per-call inputs, invalidate cache."""
+    gen = self._state.reset(
+        env_ids=env_ids, qpos=qpos, qvel=qvel, eq_active=eq_active,
+        mocap_pos=mocap_pos, mocap_quat=mocap_quat,
+    )
+    self._clear_held_inputs(env_ids)
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
+    if hasattr(self, "_last_coupled_generation"):
+      self._last_coupled_generation = None
+    return gen
+
+  def reset_to_keyframe(self, key_id, env_ids=None):
+    """Reset selected worlds from a compiled keyframe (pinned mj_resetDataKeyframe).
+
+    Sets time to `key_time`, qpos/qvel/mocap to the key values, qacc/status to
+    zero, equality activity to compiled defaults, and held controls to `key_ctrl`
+    for the selected worlds. Invalid key ids fail atomically before any mutation.
+    """
+    model = self._mjmodel
+    if not isinstance(model, mujoco.MjModel):
+      raise TypeError("keyframe reset requires a compiled MjModel")
+    if isinstance(key_id, bool) or not isinstance(key_id, (int, np.integer)):
+      raise TypeError("key_id must be an integer")
+    key_id = int(key_id)
+    if not 0 <= key_id < int(model.nkey):
+      raise ValueError(f"key_id {key_id} out of range for nkey={int(model.nkey)}")
+    nq, nv, nmocap, nu = int(model.nq), int(model.nv), int(model.nmocap), int(model.nu)
+    key_qpos = np.asarray(model.key_qpos).reshape(int(model.nkey), nq)[key_id]
+    key_qvel = np.asarray(model.key_qvel).reshape(int(model.nkey), nv)[key_id] if nv else np.zeros(0)
+    if nmocap:
+      key_mpos = np.asarray(model.key_mpos).reshape(int(model.nkey), nmocap, 3)[key_id]
+      key_mquat = np.asarray(model.key_mquat).reshape(int(model.nkey), nmocap, 4)[key_id]
+    else:
+      key_mpos, key_mquat = None, None
+    key_time = float(np.asarray(model.key_time).reshape(int(model.nkey))[key_id])
+    if not np.isfinite(key_time) or key_time < 0:
+      raise ValueError("keyframe time must be finite and nonnegative")
+    # Validate key payloads through the same paths as reset before mutating.
+    gen = self._state.reset(
+        env_ids=env_ids, qpos=key_qpos, qvel=key_qvel,
+        mocap_pos=key_mpos, mocap_quat=key_mquat,
+    )
+    # mj_resetDataKeyframe sets time after _resetData; mirror per selected world.
+    if env_ids is None:
+      self._state._time.zero_().add_(key_time)
+    else:
+      ids = self._state._env_ids(env_ids)
+      if ids.size:
+        index = self._state._torch.as_tensor(ids, dtype=self._state._torch.int64, device=self._state._device)
+        time_tensor = self._state._torch.full((ids.size,), key_time, dtype=self._state._torch.float32, device=self._state._device)
+        next_time = self._state._time.clone()
+        next_time.index_copy_(0, index, time_tensor)
+        self._state._time = next_time
+    self._state._generation += 1
+    # Held controls follow key_ctrl for selected worlds; other held inputs zeroed.
+    self._apply_key_ctrl(key_id, env_ids)
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
+    if hasattr(self, "_last_coupled_generation"):
+      self._last_coupled_generation = None
+    return self._state._generation
+
+  def _clear_held_inputs(self, env_ids):
+    ids = None if env_ids is None else self._state._env_ids(env_ids)
+    if self._applied_force is not None:
+      if ids is None:
+        self._applied_force.zero_()
+      elif ids.size:
+        self._applied_force[ids] = 0
+    if self._control is not None:
+      if ids is None:
+        self._control.zero_()
+      elif ids.size:
+        self._control[ids] = 0
+    if self._body_wrench is not None:
+      if ids is None:
+        self._body_wrench.zero_()
+      elif ids.size:
+        self._body_wrench[ids] = 0
+
+  def _apply_key_ctrl(self, key_id, env_ids):
+    model = self._mjmodel
+    nu = int(model.nu)
+    key_ctrl = np.asarray(model.key_ctrl).reshape(int(model.nkey), nu)[key_id] if nu else None
+    self._clear_held_inputs(env_ids)
+    if key_ctrl is not None and self._control is not None:
+      if not np.all(np.isfinite(key_ctrl)):
+        raise ValueError("keyframe ctrl must be finite")
+      ids = None if env_ids is None else self._state._env_ids(env_ids)
+      ctrl32 = np.asarray(key_ctrl, dtype=np.float32)
+      if ids is None:
+        self._control.copy_(
+            self._state._torch.as_tensor(
+                np.broadcast_to(ctrl32, (self.batch_size, nu)).copy(),
+                dtype=self._state._torch.float32, device=self._state._device,
+            )
+        )
+      elif ids.size:
+        index = self._state._torch.as_tensor(ids, dtype=self._state._torch.int64, device=self._state._device)
+        vals = self._state._torch.as_tensor(
+            np.broadcast_to(ctrl32, (ids.size, nu)).copy(),
+            dtype=self._state._torch.float32, device=self._state._device,
+        )
+        nxt = self._control.clone()
+        nxt.index_copy_(0, index, vals)
+        self._control = nxt
+
   def buffer_audit(self):
     """Return a tuple of buffer specifications derived from real device allocations."""
     b = self.batch_size
@@ -399,6 +543,9 @@ class MetalSimulation:
     ]
     if getattr(self._state, "_neq", 0) > 0 and getattr(self._state, "_eq_active", None) is not None:
       entries.append({"name": "state.eq_active", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._state._neq})", "dtype": str(self._state._eq_active.dtype).replace("torch.", "")})
+    if getattr(self._state, "_nmocap", 0) > 0:
+      entries.append({"name": "state.mocap_pos", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._state._nmocap}, 3)", "dtype": "float32"})
+      entries.append({"name": "state.mocap_quat", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._state._nmocap}, 4)", "dtype": "float32"})
     if self._euler_solver is not None:
       entries.append({"name": "effective_mass", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._model.nv}, {self._state._model.nv})", "dtype": "float32"})
     if self._coupled_constraints is not None:
@@ -435,7 +582,9 @@ class MetalSimulation:
     if self._sensors is None:
       raise ValueError("sensor_values requires a sensor stepping profile")
     state = self._state
-    dynamics = self._smooth.run_device(state._qpos, state._qvel)
+    mpos = getattr(state, "_mpos", None)
+    mquat = getattr(state, "_mquat", None)
+    dynamics = self._smooth.run_device(state._qpos, state._qvel, mpos, mquat)
     poses = dict(
         dynamics["poses"], cvel=dynamics["cvel"], root_com=dynamics["root_com"]
     )
@@ -469,14 +618,17 @@ class MetalSimulation:
       return self._last_coupled
     state = self._state
     qpos, qvel = state._qpos, state._qvel
-    dynamics = self._smooth.run_device(qpos, qvel)
+    mpos = getattr(state, "_mpos", None)
+    mquat = getattr(state, "_mquat", None)
+    dynamics = self._smooth.run_device(qpos, qvel, mpos, mquat)
     torch = state._torch
     rhs = torch.neg(dynamics["qfrc_bias"])
     if self._applied_force is not None:
       rhs.add_(self._applied_force)
     if self._passive is not None:
       passive, _ = self._passive.run_device(
-          qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True
+          qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True,
+          mocap_pos=mpos, mocap_quat=mquat,
       )
       rhs.add_(passive)
     if self._fluid is not None:
@@ -592,7 +744,9 @@ class MetalSimulation:
     self._control.copy_(torch.tensor(array, device=self._state._device))
 
   def _acceleration(self, qpos, qvel):
-    dynamics = self._smooth.run_device(qpos, qvel)
+    mpos = getattr(self._state, "_mpos", None)
+    mquat = getattr(self._state, "_mquat", None)
+    dynamics = self._smooth.run_device(qpos, qvel, mpos, mquat)
     self._state._torch.neg(dynamics["qfrc_bias"], out=self._rhs)
     if self._applied_force is not None:
       if (
@@ -604,7 +758,8 @@ class MetalSimulation:
       self._rhs.add_(self._applied_force)
     if self._passive is not None:
       passive, self._damping_tangent = self._passive.run_device(
-          qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True
+          qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True,
+          mocap_pos=mpos, mocap_quat=mquat,
       )
       self._rhs.add_(passive)
     if self._fluid is not None:

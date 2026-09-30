@@ -104,11 +104,112 @@ class ModelLifecycle:
       raise RuntimeError(f"requires MuJoCo 3.10.0; found {mujoco.__version__}")
     self._model = _compile_source(source)
     if self._model.nmocap:
-      raise ValueError(
-          "mocap inputs are unsupported by the current kinematics stage"
-      )
+      mocapid = np.asarray(self._model.body_mocapid)
+      for bid in range(int(self._model.nbody)):
+        if int(mocapid[bid]) >= 0 and int(self._model.body_parentid[bid]) != 0:
+          raise ValueError(
+              f"mocap body {bid} must be a direct child of world"
+          )
     self.descriptor = load_model(self._model)
     self.generation = 0
+
+  def update_geom_contact(self, geom_ids, friction=None, solref=None,
+                          solimp=None, margin=None, gap=None):
+    """Update geom contact parameters transactionally; returns True if changed.
+
+    Only contact-frame parameters with no derived constants are mutable here:
+    `friction` (...,3), `solref` (...,2), `solimp` (...,5), `margin`/`gap`
+    scalars. Geometry shape/type/affinity and reference poses are
+    recompile-required and rejected here (build a new lifecycle/simulation).
+    Validation is atomic: bad input leaves the model unchanged.
+    """
+    raw_ids = np.asarray(geom_ids)
+    if raw_ids.dtype.kind not in "iu":
+      raise ValueError("geom_ids must contain integers")
+    ids = raw_ids.astype(np.int64, copy=False)
+    if ids.ndim != 1 or ids.size == 0:
+      raise ValueError("geom_ids must be a nonempty vector")
+    if np.unique(ids).size != ids.size:
+      raise ValueError("geom_ids must be unique")
+    if np.any(ids < 0) or np.any(ids >= self.descriptor.ngeom):
+      raise ValueError("geom_ids out of range")
+    n = ids.size
+    updates = {}
+    if friction is not None:
+      arr = np.asarray(friction, dtype=np.float64)
+      if arr.shape != (n, 3):
+        raise ValueError(f"friction must have shape ({n}, 3)")
+      if not np.all(np.isfinite(arr)) or np.any(arr[:, 0] < 0) or np.any(arr[:, 1:] < 0):
+        raise ValueError("friction must be finite and nonnegative")
+      with np.errstate(over="ignore", under="ignore"):
+        f32 = np.asarray(arr, dtype=np.float32)
+      if not np.all(np.isfinite(f32)):
+        raise ValueError("friction must be representable as finite float32")
+      updates["geom_friction"] = f32
+    if solref is not None:
+      arr = np.asarray(solref, dtype=np.float64)
+      if arr.shape != (n, 2):
+        raise ValueError(f"solref must have shape ({n}, 2)")
+      if not np.all(np.isfinite(arr)):
+        raise ValueError("solref must be finite")
+      with np.errstate(over="ignore", under="ignore"):
+        f32 = np.asarray(arr, dtype=np.float32)
+      if not np.all(np.isfinite(f32)):
+        raise ValueError("solref must be representable as finite float32")
+      updates["geom_solref"] = f32
+    if solimp is not None:
+      arr = np.asarray(solimp, dtype=np.float64)
+      if arr.shape != (n, 5):
+        raise ValueError(f"solimp must have shape ({n}, 5)")
+      if not np.all(np.isfinite(arr)):
+        raise ValueError("solimp must be finite")
+      with np.errstate(over="ignore", under="ignore"):
+        f32 = np.asarray(arr, dtype=np.float32)
+      if not np.all(np.isfinite(f32)):
+        raise ValueError("solimp must be representable as finite float32")
+      updates["geom_solimp"] = f32
+    if margin is not None:
+      arr = np.asarray(margin, dtype=np.float64).reshape(n)
+      if arr.shape != (n,):
+        raise ValueError(f"margin must have shape ({n},)")
+      if not np.all(np.isfinite(arr)):
+        raise ValueError("margin must be finite")
+      with np.errstate(over="ignore", under="ignore"):
+        f32 = np.asarray(arr, dtype=np.float32)
+      if not np.all(np.isfinite(f32)):
+        raise ValueError("margin must be representable as finite float32")
+      updates["geom_margin"] = f32
+    if gap is not None:
+      arr = np.asarray(gap, dtype=np.float64).reshape(n)
+      if arr.shape != (n,):
+        raise ValueError(f"gap must have shape ({n},)")
+      if not np.all(np.isfinite(arr)):
+        raise ValueError("gap must be finite")
+      with np.errstate(over="ignore", under="ignore"):
+        f32 = np.asarray(arr, dtype=np.float32)
+      if not np.all(np.isfinite(f32)):
+        raise ValueError("gap must be representable as finite float32")
+      updates["geom_gap"] = f32
+    if not updates:
+      raise ValueError("no contact parameters given")
+    # Detect no-op before cloning.
+    changed = False
+    for name, value in updates.items():
+      current = np.asarray(getattr(self._model, name))[ids]
+      if not np.array_equal(np.asarray(current, dtype=np.float32), value):
+        changed = True
+        break
+    if not changed:
+      return False
+    candidate = _clone_model(self._model)
+    for name, value in updates.items():
+      getattr(candidate, name)[ids] = value
+    # Contact parameters have no mj_setConst derived state; lowering validates.
+    descriptor = load_model(candidate)
+    self._model = candidate
+    self.descriptor = descriptor
+    self.generation += 1
+    return True
 
   def recompute_body_masses(self, body_ids, masses):
     """Set body masses, run `mj_setConst`, and commit only a valid candidate."""

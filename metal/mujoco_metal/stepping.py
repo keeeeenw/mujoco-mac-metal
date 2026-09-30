@@ -401,13 +401,20 @@ def validate_stepping_profile(
     if model.nplugin > 0:
       raise ValueError("MuJoCo plugins are unsupported")
     if model.nmocap > 0:
-      raise ValueError("mocap bodies are unsupported")
+      mocapid = np.asarray(model.body_mocapid)
+      for bid in range(model.nbody):
+        if int(mocapid[bid]) >= 0 and int(model.body_parentid[bid]) != 0:
+          raise ValueError(
+              f"mocap body {bid} must be a direct child of world"
+          )
 
     supported_list = [
         "rigid hinge, slide, free, and ball joints",
         "semi-implicit Euler integration",
         "gravity compensation and MuJoCo disable flags",
     ]
+    if model.nmocap > 0:
+      supported_list.append("native per-environment mocap bodies and inputs")
 
     if model.nu > 0:
       from mujoco_metal.transmissions import TransmissionModel
@@ -461,7 +468,6 @@ def validate_stepping_profile(
         rejected=(
             "flex/deformable elements",
             "MuJoCo plugins",
-            "mocap bodies",
             "spatial/wrapping tendons, tendon limits, and tendon frictionloss",
             "non-scalar/non-fixed-tendon actuators, activation state, and muscles",
             "non-primitive collision geoms (supported: plane, sphere, capsule, box)",
@@ -775,8 +781,13 @@ def validate_stepping_profile(
       or np.any(model.geom_plugin >= 0)
   ):
     raise ValueError("MuJoCo plugins are unsupported")
-  if model.nmocap or np.any(model.body_mocapid >= 0):
-    raise ValueError("mocap bodies are unsupported")
+  if model.nmocap or np.any(np.asarray(model.body_mocapid) >= 0):
+    mocapid = np.asarray(model.body_mocapid)
+    for bid in range(int(model.nbody)):
+      if int(mocapid[bid]) >= 0 and int(model.body_parentid[bid]) != 0:
+        raise ValueError(
+            f"mocap body {bid} must be a direct child of world"
+        )
   if model.nsensor:
     if not with_sensors:
       raise ValueError(
@@ -940,6 +951,7 @@ def validate_stepping_profile(
                       "contact_free_sensor_euler_v1",
                   )
               )
+              and not (item == "mocap bodies")
           )
           + (
               (

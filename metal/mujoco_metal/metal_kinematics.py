@@ -56,6 +56,7 @@ def _prepare_host_arrays(model: ModelDescriptor):
       "ngeom": model.ngeom,
       "nsite": model.nsite,
       "ntendon": model.ntendon,
+      "nmocap": model.nmocap,
       "disableflags": model.disableflags,
   }
   names = (
@@ -70,6 +71,7 @@ def _prepare_host_arrays(model: ModelDescriptor):
       "body_parentid",
       "body_jntadr",
       "body_jntnum",
+      "body_mocapid",
       "body_pos",
       "body_quat",
       "body_ipos",
@@ -98,8 +100,6 @@ def _prepare_host_arrays(model: ModelDescriptor):
   )
   values = {name: getattr(model, name) for name in names}
   _validate_lowered(counts, values)
-  if model.nmocap:
-    raise ValueError("Metal kinematics does not support mocap inputs")
   host = {}
   for name, value in values.items():
     dtype = np.int32 if np.asarray(value).dtype.kind in "iu" else np.float32
@@ -235,7 +235,7 @@ class MetalKinematics:
         max(batch_size * m.nq, 1), dtype=torch.float32, device=self._device
     )
     outputs["dims"] = torch.tensor(
-        [m.nq, m.nbody, m.njnt, m.ngeom, m.nsite, batch_size],
+        [m.nq, m.nbody, m.njnt, m.ngeom, m.nsite, batch_size, m.nmocap],
         dtype=torch.int32, device=self._device,
     )
     self._workspace = {"batch_size": batch_size, "outputs": outputs}
@@ -254,13 +254,17 @@ class MetalKinematics:
     if not value.is_contiguous():
       raise ValueError(f"{name} must be contiguous")
 
-  def run_device(self, qpos):
+  def run_device(self, qpos, mocap_pos=None, mocap_quat=None):
     """Run FK from a contiguous MPS float32 state without host readback.
 
     State values are trusted to be finite; free/ball quaternions must be
     nonzero (they are normalized by the shader). Values are validated when a
     device state is reset. This method performs metadata checks only. Returned
     tensors are borrowed workspace views, valid until the next workspace use.
+
+    `mocap_pos`/`mocap_quat` are contiguous float32 MPS tensors with shapes
+    ``(batch, nmocap, 3)`` and ``(batch, nmocap, 4)``. They are required when
+    the model has mocap bodies and must be omitted otherwise.
     """
     torch = self._torch
     if not isinstance(qpos, torch.Tensor) or qpos.ndim != 2:
@@ -273,6 +277,25 @@ class MetalKinematics:
     self._check_device_tensor(
         qpos, "qpos", (batch, self.model.nq), torch, self._device
     )
+    nmocap = int(self.model.nmocap)
+    if nmocap == 0:
+      if mocap_pos is not None or mocap_quat is not None:
+        raise ValueError("model has no mocap bodies")
+      mocap_flat = torch.zeros(1, dtype=torch.float32, device=self._device)
+    else:
+      if mocap_pos is None or mocap_quat is None:
+        raise ValueError(
+            f"mocap_pos/mocap_quat are required for {nmocap} mocap bodies"
+        )
+      self._check_device_tensor(
+          mocap_pos, "mocap_pos", (batch, nmocap, 3), torch, self._device
+      )
+      self._check_device_tensor(
+          mocap_quat, "mocap_quat", (batch, nmocap, 4), torch, self._device
+      )
+      mocap_flat = torch.cat(
+          (mocap_pos.reshape(-1), mocap_quat.reshape(-1)), dim=0
+      )
     workspace = self._workspace
     if workspace is None or workspace["batch_size"] != batch:
       raise ValueError(
@@ -306,6 +329,7 @@ class MetalKinematics:
         out["inertial_quat"],
     ])
     args.extend([out["dims"], out["joint_anchor"], out["joint_axis"]])
+    args.extend([self._arrays["body_mocapid"], mocap_flat])
     self._kernel(*args, threads=(batch,), group_size=(1,))
     result = {}
     for kind, count in (
@@ -322,7 +346,7 @@ class MetalKinematics:
       result[name] = _shape_output(out[name], batch, self.model.njnt, 3)
     return result
 
-  def run(self, qpos):
+  def run(self, qpos, mocap_pos=None, mocap_quat=None):
     """Compute full world poses for a CPU qpos batch; returns MPS tensors."""
     source = np.asarray(qpos, dtype=np.float64)
     if source.ndim == 1:
@@ -337,6 +361,29 @@ class MetalKinematics:
       )
     if not np.all(np.isfinite(source)):
       raise ValueError("qpos must be finite")
+    batch = source.shape[0]
+    nmocap = int(self.model.nmocap)
+    if nmocap == 0:
+      if mocap_pos is not None or mocap_quat is not None:
+        raise ValueError("model has no mocap bodies")
+      mocap_flat_host = np.zeros(1, dtype=np.float32)
+    else:
+      if mocap_pos is None or mocap_quat is None:
+        checked_pos, checked_quat = self.model._checked_mocap(None, None)
+        checked_pos = np.broadcast_to(checked_pos, (batch, nmocap, 3)).copy()
+        checked_quat = np.broadcast_to(checked_quat, (batch, nmocap, 4)).copy()
+      else:
+        pos_in = np.asarray(mocap_pos, dtype=np.float64)
+        quat_in = np.asarray(mocap_quat, dtype=np.float64)
+        if pos_in.shape == (nmocap, 3):
+          pos_in = np.broadcast_to(pos_in, (batch, nmocap, 3)).copy()
+        if quat_in.shape == (nmocap, 4):
+          quat_in = np.broadcast_to(quat_in, (batch, nmocap, 4)).copy()
+        checked_pos, checked_quat = self.model._checked_mocap(pos_in, quat_in)
+      mocap_flat_host = np.concatenate(
+          [np.asarray(checked_pos, dtype=np.float32).reshape(-1),
+           np.asarray(checked_quat, dtype=np.float32).reshape(-1)]
+      )
     q = np.array(source, dtype=np.float32, order="C", copy=True)
     if not np.all(np.isfinite(q)):
       raise ValueError("qpos cannot be represented as finite float32")
@@ -424,11 +471,16 @@ class MetalKinematics:
             self.model.ngeom,
             self.model.nsite,
             source.shape[0],
+            self.model.nmocap,
         ],
         dtype=torch.int32,
         device=self._device,
     )
     args.extend([dims, outputs["joint_anchor"], outputs["joint_axis"]])
+    args.extend([
+        self._arrays["body_mocapid"],
+        torch.from_numpy(mocap_flat_host).to(self._device),
+    ])
     self._kernel(*args, threads=(source.shape[0],), group_size=(1,))
     shaped = {}
     for kind, count in (

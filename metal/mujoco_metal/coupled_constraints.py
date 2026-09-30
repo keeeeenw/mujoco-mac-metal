@@ -265,32 +265,16 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
           raise ValueError(f"equality {eid}: body2 id out of range (world 0 allowed)")
         if o1 == o2:
           raise ValueError(f"equality {eid}: connect bodies must differ")
-        # Mocap bodies are out of scope; world (0) and ordinary
-        # hinge/slide/ball/free bodies are in scope.
-        if model.nmocap:
-          try:
-            mocap = np.asarray(model.body_mocapid)
-            if (o1 < len(mocap) and int(mocap[o1]) >= 0) or (
-                o2 < len(mocap) and int(mocap[o2]) >= 0
-            ):
-              raise ValueError(f"equality {eid}: mocap bodies are unsupported")
-          except AttributeError:
-            pass
+        # World (0), ordinary hinge/slide/ball/free bodies and mocap bodies
+        # (kinematic anchors, exactly the crane-attach case) are in scope.
+        # A both-mocap equality reserves rows but assembles zero rows/forces,
+        # matching MuJoCo skipping its empty Jacobian.
       else:
         if not 0 <= o1 < model.nsite or not 0 <= o2 < model.nsite:
           raise ValueError(f"equality {eid}: site ids out of range")
         if o1 == o2:
           raise ValueError(f"equality {eid}: connect sites must differ")
-        if model.nmocap:
-          try:
-            site_body = np.asarray(model.site_bodyid)
-            mocap = np.asarray(model.body_mocapid)
-            for sid in (o1, o2):
-              bid = int(site_body[sid])
-              if 0 <= bid < len(mocap) and int(mocap[bid]) >= 0:
-                raise ValueError(f"equality {eid}: mocap bodies are unsupported")
-          except AttributeError:
-            pass
+        # Sites on mocap bodies are supported kinematic anchors (see above).
       # Connect eq_data anchors/ Hogan: validate finite float32 below via _frozen;
       # site-based connect ignores eq_data (must still be finite).
     else:  # _EQ_WELD
@@ -304,30 +288,13 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
           raise ValueError(f"equality {eid}: body2 id out of range (world 0 allowed)")
         if o1 == o2:
           raise ValueError(f"equality {eid}: weld bodies must differ")
-        if model.nmocap:
-          try:
-            mocap = np.asarray(model.body_mocapid)
-            if (o1 < len(mocap) and int(mocap[o1]) >= 0) or (
-                o2 < len(mocap) and int(mocap[o2]) >= 0
-            ):
-              raise ValueError(f"equality {eid}: mocap bodies are unsupported")
-          except AttributeError:
-            pass
+        # Mocap bodies allowed as above (crane-attach case).
       else:
         if not 0 <= o1 < model.nsite or not 0 <= o2 < model.nsite:
           raise ValueError(f"equality {eid}: site ids out of range")
         if o1 == o2:
           raise ValueError(f"equality {eid}: weld sites must differ")
-        if model.nmocap:
-          try:
-            site_body = np.asarray(model.site_bodyid)
-            mocap = np.asarray(model.body_mocapid)
-            for sid in (o1, o2):
-              bid = int(site_body[sid])
-              if 0 <= bid < len(mocap) and int(mocap[bid]) >= 0:
-                raise ValueError(f"equality {eid}: mocap bodies are unsupported")
-          except AttributeError:
-            pass
+        # Sites on mocap bodies allowed as above.
       # Weld torquescale (eq_data[10]) must be finite float32; zero is valid
       # (behaves like connect for rotation) and is explicitly reserved.
       try:
