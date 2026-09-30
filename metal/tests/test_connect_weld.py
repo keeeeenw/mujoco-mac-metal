@@ -165,6 +165,7 @@ def test_mixed_joint_connect_weld_row_layout_is_deterministic():
 
 
 def test_unsupported_equality_types_still_rejected():
+    # Tendon equality moved to milestone 008: it is admitted and reserves one row.
     m_tendon = mujoco.MjModel.from_xml_string(
         """<mujoco><worldbody>
         <body><joint name="j1" type="hinge"/><geom type="sphere" size="0.1"/></body>
@@ -172,18 +173,18 @@ def test_unsupported_equality_types_still_rejected():
         <tendon><fixed name="t1"><joint joint="j1" coef="1"/></fixed></tendon>
         <equality><tendon tendon1="t1" polycoef="0 1 0 0 0"/></equality></mujoco>"""
     )
-    with pytest.raises(ValueError, match="only joint, connect and weld"):
-        lower_coupled_constraints(m_tendon)
+    d_tendon = lower_coupled_constraints(m_tendon)
+    assert d_tendon.n_eq_rows == 1
 
-    # Tendon limits/frictionloss remain out of scope.
+    # Tendon limits/frictionloss moved to milestone 008 as well.
     m_lim = mujoco.MjModel.from_xml_string(
         """<mujoco><worldbody>
         <body><joint name="j1" type="hinge"/><geom type="sphere" size="0.1"/></body>
         </worldbody>
         <tendon><fixed name="t1" limited="true" range="0 1"><joint joint="j1" coef="1"/></fixed></tendon></mujoco>"""
     )
-    with pytest.raises(ValueError, match="tendon limits"):
-        lower_coupled_constraints(m_lim)
+    d_lim = lower_coupled_constraints(m_lim)
+    assert d_lim.ten_limit_rows == 2
 
 
 def test_inactive_new_equality_still_validated_and_reserved():
