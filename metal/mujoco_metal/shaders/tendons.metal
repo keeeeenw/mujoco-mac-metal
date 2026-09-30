@@ -482,77 +482,50 @@ inline float3 st8_site_vel(float3 p, int body,
   return v + cross(w, p - com);
 }
 
-// Jdot(qvel) 3-vector for a site: d/dt(point Jacobian) dotted with qvel.
-// Pinned source: engine_core_util.c mj_jacDot, restricted to the dense
-// translational path. Hinge/slide axes rotate with the parent body;
-// ball/free rotation axes rotate with the joint body itself.
-inline float3 st8_point_jacdot(float3 point, float3 v_point, int body,
-    device const float* body_pos, device const float* body_quat,
-    device const float* cvel, device const float* root_com,
-    device const int* body_rootid,
-    device const float* joint_anchor, device const float* joint_axis,
-    device const int* body_parentid, device const int* body_jntadr,
-    device const int* body_jntnum, device const int* jnt_type,
-    device const int* jnt_dofadr,
+// Point-Jacobian-dot times qvel: exact port of pinned mj_jacDot (dense,
+// translational part only; engine_core_util.c). Uses the smooth stage's
+// cdof/cdof_dot/cvel plus subtree COMs, so serial same-body joints,
+// ball/free quaternion joints and multi-joint bodies match by construction.
+inline float3 st8_point_jacdot(float3 point, int body,
+    device const float* cvel, device const float* cdof, device const float* cdof_dot,
+    device const float* root_com, device const int* body_rootid,
+    device const int* body_weldid, device const int* body_dofadr, device const int* body_dofnum,
+    device const int* dof_parentid, device const int* dof_bodyid, device const int* dof_is_quat,
     device const float* qvel,
-    int nbody, int njnt, int nv, int bo, int jo, int vbase) {
+    int nbody, int nv, int bo, int vbase) {
   float3 A = float3(0.0f);
   if (nv == 0) return A;
-  int b = body;
-  while (b > 0 && b < nbody) {
-    int P = body_parentid[b];
-    int pc = (P >= 0 && P < nbody) ? P : 0;
-    int rcP = body_rootid[pc];
-    rcP = (rcP >= 0 && rcP < nbody) ? rcP : 0;
-    float3 wP = float3(cvel[(bo+pc)*6], cvel[(bo+pc)*6+1], cvel[(bo+pc)*6+2]);
-    float3 linP = float3(cvel[(bo+pc)*6+3], cvel[(bo+pc)*6+4], cvel[(bo+pc)*6+5]);
-    float3 comP = float3(root_com[(bo+rcP)*3], root_com[(bo+rcP)*3+1], root_com[(bo+rcP)*3+2]);
-    float3 wC = float3(cvel[(bo+b)*6], cvel[(bo+b)*6+1], cvel[(bo+b)*6+2]);
-    float3 linC = float3(cvel[(bo+b)*6+3], cvel[(bo+b)*6+4], cvel[(bo+b)*6+5]);
-    float3 posC = float3(body_pos[(bo+b)*3], body_pos[(bo+b)*3+1], body_pos[(bo+b)*3+2]);
-    // G1: the free-joint pivot rides on the child body itself, so its
-    // velocity is measured about the CHILD root's COM (like pinned
-    // mj_jacDot with subtree_com[rootid[child]]), not the parent's.
-    int rcC = body_rootid[b];
-    rcC = (rcC >= 0 && rcC < nbody) ? rcC : 0;
-    float3 comC = float3(root_com[(bo+rcC)*3], root_com[(bo+rcC)*3+1], root_com[(bo+rcC)*3+2]);
-    float3 v_c = linC + cross(wC, posC - comC);
-    float4 bq = float4(body_quat[(bo+b)*4], body_quat[(bo+b)*4+1],
-                       body_quat[(bo+b)*4+2], body_quat[(bo+b)*4+3]);
-    float nq = length(bq); bq = nq > 1e-30f ? bq / nq : float4(1,0,0,0);
-    float3x3 bm = st8_quat2mat(bq);
-    int ja = body_jntadr[b], jn = body_jntnum[b];
-    for (int jj = 0; jj < jn; ++jj) {
-      int j = ja + jj;
-      if (j < 0 || j >= njnt) continue;
-      int da = jnt_dofadr[j], typ = jnt_type[j];
-      float3 r = float3(joint_anchor[(jo+j)*3], joint_anchor[(jo+j)*3+1], joint_anchor[(jo+j)*3+2]);
-      float3 a = float3(joint_axis[(jo+j)*3], joint_axis[(jo+j)*3+1], joint_axis[(jo+j)*3+2]);
-      float3 v_r = linP + cross(wP, r - comP);
-      if (typ == 2) {  // slide
-        int dof = da;
-        if (dof >= 0 && dof < nv) A += cross(wP, a) * qvel[vbase+dof];
-      } else if (typ == 3) {  // hinge
-        int dof = da;
-        if (dof >= 0 && dof < nv)
-          A += (cross(cross(wP, a), point - r) + cross(a, v_point - v_r)) * qvel[vbase+dof];
-      } else if (typ == 1) {  // ball
-        for (int q = 0; q < 3; ++q) {
-          int dof = da + q;
-          if (dof < 0 || dof >= nv) continue;
-          float3 e = bm[q];
-          A += (cross(cross(wC, e), point - r) + cross(e, v_point - v_r)) * qvel[vbase+dof];
-        }
-      } else if (typ == 0) {  // free: translation dofs constant, rotation as ball
-        for (int q = 0; q < 3; ++q) {
-          int dof = da + 3 + q;
-          if (dof < 0 || dof >= nv) continue;
-          float3 e = bm[q];
-          A += (cross(cross(wC, e), point - posC) + cross(e, v_point - v_c)) * qvel[vbase+dof];
-        }
-      }
+  int b = (body >= 0 && body < nbody) ? body : 0;
+  int rc = body_rootid[b];
+  rc = (rc >= 0 && rc < nbody) ? rc : 0;
+  float3 com = float3(root_com[(bo+rc)*3], root_com[(bo+rc)*3+1], root_com[(bo+rc)*3+2]);
+  float3 off = point - com;
+  // pvel = transformSpatial(cvel[b], point, com).
+  float3 bw = float3(cvel[(bo+b)*6], cvel[(bo+b)*6+1], cvel[(bo+b)*6+2]);
+  float3 bv = float3(cvel[(bo+b)*6+3], cvel[(bo+b)*6+4], cvel[(bo+b)*6+5]);
+  float3 pv = bv + cross(bw, off);
+  // Skip fixed bodies (weld target 0).
+  int wb = body_weldid[b];
+  if (wb <= 0 || wb >= nbody) return A;
+  // Backward pass over the dof ancestor chain.
+  int i = body_dofadr[wb] + body_dofnum[wb] - 1;
+  int guard = nv + 1;
+  while (i >= 0 && i < nv && guard-- > 0) {
+    float3 cd = float3(cdof[(vbase+i)*6], cdof[(vbase+i)*6+1], cdof[(vbase+i)*6+2]);
+    float3 cdv = float3(cdof[(vbase+i)*6+3], cdof[(vbase+i)*6+4], cdof[(vbase+i)*6+5]);
+    float3 cdd = float3(cdof_dot[(vbase+i)*6], cdof_dot[(vbase+i)*6+1], cdof_dot[(vbase+i)*6+2]);
+    float3 cddv = float3(cdof_dot[(vbase+i)*6+3], cdof_dot[(vbase+i)*6+4], cdof_dot[(vbase+i)*6+5]);
+    if (dof_is_quat[i]) {
+      // Quaternion joints use the joint body's current velocity.
+      int db = dof_bodyid[i];
+      db = (db >= 0 && db < nbody) ? db : 0;
+      float3 jw = float3(cvel[(bo+db)*6], cvel[(bo+db)*6+1], cvel[(bo+db)*6+2]);
+      float3 jv = float3(cvel[(bo+db)*6+3], cvel[(bo+db)*6+4], cvel[(bo+db)*6+5]);
+      cdd = cross(jw, cd);
+      cddv = cross(jw, cdv) + cross(jv, cd);
     }
-    b = body_parentid[b];
+    A += (cddv + cross(cdd, off) + cross(cd, pv)) * qvel[vbase+i];
+    i = dof_parentid[i];
   }
   return A;
 }
@@ -563,33 +536,32 @@ inline float3 st8_point_jacdot(float3 point, float3 v_point, int body,
 kernel void spatial_armature_dots(
     device const float* qvel [[buffer(0)]],
     device const float* site_pos [[buffer(1)]],
-    device const float* body_pos [[buffer(2)]],
-    device const float* body_quat [[buffer(3)]],
-    device const float* cvel [[buffer(4)]],
+    device const float* cvel [[buffer(2)]],
+    device const float* cdof [[buffer(3)]],
+    device const float* cdof_dot [[buffer(4)]],
     device const float* root_com [[buffer(5)]],
-    device const float* joint_anchor [[buffer(6)]],
-    device const float* joint_axis [[buffer(7)]],
-    device const int* path_types [[buffer(8)]],
-    device const int* path_objids [[buffer(9)]],
-    device const float* path_prms [[buffer(10)]],
-    device const int* path_offset [[buffer(11)]],
-    device const int* path_count [[buffer(12)]],
-    device const int* site_bodyid [[buffer(13)]],
-    device const int* body_rootid [[buffer(14)]],
-    device const int* jnt_type [[buffer(15)]],
-    device const int* jnt_dofadr [[buffer(16)]],
-    device const int* body_parentid [[buffer(17)]],
-    device const int* body_jntadr [[buffer(18)]],
-    device const int* body_jntnum [[buffer(19)]],
-    device const float* armature [[buffer(20)]],
-    constant int* dims [[buffer(21)]],
-    device float* out_dots [[buffer(22)]],
+    device const int* path_types [[buffer(6)]],
+    device const int* path_objids [[buffer(7)]],
+    device const float* path_prms [[buffer(8)]],
+    device const int* path_offset [[buffer(9)]],
+    device const int* path_count [[buffer(10)]],
+    device const int* site_bodyid [[buffer(11)]],
+    device const int* body_rootid [[buffer(12)]],
+    device const int* body_weldid [[buffer(13)]],
+    device const int* body_dofadr [[buffer(14)]],
+    device const int* body_dofnum [[buffer(15)]],
+    device const int* dof_parentid [[buffer(16)]],
+    device const int* dof_bodyid [[buffer(17)]],
+    device const int* dof_is_quat [[buffer(18)]],
+    device const float* armature [[buffer(19)]],
+    constant int* dims [[buffer(20)]],
+    device float* out_dots [[buffer(21)]],
     uint world [[thread_position_in_grid]]) {
   int nv=dims[0], nt=dims[1], nsite=dims[2];
-  int nbody=dims[4], njnt=dims[5], batch=dims[7];
+  int nbody=dims[4], batch=dims[7];
   if (uint(world)>=uint(batch)) return;
   uint vbase=uint(world)*uint(max(nv,1)), tbase=uint(world)*uint(max(nt,1));
-  int bo=world*nbody, jo=world*max(njnt,1), so=world*max(nsite,1);
+  int bo=world*nbody, so=world*max(nsite,1);
   for (int t=0;t<nt;++t) {
     float tdot=0.0f;
     if (armature[t] != 0.0f) {
@@ -626,12 +598,12 @@ kernel void spatial_armature_dots(
                 float3 dv=v1-v0;
                 float s=dot(dpnt,dv);
                 float3 dvel=(dv-dpnt*s)/n;
-                float3 A0=st8_point_jacdot(p0,v0,b0,body_pos,body_quat,cvel,root_com,
-                  body_rootid,joint_anchor,joint_axis,body_parentid,body_jntadr,body_jntnum,
-                  jnt_type,jnt_dofadr,qvel,nbody,njnt,nv,bo,jo,vbase);
-                float3 A1=st8_point_jacdot(p1,v1,b1,body_pos,body_quat,cvel,root_com,
-                  body_rootid,joint_anchor,joint_axis,body_parentid,body_jntadr,body_jntnum,
-                  jnt_type,jnt_dofadr,qvel,nbody,njnt,nv,bo,jo,vbase);
+                float3 A0=st8_point_jacdot(p0,b0,cvel,cdof,cdof_dot,
+                  root_com,body_rootid,body_weldid,body_dofadr,body_dofnum,
+                  dof_parentid,dof_bodyid,dof_is_quat,qvel,nbody,nv,bo,vbase);
+                float3 A1=st8_point_jacdot(p1,b1,cvel,cdof,cdof_dot,
+                  root_com,body_rootid,body_weldid,body_dofadr,body_dofnum,
+                  dof_parentid,dof_bodyid,dof_is_quat,qvel,nbody,nv,bo,vbase);
                 tdot+=(dot(dpnt,A1-A0)+dot(dvel,v1-v0))/divisor;
               }
             }

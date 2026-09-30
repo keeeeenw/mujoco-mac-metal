@@ -749,7 +749,8 @@ class MetalSimulation:
       rhs.add_(sforce.reshape(rhs.shape))
       sbias, _ = self._spatial_tendons.run_armature_bias(
           skin, qvel, dynamics["poses"], dynamics.get("cvel", None),
-          dynamics.get("root_com", None))
+          dynamics.get("root_com", None), dynamics.get("cdof", None),
+          dynamics.get("cdof_dot", None))
       # Armature bias is a bias force (pinned mj_tendonBias accumulates into
       # qfrc_bias), so it subtracts from rhs like Coriolis/gravity.
       rhs.sub_(sbias.reshape(rhs.shape))
@@ -967,7 +968,8 @@ class MetalSimulation:
       self._rhs.add_(sforce.reshape(self._rhs.shape))
       sbias, _ = self._spatial_tendons.run_armature_bias(
           skin, qvel, dynamics["poses"], dynamics.get("cvel", None),
-          dynamics.get("root_com", None))
+          dynamics.get("root_com", None), dynamics.get("cdof", None),
+          dynamics.get("cdof_dot", None))
       # Armature bias is a bias force (pinned mj_tendonBias accumulates into
       # qfrc_bias), so it subtracts from rhs like Coriolis/gravity.
       self._rhs.sub_(sbias.reshape(self._rhs.shape))

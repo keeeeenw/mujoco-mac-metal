@@ -450,6 +450,20 @@ class MetalSpatialTendonDynamics:
                              if ngeom0(model) else np.zeros(3, dtype=np.float32))
     self._site_bodyid = tensor(model.site_bodyid if meta.nsite else np.zeros(1, dtype=np.int32), torch.int32)
     self._body_rootid = tensor(model.body_rootid, torch.int32)
+    self._body_weldid = tensor(model.body_weldid, torch.int32)
+    self._body_dofadr = tensor(model.body_dofadr, torch.int32)
+    self._body_dofnum = tensor(model.body_dofnum, torch.int32)
+    self._dof_parentid = tensor(model.dof_parentid if meta.nv else np.zeros(1, dtype=np.int32), torch.int32)
+    self._dof_bodyid = tensor(model.dof_bodyid if meta.nv else np.zeros(1, dtype=np.int32), torch.int32)
+    dof_is_quat = np.zeros(max(meta.nv, 1), dtype=np.int32)
+    for j in range(njnt):
+      typ = int(model.jnt_type[j])
+      da = int(model.jnt_dofadr[j])
+      nd = 6 if typ == 0 else (3 if typ == 1 else 1)
+      for q in range(nd):
+        if 0 <= da + q < meta.nv:
+          dof_is_quat[da + q] = 1 if (typ == 1 or (typ == 0 and q >= 3)) else 0
+    self._dof_is_quat = tensor(dof_is_quat, torch.int32)
     self._jnt_type = tensor(model.jnt_type if njnt else np.zeros(1, dtype=np.int32), torch.int32)
     self._jnt_dofadr = tensor(model.jnt_dofadr if njnt else np.zeros(1, dtype=np.int32), torch.int32)
     self._body_parentid = tensor(model.body_parentid, torch.int32)
@@ -637,14 +651,17 @@ class MetalSpatialTendonDynamics:
     w["armature"].copy_(arm_mat.reshape(-1))
     return w["qfrc"].reshape(b, nv), w["damping"].reshape(b, nv, nv), w["armature"].reshape(b, nv, nv)
 
-  def run_armature_bias(self, kin, qvel, poses, cvel, root_com):
-    """Armature bias force for site-only spatial paths (F1).
+  def run_armature_bias(self, kin, qvel, poses, cvel, root_com, cdof=None, cdof_dot=None):
+    """Armature bias force for site-only spatial paths (F1/G1).
 
     Computes per-tendon dots = Jdot(qvel) (pinned mj_tendonDot) on device,
     returns ``(bias_qfrc [B, nv], dots [B, nt])`` with
-    bias = J'·armature·dots (pinned mj_tendonBias). Wrapped paths carry no
-    armature (rejected at admission); their dots stay zero. When no tendon
-    has armature, returns zeros without launching work.
+    bias = J'·armature·dots (pinned mj_tendonBias). The device Jdot is an
+    exact port of pinned mj_jacDot (dense path) over cdof/cdof_dot, so
+    serial same-body joints and ball/free quaternion joints match by
+    construction. Wrapped paths carry no armature (rejected at admission);
+    their dots stay zero. When no tendon has armature, returns zeros
+    without launching work.
 
     NOTE: the returned bias accumulates into qfrc_bias (pinned convention),
     so callers subtract it from the rhs vector.
@@ -655,6 +672,7 @@ class MetalSpatialTendonDynamics:
     w = self._ws
     J = kin["jacobian"].reshape(b, max(nt, 1), max(nv, 1))
     if (nt == 0 or nv == 0 or cvel is None or root_com is None
+            or cdof is None or cdof_dot is None
             or not bool((np.asarray(meta.armature) > 0).any())):
       return (torch.zeros((b, max(nv, 1)), dtype=torch.float32, device=self._device),
               torch.zeros((b, max(nt, 1)), dtype=torch.float32, device=self._device))
@@ -662,14 +680,13 @@ class MetalSpatialTendonDynamics:
     self._dots_kernel(
         qvel.reshape(-1),
         site_pos,
-        poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),
-        cvel.reshape(-1), root_com.reshape(-1),
-        poses["joint_anchor"].reshape(-1), poses["joint_axis"].reshape(-1),
+        cvel.reshape(-1), cdof.reshape(-1), cdof_dot.reshape(-1),
+        root_com.reshape(-1),
         self._types.reshape(-1), self._objids.reshape(-1), self._prms.reshape(-1),
         self._offset, self._count,
         self._site_bodyid, self._body_rootid,
-        self._jnt_type, self._jnt_dofadr,
-        self._body_parentid, self._body_jntadr, self._body_jntnum,
+        self._body_weldid, self._body_dofadr, self._body_dofnum,
+        self._dof_parentid, self._dof_bodyid, self._dof_is_quat,
         self._armature.reshape(-1),
         self._dims,
         w["dots"],

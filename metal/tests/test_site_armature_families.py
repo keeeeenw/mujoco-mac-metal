@@ -53,7 +53,8 @@ def _native_state(sim, m, qp, qv):
   kin = sim._spatial_tendons.run_kinematics(qvel_t, dynamics["poses"])
   bias, dots = sim._spatial_tendons.run_armature_bias(
       kin, qvel_t, dynamics["poses"], dynamics.get("cvel", None),
-      dynamics.get("root_com", None))
+      dynamics.get("root_com", None), dynamics.get("cdof", None),
+      dynamics.get("cdof_dot", None))
   asm = sim.assembled_system(recompute=True)
   return dots.cpu().numpy()[0], bias.cpu().numpy()[0], asm["qacc"].cpu().numpy()[0]
 
@@ -115,6 +116,49 @@ TWIN_XML = """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
 <tendon><spatial name="t" armature="0.5"><site site="anchor"/><site site="tip1"/><site site="tip2"/></spatial></tendon>
 </mujoco>"""
 
+# Blocking-review fixtures: two joints serially on ONE body. The second
+# joint's frame velocity must include the first joint's motion.
+HH_XML = """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
+<worldbody>
+<site name="anchor" pos="-0.3 0.2 1.5"/>
+<body name="car" pos="0 0 1"><joint name="h1" type="hinge" axis="0 1 0"/>
+<joint name="h2" type="hinge" axis="1 0 0"/>
+<geom type="box" size="0.1 0.08 0.06" pos="0.03 0 0" mass="1"/>
+<site name="tip" pos="0.15 0.05 0.02"/></body>
+</worldbody>
+<tendon><spatial name="t" armature="0.5"><site site="anchor"/><site site="tip"/></spatial></tendon>
+</mujoco>"""
+
+HS_XML = """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
+<worldbody>
+<site name="anchor" pos="-0.3 0.2 1.5"/>
+<body name="car" pos="0 0 1"><joint name="h" type="hinge" axis="0 1 0"/>
+<joint name="s" type="slide" axis="1 0 0"/>
+<geom type="box" size="0.1 0.08 0.06" pos="0.03 0 0" mass="1"/>
+<site name="tip" pos="0.15 0.05 0.02"/></body>
+</worldbody>
+<tendon><spatial name="t" armature="0.5"><site site="anchor"/><site site="tip"/></spatial></tendon>
+</mujoco>"""
+
+
+def _finite_diff_dot(m, qp, qv):
+  # Independent oracle: Jdot.qvel via central differences of the dense
+  # tendon Jacobian along the velocity direction (no mj_jacDot involved).
+  # Valid for hinge/slide models (no quaternion renormalization needed).
+  h = 1e-7
+  nv = m.nv
+  rows = []
+  for sgn in (1.0, -1.0):
+    d = mujoco.MjData(m)
+    d.qpos[:] = np.asarray(qp, dtype=float) + sgn * h * np.asarray(qv, dtype=float)
+    mujoco.mj_forward(m, d)
+    r = np.zeros(nv)
+    for k in range(int(m.ten_J_rownnz[0])):
+      r[int(m.ten_J_colind[int(m.ten_J_rowadr[0]) + k])] = float(d.ten_J[int(m.ten_J_rowadr[0]) + k])
+    rows.append(r)
+  Jdot_qvel = (rows[0] - rows[1]) / (2 * h)
+  return float(Jdot_qvel @ np.asarray(qv, dtype=float))
+
 
 def _random_state(m, seed, vscale=3.0):
   rng = np.random.default_rng(seed)
@@ -167,6 +211,36 @@ def test_armature_family_dots_and_qacc_gpu(xml, sites, seeds):
                                rtol=1e-5, atol=2e-4)
     worst_q = max(worst_q, float(np.max(np.abs(nqacc[:m.nv] - np.asarray(d.qacc)[:m.nv]))))
   assert worst_dot < 2e-5, worst_dot
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("xml,sites", [
+    (HH_XML, ("anchor", "tip")),
+    (HS_XML, ("anchor", "tip")),
+])
+def test_armature_serial_same_body_joints_gpu(xml, sites):
+  # Blocking review: two joints serially on ONE body. The second joint's
+  # frame velocity must include the first joint's motion. Triple-checked:
+  # native dots vs pinned mj_tendonDot vs finite differences of ten_J.
+  from mujoco_metal import MetalSimulation
+  m = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  for seed in (3, 17):
+    qp = (np.random.default_rng(seed).random(m.nq) - 0.5) * 0.8
+    qv = (np.random.default_rng(seed + 100).random(m.nv) - 0.5) * 6.0
+    dots, _, nqacc = _native_state(sim, m, qp, qv)
+    d = mujoco.MjData(m)
+    d.qpos[:] = qp
+    d.qvel[:] = qv
+    mujoco.mj_forward(m, d)
+    ref = _pinned_dot_generic(m, d, sites)
+    fd = _finite_diff_dot(m, qp, qv)
+    assert abs(ref) > 1e-3, ref  # nonzero guard
+    np.testing.assert_allclose(ref, fd, rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(float(dots[0]), ref, rtol=1e-5, atol=2e-5)
+    np.testing.assert_allclose(nqacc[:m.nv], np.asarray(d.qacc)[:m.nv],
+                               rtol=1e-5, atol=2e-4)
 
 
 @pytest.mark.gpu
