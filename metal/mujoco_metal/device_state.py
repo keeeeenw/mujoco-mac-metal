@@ -79,11 +79,13 @@ class StateSnapshot:
   time: np.ndarray
   status: np.ndarray
   schema_version: int = 1
+  neq: int = 0
+  eq_active: np.ndarray | None = None
 
   def __post_init__(self):
-    if self.schema_version != 1:
+    if self.schema_version not in (1, 2):
       raise ValueError("unsupported state snapshot schema")
-    if self.batch_size <= 0 or self.nq < 0 or self.nv < 0:
+    if self.batch_size <= 0 or self.nq < 0 or self.nv < 0 or self.neq < 0:
       raise ValueError("invalid state snapshot dimensions")
     if not math.isfinite(float(self.timestep)) or self.timestep <= 0:
       raise ValueError("snapshot timestep must be finite and positive")
@@ -110,6 +112,29 @@ class StateSnapshot:
     status = np.asarray(raw_status, dtype=np.int32, order="C")
     frozen = np.frombuffer(status.tobytes(), dtype=np.int32).reshape((batch,))
     object.__setattr__(self, "status", frozen)
+    # Equality activity (schema 2). Version 1 never carries activity and must
+    # never be silently upgraded for models with equalities.
+    if self.schema_version == 1:
+      if self.neq != 0 or self.eq_active is not None:
+        raise ValueError("schema 1 snapshots must not carry equality activity")
+      object.__setattr__(self, "neq", 0)
+      object.__setattr__(self, "eq_active", None)
+    else:
+      if self.neq < 0:
+        raise ValueError("invalid equality dimensions")
+      if self.neq == 0:
+        if self.eq_active is not None:
+          raise ValueError("snapshots without equalities must not carry activity")
+        object.__setattr__(self, "eq_active", None)
+      else:
+        raw_eq = np.asarray(self.eq_active) if self.eq_active is not None else None
+        if raw_eq is None or raw_eq.shape != (batch, self.neq) or raw_eq.dtype.kind not in "iub":
+          raise ValueError(f"eq_active must be boolean/integer with shape ({batch}, {self.neq})")
+        eq = np.asarray(raw_eq, dtype=np.int32, order="C")
+        if np.any((eq != 0) & (eq != 1)):
+          raise ValueError("eq_active values must be 0 or 1")
+        frozen_eq = np.frombuffer(eq.tobytes(), dtype=np.int32).reshape((batch, self.neq))
+        object.__setattr__(self, "eq_active", frozen_eq)
 
 
 class DeviceState:
@@ -168,6 +193,22 @@ class DeviceState:
     self._model_fingerprint = model_fingerprint
     self._profile_fingerprint = _state_fingerprint(profile)
 
+    # Equality activity: one logical boolean per equality per environment,
+    # initialized from compiled eq_active0. Models without equalities (including
+    # ModelDescriptor inputs, which carry no equality metadata) own no mask.
+    if isinstance(model, mujoco.MjModel):
+      self._neq = int(model.neq)
+      if self._neq > 0:
+        eq0 = np.asarray(model.eq_active0).astype(np.int32, copy=True).reshape((self._neq,))
+        if eq0.shape != (self._neq,) or np.any((eq0 != 0) & (eq0 != 1)):
+          raise ValueError("compiled eq_active0 must be 0/1")
+      else:
+        eq0 = np.zeros(0, dtype=np.int32)
+    else:
+      self._neq = 0
+      eq0 = np.zeros(0, dtype=np.int32)
+    self._eq_active0 = np.frombuffer(eq0.tobytes(), dtype=np.int32).reshape(eq0.shape)
+
     initial_qpos = np.broadcast_to(
         descriptor.qpos0, (self.batch_size, descriptor.nq)
     ).copy()
@@ -210,7 +251,22 @@ class DeviceState:
     self._status = torch.zeros(
         (self.batch_size,), dtype=torch.int32, device=self._device
     )
+    if self._neq > 0:
+      init_eq = np.broadcast_to(self._eq_active0, (self.batch_size, self._neq)).copy()
+      self._eq_active = torch.as_tensor(init_eq, dtype=torch.int32, device=self._device).clone()
+    else:
+      self._eq_active = None
     self._generation = 0
+
+  @property
+  def neq(self):
+    return self._neq
+
+  @property
+  def eq_active(self):
+    if self._eq_active is None:
+      return None
+    return self._eq_active.detach().clone()
 
   @staticmethod
   def _host_values(value, shape, name):
@@ -280,8 +336,95 @@ class DeviceState:
       raise ValueError("env_ids are out of range")
     return ids
 
-  def reset(self, env_ids=None, qpos=None, qvel=None):
-    """Reset selected rows atomically from checked host arrays or model defaults."""
+  def _validate_eq_active(self, value, shape, name="eq_active"):
+    arr = np.asarray(value)
+    # Accept bool or integer 0/1; reject float/non-binary.
+    if arr.dtype.kind == "f":
+      raise ValueError(f"{name} must be boolean or integer 0/1, not float")
+    if arr.shape != shape or arr.dtype.kind not in "bi u":
+      raise ValueError(f"{name} must be boolean/integer with shape {shape}")
+    try:
+      as_int = np.asarray(arr, dtype=np.int32)
+    except Exception as exc:
+      raise ValueError(f"{name} must be representable as int32") from exc
+    if np.any((as_int != 0) & (as_int != 1)):
+      raise ValueError(f"{name} values must be 0 or 1")
+    return np.ascontiguousarray(as_int, dtype=np.int32).copy()
+
+  def set_equality_active(self, values, env_ids=None):
+    """Update persistent equality activity for selected environments.
+
+    `values` accepts host boolean/integer arrays with shape `(neq,)` (broadcast
+    to all selected worlds) or `(len(env_ids), neq)` (per-world), or contiguous
+    int32/bool MPS/CPU tensors with the same shapes (device tensors are copied,
+    never borrowed or modified). `env_ids=None` selects all worlds. Validation
+    is atomic: bad input leaves all worlds unchanged. Changes take effect on
+    the next step/assembly and do not clear sticky failure status.
+    """
+    if self._neq == 0:
+      raise ValueError("model has no equalities")
+    ids = self._env_ids(env_ids)
+    if not ids.size:
+      return self._generation
+    count = ids.size
+    torch = self._torch
+    # Device tensor fast path (copied, validated without host readback of state).
+    if isinstance(values, torch.Tensor):
+      if values.dtype not in (torch.int32, torch.bool):
+        raise ValueError("eq_active tensor must have dtype torch.int32 or torch.bool")
+      if not values.is_contiguous():
+        raise ValueError("eq_active tensor must be contiguous")
+      if tuple(values.shape) == (self._neq,):
+        # Broadcast single row to all selected worlds.
+        want = (count, self._neq)
+        # Validate values are 0/1 without host readback of state (read input only).
+        # For device inputs, nonfinite rows fail via solver; here check 0/1 via device ops?
+        # To keep atomic without host sync, copy to host for validation (input readback
+        # is allowed; hot-path stepping performs no readback).
+        host = values.detach().to("cpu").numpy()
+        checked = self._validate_eq_active(host, (self._neq,), "eq_active")
+        checked = np.broadcast_to(checked, want).copy()
+      elif tuple(values.shape) == (count, self._neq):
+        host = values.detach().to("cpu").numpy()
+        checked = self._validate_eq_active(host, (count, self._neq), "eq_active")
+      elif env_ids is None and tuple(values.shape) == (self.batch_size, self._neq):
+        host = values.detach().to("cpu").numpy()
+        checked = self._validate_eq_active(host, (self.batch_size, self._neq), "eq_active")
+        # ids is all worlds in order; use checked directly.
+        ids = np.arange(self.batch_size, dtype=np.int64)
+        count = self.batch_size
+      else:
+        raise ValueError(
+            f"eq_active tensor must have shape ({self._neq},) or ({count}, {self._neq})"
+        )
+    else:
+      arr = np.asarray(values)
+      if arr.shape == (self._neq,):
+        checked = self._validate_eq_active(arr, (self._neq,), "eq_active")
+        checked = np.broadcast_to(checked, (count, self._neq)).copy()
+      elif arr.shape == (count, self._neq):
+        checked = self._validate_eq_active(arr, (count, self._neq), "eq_active")
+      else:
+        raise ValueError(
+            f"eq_active must have shape ({self._neq},) or ({count}, {self._neq}), got {arr.shape}"
+        )
+    index = torch.as_tensor(ids, dtype=torch.int64, device=self._device)
+    value_tensor = torch.as_tensor(checked, dtype=torch.int32, device=self._device)
+    # Atomic commit via copy-then-swap (no partial updates on failure; validation
+    # already passed, index_copy_ cannot fail for validated shapes).
+    next_eq = self._eq_active.clone()
+    next_eq.index_copy_(0, index, value_tensor)
+    self._eq_active = next_eq
+    self._generation += 1
+    return self._generation
+
+  def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None):
+    """Reset selected rows atomically from checked host arrays or model defaults.
+
+    `eq_active=None` restores compiled defaults for selected worlds; pass an
+    explicit `(neq,)` or `(len(env_ids), neq)` boolean/integer array to override.
+    Unselected worlds keep their activity. Validation is atomic.
+    """
     ids = self._env_ids(env_ids)
     if not ids.size:
       return self._generation
@@ -297,6 +440,24 @@ class DeviceState:
         qvel, vel_default.shape, "qvel"
     )
     pos = self._validate_qpos(pos)
+    if self._neq == 0:
+      if eq_active is not None:
+        raise ValueError("model has no equalities")
+      eq_checked = None
+    else:
+      if eq_active is None:
+        eq_checked = np.broadcast_to(self._eq_active0, (count, self._neq)).copy()
+      else:
+        arr = np.asarray(eq_active)
+        if arr.shape == (self._neq,):
+          eq_checked = self._validate_eq_active(arr, (self._neq,), "eq_active")
+          eq_checked = np.broadcast_to(eq_checked, (count, self._neq)).copy()
+        elif arr.shape == (count, self._neq):
+          eq_checked = self._validate_eq_active(arr, (count, self._neq), "eq_active")
+        else:
+          raise ValueError(
+              f"eq_active must have shape ({self._neq},) or ({count}, {self._neq}), got {arr.shape}"
+          )
 
     index = self._torch.as_tensor(ids, dtype=self._torch.int64, device=self._device)
     pos_tensor = self._torch.as_tensor(
@@ -325,11 +486,33 @@ class DeviceState:
     next_status.index_copy_(0, index, zero_status)
     self._qpos, self._qvel = next_qpos, next_qvel
     self._qacc, self._time, self._status = next_qacc, next_time, next_status
+    if self._neq > 0:
+      next_eq = self._eq_active.clone()
+      eq_tensor = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)
+      next_eq.index_copy_(0, index, eq_tensor)
+      self._eq_active = next_eq
     self._generation += 1
     return self._generation
 
   def snapshot(self):
     """Copy all state to an immutable host checkpoint outside the step loop."""
+    if self._neq == 0:
+      return StateSnapshot(
+        model_fingerprint=self._model_fingerprint,
+        profile_fingerprint=self._profile_fingerprint,
+        timestep=self.profile.timestep,
+        nq=self._model.nq,
+        nv=self._model.nv,
+        batch_size=self.batch_size,
+        qpos=self._qpos.detach().cpu().numpy(),
+        qvel=self._qvel.detach().cpu().numpy(),
+        qacc=self._qacc.detach().cpu().numpy(),
+        time=self._time.detach().cpu().numpy(),
+        status=self._status.detach().cpu().numpy(),
+        schema_version=1,
+        neq=0,
+        eq_active=None,
+      )
     return StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
@@ -342,13 +525,16 @@ class DeviceState:
         qacc=self._qacc.detach().cpu().numpy(),
         time=self._time.detach().cpu().numpy(),
         status=self._status.detach().cpu().numpy(),
+        schema_version=2,
+        neq=self._neq,
+        eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
     )
 
   def restore(self, snapshot):
     """Restore a matching checkpoint only after validating every field."""
     if not isinstance(snapshot, StateSnapshot):
       raise TypeError("snapshot must be a StateSnapshot")
-    if snapshot.schema_version != 1:
+    if snapshot.schema_version not in (1, 2):
       raise ValueError("unsupported state snapshot schema")
     if (
         snapshot.model_fingerprint != self._model_fingerprint
@@ -359,6 +545,22 @@ class DeviceState:
         or snapshot.batch_size != self.batch_size
     ):
       raise ValueError("snapshot model, profile, timestep, or dimensions do not match")
+    # Equality compatibility: never silently lose activity.
+    if self._neq == 0:
+      if snapshot.schema_version == 2 and snapshot.neq != 0:
+        raise ValueError("snapshot equality dimensions do not match")
+      eq_checked = None
+    else:
+      if snapshot.schema_version == 1:
+        raise ValueError(
+            "snapshot schema 1 has no equality activity; refusing to restore "
+            "into a model with equalities (would silently lose activity)"
+        )
+      if snapshot.neq != self._neq:
+        raise ValueError("snapshot equality dimensions do not match")
+      eq_checked = self._validate_eq_active(
+          snapshot.eq_active, (self.batch_size, self._neq), "eq_active"
+      )
     qpos = self._validate_qpos(
         self._host_values(snapshot.qpos, (self.batch_size, self._model.nq), "qpos")
     )
@@ -391,5 +593,7 @@ class DeviceState:
         ),
     )
     self._qpos, self._qvel, self._qacc, self._time, self._status = tensors
+    if self._neq > 0:
+      self._eq_active = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)
     self._generation += 1
     return self._generation

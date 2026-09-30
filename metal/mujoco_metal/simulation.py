@@ -350,6 +350,41 @@ class MetalSimulation:
       return self._coupled_constraints.solver_settings
     return None
 
+  def set_equality_active(self, values, env_ids=None):
+    """Set persistent equality activity for selected environments.
+
+    `values` accepts host boolean/integer arrays with shape `(neq,)` (broadcast
+    to selected worlds) or `(len(env_ids), neq)`, or contiguous int32/bool MPS
+    tensors with the same shapes (copied, never borrowed). `env_ids=None`
+    selects all worlds. Validation is atomic: bad input leaves all worlds
+    unchanged. Changes take effect on the next step/assembly, invalidate cached
+    assembly, and do not clear sticky failure status. Works for joint, connect
+    and weld equalities; reattaching uses the compiled reference, not a
+    recaptured pose.
+    """
+    if self._coupled_constraints is None:
+      # No coupled stage (e.g., constraints disabled): only allow empty/no-op?
+      # Preserve no-equality support: raise unless model truly has no equalities.
+      neq = int(self._mjmodel.neq) if isinstance(self._mjmodel, mujoco.MjModel) else 0
+      if neq == 0:
+        # Accept empty calls for uniformity? Reject non-empty to avoid silent loss.
+        try:
+          arr = values.detach().cpu().numpy() if hasattr(values, "detach") else __import__("numpy").asarray(values)
+        except Exception:
+          raise ValueError("model has no equalities")
+        if np.asarray(arr).size != 0:
+          raise ValueError("model has no equalities")
+        return self._state.generation
+      raise ValueError("set_equality_active requires a coupled constraint profile")
+    gen = self._state.set_equality_active(values, env_ids=env_ids)
+    # Invalidate cached assembly so next assembled_system recomputes with new
+    # activity and fresh diagnostics. Do not touch failure status.
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
+    if hasattr(self, "_last_coupled_generation"):
+      self._last_coupled_generation = None
+    return gen
+
   def buffer_audit(self):
     """Return a tuple of buffer specifications derived from real device allocations."""
     b = self.batch_size
@@ -362,6 +397,8 @@ class MetalSimulation:
         {"name": "qfrc_bias", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._model.nv})", "dtype": "float32"},
         {"name": "qfrc_smooth", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._model.nv})", "dtype": "float32"},
     ]
+    if getattr(self._state, "_neq", 0) > 0 and getattr(self._state, "_eq_active", None) is not None:
+      entries.append({"name": "state.eq_active", "residency": "MPS device-resident", "lifetime": "persistent", "shape": f"({b}, {self._state._neq})", "dtype": str(self._state._eq_active.dtype).replace("torch.", "")})
     if self._euler_solver is not None:
       entries.append({"name": "effective_mass", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"({b}, {self._state._model.nv}, {self._state._model.nv})", "dtype": "float32"})
     if self._coupled_constraints is not None:
@@ -414,6 +451,7 @@ class MetalSimulation:
     assembly at the current device state with the provided control and applied forces.
     Returns dict containing 'J', 'W', 'W_regularized', 'R', 'ar', 'rhs', 'lambda',
     'qacc', 'qfrc_constraint', 'mass_matrix', 'status'.
+    Changing equality activity, reset or restore invalidates the cache.
     """
     if self._coupled_constraints is None:
       raise ValueError("assembled_system requires a coupled constraint stepping profile")
@@ -423,7 +461,11 @@ class MetalSimulation:
     if qfrc_applied is not None:
       self._prepare_force(qfrc_applied)
       recompute = True
-    if not recompute and hasattr(self, "_last_coupled") and self._last_coupled is not None:
+    if (
+        not recompute
+        and getattr(self, "_last_coupled", None) is not None
+        and getattr(self, "_last_coupled_generation", None) == self._state.generation
+    ):
       return self._last_coupled
     state = self._state
     qpos, qvel = state._qpos, state._qvel
@@ -447,12 +489,14 @@ class MetalSimulation:
       rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
     if self._motor is not None:
       rhs.add_(self._motor.run_device(self._control))
+    eq_active = getattr(state, "_eq_active", None)
     coupled = self._coupled_constraints.run_device(
         dynamics["poses"], dynamics["mass_matrix"], rhs, qpos, qvel,
-        cvel=dynamics.get("cvel", None),
+        eq_active=eq_active, cvel=dynamics.get("cvel", None),
     )
     coupled["mass_matrix"] = dynamics["mass_matrix"]
     self._last_coupled = coupled
+    self._last_coupled_generation = self._state.generation
     return coupled
 
   def _prepare_force(self, qfrc_applied):
@@ -579,12 +623,14 @@ class MetalSimulation:
         dynamics["mass_matrix"], self._rhs
     )
     if self._coupled_constraints is not None:
+      eq_active = getattr(self._state, "_eq_active", None)
       coupled = self._coupled_constraints.run_device(
           dynamics["poses"], dynamics["mass_matrix"], self._rhs, qpos, qvel,
-          cvel=dynamics.get("cvel", None),
+          eq_active=eq_active, cvel=dynamics.get("cvel", None),
       )
       coupled["mass_matrix"] = dynamics["mass_matrix"]
       self._last_coupled = coupled
+      self._last_coupled_generation = self._state.generation
       status = self._state._torch.where(
           status == 0, coupled["status"], status
       )
