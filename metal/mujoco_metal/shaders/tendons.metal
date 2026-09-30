@@ -344,7 +344,7 @@ kernel void spatial_tendon_kinematics(
     device const int* path_types [[buffer(9)]],
     device const int* path_objids [[buffer(10)]],
     device const float* path_prms [[buffer(11)]],
-    device const int* path_start [[buffer(12)]],
+    device const int* path_offset [[buffer(12)]],
     device const int* path_count [[buffer(13)]],
     device const int* geom_type [[buffer(14)]],
     device const int* geom_bodyid [[buffer(15)]],
@@ -360,12 +360,12 @@ kernel void spatial_tendon_kinematics(
     device float* out_jacobian [[buffer(25)]],
     uint world [[thread_position_in_grid]]) {
   int nv=dims[0], nt=dims[1], nsite=dims[2], ngeom=dims[3];
-  int nbody=dims[4], njnt=dims[5], maxwrap=dims[6], batch=dims[7];
+  int nbody=dims[4], njnt=dims[5], batch=dims[7];
   if (uint(world)>=uint(batch)) return;
   uint vbase=uint(world)*uint(max(nv,1)), tbase=uint(world)*uint(max(nt,1));
   int bo=world*nbody, jo=world*max(njnt,1), so=world*max(nsite,1), go=world*max(ngeom,1);
   for (int t=0;t<nt;++t) {
-    int start=path_start[t], count=path_count[t];
+    int off=path_offset[t], count=path_count[t];
     float len=0.0f;
     float row[32];
     for (int d=0;d<32;++d) row[d]=0.0f;
@@ -373,10 +373,10 @@ kernel void spatial_tendon_kinematics(
       float divisor=1.0f;
       int j=0;
       while (j<count-1) {
-        int t0=path_types[t*maxwrap+j], t1=path_types[t*maxwrap+j+1];
-        int id0=path_objids[t*maxwrap+j], id1=path_objids[t*maxwrap+j+1];
+        int t0=path_types[off+j], t1=path_types[off+j+1];
+        int id0=path_objids[off+j], id1=path_objids[off+j+1];
         if (t0==2||t1==2) {  // mjWRAP_PULLEY
-          if (t0==2) divisor=path_prms[t*maxwrap+j];
+          if (t0==2) divisor=path_prms[off+j];
           j++;
           continue;
         }
@@ -384,8 +384,8 @@ kernel void spatial_tendon_kinematics(
         int b0=(id0>=0&&id0<nsite)?site_bodyid[id0]:0;
         // site-geom-site wrap: t1 is SPHERE(4)/CYLINDER(5), next is a site
         if ((t1==4||t1==5)&&j+2<count) {
-          int id2=path_objids[t*maxwrap+j+2];
-          float side_prm=path_prms[t*maxwrap+j+1];
+          int id2=path_objids[off+j+2];
+          float side_prm=path_prms[off+j+1];
           int sideid=int(round(side_prm));
           bool has_side=(sideid>=0&&sideid<nsite);
           float3 sp=has_side?float3(site_pos[(so+sideid)*3],site_pos[(so+sideid)*3+1],site_pos[(so+sideid)*3+2]):float3(0.0f);

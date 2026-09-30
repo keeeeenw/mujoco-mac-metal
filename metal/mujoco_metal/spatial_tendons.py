@@ -18,6 +18,9 @@ import numpy as np
 
 _MJMINVAL = 1e-15
 _INT32_MAX = (1 << 31) - 1
+# Native cap on total flattened spatial wraps (R2 bound, disclosed in docs).
+# Paths have no per-path stride limit; unequal lengths are exact.
+_MAX_TOTAL_WRAP = 512
 
 
 def _frozen(values, dtype):
@@ -284,6 +287,24 @@ class SpatialTendonModel:
       self.paths.append({"start": start, "count": count, "types": types,
                          "objids": objids, "prms": prms})
     self.has_spatial = any(p is not None for p in self.paths)
+    # Flat device storage: concatenated spatial wraps with explicit per-tendon
+    # offsets (no row stride, so unequal path lengths are exact). Total
+    # flattened wraps are capped for workspace sizing (R2 bound, disclosed).
+    self.flat_types, self.flat_objids, self.flat_prms = [], [], []
+    self.flat_offset, self.flat_count = [], []
+    for p in self.paths:
+      self.flat_offset.append(len(self.flat_types))
+      if p is None:
+        self.flat_count.append(0)
+        continue
+      self.flat_types.extend(p["types"])
+      self.flat_objids.extend(p["objids"])
+      self.flat_prms.extend(p["prms"])
+      self.flat_count.append(len(p["types"]))
+    if len(self.flat_types) > _MAX_TOTAL_WRAP:
+      raise ValueError(
+          f"spatial tendon wraps ({len(self.flat_types)}) exceed the native cap "
+          f"{_MAX_TOTAL_WRAP}")
     # Dynamics/constraint parameters (all tendons, fixed or spatial).
     self.stiffness = _frozen(model.tendon_stiffness, np.float32)
     self.stiffnesspoly = _frozen(np.asarray(model.tendon_stiffnesspoly).reshape(ntendon, 2)
@@ -369,6 +390,7 @@ def spatial_length_reference(model, tendon, site_xpos, geom_xpos=None, geom_xmat
 
 
 _MAX_WRAP = 8
+# (Deprecated stride alias kept for the dims slot only; storage is flat.)
 
 
 class MetalSpatialTendonDynamics:
@@ -400,25 +422,13 @@ class MetalSpatialTendonDynamics:
         arr = np.zeros(1, dtype=arr.dtype)
       return torch.as_tensor(arr, dtype=dtype, device=self._device)
 
-    self._types = tensor(np.zeros((nt, _MAX_WRAP), dtype=np.int32)
-                         if nt == 0 else np.stack([
-                             np.asarray(p["types"] + [0] * (_MAX_WRAP - len(p["types"])), dtype=np.int32)
-                             if p is not None else np.zeros(_MAX_WRAP, dtype=np.int32)
-                             for p in meta.paths]), torch.int32)
-    self._objids = tensor(np.zeros((nt, _MAX_WRAP), dtype=np.int32)
-                          if nt == 0 else np.stack([
-                              np.asarray(p["objids"] + [-1] * (_MAX_WRAP - len(p["objids"])), dtype=np.int32)
-                              if p is not None else -np.ones(_MAX_WRAP, dtype=np.int32)
-                              for p in meta.paths]), torch.int32)
-    self._prms = tensor(np.zeros((nt, _MAX_WRAP), dtype=np.float32)
-                        if nt == 0 else np.stack([
-                            np.asarray(p["prms"] + [0.0] * (_MAX_WRAP - len(p["prms"])), dtype=np.float32)
-                            if p is not None else np.zeros(_MAX_WRAP, dtype=np.float32)
-                            for p in meta.paths]))
-    self._start = tensor([p["start"] if p is not None else 0 for p in meta.paths]
-                         if nt else np.zeros(1, dtype=np.int32), torch.int32)
-    self._count = tensor([p["count"] if p is not None else 0 for p in meta.paths]
-                         if nt else np.zeros(1, dtype=np.int32), torch.int32)
+    self._types = tensor(np.asarray(meta.flat_types if meta.flat_types else [0], dtype=np.int32),
+                         torch.int32)
+    self._objids = tensor(np.asarray(meta.flat_objids if meta.flat_objids else [-1], dtype=np.int32),
+                          torch.int32)
+    self._prms = tensor(np.asarray(meta.flat_prms if meta.flat_prms else [0.0], dtype=np.float32))
+    self._offset = tensor(np.asarray(meta.flat_offset if nt else [0], dtype=np.int32), torch.int32)
+    self._count = tensor(np.asarray(meta.flat_count if nt else [0], dtype=np.int32), torch.int32)
     nbody, njnt = int(model.nbody), int(model.njnt)
     self._geom_type = tensor(model.geom_type if ngeom0(model) else np.zeros(1, dtype=np.int32), torch.int32)
     self._geom_bodyid = tensor(model.geom_bodyid if ngeom0(model) else np.zeros(1, dtype=np.int32), torch.int32)
@@ -430,7 +440,8 @@ class MetalSpatialTendonDynamics:
     self._body_parentid = tensor(model.body_parentid, torch.int32)
     self._body_jntadr = tensor(model.body_jntadr, torch.int32)
     self._body_jntnum = tensor(model.body_jntnum, torch.int32)
-    self._dims = tensor([nv, nt, meta.nsite, ngeom0(model), nbody, njnt, _MAX_WRAP, batch_size],
+    self._dims = tensor([nv, nt, meta.nsite, ngeom0(model), nbody, njnt, len(meta.flat_types),
+                         batch_size],
                         torch.int32)
     self._stiffness = tensor(meta.stiffness)
     self._stiffnesspoly = tensor(meta.stiffnesspoly.reshape(-1))
@@ -517,7 +528,7 @@ class MetalSpatialTendonDynamics:
         poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),
         poses["joint_anchor"].reshape(-1), poses["joint_axis"].reshape(-1),
         self._types.reshape(-1), self._objids.reshape(-1), self._prms.reshape(-1),
-        self._start, self._count,
+        self._offset, self._count,
         self._geom_type, self._geom_bodyid, self._site_bodyid,
         self._jnt_type, self._jnt_dofadr,
         self._body_parentid, self._body_jntadr, self._body_jntnum,

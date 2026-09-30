@@ -262,6 +262,52 @@ def test_tendon_equality_native_parity_gpu():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_long_unequal_paths_native_parity_gpu():
+  # R2 regression: paths longer than the old 8-entry stride with unequal
+  # lengths must address the right wraps (flat offsets, no stride).
+  import torch
+  from mujoco_metal import MetalSimulation
+  sites = "".join(f'<site name="s{k}" pos="{0.1 * k} 0 1"/>' for k in range(12))
+  long_path = "".join(f'<site site="s{k}"/>' for k in range(12))
+  short_path = '<site site="s0"/><site site="s5"/><site site="s11"/>'
+  world = sites + '<body pos="0 0 1"><joint name="j" type="slide" axis="1 0 0"/>' \
+    '<geom type="sphere" size="0.05" mass="1"/>' \
+    '<site name="m" pos="0.3 0 0"/></body>'
+  m = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.002"/><worldbody>' + world + '</worldbody>'
+      '<tendon><spatial name="long">' + long_path + '</spatial>'
+      '<spatial name="short">' + short_path + '</spatial>'
+      '<spatial name="move"><site site="s0"/><site site="m"/><site site="s11"/></spatial>'
+      '</tendon></mujoco>')
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  d = mujoco.MjData(m)
+  d.qpos[0] = 0.07
+  d.qvel[0] = 0.3
+  mujoco.mj_forward(m, d)
+  sim.state._qpos.copy_(torch.as_tensor(
+      np.asarray(d.qpos, dtype=np.float32).reshape(1, -1), device=sim.state._device))
+  sim.state._qvel.copy_(torch.as_tensor(
+      np.asarray(d.qvel, dtype=np.float32).reshape(1, -1), device=sim.state._device))
+  poses = sim._smooth.run_device(sim.state._qpos, sim.state._qvel, None, None)["poses"]
+  kin = sim._spatial_tendons.run_kinematics(sim.state._qvel, poses)
+  np.testing.assert_allclose(kin["length"].cpu().numpy()[0],
+                             np.asarray(d.ten_length), rtol=2e-5, atol=2e-6)
+  np.testing.assert_allclose(kin["jacobian"].cpu().numpy()[0], _dense_J(m, d),
+                             rtol=2e-5, atol=2e-6)
+
+
+def test_total_wrap_overflow_rejected_cpu():
+  from mujoco_metal.spatial_tendons import SpatialTendonModel, _MAX_TOTAL_WRAP
+  n = _MAX_TOTAL_WRAP + 10
+  sites = "".join(f'<site name="s{k}" pos="{0.01 * k} 0 1"/>' for k in range(n))
+  path = "".join(f'<site site="s{k}"/>' for k in range(n))
+  m = _model(sites, f'<spatial name="t">{path}</spatial>')
+  with pytest.raises(ValueError, match="exceed the native cap"):
+    SpatialTendonModel(m)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_slack_taut_and_mixed_model_gpu():
   from mujoco_metal import MetalSimulation
   # Spring engages only outside its rest range (slack inside).
