@@ -504,6 +504,9 @@ kernel void solve_coupled_constraints(
   int maxiter = dims[8];
   int nr = dims[9];
   int cone_type = dims[10];
+  int n_eq_rows = nr > 0 ? dims[14] : 0;
+  if (n_eq_rows < 0) n_eq_rows = 0;
+  if (n_eq_rows > nr) n_eq_rows = nr;
   if (world >= uint(batch)) return;
 
   int mb = world * nv * nv;
@@ -515,13 +518,20 @@ kernel void solve_coupled_constraints(
   for (int i = 0; i < nv; ++i) { out_force[qb + i] = 0.0f; out_acc[qb + i] = 0.0f; }
   if (workspace_debug && nr > 0) {
     device float* dbg = workspace_debug + world * (nr * nr + 4 * nr);
-    for (int i = 0; i < nr * nr + 4 * nr; ++i) dbg[i] = 0.0f;
+    for (int i = 0; i < nr * nr; ++i) dbg[i] = 0.0f;
+    for (int r = n_eq_rows; r < nr; ++r) {
+      dbg[nr * nr + r] = 0.0f;
+      dbg[nr * nr + nr + r] = 0.0f;
+    }
+    for (int i = 0; i < 2 * nr; ++i) dbg[nr * nr + 2 * nr + i] = 0.0f;
   }
   if (nv == 0) return;
   if (nv > 32 || nr > 96) { out_status[world] = 2; return; }
 
   device float* J_world = workspace_J + world * nr * nv;
-  for (int i = 0; i < nr * nv; ++i) J_world[i] = 0.0f;
+  for (int r = n_eq_rows; r < nr; ++r) {
+    for (int i = 0; i < nv; ++i) J_world[r * nv + i] = 0.0f;
+  }
 
   thread float L[32 * 32];
   thread float Z[96 * 32];
@@ -533,51 +543,28 @@ kernel void solve_coupled_constraints(
   for (int i = 0; i < nr; ++i) {
     R[i] = 0.0f; ar[i] = 0.0f; lo[i] = 0.0f; hi[i] = 0.0f; lam[i] = 0.0f; enabled[i] = false;
   }
+  // Equality rows [0, n_eq_rows) are preassembled on Metal by equality_assembly
+  // (joint/connect/weld with version-pinned residuals, Jacobians, Jdot, impedance).
+  // Treat them as bilateral; inactive rows were written as zero J/R/ar and
+  // naturally yield zero multipliers without affecting coupled rows.
+  if (workspace_debug && nr > 0) {
+    device float* dbg = workspace_debug + world * (nr * nr + 4 * nr);
+    for (int r = 0; r < n_eq_rows && r < nr; ++r) {
+      R[r] = dbg[nr * nr + r];
+      ar[r] = dbg[nr * nr + nr + r];
+      lo[r] = -INFINITY;
+      hi[r] = INFINITY;
+      enabled[r] = true;
+    }
+  }
 
-  int base_contact = neq + nv + 2 * nj;
+  int base_contact = n_eq_rows + nv + 2 * nj;
 
   // 1. Joint constraints (if constraint disable flag not set: bit 0 mjDSBL_CONSTRAINT)
   if ((flags & 1) == 0) {
-    // Equalities (bit 1 mjDSBL_EQUALITY)
-    for (int e = 0; e < neq; ++e) {
-      if ((flags & 2) != 0 || eq_active[world * neq + e] == 0) continue;
-      int j1 = eq_obj[e * 2];
-      int j2 = eq_obj[e * 2 + 1];
-      int q1 = joint_qadr[j1];
-      int d1 = joint_dadr[j1];
-      float value1 = qpos[pb + q1];
-      float ref1 = qpos0[q1];
-      float data0 = eq_data[e * 11];
-      float pos = value1 - ref1 - data0;
-      float vel = qvel[qb + d1];
-      float diag = invweight[d1];
-      if (j2 >= 0) {
-        int q2 = joint_qadr[j2];
-        int d2 = joint_dadr[j2];
-        float dif = qpos[pb + q2] - qpos0[q2];
-        float poly = 0.0f, deriv = 0.0f, power = dif;
-        for (int k = 0; k < 4; ++k) {
-          poly += eq_data[e * 11 + k + 1] * power;
-          deriv += (k + 1) * eq_data[e * 11 + k + 1] * pow(dif, float(k));
-          power *= dif;
-        }
-        pos -= poly;
-        J_world[e * nv + d1] = 1.0f;
-        J_world[e * nv + d2] = -deriv;
-        vel -= deriv * qvel[qb + d2];
-        diag += invweight[d2];
-      } else {
-        J_world[e * nv + d1] = 1.0f;
-      }
-      reference_params(eq_sol_params + e * 7, eq_sol_params + e * 7 + 2, 0, pos, 0.0f, vel, diag, false, params[0], refsafe, R[e], ar[e]);
-      lo[e] = -INFINITY;
-      hi[e] = INFINITY;
-      enabled[e] = true;
-    }
-
     // Frictionloss (bit 2 mjDSBL_FRICTIONLOSS)
     for (int d = 0; d < nv; ++d) {
-      int row = neq + d;
+      int row = n_eq_rows + d;
       float loss = frictionloss[d];
       if ((flags & 4) != 0 || loss <= 0.0f) continue;
       J_world[row * nv + d] = 1.0f;
@@ -594,7 +581,7 @@ kernel void solve_coupled_constraints(
       int q = joint_qadr[j];
       float margin = joint_limit_params[j * 3 + 2];
       // Lower limit
-      int row0 = neq + nv + 2 * j;
+      int row0 = n_eq_rows + nv + 2 * j;
       float dist0 = qpos[pb + q] - joint_limit_params[j * 3 + 0];
       if ((flags & 8) == 0 && dist0 < margin) {
         J_world[row0 * nv + d] = 1.0f;
@@ -604,7 +591,7 @@ kernel void solve_coupled_constraints(
         enabled[row0] = true;
       }
       // Upper limit
-      int row1 = neq + nv + 2 * j + 1;
+      int row1 = n_eq_rows + nv + 2 * j + 1;
       float dist1 = joint_limit_params[j * 3 + 1] - qpos[pb + q];
       if ((flags & 8) == 0 && dist1 < margin) {
         J_world[row1 * nv + d] = -1.0f;

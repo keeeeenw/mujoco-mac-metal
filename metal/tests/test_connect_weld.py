@@ -7,6 +7,8 @@ Per-step equality assembly/solving must execute on Metal; CPU work here is
 constant preparation and independent reference calculation only.
 """
 
+import os
+
 import mujoco
 import numpy as np
 import pytest
@@ -221,3 +223,106 @@ def test_capacity_uses_spans_not_equality_counts():
     d_small = lower_coupled_constraints(m_small)
     assert d_small.n_eq_rows == 1
     assert d_small.nr_joint == 1 + m_small.nv + 2 * m_small.njnt
+
+
+def _native_connect_result(model, qpos, qvel):
+    import torch
+
+    from mujoco_metal.metal_kinematics import MetalKinematics
+    from mujoco_metal.smooth_metal import MetalSmoothDynamics
+    from mujoco_metal.coupled_constraints import MetalCoupledConstraints
+    from mujoco_metal.model import load_model
+
+    qpos = np.asarray(qpos, dtype=np.float32)
+    qvel = np.asarray(qvel, dtype=np.float32)
+    qpos_mps = torch.as_tensor(qpos, device="mps")
+    qvel_mps = torch.as_tensor(qvel, device="mps")
+    md = load_model(model)
+    poses = MetalKinematics(md, qpos.shape[0]).run_device(qpos_mps)
+    dyn = MetalSmoothDynamics(md, qpos.shape[0]).run_device(qpos_mps, qvel_mps)
+    res = MetalCoupledConstraints(model, qpos.shape[0]).run_device(
+        poses, dyn["mass_matrix"], -dyn["qfrc_bias"], qpos_mps, qvel_mps,
+        cvel=dyn["cvel"],
+    )
+    return res, dyn
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("form", ["body-body", "body-world", "site-site"])
+def test_native_connect_forms_match_cpu(form):
+    if form == "body-body":
+        xml = """<mujoco><option timestep="0.002" gravity="0 0 0" iterations="1000" tolerance="1e-10"/>
+        <worldbody>
+        <body name="b1" pos="0 0 1"><freejoint/><geom type="sphere" size="0.1"/></body>
+        <body name="b2" pos="1 0.2 1.1"><freejoint/><geom type="sphere" size="0.1"/></body>
+        </worldbody><equality><connect body1="b1" body2="b2" anchor="0.5 0.1 0.05"/></equality></mujoco>"""
+    elif form == "body-world":
+        xml = """<mujoco><option timestep="0.002" gravity="0 0 0" iterations="1000" tolerance="1e-10"/>
+        <worldbody>
+        <body name="b1" pos="0.2 -0.1 1.1"><freejoint/><geom type="sphere" size="0.1"/></body>
+        </worldbody><equality><connect body1="b1" anchor="0.3 0.1 0.05"/></equality></mujoco>"""
+    else:
+        xml = """<mujoco><option timestep="0.002" gravity="0 0 0" iterations="1000" tolerance="1e-10"/>
+        <worldbody>
+        <body name="b1" pos="0 0 1"><freejoint/><site name="s1" pos="0.1 0.2 0.3"/><geom type="sphere" size="0.1"/></body>
+        <body name="b2" pos="1 0.1 0.9"><freejoint/><site name="s2" pos="-0.15 0.05 -0.1"/><geom type="sphere" size="0.1"/></body>
+        </worldbody><equality><connect site1="s1" site2="s2"/></equality></mujoco>"""
+    m = mujoco.MjModel.from_xml_string(xml)
+    d = lower_coupled_constraints(m)
+    assert d.n_eq_rows == 3
+    qpos = m.qpos0[None, :].astype(np.float32)
+    qpos[0, 0] += 0.01
+    qvel = np.zeros((1, m.nv), dtype=np.float32)
+    qvel[0, :3] = [0.2, -0.1, 0.05]
+    if m.nv >= 6:
+        qvel[0, 3:6] = [0.5, -0.3, 0.4]
+    if m.nv >= 12:
+        qvel[0, 6:9] = [-0.15, 0.1, -0.05]
+        qvel[0, 9:12] = [0.3, 0.2, -0.4]
+    res, _ = _native_connect_result(m, qpos, qvel)
+    assert int(res["status"][0]) == 0
+    ref = mujoco.MjData(m)
+    ref.qpos[:] = qpos[0]
+    ref.qvel[:] = qvel[0]
+    mujoco.mj_forward(m, ref)
+    assert ref.nefc == 3, (form, ref.nefc)
+    gpu_rows = np.arange(0, 3)
+    cpu_J = ref.efc_J.reshape(ref.nefc, m.nv)
+    np.testing.assert_allclose(res["J"][0, gpu_rows].cpu().numpy(), cpu_J, atol=3e-6)
+    np.testing.assert_allclose(res["R"][0, gpu_rows].cpu().numpy(), ref.efc_R, rtol=2e-5, atol=1e-5)
+    np.testing.assert_allclose(res["ar"][0, gpu_rows].cpu().numpy(), ref.efc_aref, rtol=2e-4, atol=2e-3)
+    np.testing.assert_allclose(-res["rhs"][0, gpu_rows].cpu().numpy(), ref.efc_b, rtol=2e-4, atol=2e-3)
+    np.testing.assert_allclose(res["qacc"][0].cpu().numpy(), ref.qacc, rtol=5e-4, atol=2e-2)
+    np.testing.assert_allclose(
+        res["qfrc_constraint"][0].cpu().numpy(), ref.qfrc_constraint, rtol=5e-4, atol=8e-2
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_native_connect_trajectory_matches_cpu():
+    from mujoco_metal.simulation import MetalSimulation
+
+    xml = """<mujoco><option timestep="0.002" gravity="0 0 -9.81" iterations="1000" tolerance="1e-6"/>
+    <worldbody>
+    <body name="b1" pos="0 0 1"><freejoint/><geom type="sphere" size="0.12" mass="1"/></body>
+    <body name="b2" pos="0.9 0.1 1.05"><freejoint/><geom type="sphere" size="0.12" mass="1"/></body>
+    </worldbody><equality><connect body1="b1" body2="b2" anchor="0.45 0.05 0.02"/></equality></mujoco>"""
+    m = mujoco.MjModel.from_xml_string(xml)
+    q0 = m.qpos0[None, :].astype(np.float32)
+    v0 = np.zeros((1, m.nv), dtype=np.float32)
+    v0[0, :3] = [0.1, -0.05, 0.02]
+    sim = MetalSimulation(m, batch_size=1, qpos=q0, qvel=v0, profile="integrated_euler_v1")
+    cpu = mujoco.MjData(m)
+    cpu.qpos[:] = q0[0]
+    cpu.qvel[:] = v0[0]
+    max_pos = 0.0
+    max_vel = 0.0
+    for _ in range(50):
+        sim.step(1)
+        mujoco.mj_step(m, cpu)
+        max_pos = max(max_pos, float(np.max(np.abs(sim.state.qpos[0].cpu().numpy() - cpu.qpos))))
+        max_vel = max(max_vel, float(np.max(np.abs(sim.state.qvel[0].cpu().numpy() - cpu.qvel))))
+    assert max_pos < 1e-5, max_pos
+    assert max_vel < 1e-4, max_vel

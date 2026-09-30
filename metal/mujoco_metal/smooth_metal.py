@@ -227,6 +227,8 @@ class MetalSmoothDynamics:
         "root_com": w["root_com"][: batch * self.model.nbody * 3].reshape(
             batch, self.model.nbody, 3
         ),
+        "cdof": w["cdof"][: batch * nv * 6].reshape(batch, nv, 6),
+        "cdof_dot": w["cdof_dot"][: batch * nv * 6].reshape(batch, nv, 6),
     }
 
   def _compute_mass_matrix(self, qpos_batch):

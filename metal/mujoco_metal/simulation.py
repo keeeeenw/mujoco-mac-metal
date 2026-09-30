@@ -448,7 +448,8 @@ class MetalSimulation:
     if self._motor is not None:
       rhs.add_(self._motor.run_device(self._control))
     coupled = self._coupled_constraints.run_device(
-        dynamics["poses"], dynamics["mass_matrix"], rhs, qpos, qvel
+        dynamics["poses"], dynamics["mass_matrix"], rhs, qpos, qvel,
+        cvel=dynamics.get("cvel", None),
     )
     coupled["mass_matrix"] = dynamics["mass_matrix"]
     self._last_coupled = coupled
@@ -579,7 +580,8 @@ class MetalSimulation:
     )
     if self._coupled_constraints is not None:
       coupled = self._coupled_constraints.run_device(
-          dynamics["poses"], dynamics["mass_matrix"], self._rhs, qpos, qvel
+          dynamics["poses"], dynamics["mass_matrix"], self._rhs, qpos, qvel,
+          cvel=dynamics.get("cvel", None),
       )
       coupled["mass_matrix"] = dynamics["mass_matrix"]
       self._last_coupled = coupled

@@ -29,6 +29,7 @@ import mujoco
 import numpy as np
 
 _SHADER = Path(__file__).parent / "shaders" / "coupled_constraints.metal"
+_EQUALITY_SHADER = Path(__file__).parent / "shaders" / "equality_assembly.metal"
 _COLLISION_SHADER = Path(__file__).parent / "shaders" / "collision_primitives.metal"
 _MINVAL = 1e-15
 _MAX_NV = 32
@@ -782,9 +783,13 @@ class MetalCoupledConstraints:
     self._torch = torch
     self._device = torch.device("mps")
 
-    shader_source = _COLLISION_SHADER.read_text() + "\n" + _SHADER.read_text()
+    shader_source = _COLLISION_SHADER.read_text() + "\n" + _EQUALITY_SHADER.read_text() + "\n" + _SHADER.read_text()
     self._library = torch.mps.compile_shader(shader_source)
     self._contact_kernel = self._library.contact_normal
+    try:
+      self._equality_kernel = self._library.equality_assembly
+    except AttributeError:
+      self._equality_kernel = None
     self._solve_kernel = self._library.solve_coupled_constraints
 
     d = self.descriptor
@@ -823,27 +828,46 @@ class MetalCoupledConstraints:
     )
 
     self._constants = {
-        "joint_qposadr": self._tensor(d.joint_qposadr),
-        "qpos0": self._tensor(d.qpos0),
-        "joint_dofadr": self._tensor(d.joint_dofadr),
-        "joint_limited": self._tensor(d.joint_limited),
+        "joint_qposadr": self._tensor(d.joint_qposadr if d.njnt else np.zeros(1, dtype=np.int32)),
+        "qpos0": self._tensor(d.qpos0 if d.nq else np.zeros(1, dtype=np.float32)),
+        "joint_dofadr": self._tensor(d.joint_dofadr if d.njnt else np.zeros(1, dtype=np.int32)),
+        "joint_limited": self._tensor(d.joint_limited if d.njnt else np.zeros(1, dtype=np.uint8)),
         "joint_limit_params": self._tensor(joint_limit_params.reshape(-1)),
         "joint_sol_params": self._tensor(d.joint_sol_params.reshape(-1)),
-        "dof_frictionloss": self._tensor(d.dof_frictionloss),
-        "dof_invweight0": self._tensor(d.dof_invweight0),
+        "dof_frictionloss": self._tensor(d.dof_frictionloss if d.nv else np.zeros(1, dtype=np.float32)),
+        "dof_invweight0": self._tensor(d.dof_invweight0 if d.nv else np.zeros(1, dtype=np.float32)),
         "dof_sol_params": self._tensor(d.dof_sol_params.reshape(-1)),
-        "eq_obj": self._tensor(d.eq_obj.reshape(-1)),
-        "eq_data": self._tensor(d.eq_data.reshape(-1)),
-        "eq_sol_params": self._tensor(d.eq_sol_params.reshape(-1)),
-        "geom_size": self._tensor(d.geom_size.reshape(-1)),
-        "geom_type": self._tensor(d.geom_type),
-        "geom_bodyid": self._tensor(d.geom_bodyid),
+        "eq_obj": self._tensor(d.eq_obj.reshape(-1) if d.neq else np.zeros(2, dtype=np.int32)),
+        "eq_data": self._tensor(d.eq_data.reshape(-1) if d.neq else np.zeros(11, dtype=np.float32)),
+        "eq_sol_params": self._tensor(d.eq_sol_params.reshape(-1) if d.neq else np.zeros(7, dtype=np.float32)),
+        "eq_type": self._tensor(d.eq_type if d.neq else np.zeros(1, dtype=np.int32)),
+        "eq_objtype": self._tensor(d.eq_objtype if d.neq else np.zeros(1, dtype=np.int32)),
+        "eq_rowadr": self._tensor(d.eq_rowadr if d.neq else np.zeros(1, dtype=np.int32)),
+        "geom_size": self._tensor(d.geom_size.reshape(-1) if d.ngeom else np.zeros(3, dtype=np.float32)),
+        "geom_type": self._tensor(d.geom_type if d.ngeom else np.zeros(1, dtype=np.int32)),
+        "geom_bodyid": self._tensor(d.geom_bodyid if d.ngeom else np.zeros(1, dtype=np.int32)),
         "body_parentid": self._tensor(d.body_parentid),
         "body_jntadr": self._tensor(d.body_jntadr),
         "body_jntnum": self._tensor(d.body_jntnum),
-        "jnt_type": self._tensor(d.joint_type),
-        "jnt_dofadr": self._tensor(d.joint_dofadr),
+        "jnt_type": self._tensor(d.joint_type if d.njnt else np.zeros(1, dtype=np.int32)),
+        "jnt_dofadr": self._tensor(d.joint_dofadr if d.njnt else np.zeros(1, dtype=np.int32)),
         "body_invweight0": self._tensor(d.body_invweight0.reshape(-1)),
+        "site_bodyid": self._tensor(
+            np.asarray(model.site_bodyid, dtype=np.int32) if model.nsite else np.zeros(1, dtype=np.int32)
+        ),
+        "body_rootid": self._tensor(np.asarray(model.body_rootid, dtype=np.int32)),
+        "body_weldid": self._tensor(np.asarray(model.body_weldid, dtype=np.int32)),
+        "body_dofadr": self._tensor(np.asarray(model.body_dofadr, dtype=np.int32)),
+        "body_dofnum": self._tensor(np.asarray(model.body_dofnum, dtype=np.int32)),
+        "dof_parentid": self._tensor(
+            np.asarray(model.dof_parentid, dtype=np.int32) if model.nv else np.zeros(1, dtype=np.int32)
+        ),
+        "dof_bodyid": self._tensor(
+            np.asarray(model.dof_bodyid, dtype=np.int32) if model.nv else np.zeros(1, dtype=np.int32)
+        ),
+        "dof_jntid": self._tensor(
+            np.asarray(model.dof_jntid, dtype=np.int32) if model.nv else np.zeros(1, dtype=np.int32)
+        ),
         "pair_geoms": self._tensor(pair_geoms),
         "pair_margin_gap": self._tensor(pair_margin_gap),
         "pair_solref": self._tensor(d.solref.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
@@ -861,7 +885,7 @@ class MetalCoupledConstraints:
             dtype=torch.int32, device=self._device,
         ),
         "solver_dims": torch.tensor(
-            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type],
+            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows],
             dtype=torch.int32, device=self._device,
         ),
         "solver_params": torch.tensor(
@@ -909,13 +933,16 @@ class MetalCoupledConstraints:
     self._constants["solver_dims"][5] = b
     return self._workspace
 
-  def run_device(self, poses, mass, qfrc_smooth, qpos, qvel, eq_active=None):
+  def run_device(self, poses, mass, qfrc_smooth, qpos, qvel, eq_active=None, cvel=None):
     """Solve coupled contacts, limits, dry friction, and equalities on MPS.
 
     `poses` is the dict of FK outputs from `MetalKinematics`.
     `mass` is batched generalized mass [batch, nv, nv] (including tendon armature).
     `qfrc_smooth` is unconstrained forces [batch, nv].
     `qpos` is [batch, nq], `qvel` is [batch, nv].
+    `cvel` is optional batched body spatial velocity [batch, nbody, 6] from
+    smooth dynamics (angular, linear COM). It is required for connect/weld
+    Jdot correction; joint-only models may omit it (Jdot is zero there).
     """
     w, torch, d = self._workspace, self._torch, self.descriptor
     b, nv, nc, nr = self.batch_size, d.nv, d.ncontacts_max, d.nr
@@ -955,6 +982,48 @@ class MetalCoupledConstraints:
           w["contact_row_data"], w["contact_frame"], w["contact_jacobian"],
           self._constants["c_dims"],
           threads=(b * d.npairs,), group_size=(1,),
+      )
+
+    # 1b. Equality assembly kernel (joint/connect; weld reserved as zeros).
+    # Writes equality J into workspace_J rows [0, n_eq_rows) and R/ar into
+    # workspace_debug R/ar slots for those rows. Solver preserves these
+    # sections and treats all equality rows as bilateral.
+    if d.neq > 0 and d.n_eq_rows > 0 and self._equality_kernel is not None:
+      if cvel is None:
+        cvel_tensor = torch.zeros((b, max(d.nbody, 1) * 6), dtype=torch.float32, device=self._device)
+        # Reshape to [b, nbody, 6] with dummy when nbody==0 (never, nbody>=1).
+        try:
+          cvel_flat = cvel_tensor.reshape(-1)
+        except Exception:
+          cvel_flat = torch.zeros(max(b * max(d.nbody, 1) * 6, 1), dtype=torch.float32, device=self._device)
+      else:
+        if not isinstance(cvel, torch.Tensor):
+          raise TypeError("cvel must be a torch.Tensor")
+        cvel_flat = cvel.reshape(-1)
+      # site_pos may be empty when nsite==0; pass dummy non-null buffer.
+      try:
+        site_pos_tensor = poses["site_pos"]
+      except KeyError:
+        site_pos_tensor = torch.zeros((b, 1, 3), dtype=torch.float32, device=self._device)
+      self._equality_kernel(
+          self._constants["eq_obj"], self._constants["eq_data"],
+          self._constants["eq_sol_params"], eq_active_tensor.reshape(-1),
+          self._constants["eq_rowadr"],
+          self._constants["eq_type"], self._constants["eq_objtype"],
+          self._constants["joint_qposadr"], self._constants["qpos0"],
+          self._constants["joint_dofadr"],
+          self._constants["dof_invweight0"], self._constants["body_invweight0"],
+          self._constants["site_bodyid"],
+          self._constants["body_parentid"], self._constants["body_jntadr"],
+          self._constants["body_jntnum"], self._constants["jnt_type"],
+          self._constants["jnt_dofadr"],
+          self._constants["solver_dims"], self._constants["solver_params"],
+          qpos.reshape(-1), qvel.reshape(-1),
+          poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),
+          poses["joint_anchor"].reshape(-1), poses["joint_axis"].reshape(-1),
+          site_pos_tensor.reshape(-1), cvel_flat,
+          w["workspace_J"], w["workspace_debug"],
+          threads=(b,), group_size=(1,),
       )
 
     # 2. Coupled constraint solver kernel
