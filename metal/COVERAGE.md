@@ -23,7 +23,7 @@ renderer), not future physics work.
 | REQ-MOD-002 | bounded stepping profile validation | host | lowered/cpu_oracle | baseline | accept listed profiles, reject others | test_stepping.py |
 | REQ-JNT-001 | hinge/slide/ball/free kinematics | device | native_gpu/gpu_qualified | baseline | accept all four joint types | test_model.py |
 | REQ-JNT-002 | scalar hinge/slide joint limits | device | native_gpu/gpu_qualified | baseline | accept limited hinge/slide, reject limited ball | test_coupled_constraints.py |
-| REQ-JNT-003 | ball joint limits | none | not_implemented/unqualified | 009 | reject limited ball joints | — |
+| REQ-JNT-003 | ball joint limits | device | native_gpu/gpu_qualified | 009 | ball branch in joint-limit loop | test_rigid_constraints_009.py |
 | REQ-GEO-001 | plane/sphere/capsule/box collision | device | native_gpu/gpu_qualified | baseline | accept the four primitives, reject others | test_primitive_collision_qualification.py |
 | REQ-GEO-002 | cylinder/ellipsoid collision | none | not_implemented/unqualified | 010 | reject cylinders and ellipsoids | — |
 | REQ-GEO-003 | convex mesh collision | none | not_implemented/unqualified | 011 | reject meshes | — |

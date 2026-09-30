@@ -1,0 +1,57 @@
+<mujoco model="suspension_platform">
+  <compiler angle="radian"/>
+  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6" gravity="0 0 -9.81">
+    <flag contact="enable" equality="enable" limit="enable" frictionloss="disable"/>
+  </option>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1" pos="0 0 0" condim="1" priority="1" contype="1" conaffinity="0"/>
+    <body name="carrier" pos="0 0 1.6" mocap="true">
+      <geom name="carrier_geom" type="box" size="0.5 0.08 0.06" rgba="0.5 0.5 0.55 1" mass="0.5" contype="0" conaffinity="0"/>
+      <site name="c0" pos="-0.4 0.3 -0.03"/>
+      <site name="c1" pos="0.4 0.3 -0.03"/>
+      <site name="c2" pos="-0.4 -0.3 -0.03"/>
+      <site name="c3" pos="0.4 -0.3 -0.03"/>
+      <body name="strut" pos="0 0 -0.03">
+        <joint name="swivel" type="ball" limited="true" range="0 0.28"/>
+        <geom name="strut_geom" type="capsule" size="0.02 0.25" pos="0 0 -0.25" rgba="0.8 0.6 0.2 1" mass="0.2" contype="0" conaffinity="0"/>
+        <geom name="bob_geom" type="sphere" size="0.05" pos="0 0 -0.5" rgba="0.8 0.6 0.2 1" mass="0.3" contype="0" conaffinity="0"/>
+      </body>
+    </body>
+    <body name="platform" pos="0 0 0.9">
+      <freejoint name="platform_free"/>
+      <geom name="platform_geom" type="box" size="0.35 0.25 0.03" rgba="0.35 0.45 0.7 1" mass="0.8" friction="1.2 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
+      <site name="p0" pos="-0.3 0.2 0.03"/>
+      <site name="p1" pos="0.3 0.2 0.03"/>
+      <site name="p2" pos="-0.3 -0.2 0.03"/>
+      <site name="p3" pos="0.3 -0.2 0.03"/>
+    </body>
+    <body name="cargo" pos="0.1 0 1.03">
+      <freejoint name="cargo_free"/>
+      <geom name="cargo_geom" type="box" size="0.08 0.08 0.08" rgba="0.9 0.25 0.15 1" mass="0.4" friction="1.2 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
+    </body>
+  </worldbody>
+  <contact>
+    <pair geom1="cargo_geom" geom2="platform_geom"/>
+    <pair geom1="cargo_geom" geom2="floor" condim="1"/>
+  </contact>
+  <tendon>
+    <spatial name="cable0" stiffness="200" damping="8" springlength="0.62 0.62">
+      <site site="c0"/><site site="p0"/>
+    </spatial>
+    <spatial name="cable1" stiffness="200" damping="8" springlength="0.62 0.62">
+      <site site="c1"/><site site="p1"/>
+    </spatial>
+    <spatial name="cable2" stiffness="200" damping="8" springlength="0.62 0.62">
+      <site site="c2"/><site site="p2"/>
+    </spatial>
+    <spatial name="cable3" stiffness="200" damping="8" springlength="0.62 0.62" limited="true" range="0 0.66">
+      <site site="c3"/><site site="p3"/>
+    </spatial>
+  </tendon>
+  <equality>
+    <tendon tendon1="cable0" tendon2="cable1" polycoef="0 1 0 0 0"/>
+  </equality>
+  <keyframe>
+    <key name="start" qpos="1 0 0 0 0 0 0.9 1 0 0 0 0.1 0 1.03 1 0 0 0" mpos="0 0 1.6" mquat="1 0 0 0"/>
+  </keyframe>
+</mujoco>

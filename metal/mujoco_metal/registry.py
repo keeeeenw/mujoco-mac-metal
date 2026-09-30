@@ -487,10 +487,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-JNT-003", "ball joint limits",
-        Stage.CONSTRAINTS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "not implemented; rejected at lowering",
-        "engine/engine_core_constraint.c", "reject limited ball joints",
-        "none", "009", (),
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
+        Execution.DEVICE, "pinned axis-angle rows in reserved slots (integrated profile; legacy joint-constraints profile stays scalar-only)",
+        "mujoco_metal/shaders/coupled_constraints.metal", "ball branch in joint-limit loop",
+        "MetalSimulation", "009", ("test_rigid_constraints_009.py",),
     ),
     # Geometry families.
     Requirement(
