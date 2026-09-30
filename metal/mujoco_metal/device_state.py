@@ -446,6 +446,30 @@ class DeviceState:
   def generation(self):
     return self._generation
 
+  def adopt_descriptor(self, other):
+    """Adopt model-derived defaults from a compatible state (R7 live update).
+
+    Copies descriptor, fingerprints, profile and compiled defaults
+    (equality/mocap/activation shapes must match); live tensors
+    (qpos/qvel/qacc/time/status/activity/poses/act) are preserved untouched.
+    Raises before mutating on any shape mismatch.
+    """
+    if (self._neq, self._nmocap, self._na) != (other._neq, other._nmocap, other._na):
+      raise ValueError("descriptor state shapes (neq/nmocap/na) do not match")
+    if (self._model.nq, self._model.nv) != (other._model.nq, other._model.nv):
+      raise ValueError("descriptor dimensions (nq/nv) do not match")
+    if self.batch_size != other.batch_size:
+      raise ValueError("batch sizes do not match")
+    self._model = other._model
+    self.profile = other.profile
+    self._model_fingerprint = other._model_fingerprint
+    self._profile_fingerprint = other._profile_fingerprint
+    self._eq_active0 = other._eq_active0
+    self._mpos0 = other._mpos0
+    self._mquat0 = other._mquat0
+    self._generation += 1
+    return self._generation
+
   @property
   def qpos(self):
     return self._qpos.detach().clone()

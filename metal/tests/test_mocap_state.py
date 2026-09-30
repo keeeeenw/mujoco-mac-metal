@@ -289,3 +289,128 @@ def test_keyframe_reset_partial_env_and_time_overflow_gpu():
   m.key_time[0] = 1.5
   sim.reset_to_keyframe(0, env_ids=[0])  # valid recovery
   assert float(sim.state.time.cpu().numpy()[0]) == 1.5
+
+
+SLIDE_XML = """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
+<worldbody>
+<geom name="floor" type="plane" size="5 5 0.1" contype="1" conaffinity="1"/>
+<body pos="0 0 0.05"><joint name="s" type="slide" axis="1 0 0"/>
+<geom name="box" type="box" size="0.05 0.05 0.05" mass="0.5" friction="0.2 0.05 0.02" contype="1" conaffinity="1"/></body>
+</worldbody>
+</mujoco>"""
+
+
+OSC_XML = """<mujoco><option timestep="0.002" gravity="0 0 0"/>
+<worldbody>
+<body pos="0 0 0.1"><joint name="s" type="slide" axis="1 0 0"/>
+<geom name="box" type="sphere" size="0.05" mass="0.5" contype="0" conaffinity="0"/></body>
+</worldbody>
+<tendon><fixed name="spring" stiffness="100" damping="0" springlength="0 0"><joint joint="s" coef="1.0"/></fixed></tendon>
+</mujoco>"""
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_apply_lifecycle_contact_update_gpu():
+  # R7: a contact-friction update through a lifecycle changes native physics
+  # (steady push slips before, holds after); invalid topology fails
+  # atomically; restore-then-update keeps stepping.
+  from mujoco_metal import MetalSimulation
+  from mujoco_metal.lifecycle import ModelLifecycle
+  m = mujoco.MjModel.from_xml_string(SLIDE_XML)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  sim.reset(qpos=np.array([[0.0]], dtype=np.float32),
+            qvel=np.array([[3.0]], dtype=np.float32))
+  for _ in range(50):
+    sim.step(1)
+  free_x = float(sim.state.qpos.cpu().numpy()[0, 0])
+  assert abs(free_x - 0.3) < 1e-3  # no contact yet: flies freely
+
+  life = ModelLifecycle(SLIDE_XML)
+  floor = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+  assert life.update_geom_contact(
+      [floor], margin=np.array([0.02]),
+      friction=np.array([[2.0, 0.05, 0.02]]))
+  gen_before = sim.state.generation
+  sim.apply_lifecycle(life)
+  assert sim.state.generation > gen_before
+  sim.reset(qpos=np.array([[0.0]], dtype=np.float32),
+            qvel=np.array([[3.0]], dtype=np.float32))
+  for _ in range(50):
+    sim.step(1)
+  gripped_x = float(sim.state.qpos.cpu().numpy()[0, 0])
+  assert gripped_x < free_x - 0.05  # contact + friction engage
+  # CPU oracle with the identical mutation agrees.
+  cpu = mujoco.MjData(life._model)
+  cpu.qpos[0] = 0.0
+  cpu.qvel[0] = 3.0
+  mujoco.mj_forward(life._model, cpu)
+  for _ in range(50):
+    mujoco.mj_step(life._model, cpu)
+  np.testing.assert_allclose(gripped_x, float(cpu.qpos[0]), rtol=1e-4, atol=1e-4)
+
+  # Incompatible topology fails without touching the simulation.
+  bad = ModelLifecycle(SLIDE_XML.replace(
+      "</worldbody>",
+      '<body pos="1 0 0.1"><geom type="sphere" size="0.05"/></body></worldbody>'))
+  q_before = sim.state.qpos.cpu().numpy().copy()
+  gen_bad = sim.state.generation
+  with pytest.raises(ValueError, match="structural count"):
+    sim.apply_lifecycle(bad)
+  np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), q_before)
+  assert sim.state.generation == gen_bad
+  sim.step(1)  # keeps stepping after a failed update
+
+  # Restore-then-update round trip.
+  snap = sim.state.snapshot()
+  sim.state.restore(snap)
+  life2 = ModelLifecycle(SLIDE_XML)
+  assert life2.update_geom_contact([floor], friction=np.array([[0.2, 0.05, 0.02]]))
+  sim.apply_lifecycle(life2)
+  sim.step(1)
+  assert np.all(np.isfinite(sim.state.qpos.cpu().numpy()))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_apply_lifecycle_mass_update_gpu():
+  # R7: a body-mass update changes native spring-mass timing (quarter period
+  # doubles when mass quadruples), verified against the CPU mutated oracle.
+  from mujoco_metal import MetalSimulation
+  from mujoco_metal.lifecycle import ModelLifecycle
+  m = mujoco.MjModel.from_xml_string(OSC_XML)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  sim.reset(qpos=np.array([[0.2]], dtype=np.float32))
+  t0, prev = None, 0.2
+  for step in range(400):
+    sim.step(1)
+    x = float(sim.state.qpos.cpu().numpy()[0, 0])
+    if prev > 0 and x <= 0:
+      t0 = step
+      break
+    prev = x
+  assert t0 is not None and 40 < t0 < 70  # ~T/4 = 55 steps
+  life = ModelLifecycle(OSC_XML)
+  assert life.recompute_body_masses([1], [2.0])
+  sim.apply_lifecycle(life)
+  sim.reset(qpos=np.array([[0.2]], dtype=np.float32))
+  t1, prev = None, 0.2
+  for step in range(600):
+    sim.step(1)
+    x = float(sim.state.qpos.cpu().numpy()[0, 0])
+    if prev > 0 and x <= 0:
+      t1 = step
+      break
+    prev = x
+  assert t1 is not None and 90 < t1 < 130  # ~T/4 = 111 steps
+  cpu = mujoco.MjData(life._model)
+  cpu.qpos[0] = 0.2
+  mujoco.mj_forward(life._model, cpu)
+  tc, prev = None, 0.2
+  for step in range(600):
+    mujoco.mj_step(life._model, cpu)
+    if prev > 0 and float(cpu.qpos[0]) <= 0:
+      tc = step
+      break
+    prev = float(cpu.qpos[0])
+  assert tc is not None and abs(t1 - tc) <= 2

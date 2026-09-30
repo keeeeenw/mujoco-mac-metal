@@ -97,7 +97,14 @@ def _compile_source(source):
 
 
 class ModelLifecycle:
-  """Owns constants and recomputes derived fields transactionally on CPU."""
+  """Own constants and recomputes derived fields transactionally on CPU.
+
+  This is a host preparation utility: it compiles and edits models and
+  validates parameter updates, but it does not itself advance physics. To run
+  the edited model natively, adopt it into a live simulation with
+  ``MetalSimulation.apply_lifecycle`` (which rebuilds device stages
+  atomically); holding only a lifecycle never changes simulation behavior.
+  """
 
   def __init__(self, source):
     if mujoco.__version__ != "3.10.0":

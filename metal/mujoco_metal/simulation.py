@@ -530,6 +530,55 @@ class MetalSimulation:
       self._last_coupled_generation = None
     return self._state._generation
 
+  def apply_lifecycle(self, lifecycle):
+    """Adopt a rebuilt model into this live simulation, atomically (R7).
+
+    `lifecycle` is a host-preparation `ModelLifecycle` (or a compiled
+    `MjModel`) whose model must be structurally compatible: identical
+    nq/nv/neq/nmocap/na counts, body/joint/geom/site/tendon/actuator counts
+    and the same stepping profile (revalidated). All device stages are
+    rebuilt from the new model first (raising before any mutation), then
+    swapped in; live state (qpos/qvel/time/activity/held inputs) is
+    preserved, fingerprints/generation advance, and assembled-system/spatial
+    caches are invalidated. The model (and its batch-sharing: one model for
+    all environments) applies to every world. On failure the simulation is
+    untouched and keeps stepping.
+    """
+    from mujoco_metal.lifecycle import ModelLifecycle as _LC
+    if isinstance(lifecycle, _LC):
+      new_model = lifecycle._model
+    elif isinstance(lifecycle, mujoco.MjModel):
+      new_model = lifecycle
+    else:
+      raise TypeError("apply_lifecycle requires a ModelLifecycle or MjModel")
+    old = self._mjmodel
+    for attr in ("nq", "nv", "nbody", "njnt", "ngeom", "nsite", "ntendon",
+                 "nu", "na", "neq", "nmocap"):
+      if int(getattr(new_model, attr)) != int(getattr(old, attr)):
+        raise ValueError(
+            f"apply_lifecycle: structural count {attr} differs "
+            f"({int(getattr(old, attr))} -> {int(getattr(new_model, attr))}); "
+            f"rebuild the simulation instead")
+    # Full validation + stage construction happens here, before any mutation
+    # of this simulation (atomicity).
+    fresh = type(self)(new_model, self.batch_size, profile=self.profile.name)
+    keep = {"_state", "batch_size", "_success", "_combined_status",
+            "_next_qpos", "_next_qvel", "_next_qacc", "_next_time",
+            "_next_status", "_next_act", "_control", "_applied_force",
+            "_body_wrench", "_tendon_damping", "_damping_tangent",
+            "_act_dot", "_act_vel", "_spatial_kin", "_spatial_cache_key",
+            "_last_coupled", "_last_coupled_generation"}
+    for key, value in fresh.__dict__.items():
+      if key not in keep:
+        setattr(self, key, value)
+    self._state.adopt_descriptor(fresh._state)
+    self._last_coupled = None
+    self._last_coupled_generation = None
+    self._spatial_cache_key = None
+    self._spatial_kin = None
+    self._state._generation += 1
+    return self._state.generation
+
   def _clear_held_inputs(self, env_ids):
     ids = None if env_ids is None else self._state._env_ids(env_ids)
     if self._applied_force is not None:
