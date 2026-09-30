@@ -41,11 +41,11 @@ renderer), not future physics work.
 | REQ-SOL-001 | PGS/Newton selector mapping | device | native_gpu/gpu_qualified | baseline | accept PGS/Newton as mapped | test_coupled_constraints.py |
 | REQ-SOL-002 | CG solver selection | none | not_implemented/unqualified | 014 | reject CG | — |
 | REQ-EQ-001 | joint/connect/weld equalities with per-env activity | device | native_gpu/gpu_qualified | 004 | accept joint/connect/weld body/site/world/mocap, reject others even if inactive | test_connect_weld.py, test_equality_activity.py, test_equality_qualification.py, test_mocap_state.py |
-| REQ-EQ-002 | tendon equality | none | not_implemented/unqualified | 009 | reject tendon equalities | — |
+| REQ-EQ-002 | tendon equality | device | native_gpu/gpu_qualified | 008 | tendon_constraint_rows equality branch | test_spatial_tendons_008.py |
 | REQ-EQ-003 | flex equalities | none | not_implemented/unqualified | 018 | reject flex/flexvert/flexstrain | — |
 | REQ-EQ-004 | removed distance equality | none | not_implemented/unqualified | 009 | reject distance equalities | — |
 | REQ-TEN-001 | fixed-joint tendons with spring/damping/armature | device | native_gpu/gpu_qualified | baseline | accept fixed joint tendons | test_tendons.py |
-| REQ-TEN-002 | spatial tendons, wrapping, limits, friction, equality | none | not_implemented/unqualified | 008 | reject spatial/wrapped/limited tendons | — |
+| REQ-TEN-002 | spatial tendons, wrapping, limits, friction, equality | device | native_gpu/gpu_qualified | 008 | spatial kinematics + tendon_constraint_rows | test_spatial_tendons_008.py |
 | REQ-TRN-001 | joint/jointinparent/tendon transmissions | device | native_gpu/gpu_qualified | baseline | accept listed transmissions | test_transmissions.py |
 | REQ-TRN-002 | slidercrank/site/body transmissions | device | native_gpu/gpu_qualified | 007 | general kinematics + BODY adhesion from same-step candidates | test_actuators_007.py |
 | REQ-TRN-003 | undefined transmission sentinel | none | not_implemented/unqualified | 005 | reject undefined | — |

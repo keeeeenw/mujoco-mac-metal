@@ -653,10 +653,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-EQ-002", "tendon equality",
-        Stage.CONSTRAINTS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "rejected at lowering",
-        "engine/engine_core_constraint.c", "reject tendon equalities",
-        "none", "009", (),
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
+        Execution.DEVICE, "cubic tendon-length coupling as coupled rows (single or paired tendons)",
+        "mujoco_metal/coupled_constraints.py", "tendon_constraint_rows equality branch",
+        "MetalSimulation", "008", ("test_spatial_tendons_008.py",),
         enums=("mjtEq.mjEQ_TENDON",),
     ),
     Requirement(
@@ -686,10 +686,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-TEN-002", "spatial tendons, wrapping, limits, friction, equality",
-        Stage.DYNAMICS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "rejected at lowering (limited/wrapped paths, tendon limits/frictionloss/equality)",
-        "engine/engine_forward.c:mj_tendon", "reject spatial/wrapped/limited tendons",
-        "none", "008", (),
+        Stage.DYNAMICS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
+        Execution.DEVICE, "pulley/site/sphere/cylinder paths; tendon limits, friction loss and tendon equality as coupled rows",
+        "mujoco_metal/spatial_tendons.py", "spatial kinematics + tendon_constraint_rows",
+        "MetalSimulation", "008", ("test_spatial_tendons_008.py",),
     ),
     Requirement(
         "REQ-TRN-001", "joint/jointinparent/tendon transmissions",
