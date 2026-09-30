@@ -1042,7 +1042,7 @@ def test_solver_status_matches_final_residual_mixed_gpu():
 <geom name="ball" type="sphere" size="0.05" mass="0.5" contype="1" conaffinity="1"/>
 <site name="h" pos="0 0 0"/></body>
 </worldbody>
-<tendon><spatial name="t" limited="true" range="0.5 0.86"><site site="top"/><site site="h"/></spatial></tendon>
+<tendon><spatial name="t" limited="true" range="0.5 0.85"><site site="top"/><site site="h"/></spatial></tendon>
 </mujoco>"""),
   ):
     m = mujoco.MjModel.from_xml_string(xml)
@@ -1056,6 +1056,7 @@ def test_solver_status_matches_final_residual_mixed_gpu():
     mujoco.mj_forward(m, cpu)
     max_err = 0.0
     saw_contact = False
+    saw_simultaneous = False
     for _ in range(150):
       sim.step(1)
       mujoco.mj_step(m, cpu)
@@ -1068,8 +1069,13 @@ def test_solver_status_matches_final_residual_mixed_gpu():
       assert (st == 0) == (res <= tol), (tag, st, res, tol)
       # G3 invariant: actual work stays within the adaptive cap.
       assert iters <= 1024, (tag, iters)
-      if cpu.ncon > 0:
+      contact_now = cpu.ncon > 0
+      if contact_now:
         saw_contact = True
+      if tag == "limit":
+        L = float(np.asarray(cpu.ten_length)[0])
+        if (L < 0.5 or L > 0.85) and contact_now:
+          saw_simultaneous = True  # limit + contact rows co-active
       if st == 0 and neq_rows > 0:
         # Independent CPU recomputation of the unbounded equality block:
         # residual |grad|/scale over rows [0, neq_rows).
@@ -1088,6 +1094,8 @@ def test_solver_status_matches_final_residual_mixed_gpu():
       gq = sim.state.qpos.cpu().numpy()[0]
       max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
     assert saw_contact, tag  # contact rows actually engaged
+    if tag == "limit":
+      assert saw_simultaneous, tag  # tendon-limit + contact co-active
     assert max_err < 5e-3, (tag, max_err)
 
 
