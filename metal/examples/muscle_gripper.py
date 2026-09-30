@@ -4,7 +4,8 @@
 
 A mocap gantry carries two muscle-driven fingers (antagonistic flexor/
 extensor pairs with MuJoCo muscle dynamics, force-length-velocity gains and
-passive biases). Phase A delivers a sphere to a bin (grasp, carry, set-down
+passive biases) plus a palm contact pad, so each grasp is a three-sided cage
+(fingers + palm) rather than a friction-only pinch. Phase A delivers a sphere to a bin (grasp, carry, set-down
 release). Phase B delivers a larger, heavier sphere onto a pedestal (grasp,
 carry, set-down release). Gantry motion and finger schedules are deterministic
 open-loop inputs identical in CPU/native runs; a paired always-open run shows

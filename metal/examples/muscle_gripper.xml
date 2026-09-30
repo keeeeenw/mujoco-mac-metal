@@ -14,7 +14,7 @@
       <geom name="wallR_geom" type="box" size="0.02 0.12 0.08" pos="0.13 0 0.12" rgba="0.1 0.6 0.2 1" mass="0" contype="1" conaffinity="0" condim="3"/>
     </body>
     <body name="gantry" pos="0 0 0.62" mocap="true">
-      <geom name="palm_geom" type="box" size="0.13 0.05 0.03" rgba="0.85 0.55 0.15 1" mass="0.3" contype="0" conaffinity="0"/>
+      <geom name="palm_geom" type="box" size="0.13 0.05 0.03" rgba="0.85 0.55 0.15 1" mass="0.3" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
       <body name="fingerL" pos="-0.095 0 -0.02">
         <joint name="gripL" type="hinge" axis="0 1 0" limited="true" range="-0.45 0.55" damping="1.0"/>
         <geom name="fingerL_geom" type="box" size="0.02 0.04 0.09" rgba="0.9 0.5 0.1 1" mass="0.15" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
@@ -35,6 +35,8 @@
   </worldbody>
   <contact>
     <pair geom1="ball_geom" geom2="fingerL_geom"/>
+    <pair geom1="ball_geom" geom2="palm_geom"/>
+    <pair geom1="ball2_geom" geom2="palm_geom"/>
     <pair geom1="ball_geom" geom2="fingerR_geom"/>
     <pair geom1="ball_geom" geom2="bin_geom" condim="4"/>
     <pair geom1="ball_geom" geom2="wallL_geom"/>

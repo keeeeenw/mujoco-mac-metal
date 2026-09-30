@@ -14,7 +14,10 @@ and sets it down inside. Phase B grasps a blue sphere (r=0.055, 0.15 kg),
 carries it to a pedestal and sets it down on top. Gantry motion and finger
 schedules are deterministic open-loop inputs identical in CPU/native runs
 (2700 steps, dt=0.002 s). A paired always-open run shows the physical effect
-of grasping. The simulation starts from the compiled `start` keyframe via
+of grasping. The palm pad is a contact surface (paired with both balls),
+so the grasp is a three-sided cage (two fingers + palm) rather than a
+friction-only pinch: this keeps the long open-loop carry deterministic under
+millimeter perturbations on both CPU and native. The simulation starts from the compiled `start` keyframe via
 `sim.reset_to_keyframe`. Rendering uses MuJoCo OpenGL; playback speed is
 presentation only, not a physics throughput claim.
 
