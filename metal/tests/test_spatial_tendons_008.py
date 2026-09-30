@@ -908,7 +908,8 @@ def _native_dots_and_qacc(sim, m, qpos, qvel):
   kin = sim._spatial_tendons.run_kinematics(qvel_t, dynamics["poses"])
   bias, dots = sim._spatial_tendons.run_armature_bias(
       kin, qvel_t, dynamics["poses"], dynamics.get("cvel", None),
-      dynamics.get("root_com", None))
+      dynamics.get("root_com", None), dynamics.get("cdof", None),
+      dynamics.get("cdof_dot", None))
   asm = sim.assembled_system(recompute=True)
   return (dots.cpu().numpy()[0], bias.cpu().numpy()[0],
           asm["qacc"].cpu().numpy()[0] if "qacc" in asm else None)
