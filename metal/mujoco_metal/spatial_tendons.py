@@ -287,6 +287,18 @@ class SpatialTendonModel:
       self.paths.append({"start": start, "count": count, "types": types,
                          "objids": objids, "prms": prms})
     self.has_spatial = any(p is not None for p in self.paths)
+    # Armature contract (R3): fixed paths have constant Jacobians (Jdot = 0,
+    # no bias). Wrapped paths with armature are rejected by the compiler
+    # itself ("geom wrapping not supported by tendon armature"); the guard
+    # below agrees for programmatic models. Site-only spatial paths with
+    # armature need pinned Jdot machinery (mj_jacDot, owned by 015): rejected
+    # for now so no wrong-bias physics ships; REQ-TEN-003 stays open.
+    arm = np.asarray(model.tendon_armature, dtype=np.float64)
+    for tendon in range(ntendon):
+      if arm[tendon] > 0 and self.paths[tendon] is not None:
+        raise ValueError(
+            f"tendon {tendon}: spatial tendon armature is unsupported "
+            f"(wrapped: rejected upstream; site-only: owned by milestone 015)")
     # Flat device storage: concatenated spatial wraps with explicit per-tendon
     # offsets (no row stride, so unequal path lengths are exact). Total
     # flattened wraps are capped for workspace sizing (R2 bound, disclosed).

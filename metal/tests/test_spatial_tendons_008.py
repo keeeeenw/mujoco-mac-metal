@@ -328,3 +328,48 @@ def test_slack_taut_and_mixed_model_gpu():
     gq = sim.state.qpos.cpu().numpy()[0]
     max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
   assert max_err < 5e-4, max_err
+
+
+def test_spatial_armature_contract_cpu():
+  # R3: wrapped + armature is rejected by the compiler itself; the lowering
+  # agrees. Site-only spatial + armature is rejected (015 owns Jdot bias).
+  with pytest.raises(ValueError, match="not supported by tendon armature"):
+    _model(
+        '<site name="a" pos="-0.2 0 0.3"/><site name="b" pos="0.2 0 -0.1"/>'
+        '<site name="side" pos="0 0.3 0.1"/>'
+        '<body pos="0 0 0.1"><geom name="ball" type="sphere" size="0.08" mass="1"/></body>',
+        '<spatial name="t" armature="0.5"><site site="a"/>'
+        '<geom geom="ball" sidesite="side"/><site site="b"/></spatial>')
+  with pytest.raises(ValueError, match="owned by milestone 015"):
+    SpatialTendonModel(_model(
+        '<site name="a" pos="0 0 1"/><site name="b" pos="0.2 0 1"/>'
+        '<body pos="0 0 1"><joint name="j" type="slide" axis="1 0 0"/>'
+        '<geom type="sphere" size="0.05" mass="1"/>'
+        '<site name="c" pos="0.1 0 0"/></body>',
+        '<spatial name="t" armature="0.5">'
+        '<site site="a"/><site site="c"/><site site="b"/></spatial>'))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_fixed_armature_bias_parity_gpu():
+  # Fixed tendons have constant Jacobians: armature adds mass only, bias is
+  # exactly zero even at nonzero velocity (pinned mj_tendonDot early-out).
+  from mujoco_metal import MetalSimulation
+  m = _model(
+      _slide_world(),
+      '<fixed name="f" armature="2.0"><joint joint="j" coef="1.0"/></fixed>')
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  cpu = mujoco.MjData(m)
+  cpu.qpos[0] = 0.5
+  cpu.qvel[0] = 2.0
+  mujoco.mj_forward(m, cpu)
+  sim.reset(qpos=np.array([[0.5]], dtype=np.float32),
+            qvel=np.array([[2.0]], dtype=np.float32))
+  max_err = 0.0
+  for _ in range(40):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+    gq = sim.state.qpos.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+  assert max_err < 5e-4, max_err
