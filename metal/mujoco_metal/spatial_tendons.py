@@ -197,7 +197,10 @@ def tendon_wrap_point(x0, x1, xpos, xmat, radius, wraptype, side):
     s = Rm.T @ (np.asarray(side, dtype=np.float64) - xpos)
     sd = [float(s @ axes[0]), float(s @ axes[1])]
     n = math.hypot(*sd)
-    sd = [sd[0] / n * radius, sd[1] / n * radius]
+    if n > _MJMINVAL:
+      sd = [sd[0] / n * radius, sd[1] / n * radius]
+    else:
+      sd = [0.0, 0.0]  # pinned mju_normalize leaves zero vectors unchanged
   if side is not None and np.linalg.norm(s) < radius:
     wlen, pnt = wrap_inside(d, radius)
   else:
@@ -500,11 +503,15 @@ class MetalSpatialTendonDynamics:
     torch = self._torch
     meta = self._meta
     b, nv, nt = self.batch_size, meta.nv, meta.ntendon
-    self._check(qvel, "qvel", (b, max(nv, 1)))
+    if nv:
+      self._check(qvel, "qvel", (b, max(nv, 1)))
+      qvel_flat = qvel.reshape(-1)
+    else:
+      qvel_flat = self._dummy
     w = self._ws
     site_pos = poses["site_pos"].reshape(-1) if meta.nsite else self._dummy
     self._kin_kernel(
-        qvel.reshape(-1) if nv else self._dummy, site_pos,
+        qvel_flat, site_pos,
         poses["geom_pos"].reshape(-1), poses["geom_quat"].reshape(-1),
         self._geom_size,
         poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),

@@ -512,8 +512,7 @@ kernel void solve_coupled_constraints(
   if (ten_base > nr) ten_base = nr;
   if (world >= uint(batch)) return;
 
-  int mb = world * nv * nv;
-  int qb = world * nv;
+  int mb = world * nv * nv;  int qb = world * nv;
   int pb = world * nq;
   out_status[world] = 0;
   out_diagnostics[world * 2] = 0.0f;
@@ -523,6 +522,8 @@ kernel void solve_coupled_constraints(
     device float* dbg = workspace_debug + world * (nr * nr + 7 * nr);
     for (int i = 0; i < nr * nr; ++i) dbg[i] = 0.0f;
     for (int r = n_eq_rows; r < nr; ++r) {
+      // Tendon-owned rows are preassembled by tendon_constraint_rows; keep them.
+      if (dbg[nr * nr + 6 * nr + r] > 0.5f) continue;
       dbg[nr * nr + r] = 0.0f;
       dbg[nr * nr + nr + r] = 0.0f;
     }
@@ -1314,10 +1315,10 @@ kernel void tendon_constraint_rows(
       for (int d=0;d<nv;++d)
         J2[d]=ten_moment_map[t2*max(nv,1)+d]+ten_J_spatial[(tbase+uint(t2))*uint(max(nv,1))+uint(d)];
       float dif=L2-ten_length0[t2];
-      float poly=0.0f, deriv=0.0f, power=1.0f;
+      float poly=0.0f, deriv=0.0f, power=dif;
       for (int k=0;k<4;++k) {
         poly+=eq_data[e*11+k+1]*power;
-        deriv+=float(k+1)*eq_data[e*11+k+1]*power;
+        deriv+=float(k+1)*eq_data[e*11+k+1]*pow(dif,float(k));
         power*=dif;
       }
       pos-=poly;

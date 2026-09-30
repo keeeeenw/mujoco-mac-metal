@@ -279,7 +279,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       et = int(eq_types[eid])
       if et not in _SUPPORTED_EQ_TYPES:
         raise ValueError(
-            f"equality {eid}: only joint, connect and weld equalities are supported "
+            f"equality {eid}: only joint, tendon, connect and weld equalities are supported "
             f"(found type {et})"
         )
   limited = np.asarray(model.jnt_limited, dtype=bool)
