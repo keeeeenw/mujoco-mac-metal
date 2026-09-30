@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Native equality assembly for joint/connect (weld translational placeholder).
+// Native equality assembly for joint/connect/weld equalities.
 // Pinned semantics: MuJoCo 3.10.0 engine/engine_setconst.c (eq_data body/site
 // semantics), engine/engine_core_constraint.c (mj_equalityAnchors,
 // mj_instantiateEquality, mj_diagApprox, getposdim/getimpedance,
-// mj_referenceConstraint, mj_Jdotv translational part), doc/XMLreference.rst
+// mj_referenceConstraint, mj_Jdotv translational part plus weld rotational
+// term1/term3 with torquescale), doc/XMLreference.rst
 // (connect anchor in body1 local, weld anchor in body2 local/relpose).
 // Per-step assembly executes on Metal; CPU work is constant preparation only.
 

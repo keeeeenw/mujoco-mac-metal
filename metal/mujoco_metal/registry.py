@@ -288,7 +288,7 @@ def _inventory():
               Implementation.NATIVE_GPU,
               Qualification.GPU_QUALIFIED,
               Execution.DEVICE,
-              "qpos/qvel/qacc/time/status storage with reset, snapshots, restore and row reset; host checkpoint readback; does not establish end-to-end stepping qualification",
+              "qpos/qvel/qacc/time/status/eq_active storage with reset, snapshots (schema v2 with activity), restore and row reset; host checkpoint readback; does not establish end-to-end stepping qualification",
           ),
           Feature(
               "contact_free_euler_v1 native simulation pipeline",
@@ -364,7 +364,7 @@ def _inventory():
       (
           "joint constraints",
           Stage.CONSTRAINTS,
-          "scalar limits, DOF frictionloss, polynomial joint equality; no other equality families, contact coupling or general solver configuration",
+          "scalar limits, DOF frictionloss, polynomial joint equality plus connect/weld equalities with per-environment activity; tendon/ball limits and other equality families remain separate stages",
       ),
       (
           "inertia-box fluid",
@@ -384,7 +384,7 @@ def _inventory():
       (
           "integrated Euler pipeline",
           Stage.INTEGRATION,
-          "coupled constraints (sphere contacts, scalar limits, dry friction, equalities) with actuation, tendons, passive/fluid forces, and sensors in integrated_euler_v1",
+          "coupled constraints (sphere contacts, scalar limits, dry friction, joint/connect/weld equalities with per-environment activity) with actuation, tendons, passive/fluid forces, and sensors in integrated_euler_v1",
       ),
   ):
     result.append(

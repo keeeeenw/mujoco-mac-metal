@@ -435,7 +435,7 @@ def validate_stepping_profile(
     from mujoco_metal.coupled_constraints import lower_coupled_constraints
     coupled_desc = lower_coupled_constraints(model)
     if coupled_desc.nc > 0 or coupled_desc.nr_joint > 0:
-      supported_list.append("coupled constraint solve for primitive contacts (plane, sphere, capsule, box), joint limits, dry friction, and equalities")
+      supported_list.append("coupled constraint solve for primitive contacts (plane, sphere, capsule, box), joint limits, dry friction, and joint/connect/weld equalities")
 
     implicit_euler_damping = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP))
     passive_damping_enabled = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))

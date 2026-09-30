@@ -22,6 +22,7 @@ XML_WELD = """<mujoco><option timestep="0.002" gravity="0 0 0"/>
 
 
 def test_device_state_eq_defaults_and_reset_override_cpu():
+    pytest.importorskip("torch")
     from mujoco_metal.device_state import DeviceState
     from mujoco_metal.stepping import validate_stepping_profile
 
@@ -45,6 +46,7 @@ def test_device_state_eq_defaults_and_reset_override_cpu():
 
 
 def test_device_state_eq_validation_atomic_cpu():
+    pytest.importorskip("torch")
     from mujoco_metal.device_state import DeviceState
     from mujoco_metal.stepping import validate_stepping_profile
 
@@ -64,6 +66,7 @@ def test_device_state_eq_validation_atomic_cpu():
 
 
 def test_snapshot_old_schema_rejected_for_equalities_cpu():
+    pytest.importorskip("torch")
     from mujoco_metal.device_state import DeviceState, StateSnapshot
     from mujoco_metal.stepping import validate_stepping_profile
 

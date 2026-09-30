@@ -74,6 +74,8 @@ def preflight(model_path=None, include_inventory=False):
               "implicit",
               "implicit_midpoint",
               "coupled_constraints",
+              "collision_primitives",
+              "equality_assembly",
           )
       },
   }

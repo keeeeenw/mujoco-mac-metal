@@ -25,7 +25,7 @@ benchmark has not been rerun for the additional profiles.
 
 | Capability | Explicit simulation profile | Evidence and creative demo |
 |---|---|---|
-| Integrated Euler physics pipeline: complete primitive collision support (all 9 valid pairs among planes, spheres, capsules, boxes, multi-contact manifolds up to 8 points per pair), condim 1/3/4/6 with pyramidal and elliptic cones, anisotropic sliding/torsional/rolling friction, plus motor actuation, fixed-joint tendons, rigid passive forces, fluid drag, joint limits/frictionloss, polynomial joint equality, and live sensor queries | `integrated_euler_v1` | Independent CPU contact force/torque and trajectory comparisons, projected cone residual checks, final admitted row layouts and snapshot replay; [Spin-and-Grip arcade](examples/spin_and_grip.md), [clockwork parcel sorter](examples/clockwork_parcel_sorter.md), and [robotic marble music machine](examples/marble_music_machine.md) |
+| Integrated Euler physics pipeline: complete primitive collision support (all 9 valid pairs among planes, spheres, capsules, boxes, multi-contact manifolds up to 8 points per pair), condim 1/3/4/6 with pyramidal and elliptic cones, anisotropic sliding/torsional/rolling friction, plus motor actuation, fixed-joint tendons, rigid passive forces, fluid drag, joint limits/frictionloss, joint/connect/weld equalities with persistent per-environment activity, and live sensor queries | `integrated_euler_v1` | Independent CPU contact force/torque and trajectory comparisons, projected cone residual checks, equality assembly checks (body-body/body-world/site-site connect/weld, weld rotation semantics, mixed coupling, activity/state-lifecycle/failure/capacity matrices), final admitted row layouts and snapshot replay; [Spin-and-Grip arcade](examples/spin_and_grip.md), [clockwork parcel sorter](examples/clockwork_parcel_sorter.md), [robotic marble music machine](examples/marble_music_machine.md), and [latch-and-release cargo bridge](examples/cargo_bridge.md) |
 | Quaternion-aware RK4 | `contact_free_rk4_v1`, force/motor/passive/sensor/transmission RK4 variants | Mixed-joint trajectories; [tumbling toys](examples/tumbling_toys.md) |
 | Rigid joint springs, polynomial damping, body gravity compensation and Cartesian body forces | `contact_free_passive_euler_v1`, `contact_free_passive_rk4_v1` | Euler/RK4 trajectories, disable flags and applied-wrench checks; [spring flower](examples/kinetic_sculpture.md) |
 | Stateless scalar servos, fixed/affine gain and affine bias, fixed-joint tendon transmissions plus spring/damping/armature | `contact_free_transmission_euler_v1`, `contact_free_transmission_rk4_v1` | Force stage and 400-step trajectories against CPU; [cable plotter](examples/cable_plotter.md) |
@@ -62,7 +62,7 @@ The pipeline consists of ten sequential integration stages plus an explicit on-d
 5. `actuation`: Stateless scalar motor actuators and transmissions with `ctrlrange` clipping.
 6. `smooth_assembly`: Aggregates unconstrained forces and tendon armature.
 7. `unconstrained_solve`: Unconstrained acceleration solve $M \hat{a} = \tau_{\text{smooth}}$.
-8. `coupled_constraints`: Unified Delassus projected solve simultaneously coupling complete primitive collision manifolds across planes, spheres, capsules, and boxes (condim 1/3/4/6 with pyramidal or elliptic cones), scalar joint limits, dry frictionloss, and polynomial equality constraints. Pyramidal contacts allocate dimension-dependent edge rows; elliptic contacts solve normal, slide, torsion and rolling components in a coupled block.
+8. `coupled_constraints`: Unified Delassus projected solve simultaneously coupling complete primitive collision manifolds across planes, spheres, capsules, and boxes (condim 1/3/4/6 with pyramidal or elliptic cones), scalar joint limits, dry frictionloss, and joint/connect/weld equality constraints (1/3/6 rows per equality with explicit `eq_rowadr`/`eq_rownum` spans, body-body/body-world/site-site forms, pinned weld quaternion error with `torquescale`, per-step Metal assembly with Jdot correction, persistent per-environment `eq_active` masks). Pyramidal contacts allocate dimension-dependent edge rows; elliptic contacts solve normal, slide, torsion and rolling components in a coupled block.
 9. `euler_damping`: Semi-implicit velocity damping solve $(M + h D) v^+ = M v^*$.
 10. `euler_integration`: Semi-implicit Euler state integration with sticky failure rollback.
 
@@ -170,9 +170,11 @@ run for this feature. The four-contact convergence correction required 31 to
 136 outer iterations for elliptic cases in the bounded fixture; this is
 convergence evidence, not a performance claim.
 
-**Release status:** these friction extensions are not present in the 0.4.0
+**Release status:** these friction extensions, like the connect/weld equality
+support and the cargo-bridge demo on this branch, are not present in the 0.4.0
 PyPI wheel. They remain bounded to `integrated_euler_v1`, primitive contacts,
-condim 1/3/4/6, pyramidal/elliptic cones, scalar joint constraints and the
+condim 1/3/4/6, pyramidal/elliptic cones, scalar joint constraints, joint /
+connect / weld equalities with per-environment activation, and the
 documented workspace caps. This does not complete full MuJoCo contact or solver
 support.
 
@@ -205,6 +207,7 @@ not throughput measurements. [Explore the gallery](examples/demo_gallery.md).
 - Clockwork parcel sorter: 600 steps; pre-impact mixed-coordinate generalized coordinate errors against CPU MuJoCo `3.74e-6` (`qpos`) and `1.30e-4` (`qvel`), with decoupled parcel translation error $< 3.2 \times 10^{-7}$ m and hinge angle error $< 1.83 \times 10^{-6}$ rad; stage sensor difference `0.0`, equality residual match within `3.2e-5` rad; full-run physical errors bounded within 0.0164 m translation, 0.048 m/s linear velocity, 0.00207 rad hinge angle, 0.400 rad/s hinge velocity, 0.544 rad rotation, and 1.82 rad/s angular velocity; exercises 9 active contact pairs across 5 collision combinations (plane-sphere, sphere-box, capsule-box, capsule-capsule, box-box; all 9 canonical pairs verified in the qualification suite) with 536 native active contact steps, peak 7 simultaneous contacts, 443 active joint limit steps; demonstrates actual physical routing sending box parcels to the left chute ($Y = -0.405$ m), capsule parcels to the right chute ($Y = +0.402$ m), and sphere parcels down the center ($Y = 0.000$ m).
 - Robotic marble music machine: 400 steps; maximum absolute qpos/qvel differences
   `8.94e-6` / `1.97e-4`; stage sensor difference `0.0`, trajectory sensor difference `8.57e-6`; exercises all Euler feature families simultaneously in one coupled Delassus solve (211 active joint limit steps, 238 near limit steps, chime oscillations 0.091 rad / 0.066 rad, 4 active contact pairs).
+- Latch-and-release cargo bridge: 1200 steps with weld release at step 50; pre-release native/CPU parity `1.93e-07` (`qpos`) / `8.77e-06` (`qvel`) over 50 stable latched steps; full-run maxima `1.33e-03` / `3.75e-01` (contact-release divergence documented, not a tolerance); native latch force `109.95` before release and `0.0` after; connect force engaged throughout (`86.19` / `44.01`); released payload reaches the tray (`0.699`, `0.230`, 1011 payload-tray contact steps) while the always-latched counterfactual stays on deck (`0.730`, `0.603`, 0 tray steps).
 
 These measured errors describe the fixtures, not universal tolerances.
 
