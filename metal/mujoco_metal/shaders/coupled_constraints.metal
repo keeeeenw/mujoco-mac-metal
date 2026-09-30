@@ -1061,8 +1061,16 @@ kernel void solve_coupled_constraints(
       if (max_res <= tol) { converged = true; break; }
     }
   } else {
-    // Preserve the established pyramidal PGS update order and arithmetic.
-    for (int it = 0; it < maxiter; ++it) {
+    // F4: redundant-contact systems certify slowly in float32, so a
+    // budgeted PGS sweep can end close (<=1e-3) but uncertified while still
+    // improving (box face plants freeze without this): grant another budget
+    // window up to a hard cap. Acceptance still requires max_res <= tol;
+    // true divergence keeps status 3 via the unchanged failure path below.
+    // Loose-but-certified solutions are tightened by block refinement in
+    // section 9; already-tight ones skip it bit-identically.
+    int pgs_cap = maxiter;
+    float win_start = 1e30f;
+    for (int it = 0; it < pgs_cap; ++it) {
       for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
         float diag = max(1e-15f, W[row * nr + row] + R[row]);
         float v = rhs[row];
@@ -1084,12 +1092,24 @@ kernel void solve_coupled_constraints(
       }
       out_diagnostics[world * 2] = max_res;
       out_diagnostics[world * 2 + 1] = float(it + 1);
-      if (max_res <= tol) { converged = true; break; }
+      if (max_res <= tol) {
+        converged = true;
+        break;
+      } else if (it + 1 == pgs_cap && pgs_cap < 1024 && max_res <= 1e-3f
+          && max_res < win_start) {
+        // Close and improved over the window: grant another window.
+        win_start = max_res;
+        pgs_cap = min(1024, pgs_cap * 2);
+      }
     }
   }
 
-  // 9. Contact Block Refinement (if not converged and contacts exist)
-  if (!converged && contact_block_count > 0 && elliptic_count == 0) {
+  // 9. Contact Block Refinement (exact per-block solves tighten the PGS
+  // solution). Runs when the sweep did not certify, or when it certified
+  // only loosely (res > 1e-7): loose PGS solutions drift on rolling
+  // friction while exact block solves match the CPU oracle. Already-tight
+  // solutions skip it, bit-identical to before.
+  if ((!converged || max_res > 1e-7f) && contact_block_count > 0 && elliptic_count == 0) {
     for (int ref = 0; ref < 256; ++ref) {
       for (int b = 0; b < contact_block_count; ++b) {
         int row_start = contact_block_start[b];

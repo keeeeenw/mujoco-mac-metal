@@ -1906,3 +1906,39 @@ def test_clockwork_parcel_sorter_matched_states_and_sensitivity_audit():
   assert max_rot_cpu32 <= 1.0
   assert max_lin_v_cpu32 <= 0.10
   assert max_ang_v_cpu32 <= 2.5
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_box_face_impact_no_freeze_gpu():
+  # F4 retained regression: a 4-contact box/plane face impact used to stall
+  # the coupled PGS (status 3, frozen world) while the CPU bounced and
+  # settled. Adaptive PGS extension converges it; the bounce tracks bitwise.
+  import numpy as np
+  from mujoco_metal import MetalSimulation
+  xml = """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
+  <worldbody>
+  <geom name="floor" type="plane" size="5 5 0.1"/>
+  <body name="b" pos="0 0 0.3"><freejoint/>
+  <geom name="bx" type="box" size="0.05 0.05 0.1" friction="0.8 0.1 0.1"/></body>
+  </worldbody></mujoco>"""
+  m = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  cpu = mujoco.MjData(m)
+  sim.reset()
+  mujoco.mj_forward(m, cpu)
+  max_err = 0.0
+  saw_contact = False
+  for _ in range(150):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+    if cpu.ncon > 0:
+      saw_contact = True
+    gq = sim.state.qpos.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+    assert int(sim.state.status.cpu().numpy()[0]) == 0
+  assert saw_contact  # the impact (redundant 4-contact rows) was exercised
+  assert max_err < 5e-4, max_err
+  # Settled on the face: body z rests at the half height.
+  np.testing.assert_allclose(float(sim.state.qpos.cpu().numpy()[0, 2]),
+                             float(cpu.qpos[2]), atol=5e-4)
