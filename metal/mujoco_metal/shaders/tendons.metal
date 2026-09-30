@@ -510,7 +510,13 @@ inline float3 st8_point_jacdot(float3 point, float3 v_point, int body,
     float3 wC = float3(cvel[(bo+b)*6], cvel[(bo+b)*6+1], cvel[(bo+b)*6+2]);
     float3 linC = float3(cvel[(bo+b)*6+3], cvel[(bo+b)*6+4], cvel[(bo+b)*6+5]);
     float3 posC = float3(body_pos[(bo+b)*3], body_pos[(bo+b)*3+1], body_pos[(bo+b)*3+2]);
-    float3 v_c = linC + cross(wC, posC - comP);
+    // G1: the free-joint pivot rides on the child body itself, so its
+    // velocity is measured about the CHILD root's COM (like pinned
+    // mj_jacDot with subtree_com[rootid[child]]), not the parent's.
+    int rcC = body_rootid[b];
+    rcC = (rcC >= 0 && rcC < nbody) ? rcC : 0;
+    float3 comC = float3(root_com[(bo+rcC)*3], root_com[(bo+rcC)*3+1], root_com[(bo+rcC)*3+2]);
+    float3 v_c = linC + cross(wC, posC - comC);
     float4 bq = float4(body_quat[(bo+b)*4], body_quat[(bo+b)*4+1],
                        body_quat[(bo+b)*4+2], body_quat[(bo+b)*4+3]);
     float nq = length(bq); bq = nq > 1e-30f ? bq / nq : float4(1,0,0,0);
