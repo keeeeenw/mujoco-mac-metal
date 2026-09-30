@@ -569,3 +569,142 @@ def test_spatial_servo_and_muscle_gpu():
     gq = sim.state.qpos.cpu().numpy()[0]
     max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
   assert max_err < 2e-3, max_err
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_spatial_equality_native_parity_gpu():
+  # Acceptance gap: equality rows coupling two curved spatial tendons.
+  from mujoco_metal import MetalSimulation
+  world = ('<site name="a0" pos="-0.3 0 1"/><site name="a1" pos="0.3 0 1"/>'
+           '<body pos="-0.3 0 0.5"><joint name="j1" type="slide" axis="0 0 1"/>'
+           '<geom type="sphere" size="0.05" mass="0.5"/>'
+           '<site name="h1" pos="0 0 0.06"/></body>'
+           '<body pos="0.3 0 0.5"><joint name="j2" type="slide" axis="0 0 1"/>'
+           '<geom type="sphere" size="0.05" mass="0.5"/>'
+           '<site name="h2" pos="0 0 0.06"/></body>')
+  m = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.002" gravity="0 0 -9.81"/><worldbody>'
+      + world + '</worldbody><tendon>'
+      '<spatial name="t1"><site site="a0"/><site site="h1"/><site site="a1"/></spatial>'
+      '<spatial name="t2"><site site="a1"/><site site="h2"/><site site="a0"/></spatial>'
+      '</tendon><equality>'
+      '<tendon tendon1="t1" tendon2="t2" polycoef="0 1 0 0 0"/>'
+      '</equality></mujoco>')
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  cpu = mujoco.MjData(m)
+  cpu.qpos[:] = [0.1, -0.05]
+  cpu.qvel[:] = [0.4, 0.2]
+  mujoco.mj_forward(m, cpu)
+  assert cpu.nefc >= 1  # equality row actually active
+  sim.reset(qpos=np.array([[0.1, -0.05]], dtype=np.float32),
+            qvel=np.array([[0.4, 0.2]], dtype=np.float32))
+  max_err = 0.0
+  for _ in range(40):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+    gq = sim.state.qpos.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+  assert max_err < 5e-4, max_err
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_cylinder_wrap_trajectory_gpu():
+  # Acceptance gap (wrap matrix): cylinder side-wrap trajectory parity.
+  from mujoco_metal import MetalSimulation
+  world = ('<site name="a" pos="-0.3 0 0.5"/><site name="b" pos="0.3 0 0.5"/>'
+           '<body pos="0 0 0.5"><joint name="j" type="slide" axis="0 0 1"/>'
+           '<geom name="rod" type="cylinder" size="0.05 0.2" mass="0.5"/></body>')
+  m = _model(world, '<spatial name="t"><site site="a"/>'
+             '<geom geom="rod"/><site site="b"/></spatial>',
+             option='timestep="0.002" gravity="0 0 -9.81"')
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  cpu = mujoco.MjData(m)
+  cpu.qpos[0] = 0.1
+  cpu.qvel[0] = 0.5
+  mujoco.mj_forward(m, cpu)
+  sim.reset(qpos=np.array([[0.1]], dtype=np.float32),
+            qvel=np.array([[0.5]], dtype=np.float32))
+  max_err = 0.0
+  for _ in range(40):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+    gq = sim.state.qpos.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+  assert max_err < 5e-4, max_err
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_spatial_reset_and_copy_gpu():
+  # Acceptance gap: reset/snapshot/copy round-trips preserve spatial state.
+  from mujoco_metal import MetalSimulation
+  m = _model(_slide_world(),
+             '<spatial name="t"><site site="s0"/><site site="s2"/><site site="s1"/></spatial>',
+             option='timestep="0.002" gravity="0 0 -9.81"')
+  sim = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
+  sim.reset(qpos=np.array([[0.1], [0.2]], dtype=np.float32),
+            qvel=np.array([[0.5], [-0.3]], dtype=np.float32))
+  for _ in range(10):
+    sim.step(1)
+  snap = sim.state.snapshot()
+  for _ in range(10):
+    sim.step(1)
+  sim.state.restore(snap)
+  q_after = sim.state.qpos.cpu().numpy().copy()
+  np.testing.assert_allclose(q_after, np.asarray(snap.qpos), atol=1e-7)
+  # Reset to defaults clears motion; copy propagates env rows.
+  sim.reset()
+  np.testing.assert_allclose(sim.state.qpos.cpu().numpy(),
+                             np.zeros((2, 1)), atol=1e-7)
+  sim.reset(qpos=np.array([[0.15], [0.0]], dtype=np.float32))
+  sim.copy_environment(0, 1)
+  np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[1],
+                             sim.state.qpos.cpu().numpy()[0], atol=1e-7)
+  for _ in range(10):
+    sim.step(1)
+  np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[1],
+                             sim.state.qpos.cpu().numpy()[0], atol=1e-6)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_spatial_with_contact_parity_gpu():
+  # Acceptance gap: spatial tendon forces combined with native contacts.
+  # Single-point (sphere/plane) impact: exact parity before first contact
+  # and identical settled rest after. Note: a 4-face box/plane impact in the
+  # same harness freezes the native dense solver (Cholesky status 3) with or
+  # without any tendon, so multi-face impacts stay a contact-solver matter
+  # outside 008 scope; the tendon coupling itself is exact here.
+  from mujoco_metal import MetalSimulation
+  world = ('<geom name="floor" type="plane" size="5 5 0.1" contype="1" conaffinity="1"/>'
+           '<site name="a" pos="-0.3 0 0.5"/><site name="b" pos="0.3 0 0.5"/>'
+           '<body pos="0 0 0.2"><joint name="j" type="slide" axis="0 0 1"/>'
+           '<geom name="ball" type="sphere" size="0.05" mass="0.5" '
+           'friction="0.5 0.05 0.02" contype="1" conaffinity="1"/>'
+           '<site name="h" pos="0 0 0.06"/></body>')
+  m = _model(world, '<spatial name="t"><site site="a"/>'
+             '<site site="h"/><site site="b"/></spatial>',
+             option='timestep="0.002" gravity="0 0 -9.81"')
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  cpu = mujoco.MjData(m)
+  cpu.qpos[0] = 0.0
+  cpu.qvel[0] = -1.0
+  mujoco.mj_forward(m, cpu)
+  sim.reset(qpos=np.array([[0.0]], dtype=np.float32),
+            qvel=np.array([[-1.0]], dtype=np.float32))
+  pre_err = 0.0
+  for _ in range(150):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+    if cpu.ncon == 0:
+      gq = sim.state.qpos.cpu().numpy()[0]
+      pre_err = max(pre_err, float(np.max(np.abs(gq - cpu.qpos))))
+  assert pre_err < 1e-6, pre_err  # exact before first contact
+  # Both settle to the ball resting on the floor (center z=0.05 -> qpos -0.15).
+  np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[0],
+                             np.asarray(cpu.qpos), atol=5e-4)
+  np.testing.assert_allclose(sim.state.qvel.cpu().numpy()[0],
+                             np.asarray(cpu.qvel), atol=5e-4)
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
