@@ -74,14 +74,15 @@ def test_admission_rejects_with_owners_cpu():
   with pytest.raises(ValueError, match="crank"):
     ActuatorModel(_model(body='<site name="s1" pos="0 0 1"/><site name="s2" pos="0 0 1"/>' + HINGE_BODY,
                          actuator='<general cranksite="s1" slidersite="s2" cranklength="0"/>'))
-  # Fixed joint tendons are supported; spatial (pulley/site) rejected toward 008.
+  # Spatial tendon actuators are owned by 008 (R1): admitted via the
+  # general path, not rejected.
   spat_world = ('<site name="s1" pos="0 0 1"/><site name="s2" pos="0 0 2"/>' + HINGE_BODY)
   m = mujoco.MjModel.from_xml_string(
       f'<mujoco><option timestep="0.002"/><worldbody>{spat_world}</worldbody>'
       '<tendon><spatial name="st"><site site="s1"/><site site="s2"/></spatial></tendon>'
       '<actuator><general tendon="st"/></actuator></mujoco>')
-  with pytest.raises(ValueError, match="008"):
-    ActuatorModel(m)
+  meta = ActuatorModel(m)
+  assert meta.needs_general_path
 
 
 def test_reference_matches_mjstep_intermediates_cpu():
