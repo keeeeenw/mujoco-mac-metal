@@ -45,6 +45,7 @@ _CAPSULE = int(mujoco.mjtGeom.mjGEOM_CAPSULE)
 _BOX = int(mujoco.mjtGeom.mjGEOM_BOX)
 _HINGE = int(mujoco.mjtJoint.mjJNT_HINGE)
 _SLIDE = int(mujoco.mjtJoint.mjJNT_SLIDE)
+_BALL = int(mujoco.mjtJoint.mjJNT_BALL)
 _EQ_CONNECT = int(mujoco.mjtEq.mjEQ_CONNECT)
 _EQ_WELD = int(mujoco.mjtEq.mjEQ_WELD)
 _EQ_JOINT = int(mujoco.mjtEq.mjEQ_JOINT)
@@ -284,8 +285,11 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
         )
   limited = np.asarray(model.jnt_limited, dtype=bool)
   for jid in range(model.njnt):
-    if limited[jid] and int(model.jnt_type[jid]) not in scalar_types:
-      raise ValueError(f"joint {jid}: only scalar hinge/slide limits are supported")
+    jt = int(model.jnt_type[jid])
+    if jt == int(mujoco.mjtJoint.mjJNT_FREE) and limited[jid]:
+      raise ValueError(f"joint {jid}: limited free joints are unsupported (upstream ignores them)")
+    if limited[jid] and jt not in scalar_types + (_BALL,):
+      raise ValueError(f"joint {jid}: only scalar hinge/slide and ball limits are supported")
   # Per-equality validation with explicit row spans; inactive equalities are
   # still validated and reserved (a model is not supported merely because a
   # new equality is initially inactive).
@@ -898,7 +902,10 @@ class MetalCoupledConstraints:
         "joint_qposadr": self._tensor(d.joint_qposadr if d.njnt else np.zeros(1, dtype=np.int32)),
         "qpos0": self._tensor(d.qpos0 if d.nq else np.zeros(1, dtype=np.float32)),
         "joint_dofadr": self._tensor(d.joint_dofadr if d.njnt else np.zeros(1, dtype=np.int32)),
-        "joint_limited": self._tensor(d.joint_limited if d.njnt else np.zeros(1, dtype=np.uint8)),
+        "joint_limited": self._tensor(
+            (np.asarray(d.joint_limited, dtype=np.int32)
+             | (np.asarray(d.joint_type, dtype=np.int32) << 1)).astype(np.uint8)
+            if d.njnt else np.zeros(1, dtype=np.uint8)),
         "joint_limit_params": self._tensor(joint_limit_params.reshape(-1)),
         "joint_sol_params": self._tensor(d.joint_sol_params.reshape(-1)),
         "dof_frictionloss": self._tensor(d.dof_frictionloss if d.nv else np.zeros(1, dtype=np.float32)),

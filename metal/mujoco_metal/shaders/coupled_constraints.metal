@@ -607,12 +607,50 @@ kernel void solve_coupled_constraints(
       enabled[row] = true;
     }
 
-    // Joint Limits (bit 3 mjDSBL_LIMIT)
+    // Joint Limits (bit 3 mjDSBL_LIMIT). joint_limited packs bit0=limited,
+    // bits[2:1]=joint type (milestone 009 ball support).
     for (int j = 0; j < nj; ++j) {
-      if (joint_limited[j] == 0) continue;
+      int limpack = joint_limited[j];
+      if ((limpack & 1) == 0) continue;
       int d = joint_dadr[j];
       int q = joint_qadr[j];
       float margin = joint_limit_params[j * 3 + 2];
+      if (((limpack >> 1) & 3) == 1) {
+        // Ball limit (pinned mj_instantiateLimit): single row on the rotation
+        // angle with Jacobian -axis over the 3 DOFs. Uses the first reserved
+        // row of the pair; the second stays disabled.
+        float4 quat = float4(qpos[pb+q], qpos[pb+q+1], qpos[pb+q+2], qpos[pb+q+3]);
+        float nq4 = length(quat);
+        quat = nq4 > 1e-30f ? quat / nq4 : float4(1, 0, 0, 0);
+        float3 vv = quat.yzw;
+        float s = length(vv);
+        float speed = 2.0f * atan2(s, quat.x);
+        if (speed > 3.14159265358979f) speed -= 2.0f * 3.14159265358979f;
+        float3 aa = s > 1e-30f ? vv * (speed / s) : float3(0.0f);
+        float value = length(aa);
+        // Pinned mju_normalize3 normalizes angleAxis in place: the Jacobian
+        // uses the UNIT axis, value is the pre-normalized angle.
+        float3 naxis = value > 1e-30f ? aa / value : float3(0.0f);
+        float rmax = max(joint_limit_params[j * 3], joint_limit_params[j * 3 + 1]);
+        float dist = rmax - value;
+        int rowb = n_eq_rows + nv + 2 * j;
+        if ((flags & 8) == 0 && dist < margin) {
+          for (int k = 0; k < 3; ++k) {
+            int dof = d + k;
+            if (dof >= 0 && dof < nv) J_world[rowb * nv + dof] = -naxis[k];
+          }
+          float vel = 0.0f;
+          for (int k = 0; k < 3; ++k) {
+            int dof = d + k;
+            if (dof >= 0 && dof < nv) vel += -naxis[k] * qvel[qb + dof];
+          }
+          reference_params(joint_sol_params + j * 7, joint_sol_params + j * 7 + 2, 0, dist, margin, vel, invweight[d], false, params[0], refsafe, R[rowb], ar[rowb]);
+          lo[rowb] = 0.0f;
+          hi[rowb] = INFINITY;
+          enabled[rowb] = true;
+        }
+        continue;
+      }
       // Lower limit
       int row0 = n_eq_rows + nv + 2 * j;
       float dist0 = qpos[pb + q] - joint_limit_params[j * 3 + 0];
