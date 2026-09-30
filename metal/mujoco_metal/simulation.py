@@ -684,9 +684,11 @@ class MetalSimulation:
     if self._motor is not None:
       rhs.add_(self._motor.run_device(self._control))
     eq_active = getattr(state, "_eq_active", None)
+    _ten_J, _ten_L = self._spatial_for_coupled(qvel, dynamics["poses"])
     coupled = self._coupled_constraints.run_device(
         dynamics["poses"], dynamics["mass_matrix"], rhs, qpos, qvel,
         eq_active=eq_active, cvel=dynamics.get("cvel", None),
+        tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
     )
     coupled["mass_matrix"] = dynamics["mass_matrix"]
     self._last_coupled = coupled
@@ -801,6 +803,14 @@ class MetalSimulation:
       self._spatial_kin = kin
     return self._spatial_kin["jacobian"]
 
+  def _spatial_for_coupled(self, qvel, poses):
+    """Borrowed (J, length) spatial tendon views for the coupled stage."""
+    if self._spatial_tendons is None:
+      return None, None
+    self._spatial_jacobian(qvel, poses)
+    kin = self._spatial_kin
+    return kin["jacobian"], kin["length"]
+
   def _actuation_force(self, qpos, qvel, poses):
     """General actuator force stage with pinned mj_fwdActuation ordering.
 
@@ -891,9 +901,11 @@ class MetalSimulation:
     )
     if self._coupled_constraints is not None:
       eq_active = getattr(self._state, "_eq_active", None)
+      _ten_J, _ten_L = self._spatial_for_coupled(qvel, dynamics["poses"])
       coupled = self._coupled_constraints.run_device(
           dynamics["poses"], dynamics["mass_matrix"], self._rhs, qpos, qvel,
           eq_active=eq_active, cvel=dynamics.get("cvel", None),
+          tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
       )
       coupled["mass_matrix"] = dynamics["mass_matrix"]
       self._last_coupled = coupled

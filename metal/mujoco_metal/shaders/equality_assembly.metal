@@ -188,14 +188,27 @@ kernel void equality_assembly(
   int so = int(world) * max(nsite, 1);
 
   device float* J_world = workspace_J + int(world) * nr * max(nv, 1);
-  device float* dbg = workspace_debug + int(world) * (nr * nr + 4 * nr);
+  device float* dbg = workspace_debug + int(world) * (nr * nr + 7 * nr);
 
   for (int e = 0; e < neq; ++e) {
     int typ = eq_type[e];
     int objtype = eq_objtype[e]; // 1=body, 6=site, 0=unknown(joint)
     int rowadr = eq_rowadr[e];
-    int span = typ == 2 ? 1 : (typ == 0 ? 3 : 6);
+    int span = typ == 2 ? 1 : (typ == 3 ? 1 : (typ == 0 ? 3 : 6));
     bool active = !(flags & 1) && !(flags & 2) && (eq_active[int(world) * neq + e] != 0);
+    if (typ == 3) {
+      // Tendon equalities are assembled by the tendon-constraint stage
+      // (milestone 008): it owns ten_length/ten_J and the cubic coupling.
+      // Reserve zeros here so the row mapping stays dense.
+      for (int k = 0; k < span; ++k) {
+        int row = rowadr + k;
+        if (row < 0 || row >= nr) continue;
+        for (int i = 0; i < nv; ++i) J_world[row * nv + i] = 0.0f;
+        dbg[nr * nr + row] = 0.0f;
+        dbg[nr * nr + nr + row] = 0.0f;
+      }
+      continue;
+    }
     if (!active) {
       for (int k = 0; k < span; ++k) {
         int row = rowadr + k;

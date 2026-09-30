@@ -48,16 +48,18 @@ _SLIDE = int(mujoco.mjtJoint.mjJNT_SLIDE)
 _EQ_CONNECT = int(mujoco.mjtEq.mjEQ_CONNECT)
 _EQ_WELD = int(mujoco.mjtEq.mjEQ_WELD)
 _EQ_JOINT = int(mujoco.mjtEq.mjEQ_JOINT)
+_EQ_TENDON = int(mujoco.mjtEq.mjEQ_TENDON)
 _OBJ_BODY = int(mujoco.mjtObj.mjOBJ_BODY)
 _OBJ_SITE = int(mujoco.mjtObj.mjOBJ_SITE)
 
 _EQ_ROWS = {
     _EQ_JOINT: 1,
+    _EQ_TENDON: 1,
     _EQ_CONNECT: 3,
     _EQ_WELD: 6,
 }
 
-_SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_CONNECT, _EQ_WELD)
+_SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_TENDON, _EQ_CONNECT, _EQ_WELD)
 
 _SUPPORTED_GEOM_TYPES = (_PLANE, _SPHERE, _CAPSULE, _BOX)
 
@@ -176,6 +178,22 @@ class CoupledConstraintDescriptor:
   body_jntadr: np.ndarray
   body_jntnum: np.ndarray
   body_invweight0: np.ndarray
+  ntendon: int = 0
+  ten_base: int = 0
+  ten_friction_rows: int = 0
+  ten_limit_rows: int = 0
+  ten_limited: np.ndarray = None
+  ten_range: np.ndarray = None
+  ten_margin: np.ndarray = None
+  ten_length0: np.ndarray = None
+  ten_invweight0: np.ndarray = None
+  ten_solref_lim: np.ndarray = None
+  ten_solimp_lim: np.ndarray = None
+  ten_frictionloss: np.ndarray = None
+  ten_solref_fri: np.ndarray = None
+  ten_solimp_fri: np.ndarray = None
+  ten_length_map: np.ndarray = None
+  ten_moment_map: np.ndarray = None
 
 
 def _mix_contact_parameters(model, g1, g2):
@@ -197,6 +215,41 @@ def _mix_contact_parameters(model, g1, g2):
   imp = mix * model.geom_solimp[g1] + (1 - mix) * model.geom_solimp[g2]
   friction = np.maximum(model.geom_friction[g1], model.geom_friction[g2])
   return ref, imp, friction
+
+
+def _fixed_tendon_maps(model):
+  """Constant fixed-tendon length/moment maps; spatial rows stay zero.
+
+  Mirrors FixedTendonModel math without its strict validation (the spatial
+  tendon kernel supplies spatial rows at runtime).
+  """
+  nt, nq, nv = int(model.ntendon), int(model.nq), int(model.nv)
+  wrap_joint = int(mujoco.mjtWrap.mjWRAP_JOINT)
+  hinge = int(mujoco.mjtJoint.mjJNT_HINGE)
+  slide = int(mujoco.mjtJoint.mjJNT_SLIDE)
+  length_map = np.zeros((max(nt, 1), max(nq, 1)), dtype=np.float64)
+  moment_map = np.zeros((max(nt, 1), max(nv, 1)), dtype=np.float64)
+  for tendon in range(nt):
+    start, count = int(model.tendon_adr[tendon]), int(model.tendon_num[tendon])
+    if count <= 0 or int(model.wrap_type[start]) != wrap_joint:
+      continue
+    ok = True
+    for wrap in range(start, start + count):
+      if int(model.wrap_type[wrap]) != wrap_joint:
+        ok = False
+        break
+      joint = int(model.wrap_objid[wrap])
+      if joint < 0 or joint >= int(model.njnt) or int(model.jnt_type[joint]) not in (hinge, slide):
+        ok = False
+        break
+    if not ok:
+      continue
+    for wrap in range(start, start + count):
+      joint = int(model.wrap_objid[wrap])
+      coefficient = float(model.wrap_prm[wrap])
+      length_map[tendon, int(model.jnt_qposadr[joint])] += coefficient
+      moment_map[tendon, int(model.jnt_dofadr[joint])] += coefficient
+  return length_map.astype(np.float32), moment_map.astype(np.float32)
 
 
 def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
@@ -254,6 +307,14 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
         raise ValueError(f"equality {eid}: object 1 must be a scalar hinge/slide joint")
       if j2 >= 0 and (j2 >= model.njnt or int(model.jnt_type[j2]) not in scalar_types):
         raise ValueError(f"equality {eid}: object 2 must be a scalar hinge/slide joint")
+    elif et == _EQ_TENDON:
+      t1, t2 = int(model.eq_obj1id[eid]), int(model.eq_obj2id[eid])
+      if not 0 <= t1 < model.ntendon:
+        raise ValueError(f"equality {eid}: tendon 1 id out of range")
+      if t2 >= 0 and not 0 <= t2 < model.ntendon:
+        raise ValueError(f"equality {eid}: tendon 2 id out of range")
+      if not np.all(np.isfinite(np.asarray(model.tendon_length0, dtype=np.float64))):
+        raise ValueError(f"equality {eid}: tendon_length0 must be finite")
     elif et == _EQ_CONNECT:
       if ot not in (_OBJ_BODY, _OBJ_SITE):
         raise ValueError(f"equality {eid}: connect requires body or site objects")
@@ -310,8 +371,27 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
   n_eq_rows = int(eq_row_cursor)
   eq_rowadr = np.asarray(eq_rowadr_list, dtype=np.int32) if model.neq else np.zeros(0, dtype=np.int32)
   eq_rownum = np.asarray(eq_rownum_list, dtype=np.int32) if model.neq else np.zeros(0, dtype=np.int32)
-  if model.ntendon and (np.any(model.tendon_limited) or np.any(model.tendon_frictionloss)):
-    raise ValueError("tendon limits and frictionloss are unsupported")
+  # Tendon limits/frictionloss are natively supported rows (milestone 008);
+  # validate their parameters here (mirrors SpatialTendonModel admission).
+  if model.ntendon:
+    if not np.all(np.isfinite(np.asarray(model.tendon_range, dtype=np.float64))):
+      raise ValueError("tendon_range must be finite")
+    if not np.all(np.isfinite(np.asarray(model.tendon_margin, dtype=np.float64))):
+      raise ValueError("tendon_margin must be finite")
+    if not np.all(np.isfinite(np.asarray(model.tendon_length0, dtype=np.float64))):
+      raise ValueError("tendon_length0 must be finite")
+    if not np.all(np.isfinite(np.asarray(model.tendon_invweight0, dtype=np.float64))):
+      raise ValueError("tendon_invweight0 must be finite")
+    lim = np.asarray(model.tendon_limited, dtype=bool)
+    rng = np.asarray(model.tendon_range, dtype=np.float64).reshape(model.ntendon, 2)
+    if np.any(lim & (rng[:, 0] > rng[:, 1])):
+      raise ValueError("limited tendon ranges must be ordered")
+    if np.any(np.asarray(model.tendon_frictionloss) < 0):
+      raise ValueError("tendon friction loss must be nonnegative")
+  ten_friction_rows = int(np.sum(np.asarray(model.tendon_frictionloss) > 0)) if model.ntendon else 0
+  ten_limit_rows = int(2 * np.sum(np.asarray(model.tendon_limited, dtype=bool))) if model.ntendon else 0
+  ten_base = int(n_eq_rows + model.nv + 2 * model.njnt)
+  n_ten_rows = int(ten_friction_rows + ten_limit_rows)
 
   # 2. Contact pairs filtering & lowering
   if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_OVERRIDE):
@@ -479,7 +559,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
   # The activity array still has one entry per equality; row mapping is
   # deterministic via eq_rowadr/eq_rownum. Do not replace all uses of neq
   # indiscriminately.
-  nr_joint = int(n_eq_rows + model.nv + 2 * model.njnt)
+  nr_joint = int(n_eq_rows + model.nv + 2 * model.njnt + n_ten_rows)
   nr_contact = int(row_offset)
   nr = int(nr_joint + nr_contact)
   if nr > _MAX_ROWS:
@@ -604,6 +684,22 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       tolerance=eff_tol,
       solver_settings=solver_settings,
       n_eq_rows=n_eq_rows,
+      ntendon=int(model.ntendon),
+      ten_base=ten_base,
+      ten_friction_rows=ten_friction_rows,
+      ten_limit_rows=ten_limit_rows,
+      ten_limited=_frozen(model.tendon_limited, np.int32) if model.ntendon else np.zeros(1, dtype=np.int32),
+      ten_range=_frozen(np.asarray(model.tendon_range).reshape(model.ntendon, 2) if model.ntendon else np.zeros((1, 2)), np.float32),
+      ten_margin=_frozen(model.tendon_margin, np.float32) if model.ntendon else np.zeros(1, dtype=np.float32),
+      ten_length0=_frozen(model.tendon_length0, np.float32) if model.ntendon else np.zeros(1, dtype=np.float32),
+      ten_invweight0=_frozen(model.tendon_invweight0, np.float32) if model.ntendon else np.zeros(1, dtype=np.float32),
+      ten_solref_lim=_frozen(np.asarray(model.tendon_solref_lim).reshape(model.ntendon, 2) if model.ntendon else np.zeros((1, 2)), np.float32),
+      ten_solimp_lim=_frozen(np.asarray(model.tendon_solimp_lim).reshape(model.ntendon, 5) if model.ntendon else np.zeros((1, 5)), np.float32),
+      ten_frictionloss=_frozen(model.tendon_frictionloss, np.float32) if model.ntendon else np.zeros(1, dtype=np.float32),
+      ten_solref_fri=_frozen(np.asarray(model.tendon_solref_fri).reshape(model.ntendon, 2) if model.ntendon else np.zeros((1, 2)), np.float32),
+      ten_solimp_fri=_frozen(np.asarray(model.tendon_solimp_fri).reshape(model.ntendon, 5) if model.ntendon else np.zeros((1, 5)), np.float32),
+      ten_length_map=_frozen(_fixed_tendon_maps(model)[0], np.float32),
+      ten_moment_map=_frozen(_fixed_tendon_maps(model)[1], np.float32),
       joint_type=_frozen(model.jnt_type, np.int32),
       joint_qposadr=_frozen(model.jnt_qposadr, np.int32),
       qpos0=_frozen(model.qpos0, np.float32),
@@ -757,6 +853,10 @@ class MetalCoupledConstraints:
       self._equality_kernel = self._library.equality_assembly
     except AttributeError:
       self._equality_kernel = None
+    try:
+      self._tendon_kernel = self._library.tendon_constraint_rows
+    except AttributeError:
+      self._tendon_kernel = None
     self._solve_kernel = self._library.solve_coupled_constraints
 
     d = self.descriptor
@@ -846,6 +946,18 @@ class MetalCoupledConstraints:
         "contact_friction": self._tensor(contact_friction_arr),
         "contact_solreffriction": self._tensor(contact_solreffriction_arr),
         "contact_condim": self._tensor(d.contact_condim_packed if d.ncontacts_max else np.zeros(3, dtype=np.int32)),
+        "ten_limited": self._tensor(d.ten_limited if d.ntendon else np.zeros(1, dtype=np.int32)),
+        "ten_range": self._tensor(d.ten_range.reshape(-1) if d.ntendon else np.zeros(2, dtype=np.float32)),
+        "ten_margin": self._tensor(d.ten_margin if d.ntendon else np.zeros(1, dtype=np.float32)),
+        "ten_length0": self._tensor(d.ten_length0 if d.ntendon else np.zeros(1, dtype=np.float32)),
+        "ten_invweight0": self._tensor(d.ten_invweight0 if d.ntendon else np.zeros(1, dtype=np.float32)),
+        "ten_solref_lim": self._tensor(d.ten_solref_lim.reshape(-1) if d.ntendon else np.zeros(2, dtype=np.float32)),
+        "ten_solimp_lim": self._tensor(d.ten_solimp_lim.reshape(-1) if d.ntendon else np.zeros(5, dtype=np.float32)),
+        "ten_frictionloss": self._tensor(d.ten_frictionloss if d.ntendon else np.zeros(1, dtype=np.float32)),
+        "ten_solref_fri": self._tensor(d.ten_solref_fri.reshape(-1) if d.ntendon else np.zeros(2, dtype=np.float32)),
+        "ten_solimp_fri": self._tensor(d.ten_solimp_fri.reshape(-1) if d.ntendon else np.zeros(5, dtype=np.float32)),
+        "ten_length_map": self._tensor(d.ten_length_map.reshape(-1)),
+        "ten_moment_map": self._tensor(d.ten_moment_map.reshape(-1)),
         "c_dims": torch.tensor(
 
             [d.nv, d.npairs, d.ncontacts_max, self.batch_size, d.nbody, d.njnt, d.ngeom, d.cone_type],
@@ -856,7 +968,7 @@ class MetalCoupledConstraints:
             dtype=torch.int32, device=self._device,
         ),
         "solver_dims": torch.tensor(
-            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows],
+            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows, d.ntendon, d.ten_base, d.ten_friction_rows + d.ten_limit_rows],
             dtype=torch.int32, device=self._device,
         ),
         "solver_params": torch.tensor(
@@ -887,7 +999,7 @@ class MetalCoupledConstraints:
         "contact_frame": empty(b * nc * 12),
         "contact_jacobian": empty(b * nc * 6 * nv),
         "workspace_J": empty(b * nr * nv),
-        "workspace_debug": empty(b * (nr * nr + 4 * nr)),
+        "workspace_debug": empty(b * (nr * nr + 7 * nr)),
         "out_force": empty(b * nv),
         "out_acc": empty(b * nv),
         "out_status": torch.zeros(b, dtype=torch.int32, device=self._device),
@@ -954,7 +1066,8 @@ class MetalCoupledConstraints:
         "dims": self._constants["body_dims"],
     }
 
-  def run_device(self, poses, mass, qfrc_smooth, qpos, qvel, eq_active=None, cvel=None):
+  def run_device(self, poses, mass, qfrc_smooth, qpos, qvel, eq_active=None, cvel=None,
+                 tendon_J_spatial=None, tendon_length_spatial=None):
     """Solve coupled contacts, limits, dry friction, and equalities on MPS.
 
     `poses` is the dict of FK outputs from `MetalKinematics`.
@@ -964,6 +1077,9 @@ class MetalCoupledConstraints:
     `cvel` is optional batched body spatial velocity [batch, nbody, 6] from
     smooth dynamics (angular, linear COM). It is required for connect/weld
     Jdot correction; joint-only models may omit it (Jdot is zero there).
+    `tendon_J_spatial`/`tendon_length_spatial` are borrowed [batch, nt(, nv)]
+    spatial tendon views from the simulation's once-per-assembly kinematics
+    (None when the model has no spatial tendons; the stage substitutes zeros).
     """
     w, torch, d = self._workspace, self._torch, self.descriptor
     b, nv, nc, nr = self.batch_size, d.nv, d.ncontacts_max, d.nr
@@ -1036,6 +1152,43 @@ class MetalCoupledConstraints:
           threads=(b,), group_size=(1,),
       )
 
+    # 1b. Tendon constraint rows (limits, friction loss, tendon equalities).
+    # Runs after equality assembly (which reserves zeros for tendon
+    # equalities) and before the coupled solve (which reads flagged rows).
+    if d.ntendon and (d.ten_friction_rows + d.ten_limit_rows > 0
+                      or bool(np.any(np.asarray(d.eq_type) == 3))):
+      if self._tendon_kernel is None:
+        raise ValueError("tendon rows require the tendon_constraint_rows kernel")
+      nt, nq = d.ntendon, d.nq
+      if tendon_J_spatial is None:
+        ten_J = torch.zeros((b * max(nt, 1) * max(nv, 1),), dtype=torch.float32, device=self._device)
+      else:
+        if tuple(tendon_J_spatial.shape) != (b, nt, max(nv, 1)):
+          raise ValueError(f"tendon_J_spatial must have shape {(b, nt, max(nv, 1))}")
+        ten_J = tendon_J_spatial.reshape(-1)
+      if tendon_length_spatial is None:
+        ten_L = torch.zeros((b * max(nt, 1),), dtype=torch.float32, device=self._device)
+      else:
+        if tuple(tendon_length_spatial.shape) != (b, max(nt, 1)):
+          raise ValueError(f"tendon_length_spatial must have shape {(b, max(nt, 1))}")
+        ten_L = tendon_length_spatial.reshape(-1)
+      self._tendon_kernel(
+          qpos.reshape(-1), qvel.reshape(-1), ten_J, ten_L,
+          self._constants["ten_length_map"], self._constants["ten_moment_map"],
+          self._constants["ten_limited"], self._constants["ten_range"],
+          self._constants["ten_margin"], self._constants["ten_length0"],
+          self._constants["ten_invweight0"],
+          self._constants["ten_solref_lim"], self._constants["ten_solimp_lim"],
+          self._constants["ten_frictionloss"],
+          self._constants["ten_solref_fri"], self._constants["ten_solimp_fri"],
+          self._constants["eq_type"], self._constants["eq_obj"],
+          self._constants["eq_data"], self._constants["eq_sol_params"],
+          self._constants["eq_rowadr"], eq_active_tensor.reshape(-1),
+          self._constants["solver_dims"], self._constants["solver_params"],
+          w["workspace_J"], w["workspace_debug"],
+          threads=(b,), group_size=(1,),
+      )
+
     # 2. Coupled constraint solver kernel
     self._solve_kernel(
         mass.reshape(-1), qfrc_smooth.reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
@@ -1070,7 +1223,7 @@ class MetalCoupledConstraints:
     }
 
     if nr > 0:
-      w_debug = w["workspace_debug"][: b * (nr * nr + 4 * nr)].reshape(b, nr * nr + 4 * nr)
+      w_debug = w["workspace_debug"][: b * (nr * nr + 7 * nr)].reshape(b, nr * nr + 7 * nr)
       W = w_debug[:, : nr * nr].reshape(b, nr, nr)
       R = w_debug[:, nr * nr : nr * nr + nr].reshape(b, nr)
       ar = w_debug[:, nr * nr + nr : nr * nr + 2 * nr].reshape(b, nr)

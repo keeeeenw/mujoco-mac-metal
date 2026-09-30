@@ -507,6 +507,9 @@ kernel void solve_coupled_constraints(
   int n_eq_rows = nr > 0 ? dims[14] : 0;
   if (n_eq_rows < 0) n_eq_rows = 0;
   if (n_eq_rows > nr) n_eq_rows = nr;
+  int ten_base = nr > 0 ? dims[16] : 0;
+  if (ten_base < 0) ten_base = 0;
+  if (ten_base > nr) ten_base = nr;
   if (world >= uint(batch)) return;
 
   int mb = world * nv * nv;
@@ -517,7 +520,7 @@ kernel void solve_coupled_constraints(
   out_diagnostics[world * 2 + 1] = 0.0f;
   for (int i = 0; i < nv; ++i) { out_force[qb + i] = 0.0f; out_acc[qb + i] = 0.0f; }
   if (workspace_debug && nr > 0) {
-    device float* dbg = workspace_debug + world * (nr * nr + 4 * nr);
+    device float* dbg = workspace_debug + world * (nr * nr + 7 * nr);
     for (int i = 0; i < nr * nr; ++i) dbg[i] = 0.0f;
     for (int r = n_eq_rows; r < nr; ++r) {
       dbg[nr * nr + r] = 0.0f;
@@ -529,7 +532,10 @@ kernel void solve_coupled_constraints(
   if (nv > 32 || nr > 96) { out_status[world] = 2; return; }
 
   device float* J_world = workspace_J + world * nr * nv;
+  device float* dbg_pre = workspace_debug + world * (nr * nr + 7 * nr);
   for (int r = n_eq_rows; r < nr; ++r) {
+    // Tendon-owned rows are preassembled by tendon_constraint_rows; keep them.
+    if (nr > 0 && dbg_pre[nr * nr + 6 * nr + r] > 0.5f) continue;
     for (int i = 0; i < nv; ++i) J_world[r * nv + i] = 0.0f;
   }
 
@@ -548,17 +554,43 @@ kernel void solve_coupled_constraints(
   // Treat them as bilateral; inactive rows were written as zero J/R/ar and
   // naturally yield zero multipliers without affecting coupled rows.
   if (workspace_debug && nr > 0) {
-    device float* dbg = workspace_debug + world * (nr * nr + 4 * nr);
+    device float* dbg = workspace_debug + world * (nr * nr + 7 * nr);
     for (int r = 0; r < n_eq_rows && r < nr; ++r) {
+      if (dbg[nr * nr + 6 * nr + r] > 0.5f) {
+        // Tendon-owned equality row (milestone 008): fully preassembled by
+        // tendon_constraint_rows, including bilateral bounds.
+        R[r] = dbg[nr * nr + r];
+        ar[r] = dbg[nr * nr + nr + r];
+        lo[r] = dbg[nr * nr + 4 * nr + r];
+        hi[r] = dbg[nr * nr + 5 * nr + r];
+        enabled[r] = true;
+        continue;
+      }
       R[r] = dbg[nr * nr + r];
       ar[r] = dbg[nr * nr + nr + r];
       lo[r] = -INFINITY;
       hi[r] = INFINITY;
       enabled[r] = true;
     }
+    // Tendon limit/friction rows in the reserved ten region.
+    for (int r = ten_base; r < nr; ++r) {
+      if (dbg[nr * nr + 6 * nr + r] > 0.5f) {
+        R[r] = dbg[nr * nr + r];
+        ar[r] = dbg[nr * nr + nr + r];
+        lo[r] = dbg[nr * nr + 4 * nr + r];
+        hi[r] = dbg[nr * nr + 5 * nr + r];
+        enabled[r] = true;
+      }
+    }
   }
 
   int base_contact = n_eq_rows + nv + 2 * nj;
+  if (nr > 0) {
+    int ten_rows = dims[17];
+    if (ten_rows < 0) ten_rows = 0;
+    if (ten_rows > nr) ten_rows = nr;
+    base_contact += ten_rows;
+  }
 
   // 1. Joint constraints (if constraint disable flag not set: bit 0 mjDSBL_CONSTRAINT)
   if ((flags & 1) == 0) {
@@ -1127,7 +1159,7 @@ kernel void solve_coupled_constraints(
 
   // 13. Write debug matrices and vectors if workspace_debug is provided
   if (workspace_debug && nr > 0) {
-    device float* dbg = workspace_debug + world * (nr * nr + 4 * nr);
+    device float* dbg = workspace_debug + world * (nr * nr + 7 * nr);
     for (int a = 0; a < nr; ++a) {
       for (int b = 0; b < nr; ++b) {
         dbg[a * nr + b] = (a < total_nr && b < total_nr) ? W[a * nr + b] : 0.0f;
@@ -1137,5 +1169,173 @@ kernel void solve_coupled_constraints(
       dbg[nr * nr + 2 * nr + a] = a < total_nr ? rhs[a] : 0.0f;
       dbg[nr * nr + 3 * nr + a] = (a < total_nr && enabled[a]) ? lam[a] : 0.0f;
     }
+  }
+}
+
+// Tendon constraint rows for MuJoCo 3.10.0 (milestone 008).
+// Pinned sources: engine/engine_core_constraint.c (tendon-limit loop with
+// side-scaled Jacobian, friction-tendon rows, JOINT/TENDON cubic equality with
+// tendon_length0 reference and tendon_invweight0 diagonal).
+// Assembles tendon equality rows (eq region, cubic coupling), tendon
+// frictionloss rows and tendon limit rows (reserved ten region) into
+// workspace_J, and writes R/ar/lo/hi/enabled into the extended debug regions
+// [4*nr, 7*nr). Runs after equality_assembly (which reserves zeros for tendon
+// equalities) and before solve_coupled_constraints (which reads rows flagged
+// in ten_en instead of computing them).
+kernel void tendon_constraint_rows(
+    device const float* qpos [[buffer(0)]],
+    device const float* qvel [[buffer(1)]],
+    device const float* ten_J_spatial [[buffer(2)]],
+    device const float* ten_length_spatial [[buffer(3)]],
+    device const float* ten_length_map [[buffer(4)]],
+    device const float* ten_moment_map [[buffer(5)]],
+    device const int* ten_limited [[buffer(6)]],
+    device const float* ten_range [[buffer(7)]],
+    device const float* ten_margin [[buffer(8)]],
+    device const float* ten_length0 [[buffer(9)]],
+    device const float* ten_invweight0 [[buffer(10)]],
+    device const float* ten_solref_lim [[buffer(11)]],
+    device const float* ten_solimp_lim [[buffer(12)]],
+    device const float* ten_frictionloss [[buffer(13)]],
+    device const float* ten_solref_fri [[buffer(14)]],
+    device const float* ten_solimp_fri [[buffer(15)]],
+    device const int* eq_type [[buffer(16)]],
+    device const int* eq_obj [[buffer(17)]],
+    device const float* eq_data [[buffer(18)]],
+    device const float* eq_sol_params [[buffer(19)]],
+    device const int* eq_rowadr [[buffer(20)]],
+    device const int* eq_active [[buffer(21)]],
+    constant int* dims [[buffer(22)]],
+    constant float* sparams [[buffer(23)]],
+    device float* workspace_J [[buffer(24)]],
+    device float* workspace_debug [[buffer(25)]],
+    uint world [[thread_position_in_grid]]) {
+  int nq=dims[0], nv=dims[1], nt=dims[15], neq=dims[3], batch=dims[5];
+  int flags=dims[6];
+  bool refsafe=dims[7]!=0;
+  int nr=dims[9];
+  int ten_base=dims[16];
+  float timestep=sparams[0];
+  if (uint(world)>=uint(batch)) return;
+  if (nr<=0||nv<=0) return;
+  device float* Jw = workspace_J + uint(world)*uint(nr)*uint(max(nv,1));
+  device float* dbg = workspace_debug + uint(world)*(uint(nr*nr)+uint(7*nr));
+  uint vbase=uint(world)*uint(max(nv,1)), qbase=uint(world)*uint(max(nq,1));
+  uint tbase=uint(world)*uint(max(nt,1));
+  for (int r=0;r<nr;++r) {
+    dbg[nr*nr+4*nr+r]=0.0f;
+    dbg[nr*nr+5*nr+r]=0.0f;
+    dbg[nr*nr+6*nr+r]=0.0f;
+  }
+  if (nt<=0) return;
+  if ((flags&1)!=0) return;
+  // Per-tendon combined length and dense Jacobian row.
+  // nt is small (tendon counts stay bounded); thread-local row buffer.
+  for (int t=0;t<nt;++t) {
+    float L=0.0f;
+    for (int q=0;q<nq;++q) L+=ten_length_map[t*max(nq,1)+q]*qpos[qbase+uint(q)];
+    L+=ten_length_spatial[tbase+uint(t)];
+    float Jrow[32];
+    for (int d=0;d<32;++d) Jrow[d]=0.0f;
+    for (int d=0;d<nv;++d)
+      Jrow[d]=ten_moment_map[t*max(nv,1)+d]+ten_J_spatial[(tbase+uint(t))*uint(max(nv,1))+uint(d)];
+    float vel=0.0f;
+    for (int d=0;d<nv;++d) vel+=Jrow[d]*qvel[vbase+uint(d)];
+    // Friction loss row (pinned: J=ten_J, margin 0, bound loss).
+    if ((flags&4)==0 && ten_frictionloss[t]>0.0f) {
+      int slot=0;
+      for (int u=0;u<t;++u) if (ten_frictionloss[u]>0.0f) slot++;
+      int row=ten_base+slot;
+      if (row>=0&&row<nr) {
+        for (int d=0;d<nv;++d) Jw[row*nv+d]=Jrow[d];
+        float R, ar;
+        reference_params(ten_solref_fri+t*2, ten_solimp_fri+t*5, 0, 0.0f, 0.0f,
+          vel, ten_invweight0[t], true, timestep, refsafe, R, ar);
+        dbg[nr*nr+row]=R; dbg[nr*nr+nr+row]=ar;
+        dbg[nr*nr+4*nr+row]=-ten_frictionloss[t];
+        dbg[nr*nr+5*nr+row]=ten_frictionloss[t];
+        dbg[nr*nr+6*nr+row]=1.0f;
+      }
+    }
+    // Limit rows (pinned: J scaled by -side, dist=side*(range-value)).
+    if ((flags&8)==0 && ten_limited[t]!=0) {
+      int nfric=0;
+      for (int u=0;u<nt;++u) if (ten_frictionloss[u]>0.0f) nfric++;
+      int pre=0;
+      for (int u=0;u<t;++u) if (ten_limited[u]!=0) pre++;
+      for (int s=0;s<2;++s) {
+        float side=s==0?-1.0f:1.0f;
+        float rangev=s==0?ten_range[2*t]:ten_range[2*t+1];
+        float dist=side*(rangev-L);
+        if (dist<ten_margin[t]) {
+          int row=ten_base+nfric+2*pre+s;
+          if (row>=0&&row<nr) {
+            for (int d=0;d<nv;++d) Jw[row*nv+d]=-side*Jrow[d];
+            float R, ar;
+            reference_params(ten_solref_lim+t*2, ten_solimp_lim+t*5, 0, dist,
+              ten_margin[t], -side*vel, ten_invweight0[t], false, timestep, refsafe, R, ar);
+            dbg[nr*nr+row]=R; dbg[nr*nr+nr+row]=ar;
+            dbg[nr*nr+4*nr+row]=0.0f;
+            dbg[nr*nr+5*nr+row]=INFINITY;
+            dbg[nr*nr+6*nr+row]=1.0f;
+          }
+        }
+      }
+    }
+  }
+  // Tendon equality rows (pinned cubic coupling, margin 0).
+  if ((flags&2)!=0) return;
+  for (int e=0;e<neq;++e) {
+    if (eq_type[e]!=3) continue;
+    if (eq_active[uint(world)*uint(max(neq,1))+uint(e)]==0) continue;
+    int t1=eq_obj[2*e], t2=eq_obj[2*e+1];
+    if (t1<0||t1>=nt) continue;
+    int row=eq_rowadr[e];
+    if (row<0||row>=nr) continue;
+    // combined length/J for t1
+    float L1=0.0f;
+    for (int q=0;q<nq;++q) L1+=ten_length_map[t1*max(nq,1)+q]*qpos[qbase+uint(q)];
+    L1+=ten_length_spatial[tbase+uint(t1)];
+    float J1[32];
+    for (int d=0;d<32;++d) J1[d]=0.0f;
+    for (int d=0;d<nv;++d)
+      J1[d]=ten_moment_map[t1*max(nv,1)+d]+ten_J_spatial[(tbase+uint(t1))*uint(max(nv,1))+uint(d)];
+    float pos=L1-ten_length0[t1]-eq_data[e*11];
+    float vel=0.0f;
+    for (int d=0;d<nv;++d) vel+=J1[d]*qvel[vbase+uint(d)];
+    float diag=ten_invweight0[t1];
+    for (int d=0;d<nv;++d) Jw[row*nv+d]=J1[d];
+    if (t2>=0&&t2<nt) {
+      float L2=0.0f;
+      for (int q=0;q<nq;++q) L2+=ten_length_map[t2*max(nq,1)+q]*qpos[qbase+uint(q)];
+      L2+=ten_length_spatial[tbase+uint(t2)];
+      float J2[32];
+      for (int d=0;d<32;++d) J2[d]=0.0f;
+      for (int d=0;d<nv;++d)
+        J2[d]=ten_moment_map[t2*max(nv,1)+d]+ten_J_spatial[(tbase+uint(t2))*uint(max(nv,1))+uint(d)];
+      float dif=L2-ten_length0[t2];
+      float poly=0.0f, deriv=0.0f, power=1.0f;
+      for (int k=0;k<4;++k) {
+        poly+=eq_data[e*11+k+1]*power;
+        deriv+=float(k+1)*eq_data[e*11+k+1]*power;
+        power*=dif;
+      }
+      pos-=poly;
+      float vel2=0.0f;
+      for (int d=0;d<nv;++d) { vel2+=J2[d]*qvel[vbase+uint(d)]; Jw[row*nv+d]=J1[d]-deriv*J2[d]; }
+      vel-=deriv*vel2;
+      diag+=ten_invweight0[t2];
+    }
+    float d_width=max(1e-15f, eq_sol_params[e*7+3]);
+    float imp=eq_impedance(eq_sol_params+e*7+2, pos, 0.0f);
+    float r0=eq_sol_params[e*7], r1=eq_sol_params[e*7+1];
+    if (refsafe&&r0>0.0f) r0=max(r0,2.0f*timestep);
+    float K=r0>0.0f?1.0f/max(1e-15f,d_width*d_width*r0*r0*r1*r1):-r0/max(1e-15f,d_width*d_width);
+    float B=r1>0.0f?2.0f/max(1e-15f,d_width*r0):-r1/d_width;
+    dbg[nr*nr+row]=max(1e-15f,(1.0f-imp)*diag/imp);
+    dbg[nr*nr+nr+row]=-B*vel-K*imp*pos;
+    dbg[nr*nr+4*nr+row]=-INFINITY;
+    dbg[nr*nr+5*nr+row]=INFINITY;
+    dbg[nr*nr+6*nr+row]=1.0f;
   }
 }
