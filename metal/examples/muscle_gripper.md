@@ -62,7 +62,7 @@ Measured results on the qualified palm-cage run (MuJoCo 3.10.0, native
 `--headless --check --steps 2700`, exit 0):
 
 - Ball delivered `(x, z)`: (`0.673`, `0.135`) inside bin footprint; always-open `(x, z)`: (`-3.667`, `0.055`) on floor.
-- Second ball placed `(x, z)`: (`-0.133`, `0.255`) on pedestal top (z=0.2); always-open stays at (`0.300`, `0.055`).
+- Second ball placed `(x, z)`: (`-0.193`, `0.255`) on pedestal top (z=0.2, gate |x+0.15|<0.10); always-open stays at (`0.300`, `0.055`).
 - Ball-bin contact steps: `1600`; finger contact steps: `1463`.
 - Pre-grasp native parity: qpos `7.4e-08`, qvel `1.4e-05`.
 - Full-run native/CPU parity on focused actuator fixtures (see milestone 007
