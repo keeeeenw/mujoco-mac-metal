@@ -832,13 +832,12 @@ class MetalSimulation:
     kin = actuators.run_kinematics(qpos, qvel, poses, contacts)
     spatial_jac = self._spatial_jacobian(qvel, poses)
     if spatial_jac is not None:
-      # Spatial tendon moment rows for TENDON-transmission actuators: the
-      # actuator kinematics stage only holds fixed-tendon maps, so add
-      # gear*ten_J rows for actuators targeting spatial tendons.
-      overlay = self._spatial_tendons.actuator_moment_overlay(
-          actuators.meta, spatial_jac)
-      if overlay is not None:
-        kin["moment"] = kin["moment"] + overlay
+      # Complete spatial-tendon actuator inputs (R1): the actuator
+      # kinematics stage only holds fixed-tendon maps, so overwrite
+      # length/velocity rows and add gear*ten_J moment rows for actuators
+      # targeting spatial tendons.
+      self._spatial_tendons.apply_spatial_tendon_state(
+          actuators.meta, self._spatial_kin, kin)
     gravcomp = None
     if self._passive is not None and bool(
         np.any(np.asarray(actuators.meta.jnt_actgravcomp))):

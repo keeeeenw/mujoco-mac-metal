@@ -330,8 +330,7 @@ def test_slack_taut_and_mixed_model_gpu():
   assert max_err < 5e-4, max_err
 
 
-def test_spatial_armature_contract_cpu():
-  # R3: wrapped + armature is rejected by the compiler itself; the lowering
+def test_spatial_armature_contract_cpu():  # R3: wrapped + armature is rejected by the compiler itself; the lowering
   # agrees. Site-only spatial + armature is rejected (015 owns Jdot bias).
   with pytest.raises(ValueError, match="not supported by tendon armature"):
     _model(
@@ -373,3 +372,128 @@ def test_fixed_armature_bias_parity_gpu():
     gq = sim.state.qpos.cpu().numpy()[0]
     max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
   assert max_err < 5e-4, max_err
+
+
+def _winch_world():
+  # Mass hung from a spatial pulley tendon; the motor below lifts it.
+  return ('<site name="top" pos="0 0 1.0"/><site name="low" pos="0 0 0.2"/>'
+          '<body pos="0 0 0.5"><joint name="lift" type="slide" axis="0 0 1"/>'
+          '<geom name="mass" type="sphere" size="0.06" mass="0.5"/>'
+          '<site name="hook" pos="0 0 0.06"/></body>')
+
+
+def _winch_model(actuator, extra_tendon=""):
+  return mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.002" gravity="0 0 -9.81"/><worldbody>'
+      + _winch_world() + '</worldbody><tendon>'
+      '<spatial name="rope"><site site="top"/><site site="hook"/><site site="low"/></spatial>'
+      + extra_tendon + '</tendon><actuator>' + actuator + '</actuator></mujoco>')
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_spatial_filter_activation_replay_gpu():
+  # R1: stateful filter dynamics on a spatial tendon, including actearly
+  # replay through Sim reset/restore.
+  from mujoco_metal import MetalSimulation
+  m = _winch_model('<general tendon="rope" gear="1.5" dyntype="filter" '
+                   'dynprm="0.05 0 0" gainprm="3 0 0" actearly="true"/>')
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  cpu = mujoco.MjData(m)
+  mujoco.mj_forward(m, cpu)
+  max_err, max_a = 0.0, 0.0
+  for step in range(60):
+    u = 1.0 if step < 30 else -0.5
+    sim.step(1, ctrl=np.array([[u]], dtype=np.float32))
+    cpu.ctrl[0] = u
+    mujoco.mj_step(m, cpu)
+    gq = sim.state.qpos.cpu().numpy()[0]
+    ga = sim.state.act.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+    max_a = max(max_a, float(np.max(np.abs(ga - cpu.act))))
+  assert max_err < 5e-4, max_err
+  assert max_a < 5e-4, max_a
+  # Restore replays activation identically.
+  snap = sim.state.snapshot()
+  sim.step(5, ctrl=np.ones((1, 1), dtype=np.float32))
+  sim.state.restore(snap)
+  ga = sim.state.act.cpu().numpy()[0]
+  np.testing.assert_allclose(ga, np.asarray(snap.act)[0], atol=1e-7)
+
+
+def test_spatial_motor_admission_cpu():
+  from mujoco_metal.stateful_actuation import ActuatorModel
+  m = _winch_model('<motor tendon="rope" gear="2"/>')
+  meta = ActuatorModel(m)
+  assert meta.needs_general_path
+  # Scalar fast path keeps rejecting spatial tendons.
+  from mujoco_metal.transmissions import TransmissionModel
+  with pytest.raises(ValueError, match="fixed tendon"):
+    TransmissionModel(m)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_spatial_motor_trajectory_gpu():
+  # R1: direct motor on a spatial pulley tendon lifts a mass; nonzero
+  # length/velocity/gear against CPU intermediates and rollout.
+  from mujoco_metal import MetalSimulation
+  m = _winch_model('<motor tendon="rope" gear="2"/>')
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  assert sim._actuators is not None
+  cpu = mujoco.MjData(m)
+  mujoco.mj_forward(m, cpu)
+  gear = float(np.asarray(m.actuator_gear)[0, 0])
+  np.testing.assert_allclose(float(np.asarray(cpu.actuator_length)[0]),
+                             gear * float(np.asarray(cpu.ten_length)[0]), rtol=1e-6)
+  sim.reset_to_keyframe(0) if m.nkey else None
+  max_err, max_f = 0.0, 0.0
+  for step in range(60):
+    u = 1.5 if step < 30 else -1.0
+    sim.step(1, ctrl=np.array([[u]], dtype=np.float32))
+    cpu.ctrl[0] = u
+    mujoco.mj_step(m, cpu)
+    gq = sim.state.qpos.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+    max_f = max(max_f, float(abs(np.asarray(cpu.actuator_force)[0])))
+  assert max_f > 1.0  # nonzero tendon force exercised
+  assert max_err < 5e-4, max_err
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_spatial_servo_and_muscle_gpu():
+  # R1: affine position servo (length-dependent gain) and antagonistic
+  # muscle pair on spatial tendons, with force limits and mixed targets.
+  from mujoco_metal import MetalSimulation
+  m = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.002" gravity="0 0 -9.81"/><worldbody>'
+      '<site name="top" pos="0 0 1.0"/><site name="low" pos="0 0 0.2"/>'
+      '<body pos="-0.3 0 0.5"><joint name="j" type="slide" axis="0 0 1"/>'
+      '<geom type="sphere" size="0.06" mass="0.5"/>'
+      '<site name="hook" pos="0 0 0.06"/></body>'
+      '<body pos="0.3 0 0.5"><joint name="k" type="hinge" axis="0 1 0"/>'
+      '<geom type="sphere" size="0.06" mass="0.5"/></body>'
+      '</worldbody><tendon>'
+      '<spatial name="rope"><site site="top"/><site site="hook"/><site site="low"/></spatial>'
+      '<fixed name="rod"><joint joint="k" coef="1.0"/></fixed>'
+      '</tendon><actuator>'
+      '<general tendon="rope" gaintype="affine" gainprm="0 -20 -2" forcelimited="true" forcerange="-8 8"/>'
+      '<general joint="k" dyntype="muscle" dynprm="0.01 0.04 0.01" '
+      'gaintype="muscle" gainprm="0.6 1.4 15 15 0.5 1.5 1 1 1.2 0" '
+      'biastype="muscle" biasprm="0.6 1.4 15 15 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6"/>'
+      '</actuator></mujoco>')
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  assert sim._actuators is not None
+  cpu = mujoco.MjData(m)
+  mujoco.mj_forward(m, cpu)
+  sim.reset_to_keyframe(0) if m.nkey else sim.reset()
+  max_err = 0.0
+  for step in range(60):
+    u = [0.5, 0.8 if step < 30 else 0.1]
+    sim.step(1, ctrl=np.array([u], dtype=np.float32))
+    cpu.ctrl[:] = u
+    mujoco.mj_step(m, cpu)
+    gq = sim.state.qpos.cpu().numpy()[0]
+    max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
+  assert max_err < 2e-3, max_err

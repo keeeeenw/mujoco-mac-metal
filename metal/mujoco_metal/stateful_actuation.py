@@ -62,7 +62,11 @@ def _fixed_maps(model, nu, nq, nv):
       moment_map[a, da] = gear[a, 0]
     elif t == trn_tendon:
       start, count = int(model.tendon_adr[t0]), int(model.tendon_num[t0])
+      if count <= 0 or int(model.wrap_type[start]) != wrap_joint:
+        continue  # spatial tendon: zero rows here, overlay owns them (R1)
       for wrap in range(start, start + count):
+        if int(model.wrap_type[wrap]) != wrap_joint:
+          break
         joint = int(model.wrap_objid[wrap])
         coefficient = gear[a, 0] * float(model.wrap_prm[wrap])
         length_map[a, int(model.jnt_qposadr[joint])] += coefficient
@@ -332,12 +336,21 @@ class ActuatorModel:
         if t0 < 0 or t0 >= int(model.ntendon):
           raise ValueError(f"actuator {i}: tendon target out of range")
         start, count = int(model.tendon_adr[t0]), int(model.tendon_num[t0])
-        if count <= 0 or any(int(v) != wrap_joint for v in model.wrap_type[start:start + count]):
-          raise ValueError(f"actuator {i}: only fixed joint tendons are supported (spatial: milestone 008)")
-        for wrap in range(start, start + count):
-          joint = int(model.wrap_objid[wrap])
-          if joint < 0 or joint >= int(model.njnt) or int(model.jnt_type[joint]) not in (hinge, slide):
-            raise ValueError(f"actuator {i}: fixed tendon wraps must target hinge or slide joints")
+        if count <= 0:
+          raise ValueError(f"actuator {i}: tendon has an empty wrap path")
+        if int(model.wrap_type[start]) == wrap_joint:
+          for wrap in range(start, start + count):
+            if int(model.wrap_type[wrap]) != wrap_joint:
+              raise ValueError(f"actuator {i}: mixed joint/spatial wraps are unsupported")
+            joint = int(model.wrap_objid[wrap])
+            if joint < 0 or joint >= int(model.njnt) or int(model.jnt_type[joint]) not in (hinge, slide):
+              raise ValueError(f"actuator {i}: fixed tendon wraps must target hinge or slide joints")
+        else:
+          # Spatial tendon target (R1): full path validation lives in
+          # SpatialTendonModel; the general actuator path consumes its
+          # length/velocity/moment at runtime (see apply_spatial_tendon_state).
+          from mujoco_metal.spatial_tendons import SpatialTendonModel as _Spatial
+          _Spatial(model)
         if np.any(gear[i, 1:] != 0):
           raise ValueError(f"actuator {i}: scalar gear must use only its first component")
       elif t == trn_site:
@@ -433,6 +446,14 @@ class ActuatorModel:
           break
         if t in (trn_joint, trn_parent):
           if int(model.jnt_type[int(trnid[i, 0])]) not in (hinge, slide):
+            scalar_ok = False
+            break
+        if t == trn_tendon:
+          # Spatial tendon targets need the general path (R1); the scalar
+          # fast path only holds fixed-tendon maps.
+          tid = int(trnid[i, 0])
+          a0 = int(model.tendon_adr[tid])
+          if int(model.wrap_type[a0]) != int(mujoco.mjtWrap.mjWRAP_JOINT):
             scalar_ok = False
             break
         if int(gaintype[i]) not in (

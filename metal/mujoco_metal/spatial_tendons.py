@@ -488,7 +488,8 @@ class MetalSpatialTendonDynamics:
 
     Returns [B, nu, nv] (zeros except qualifying actuators) or None when no
     actuator targets a spatial tendon. Fixed-tendon rows stay zero here; the
-    actuator stage owns those maps.
+    actuator stage owns those maps. Length/velocity rows are handled by
+    apply_spatial_tendon_state.
     """
     import mujoco as _mj
     torch = self._torch
@@ -513,6 +514,39 @@ class MetalSpatialTendonDynamics:
     for a, tid, gear in rows:
       out[:, a, :] = gear * spatial_jac[:, tid, :nv]
     return out
+
+  def apply_spatial_tendon_state(self, actuator_meta, spatial_kin, kin):
+    """Complete spatial-tendon actuator inputs (R1).
+
+    Overwrites length/velocity rows and adds gear-scaled moment rows for
+    TENDON actuators targeting spatial tendons, so affine gains/biases,
+    servos, muscles and DC mechanics consume true tendon state. Fixed rows
+    are untouched. Operates device-side on borrowed views, no readback.
+    Returns True when any actuator was updated.
+    """
+    import mujoco as _mj
+    meta = self._meta
+    trn_tendon = int(_mj.mjtTrn.mjTRN_TENDON)
+    rows = []
+    for a in range(actuator_meta.nu):
+      if int(np.asarray(actuator_meta.trntype)[a]) != trn_tendon:
+        continue
+      tid = int(np.asarray(actuator_meta.trnid)[a, 0])
+      if tid < 0 or tid >= meta.ntendon:
+        continue
+      if meta.paths[tid] is None:
+        continue
+      rows.append((a, tid, float(np.asarray(actuator_meta.gear)[a, 0])))
+    if not rows:
+      return False
+    for a, tid, gear in rows:
+      # Pinned mj_transmission scales tendon length by gear; velocity follows
+      # the gear-scaled moment row.
+      kin["length"][:, a].copy_(gear * spatial_kin["length"][:, tid])
+      kin["velocity"][:, a].copy_(gear * spatial_kin["velocity"][:, tid])
+      kin["moment"][:, a, :].add_(
+          gear * spatial_kin["jacobian"][:, tid, :kin["moment"].shape[2]])
+    return True
 
   def _check(self, value, name, shape):
     torch = self._torch
