@@ -441,7 +441,19 @@ def main(argv=None):
       "--gpu", action="store_true", help="Run a native MPS stepping smoke test"
   )
   doctor_parser.add_argument("--json", action="store_true", dest="as_json")
+  coverage_parser = subparsers.add_parser(
+      "coverage", help="Print the machine-readable support-contract table"
+  )
+  coverage_parser.add_argument("--json", action="store_true", dest="as_json")
   args = parser.parse_args(argv)
+  if args.command == "coverage":
+    from mujoco_metal.registry import REQUIREMENTS, coverage_table
+    from mujoco_metal.registry import _jsonable_requirement
+    if args.as_json:
+      print(json.dumps([_jsonable_requirement(r) for r in REQUIREMENTS], indent=2, sort_keys=True))
+    else:
+      print(coverage_table(), end="")
+    return 0
   if args.command == "doctor":
     result = doctor(args.gpu)
     _print_doctor(result, args.as_json)
