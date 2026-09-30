@@ -643,12 +643,12 @@ REQUIREMENTS = (
     Requirement(
         "REQ-EQ-001", "joint/connect/weld equalities with per-env activity",
         Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "1/3/6 rows, body/world/site forms, torquescale, schema-2 activity state",
+        Execution.DEVICE, "1/3/6 rows, body/world/site forms incl. mocap anchors, torquescale, schema-2/3 activity state",
         "mujoco_metal/shaders/equality_assembly.metal",
-        "accept joint/connect/weld body/site/world, reject others even if inactive",
+        "accept joint/connect/weld body/site/world/mocap, reject others even if inactive",
         "sim.set_equality_active", "004",
         ("test_connect_weld.py", "test_equality_activity.py",
-         "test_equality_qualification.py"),
+         "test_equality_qualification.py", "test_mocap_state.py"),
         enums=("mjtEq.mjEQ_JOINT", "mjtEq.mjEQ_CONNECT", "mjtEq.mjEQ_WELD"),
     ),
     Requirement(
@@ -813,11 +813,12 @@ REQUIREMENTS = (
     ),
     # Runtime state fields (mjtState).
     Requirement(
-        "REQ-STATE-001", "time/qpos/qvel/eq_active state ownership",
+        "REQ-STATE-001", "time/qpos/qvel/eq_active/mocap state ownership",
         Stage.API, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "persistent per-env masks, schema-2 snapshots",
-        "mujoco_metal/device_state.py", "accept matching snapshots, reject v1-into-neq",
-        "sim.state", "004", ("test_device_state.py", "test_equality_activity.py"),
+        Execution.DEVICE, "persistent per-env poses/masks, schema-3 snapshots, keyframe reset, copy",
+        "mujoco_metal/device_state.py", "accept matching snapshots, reject v1-into-neq and <v3-into-mocap",
+        "sim.state", "006", ("test_device_state.py", "test_equality_activity.py",
+         "test_mocap_state.py"),
         enums=("mjtState.mjSTATE_TIME", "mjtState.mjSTATE_QPOS",
                "mjtState.mjSTATE_QVEL", "mjtState.mjSTATE_EQ_ACTIVE"),
     ),
@@ -832,10 +833,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-STATE-003", "mocap position/quaternion inputs",
-        Stage.KINEMATICS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "mocap bodies rejected; per-env mocap inputs unimplemented",
-        "mujoco_metal/model.py:load_model", "reject mocap",
-        "none", "006", (),
+        Stage.KINEMATICS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
+        Execution.DEVICE, "jointless world-child mocap bodies; per-env poses, keyframe reset, schema-3 snapshots",
+        "mujoco_metal/simulation.py:MetalSimulation.set_mocap", "accept valid mocap, reject non-world-child",
+        "sim.set_mocap", "006", ("test_mocap_state.py",),
         enums=("mjtState.mjSTATE_MOCAP_POS", "mjtState.mjSTATE_MOCAP_QUAT"),
     ),
     Requirement(

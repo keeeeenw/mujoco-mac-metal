@@ -40,7 +40,7 @@ renderer), not future physics work.
 | REQ-JAC-002 | sparse/auto Jacobians | none | not_implemented/unqualified | 017 | reject sparse | — |
 | REQ-SOL-001 | PGS/Newton selector mapping | device | native_gpu/gpu_qualified | baseline | accept PGS/Newton as mapped | test_coupled_constraints.py |
 | REQ-SOL-002 | CG solver selection | none | not_implemented/unqualified | 014 | reject CG | — |
-| REQ-EQ-001 | joint/connect/weld equalities with per-env activity | device | native_gpu/gpu_qualified | 004 | accept joint/connect/weld body/site/world, reject others even if inactive | test_connect_weld.py, test_equality_activity.py, test_equality_qualification.py |
+| REQ-EQ-001 | joint/connect/weld equalities with per-env activity | device | native_gpu/gpu_qualified | 004 | accept joint/connect/weld body/site/world/mocap, reject others even if inactive | test_connect_weld.py, test_equality_activity.py, test_equality_qualification.py, test_mocap_state.py |
 | REQ-EQ-002 | tendon equality | none | not_implemented/unqualified | 009 | reject tendon equalities | — |
 | REQ-EQ-003 | flex equalities | none | not_implemented/unqualified | 018 | reject flex/flexvert/flexstrain | — |
 | REQ-EQ-004 | removed distance equality | none | not_implemented/unqualified | 009 | reject distance equalities | — |
@@ -57,9 +57,9 @@ renderer), not future physics work.
 | REQ-BIAS-002 | muscle/DC-motor/user biases | none | not_implemented/unqualified | 007 | reject muscle/dcmotor/user | — |
 | REQ-SENS-001 | current-state kinematic/clock/gyro/velocimeter queries | device | native_gpu/gpu_qualified | baseline | accept the 14 listed types | test_sensors.py |
 | REQ-SENS-002 | remaining sensor families | none | not_implemented/unqualified | 016 | reject unlisted sensor types | — |
-| REQ-STATE-001 | time/qpos/qvel/eq_active state ownership | device | native_gpu/gpu_qualified | 004 | accept matching snapshots, reject v1-into-neq | test_device_state.py, test_equality_activity.py |
+| REQ-STATE-001 | time/qpos/qvel/eq_active/mocap state ownership | device | native_gpu/gpu_qualified | 006 | accept matching snapshots, reject v1-into-neq and <v3-into-mocap | test_device_state.py, test_equality_activity.py, test_mocap_state.py |
 | REQ-STATE-002 | control/applied-force state ownership | device | native_gpu/gpu_qualified | baseline | accept finite host/device inputs | test_simulation.py |
-| REQ-STATE-003 | mocap position/quaternion inputs | none | not_implemented/unqualified | 006 | reject mocap | — |
+| REQ-STATE-003 | mocap position/quaternion inputs | device | native_gpu/gpu_qualified | 006 | accept valid mocap, reject non-world-child | test_mocap_state.py |
 | REQ-STATE-004 | actuator activation state | none | not_implemented/unqualified | 007 | reject models requiring act state | — |
 | REQ-STATE-005 | warmstart state | none | not_implemented/unqualified | 014 | ignore warmstart content | — |
 | REQ-STATE-006 | history state | none | not_implemented/unqualified | 015 | reject history-dependent models | — |

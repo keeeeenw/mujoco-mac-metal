@@ -100,22 +100,30 @@ The integrated Euler pipeline enforces explicit hardware-tailored capacity bound
 - Equality row spans: joint equality 1 row, connect 3 rows, weld 6 rows per equality (`n_eq_rows` total, deterministic `eq_rowadr`/`eq_rownum` mapping). The activity array keeps one entry per equality, not per row.
 - Contact row counts depend on cone and `condim`: pyramidal condim 1/3/4/6 expands to 1/4/6/10 rows; elliptic condim 1/3/4/6 uses 1/3/4/6 coupled rows. Lowering calculates row offsets and rejects models that exceed the total row cap before GPU execution.
 - Supported primitive geometries: plane, sphere, capsule, box. Models exceeding these bounds or requesting non-primitive geometries (meshes, cylinders, ellipsoids, heightfields, SDFs), non-Euler integrators, flex, or plugins are rejected cleanly during profile validation before GPU execution.
-- Supported equality types: joint, connect, weld (body-body, body-world, site-site). Tendon/flex equalities, ball limits, mocap bodies in equalities and non-finite `torquescale` are rejected, even when initially inactive.
+- Supported equality types: joint, connect, weld (body-body, body-world, site-site, including mocap bodies as kinematic anchors; both-mocap equalities reserve rows but assemble zero rows/forces, matching MuJoCo skipping its empty Jacobian). Tendon/flex equalities, ball limits and non-finite `torquescale` are rejected, even when initially inactive.
+- Mocap bodies: jointless direct children of world only (pinned compiler restriction, re-validated at lowering). Prescribed per-environment poses via `sim.set_mocap`.
 
 ### Equality activation, reset, snapshots and failure
 
 ```python
 sim.set_equality_active(values, env_ids=None)  # persistent per-env, per-equality booleans
-sim.state.reset(env_ids=None, qpos=None, qvel=None, eq_active=None)
-snapshot = sim.state.snapshot()  # schema v2 carries eq_active when neq > 0
+sim.set_mocap(pos, quat=None, env_ids=None)  # prescribed per-env mocap poses
+sim.reset(env_ids=None, qpos=None, qvel=None, eq_active=None, mocap_pos=None, mocap_quat=None)
+sim.reset_to_keyframe(key_id, env_ids=None)  # pinned mj_resetDataKeyframe semantics
+sim.copy_environment(src, dst)
+snapshot = sim.state.snapshot()  # schema v3 carries eq_active + mocap when present
 sim.state.restore(snapshot)
 ```
 
 - `set_equality_active` accepts host boolean/integer arrays of shape `(neq,)` (broadcast to the selected worlds) or `(len(env_ids), neq)`, or contiguous int32/bool MPS tensors of the same shapes. Device tensors are copied, never borrowed or modified. `env_ids=None` selects all worlds. Validation is atomic: malformed input leaves every world unchanged. Changes take effect on the next step or assembly, invalidate cached assembly/diagnostics, and never clear sticky per-world failure status. Releasing an equality clears its stale rows, multipliers and generalized force on recomputation; reattaching reuses the compiled reference anchors/poses.
-- `reset` with `eq_active=None` restores compiled `eq_active0` defaults for the selected worlds; an explicit `eq_active` array overrides them. Unselected worlds are untouched. Reset clears sticky failure status for the selected worlds only.
-- Snapshots use schema version 2 when the model has equalities (`neq`, `eq_active` included) and version 1 otherwise. Restoring a version-1 snapshot into a model with equalities is rejected rather than silently dropping activity; model/profile/dimension mismatches are rejected; restores are atomic.
+- `reset` with `eq_active=None` restores compiled `eq_active0` defaults for the selected worlds; an explicit `eq_active` array overrides them. `mocap_pos`/`mocap_quat=None` restore compiled reference frames; explicit arrays override. Unselected worlds are untouched. Reset clears sticky failure status for the selected worlds only. `sim.reset` additionally clears held per-call inputs (`ctrl`, `qfrc_applied`, `xfrc_applied`) for the selected worlds and invalidates cached assembly.
+- `set_mocap` accepts host arrays or contiguous float32 MPS tensors: `(nmocap, 3/4)` broadcast to the selected worlds or `(len(env_ids), nmocap, 3/4)` per world, or a single `(…, nmocap, 7)` posquat array with `quat=None`. Inputs are copied, validation is atomic, sticky failure is preserved, changes take effect on the next step/assembly.
+- `reset_to_keyframe` mirrors pinned `mj_resetDataKeyframe`: time to `key_time`, qpos/qvel/mocap to the key values, qacc/status cleared, equality activity to compiled defaults, held controls to `key_ctrl` for the selected worlds. Invalid key ids fail atomically.
+- `copy_environment` copies every state row (qpos/qvel/qacc/time/status/eq/mocap) src to dst and bumps generation.
+- Snapshots use schema version 3 when the model has mocap bodies (`nmocap`, `mpos`, `mquat` included), version 2 when it has equalities but no mocap, and version 1 otherwise. Restoring a version-1 snapshot into a model with equalities, or a version <3 snapshot into a model with mocap bodies, is rejected rather than silently dropping activity/poses; model/profile/dimension mismatches are rejected; restores are atomic.
+- Model changes are shared by the batch, not per environment: `ModelLifecycle.recompute_body_masses` (via `mj_setConst`) and `update_geom_contact` (friction/solref/solimp/margin/gap) are the supported runtime-mutable paths with transactional validation; reference poses/shapes/types are recompile-required (build a new lifecycle/simulation). Actuator activation state, warmstarts, history, userdata and plugins have no native storage and are rejected at admission; controls and applied forces are per-call held inputs, not persistent state.
 - A failed physics step rolls back physical state/time for that world and stays sticky until reset/restore; an accepted activity change is persistent input state, not a partially applied step.
 
-Try the [latch-and-release cargo bridge demo](examples/cargo_bridge.md), the [clockwork parcel sorter demo](examples/clockwork_parcel_sorter.md), the [robotic marble music machine demo](examples/marble_music_machine.md) or the [spacecraft force-control demo](examples/space_docking.md), or use the
+Try the [magnetic crane demo](examples/magnetic_crane.md), the [latch-and-release cargo bridge demo](examples/cargo_bridge.md), the [clockwork parcel sorter demo](examples/clockwork_parcel_sorter.md), the [robotic marble music machine demo](examples/marble_music_machine.md) or the [spacecraft force-control demo](examples/space_docking.md), or use the
 [installation and diagnostic guide](INSTALL.md) for `pip install mujoco-mac-metal`
 and `mujoco-metal doctor --gpu`. Install version 0.4.0 for the additional bounded profiles.
