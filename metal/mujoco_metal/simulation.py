@@ -202,7 +202,7 @@ class MetalSimulation:
       if plan.is_stage_enabled("actuation") or (_act_disabled and int(model.nu) > 0):
         from mujoco_metal.stateful_actuation import ActuatorModel
         from mujoco_metal.stateful_actuation import MetalActuators
-        actuator_meta = ActuatorModel(model)
+        actuator_meta = ActuatorModel(model, allow_inherited=True)
         if actuator_meta.needs_general_path:
           self._actuators = MetalActuators(model, batch_size)
         else:

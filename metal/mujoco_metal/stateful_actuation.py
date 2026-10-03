@@ -210,7 +210,7 @@ class ActuatorModel:
   stage can be reused byte-identically.
   """
 
-  def __init__(self, model):
+  def __init__(self, model, allow_inherited=False):
     if mujoco.__version__ != "3.10.0":
       raise RuntimeError(f"actuator lowering requires MuJoCo 3.10.0; found {mujoco.__version__}")
     if not isinstance(model, mujoco.MjModel):
@@ -225,11 +225,16 @@ class ActuatorModel:
       raise ValueError("actuator plugins are unsupported (owned by milestone 019)")
     if np.any(np.asarray(model.actuator_plugin) >= 0):
       raise ValueError("actuator plugins are unsupported (owned by milestone 019)")
-    if np.any(np.asarray(model.actuator_armature) != 0):
-      raise ValueError("actuator armature is unsupported (owned by milestone 015)")
-    if np.any(np.asarray(model.actuator_damping) != 0) or np.any(
-        np.asarray(model.actuator_dampingpoly) != 0):
-      raise ValueError("actuator damping is unsupported (owned by milestone 015)")
+    if not allow_inherited:
+      if np.any(np.asarray(model.actuator_armature) != 0):
+        raise ValueError("actuator armature is unsupported (owned by milestone 015)")
+      if np.any(np.asarray(model.actuator_damping) != 0) or np.any(
+          np.asarray(model.actuator_dampingpoly) != 0):
+        raise ValueError("actuator damping is unsupported (owned by milestone 015)")
+    else:
+      from mujoco_metal.model import actuator_joint_inheritance, actuator_tendon_inheritance
+      actuator_joint_inheritance(model, tendon_ok=True)
+      actuator_tendon_inheritance(model)
     if np.any(np.asarray(model.actuator_delay) != 0):
       raise ValueError("actuator delay is unsupported (owned by milestone 015)")
     if np.any(np.asarray(model.actuator_history) != 0):
@@ -772,7 +777,7 @@ class MetalActuators:
     from pathlib import Path as _Path
     import torch as _torch
     self._torch = _torch
-    self._meta = ActuatorModel(model)
+    self._meta = ActuatorModel(model, allow_inherited=True)
     self._device = _torch.device("mps")
     tlib = _torch.mps.compile_shader(
         (_Path(__file__).parent / "shaders" / "transmissions.metal").read_text())

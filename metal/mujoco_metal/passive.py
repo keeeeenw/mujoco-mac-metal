@@ -52,6 +52,15 @@ class PassiveForceModel:
     self.damperpoly = _frozen(
         np.asarray(model.dof_dampingpoly).reshape(self.nv, 2), np.float32
     )
+    # R06-1: joint-targeted actuator damping folds into the dof damper
+    # (pinned mj_actuatorDamping gear^2 scan); tendon-targeted raises.
+    from mujoco_metal.model import actuator_joint_inheritance
+    _, _damp_fold, _dpoly_fold = actuator_joint_inheritance(model, tendon_ok=True)
+    self.damping = _frozen(
+        np.asarray(self.damping, dtype=np.float64) + _damp_fold, np.float32)
+    self.damperpoly = _frozen(
+        np.asarray(self.damperpoly, dtype=np.float64).reshape(self.nv, 2)
+        + _dpoly_fold, np.float32)
     self.disableflags = int(model.opt.disableflags)
     self._num_poly = self.springpoly.shape[1]
     self.body_mass = _frozen(model.body_mass, np.float32)

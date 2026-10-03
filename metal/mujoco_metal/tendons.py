@@ -40,10 +40,7 @@ class FixedTendonModel:
       raise ValueError("tendon dimensions exceed int32")
     if self.ntendon * self.nq > _UINT32_MAX or self.ntendon * self.nv > _UINT32_MAX:
       raise ValueError("tendon model buffers exceed uint32 indexing")
-    if np.any(np.asarray(model.actuator_armature) != 0):
-      raise ValueError("actuator-inherited tendon armature is unsupported")
-    if np.any(np.asarray(model.actuator_damping) != 0) or np.any(np.asarray(model.actuator_dampingpoly) != 0):
-      raise ValueError("actuator-inherited tendon damping is unsupported")
+    # R06: actuator-inherited tendon armature and damping fold into tendon fields below.
     if np.any(np.asarray(model.tendon_limited)) and not spatial_ok:
       raise ValueError("tendon limits are unsupported")
     if np.any(np.asarray(model.tendon_frictionloss) != 0) and not spatial_ok:
@@ -87,10 +84,13 @@ class FixedTendonModel:
     self.moment_map = _frozen(moment_map)
     self.stiffness = _frozen(model.tendon_stiffness)
     self.stiffnesspoly = _frozen(np.asarray(model.tendon_stiffnesspoly).reshape(self.ntendon, 2))
-    self.damping = _frozen(model.tendon_damping)
-    self.dampingpoly = _frozen(np.asarray(model.tendon_dampingpoly).reshape(self.ntendon, 2))
+    from mujoco_metal.model import actuator_tendon_inheritance
+    _t_arm, _t_damp, _t_dpoly = actuator_tendon_inheritance(model)
+    self.damping = _frozen(np.asarray(model.tendon_damping, dtype=np.float64) + _t_damp)
+    self.dampingpoly = _frozen(
+        np.asarray(model.tendon_dampingpoly, dtype=np.float64).reshape(self.ntendon, 2) + _t_dpoly)
     self.spring_range = _frozen(np.asarray(model.tendon_lengthspring).reshape(self.ntendon, 2))
-    self.armature = _frozen(model.tendon_armature)
+    self.armature = _frozen(np.asarray(model.tendon_armature, dtype=np.float64) + _t_arm)
     if np.any(self.armature < 0) or np.any(self.damping < 0):
       raise ValueError("tendon armature and damping must be nonnegative")
     self.disable_spring = bool(int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_SPRING))

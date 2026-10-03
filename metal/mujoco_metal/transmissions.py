@@ -30,7 +30,7 @@ class TransmissionModel:
   actuation disable follow MuJoCo's source behavior.
   """
 
-  def __init__(self, model):
+  def __init__(self, model, allow_inherited=False):
     if mujoco.__version__ != "3.10.0":
       raise RuntimeError(f"transmission lowering requires MuJoCo 3.10.0; found {mujoco.__version__}")
     if not isinstance(model, mujoco.MjModel):
@@ -48,10 +48,15 @@ class TransmissionModel:
       raise ValueError("actuator plugins are unsupported")
     if np.any(np.asarray(model.actuator_actnum) != 0) or np.any(np.asarray(model.actuator_dyntype) != int(mujoco.mjtDyn.mjDYN_NONE)):
       raise ValueError("stateful actuator dynamics are unsupported")
-    if np.any(np.asarray(model.actuator_armature) != 0):
-      raise ValueError("actuator armature is unsupported")
-    if np.any(np.asarray(model.actuator_damping) != 0) or np.any(np.asarray(model.actuator_dampingpoly) != 0):
-      raise ValueError("actuator damping is unsupported")
+    if not allow_inherited:
+      if np.any(np.asarray(model.actuator_armature) != 0):
+        raise ValueError("actuator armature is unsupported")
+      if np.any(np.asarray(model.actuator_damping) != 0) or np.any(np.asarray(model.actuator_dampingpoly) != 0):
+        raise ValueError("actuator damping is unsupported")
+    else:
+      from mujoco_metal.model import actuator_joint_inheritance, actuator_tendon_inheritance
+      actuator_joint_inheritance(model, tendon_ok=True)
+      actuator_tendon_inheritance(model)
     if np.any(np.asarray(model.jnt_actfrclimited)):
       raise ValueError("joint-level actuator force limits are unsupported")
     if np.any(np.asarray(model.jnt_actgravcomp)):
@@ -182,9 +187,9 @@ class TransmissionModel:
 class MetalTransmissions:
   """Native MPS stateless scalar actuator force stage."""
 
-  def __init__(self, model):
+  def __init__(self, model, allow_inherited=True):
     self.model = model
-    self._meta = TransmissionModel(model)
+    self._meta = TransmissionModel(model, allow_inherited=allow_inherited)
     self._last_force = None
     import torch
     self._torch = torch

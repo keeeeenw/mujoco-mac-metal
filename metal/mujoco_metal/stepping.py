@@ -418,7 +418,7 @@ def validate_stepping_profile(
 
     if model.nu > 0:
       from mujoco_metal.stateful_actuation import ActuatorModel
-      actuator_model = ActuatorModel(model)
+      actuator_model = ActuatorModel(model, allow_inherited=True)
       if actuator_model.needs_general_path:
         supported_list.append(
             "full-family actuators: stateful activation, muscle/DC-motor, "

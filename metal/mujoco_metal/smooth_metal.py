@@ -54,11 +54,16 @@ class MetalSmoothDynamics:
   """
 
   def __init__(self, model: ModelDescriptor, batch_size: int = 1):
-    if model.nu and np.any(model.actuator_armature != 0):
-      raise ValueError("Metal smooth stage does not support actuator armature")
+    from mujoco_metal.model import actuator_joint_inheritance
+    # R06-1: joint-targeted actuator armature folds into the dof armature
+    # (pinned mj_actuatorArmature gear^2 scan); tendon-targeted handled by tendon stage.
+    arm_fold, _, _ = actuator_joint_inheritance(model, tendon_ok=True)
     if np.any(model.tendon_armature != 0):
       raise ValueError("Metal smooth stage does not support tendon armature")
     host = _prepare_host_arrays(model)
+    host["dof_armature"] = np.asarray(
+        np.asarray(host["dof_armature"], dtype=np.float64) + arm_fold,
+        dtype=np.float32)
     self._fk = MetalKinematics(model, batch_size=batch_size)
     self.model = self._fk.model
     torch = self._fk._torch

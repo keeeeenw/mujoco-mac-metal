@@ -28,6 +28,109 @@ def _frozen(array, dtype=None):
   return np.frombuffer(value.tobytes(), dtype=value.dtype).reshape(value.shape)
 
 
+def actuator_joint_inheritance(model, tendon_ok=False):
+  """Per-dof inherited armature/damping from joint-targeted actuators.
+
+  Mirrors pinned ``mj_actuatorArmature``/``mj_actuatorDamping`` (gear[0]^2
+  scan over JOINT/JOINTINPARENT transmissions): returns ``(arm, damp,
+  damppoly)`` float64 arrays shaped ``(nv,)``, ``(nv,)``,
+  ``(nv, npoly)`` to add onto ``dof_armature``/``dof_damping``/
+  ``dof_dampingpoly``. Tendon/site/body-targeted nonzero armature,
+  damping or dampingpoly raises (tendon inheritance needs the unsupported
+  tendon-armature path).
+  """
+  import mujoco as _mj
+  nv = int(model.nv)
+  nu = int(model.nu)
+  arm = np.zeros(nv)
+  damp = np.zeros(nv)
+  npoly = int(np.asarray(model.actuator_dampingpoly).shape[1]) if nu else 2
+  _dofpoly = getattr(model, "dof_dampingpoly", None)
+  dampWidth = int(np.asarray(_dofpoly).shape[1]) if nv and _dofpoly is not None else npoly
+  damppoly = np.zeros((nv, dampWidth))
+  if nu == 0:
+    return arm, damp, damppoly
+  joint_trn = int(_mj.mjtTrn.mjTRN_JOINT)
+  parent_trn = int(_mj.mjtTrn.mjTRN_JOINTINPARENT)
+  tendon_trn = int(_mj.mjtTrn.mjTRN_TENDON)
+  gear = np.asarray(model.actuator_gear, dtype=np.float64).reshape(nu, 6)
+  trntype = np.asarray(model.actuator_trntype, dtype=np.int32)
+  trnid = np.asarray(model.actuator_trnid, dtype=np.int32).reshape(nu, 2)
+  armature = np.asarray(model.actuator_armature, dtype=np.float64)
+  damping = np.asarray(model.actuator_damping, dtype=np.float64)
+  dampingpoly = np.asarray(model.actuator_dampingpoly, dtype=np.float64).reshape(nu, npoly)
+  if npoly != dampWidth:
+    raise ValueError("actuator/dof dampingpoly widths do not match")
+  for k in range(int(model.nu)):
+    if not (armature[k] or damping[k] or np.any(dampingpoly[k])):
+      continue
+    t = int(trntype[k])
+    if t in (joint_trn, parent_trn):
+      jnt = int(trnid[k, 0])
+      if jnt < 0 or jnt >= int(model.njnt):
+        raise ValueError("actuator transmission must target a valid joint")
+      da = int(model.jnt_dofadr[jnt])
+      jt = int(model.jnt_type[jnt])
+      nd = 6 if jt == int(_mj.mjtJoint.mjJNT_FREE) else (3 if jt == int(_mj.mjtJoint.mjJNT_BALL) else 1)
+      if da < 0 or da + nd > nv:
+        raise ValueError("actuator inheritance requires valid joint dofs")
+      g2 = float(gear[k, 0]) ** 2
+      for d in range(da, da + nd):
+        arm[d] += float(armature[k]) * g2
+        damp[d] += float(damping[k]) * g2
+        damppoly[d] += dampingpoly[k] * g2
+    elif t == tendon_trn:
+      if not tendon_ok:
+        raise ValueError(
+            "tendon-targeted actuator armature/damping is unsupported "
+            "(tendon armature path owned by a later milestone)")
+      continue
+    else:
+      raise ValueError(
+          "site/body-targeted actuator armature/damping is unsupported")
+  return arm, damp, damppoly
+
+
+def actuator_tendon_inheritance(model):
+  """Per-tendon inherited armature/damping from tendon-targeted actuators.
+
+  Mirrors pinned gear^2 inheritance onto tendons: returns (arm, damp, damppoly)
+  float64 arrays shaped (ntendon,), (ntendon,), (ntendon, npoly) to add onto
+  tendon_armature / tendon_damping / tendon_dampingpoly.
+  """
+  import mujoco as _mj
+  nt = int(model.ntendon)
+  nu = int(model.nu)
+  arm = np.zeros(nt)
+  damp = np.zeros(nt)
+  npoly = int(np.asarray(model.actuator_dampingpoly).shape[1]) if nu else 2
+  _tdpoly = getattr(model, "tendon_dampingpoly", None)
+  dampWidth = int(np.asarray(_tdpoly).shape[1]) if nt and _tdpoly is not None else npoly
+  damppoly = np.zeros((nt, dampWidth))
+  if nu == 0 or nt == 0:
+    return arm, damp, damppoly
+  tendon_trn = int(_mj.mjtTrn.mjTRN_TENDON)
+  gear = np.asarray(model.actuator_gear, dtype=np.float64).reshape(nu, 6)
+  trntype = np.asarray(model.actuator_trntype, dtype=np.int32)
+  trnid = np.asarray(model.actuator_trnid, dtype=np.int32).reshape(nu, 2)
+  armature = np.asarray(model.actuator_armature, dtype=np.float64)
+  damping = np.asarray(model.actuator_damping, dtype=np.float64)
+  dampingpoly = np.asarray(model.actuator_dampingpoly, dtype=np.float64).reshape(nu, npoly)
+  for k in range(nu):
+    if not (armature[k] or damping[k] or np.any(dampingpoly[k])):
+      continue
+    if int(trntype[k]) == tendon_trn:
+      t = int(trnid[k, 0])
+      if t < 0 or t >= nt:
+        raise ValueError("actuator transmission must target a valid tendon")
+      g2 = float(gear[k, 0]) ** 2
+      arm[t] += float(armature[k]) * g2
+      damp[t] += float(damping[k]) * g2
+      if npoly == dampWidth:
+        damppoly[t] += dampingpoly[k] * g2
+  return arm, damp, damppoly
+
+
 def _quat_mul(a, b):
   aw, ax, ay, az = a
   bw, bx, by, bz = b
@@ -100,6 +203,11 @@ class ModelDescriptor:
   dof_armature: np.ndarray
   dof_damping: np.ndarray
   actuator_armature: np.ndarray
+  actuator_trntype: np.ndarray
+  actuator_trnid: np.ndarray
+  actuator_gear: np.ndarray
+  actuator_damping: np.ndarray
+  actuator_dampingpoly: np.ndarray
   tendon_armature: np.ndarray
   jnt_type: np.ndarray
   jnt_qposadr: np.ndarray
@@ -293,6 +401,11 @@ def _validate_lowered(counts, values):
       "dof_armature": (nv,),
       "dof_damping": (nv,),
       "actuator_armature": (counts["nu"],),
+      "actuator_trntype": (counts["nu"],),
+      "actuator_trnid": (counts["nu"], 2),
+      "actuator_gear": (counts["nu"], 6),
+      "actuator_damping": (counts["nu"],),
+      "actuator_dampingpoly": (counts["nu"], 2),
       "tendon_armature": (counts["ntendon"],),
       "jnt_type": (nj,),
       "jnt_qposadr": (nj,),
@@ -310,6 +423,8 @@ def _validate_lowered(counts, values):
       "site_quat": (counts["nsite"], 4),
   }
   for name, shape in array_shapes.items():
+    if name not in values:
+      raise ValueError(f"missing {name} in lowered model values")
     if values[name].shape != shape:
       raise ValueError(
           f"invalid {name} shape: {values[name].shape}, expected {shape}"
@@ -502,6 +617,11 @@ def load_model(source):
       "dof_armature",
       "dof_damping",
       "actuator_armature",
+      "actuator_trntype",
+      "actuator_trnid",
+      "actuator_gear",
+      "actuator_damping",
+      "actuator_dampingpoly",
       "tendon_armature",
       "jnt_type",
       "jnt_qposadr",
