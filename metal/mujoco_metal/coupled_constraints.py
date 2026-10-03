@@ -255,6 +255,8 @@ class CoupledConstraintDescriptor:
   disableflags: int
   iterations: int
   tolerance: float
+  noslip_iterations: int
+  noslip_tolerance: float
   solver_settings: CoupledSolverSettings
   n_eq_rows: int
 
@@ -391,11 +393,17 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
     raise RuntimeError(f"coupled constraint lowering requires MuJoCo 3.10.0; found {mujoco.__version__}")
   if model.nv > _MAX_NV:
     raise ValueError(f"coupled constraint stage bounds nv to {_MAX_NV}; found {model.nv}")
-  if int(model.opt.noslip_iterations) != 0:
+  # Pinned no-slip post-stage (R04): admitted with validated budget; the
+  # native solver runs exact friction subproblem sweeps after the main
+  # solve (zero iterations = skipped, bit-identical to before).
+  noslip_iters = int(model.opt.noslip_iterations)
+  if noslip_iters < 0 or noslip_iters > _MAX_ITERATIONS:
     raise ValueError(
-        "noslip_iterations is unsupported by integrated_euler_v1; "
-        "MuJoCo's separate no-slip post-solver is not implemented"
+        f"integrated_euler_v1 bounds noslip_iterations to [0, {_MAX_ITERATIONS}]; found {noslip_iters}"
     )
+  noslip_tol = float(model.opt.noslip_tolerance)
+  if noslip_iters > 0 and (not math.isfinite(noslip_tol) or noslip_tol <= 0):
+    raise ValueError("model.opt.noslip_tolerance must be finite and positive with nonzero noslip_iterations")
   if int(model.opt.solver) == int(mujoco.mjtSolver.mjSOL_CG):
     # Mapped like Newton (REQ-SOL-002): the native projected solver handles
     # the same coupled problem for every convex/cone combination; the
@@ -996,6 +1004,8 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       disableflags=int(model.opt.disableflags),
       iterations=iter_req,
       tolerance=eff_tol,
+      noslip_iterations=noslip_iters,
+      noslip_tolerance=noslip_tol if noslip_iters > 0 else 0.0,
       solver_settings=solver_settings,
       n_eq_rows=n_eq_rows,
       ntendon=int(model.ntendon),
@@ -1296,11 +1306,13 @@ class MetalCoupledConstraints:
             dtype=torch.int32, device=self._device,
         ),
         "solver_dims": torch.tensor(
-            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows, d.ntendon, d.ten_base, d.ten_friction_rows + d.ten_limit_rows],
+            # Appended tail carries the no-slip budget (R04); earlier
+            # indices are frozen for every consumer of this layout.
+            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows, d.ntendon, d.ten_base, d.ten_friction_rows + d.ten_limit_rows, d.noslip_iterations],
             dtype=torch.int32, device=self._device,
         ),
         "solver_params": torch.tensor(
-            [d.timestep, d.impratio, d.tolerance],
+            [d.timestep, d.impratio, d.tolerance, d.noslip_tolerance],
             dtype=torch.float32, device=self._device,
         ),
     }

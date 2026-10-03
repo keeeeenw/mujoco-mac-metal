@@ -468,6 +468,215 @@ inline float elliptic_projected_residual(thread const float* A,
   return residual;
 }
 
+// Cone-aware row residual for re-certification loops (R04): elliptic
+// member rows use the Lorentz certificate over their block; all other
+// rows use the box-projected row residual with identical scaling.
+inline float cert_row_residual(int row,
+    thread const float* W, thread const float* R, thread const float* rhs,
+    thread const float* ar, thread const float* lam,
+    thread const float* lo, thread const float* hi,
+    thread const bool* enabled, int nr, int total_nr,
+    int eblock, int edim, thread const float* emu) {
+  if (eblock >= 0) {
+    return 0.0f;  // aggregated per block by the caller (see below)
+  }
+  float grad = -rhs[row];
+  for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
+  grad += R[row] * lam[row];
+  float diag = max(1e-15f, W[row * nr + row] + R[row]);
+  float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
+  float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
+  for (int col = 0; col < total_nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
+  row_scale = max(1.0f, row_scale);
+  return abs(proj - lam[row]) * diag / row_scale;
+}
+
+// Per-block cone residual (caller aggregates the max over blocks).
+inline float cert_block_residual(int start, int dim, thread const float* mu,
+    thread const float* W, thread const float* R, thread const float* rhs,
+    thread const float* lam, thread const bool* enabled,
+    int nr, int total_nr) {
+  thread float A[36], g[6], frc[6], mulo[5];
+  for (int i = 0; i < 36; ++i) A[i] = 0.0f;
+  for (int i = 0; i < 6; ++i) { g[i] = 0.0f; frc[i] = 0.0f; }
+  for (int i = 0; i < 5; ++i) mulo[i] = mu[i];
+  for (int i = 0; i < dim; ++i) {
+    int ri = start + i;
+    frc[i] = lam[ri];
+    g[i] = -rhs[ri];
+    for (int col = 0; col < total_nr; ++col)
+      if (enabled[col] && (col < start || col >= start + dim))
+        g[i] += W[ri * nr + col] * lam[col];
+    for (int j = 0; j < dim; ++j) {
+      int cj = start + j;
+      A[i * 6 + j] = W[ri * nr + cj] + (i == j ? R[ri] : 0.0f);
+    }
+  }
+  return elliptic_projected_residual(A, g, mulo, dim, frc);
+}
+
+// ---- No-slip helpers (pinned solNoSlip/mju_QCQP family, R04) ----
+// QCQP in 2 dimensions: min 0.5*x'*A*x + x'*b s.t. sum (xi/di)^2 <= r^2.
+// Returns 0 if unconstrained, 1 if constrained.
+inline int nsl_qcqp2(thread float* res, thread const float* Ain, thread const float* bin,
+    thread const float* d, float r) {
+  float b1 = bin[0]*d[0];
+  float b2 = bin[1]*d[1];
+  float A11 = Ain[0]*d[0]*d[0];
+  float A22 = Ain[3]*d[1]*d[1];
+  float A12 = Ain[1]*d[0]*d[1];
+  float la = 0.0f;
+  float v1 = 0.0f, v2 = 0.0f;
+  for (int iter = 0; iter < 20; ++iter) {
+    float det = (A11+la)*(A22+la) - A12*A12;
+    if (det < 1e-10f) {
+      res[0] = 0.0f;
+      res[1] = 0.0f;
+      return 0;
+    }
+    float detinv = 1.0f/det;
+    float P11 = (A22+la)*detinv;
+    float P22 = (A11+la)*detinv;
+    float P12 = -A12*detinv;
+    v1 = -P11*b1 - P12*b2;
+    v2 = -P12*b1 - P22*b2;
+    float val = v1*v1 + v2*v2 - r*r;
+    if (val < 1e-10f) break;
+    float deriv = -2.0f*(P11*v1*v1 + 2.0f*P12*v1*v2 + P22*v2*v2);
+    float delta = -val/deriv;
+    if (delta < 1e-10f) break;
+    la += delta;
+  }
+  res[0] = v1*d[0];
+  res[1] = v2*d[1];
+  return (la != 0.0f);
+}
+
+// QCQP in 3 dimensions (same contract).
+inline int nsl_qcqp3(thread float* res, thread const float* Ain, thread const float* bin,
+    thread const float* d, float r) {
+  float b1 = bin[0]*d[0];
+  float b2 = bin[1]*d[1];
+  float b3 = bin[2]*d[2];
+  float A11 = Ain[0]*d[0]*d[0];
+  float A22 = Ain[4]*d[1]*d[1];
+  float A33 = Ain[8]*d[2]*d[2];
+  float A12 = Ain[1]*d[0]*d[1];
+  float A13 = Ain[2]*d[0]*d[2];
+  float A23 = Ain[5]*d[1]*d[2];
+  float la = 0.0f;
+  float v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+  for (int iter = 0; iter < 20; ++iter) {
+    float P11 = (A22+la)*(A33+la) - A23*A23;
+    float P22 = (A11+la)*(A33+la) - A13*A13;
+    float P33 = (A11+la)*(A22+la) - A12*A12;
+    float P12 = A13*A23 - A12*(A33+la);
+    float P13 = A12*A23 - A13*(A22+la);
+    float P23 = A12*A13 - A23*(A11+la);
+    float det = (A11+la)*P11 + A12*P12 + A13*P13;
+    if (det < 1e-10f) {
+      res[0] = 0.0f;
+      res[1] = 0.0f;
+      res[2] = 0.0f;
+      return 0;
+    }
+    float detinv = 1.0f/det;
+    P11 *= detinv;
+    P22 *= detinv;
+    P33 *= detinv;
+    P12 *= detinv;
+    P13 *= detinv;
+    P23 *= detinv;
+    v1 = -P11*b1 - P12*b2 - P13*b3;
+    v2 = -P12*b1 - P22*b2 - P23*b3;
+    v3 = -P13*b1 - P23*b2 - P33*b3;
+    float val = v1*v1 + v2*v2 + v3*v3 - r*r;
+    if (val < 1e-10f) break;
+    float deriv = -2.0f*(P11*v1*v1 + P22*v2*v2 + P33*v3*v3)
+            -4.0f*(P12*v1*v2 + P13*v1*v3 + P23*v2*v3);
+    float delta = -val/deriv;
+    if (delta < 1e-10f) break;
+    la += delta;
+  }
+  res[0] = v1*d[0];
+  res[1] = v2*d[1];
+  res[2] = v3*d[2];
+  return (la != 0.0f);
+}
+
+// QCQP in n<=5 dimensions via Cholesky Newton (same contract). The pinned
+// mju_cholFactor/mju_cholSolve steps are inlined (rank threshold 1e-10).
+inline int nsl_qcqpn(thread float* res, thread const float* Ain, thread const float* bin,
+    thread const float* d, float r, int n) {
+  thread float A[25], Ala[25], b[5], tmp[5];
+  for (int i = 0; i < 25; ++i) A[i] = 0.0f;
+  for (int i = 0; i < 5; ++i) { b[i] = 0.0f; tmp[i] = 0.0f; res[i] = 0.0f; }
+  if (n > 5) return 0;
+  for (int i = 0; i < n; ++i) {
+    b[i] = bin[i] * d[i];
+    for (int j = 0; j < n; ++j) A[j+i*n] = Ain[j+i*n] * d[i] * d[j];
+  }
+  float la = 0.0f;
+  for (int iter = 0; iter < 20; ++iter) {
+    for (int i = 0; i < n*n; ++i) Ala[i] = A[i];
+    for (int i = 0; i < n; ++i) Ala[i*(n+1)] += la;
+    int rank = 0;
+    for (int i = 0; i < n; ++i) {
+      for (int j = 0; j <= i; ++j) {
+        float v = Ala[i*n+j];
+        for (int k = 0; k < j; ++k) v -= Ala[i*n+k] * Ala[j*n+k];
+        if (i == j) {
+          if (!(v > 1e-10f)) break;
+          Ala[i*n+j] = sqrt(v);
+          rank++;
+        } else {
+          Ala[i*n+j] = v / Ala[j*n+j];
+        }
+      }
+      if (rank <= i) break;
+    }
+    if (rank < n) {
+      for (int i = 0; i < n; ++i) res[i] = 0.0f;
+      return 0;
+    }
+    // res = -Ala \ b.
+    for (int i = 0; i < n; ++i) {
+      float v = b[i];
+      for (int k = 0; k < i; ++k) v -= Ala[i*n+k] * tmp[k];
+      tmp[i] = v / Ala[i*n+i];
+    }
+    for (int i = n - 1; i >= 0; --i) {
+      float v = tmp[i];
+      for (int k = i + 1; k < n; ++k) v -= Ala[k*n+i] * res[k];
+      res[i] = v / Ala[i*n+i];
+    }
+    for (int i = 0; i < n; ++i) res[i] = -res[i];
+    float val = 0.0f;
+    for (int i = 0; i < n; ++i) val += res[i]*res[i];
+    val -= r*r;
+    if (val < 1e-10f) break;
+    // deriv = -2 * res' * Ala^-1 * res.
+    for (int i = 0; i < n; ++i) {
+      float v = res[i];
+      for (int k = 0; k < i; ++k) v -= Ala[i*n+k] * tmp[k];
+      tmp[i] = v / Ala[i*n+i];
+    }
+    for (int i = n - 1; i >= 0; --i) {
+      float v = tmp[i];
+      for (int k = i + 1; k < n; ++k) v -= Ala[k*n+i] * tmp[k];
+      tmp[i] = v / Ala[i*n+i];
+    }
+    float deriv = 0.0f;
+    for (int i = 0; i < n; ++i) deriv += res[i] * tmp[i];
+    deriv *= -2.0f;
+    float delta = -val/deriv;
+    if (delta < 1e-10f) break;
+    la += delta;
+  }
+  for (int i = 0; i < n; ++i) res[i] = res[i] * d[i];
+  return (la != 0.0f);
+}
+
 kernel void solve_coupled_constraints(
     device const float* mass [[buffer(0)]],
     device const float* qfrc [[buffer(1)]],
@@ -1181,12 +1390,13 @@ kernel void solve_coupled_constraints(
   // solution). Runs when the sweep did not certify, or when it certified
   // only loosely (res > 1e-7): loose PGS solutions drift on rolling
   // friction while exact block solves match the CPU oracle. Already-tight
-  // solutions skip it, bit-identical to before.
+  // solutions skip it, bit-identical to before. Elliptic blocks join via
+  // alternating normal/QCQP exact block rounds (R04 pinch repair).
   // G2: refinement changes retained multipliers, so the pre-refinement
   // certificate must not survive it. Snapshot the certified candidate;
   // after refinement, re-certify from the FINAL multipliers: revert to the
   // snapshot if refinement lost certification, fail on nonfinite residuals.
-  if ((!converged || max_res > 1e-7f) && contact_block_count > 0 && elliptic_count == 0) {
+  if ((!converged || max_res > 1e-7f) && (contact_block_count > 0 || elliptic_count > 0)) {
     thread float snap_lam[96];
     for (int r = 0; r < 96; ++r) snap_lam[r] = lam[r];
     float snap_res = max_res;
@@ -1240,8 +1450,75 @@ kernel void solve_coupled_constraints(
           for (int i = 0; i < nlocal; ++i) lam[local_rows[i]] = max(0.0f, local_sol[i]);
         }
       }
+      // Elliptic blocks: alternating exact normal 1D Newton and QCQP
+      // friction solves (4 rounds), with per-block revert when the block
+      // cone residual does not improve.
+      for (int b = 0; b < elliptic_count; ++b) {
+        int start = elliptic_start[b];
+        int dim = elliptic_dim[b];
+        thread float mu[5];
+        for (int k = 0; k < 5; ++k) mu[k] = elliptic_friction[b * 5 + k];
+        float before = cert_block_residual(start, dim, mu, W, R, rhs, lam,
+                                           enabled, nr, total_nr);
+        thread float keep[6];
+        for (int k = 0; k < 6; ++k) keep[k] = 0.0f;
+        for (int k = 0; k < dim; ++k) keep[k] = lam[start + k];
+        for (int round = 0; round < 4; ++round) {
+          // Friction QCQP given the current normal.
+          {
+            int nf = dim - 1;
+            thread float Ac[36], bc[6], oldf[6];
+            for (int i = 0; i < 36; ++i) Ac[i] = 0.0f;
+            for (int i = 0; i < 6; ++i) { bc[i] = 0.0f; oldf[i] = 0.0f; }
+            float fn = lam[start];
+            if (fn < 1e-15f) {
+              for (int k = 1; k < dim; ++k) lam[start + k] = 0.0f;
+            } else {
+              for (int i = 0; i < nf; ++i) {
+                int ri = start + 1 + i;
+                oldf[i] = lam[ri];
+                float v = -rhs[ri];
+                for (int col = 0; col < total_nr; ++col)
+                  if (enabled[col] && (col < start || col >= start + dim))
+                    v += W[ri * nr + col] * lam[col];
+                bc[i] = v;
+                for (int j = 0; j < nf; ++j)
+                  Ac[i * 6 + j] = W[ri * nr + start + 1 + j];
+              }
+              thread float qv[6];
+              for (int i = 0; i < 6; ++i) qv[i] = 0.0f;
+              int act = 0;
+              if (nf == 2) act = nsl_qcqp2(qv, Ac, bc, mu, fn);
+              else if (nf == 3) act = nsl_qcqp3(qv, Ac, bc, mu, fn);
+              else act = nsl_qcqpn(qv, Ac, bc, mu, fn, nf);
+              if (act) {
+                float s = 0.0f;
+                for (int j = 0; j < nf; ++j) s += qv[j] * qv[j] / max(mu[j] * mu[j], 1e-30f);
+                s = sqrt(fn * fn / max(1e-15f, s));
+                for (int j = 0; j < nf; ++j) qv[j] *= s;
+              }
+              for (int i = 0; i < nf; ++i) lam[start + 1 + i] = qv[i];
+            }
+          }
+          // Normal 1D Newton given friction.
+          {
+            float grad = -rhs[start];
+            for (int col = 0; col < total_nr; ++col)
+              if (enabled[col]) grad += W[start * nr + col] * lam[col];
+            grad += R[start] * lam[start];
+            float diag = max(1e-15f, W[start * nr + start] + R[start]);
+            lam[start] = max(0.0f, lam[start] - grad / diag);
+          }
+        }
+        float after = cert_block_residual(start, dim, mu, W, R, rhs, lam,
+                                          enabled, nr, total_nr);
+        if (!(after <= before) || !isfinite(after)) {
+          for (int k = 0; k < dim; ++k) lam[start + k] = keep[k];
+        }
+      }
       max_res = 0.0f;
       for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+        if (elliptic_member[row]) continue;
         float grad = -rhs[row];
         for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
         grad += R[row] * lam[row];
@@ -1251,6 +1528,14 @@ kernel void solve_coupled_constraints(
         for (int col = 0; col < total_nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
         row_scale = max(1.0f, row_scale);
         max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
+      }
+      for (int b = 0; b < elliptic_count; ++b) {
+        int start = elliptic_start[b];
+        int dim = elliptic_dim[b];
+        thread float mu[5];
+        for (int k = 0; k < 5; ++k) mu[k] = elliptic_friction[b * 5 + k];
+        max_res = max(max_res, cert_block_residual(start, dim, mu, W, R, rhs,
+                                                   lam, enabled, nr, total_nr));
       }
       out_diagnostics[world * 10] = max_res;
       out_diagnostics[world * 10 + 1] = float(int(out_diagnostics[world * 10 + 1]) + 1);
@@ -1281,6 +1566,169 @@ kernel void solve_coupled_constraints(
       converged = true;
     }
     out_diagnostics[world * 10] = max_res;
+  }
+
+  // 9b. No-slip post-pass (pinned solNoSlip): exact friction subproblem
+  // solves over dry-friction rows and contact friction blocks. Gated on
+  // noslip_iterations (dims[18]); zero iterations skip bit-identically.
+  // Improvement accounting and the noslip_tolerance stop rule (params[3])
+  // mirror the pinned stage; iteration counts accumulate into diagnostics.
+  int noslip_iters = dims[18];
+  float noslip_tol = params[3];
+  if (noslip_iters > 0 && total_nr > 0) {
+    int ns_done = 0;
+    for (int nsit = 0; nsit < noslip_iters; ++nsit) {
+      float improvement = 0.0f;
+      // Dry friction rows: symmetric finite bounds identify joint and
+      // tendon frictionloss rows (bilateral equalities use infinite
+      // bounds; limits use [0, inf)).
+      for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+        float lorb = lo[row], hib = hi[row];
+        if (!(lorb < 0.0f && hib == -lorb && hib < INFINITY)) continue;
+        float diag = max(1e-15f, W[row * nr + row] + R[row]);
+        float grad = -rhs[row];
+        for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
+        grad += R[row] * lam[row];
+        float old = lam[row];
+        float v = clamp(lam[row] - grad / diag, lorb, hib);
+        float delta = v - old;
+        float change = 0.5f * delta * delta * diag + delta * (grad - 0.0f);
+        // NOTE: pinned costChange uses the pre-update residual; grad
+        // above is exactly that (computed from old lam).
+        if (change > 1e-10f) {
+          v = old;
+          change = 0.0f;
+        }
+        lam[row] = v;
+        improvement -= change;
+      }
+      // Contact friction blocks.
+      for (int b = 0; b < contact_block_count; ++b) {
+        int row_start = contact_block_start[b];
+        int block_size = contact_block_size[b];
+        // Pyramidal edge pairs: exact 2D solve preserving the pair sum.
+        for (int k = 0; k + 1 < block_size; k += 2) {
+          int j0 = row_start + k, j1 = row_start + k + 1;
+          if (!(enabled[j0] && enabled[j1])) continue;
+          float r0 = -rhs[j0], r1 = -rhs[j1];
+          for (int col = 0; col < total_nr; ++col) if (enabled[col]) {
+            r0 += W[j0 * nr + col] * lam[col];
+            r1 += W[j1 * nr + col] * lam[col];
+          }
+          r0 += R[j0] * lam[j0];
+          r1 += R[j1] * lam[j1];
+          float old0 = lam[j0], old1 = lam[j1];
+          float A00 = W[j0 * nr + j0], A11 = W[j1 * nr + j1];
+          float A01 = W[j0 * nr + j1];
+          float mid = 0.5f * (old0 + old1);
+          float y = 0.5f * (old0 - old1);
+          float K1 = A00 + A11 - 2.0f * A01;
+          float K0 = mid * (A00 - A11) + r0 - r1;
+          float ny = y;
+          if (K1 < 1e-15f) {
+            ny = y;
+          } else {
+            ny = -K0 / K1;
+            ny = ny < -mid ? -mid : (ny > mid ? mid : ny);
+          }
+          float f0 = mid + ny, f1 = mid - ny;
+          // costChange with the pair block (R excluded, matching pinned).
+          float d0 = f0 - old0, d1 = f1 - old1;
+          float change = 0.5f * (d0 * (A00 * d0 + A01 * d1) + d1 * (A01 * d0 + A11 * d1))
+              + d0 * r0 + d1 * r1;
+          if (change > 1e-10f) {
+            f0 = old0;
+            f1 = old1;
+            change = 0.0f;
+          }
+          lam[j0] = f0;
+          lam[j1] = f1;
+          improvement -= change;
+        }
+      }
+      // Elliptic friction blocks: QCQP over friction rows given normal.
+      for (int b = 0; b < elliptic_count; ++b) {
+        int start = elliptic_start[b];
+        int dim = elliptic_dim[b];
+        if (!(enabled[start] > 0.5f)) continue;
+        float fn = lam[start];
+        if (fn < 1e-15f) {
+          for (int k = 1; k < dim; ++k) lam[start + k] = 0.0f;
+          continue;
+        }
+        int nf = dim - 1;
+        thread float Ac[36], bc[6], oldf[6], muf[5];
+        for (int i = 0; i < 36; ++i) Ac[i] = 0.0f;
+        for (int i = 0; i < 6; ++i) { bc[i] = 0.0f; oldf[i] = 0.0f; }
+        for (int i = 0; i < 5; ++i) muf[i] = elliptic_friction[b * 5 + i];
+        for (int i = 0; i < nf; ++i) {
+          int ri = start + 1 + i;
+          oldf[i] = lam[ri];
+          float v = -rhs[ri];
+          for (int col = 0; col < total_nr; ++col) if (enabled[col]) v += W[ri * nr + col] * lam[col];
+          v += R[ri] * lam[ri];
+          // Remove own-R (pinned flg_subR) and own-block contribution.
+          v -= R[ri] * lam[ri];
+          for (int j = 0; j < nf; ++j) v -= W[ri * nr + start + 1 + j] * lam[start + 1 + j];
+          bc[i] = v;
+          for (int j = 0; j < nf; ++j) {
+            Ac[i * 6 + j] = W[ri * nr + start + 1 + j];
+          }
+        }
+        thread float qv[6];
+        for (int i = 0; i < 6; ++i) qv[i] = 0.0f;
+        int active = 0;
+        if (nf == 2) active = nsl_qcqp2(qv, Ac, bc, muf, fn);
+        else if (nf == 3) active = nsl_qcqp3(qv, Ac, bc, muf, fn);
+        else active = nsl_qcqpn(qv, Ac, bc, muf, fn, nf);
+        if (active) {
+          float s = 0.0f;
+          for (int j = 0; j < nf; ++j) s += qv[j] * qv[j] / max(muf[j] * muf[j], 1e-30f);
+          s = sqrt(fn * fn / max(1e-15f, s));
+          for (int j = 0; j < nf; ++j) qv[j] *= s;
+        }
+        for (int i = 0; i < nf; ++i) lam[start + 1 + i] = qv[i];
+        // costChange with the friction block (R excluded, matching pinned).
+        float change = 0.0f;
+        for (int i = 0; i < nf; ++i) {
+          float delta = lam[start + 1 + i] - oldf[i];
+          float ad = 0.0f;
+          for (int j = 0; j < nf; ++j) ad += Ac[i * 6 + j] * delta;
+          change += 0.5f * delta * ad + delta * bc[i];
+        }
+        if (change > 1e-10f) {
+          for (int i = 0; i < nf; ++i) lam[start + 1 + i] = oldf[i];
+          change = 0.0f;
+        }
+        improvement -= change;
+      }
+      ns_done++;
+      if (improvement < noslip_tol) break;
+    }
+    out_diagnostics[world * 10 + 1] += float(ns_done);
+    // Re-certify from the final multipliers for the status below
+    // (cone-aware: elliptic member rows use the block certificate).
+    max_res = 0.0f;
+    for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+      int eblock = -1;
+      for (int b = 0; b < elliptic_count; ++b) {
+        int s0 = elliptic_start[b];
+        if (row >= s0 && row < s0 + elliptic_dim[b]) { eblock = b; break; }
+      }
+      if (eblock >= 0) continue;
+      max_res = max(max_res, cert_row_residual(row, W, R, rhs, ar, lam,
+                                               lo, hi, enabled, nr, total_nr,
+                                               -1, 0, lo));
+    }
+    for (int b = 0; b < elliptic_count; ++b) {
+      int start = elliptic_start[b];
+      int dim = elliptic_dim[b];
+      thread float mu[5];
+      for (int k = 0; k < 5; ++k) mu[k] = elliptic_friction[b * 5 + k];
+      max_res = max(max_res, cert_block_residual(start, dim, mu, W, R, rhs,
+                                                 lam, enabled, nr, total_nr));
+    }
+    converged = (max_res <= tol);
   }
 
   // G2: nonfinite residuals fail explicitly (NaN never satisfies `> tol`,

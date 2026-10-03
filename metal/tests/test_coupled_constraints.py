@@ -131,15 +131,29 @@ def test_coupled_lowering_elliptic_cone_is_recorded():
   assert desc.cone_type == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
 
 
-def test_coupled_lowering_rejects_nondefault_noslip_iterations():
+def test_coupled_lowering_admits_noslip_with_validated_budget():
+  # R04: nonzero noslip_iterations lower with an explicit validated budget
+  # (separate no-slip friction stage) instead of being rejected.
   xml = '''<mujoco><option cone="elliptic" noslip_iterations="5"/>
     <worldbody><geom type="plane" size="1 1 .1"/>
       <body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1"
         condim="6"/></body></worldbody></mujoco>'''
   model = mujoco.MjModel.from_xml_string(xml)
   assert model.opt.noslip_iterations == 5
-  with pytest.raises(ValueError, match="noslip_iterations is unsupported"):
-    lower_coupled_constraints(model)
+  desc = lower_coupled_constraints(model)
+  assert desc.noslip_iterations == 5
+  assert desc.noslip_tolerance > 0
+  bad_iters = mujoco.MjModel.from_xml_string(
+      xml.replace('noslip_iterations="5"', 'noslip_iterations="-1"'))
+  with pytest.raises(ValueError, match="noslip_iterations"):
+    lower_coupled_constraints(bad_iters)
+  bad_tol = mujoco.MjModel.from_xml_string(
+      '''<mujoco><option cone="elliptic" noslip_iterations="5" noslip_tolerance="0"/>
+    <worldbody><geom type="plane" size="1 1 .1"/>
+      <body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1"
+        condim="6"/></body></worldbody></mujoco>''')
+  with pytest.raises(ValueError, match="noslip_tolerance"):
+    lower_coupled_constraints(bad_tol)
 
 
 def test_coupled_lowering_maps_solver_selection():
@@ -634,7 +648,9 @@ def test_native_elliptic_multicontact_iteration_exhaustion_is_reported():
   )
   diagnostic = result["solver_diagnostics"][0].cpu().numpy()
   assert int(result["status"][0]) == 3, diagnostic
-  assert diagnostic[1] == 1
+  # One main sweep plus exact block-refinement rounds (R04: refinement also
+  # covers elliptic blocks, matching pyramidal exhaustion behavior).
+  assert diagnostic[1] >= 1, diagnostic
   assert diagnostic[0] > 1e-6, diagnostic
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")

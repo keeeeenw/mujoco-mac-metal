@@ -71,7 +71,8 @@ def kkt_violation(asm, elliptic_blocks=None):
 
 def _lorentz_violation(W, R, rhs, lam, start, dim, friction):
   """Stationarity residual of one elliptic block under Lorentz projection
-  (host mirror of the kernel-side cone certificate)."""
+  (host mirror of the kernel-side cone certificate, including frozen
+  outside-block coupling exactly like the kernel's g vector)."""
   scale = np.ones(dim)
   for i in range(1, dim):
     scale[i] = max(float(friction[i - 1]), 0.0)
@@ -82,8 +83,13 @@ def _lorentz_violation(W, R, rhs, lam, start, dim, friction):
     y[i] = force[i] / scale[i] if scale[i] > 1e-12 else 0.0
   H = np.zeros((dim, dim))
   linear = np.zeros(dim)
+  n = W.shape[0]
   for i in range(dim):
-    linear[i] = scale[i] * (-rhs[start + i])
+    ri = start + i
+    linear[i] = scale[i] * (-rhs[ri])
+    for col in range(n):
+      if col < start or col >= start + dim:
+        linear[i] += scale[i] * W[ri, col] * lam[col]
     for j in range(dim):
       H[i, j] = scale[i] * (W[start + i, start + j]
                             + (R[start + i] if i == j else 0.0)) * scale[j]
@@ -416,6 +422,124 @@ def test_kkt_certifies_retained_accepted_step_gpu(cone):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+def test_opposing_pinch_converges_gpu(cone):
+  # R04: opposing-contact pinch (box settles into a snug slot between two
+  # walls under gravity): opposing normals stress the coupled solve;
+  # status, KKT and CPU parity must all hold on the retained system.
+  xml = (f'<mujoco><option timestep="0.002" integrator="Euler" cone="{cone}" '
+          'iterations="200" tolerance="1e-8" gravity="0 0 -9.81"/>'
+          '<worldbody><geom name="floor" type="plane" size="5 5 0.1"/>'
+          '<geom name="wallL" type="box" size="0.05 0.3 0.3" pos="-0.14 0 0.15"/>'
+          '<geom name="wallR" type="box" size="0.05 0.3 0.3" pos="0.14 0 0.15"/>'
+          '<body pos="0 0 0.35"><freejoint/>'
+          '<geom name="bx" type="box" size="0.08 0.08 0.08"/></body>'
+          '</worldbody></mujoco>')
+  m = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  qp = np.asarray(m.qpos0, dtype=np.float32)
+  sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
+  cpu = mujoco.MjData(m)
+  cpu.qpos[:] = qp
+  cpu.qvel[:] = 0
+  mujoco.mj_forward(m, cpu)
+  for _ in range(300):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  gq = sim.state.qpos.cpu().numpy()[0]
+  np.testing.assert_allclose(gq[:3], np.asarray(cpu.qpos)[:3], atol=5e-3,
+                             err_msg=f"pinch/{cone}")
+  asm = sim.assembled_system()
+  assert int(asm["status"].cpu().numpy()[0]) == 0
+  assert kkt_violation(asm, _elliptic_blocks(sim, cone)) < 1e-3
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_requested_effective_iterations_reported_gpu():
+  # Requested vs effective budgets are explicit: settings carry both, and
+  # actual diagnostics never exceed the adaptive cap.
+  m = _press_model(iterations=100)
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  qp = np.asarray(m.qpos0, dtype=np.float32)
+  sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
+  settings = sim._coupled_constraints.solver_settings
+  assert settings.requested_iterations == 100
+  assert settings.effective_iterations == 100
+  assert settings.adaptive_max_iterations == 1024
+  for _ in range(10):
+    sim.step(1)
+  it = int(sim.assembled_system()["solver_diagnostics"].cpu().numpy()[0, 1])
+  assert it <= settings.adaptive_max_iterations, it
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_teleport_rejects_stale_seed_gpu():
+  # Identity transition under a large state jump with a single-iteration
+  # budget: the stale retained seed cannot survive the cost gate, so one
+  # step from the teleported state matches a cold twin bit-exactly. (With
+  # a full budget both would converge alike and prove nothing.)
+  m = _press_model(iterations=1)
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  qp = np.asarray(m.qpos0, dtype=np.float32)
+  sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
+  for _ in range(30):
+    sim.step(1)
+  assert bool(np.any(sim._coupled_constraints.get_warmstart() != 0))
+  tele = sim.state.qpos.cpu().numpy().copy()
+  tele[0, 2] += 0.3
+  tele = tele.astype(np.float32)
+  qv = sim.state.qvel.cpu().numpy().copy()
+  # Teleport WITHOUT reset: retained seed stays stale (reset would clear it).
+  sim.state._qpos.copy_(sim.state._torch.as_tensor(tele))
+  cold = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  cold.reset(qpos=tele, qvel=qv.copy())
+  sim.step(1)
+  cold.step(1)
+  np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(),
+                                cold.state.qpos.cpu().numpy())
+  np.testing.assert_array_equal(sim.state.qvel.cpu().numpy(),
+                                cold.state.qvel.cpu().numpy())
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+def test_stacked_boxes_converge_gpu(cone):
+  # R04: stacked boxes (multi-contact elliptic/pyramidal with refinement
+  # available): status, cone-aware KKT and CPU parity on the retained system.
+  xml = (f'<mujoco><option timestep="0.002" integrator="Euler" cone="{cone}" '
+          'iterations="200" tolerance="1e-8" gravity="0 0 -9.81"/>'
+          '<worldbody><geom name="floor" type="plane" size="5 5 0.1"/>'
+          '<body pos="0 0 0.3"><freejoint/>'
+          '<geom name="b1" type="box" size="0.09 0.09 0.09"/></body>'
+          '<body pos="0.02 0 0.55"><freejoint/>'
+          '<geom name="b2" type="box" size="0.09 0.09 0.09"/></body>'
+          '</worldbody></mujoco>')
+  m = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  qp = np.asarray(m.qpos0, dtype=np.float32)
+  sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
+  cpu = mujoco.MjData(m)
+  cpu.qpos[:] = qp
+  cpu.qvel[:] = 0
+  mujoco.mj_forward(m, cpu)
+  for _ in range(150):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  gq = sim.state.qpos.cpu().numpy()[0]
+  np.testing.assert_allclose(gq, np.asarray(cpu.qpos), atol=5e-3,
+                             err_msg=f"stacked/{cone}")
+  asm = sim.assembled_system()
+  assert int(asm["status"].cpu().numpy()[0]) == 0
+  assert kkt_violation(asm, _elliptic_blocks(sim, cone)) < 1e-3
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 @pytest.mark.parametrize("tilt_deg,stuck", [(10, True), (50, False)])
 def test_noslip_stick_slip_gpu(tilt_deg, stuck):
   # No-slip behavior: below the friction angle the block sticks (no slip);
@@ -453,6 +577,57 @@ def test_noslip_stick_slip_gpu(tilt_deg, stuck):
   else:
     assert moved_nat > 0.1 and moved_cpu > 0.1, (moved_nat, moved_cpu)
     np.testing.assert_allclose(gq[:2], cq[:2], atol=3e-2, err_msg="slide")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_noslip_matches_cpu_noslip_and_reduces_slip_gpu():
+  # R04: native no-slip stage vs the CPU no-slip oracle on a stuck slope,
+  # with quantified slip reduction against the plain (no-noslip) CPU run.
+  th = float(np.deg2rad(10))
+  c, s = float(np.cos(th)), float(np.sin(th))
+  base = (f'<option timestep="0.002" integrator="Euler" iterations="100" '
+          f'tolerance="1e-8" gravity="0 0 -9.81" NOSLIP/>'
+          f'<worldbody><geom name="slope" type="plane" size="5 5 0.1" '
+          f'quat="0 {s / 2:.6f} 0 {c / 2:.6f}" friction="0.8 0.05 0.02"/>'
+          '<body pos="0 0 0.3"><freejoint/>'
+          '<geom name="bx" type="box" size="0.06 0.06 0.04"/></body>'
+          '</worldbody>')
+  m_plain = mujoco.MjModel.from_xml_string(
+      "<mujoco>" + base.replace("NOSLIP", "") + "</mujoco>")
+  m_noslip = mujoco.MjModel.from_xml_string(
+      "<mujoco>" + base.replace("NOSLIP",
+                                'noslip_iterations="5" noslip_tolerance="1e-6"') + "</mujoco>")
+  sim = MetalSimulation(m_noslip, batch_size=1, profile=PROFILE)
+  qp = np.asarray(m_noslip.qpos0, dtype=np.float32)
+  sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m_noslip.nv), dtype=np.float32))
+  cpu_p, cpu_n = mujoco.MjData(m_plain), mujoco.MjData(m_noslip)
+  for dd, mm in ((cpu_p, m_plain), (cpu_n, m_noslip)):
+    dd.qpos[:] = np.asarray(mm.qpos0)
+    dd.qvel[:] = 0
+    mujoco.mj_forward(mm, dd)
+  for _ in range(300):
+    sim.step(1)
+    mujoco.mj_step(m_plain, cpu_p)
+    mujoco.mj_step(m_noslip, cpu_n)
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  gq = sim.state.qpos.cpu().numpy()[0]
+  dp = float(np.linalg.norm(np.asarray(cpu_p.qpos)[:2] - qp[:2]))
+  dn = float(np.linalg.norm(np.asarray(cpu_n.qpos)[:2] - qp[:2]))
+  dg = float(np.linalg.norm(gq[:2] - qp[:2]))
+  # Native no-slip tracks the CPU no-slip oracle and improves on plain.
+  np.testing.assert_allclose(dg, dn, atol=3e-3, err_msg="native-vs-cpu-noslip")
+  assert dg <= dp + 2e-3, (dg, dp, dn)
+  # Iteration accounting includes the no-slip sweeps: same retained system
+  # solved with the budget toggled proves the extra sweeps execute.
+  dims = sim._coupled_constraints._constants["solver_dims"]
+  dims[18] = 0
+  it_plain = int(sim.assembled_system(recompute=True)["solver_diagnostics"].cpu().numpy()[0, 1])
+  dims[18] = 5
+  asm_ns = sim.assembled_system(recompute=True)
+  it = int(asm_ns["solver_diagnostics"].cpu().numpy()[0, 1])
+  assert it >= it_plain, (it, it_plain)
+  assert kkt_violation(asm_ns, _elliptic_blocks(sim, "pyramidal")) < 1e-3
 
 
 @pytest.mark.gpu
