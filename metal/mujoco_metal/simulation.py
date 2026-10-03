@@ -497,6 +497,14 @@ class MetalSimulation:
     self._clear_held_inputs(env_ids)
     if getattr(self, "_coupled_constraints", None) is not None:
       self._coupled_constraints.clear_warmstart(env_ids=env_ids)
+    if getattr(self, "_sensordata", None) is not None:
+      # Stored step samples are state: reset zeroes selected worlds.
+      if env_ids is None:
+        self._sensordata.zero_()
+      else:
+        ids = self._state._env_ids(env_ids)
+        if ids.size:
+          self._sensordata[ids.tolist()] = 0.0
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -573,6 +581,13 @@ class MetalSimulation:
     # Keyframe reset is cold like reset.
     if getattr(self, "_coupled_constraints", None) is not None:
       self._coupled_constraints.clear_warmstart(env_ids=env_ids)
+    if getattr(self, "_sensordata", None) is not None:
+      if env_ids is None:
+        self._sensordata.zero_()
+      else:
+        ids = self._state._env_ids(env_ids)
+        if ids.size:
+          self._sensordata[ids.tolist()] = 0.0
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -730,8 +745,9 @@ class MetalSimulation:
     """Evaluate supported stateless sensors at CURRENT state on MPS.
 
     This is an explicit forward-stage query, not the pre-integration sample
-    left by MuJoCo mj_step. Re-evaluation makes reset/restore immediately visible.
-    Returned values are detached copies owned by the caller.
+    left by MuJoCo mj_step (see step_sensordata). Re-evaluation makes
+    reset/restore immediately visible. Returned values are detached copies
+    owned by the caller.
     """
     if self._sensors is None:
       raise ValueError("sensor_values requires a sensor stepping profile")
@@ -742,9 +758,54 @@ class MetalSimulation:
     poses = dict(
         dynamics["poses"], cvel=dynamics["cvel"], root_com=dynamics["root_com"]
     )
-    return self._sensors.run_device(
-        state._qpos, state._qvel, state._time, poses
-    ).clone()
+    torch = state._torch
+    b = state.batch_size
+    base = torch.zeros((b, self._mjmodel.nsensordata), dtype=torch.float32,
+                       device=state._device)
+    out = self._sensors.run_device(
+        state._qpos, state._qvel, state._time, poses, sensordata=base)
+    out = self._run_state_sensors(state._qpos, state._qvel, poses, dynamics,
+                                  out=out)
+    return out.clone()
+
+  def _state_sensor_inputs(self, qpos, qvel, poses, dynamics):
+    """Borrowed (ten_spa_len, ten_spa_vel, act_dyn_len, act_dyn_vel, kind).
+
+    Computes spatial/general kinematics scratch synchronously (no readback)
+    so tendon/actuator state sensors observe the given state. Returns
+    ``None`` views when the driving stage is absent.
+    """
+    ten_l = ten_v = act_l = act_v = None
+    kind = 0
+    if getattr(self, "_spatial_tendons", None) is not None:
+      self._spatial_jacobian(qvel, poses)
+      kin = self._spatial_kin
+      ten_l = kin["length"].reshape(self._state.batch_size, -1)
+      ten_v = kin["velocity"].reshape(self._state.batch_size, -1)
+    if getattr(self, "_actuators", None) is not None:
+      kind = 1
+      actuators = self._actuators
+      contacts = None
+      if actuators.meta.has_body_transmission:
+        if self._coupled_constraints is None:
+          raise ValueError("BODY transmissions require the coupled constraint stage")
+        self._coupled_constraints._constants["body_dims"][3] = actuators.meta.nu
+        self._coupled_constraints.generate_candidates(poses, qvel)
+        contacts = self._coupled_constraints.contact_buffers()
+      kin = actuators.run_kinematics(qpos, qvel, poses, contacts)
+      act_l = kin["length"].reshape(self._state.batch_size, -1)
+      act_v = kin["velocity"].reshape(self._state.batch_size, -1)
+    return ten_l, ten_v, act_l, act_v, kind
+
+  def _run_state_sensors(self, qpos, qvel, poses, dynamics, out):
+    """Evaluate milestone-016 state families into ``out`` (borrowed)."""
+    ten_l, ten_v, act_l, act_v, kind = self._state_sensor_inputs(
+        qpos, qvel, poses, dynamics)
+    mm = dynamics.get("mass_matrix", None)
+    return self._sensors.run_state_device(
+        qpos, qvel, poses, mass_matrix=mm,
+        ten_spa_len=ten_l, ten_spa_vel=ten_v,
+        act_dyn_len=act_l, act_dyn_vel=act_v, act_kind=kind, out=out)
 
   def assembled_system(self, *, ctrl=None, qfrc_applied=None, recompute=False):
     """Return the coupled constraint system tensors on MPS.
@@ -1093,6 +1154,11 @@ class MetalSimulation:
     state = self._state
     for _ in range(int(steps)):
       if self._rk4 is not None:
+        if self._sensors is not None:
+          # Pinned RK4 evaluates the outer forward (with sensors) at the
+          # step-start state; intermediate stages skip sensing.
+          fwd_acc, _, fwd_dyn = self._acceleration(state._qpos, state._qvel)
+          self._store_step_sensors(state._qpos, state._qvel, fwd_dyn)
         qpos, qvel, acceleration, time, status = self._rk4.run_device(
             state._qpos,
             state._qvel,
@@ -1111,6 +1177,10 @@ class MetalSimulation:
       acceleration, solve_status, dynamics = self._acceleration(
           state._qpos, state._qvel
       )
+      if self._sensors is not None:
+        # Stored step-stage sample at the pre-integration (forward) state,
+        # matching pinned mj_step sensor timing; see step_sensordata.
+        self._store_step_sensors(state._qpos, state._qvel, dynamics)
       integration_acceleration = acceleration
       next_velocity = position_velocity = None
       if self._implicitfast is not None:
@@ -1191,6 +1261,36 @@ class MetalSimulation:
         state._act, self._next_act = self._next_act, state._act
       state._generation += 1
     return state._status
+
+  def step_sensordata(self):
+    """Return a host copy of the stored step-stage sensor sample.
+
+    The sample is taken at every step's pre-integration forward state for
+    the model's position/velocity stages (acceleration stages join in the
+    force-family milestone), exactly the values MuJoCo's ``mj_step`` leaves
+    in ``d->sensordata``. This differs from :meth:`sensor_values`, which
+    re-evaluates at the current (post-step) state. Reset zeroes the sample;
+    a state restore leaves it untouched until the next step recomputes it.
+    """
+    if self._sensors is None or self._sensordata is None:
+      raise ValueError("step_sensordata requires a sensor stepping profile")
+    return self._sensordata.detach().cpu().numpy().copy()
+
+  def _store_step_sensors(self, qpos, qvel, dynamics):
+    """Evaluate position/velocity sensor stages into persistent storage."""
+    import mujoco as _mj
+    torch = self._state._torch
+    if self._sensordata is None:
+      self._sensordata = torch.zeros(
+          (self._state.batch_size, self._mjmodel.nsensordata),
+          dtype=torch.float32, device=self._state._device)
+    poses = dict(dynamics["poses"], cvel=dynamics["cvel"],
+                 root_com=dynamics["root_com"])
+    stages = [_mj.mjtStage.mjSTAGE_POS, _mj.mjtStage.mjSTAGE_VEL]
+    old = self._sensors.run_device(
+        qpos, qvel, self._state._time, poses, stages=tuple(stages))
+    merged = self._run_state_sensors(qpos, qvel, poses, dynamics, out=old)
+    self._sensordata.copy_(merged)
 
   def _advance_activations(self, state):
     """Advance activation state with pinned mj_nextActivation semantics.

@@ -36,6 +36,22 @@ inline void write3(device float* a, uint i, float3 v) {
 inline void write4(device float* a, uint i, float4 v) {
   a[i]=v.x; a[i+1]=v.y; a[i+2]=v.z; a[i+3]=v.w;
 }
+inline float3x3 qmat(float4 q) {
+  float x=q.y, y=q.z, z=q.w, w=q.x;
+  return float3x3(
+    1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w),
+    2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w),
+    2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y));
+}
+inline float3 sub_quat(float4 qa, float4 qb) {
+  qa=qunit(qa); qb=qunit(qb);
+  float4 d=qmul(float4(qb.x,-qb.yzw),qa);
+  float s=length(d.yzw);
+  if (s<1e-12f) return float3(0.0f);
+  float speed=2.0f*atan2(s,d.x);
+  if (speed>M_PI_F) speed-=2.0f*M_PI_F;
+  return d.yzw*(speed/s);
+}
 
 inline void frame_pose(int type, int id, uint world, constant int* dims,
     device const float* body_pos, device const float* body_quat,
@@ -118,6 +134,13 @@ kernel void evaluate_sensors(
   uint world=index/nsensor, i=index-world*nsensor;
   uint stage=uint(sensor_needstage[i]);
   if ((uint(stage_mask[0]) & (1u<<stage)) == 0) return;
+  int typ0=sensor_type[i];
+  // This kernel serves the 14 baseline families only; milestone-016 state,
+  // force and spatial families are evaluated by dedicated kernels.
+  bool legacy = typ0==9||typ0==10||typ0==18||typ0==19||typ0==26||typ0==27
+      ||typ0==28||typ0==29||typ0==30||typ0==45||typ0==31||typ0==32
+      ||typ0==2||typ0==3;
+  if (!legacy) return;
   uint adr=uint(sensor_adr[i]), dim=uint(sensor_dim[i]);
   int typ=sensor_type[i], jid=sensor_objid[i];
   float value[4] = {0.0f,0.0f,0.0f,0.0f};
@@ -196,4 +219,319 @@ kernel void evaluate_sensors(
   }
   uint base=world*ndata+adr;
   for (uint j=0;j<dim;j++) output[base+j]=value[j];
+}
+
+// Milestone 016 state families: tendon/actuator/limit/subtree/insidesite/
+// energy/magnetometer. Tendon length/velocity = fixed linear maps plus the
+// spatial kinematics workspace (zero rows for fixed tendons); actuator
+// length/velocity = stateless linear maps, or the general kinematics
+// workspace when act_kind==1. Joint/tendon limit distances reuse the
+// coupled-assembly formulas (lower row first).
+kernel void evaluate_state_sensors(
+    device const float* qpos [[buffer(0)]],
+    device const float* qvel [[buffer(1)]],
+    device const float* body_pos [[buffer(2)]],
+    device const float* inertial_pos [[buffer(3)]],
+    device const float* inertial_quat [[buffer(4)]],
+    device const float* body_quat [[buffer(5)]],
+    device const float* site_pos [[buffer(6)]],
+    device const float* site_quat [[buffer(7)]],
+    device const float* cvel [[buffer(8)]],
+    device const float* root_com [[buffer(9)]],
+    device const float* mass_matrix [[buffer(10)]],
+    device const float* ten_fix_lmap [[buffer(11)]],
+    device const float* ten_fix_mmap [[buffer(12)]],
+    device const float* ten_spa_len [[buffer(13)]],
+    device const float* ten_spa_vel [[buffer(14)]],
+    device const float* act_stat_lmap [[buffer(15)]],
+    device const float* act_stat_mmap [[buffer(16)]],
+    device const float* act_dyn_len [[buffer(17)]],
+    device const float* act_dyn_vel [[buffer(18)]],
+    device const int* meta [[buffer(19)]],
+    device const float* geom_pos [[buffer(20)]],
+    device const int* jnt_meta [[buffer(21)]],
+    device const float* jnt_lim [[buffer(22)]],
+    device const float* ten_lim [[buffer(23)]],
+    device const float* massub [[buffer(24)]],
+    device const int* body_tree [[buffer(25)]],
+    device const float* site_geom [[buffer(26)]],
+    device const float* econst [[buffer(27)]],
+    constant int* dims [[buffer(28)]],
+    device float* output [[buffer(29)]],
+    constant int* stage_mask [[buffer(30)]],
+    uint index [[thread_position_in_grid]]) {
+  // meta per sensor (10 ints): type, datatype, needstage, objtype, objid,
+  //   dim, adr, cutoff_bits, reftype, refid.
+  // jnt_meta per joint (4 ints): type, qposadr, dofadr, limited.
+  // jnt_lim per joint (3 floats): range0, range1, margin.
+  // ten_lim per tendon (9 floats): range0, range1, margin, ls0, ls1, k, p0,
+  //   p1, limited.
+  // massub per body (5 floats): mass, subtreemass, ix, iy, iz.
+  // body_tree per body (2 ints): parent, rootid.
+  // site_geom per site (4 floats): size0, size1, size2, type.
+  // econst: gravity(3), magnetic(3), dis_spring, dis_damper, dis_gravity,
+  //   nq, qpos_spring(nq), jnt_k(njnt), jnt_p0(njnt), jnt_p1(njnt).
+  // dims (14 ints): nsensor, ndata, nq, nv, njnt, nbody, ngeom, nsite, batch,
+  //   disable, ntendon, nu, act_kind, has_mass.
+  uint nsensor=uint(dims[0]), ndata=uint(dims[1]), nq=uint(dims[2]);
+  uint nv=uint(dims[3]), njnt=uint(dims[4]), nbody=uint(dims[5]);
+  uint nsite=uint(dims[7]), batch=uint(dims[8]);
+  uint nt=uint(dims[10]), nu=uint(dims[11]);
+  uint act_kind=uint(dims[12]), has_mass=uint(dims[13]);
+  if (index >= batch*nsensor || (dims[9] & 8192)) return;
+  if (nbody > 64) return;
+  uint world=index/nsensor, i=index-world*nsensor;
+  uint stage=uint(meta[i*10+2]);
+  if ((uint(stage_mask[0]) & (1u<<stage)) == 0) return;
+  int typ=meta[i*10+0], objid=meta[i*10+4];
+  // This kernel serves POS/VEL state families only; force, contact and
+  // spatial families have dedicated kernels.
+  bool handled = typ==11||typ==12||typ==13||typ==14||typ==20||typ==21
+      ||typ==23||typ==24||typ==6||typ==35||typ==36||typ==37||typ==38
+      ||typ==43||typ==44;
+  if (!handled) return;
+  uint dim=uint(meta[i*10+5]), adr=uint(meta[i*10+6]);
+  float value[6] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+  uint qb=world*nq, vb=world*nv;
+  float ten_len=0.0f, ten_vel=0.0f;
+  bool need_ten=(typ==11||typ==12||typ==23||typ==24);
+  if (need_ten && objid>=0 && uint(objid)<nt) {
+    uint t=uint(objid);
+    for (uint q=0;q<nq;++q) ten_len+=ten_fix_lmap[t*nq+q]*qpos[qb+q];
+    for (uint d=0;d<nv;++d) ten_vel+=ten_fix_mmap[t*nv+d]*qvel[vb+d];
+    ten_len+=ten_spa_len[world*nt+t];
+    ten_vel+=ten_spa_vel[world*nt+t];
+  }
+  float act_len=0.0f, act_vel=0.0f;
+  bool need_act=(typ==13||typ==14);
+  if (need_act && objid>=0 && uint(objid)<nu) {
+    uint a=uint(objid);
+    if (act_kind==1) {
+      act_len=act_dyn_len[world*nu+a];
+      act_vel=act_dyn_vel[world*nu+a];
+    } else {
+      for (uint q=0;q<nq;++q) act_len+=act_stat_lmap[a*nq+q]*qpos[qb+q];
+      for (uint d=0;d<nv;++d) act_vel+=act_stat_mmap[a*nv+d]*qvel[vb+d];
+    }
+  }
+  if (typ==11) value[0]=ten_len;
+  else if (typ==12) value[0]=ten_vel;
+  else if (typ==13) value[0]=act_len;
+  else if (typ==14) value[0]=act_vel;
+  else if (typ==20 || typ==21) {
+    if (objid>=0 && uint(objid)<njnt && jnt_meta[uint(objid)*4+3]!=0) {
+      uint j=uint(objid);
+      int jt=jnt_meta[j*4+0];
+      float r0=jnt_lim[j*3+0], r1=jnt_lim[j*3+1], margin=jnt_lim[j*3+2];
+      if (jt==2 || jt==3) {
+        int q=jnt_meta[j*4+1], d=jnt_meta[j*4+2];
+        bool has = d>=0 && uint(d)<nv;
+        float d0 = has ? qpos[qb+uint(q)]-r0 : 1e30f;
+        float d1 = has ? r1-qpos[qb+uint(q)] : 1e30f;
+        if (typ==20) {
+          if (d0<margin) value[0]=d0-margin;
+          else if (d1<margin) value[0]=d1-margin;
+        } else {
+          float v = has ? qvel[vb+uint(d)] : 0.0f;
+          if (d0<margin) value[0]=v;
+          else if (d1<margin) value[0]=-v;
+        }
+      } else if (jt==1) {
+        int q=jnt_meta[j*4+1], d=jnt_meta[j*4+2];
+        float4 quat=float4(qpos[qb+uint(q)],qpos[qb+uint(q)+1],qpos[qb+uint(q)+2],qpos[qb+uint(q)+3]);
+        float nq4=length(quat);
+        quat=nq4>1e-30f ? quat/nq4 : float4(1,0,0,0);
+        float3 vv=quat.yzw;
+        float s=length(vv);
+        float speed=2.0f*atan2(s,quat.x);
+        if (speed>3.14159265358979f) speed-=2.0f*3.14159265358979f;
+        float rmax=max(r0,r1);
+        float dist=rmax-speed;
+        if (typ==20) value[0]=dist<margin ? dist-margin : 0.0f;
+        else {
+          float vel=0.0f;
+          float3 naxis=s>1e-30f ? vv/max(s,1e-30f) : float3(0.0f);
+          for (int k=0;k<3;++k) {
+            int dof=d+k;
+            if (dof>=0 && uint(dof)<nv) vel+=-naxis[k]*qvel[vb+uint(dof)];
+          }
+          value[0]=dist<margin ? vel : 0.0f;
+        }
+      }
+    }
+  }
+  else if (typ==23 || typ==24) {
+    if (objid>=0 && uint(objid)<nt && ten_lim[uint(objid)*9+8]>0.5f) {
+      uint t=uint(objid);
+      float r0=ten_lim[t*9+0], r1=ten_lim[t*9+1], margin=ten_lim[t*9+2];
+      float d0=-(r0-ten_len), d1=(r1-ten_len);
+      if (typ==23) {
+        if (d0<margin) value[0]=d0-margin;
+        else if (d1<margin) value[0]=d1-margin;
+      } else {
+        // Row Jacobian is -side*Jrow: lower (side -1) reads +ten_vel.
+        if (d0<margin) value[0]=ten_vel;
+        else if (d1<margin) value[0]=-ten_vel;
+      }
+    }
+  }
+  else if (typ==6) {
+    float4 q=qunit(read4(site_quat,(world*nsite+uint(objid))*4));
+    float3 v=qrot(qconj(q),float3(econst[3],econst[4],econst[5]));
+    value[0]=v.x; value[1]=v.y; value[2]=v.z;
+  }
+  else if (typ>=35 && typ<=38) {
+    // Shared subtree pass (pinned mj_subtreeVel): per-body COM velocity
+    // from com-based cvel, mass-weighted backward accumulation.
+    float3 xipos[64], vcom[64], scom[64], slin[64], sang[64];
+    for (uint k=0;k<nbody;++k) {
+      xipos[k]=read3(inertial_pos,(world*nbody+k)*3);
+      float3 w=read3(cvel,(world*nbody+k)*6);
+      float3 vr=read3(cvel,(world*nbody+k)*6+3);
+      uint root=uint(body_tree[k*2+1]);
+      vcom[k]=vr+cross(w,xipos[k]-read3(root_com,(world*nbody+root)*3));
+      scom[k]=xipos[k];
+      slin[k]=massub[k*5+0]*vcom[k];
+      float4 iq=qunit(read4(inertial_quat,(world*nbody+k)*4));
+      float3 dv=qrot(qconj(iq),w);
+      dv*=float3(massub[k*5+2],massub[k*5+3],massub[k*5+4]);
+      sang[k]=qrot(iq,dv);
+    }
+    for (int k=int(nbody)-1;k>0;--k) {
+      uint p=uint(body_tree[uint(k)*2+0]);
+      slin[p]+=slin[uint(k)];
+    }
+    float smass[64];
+    for (uint k=0;k<nbody;++k) smass[k]=massub[k*5+0];
+    for (int k=int(nbody)-1;k>0;--k) smass[uint(body_tree[uint(k)*2+0])]+=smass[uint(k)];
+    for (uint k=0;k<nbody;++k) scom[k]=xipos[k];
+    for (int k=int(nbody)-1;k>0;--k) {
+      uint p=uint(body_tree[uint(k)*2+0]);
+      scom[p]=(scom[p]*(smass[p]-smass[uint(k)])+scom[uint(k)]*smass[uint(k)])/max(smass[p],1e-30f);
+    }
+    float3 slv[64];
+    for (uint k=0;k<nbody;++k) {
+      float sm=smass[k];
+      slv[k]=sm>1e-30f ? slin[k]/sm : float3(0.0f);
+    }
+    if (typ==35) {
+      value[0]=scom[uint(objid)].x; value[1]=scom[uint(objid)].y; value[2]=scom[uint(objid)].z;
+    } else if (typ==36) {
+      float3 lv=slv[uint(objid)];
+      value[0]=lv.x; value[1]=lv.y; value[2]=lv.z;
+    } else if (typ==37) {
+      for (int k=int(nbody)-1;k>0;--k) {
+        uint kk=uint(k), pp=uint(body_tree[kk*2+0]);
+        float3 dx=xipos[kk]-scom[kk];
+        float3 dvv=vcom[kk]-slv[kk];
+        sang[kk]+=cross(dx,massub[kk*5+0]*dvv);
+        sang[pp]+=sang[kk];
+        float3 dx2=scom[kk]-scom[pp];
+        float3 dv2=slv[kk]-slv[pp];
+        sang[pp]+=cross(dx2,smass[kk]*dv2);
+      }
+      value[0]=sang[uint(objid)].x; value[1]=sang[uint(objid)].y; value[2]=sang[uint(objid)].z;
+    } else {
+      // Pinned INSIDESITE (massless-body rule uses subtree com).
+      // Site zone types share mjtGeom values: 2 sphere, 3 capsule,
+      // 4 ellipsoid, 5 cylinder, 6 box, 0 plane.
+      float3 pp;
+      int otype=meta[i*10+3];
+      if (otype==1) {
+        pp=read3(inertial_pos,(world*nbody+uint(objid))*3);
+        if (objid>0 && massub[uint(objid)*5+0]<1e-15f
+            && massub[uint(objid)*5+1]>=1e-15f) pp=scom[uint(objid)];
+      }
+      else if (otype==2) pp=read3(body_pos,(world*nbody+uint(objid))*3);
+      else if (otype==5) pp=read3(geom_pos,(world*uint(dims[6])+uint(objid))*3);
+      else pp=read3(site_pos,(world*nsite+uint(objid))*3);
+      uint s=uint(meta[i*10+9]);
+      float3 sp=read3(site_pos,(world*nsite+s)*3);
+      float4 sq=qunit(read4(site_quat,(world*nsite+s)*4));
+      float3 vec=pp-sp;
+      float3 pl=qrot(qconj(sq),vec);
+      float st=site_geom[s*4+3];
+      float sx=site_geom[s*4+0], sy=site_geom[s*4+1], sz=site_geom[s*4+2];
+      bool inside=false;
+      if (st==2.0f) inside=dot(vec,vec)<sx*sx;
+      else if (st==3.0f) {
+        float zc=clamp(pl.z,-sy,sy);
+        inside=pl.x*pl.x+pl.y*pl.y+(pl.z-zc)*(pl.z-zc)<sx*sx;
+      }
+      else if (st==4.0f) inside=(pl.x*pl.x/(sx*sx)+pl.y*pl.y/(sy*sy)+pl.z*pl.z/(sz*sz))<1.0f;
+      else if (st==5.0f) inside=(abs(pl.z)<sy && pl.x*pl.x+pl.y*pl.y<sx*sx);
+      else if (st==6.0f) inside=(abs(pl.x)<sx && abs(pl.y)<sy && abs(pl.z)<sz);
+      else if (st==0.0f) inside=(pl.z<0.0f);
+      value[0]=inside ? 1.0f : 0.0f;
+    }
+  }
+  else if (typ==43 || typ==44) {
+    // Pinned mj_energyPos / mj_energyVel (no flex, no sleep).
+    if (typ==43) {
+      float e=0.0f;
+      float dis_spring=econst[6], dis_gravity=econst[8];
+      if (dis_gravity==0.0f) {
+        float3 g=float3(econst[0],econst[1],econst[2]);
+        for (uint b=1;b<nbody;++b)
+          e-=massub[b*5+0]*dot(g,read3(inertial_pos,(world*nbody+b)*3));
+      }
+      if (dis_spring==0.0f) {
+        uint nq2=uint(econst[9]);
+        for (uint j=0;j<njnt;++j) {
+          int jt=jnt_meta[j*4+0];
+          float k=econst[10+nq2+j*3+0], p0=econst[10+nq2+j*3+1], p1=econst[10+nq2+j*3+2];
+          if (k==0.0f && p0==0.0f && p1==0.0f) continue;
+          if (jt==2 || jt==3) {
+            uint q=uint(jnt_meta[j*4+1]);
+            float x=qpos[qb+q]-econst[10+q];
+            e+=0.5f*k*x*x+p0/3.0f*x*x*x+p1/4.0f*x*x*x*x;
+          } else if (jt==0) {
+            uint q=uint(jnt_meta[j*4+1]);
+            float3 dif=read3(qpos,qb+q)-float3(econst[10+q],econst[10+q+1],econst[10+q+2]);
+            float x=length(dif);
+            e+=0.5f*k*x*x+p0/3.0f*x*x*x+p1/4.0f*x*x*x*x;
+            float4 qc=qunit(read4(qpos,qb+q+3)), qr=qunit(float4(econst[10+q+3],econst[10+q+4],econst[10+q+5],econst[10+q+6]));
+            float3 dq=sub_quat(qc,qr);
+            float xr=length(dq);
+            e+=0.5f*k*xr*xr+p0/3.0f*xr*xr*xr+p1/4.0f*xr*xr*xr*xr;
+          } else if (jt==1) {
+            uint q=uint(jnt_meta[j*4+1]);
+            float4 qc=qunit(read4(qpos,qb+q));
+            float4 qr=qunit(float4(econst[10+q],econst[10+q+1],econst[10+q+2],econst[10+q+3]));
+            float xr=length(sub_quat(qc,qr));
+            e+=0.5f*k*xr*xr+p0/3.0f*xr*xr*xr+p1/4.0f*xr*xr*xr*xr;
+          }
+        }
+        for (uint t=0;t<nt;++t) {
+          float k=ten_lim[t*9+5], pp0=ten_lim[t*9+6], pp1=ten_lim[t*9+7];
+          if (k==0.0f && pp0==0.0f && pp1==0.0f) continue;
+          float L=0.0f;
+          for (uint q=0;q<nq;++q) L+=ten_fix_lmap[t*nq+q]*qpos[qb+q];
+          L+=ten_spa_len[world*nt+t];
+          float lo=ten_lim[t*9+3], hi=ten_lim[t*9+4];
+          float x=L>hi ? L-hi : (L<lo ? L-lo : 0.0f);
+          e+=0.5f*k*x*x+pp0/3.0f*x*x*x+pp1/4.0f*x*x*x*x;
+        }
+      }
+      value[0]=e;
+    } else {
+      float e=0.0f;
+      if (has_mass!=0) {
+        for (uint r=0;r<nv;++r) {
+          float s=0.0f;
+          for (uint c=0;c<nv;++c) s+=mass_matrix[(world*nv+r)*nv+c]*qvel[vb+c];
+          e+=0.5f*s*qvel[vb+r];
+        }
+      }
+      value[0]=e;
+    }
+  }
+  float cutoff=as_type<float>(meta[i*10+7]);
+  if (cutoff>0 && meta[i*10+1]==0) {
+    for (uint j=0;j<dim;j++) value[j]=clamp(value[j],-cutoff,cutoff);
+  } else if (cutoff>0 && meta[i*10+1]==1) {
+    for (uint j=0;j<dim;j++) value[j]=min(value[j],cutoff);
+  }
+  uint base=world*ndata+adr;
+  for (uint j=0;j<dim && j<6;j++) output[base+j]=value[j];
 }
