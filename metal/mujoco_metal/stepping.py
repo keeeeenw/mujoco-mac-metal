@@ -565,6 +565,11 @@ def validate_stepping_profile(
       raise TypeError("model must be a compiled mujoco.MjModel")
     if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_RK4):
       raise ValueError(f"{profile} requires the RK4 integrator")
+    if int(model.na) > 0:
+      # Pinned RK4 integrates actuator activation state (act_dot) at every
+      # stage; the native RK4 path holds controls with frozen activation.
+      # Reject rather than silently integrate wrong dynamics (015).
+      raise ValueError(f"{profile} excludes actuator activation state; use Euler")
     reference = copy.copy(model)
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
     result = validate_stepping_profile(
