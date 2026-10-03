@@ -348,7 +348,7 @@ def test_articulated_triangle_bend_tangent_matches_pinned_qpos_difference():
         <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
         <flexcomp name="shell" type="grid" count="2 2 1"
                   pos=".13 .21 -.07" spacing=".1 .1 .1" mass="1" dim="2">
-          <contact contype="0" conaffinity="0"/>
+          <contact contype="0" conaffinity="0" selfcollide="none"/>
           <elasticity young="3000" poisson=".2" damping=".15"
                       thickness=".02" elastic2d="bend"/>
         </flexcomp>
@@ -468,6 +468,222 @@ def test_interpolated_q1_volume_uses_compiled_element_matrix():
   assert flex._interp_count == 1
   assert np.max(np.abs(data.qfrc_passive)) > 1e-4
   np.testing.assert_allclose(force, data.qfrc_passive, rtol=2e-4, atol=8e-6)
+
+
+def test_interpolated_material_operators_are_separate_and_reused():
+  MetalFlex, _ = _flex_api()
+  model = mujoco.MjModel.from_xml_string("""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <flexcomp name="q1" type="grid" count="2 2 2"
+                spacing=".1 .1 .1" mass="1" dim="3" dof="trilinear">
+        <contact contype="0" conaffinity="0" selfcollide="none"/>
+        <elasticity young="1000" poisson=".2" damping=".1"/>
+      </flexcomp>
+    </worldbody></mujoco>
+  """)
+  qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+  qpos[3] += 0.02
+  data = mujoco.MjData(model)
+  data.qpos[:] = qpos
+  mujoco.mj_forward(model, data)
+  root_com = _root_com(model, data)
+  poses = {
+      "body_pos": torch.tensor(data.xpos[None], dtype=torch.float32),
+      "body_quat": torch.tensor(data.xquat[None], dtype=torch.float32),
+      "joint_anchor": torch.tensor(data.xanchor[None], dtype=torch.float32),
+      "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32),
+      "root_com": torch.tensor(root_com[None], dtype=torch.float32),
+  }
+  flex = MetalFlex(model, device="cpu")
+  operators = flex.run_material_operators(
+      torch.tensor(qpos[None], dtype=torch.float32),
+      torch.tensor(data.qvel[None], dtype=torch.float32), poses,
+      torch.tensor(data.cvel[None], dtype=torch.float32))
+  assert set(operators) == {
+      "interp_stiffness", "interp_damped_stiffness", "bend_stiffness",
+      "bend_damped_stiffness", "edge_velocity_derivative"}
+  interp = operators["interp_stiffness"]
+  damped = operators["interp_damped_stiffness"]
+  assert interp.shape == (1, model.nv, model.nv)
+  assert interp.dtype == torch.float32 and interp.is_contiguous()
+  assert float(torch.linalg.vector_norm(interp)) > 1.0
+  torch.testing.assert_close(interp, interp.transpose(1, 2), rtol=1e-5, atol=2e-5)
+  torch.testing.assert_close(damped, 0.1 * interp, rtol=2e-5, atol=2e-6)
+  ptr = interp.data_ptr()
+  second = flex.run_material_operators(
+      torch.tensor(qpos[None], dtype=torch.float32),
+      torch.tensor(data.qvel[None], dtype=torch.float32), poses,
+      torch.tensor(data.cvel[None], dtype=torch.float32))
+  assert second["interp_stiffness"].data_ptr() == ptr
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_SPRING)
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
+  disabled_ops = MetalFlex(model, device="cpu").run_material_operators(
+      torch.tensor(qpos[None], dtype=torch.float32),
+      torch.tensor(data.qvel[None], dtype=torch.float32), poses,
+      torch.tensor(data.cvel[None], dtype=torch.float32))
+  # MuJoCo's implicit flex correction does not apply passive spring/damper
+  # disable bits to the frozen interpolation K/Kd operators. The separate
+  # flex-edge qDeriv path does honor the damper disable bit.
+  for name in ("interp_stiffness", "interp_damped_stiffness",
+               "bend_stiffness", "bend_damped_stiffness"):
+    torch.testing.assert_close(disabled_ops[name], second[name])
+  assert not torch.any(disabled_ops["edge_velocity_derivative"])
+
+
+def test_pinned_implicit_flex_correction_survives_passive_disable_flags():
+  model = mujoco.MjModel.from_xml_string("""
+    <mujoco><option gravity="0 0 0" integrator="implicit"
+                    timestep=".002"/><worldbody>
+      <flexcomp name="q1" type="grid" count="2 2 2"
+                spacing=".1 .1 .1" mass="1" dim="3" dof="trilinear">
+        <contact contype="0" conaffinity="0" selfcollide="none"/>
+        <elasticity young="1000" poisson=".2" damping=".1"/>
+      </flexcomp>
+    </worldbody></mujoco>
+  """)
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_SPRING)
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
+  data = mujoco.MjData(model)
+  data.qvel[:] = np.linspace(-0.2, 0.3, model.nv)
+  mujoco.mj_forward(model, data)
+  np.testing.assert_array_equal(data.qfrc_passive, np.zeros(model.nv))
+  assert not np.any(data.qacc)
+  qvel0 = np.asarray(data.qvel).copy()
+  mujoco.mj_step(model, data)
+  # The passive force is disabled, but pinned flexInterp_cgsolve still applies
+  # compiled K/Kd in its velocity correction.
+  assert np.max(np.abs(data.qvel - qvel0)) > 1e-5
+
+
+def test_attached_trilinear_q1_material_uses_pinned_direct_dof_path():
+  model = mujoco.MjModel.from_xml_string("""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <body name="arm" pos="0 0 1">
+        <joint name="hinge" type="hinge" axis="0 1 0"/>
+        <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+        <flexcomp name="attached" type="grid" count="2 2 2"
+                  pos=".13 .21 -.07" spacing=".1 .1 .1" mass="1"
+                  dim="3" dof="trilinear">
+          <contact contype="0" conaffinity="0" selfcollide="none"/>
+          <edge stiffness="0" damping="0"/>
+          <elasticity young="1000" poisson=".2" damping=".4"/>
+        </flexcomp>
+      </body>
+    </worldbody></mujoco>
+  """)
+  qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+  qpos[0] = 0.24
+  qpos[1] += 0.01
+  qvel = np.zeros(model.nv)
+  data, flex, force, _, tangent = _evaluate(model, qpos, qvel)
+  assert model.flex_interp[0] == 1
+  np.testing.assert_allclose(force, data.qfrc_passive, rtol=5e-4, atol=3e-5)
+  eps = 1e-3
+  qhi, qlo = qpos.copy(), qpos.copy()
+  qhi[1] += eps
+  qlo[1] -= eps
+  numerical = (_oracle_passive_force(model, qhi, qvel)
+               - _oracle_passive_force(model, qlo, qvel)) / (2*eps)
+  np.testing.assert_allclose(
+      tangent.detach().numpy()[0, :, 1], numerical,
+      rtol=3e-2, atol=3e-3)
+
+
+def test_mps_attached_trilinear_q1_material_uses_pinned_direct_dof_path():
+  if torch is None or not torch.backends.mps.is_available():
+    pytest.skip("Apple MPS is unavailable in this test process")
+  MetalFlex, _ = _flex_api()
+  model = mujoco.MjModel.from_xml_string("""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <body name="arm" pos="0 0 1">
+        <joint name="hinge" type="hinge" axis="0 1 0"/>
+        <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+        <flexcomp name="attached" type="grid" count="2 2 2"
+                  pos=".13 .21 -.07" spacing=".1 .1 .1" mass="1"
+                  dim="3" dof="trilinear">
+          <contact contype="0" conaffinity="0" selfcollide="none"/>
+          <edge stiffness="0" damping="0"/>
+          <elasticity young="1000" poisson=".2" damping=".4"/>
+        </flexcomp>
+      </body>
+    </worldbody></mujoco>
+  """)
+  qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+  qpos[0] = 0.24
+  qpos[1] += 0.01
+  qvel = np.zeros(model.nv)
+  data = mujoco.MjData(model)
+  data.qpos[:], data.qvel[:] = qpos, qvel
+  mujoco.mj_forward(model, data)
+  poses = {
+      "body_pos": torch.tensor(data.xpos[None], dtype=torch.float32, device="mps"),
+      "body_quat": torch.tensor(data.xquat[None], dtype=torch.float32, device="mps"),
+      "joint_anchor": torch.tensor(data.xanchor[None], dtype=torch.float32, device="mps"),
+      "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32, device="mps"),
+      "root_com": torch.tensor(_root_com(model, data)[None],
+                                dtype=torch.float32, device="mps"),
+  }
+  flex = MetalFlex(model, device="mps")
+  force, _, tangent = flex.run_device(
+      torch.tensor(qpos[None], dtype=torch.float32, device="mps"),
+      torch.tensor(qvel[None], dtype=torch.float32, device="mps"), poses,
+      torch.tensor(data.cvel[None], dtype=torch.float32, device="mps"))
+  np.testing.assert_allclose(
+      force.detach().cpu().numpy()[0], data.qfrc_passive,
+      rtol=5e-4, atol=3e-5)
+  eps = 1e-3
+  qhi, qlo = qpos.copy(), qpos.copy()
+  qhi[1] += eps
+  qlo[1] -= eps
+  numerical = (_oracle_passive_force(model, qhi, qvel)
+               - _oracle_passive_force(model, qlo, qvel)) / (2*eps)
+  np.testing.assert_allclose(
+      tangent.detach().cpu().numpy()[0, :, 1], numerical,
+      rtol=3e-2, atol=3e-3)
+
+
+def test_mps_interpolated_material_operator_workspace_matches_cpu():
+  if torch is None or not torch.backends.mps.is_available():
+    pytest.skip("Apple MPS is unavailable in this test process")
+  MetalFlex, _ = _flex_api()
+  model = mujoco.MjModel.from_xml_string("""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <flexcomp name="q1" type="grid" count="2 2 2"
+                spacing=".1 .1 .1" mass="1" dim="3" dof="trilinear">
+        <contact contype="0" conaffinity="0" selfcollide="none"/>
+        <elasticity young="1000" poisson=".2" damping=".1"/>
+      </flexcomp>
+    </worldbody></mujoco>
+  """)
+  qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+  qpos[3] += 0.02
+  qvel = np.zeros(model.nv)
+  data = mujoco.MjData(model)
+  data.qpos[:], data.qvel[:] = qpos, qvel
+  mujoco.mj_forward(model, data)
+  root_com = _root_com(model, data)
+  poses_cpu = {
+      "body_pos": torch.tensor(data.xpos[None], dtype=torch.float32),
+      "body_quat": torch.tensor(data.xquat[None], dtype=torch.float32),
+      "joint_anchor": torch.tensor(data.xanchor[None], dtype=torch.float32),
+      "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32),
+      "root_com": torch.tensor(root_com[None], dtype=torch.float32),
+  }
+  poses_mps = {name: value.to("mps") for name, value in poses_cpu.items()}
+  cvel_cpu = torch.tensor(data.cvel[None], dtype=torch.float32)
+  cvel_mps = cvel_cpu.to("mps")
+  qpos_cpu = torch.tensor(qpos[None], dtype=torch.float32)
+  qvel_cpu = torch.tensor(qvel[None], dtype=torch.float32)
+  cpu_ops = MetalFlex(model, device="cpu").run_material_operators(
+      qpos_cpu, qvel_cpu, poses_cpu, cvel_cpu)
+  native_ops = MetalFlex(model, device="mps").run_material_operators(
+      qpos_cpu.to("mps"), qvel_cpu.to("mps"), poses_mps, cvel_mps)
+  for name, expected in cpu_ops.items():
+    actual = native_ops[name]
+    assert actual.device.type == "mps" and actual.is_contiguous()
+    np.testing.assert_allclose(
+        actual.detach().cpu().numpy(), expected.detach().numpy(),
+        rtol=2e-4, atol=2e-5)
 
 
 def test_mps_interpolated_q1_volume_kernel_matches_pinned_cpu():
