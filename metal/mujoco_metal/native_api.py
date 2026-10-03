@@ -157,8 +157,18 @@ def _inverse_query_workspaces(sim):
   This allocation cost belongs to the explicit inverse query, not stepping.
   """
   roots = ("_smooth", "_passive", "_fluid", "_tendons", "_spatial_tendons",
-           "_flex", "_coupled_constraints")
+           "_flex", "_coupled_constraints", "_component_solver", "_forward_stages",
+           "_solver", "_implicit", "_implicitfast", "_actuators", "_transmissions",
+           "_motor", "_sensors")
   seen, saved, memo = set(), [], {}
+  stages = getattr(sim, "_forward_stages", None)
+  record = getattr(stages, "_record", None)
+  coherent_inputs = []
+  if record is not None:
+    for name, value in record.input_tensors.items():
+      expected = record.input_versions.get(name)
+      if expected is not None and stages._version(value) == expected:
+        coherent_inputs.append((name, value))
   def collect(program):
     if program is None or id(program) in seen or not hasattr(program, "__dict__"):
       return
@@ -167,15 +177,28 @@ def _inverse_query_workspaces(sim):
     storage = {name: _capture_query_storage(value, memo)
                for name, value in attributes.items() if _contains_device_tensor(value)}
     saved.append((program, attributes, storage))
-    for value in attributes.values():
+    for name, value in attributes.items():
       # Programs own subordinate FK, broadphase, compaction and flex stages;
       # arbitrary third-party objects and Torch internals are not traversed.
-      if type(value).__module__.startswith("mujoco_metal."):
+      if name != "_owner" and type(value).__module__.startswith("mujoco_metal."):
         collect(value)
   for name in roots:
     collect(getattr(sim, name, None))
-  spatial = {name: getattr(sim, name) for name in ("_spatial_kin", "_spatial_cache_key")
-             if hasattr(sim, name)}
+  bookkeeping_names = ("_spatial_kin", "_spatial_cache_key", "_forward_position_epoch",
+      "_accepted_step", "_last_actuation_kin", "_last_coupled",
+      "_last_coupled_generation", "_assembled_system_valid")
+  bookkeeping = {name: _capture_query_storage(getattr(sim, name), memo)
+                 for name in bookkeeping_names if hasattr(sim, name)}
+  scratch_names = ("_component_solve_rhs", "_component_world_status",
+                   "_component_tendon_J", "_component_damping_deriv", "_rhs",
+                   "_act_dot", "_actuator_velocity_derivative", "_sensordata",
+                   "_raw_sensordata")
+  scratch_names += tuple(name for name in vars(sim)
+                         if name.startswith("_forward_stage_") and
+                         isinstance(getattr(sim, name), torch.Tensor))
+  component = {name: _capture_query_storage(getattr(sim, name), memo)
+               for name in scratch_names
+               if hasattr(sim, name)}
   try:
     yield
   finally:
@@ -186,11 +209,21 @@ def _inverse_query_workspaces(sim):
       vars(program).update(attributes)
       for name, value in storage.items():
         setattr(program, name, _restore_query_storage(value))
-    for name in ("_spatial_kin", "_spatial_cache_key"):
-      if name in spatial:
-        setattr(sim, name, spatial[name])
+    for name in bookkeeping_names:
+      if name in bookkeeping:
+        setattr(sim, name, _restore_query_storage(bookkeeping[name]))
       elif hasattr(sim, name):
         delattr(sim, name)
+    for name, value in component.items():
+      setattr(sim, name, _restore_query_storage(value))
+    # Restoring tensor values increments Torch mutation counters. Rebind only
+    # inputs that were coherent on entry, after every borrowed buffer has been
+    # restored. Never turn an already-stale record into a valid one.
+    if record is not None and getattr(stages, "_record", None) is record:
+      for name, value in coherent_inputs:
+        if record.input_tensors.get(name) is value:
+          stages.capture_input(record, name, value)
+
 
 
 def mj_inverse(sim, qpos=None, qvel=None, qacc=None,
