@@ -34,6 +34,32 @@ _EQUALITY_SHADER = Path(__file__).parent / "shaders" / "equality_assembly.metal"
 _COLLISION_SHADER = Path(__file__).parent / "shaders" / "collision_primitives.metal"
 _CONVEX_SHADER = Path(__file__).parent / "shaders" / "convex_narrowphase.metal"
 _SDF_SHADER = Path(__file__).parent / "shaders" / "sdf_narrowphase.metal"
+
+
+def _pack_contact_dims_offsets(c_dims, pair_offsets):
+  """Pack the fixed ten-word contact header before logical slot offsets."""
+  dims = np.asarray(c_dims)
+  offsets = np.asarray(pair_offsets)
+  for name, values in (("contact dims header", dims), ("pair contact offsets", offsets)):
+    if values.dtype.kind not in "iu":
+      raise TypeError(f"{name} must contain integers")
+    if np.any(values < 0) or np.any(values > np.iinfo(np.int32).max):
+      raise ValueError(f"{name} must be int32-representable and nonnegative")
+  if dims.shape != (10,):
+    raise ValueError(f"contact dims header must have 10 entries, got {dims.shape}")
+  if dims[0] < 0 or dims[1] < 0 or dims[2] < 0 or dims[3] <= 0:
+    raise ValueError("contact dims nv, npairs, and ncontacts must be nonnegative; batch must be positive")
+  if dims[4] < 0 or dims[5] < 0 or dims[6] < 0:
+    raise ValueError("contact dims body, joint, and geom counts must be nonnegative")
+  if dims[7] not in (0, 1) or dims[8] not in (0, 1) or dims[9] not in (0, 1):
+    raise ValueError("contact cone and boolean dims must be 0 or 1")
+  if offsets.ndim != 1 or offsets.size != int(dims[1]) + 1 or offsets[0] != 0:
+    raise ValueError("pair contact offsets must be a nonempty 1-D array starting at zero")
+  if np.any(offsets[1:] < offsets[:-1]):
+    raise ValueError("pair contact offsets must be monotone")
+  if offsets[-1] != dims[2]:
+    raise ValueError("final pair contact offset must equal ncontacts")
+  return np.concatenate((dims, offsets)).astype(np.int32, copy=False)
 _MINVAL = 1e-15
 _MAX_NV = 32
 _MAX_PAIRS = 16
@@ -1290,6 +1316,10 @@ class MetalCoupledConstraints:
         else np.zeros(1, dtype=np.int32)
     )
 
+    c_dims_values = [d.nv, d.npairs, d.ncontacts_max, self.batch_size,
+                     d.nbody, d.njnt, d.ngeom, d.cone_type,
+                     1 if (int(d.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)) else 0,
+                     1]
     self._constants = {
         "joint_qposadr": self._tensor(d.joint_qposadr if d.njnt else np.zeros(1, dtype=np.int32)),
         "qpos0": self._tensor(d.qpos0 if d.nq else np.zeros(1, dtype=np.float32)),
@@ -1360,15 +1390,8 @@ class MetalCoupledConstraints:
         "ten_solimp_fri": self._tensor(d.ten_solimp_fri.reshape(-1) if d.ntendon else np.zeros(5, dtype=np.float32)),
         "ten_length_map": self._tensor(d.ten_length_map.reshape(-1)),
         "ten_moment_map": self._tensor(d.ten_moment_map.reshape(-1)),
-        "c_dims": torch.tensor(
-
-            [d.nv, d.npairs, d.ncontacts_max, self.batch_size, d.nbody, d.njnt, d.ngeom, d.cone_type,
-             1 if (int(d.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)) else 0,
-             # Tail index 9 toggles broadphase-fed narrowphase pruning
-             # (R08/F1); earlier indices are frozen for every consumer.
-             1],
-            dtype=torch.int32, device=self._device,
-        ),
+        # Tail index 9 toggles broadphase-fed narrowphase pruning (R08/F1).
+        "c_dims": torch.tensor(c_dims_values, dtype=torch.int32, device=self._device),
         "body_dims": torch.tensor(
             [d.ncontacts_max, d.npairs, d.nv, 0, self.batch_size],
             dtype=torch.int32, device=self._device,
@@ -1384,15 +1407,14 @@ class MetalCoupledConstraints:
             dtype=torch.float32, device=self._device,
       ),
     }
-    # Pair offsets and candidate dimensions are read together by contact
-    # narrowphase. Store them in one device buffer to leave the native kernel
-    # ABI within Metal's 31-buffer limit after adding the logical compaction map.
-    pair_offsets_size = int(d.npairs) + 1
-    self._constants["pair_contact_offsets_dims"] = torch.cat((
-        self._constants["pair_contact_offset"], self._constants["c_dims"]))
-    packed_dims = self._constants["pair_contact_offsets_dims"]
-    self._constants["pair_contact_offset"] = packed_dims[:pair_offsets_size]
-    self._constants["c_dims"] = packed_dims[pair_offsets_size:]
+    # Keep a fixed ten-word dimensions header followed by logical slot
+    # offsets. The contact kernel can then read npairs from header[1] without
+    # circularly deriving the header address from an offset value.
+    packed_dims = self._tensor(
+        _pack_contact_dims_offsets(c_dims_values, d.pair_contact_offset))
+    self._constants["pair_contact_offsets_dims"] = packed_dims
+    self._constants["c_dims"] = packed_dims[:10]
+    self._constants["pair_contact_offset"] = packed_dims[10:]
     self._workspace = None
     self.prepare_workspace(self.batch_size)
 

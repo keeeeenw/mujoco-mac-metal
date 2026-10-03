@@ -207,22 +207,24 @@ kernel void contact_normal(
     device const float* mesh_hull [[buffer(29)]],
     device const int* mesh_hull_info [[buffer(30)]],
     uint tid [[thread_position_in_grid]]) {
+  // Fixed header [nv, npairs, ncontacts, batch, nbody, njnt, ngeom,
+  // cone, disable_multiccd, prune], then npairs+1 slot offsets.
+  int nv = pair_contact_offsets_dims[0];
   int npairs = pair_contact_offsets_dims[1];
-  int dims_base = npairs + 1;
-  int nv = pair_contact_offsets_dims[dims_base + 0];
-  int ncontacts_max = pair_contact_offsets_dims[dims_base + 2];
-  int batch = pair_contact_offsets_dims[dims_base + 3];
-  int nbody = pair_contact_offsets_dims[dims_base + 4];
-  int njnt = pair_contact_offsets_dims[dims_base + 5];
-  int ngeom = pair_contact_offsets_dims[dims_base + 6];
+  int ncontacts_max = pair_contact_offsets_dims[2];
+  int batch = pair_contact_offsets_dims[3];
+  int nbody = pair_contact_offsets_dims[4];
+  int njnt = pair_contact_offsets_dims[5];
+  int ngeom = pair_contact_offsets_dims[6];
+  int offsets_base = 10;
 
   int world = int(tid) / max(npairs, 1);
   int pair_idx = int(tid) % max(npairs, 1);
   if (uint(world) >= uint(batch) || pair_idx >= npairs) return;
-  if (pair_contact_offsets_dims[dims_base + 9] != 0
+  if (pair_contact_offsets_dims[9] != 0
       && logical_pair_to_packed[world * npairs + pair_idx] < 0) {
-    int offset = pair_contact_offsets_dims[pair_idx];
-    int max_con = pair_contact_offsets_dims[pair_idx + 1] - offset;
+    int offset = pair_contact_offsets_dims[offsets_base + pair_idx];
+    int max_con = pair_contact_offsets_dims[offsets_base + pair_idx + 1] - offset;
     for (int k = 0; k < max_con; ++k) {
       int slot = offset + k;
       if (slot >= ncontacts_max) break;
@@ -240,7 +242,7 @@ kernel void contact_normal(
   float3 szb = float3(geom_size[b * 3], geom_size[b * 3 + 1], geom_size[b * 3 + 2]);
   float rba = geom_rbound[a];
   float rbb = geom_rbound[b];
-  int disable_multiccd = pair_contact_offsets_dims[dims_base + 8];
+  int disable_multiccd = pair_contact_offsets_dims[8];
 
   int go = world * ngeom;
   float3 pa = float3(geom_pos[(go + a) * 3], geom_pos[(go + a) * 3 + 1], geom_pos[(go + a) * 3 + 2]);
@@ -251,10 +253,10 @@ kernel void contact_normal(
   float m = pair_margin_gap[pair_idx * 2 + 0];
   float g = pair_margin_gap[pair_idx * 2 + 1];
   int dim = pair_condim[pair_idx];
-  float cone = float(pair_contact_offsets_dims[dims_base + 7]);
+  float cone = float(pair_contact_offsets_dims[7]);
 
-  int offset = pair_contact_offsets_dims[pair_idx];
-  int max_con = pair_contact_offsets_dims[pair_idx + 1] - offset;
+  int offset = pair_contact_offsets_dims[offsets_base + pair_idx];
+  int max_con = pair_contact_offsets_dims[offsets_base + pair_idx + 1] - offset;
 
   // Run collision algorithm
   ContactGeom con[16];

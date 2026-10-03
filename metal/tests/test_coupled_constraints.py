@@ -11,6 +11,7 @@ import pytest
 from mujoco_metal.coupled_constraints import (
     CoupledConstraintDescriptor,
     CoupledSolverSettings,
+    _pack_contact_dims_offsets,
     coupled_constraint_oracle,
     lower_coupled_constraints,
     MetalCoupledConstraints,
@@ -50,6 +51,28 @@ COUPLED_XML = """<mujoco model="coupled_test">
     <jointvel joint="j1"/>
   </sensor>
 </mujoco>"""
+
+
+def test_contact_pair_header_layout_cpu():
+  dims = np.asarray([6, 3, 6, 3, 4, 3, 4, 0, 0, 1], dtype=np.int32)
+  offsets = np.asarray([0, 1, 2, 6], dtype=np.int32)
+  packed = _pack_contact_dims_offsets(dims, offsets)
+  np.testing.assert_array_equal(packed[:10], dims)
+  np.testing.assert_array_equal(packed[10:], offsets)
+  assert packed[1] == 3  # Pair count is independent of the first slot end.
+  empty = _pack_contact_dims_offsets(
+      np.asarray([0, 0, 0, 1, 1, 0, 1, 0, 0, 1], dtype=np.int32),
+      np.asarray([0], dtype=np.int32))
+  assert empty.shape == (11,)
+  with pytest.raises(ValueError, match="10 entries"):
+    _pack_contact_dims_offsets(np.zeros(9, dtype=np.int32), offsets)
+  with pytest.raises(ValueError, match="final pair contact offset"):
+    _pack_contact_dims_offsets(
+        np.asarray([6, 3, 9, 3, 4, 3, 4, 0, 0, 1], dtype=np.int32), offsets)
+  with pytest.raises(ValueError, match="offsets"):
+    _pack_contact_dims_offsets(dims, np.asarray([0, 1, 2], dtype=np.int32))
+  with pytest.raises(TypeError, match="integers"):
+    _pack_contact_dims_offsets(dims.astype(np.float64), offsets)
 
 
 def test_coupled_lowering_and_immutability():
@@ -1002,6 +1025,122 @@ def test_metal_coupled_constraints_zero_contact():
   dyn = smooth.run_device(qpos, qvel)
   res = coupled.run_device(dyn["poses"], dyn["mass_matrix"], -dyn["qfrc_bias"], qpos, qvel)
   assert res["status"].item() == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_batched_second_pair_contact_routing():
+  """The second logical pair produces rows independently in three worlds."""
+  import torch
+
+  model = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep=".002" iterations="100" tolerance="1e-8"/>'
+      '<worldbody><geom type="plane" size="2 2 .1"/>'
+      '<body pos="0 0 .4"><freejoint/><geom type="sphere" size=".1" '
+      'mass="1" condim="1"/></body>'
+      '<body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1" '
+      'mass="1" condim="1"/></body></worldbody></mujoco>')
+  batch = 3
+  qpos = np.tile(model.qpos0, (batch, 1)).astype(np.float32)
+  qpos[1, 2] += 0.4  # Keep both spheres separated and clear of the floor.
+  qpos[1, 9] += 0.4
+  qpos[2, 9] -= 0.015
+  qvel = np.zeros((batch, model.nv), dtype=np.float32)
+  qpos_device = torch.as_tensor(qpos, device="mps")
+  qvel_device = torch.as_tensor(qvel, device="mps")
+  desc = load_model(model)
+  smooth = MetalSmoothDynamics(desc, batch)
+  coupled = MetalCoupledConstraints(model, batch)
+  assert coupled.descriptor.npairs == 3
+  assert (coupled.descriptor.pair_contact_offset[1]
+          - coupled.descriptor.pair_contact_offset[0]) == 1
+  dynamics = smooth.run_device(qpos_device, qvel_device)
+
+  # Inspect candidate generation independently from the solver so a lost
+  # broadphase/narrowphase row cannot be hidden by a plausible qacc result.
+  coupled.generate_candidates(dynamics["poses"], qvel_device)
+  candidate = coupled._workspace["contact_row_data"].reshape(
+      batch, coupled.descriptor.ncontacts_max, 6, 6)[:, :, 0, 0]
+  refs = []
+  for world in range(batch):
+    data = mujoco.MjData(model)
+    data.qpos[:] = qpos[world]
+    data.qvel[:] = qvel[world]
+    mujoco.mj_forward(model, data)
+    refs.append(data)
+  assert [data.ncon > 0 for data in refs] == [True, False, True]
+  # The contacting floor/sphere pair is logical pair 1, which catches an
+  # ABI that mistakes its first slot offset for the total pair count.
+  target_slot = int(coupled.descriptor.pair_contact_offset[1])
+  assert torch.any(candidate[0, target_slot:coupled.descriptor.pair_contact_offset[2]] > 0.5)
+  assert not torch.any(candidate[1] > 0.5)
+  assert torch.any(candidate[2, target_slot:coupled.descriptor.pair_contact_offset[2]] > 0.5)
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("pruning", [False, True])
+def test_pair_header_routes_after_four_slot_first_pair(pruning):
+  """The fixed header routes past a 4-slot pair to the later sphere pair."""
+  import torch
+
+  model = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep=".002"/>'
+      '<worldbody><geom type="plane" size="2 2 .1"/>'
+      '<body pos="0 0 2"><freejoint/><geom type="box" size=".05 .05 .05" '
+      'mass="1"/></body>'
+      '<body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1" '
+      'mass="1"/></body></worldbody></mujoco>')
+  batch = 3
+  qpos = np.tile(model.qpos0, (batch, 1)).astype(np.float32)
+  qpos[1, 2] += 0.4
+  qpos[1, 9] += 0.4
+  qpos[2, 9] -= 0.015
+  qvel = torch.zeros((batch, model.nv), dtype=torch.float32, device="mps")
+  qpos_device = torch.as_tensor(qpos, device="mps")
+  desc = load_model(model)
+  smooth = MetalSmoothDynamics(desc, batch)
+  coupled = MetalCoupledConstraints(model, batch)
+  assert coupled.descriptor.npairs == 3
+  offsets = coupled.descriptor.pair_contact_offset
+  assert int(offsets[1] - offsets[0]) == 4
+  coupled.set_broadphase_pruning(pruning)
+  dynamics = smooth.run_device(qpos_device, qvel)
+  coupled.generate_candidates(dynamics["poses"], qvel)
+  rows = coupled._workspace["contact_row_data"].reshape(
+      batch, coupled.descriptor.ncontacts_max, 6, 6)[:, :, 0, 0]
+  second_pair = slice(int(offsets[1]), int(offsets[2]))
+  assert torch.any(rows[0, second_pair] > 0.5)
+  assert not torch.any(rows[1] > 0.5)
+  assert torch.any(rows[2, second_pair] > 0.5)
+  cpu_active = []
+  for world in range(batch):
+    data = mujoco.MjData(model)
+    data.qpos[:] = qpos[world]
+    mujoco.mj_forward(model, data)
+    cpu_active.append(data.ncon > 0)
+  assert cpu_active == [True, False, True]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_pair_header_empty_pair_universe():
+  """An empty pair-offset tail remains valid when the model has one geom."""
+  import torch
+
+  model = mujoco.MjModel.from_xml_string(
+      '<mujoco><worldbody><body pos="0 0 1"><freejoint/>'
+      '<geom type="sphere" size=".1" mass="1"/></body></worldbody></mujoco>')
+  coupled = MetalCoupledConstraints(model, batch_size=3)
+  desc = load_model(model)
+  qpos = torch.as_tensor(np.tile(model.qpos0, (3, 1)), dtype=torch.float32, device="mps")
+  qvel = torch.zeros((3, model.nv), dtype=torch.float32, device="mps")
+  dynamics = MetalSmoothDynamics(desc, 3).run_device(qpos, qvel)
+  assert coupled.descriptor.npairs == 0
+  assert coupled.descriptor.pair_contact_offset.tolist() == [0]
+  packed = coupled._constants["pair_contact_offsets_dims"].cpu().numpy()
+  assert packed[1] == 0
+  np.testing.assert_array_equal(packed[10:], [0])
+  coupled.generate_candidates(dynamics["poses"], qvel)
 
 
 @pytest.mark.gpu
