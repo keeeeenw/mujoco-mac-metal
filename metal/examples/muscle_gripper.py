@@ -99,6 +99,64 @@ def _clearance_monitor(model):
          ("ball_geom", "wallR_geom"), ("ball2_geom", "pedestal_geom")])
 
 
+def _state_error_breakdown(model, qpos_a, qvel_a, qpos_b, qvel_b):
+  """Return unit-separated free-body and scalar-joint state errors."""
+  errors = {
+      "translation_m": 0.0,
+      "orientation_geodesic_rad": 0.0,
+      "linear_velocity_m_s": 0.0,
+      "angular_velocity_rad_s": 0.0,
+      "scalar_joint_position": 0.0,
+      "scalar_joint_velocity": 0.0,
+  }
+  free = int(mujoco.mjtJoint.mjJNT_FREE)
+  ball = int(mujoco.mjtJoint.mjJNT_BALL)
+  for joint in range(model.njnt):
+    kind = int(model.jnt_type[joint])
+    qa = int(model.jnt_qposadr[joint])
+    va = int(model.jnt_dofadr[joint])
+    if kind == free:
+      errors["translation_m"] = max(
+          errors["translation_m"],
+          float(np.linalg.norm(qpos_a[qa:qa + 3] - qpos_b[qa:qa + 3])))
+      qa_quat = np.asarray(qpos_a[qa + 3:qa + 7], dtype=np.float64).copy()
+      qb_quat = np.asarray(qpos_b[qa + 3:qa + 7], dtype=np.float64).copy()
+      qa_quat /= max(float(np.linalg.norm(qa_quat)), 1e-30)
+      qb_quat /= max(float(np.linalg.norm(qb_quat)), 1e-30)
+      dot = float(np.clip(abs(np.dot(qa_quat, qb_quat)), 0.0, 1.0))
+      errors["orientation_geodesic_rad"] = max(
+          errors["orientation_geodesic_rad"], 2.0 * float(np.arccos(dot)))
+      errors["linear_velocity_m_s"] = max(
+          errors["linear_velocity_m_s"],
+          float(np.linalg.norm(qvel_a[va:va + 3] - qvel_b[va:va + 3])))
+      errors["angular_velocity_rad_s"] = max(
+          errors["angular_velocity_rad_s"],
+          float(np.linalg.norm(qvel_a[va + 3:va + 6] - qvel_b[va + 3:va + 6])))
+    elif kind == ball:
+      qa_quat = np.asarray(qpos_a[qa:qa + 4], dtype=np.float64).copy()
+      qb_quat = np.asarray(qpos_b[qa:qa + 4], dtype=np.float64).copy()
+      qa_quat /= max(float(np.linalg.norm(qa_quat)), 1e-30)
+      qb_quat /= max(float(np.linalg.norm(qb_quat)), 1e-30)
+      dot = float(np.clip(abs(np.dot(qa_quat, qb_quat)), 0.0, 1.0))
+      errors["orientation_geodesic_rad"] = max(
+          errors["orientation_geodesic_rad"], 2.0 * float(np.arccos(dot)))
+      errors["angular_velocity_rad_s"] = max(
+          errors["angular_velocity_rad_s"],
+          float(np.linalg.norm(qvel_a[va:va + 3] - qvel_b[va:va + 3])))
+    else:
+      qpos_width = 1
+      qvel_width = 1
+      errors["scalar_joint_position"] = max(
+          errors["scalar_joint_position"],
+          float(np.max(np.abs(qpos_a[qa:qa + qpos_width]
+                               - qpos_b[qa:qa + qpos_width]))))
+      errors["scalar_joint_velocity"] = max(
+          errors["scalar_joint_velocity"],
+          float(np.max(np.abs(qvel_a[va:va + qvel_width]
+                               - qvel_b[va:va + qvel_width]))))
+  return errors
+
+
 def run(steps=3000, mode="metal", check=False, record=None):
   if mode not in ("metal", "cpu"):
     raise ValueError(f"Unknown mode {mode!r}")
@@ -142,9 +200,26 @@ def run(steps=3000, mode="metal", check=False, record=None):
   max_qpos_err = 0.0; max_qvel_err = 0.0
   max_act_err = 0.0
   pre_qpos_err = 0.0; pre_qvel_err = 0.0
+  max_state_err = {
+      "translation_m": 0.0,
+      "orientation_geodesic_rad": 0.0,
+      "linear_velocity_m_s": 0.0,
+      "angular_velocity_rad_s": 0.0,
+      "scalar_joint_position": 0.0,
+      "scalar_joint_velocity": 0.0,
+  }
+  first_large_divergence = {
+      "translation_step_1cm": None,
+      "orientation_step_0p05rad": None,
+      "linear_velocity_step_0p1m_s": None,
+      "angular_velocity_step_0p1rad_s": None,
+  }
   ball_bin_hits = 0
   latched_bin_hits = 0
   finger_contacts = 0
+  first_finger_contact_step = None
+  first_red_ball_finger_contact_step = None
+  first_red_ball_bin_contact_step = None
   gripL_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "gripL")
   gripR_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "gripR")
   qadr_L = int(model.jnt_qposadr[gripL_id])
@@ -175,6 +250,18 @@ def run(steps=3000, mode="metal", check=False, record=None):
       step_qvel_err = float(np.max(np.abs(gv - cpu_grasp.qvel)))
       max_qpos_err = max(max_qpos_err, step_qpos_err)
       max_qvel_err = max(max_qvel_err, step_qvel_err)
+      state_err = _state_error_breakdown(model, gq, gv,
+                                         cpu_grasp.qpos, cpu_grasp.qvel)
+      for name, value in state_err.items():
+        max_state_err[name] = max(max_state_err[name], value)
+      for name, key, threshold in (
+          ("translation_step_1cm", "translation_m", 0.01),
+          ("orientation_step_0p05rad", "orientation_geodesic_rad", 0.05),
+          ("linear_velocity_step_0p1m_s", "linear_velocity_m_s", 0.1),
+          ("angular_velocity_step_0p1rad_s", "angular_velocity_rad_s", 0.1),
+      ):
+        if first_large_divergence[name] is None and state_err[key] > threshold:
+          first_large_divergence[name] = step
       max_act_err = max(max_act_err, float(np.max(np.abs(ga - cpu_grasp.act))))
       if step < 100:
         pre_qpos_err = max(pre_qpos_err, step_qpos_err)
@@ -183,6 +270,8 @@ def run(steps=3000, mode="metal", check=False, record=None):
       g1, g2 = int(cpu_grasp.contact[c].geom[0]), int(cpu_grasp.contact[c].geom[1])
       if (g1 == ball_geom and g2 == bin_geom) or (g2 == ball_geom and g1 == bin_geom):
         ball_bin_hits += 1
+        if first_red_ball_bin_contact_step is None:
+          first_red_ball_bin_contact_step = step
         break
     for c in range(cpu_open.ncon):
       g1, g2 = int(cpu_open.contact[c].geom[0]), int(cpu_open.contact[c].geom[1])
@@ -193,6 +282,11 @@ def run(steps=3000, mode="metal", check=False, record=None):
       g1, g2 = int(cpu_grasp.contact[c].geom[0]), int(cpu_grasp.contact[c].geom[1])
       if (g1 in finger_geoms or g2 in finger_geoms):
         finger_contacts += 1
+        if first_finger_contact_step is None:
+          first_finger_contact_step = step
+        other = g2 if g1 in finger_geoms else g1
+        if other == ball_geom and first_red_ball_finger_contact_step is None:
+          first_red_ball_finger_contact_step = step
         break
     clearance.sample(
         native.state.qpos[0].cpu().numpy() if native is not None else cpu_grasp.qpos,
@@ -240,8 +334,13 @@ def run(steps=3000, mode="metal", check=False, record=None):
       "max_qpos_err": max_qpos_err, "max_qvel_err": max_qvel_err,
       "max_act_err": max_act_err,
       "pre_qpos_err": pre_qpos_err, "pre_qvel_err": pre_qvel_err,
+      "max_state_error_components": max_state_err,
+      "first_large_divergence_steps": first_large_divergence,
       "ball_bin_hits": ball_bin_hits, "latched_bin_hits": latched_bin_hits,
       "finger_contacts": finger_contacts,
+      "first_finger_contact_step": first_finger_contact_step,
+      "first_red_ball_finger_contact_step": first_red_ball_finger_contact_step,
+      "first_red_ball_bin_contact_step": first_red_ball_bin_contact_step,
       "released_ball": released, "latched_ball": latched,
       "block_rel": block_rel, "block_lat": block_lat,
       "steps": steps,

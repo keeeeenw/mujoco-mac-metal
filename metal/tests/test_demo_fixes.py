@@ -44,6 +44,36 @@ def test_gripper_schedule_clears_furniture_and_delivers_both_balls(monkeypatch):
   assert result["ball_bin_hits"] > 100
   assert result["latched_bin_hits"] == 0
   assert result["finger_contacts"] > 100
+  assert result["first_red_ball_finger_contact_step"] is not None
+  assert result["first_red_ball_bin_contact_step"] is not None
+  assert result["first_red_ball_finger_contact_step"] < result["first_red_ball_bin_contact_step"]
+  assert result["first_large_divergence_steps"]["translation_step_1cm"] is None
+  assert set(result["max_state_error_components"]) == {
+      "translation_m", "orientation_geodesic_rad", "linear_velocity_m_s",
+      "angular_velocity_rad_s", "scalar_joint_position", "scalar_joint_velocity",
+  }
+
+
+def test_gripper_quaternion_error_is_sign_invariant_and_unit_separated(monkeypatch):
+  module = _import("muscle_gripper", monkeypatch)
+  model = module._load_model()
+  data = mujoco.MjData(model)
+  mujoco.mj_resetDataKeyframe(model, data, 0)
+  qpos_a = data.qpos.copy()
+  qvel_a = data.qvel.copy()
+  qpos_b = qpos_a.copy()
+  qvel_b = qvel_a.copy()
+  free = int(mujoco.mjtJoint.mjJNT_FREE)
+  free_joint = next(j for j in range(model.njnt) if model.jnt_type[j] == free)
+  qa = int(model.jnt_qposadr[free_joint])
+  qpos_b[qa + 3:qa + 7] *= -1.0
+  qpos_b[qa] += 0.02
+  va = int(model.jnt_dofadr[free_joint])
+  qvel_b[va:va + 3] += (0.0, 0.03, 0.0)
+  errors = module._state_error_breakdown(model, qpos_a, qvel_a, qpos_b, qvel_b)
+  assert errors["translation_m"] == pytest.approx(0.02)
+  assert errors["orientation_geodesic_rad"] == pytest.approx(0.0, abs=1e-7)
+  assert errors["linear_velocity_m_s"] == pytest.approx(0.03)
 
 
 def test_gripper_supported_joint_endpoints_clear_empty_jaws(monkeypatch):
