@@ -27,6 +27,43 @@ def test_rk4_contract():
     validate_stepping_profile(m, profile='contact_free_motor_rk4_v1')
 
 
+def _cpu_stage_orchestrator():
+  """Exercise actual callback ordering without claiming native physics parity."""
+  torch = pytest.importorskip("torch")
+  from mujoco_metal.runge_kutta import MetalRungeKutta
+  program = object.__new__(MetalRungeKutta)
+  program._torch, program._na, program.dt = torch, 0, .002
+  program._zero = torch.zeros((1, 1))
+  class Position:
+    def run_device(self, q, v, a, t, status):
+      return q+.002*v, v, t+.002, status
+  program._position = Position()
+  return program, (torch.zeros((1,1)),torch.ones((1,1)),None,
+                   torch.zeros(1),torch.zeros(1,dtype=torch.int32))
+
+
+def test_rk4_reuses_outer_forward_as_first_stage_and_preserves_three_argument_callback():
+  program, args = _cpu_stage_orchestrator()
+  calls = []
+  def callback(q,v,a):
+    calls.append(1)
+    return program._torch.zeros_like(v),None,args[-1]
+  initial=(program._torch.zeros_like(args[1]),None,args[-1])
+  program.run_device(*args,callback,initial_stage=initial)
+  assert len(calls)==3
+
+
+def test_rk4_does_not_retry_callback_body_typeerror():
+  program,args=_cpu_stage_orchestrator()
+  calls=[]
+  def callback(q,v,a,time=None):
+    calls.append(1)
+    raise TypeError("callback body failed")
+  with pytest.raises(TypeError,match="callback body failed"):
+    program.run_device(*args,callback)
+  assert len(calls)==1
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(
     os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='opt-in GPU'

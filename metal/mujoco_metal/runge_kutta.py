@@ -9,6 +9,7 @@ force/solve kernels; it must return borrowed acceleration and status tensors.
 """
 
 from mujoco_metal.integration import MetalEulerIntegration
+import inspect
 
 
 class MetalRungeKutta:
@@ -22,7 +23,7 @@ class MetalRungeKutta:
     # ModelDescriptor snapshots omit actuator counts; raw models carry na.
     self._na = int(getattr(model, "na", 0))
 
-  def run_device(self, qpos, qvel, act, time, status, acceleration):
+  def run_device(self, qpos, qvel, act, time, status, acceleration, *, initial_stage=None):
     """Four RK4 stages with pinned stage structure (R06/D3).
 
     ``act`` is ``(batch, na)`` or None when the model has no activation
@@ -34,6 +35,15 @@ class MetalRungeKutta:
     mj_nextActivation to the weighted derivative).
     """
     torch = self._torch
+    # Select the supported callback arity once. Catching TypeError from an
+    # executed callback would repeat side effects and hide its actual error.
+    signature = inspect.signature(acceleration)
+    try:
+      signature.bind(qpos, qvel, act, time)
+      timed_callback = True
+    except TypeError:
+      signature.bind(qpos, qvel, act)
+      timed_callback = False
     status = status.clone()
     na = self._na
     if na > 0:
@@ -45,9 +55,11 @@ class MetalRungeKutta:
     stage_times = (time, time + 0.5 * self.dt, time + 0.5 * self.dt, time + self.dt)
     for stage in range(4):
       stage_time = stage_times[stage]
-      try:
+      if stage == 0 and initial_stage is not None:
+        a, adot, solve_status = initial_stage
+      elif timed_callback:
         a, adot, solve_status = acceleration(q, v, cur_act, stage_time)
-      except TypeError:
+      else:
         a, adot, solve_status = acceleration(q, v, cur_act)
       status = torch.where(status == 0, solve_status, status)
       velocities.append(v.clone())
