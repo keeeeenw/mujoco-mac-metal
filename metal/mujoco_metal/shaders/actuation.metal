@@ -282,7 +282,7 @@ kernel void actuator_act_dot(
   for (int j=0;j<na;++j) out_actdot[abase+uint(j)]=0.0f;
   for (int i=0;i<nu;++i) out_ctrl[ubase+uint(i)]=ctrl[ubase+uint(i)];
   if (act_disabled) return;
-  float u[32];
+  device float* u=out_ctrl+ubase;
   for (int i=0;i<nu;++i) {
     float c=ctrl[ubase+uint(i)];
     if (!clamp_disabled && ctrllimited[i]) c=clamp(c,ctrlrange[2*i],ctrlrange[2*i+1]);
@@ -407,8 +407,10 @@ kernel void actuator_force(
   uint ubase=world*uint(max(nu,1)), abase=world*uint(max(na,1));
   for (int i=0;i<nu;++i) { out_force[ubase+uint(i)]=0.0f; out_ctrl[ubase+uint(i)]=ctrl_used[ubase+uint(i)]; }
   if (act_disabled) return;
-  float u[32], f[32];
-  for (int i=0;i<nu;++i) { u[i]=ctrl_used[ubase+uint(i)]; f[i]=0.0f; }
+  // Per-world owned workspace replaces fixed thread-local actuator arrays.
+  // Serial source ordering still applies to tendon/force/DC clamps below.
+  device float* u=out_ctrl+ubase;
+  device float* f=out_force+ubase;
   for (int i=0;i<nu;++i) {
     int grp=actuator_group[i];
     if ((disableactuator&(1<<grp))!=0) continue;

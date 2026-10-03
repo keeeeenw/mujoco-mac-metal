@@ -26,7 +26,6 @@ import numpy as np
 _MJMINVAL = 1e-15
 _INT32_MAX = (1 << 31) - 1
 _UINT32_MAX = (1 << 32) - 1
-_NU_CAP = 32
 
 
 def _frozen(values, dtype):
@@ -410,8 +409,6 @@ class ActuatorModel:
     na = int(model.na)
     if any(v < 0 or v > _INT32_MAX for v in (nq, nv, nu, na)):
       raise ValueError("actuator dimensions exceed int32")
-    if nu > _NU_CAP:
-      raise ValueError(f"actuator count {nu} exceeds the native cap {_NU_CAP}")
     if int(model.nplugin):
       raise ValueError("actuator plugins are unsupported (owned by milestone 019)")
     if np.any(np.asarray(model.actuator_plugin) >= 0):
@@ -971,6 +968,16 @@ class MetalActuators:
     self._torch = _torch
     self._meta = ActuatorModel(model, allow_inherited=True)
     self._device = _torch.device("mps")
+    meta = self._meta
+    if (isinstance(batch_size, (bool, np.bool_))
+        or not isinstance(batch_size, (int, np.integer)) or batch_size <= 0):
+      raise ValueError("batch_size must be a positive integer")
+    b = int(batch_size)
+    if max(b*max(meta.nv, 1)*max(meta.nu, 1),
+           b*max(meta.nv, 1)**2, b*max(meta.na, 1),
+           b*max(meta.nbody, 1)*6, meta.nu*10,
+           meta.nu*meta.nq) > _INT32_MAX:
+      raise ValueError("actuator workspace exceeds int32 shader indexing capacity")
     tlib = _torch.mps.compile_shader(
         (_Path(__file__).parent / "shaders" / "transmissions.metal").read_text())
     alib = _torch.mps.compile_shader(
@@ -982,10 +989,6 @@ class MetalActuators:
     self._qfrc_kernel = alib.actuator_assemble_qfrc
     self._adv_kernel = alib.advance_activations
     self._velocity_derivative_kernel = alib.actuator_velocity_derivative
-    meta = self._meta
-    b = int(batch_size)
-    if b <= 0:
-      raise ValueError("batch_size must be positive")
 
     def tensor(values, dtype=_torch.float32):
       # Metal kernels declare integer buffers as int (4 bytes); uint8 device
