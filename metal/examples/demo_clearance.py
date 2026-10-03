@@ -37,6 +37,43 @@ def _aabb(model, data, gid):
   return center, half
 
 
+def _obb_sat_penetration(model, data, first, second):
+  """Separating-axis penetration depth for box-box pairs, else None.
+
+  R09 coincidence control: MuJoCo GJK collapses to exactly 0.0 for exactly
+  coincident volumes (and near-coincident basins), so a zero base reading
+  with intersecting AABBs is ambiguous between touching and deep overlap.
+  The 15-axis OBB SAT decides it analytically. Returns the minimum
+  penetration depth (> 0 when volumes overlap, 0.0 when merely touching or
+  separated) or None for non-box pairs.
+  """
+  box = int(mujoco.mjtGeom.mjGEOM_BOX)
+  if int(model.geom_type[first]) != box or int(model.geom_type[second]) != box:
+    return None
+  c1 = np.asarray(data.geom_xpos[first], dtype=np.float64)
+  c2 = np.asarray(data.geom_xpos[second], dtype=np.float64)
+  r1 = np.asarray(data.geom_xmat[first], dtype=np.float64).reshape(3, 3)
+  r2 = np.asarray(data.geom_xmat[second], dtype=np.float64).reshape(3, 3)
+  h1 = np.asarray(model.geom_size[first], dtype=np.float64)
+  h2 = np.asarray(model.geom_size[second], dtype=np.float64)
+  t = c2 - c1
+  axes = [r1[:, 0], r1[:, 1], r1[:, 2], r2[:, 0], r2[:, 1], r2[:, 2]]
+  for i in range(3):
+    for j in range(3):
+      c = np.cross(r1[:, i], r2[:, j])
+      if float(np.dot(c, c)) > 1e-24:
+        axes.append(c / float(np.linalg.norm(c)))
+  pen = np.inf
+  for a in axes:
+    ra = float(np.abs(a @ r1) @ h1)
+    rb = float(np.abs(a @ r2) @ h2)
+    gap = float(abs(a @ t)) - ra - rb
+    if gap > 0.0:
+      return 0.0
+    pen = min(pen, -gap)
+  return float(pen)
+
+
 def _slab_gap(model, data, first, second):
   """Sound lower bound on separation for AABB-able pairs, else None.
 
@@ -93,9 +130,12 @@ class ClearanceMonitor:
   max(slab lower bound, ensemble max - bound): the analytic AABB-slab gap
   PROVES far-field separation with no GJK involvement, while the nudge
   ensemble (translations breaking the parallel overlap) recovers near-field
-  values; truly touching pairs still report ~0. Known edge: exactly
-  coincident volumes report 0.0 instead of a negative depth; demo scenes
-  never place distinct bodies exactly coincident.
+  values; truly touching pairs still report ~0. Exactly coincident volumes
+  (GJK reads 0.0 instead of a negative depth) fall back to analytic
+  box-box SAT (R09): real overlap records a negative depth and fails, while
+  touching/near pairs are unaffected. Demo scenes never place distinct
+  bodies exactly coincident, and the fallback is covered by negative
+  controls in test_demo_fixes.py.
   """
 
   # Reporting ensemble (nudge triplets on mocap xyz when present, else on
@@ -157,7 +197,16 @@ class ClearanceMonitor:
                                             1.0, None))
                for d in states]
       # Gate: base reading only (see class doc).
-      self.minimum[key] = min(self.minimum[key], reads[0])
+      base = reads[0]
+      # R09 coincidence control: an exactly-zero base reading with
+      # intersecting AABBs is ambiguous (touching vs collapsed-GJK overlap),
+      # so box-box pairs fall back to analytic SAT; real overlap records a
+      # negative depth and fails the gate below.
+      if abs(base) < 1e-12:
+        sat = _obb_sat_penetration(self.model, states[0], first, second)
+        if sat is not None and sat > 0.0:
+          base = -sat
+      self.minimum[key] = min(self.minimum[key], base)
       slab = _slab_gap(self.model, states[0], first, second)
       honest = max(reads) - bound
       if slab is not None and slab > 0.0:
@@ -166,9 +215,14 @@ class ClearanceMonitor:
     for key, first, second in self.contacts:
       # Base reading: penetration depth comes from the EPA path, verified
       # honest from +-0.1 mm through -0.05 m; the GJK false-0 affects
-      # separated pairs only.
+      # separated pairs only. Exact-zero readings on box-box pairs get the
+      # same SAT fallback as clearance pairs (coincident contact volumes).
       distance = float(mujoco.mj_geomDistance(
           self.model, states[0], first, second, 1.0, None))
+      if abs(distance) < 1e-12:
+        sat = _obb_sat_penetration(self.model, states[0], first, second)
+        if sat is not None and sat > 0.0:
+          distance = -sat
       self.max_pen[key] = max(self.max_pen[key], -distance)
 
   def check(self, allowed_penetration=1e-5):

@@ -147,3 +147,50 @@ def test_clearance_monitor_detects_overlap_without_collision_pair(monkeypatch):
   monitor.sample(data.qpos)
   with pytest.raises(AssertionError, match="Geometry overlap"):
     monitor.check()
+
+
+def _box_pair_model(second_pos, second_quat=None):
+  quat = f"quat='{second_quat}'" if second_quat else ""
+  return mujoco.MjModel.from_xml_string(
+      f'''<mujoco><worldbody>
+    <geom name="a" type="box" size="0.1 0.1 0.1" contype="0" conaffinity="0"/>
+    <body pos="{second_pos}"><freejoint/><geom name="b" type="box"
+      size="0.1 0.1 0.1" contype="0" conaffinity="0" {quat}/></body>
+  </worldbody></mujoco>''')
+
+
+def test_clearance_monitor_catches_coincident_boxes(monkeypatch):
+  """R09: exactly coincident volumes read GJK 0.0; SAT must still fail."""
+  monitor_type = _import("demo_clearance", monkeypatch).ClearanceMonitor
+  model = _box_pair_model("0 0 0")
+  monitor = monitor_type(model, [("a", "b")])
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  assert float(mujoco.mj_geomDistance(model, data, 0, 1, 1.0, None)) == 0.0
+  monitor.sample(data.qpos)
+  with pytest.raises(AssertionError, match="Geometry overlap"):
+    monitor.check()
+
+
+def test_clearance_monitor_catches_rotated_box_intersection(monkeypatch):
+  """R09: 30-degree yawed overlap reads GJK 0.0 or positive; SAT fails it."""
+  monitor_type = _import("demo_clearance", monkeypatch).ClearanceMonitor
+  model = _box_pair_model("0.05 0 0", "0 0 0.259 0.966")
+  monitor = monitor_type(model, [("a", "b")])
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  monitor.sample(data.qpos)
+  with pytest.raises(AssertionError, match="Geometry overlap"):
+    monitor.check()
+
+
+def test_clearance_monitor_passes_near_and_flush_boxes(monkeypatch):
+  """R09: no false positives — 1 mm gap and flush-face touch both pass."""
+  monitor_type = _import("demo_clearance", monkeypatch).ClearanceMonitor
+  for pos in ("0 0 0.201", "0 0 0.2"):
+    model = _box_pair_model(pos)
+    monitor = monitor_type(model, [("a", "b")])
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    monitor.sample(data.qpos)
+    monitor.check()  # must not raise
