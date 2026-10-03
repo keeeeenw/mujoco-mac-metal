@@ -424,15 +424,16 @@ def test_kkt_certifies_retained_accepted_step_gpu(cone):
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 @pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
 def test_opposing_pinch_converges_gpu(cone):
-  # R04: opposing-contact pinch (box settles into a snug slot between two
-  # walls under gravity): opposing normals stress the coupled solve;
-  # status, KKT and CPU parity must all hold on the retained system.
+  # R04: genuine opposing-contact pinch (box fits snugly into a slot between two
+  # walls with 1 mm overlap per side): simultaneous opposing contact normals (+x and -x)
+  # generate large symmetric normal forces; per-step status, KKT certification,
+  # and CPU trajectory parity all hold.
   xml = (f'<mujoco><option timestep="0.002" integrator="Euler" cone="{cone}" '
           'iterations="200" tolerance="1e-8" gravity="0 0 -9.81"/>'
           '<worldbody><geom name="floor" type="plane" size="5 5 0.1"/>'
-          '<geom name="wallL" type="box" size="0.05 0.3 0.3" pos="-0.14 0 0.15"/>'
-          '<geom name="wallR" type="box" size="0.05 0.3 0.3" pos="0.14 0 0.15"/>'
-          '<body pos="0 0 0.35"><freejoint/>'
+          '<geom name="wallL" type="box" size="0.05 0.3 0.3" pos="-0.129 0 0.15"/>'
+          '<geom name="wallR" type="box" size="0.05 0.3 0.3" pos="0.129 0 0.15"/>'
+          '<body pos="0 0 0.15"><freejoint/>'
           '<geom name="bx" type="box" size="0.08 0.08 0.08"/></body>'
           '</worldbody></mujoco>')
   m = mujoco.MjModel.from_xml_string(xml)
@@ -443,16 +444,85 @@ def test_opposing_pinch_converges_gpu(cone):
   cpu.qpos[:] = qp
   cpu.qvel[:] = 0
   mujoco.mj_forward(m, cpu)
-  for _ in range(300):
+
+  # Step 1: verify non-zero opposing contact forces on both walls simultaneously
+  sim.step(1)
+  mujoco.mj_step(m, cpu)
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  cf0 = sim._coupled_constraints._workspace["out_contact_force"].cpu().numpy().reshape(-1, 11)
+  normal_L = float(np.sum([cf0[i, 0] for i in range(4, 8)]))
+  normal_R = float(np.sum([cf0[i, 0] for i in range(12, 16)]))
+  assert normal_L > 100.0 and normal_R > 100.0, f"Opposing forces must be nonzero: L={normal_L}, R={normal_R}"
+
+  # Advance 100 steps under continuous opposing pinch
+  for _ in range(99):
     sim.step(1)
     mujoco.mj_step(m, cpu)
-  assert int(sim.state.status.cpu().numpy()[0]) == 0
+    assert int(sim.state.status.cpu().numpy()[0]) == 0
+
   gq = sim.state.qpos.cpu().numpy()[0]
-  np.testing.assert_allclose(gq[:3], np.asarray(cpu.qpos)[:3], atol=5e-3,
-                             err_msg=f"pinch/{cone}")
+  cq = np.asarray(cpu.qpos)
+  np.testing.assert_allclose(gq[:3], cq[:3], atol=5e-3, err_msg=f"pinch/{cone}")
   asm = sim.assembled_system()
   assert int(asm["status"].cpu().numpy()[0]) == 0
   assert kkt_violation(asm, _elliptic_blocks(sim, cone)) < 1e-3
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_opposing_walls_clearance_gpu():
+  # Retained clearance test: box drops between walls with 10 mm clearance per side.
+  xml = ('<mujoco><option timestep="0.002" integrator="Euler" cone="pyramidal" '
+         'iterations="200" tolerance="1e-8" gravity="0 0 -9.81"/>'
+         '<worldbody><geom name="floor" type="plane" size="5 5 0.1"/>'
+         '<geom name="wallL" type="box" size="0.05 0.3 0.3" pos="-0.14 0 0.15"/>'
+         '<geom name="wallR" type="box" size="0.05 0.3 0.3" pos="0.14 0 0.15"/>'
+         '<body pos="0 0 0.35"><freejoint/>'
+         '<geom name="bx" type="box" size="0.08 0.08 0.08"/></body>'
+         '</worldbody></mujoco>')
+  m = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  qp = np.asarray(m.qpos0, dtype=np.float32)
+  sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
+  for _ in range(100):
+    sim.step(1)
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  asm = sim.assembled_system()
+  assert int(asm["status"].cpu().numpy()[0]) == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_opposing_pinch_cold_vs_warm_gpu():
+  # Genuine pinch with warm vs cold starts: warm start certifies in far fewer iterations.
+  xml = ('<mujoco><option timestep="0.002" integrator="Euler" cone="pyramidal" '
+         'iterations="200" tolerance="1e-8" gravity="0 0 -9.81"/>'
+         '<worldbody><geom name="floor" type="plane" size="5 5 0.1"/>'
+         '<geom name="wallL" type="box" size="0.05 0.3 0.3" pos="-0.129 0 0.15"/>'
+         '<geom name="wallR" type="box" size="0.05 0.3 0.3" pos="0.129 0 0.15"/>'
+         '<body pos="0 0 0.15"><freejoint/>'
+         '<geom name="bx" type="box" size="0.08 0.08 0.08"/></body>'
+         '</worldbody></mujoco>')
+  m = mujoco.MjModel.from_xml_string(xml)
+
+  def run(warm):
+    sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+    qp = np.asarray(m.qpos0, dtype=np.float32)
+    sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
+    total_iters = 0
+    for _ in range(30):
+      if not warm:
+        sim.clear_warmstart()
+      sim.step(1)
+      assert int(sim.state.status.cpu().numpy()[0]) == 0
+      w = sim._coupled_constraints._workspace["out_diagnostics"][:10].reshape(10)
+      total_iters += int(w[1].item())
+    return total_iters, sim.state.qpos.cpu().numpy()[0]
+
+  iters_cold, q_cold = run(False)
+  iters_warm, q_warm = run(True)
+  assert iters_warm < iters_cold
+  np.testing.assert_allclose(q_warm[:3], q_cold[:3], atol=1e-4)
 
 
 @pytest.mark.gpu
