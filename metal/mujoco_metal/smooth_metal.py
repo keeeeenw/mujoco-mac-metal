@@ -56,7 +56,7 @@ def bias_derivative_workspace_sizes(nbody, nv, batch_size):
   return sizes
 
 
-def validate_pose_dict(model, poses, batch, device, torch):
+def validate_pose_dict(model, poses, batch, device, torch, *, check_finite=True):
   """Validate the full device pose ABI consumed by native smooth stages."""
   if not isinstance(poses, dict):
     raise TypeError("poses must be a position-stage pose dictionary")
@@ -81,7 +81,7 @@ def validate_pose_dict(model, poses, batch, device, torch):
         value.device.type != device.type or
         (device.index is not None and value.device.index != device.index)):
       raise ValueError(f"poses.{name} has an invalid shape, dtype, layout, or device")
-    if not bool(torch.isfinite(value).all()):
+    if check_finite and not bool(torch.isfinite(value).all()):
       raise ValueError(f"poses.{name} contains nonfinite values")
 
 
@@ -112,6 +112,7 @@ class MetalSmoothDynamics:
     self._torch = torch
     self._library = torch.mps.compile_shader(_SHADER.read_text())
     self._kernel = self._library.dense_mass_matrix
+    self._pose_finite_kernel = self._library.pose_finite_status
     self._bias_library = torch.mps.compile_shader(_BIAS_SHADER.read_text())
     self._bias_kernel = self._bias_library.smooth_bias
     self._bias_deriv_kernel = self._bias_library.smooth_bias_derivative
@@ -129,6 +130,7 @@ class MetalSmoothDynamics:
         batch_size,
         {
             "mass": batch_size * nv * nv,
+            "pose_status": batch_size,
             "root_com": batch_size * nb * 3,
             "cdof": batch_size * nv * 6,
             "crb": batch_size * nb * 36,
@@ -151,6 +153,10 @@ class MetalSmoothDynamics:
     self._workspace = {
         "batch_size": batch_size,
         "mass": buffer(batch_size * nv * nv),
+        "pose_status": torch.zeros(batch_size, dtype=torch.int32, device=device),
+        "pose_finite_dims": torch.tensor(
+            [nb, self.model.ngeom, self.model.nsite, self.model.njnt, batch_size],
+            dtype=torch.int32, device=device),
         "root_com": buffer(batch_size * nb * 3),
         "cdof": buffer(batch_size * nv * 6),
         "crb": buffer(batch_size * nb * 36),
@@ -176,12 +182,15 @@ class MetalSmoothDynamics:
         ),
     }
 
-  def run_device(self, qpos, qvel, mocap_pos=None, mocap_quat=None, poses=None):
+  def run_device(self, qpos, qvel, mocap_pos=None, mocap_quat=None, poses=None, *,
+                 _trusted_internal_poses=False):
     """Compute M(q) and bias from borrowed MPS float32 state tensors.
 
     Inputs are trusted to be finite and have finite nonzero free/ball
     quaternions. Device-state reset owns value validation; this hot path checks
     tensor metadata only and never reads a device value back to the host.
+    Internal poses report nonfinite worlds through device pose_status.
+    Supplied external poses retain strict synchronous boundary validation.
     Results borrow persistent workspace and remain valid until its next use.
 
     Mocap poses follow the `MetalKinematics.run_device` contract (required
@@ -211,13 +220,27 @@ class MetalSmoothDynamics:
     # The split-stage API may pass a position-stage result. Validate that
     # complete borrowed pose ABI and consume it directly; do not recompute FK
     # (which can overwrite the caller's position-stage workspace).
+    internal_pose_values = poses is None or _trusted_internal_poses
     if poses is None:
       poses = self._fk.run_device(qpos, mocap_pos, mocap_quat)
     else:
       if mocap_pos is not None or mocap_quat is not None:
         raise ValueError("mocap inputs cannot accompany supplied poses")
-      validate_pose_dict(self.model, poses, batch, self._fk._device, torch)
+      validate_pose_dict(self.model, poses, batch, self._fk._device, torch,
+                         check_finite=not _trusted_internal_poses)
     w, arrays = self._workspace, self._arrays
+    if internal_pose_values:
+      pose_buffers = []
+      for name in ("body_pos", "body_quat", "geom_pos", "geom_quat",
+                   "site_pos", "site_quat", "inertial_pos", "inertial_quat",
+                   "joint_anchor", "joint_axis"):
+        value = poses[name]
+        pose_buffers.append(value.reshape(-1) if value.numel() else w["bias"])
+      self._pose_finite_kernel(
+          *pose_buffers, w["pose_finite_dims"], w["pose_status"],
+          threads=(batch,), group_size=(1,))
+    else:
+      w["pose_status"].zero_()
     qvel_flat = qvel.reshape(-1) if self.model.nv else w["qvel"]
     args = [
         arrays[name]
@@ -276,6 +299,7 @@ class MetalSmoothDynamics:
     nv = self.model.nv
     return {
         "mass_matrix": w["mass"][: batch * nv * nv].reshape(batch, nv, nv),
+        "pose_status": w["pose_status"],
         "qfrc_bias": w["bias"][: batch * nv].reshape(batch, nv),
         "poses": poses,
         "cvel": w["cvel"][: batch * self.model.nbody * 6].reshape(

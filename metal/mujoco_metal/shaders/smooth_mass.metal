@@ -15,6 +15,43 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Device-only finite status for internally generated or explicitly trusted
+// pose packets. The host validates the external pose boundary separately.
+kernel void pose_finite_status(
+    device const float* body_pos [[buffer(0)]],
+    device const float* body_quat [[buffer(1)]],
+    device const float* geom_pos [[buffer(2)]],
+    device const float* geom_quat [[buffer(3)]],
+    device const float* site_pos [[buffer(4)]],
+    device const float* site_quat [[buffer(5)]],
+    device const float* inertial_pos [[buffer(6)]],
+    device const float* inertial_quat [[buffer(7)]],
+    device const float* joint_anchor [[buffer(8)]],
+    device const float* joint_axis [[buffer(9)]],
+    constant int* dims [[buffer(10)]],
+    device int* status [[buffer(11)]],
+    uint world [[thread_position_in_grid]]) {
+  int nbody=dims[0], ngeom=dims[1], nsite=dims[2], njnt=dims[3];
+  int batch=dims[4];
+  if (int(world) >= batch) return;
+  int b3=int(world)*nbody*3, b4=int(world)*nbody*4;
+  int g3=int(world)*ngeom*3, g4=int(world)*ngeom*4;
+  int s3=int(world)*nsite*3, s4=int(world)*nsite*4;
+  int j3=int(world)*njnt*3;
+  bool valid=true;
+  for (int i=0; i<nbody*3; ++i) valid=valid && isfinite(body_pos[b3+i]);
+  for (int i=0; i<nbody*4; ++i) valid=valid && isfinite(body_quat[b4+i]);
+  for (int i=0; i<ngeom*3; ++i) valid=valid && isfinite(geom_pos[g3+i]);
+  for (int i=0; i<ngeom*4; ++i) valid=valid && isfinite(geom_quat[g4+i]);
+  for (int i=0; i<nsite*3; ++i) valid=valid && isfinite(site_pos[s3+i]);
+  for (int i=0; i<nsite*4; ++i) valid=valid && isfinite(site_quat[s4+i]);
+  for (int i=0; i<nbody*3; ++i) valid=valid && isfinite(inertial_pos[b3+i]);
+  for (int i=0; i<nbody*4; ++i) valid=valid && isfinite(inertial_quat[b4+i]);
+  for (int i=0; i<njnt*3; ++i) valid=valid && isfinite(joint_anchor[j3+i]);
+  for (int i=0; i<njnt*3; ++i) valid=valid && isfinite(joint_axis[j3+i]);
+  status[world]=valid ? 0 : 1;
+}
+
 inline float3 qrot_mass(float4 q, float3 v) {
   return v + 2.0f*cross(q.yzw, cross(q.yzw, v) + q.x*v);
 }
