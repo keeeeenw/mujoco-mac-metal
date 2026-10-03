@@ -19,7 +19,7 @@ import copy
 
 import numpy as np
 
-from dataclasses import replace
+from dataclasses import replace, fields, is_dataclass
 
 import mujoco
 
@@ -34,19 +34,34 @@ from mujoco_metal.stepping import validate_stepping_profile
 
 
 def _clone_system_dict(d):
-  """Clone system tensor dictionary for immutable accepted-step retention."""
-  if d is None:
-    return None
+  """Clone structured device workspaces without retaining mutable map aliases."""
   import torch
-  cloned = {}
-  for k, v in d.items():
-    if isinstance(v, torch.Tensor):
-      cloned[k] = v.detach().clone()
-    elif isinstance(v, dict):
-      cloned[k] = _clone_system_dict(v)
-    else:
-      cloned[k] = v
-  return cloned
+  if isinstance(d, torch.Tensor):
+    return d.detach().clone()
+  if isinstance(d, dict):
+    return {k: _clone_system_dict(v) for k, v in d.items()}
+  if is_dataclass(d) and not isinstance(d, type):
+    return replace(d, **{field.name: _clone_system_dict(getattr(d, field.name))
+                         for field in fields(d) if field.init})
+  if isinstance(d, (list, tuple)):
+    return type(d)(_clone_system_dict(v) for v in d)
+  return d
+
+
+def _restore_system_buffers(current, saved):
+  """Restore borrowed tensor storage in place, including fixed compaction maps."""
+  import torch
+  if isinstance(saved, torch.Tensor):
+    current.copy_(saved)
+  elif isinstance(saved, dict):
+    for key, value in saved.items():
+      _restore_system_buffers(current[key], value)
+  elif is_dataclass(saved) and not isinstance(saved, type):
+    for field in fields(saved):
+      _restore_system_buffers(getattr(current, field.name), getattr(saved, field.name))
+  elif isinstance(saved, (list, tuple)):
+    for target, value in zip(current, saved):
+      _restore_system_buffers(target, value)
 
 
 def _plugin_state_key(plugin):
@@ -1459,12 +1474,11 @@ class MetalSimulation:
       # refreshes retained warmstarts and the coupled cache, so both are
       # saved and restored around the query (R03 isolation).
       cc = getattr(self, "_coupled_constraints", None)
-      lam_saved = cc.get_warmstart() if cc is not None else None
       last_coupled = getattr(self, "_last_coupled", None)
       last_gen = getattr(self, "_last_coupled_generation", None)
       accepted_step = getattr(self, "_accepted_step", None)
       asm_valid = getattr(self, "_assembled_system_valid", True)
-      ws_saved = {k: v.clone() for k, v in cc._workspace.items()} if cc is not None else None
+      ws_saved = _clone_system_dict(cc._workspace) if cc is not None else None
       rhs_saved = self._rhs.clone() if getattr(self, "_rhs", None) is not None else None
       try:
         acceleration, _, acc_dyn = self._acceleration(state._qpos, state._qvel)
@@ -1477,16 +1491,9 @@ class MetalSimulation:
           out = self._run_spatial_into(acc_poses, out)
       finally:
         if ws_saved is not None:
-          for k, v in ws_saved.items():
-            cc._workspace[k].copy_(v)
+          _restore_system_buffers(cc._workspace, ws_saved)
         if rhs_saved is not None:
           self._rhs.copy_(rhs_saved)
-        if cc is not None and lam_saved is not None:
-          import numpy as _np
-          if bool(_np.all(_np.isfinite(lam_saved))):
-            cc.set_warmstart(lam_saved)
-          else:
-            cc.clear_warmstart()
         if hasattr(self, "_last_coupled"):
           self._last_coupled = last_coupled
         if hasattr(self, "_last_coupled_generation"):
