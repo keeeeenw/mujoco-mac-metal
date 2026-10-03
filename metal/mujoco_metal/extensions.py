@@ -25,6 +25,10 @@ Provides:
 from __future__ import annotations
 
 from enum import Enum
+from dataclasses import dataclass
+import copy
+import threading
+import weakref
 import mujoco
 import numpy as np
 
@@ -64,6 +68,17 @@ class NativePlugin:
     """
     raise NotImplementedError("NativePlugin subclasses must implement run_device")
 
+  def create_instance(self):
+    """Create an unbound instance from an unbound configuration prototype.
+
+    Override this when configuration contains resources that cannot be copied,
+    or register an explicit factory. Runtime buffers belong to ``init`` and
+    must never be shared between simulations.
+    """
+    if self.model is not None or self.device is not None:
+      raise ValueError("register an unbound plugin configuration or a factory")
+    return copy.deepcopy(self)
+
   def run_host(self, data, **kwargs):
     """Optional host callback for legacy CPU execution.
     
@@ -84,48 +99,107 @@ class NativePlugin:
     pass
 
 
+@dataclass(frozen=True)
+class PluginRegistration:
+  """Immutable role/name/factory descriptor; never a bound runtime plugin."""
+
+  name: str
+  plugin_type: PluginType
+  factory: object
+
+
 class ExtensionRegistry:
   """Thread-safe registry for device-native physics plugins."""
 
   def __init__(self):
     self._plugins: dict[tuple[str, PluginType], NativePlugin] = {}
+    self._registrations: dict[tuple[str, PluginType], PluginRegistration] = {}
+    self._instances = weakref.WeakSet()
+    self._lock = threading.RLock()
     self.allow_host_callbacks = False
 
   def register(self, plugin: NativePlugin):
     """Register a NativePlugin instance."""
     if not isinstance(plugin, NativePlugin):
       raise TypeError("plugin must be an instance of NativePlugin")
-    key = (plugin.name, plugin.plugin_type)
-    if key in self._plugins:
-      raise ValueError(f"Plugin {plugin.name!r} of type {plugin.plugin_type.value!r} already registered")
-    self._plugins[key] = plugin
+    if not isinstance(plugin.plugin_type, PluginType) or not plugin.name:
+      raise ValueError("plugin requires a nonempty name and PluginType role")
+    # Snapshot the configuration now. Later mutations to the supplied prototype
+    # cannot reconfigure an existing registration or another simulation.
+    blueprint = plugin.create_instance()
+    if blueprint is plugin or not isinstance(blueprint, NativePlugin):
+      raise ValueError("create_instance must return a distinct NativePlugin")
+    with self._lock:
+      self._add_registration(plugin.name, plugin.plugin_type, blueprint.create_instance)
+      self._plugins[(plugin.name, plugin.plugin_type)] = plugin
+
+  def _add_registration(self, name, plugin_type, factory):
+    key = (name, plugin_type)
+    if key in self._registrations:
+      raise ValueError(f"Plugin {name!r} of type {plugin_type.value!r} already registered")
+    self._registrations[key] = PluginRegistration(name, plugin_type, factory)
+
+  def register_factory(self, name, plugin_type, factory):
+    """Register a zero-argument factory returning a fresh unbound plugin."""
+    if not isinstance(name, str) or not name or not isinstance(plugin_type, PluginType):
+      raise ValueError("registration requires a nonempty name and PluginType role")
+    if not callable(factory):
+      raise TypeError("plugin factory must be callable")
+    with self._lock:
+      self._add_registration(name, plugin_type, factory)
+
+  def instantiate(self, model, batch_size=1, device=None):
+    """Bind fresh instances to one simulation without changing registrations.
+
+    The descriptor list is captured atomically. Registration/unregistration after
+    construction affects future simulations only. Failed construction never
+    rebinds an existing simulation's instance.
+    """
+    with self._lock:
+      descriptors = tuple(self._registrations.values())
+    instances = []
+    for desc in descriptors:
+      plugin = desc.factory()
+      if (not isinstance(plugin, NativePlugin) or plugin.name != desc.name
+          or plugin.plugin_type != desc.plugin_type):
+        raise ValueError("plugin factory result must match its registered name and role")
+      with self._lock:
+        if plugin in self._instances or plugin.model is not None or plugin.device is not None:
+          raise ValueError("plugin factory must return a fresh unbound instance")
+        self._instances.add(plugin)
+      plugin.init(model, batch_size, device)
+      instances.append(plugin)
+    return tuple(instances)
 
   def unregister(self, name: str, plugin_type: PluginType | None = None):
     """Remove a plugin from the registry."""
-    if plugin_type is not None:
-      key = (str(name), plugin_type)
-      if key in self._plugins:
-        del self._plugins[key]
-    else:
-      keys_to_del = [k for k in self._plugins if k[0] == str(name)]
-      for k in keys_to_del:
-        del self._plugins[k]
+    with self._lock:
+      keys = [(str(name), plugin_type)] if plugin_type is not None else [
+          key for key in self._registrations if key[0] == str(name)]
+      for key in keys:
+        self._plugins.pop(key, None)
+        self._registrations.pop(key, None)
 
   def get(self, name: str, plugin_type: PluginType) -> NativePlugin | None:
     """Retrieve a registered plugin by name and type."""
-    return self._plugins.get((str(name), plugin_type), None)
+    with self._lock:
+      return self._plugins.get((str(name), plugin_type), None)
 
   def has(self, name: str, plugin_type: PluginType) -> bool:
     """Check if a plugin is registered."""
-    return (str(name), plugin_type) in self._plugins
+    with self._lock:
+      return (str(name), plugin_type) in self._registrations
 
   def list_plugins(self) -> list[tuple[str, str]]:
     """List all registered plugins as (name, type_str) tuples."""
-    return [(k[0], k[1].value) for k in self._plugins]
+    with self._lock:
+      return [(k[0], k[1].value) for k in self._registrations]
 
   def clear(self):
     """Clear all registered plugins."""
-    self._plugins.clear()
+    with self._lock:
+      self._plugins.clear()
+      self._registrations.clear()
 
 
 # Global default registry instance
