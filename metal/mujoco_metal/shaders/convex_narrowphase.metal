@@ -18,6 +18,12 @@ using namespace metal;
 #define CX_ELLIPSOID 4
 #define CX_CYLINDER 5
 #define CX_BOX 6
+#define CX_MESH 7
+
+// Milestone 011: convex-hull vertex support. Hull verts are geom-local
+// (world = geom frame composed with mesh_vert, calibrated against CPU
+// contacts); hull_info holds per-geom (offset, count).
+#define CX_MESH_MAXSCAN 64
 
 #define CX_MINVAL 1e-15f
 #define CX_EPA_MAXFACES 64
@@ -25,7 +31,8 @@ using namespace metal;
 #define CX_GJK_MAXITER 64
 
 // Analytic support point of a convex geom in world direction d.
-inline float3 cx_support(int type, float3 p, float3x3 R, float3 sz, float3 d) {
+inline float3 cx_support(int type, float3 p, float3x3 R, float3 sz, float3 d,
+                         int gi, device const float* hull, device const int* hull_info) {
   float dl = length(d);
   float3 dn = dl > 1e-12f ? d / dl : float3(1.0f, 0.0f, 0.0f);
   // Local direction.
@@ -48,6 +55,30 @@ inline float3 cx_support(int type, float3 p, float3x3 R, float3 sz, float3 d) {
     float n2 = l.x * l.x + l.y * l.y;
     float scl = n2 >= CX_MINVAL * CX_MINVAL ? sz.x / sqrt(n2) : 0.0f;
     s = float3(scl * l.x, scl * l.y, l.z >= 0.0f ? sz.y : -sz.y);
+  } else if (type == CX_MESH) {
+    // Vertex-support over hull verts. Ties (face/edge contact) average to
+    // the tied feature's centroid so portal seeding stays symmetric: a
+    // bottom-face tie seeds the face basin, not an arbitrary tied vertex's
+    // edge basin. Tie eps 1e-6 m never merges distinct mm-scale features.
+    int off = hull_info[gi * 5];
+    int cnt = hull_info[gi * 5 + 1];
+    if (cnt < 0) cnt = 0;
+    if (cnt > CX_MESH_MAXSCAN) cnt = CX_MESH_MAXSCAN;
+    float best = -3.4028235e+38f;
+    for (int k = 0; k < cnt; ++k) {
+      float3 v = float3(hull[(off + k) * 3], hull[(off + k) * 3 + 1],
+                        hull[(off + k) * 3 + 2]);
+      float dp = dot(v, l);
+      if (dp > best) best = dp;
+    }
+    float3 bs = float3(0.0f);
+    float nw = 0.0f;
+    for (int k = 0; k < cnt; ++k) {
+      float3 v = float3(hull[(off + k) * 3], hull[(off + k) * 3 + 1],
+                        hull[(off + k) * 3 + 2]);
+      if (dot(v, l) >= best - 1e-6f) { bs += v; nw += 1.0f; }
+    }
+    s = nw > 0.0f ? bs / nw : float3(0.0f);
   } else {  // CX_BOX
     s = float3(l.x >= 0.0f ? sz.x : -sz.x,
                l.y >= 0.0f ? sz.y : -sz.y,
@@ -65,10 +96,11 @@ struct CxVertex {
 
 inline CxVertex cx_minkowski(int ta, float3 pa, float3x3 Ra, float3 sza,
                              int tb, float3 pb, float3x3 Rb, float3 szb,
-                             float3 d) {
+                             float3 d, int ia, int ib,
+                             device const float* hull, device const int* hull_info) {
   CxVertex v;
-  v.a = cx_support(ta, pa, Ra, sza, d);
-  v.b = cx_support(tb, pb, Rb, szb, -d);
+  v.a = cx_support(ta, pa, Ra, sza, d, ia, hull, hull_info);
+  v.b = cx_support(tb, pb, Rb, szb, -d, ib, hull, hull_info);
   v.m = v.a - v.b;
   return v;
 }
@@ -170,7 +202,9 @@ inline float3 cx_tet_closest(float3 a, float3 b, float3 c, float3 d,
 inline float cx_gjk(int ta, float3 pa, float3x3 Ra, float3 sza,
                     int tb, float3 pb, float3x3 Rb, float3 szb,
                     float3 d0, thread float3& wpa, thread float3& wpb,
-                    thread bool& overlap, thread CxVertex* seed, thread int* nseed) {
+                    thread bool& overlap, thread CxVertex* seed, thread int* nseed,
+                    int ia, int ib,
+                    device const float* hull, device const int* hull_info) {
   CxVertex S[4];
   int n = 0;
   float3 d = d0;
@@ -182,7 +216,7 @@ inline float cx_gjk(int ta, float3 pa, float3x3 Ra, float3 sza,
   overlap = false;
   *nseed = 0;
   for (int iter = 0; iter < CX_GJK_MAXITER; ++iter) {
-    CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, d);
+    CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, d, ia, ib, hull, hull_info);
     if (n == 0) {
       S[0] = v; n = 1;
       closest = v.m; wts[0] = 1.0f;
@@ -299,15 +333,253 @@ inline float cx_min_face_dist(thread CxVertex* P) {
   return m;
 }
 
+// Milestone 011 mesh face-snap: given a mesh-side portal witness (world)
+// and the current portal normal u (A->B convention), snap to the
+// most-facing hull face through the nearest hull vertex. side = +1 when
+// the mesh is geom B (its outward faces oppose u), -1 when geom A (they
+// align with u). The gate (within ~45 degrees of u) keeps genuinely
+// side-on basins on the MPR result; face-like basins snap exactly.
+inline bool cx_mesh_snap(int gi, float3 p, float3x3 R,
+                         float3 rayDir, float side,
+                         device const float* hull, device const int* hull_info,
+                         thread float3& n_out,
+                         thread float3& fw0, thread float3& fw1, thread float3& fw2) {
+  // Contact face by center-ray-cast: ray from the hull centroid (interior
+  // for convex hulls) toward the other body exits exactly through the
+  // facing face. rayDir points from this geom toward the other
+  // (body-center delta). Robust for deep/oblique penetration where portal
+  // witnesses sit far from the contact region. Moller-Trumbore, nearest
+  // hit wins; the 0.5 gate rejects grazing hits.
+  int hoff = hull_info[gi * 5];
+  int hcnt = hull_info[gi * 5 + 1];
+  if (hcnt <= 0 || hcnt > CX_MESH_MAXSCAN) return false;
+  float rl = length(rayDir);
+  if (rl < 1e-24f) return false;
+  float3 rd = rayDir / rl;
+  float3 c = float3(0.0f);
+  for (int k = 0; k < hcnt; ++k) {
+    c += float3(hull[(hoff + k) * 3], hull[(hoff + k) * 3 + 1],
+                hull[(hoff + k) * 3 + 2]);
+  }
+  c /= float(hcnt);
+  float3 cw = p + R * c;
+  // Backstep inside along -rd: the centroid can sit exactly on a hull
+  // face plane (mesh bodies often rest at face height), which would make
+  // the ray start on the boundary and miss. 1 mm ≪ hull scale.
+  float3 org = cw - rd * 1e-3f;
+  int foff = hull_info[gi * 5 + 3];
+  int fcnt = hull_info[gi * 5 + 4];
+  int noff = hull_info[gi * 5 + 2];
+  if (fcnt < 0) return false;
+  float bestT = 3.4028235e+38f;
+  float3 bestN = float3(0.0f);
+  float3 b0 = float3(0.0f), b1 = float3(0.0f), b2 = float3(0.0f);
+  bool found = false;
+  for (int f = 0; f < fcnt; ++f) {
+    int l0 = int(hull[(foff + f) * 3]);
+    int l1 = int(hull[(foff + f) * 3 + 1]);
+    int l2 = int(hull[(foff + f) * 3 + 2]);
+    if (l0 < 0 || l0 >= hcnt || l1 < 0 || l1 >= hcnt || l2 < 0 || l2 >= hcnt)
+      continue;
+    float3 nl = float3(hull[(noff + f) * 3], hull[(noff + f) * 3 + 1],
+                       hull[(noff + f) * 3 + 2]);
+    if (dot(nl, nl) < 0.25f) continue;
+    float3 v0 = p + R * float3(hull[(hoff + l0) * 3], hull[(hoff + l0) * 3 + 1],
+                               hull[(hoff + l0) * 3 + 2]);
+    float3 v1 = p + R * float3(hull[(hoff + l1) * 3], hull[(hoff + l1) * 3 + 1],
+                               hull[(hoff + l1) * 3 + 2]);
+    float3 v2 = p + R * float3(hull[(hoff + l2) * 3], hull[(hoff + l2) * 3 + 1],
+                               hull[(hoff + l2) * 3 + 2]);
+    float3 e1 = v1 - v0, e2 = v2 - v0;
+    float3 pv = cross(rd, e2);
+    float det = dot(e1, pv);
+    if (fabs(det) < 1e-24f) continue;
+    float inv = 1.0f / det;
+    float3 tv = org - v0;
+    float uu2 = dot(tv, pv) * inv;
+    if (uu2 < 0.0f || uu2 > 1.0f) continue;
+    float3 qv = cross(tv, e1);
+    float vv2 = dot(rd, qv) * inv;
+    if (vv2 < 0.0f || uu2 + vv2 > 1.0f) continue;
+    float t = dot(e2, qv) * inv;
+    if (t < 1e-9f || t >= bestT) continue;
+    float3 nw = R * (nl / sqrt(dot(nl, nl)));
+    if (dot(nw, rd) <= 0.5f) continue;
+    bestT = t;
+    bestN = (side > 0.0f ? -nw : nw);
+    b0 = v0; b1 = v1; b2 = v2;
+    found = true;
+  }
+  if (!found) return false;
+  n_out = bestN;
+  fw0 = b0; fw1 = b1; fw2 = b2;
+  return true;
+}
+
+// Terminal-scored face-snap variant (mesh-mesh path): nearest hull vertex
+// to the refined portal witness, best face through it vs the terminal
+// normal (45-degree gate). Used when both sides are meshes, where
+// refinement converges the basin and only tilt correction is needed.
+inline bool cx_mesh_snap_u(int gi, float3 p, float3x3 R,
+                         float3 eaW, float3 u, float side,
+                         device const float* hull, device const int* hull_info,
+                         thread float3& n_out,
+                         thread float3& fw0, thread float3& fw1, thread float3& fw2) {
+  float3 d = eaW - p;
+  float3 el = float3(dot(R[0], d), dot(R[1], d), dot(R[2], d));
+  int hoff = hull_info[gi * 5];
+  int hcnt = hull_info[gi * 5 + 1];
+  if (hcnt <= 0 || hcnt > CX_MESH_MAXSCAN) return false;
+  int bestV = -1;
+  float bestD2 = 3.4028235e+38f;
+  for (int k = 0; k < hcnt; ++k) {
+    float3 v = float3(hull[(hoff + k) * 3], hull[(hoff + k) * 3 + 1],
+                      hull[(hoff + k) * 3 + 2]);
+    float3 dd = v - el;
+    float q = dot(dd, dd);
+    if (q < bestD2) { bestD2 = q; bestV = k; }
+  }
+  if (bestV < 0) return false;
+  int foff = hull_info[gi * 5 + 3];
+  int fcnt = hull_info[gi * 5 + 4];
+  int noff = hull_info[gi * 5 + 2];
+  if (fcnt < 0) return false;
+  float bestS = 0.7f;
+  float3 bestN = float3(0.0f);
+  bool found = false;
+  for (int f = 0; f < fcnt; ++f) {
+    int l0 = int(hull[(foff + f) * 3]);
+    int l1 = int(hull[(foff + f) * 3 + 1]);
+    int l2 = int(hull[(foff + f) * 3 + 2]);
+    if (l0 != bestV && l1 != bestV && l2 != bestV) continue;
+    float3 nl = float3(hull[(noff + f) * 3], hull[(noff + f) * 3 + 1],
+                       hull[(noff + f) * 3 + 2]);
+    if (dot(nl, nl) < 0.25f) continue;
+    float3 nw = R * (nl / sqrt(dot(nl, nl)));
+    float s = dot(nw, u) * (side > 0.0f ? -1.0f : 1.0f);
+    if (s > bestS) {
+      bestS = s;
+      bestN = (side > 0.0f ? -nw : nw);
+      float3 g0 = float3(hull[(hoff + l0) * 3], hull[(hoff + l0) * 3 + 1],
+                         hull[(hoff + l0) * 3 + 2]);
+      float3 g1 = float3(hull[(hoff + l1) * 3], hull[(hoff + l1) * 3 + 1],
+                         hull[(hoff + l1) * 3 + 2]);
+      float3 g2 = float3(hull[(hoff + l2) * 3], hull[(hoff + l2) * 3 + 1],
+                         hull[(hoff + l2) * 3 + 2]);
+      fw0 = p + R * g0; fw1 = p + R * g1; fw2 = p + R * g2;
+      found = true;
+    }
+  }
+  if (!found) return false;
+  n_out = bestN;
+  return true;
+}
+
 // MPR penetration query (Minkowski Portal Refinement; pinned MuJoCo uses
 // the same algorithm family via mjc_Convex/libccd for these pairs).
 // Portal = tetrahedron (v0 = Minkowski center + face v1,v2,v3 facing
 // outside). Returns depth (>0), normal, and witness points. Returns 0
 // (touching, center-delta normal) in degenerate configurations.
+// Milestone 011 box-face clamp: analytic box supports tie across whole
+// faces but return a single sign-picked corner, which can sit far from a
+// localized contact (e.g. tray corner 40 cm from a tetra). Given a query
+// point near the contact and the contact normal, return the closest point
+// on the most-facing box face (empty = keep query). Used for witness
+// placement only; overlap depths use min/max projections (tie-invariant).
+inline float3 cx_box_clamp(float3 p, float3x3 R, float3 sz, float3 q,
+                           float3 fdir, thread bool& ok) {
+  ok = false;
+  float3 best = q;
+  float bestS = 0.5f;
+  for (int k = 0; k < 3; ++k) {
+    float3 ck = float3(R[0][k], R[1][k], R[2][k]);
+    for (int s = -1; s <= 1; s += 2) {
+      float3 m = ck * float(s);
+      float sc = dot(m, fdir);
+      if (sc <= bestS) continue;
+      float3 c = p + ck * (float(s) * ((k == 0) ? sz.x : ((k == 1) ? sz.y : sz.z)));
+      float3 d = q - c;
+      float3 dl = float3(dot(R[0], d), dot(R[1], d), dot(R[2], d));
+      float3 h = sz;
+      float3 dc = float3(min(max(dl.x, -h.x), h.x),
+                         min(max(dl.y, -h.y), h.y),
+                         min(max(dl.z, -h.z), h.z));
+      // Pin to the face plane through c (c already carries the half-size
+      // offset, so the normal coordinate is 0 here, not +/-sz).
+      if (k == 0) dc.x = 0.0f;
+      if (k == 1) dc.y = 0.0f;
+      if (k == 2) dc.z = 0.0f;
+      bestS = sc;
+      best = c + R * dc;
+      ok = true;
+    }
+  }
+  return best;
+}
+
+// Milestone 011 mesh readout helper: given the final normal and optional
+// snapped faces per side, compute the exact overlap interval along it with
+// face-projected interface witnesses (analytic sides contribute their
+// toward-supports). Returns false for touching/degenerate (caller falls
+// back to the barycentric restore).
+inline bool cx_mesh_readout(int ta, float3 pa, float3x3 Ra, float3 sza,
+                            int tb, float3 pb, float3x3 Rb, float3 szb,
+                            int ia, int ib,
+                            device const float* hull, device const int* hull_info,
+                            float3 nn, bool sA, float3 fA0, float3 fA1, float3 fA2,
+                            bool sB, float3 fB0, float3 fB1, float3 fB2,
+                            thread float& depth, thread float3& wmid) {
+  float3 seedA = cx_support(ta, pa, Ra, sza, nn, ia, hull, hull_info);
+  float3 seedB = cx_support(tb, pb, Rb, szb, -nn, ib, hull, hull_info);
+  // Box sides clamp to the facing face (corner ties sit far from
+  // localized contacts); other analytic supports are already unique.
+  // Canonical order puts box first in mesh-box pairs, but both sides
+  // are handled for robustness.
+  if (ta == 6) {
+    bool ok = false;
+    float3 c = cx_box_clamp(pa, Ra, sza, seedB, nn, ok);
+    if (ok) seedA = c;
+  }
+  if (tb == 6) {
+    bool ok = false;
+    float3 c = cx_box_clamp(pb, Rb, szb, seedA, -nn, ok);
+    if (ok) seedB = c;
+  }
+  float3 ifA = seedA, ifB = seedB;
+  if (tb == 7 && sB) {
+    float u, v, w;
+    float3 q = cx_tri_closest(fB0 - seedA, fB1 - seedA, fB2 - seedA,
+                              &u, &v, &w);
+    ifB = q + seedA;
+    if (ta == 7 && sA) {
+      float u2, v2, w2;
+      float3 q2 = cx_tri_closest(fA0 - ifB, fA1 - ifB, fA2 - ifB,
+                                  &u2, &v2, &w2);
+      ifA = q2 + ifB;
+    }
+  } else if (ta == 7 && sA) {
+    float u, v, w;
+    float3 q = cx_tri_closest(fA0 - seedB, fA1 - seedB, fA2 - seedB,
+                              &u, &v, &w);
+    ifA = q + seedB;
+  }
+  float3 saP = cx_support(ta, pa, Ra, sza, nn, ia, hull, hull_info);
+  float3 saM = cx_support(ta, pa, Ra, sza, -nn, ia, hull, hull_info);
+  float3 sbP = cx_support(tb, pb, Rb, szb, nn, ib, hull, hull_info);
+  float3 sbM = cx_support(tb, pb, Rb, szb, -nn, ib, hull, hull_info);
+  float ha = dot(saP, nn), la = dot(saM, nn);
+  float hb = dot(sbP, nn), lb = dot(sbM, nn);
+  depth = min(ha, hb) - max(la, lb);
+  if (depth <= 1e-9f) return false;
+  wmid = (ifA + ifB) * 0.5f;
+  return true;
+}
 inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
                     int tb, float3 pb, float3x3 Rb, float3 szb,
                     bool raw, thread float3& normal,
-                    thread float3& wpa, thread float3& wpb) {
+                    thread float3& wpa, thread float3& wpb,
+                    int ia, int ib,
+                    device const float* hull, device const int* hull_info) {
   CxVertex P[4];
   P[0].a = pa; P[0].b = pb; P[0].m = pa - pb;
   float3 c0 = P[0].m;
@@ -320,7 +592,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
   float3 dir = -c0;
   float dl = length(dir);
   dir = dl > 1e-24f ? dir / dl : float3(1.0f, 0.0f, 0.0f);
-  P[1] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir);
+  P[1] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir, ia, ib, hull, hull_info);
   if (dot(P[1].m, dir) <= 0.0f) return 0.0f;
   // v2 perpendicular to plane (origin, v0, v1). The cross-product sign
   // is ambiguous: try both, keep the portal with the best containment
@@ -343,7 +615,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
       return l1;
     }
     dl = length(dir); dir = dir / dl;
-    P[2] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir);
+    P[2] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir, ia, ib, hull, hull_info);
     if (dot(P[2].m, dir) <= 0.0f) {
       if (attempt == 1 && !established) return 0.0f;
       continue;
@@ -369,7 +641,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
     }
     bool failed = false;
     for (int guard = 0; guard < 8; ++guard) {
-      P[3] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir);
+      P[3] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir, ia, ib, hull, hull_info);
       if (dot(P[3].m, dir) <= 0.0f) { failed = true; break; }
       // Origin outside face (v1,v0,v3)? -> v2 = v3 (libccd absolute test).
       float3 va = cross(P[1].m, P[3].m);
@@ -418,7 +690,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
   for (int guard = 0; guard < 64; ++guard) {
     float3 fdir = cx_portal_dir(P[1].m, P[2].m, P[3].m);
     if (dot(fdir, P[1].m) > 0.0f) break;
-    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, fdir);
+    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, fdir, ia, ib, hull, hull_info);
     if (dot(v4.m, fdir) <= 0.0f) return 0.0f;
     float adv0 = dot(v4.m, fdir) - dot(P[1].m, fdir);
     adv0 = min(adv0, dot(v4.m, fdir) - dot(P[2].m, fdir));
@@ -428,6 +700,9 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
   }
   // Refine portal face toward origin, then read depth. Tracks the best
   // (deepest) certified state so post-convergence wander cannot regress.
+  // Mesh pairs additionally score face-snap against the refined terminal
+  // normal afterwards (see below); analytic pairs use deepest-tracking
+  // directly (010-qualified).
   float3 nrm = cx_portal_dir(P[1].m, P[2].m, P[3].m);
   float best = dot(nrm, P[1].m);
   CxVertex bestP[4];
@@ -441,10 +716,158 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
       bestVal = best; bestNrm = nrm;
       bestP[0] = P[0]; bestP[1] = P[1]; bestP[2] = P[2]; bestP[3] = P[3];
     }
-    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, nrm);
+    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, nrm, ia, ib, hull, hull_info);
     float adv = dot(v4.m, nrm) - best;
     if (adv < CX_MPR_TOL * max(1.0f, best)) break;
     cx_expand_portal(P, &v4);
+  }
+  // Milestone 011 dual-candidate mesh readout. Candidate A scores
+  // face-snap against the refined terminal normal (refinement basin);
+  // candidate B scores center-ray snap against the body-delta direction
+  // (body-delta basin, robust when the terminal portal wanders). Each
+  // candidate reads depth as the exact overlap interval along its normal
+  // with face-projected witnesses. Select: agree (10 deg) keeps terminal
+  // for continuity, else min penetration depth (CPU EPA is the global
+  // minimum). Analytic pairs use the barycentric restore below
+  // (010-qualified).
+  if (ta == 7 || tb == 7) {
+    float bl = length(bestNrm);
+    float3 uu = bl > 1e-24f ? bestNrm / bl : float3(1.0f, 0.0f, 0.0f);
+    float3 d0 = pa - pb;
+    float dl0 = length(d0);
+    float3 rayA = dl0 > 1e-12f ? -d0 / dl0 : uu;
+    float3 rayB = dl0 > 1e-12f ? d0 / dl0 : uu;
+    // Candidate A: terminal-scored snap.
+    float3 eaA = (bestP[1].a + bestP[2].a + bestP[3].a) / 3.0f;
+    float3 eaB = (bestP[1].b + bestP[2].b + bestP[3].b) / 3.0f;
+    float3 nA = uu, nB = uu;
+    float3 fA0 = pa, fA1 = pa, fA2 = pa;
+    float3 fB0 = pb, fB1 = pb, fB2 = pb;
+    bool sA = (ta == 7) ? cx_mesh_snap_u(ia, pa, Ra, eaA, uu, -1.0f,
+                                         hull, hull_info, nA, fA0, fA1, fA2)
+                        : true;
+    bool sB = (tb == 7) ? cx_mesh_snap_u(ib, pb, Rb, eaB, uu, 1.0f,
+                                         hull, hull_info, nB, fB0, fB1, fB2)
+                        : true;
+    float3 nn = uu;
+    if (sA && sB) {
+      if (ta == 7 && tb == 7) {
+        nn = nA + nB;
+        float lnn = length(nn);
+        nn = lnn > 1e-24f ? nn / lnn : uu;
+      } else if (tb == 7) {
+        nn = nB;
+      } else {
+        nn = nA;
+      }
+    }
+    float dA = 0.0f;
+    float3 wA = float3(0.0f);
+    bool okA = cx_mesh_readout(ta, pa, Ra, sza, tb, pb, Rb, szb, ia, ib,
+                               hull, hull_info, nn, sA, fA0, fA1, fA2,
+                               sB, fB0, fB1, fB2, dA, wA);
+    // Candidate B: center-ray snap.
+    float3 mA = uu, mB = uu;
+    float3 hA0 = pa, hA1 = pa, hA2 = pa;
+    float3 hB0 = pb, hB1 = pb, hB2 = pb;
+    bool qA = (ta == 7 && dl0 > 1e-12f)
+                  ? cx_mesh_snap(ia, pa, Ra, rayA, -1.0f,
+                                 hull, hull_info, mA, hA0, hA1, hA2)
+                  : false;
+    bool qB = (tb == 7 && dl0 > 1e-12f)
+                  ? cx_mesh_snap(ib, pb, Rb, rayB, 1.0f,
+                                 hull, hull_info, mB, hB0, hB1, hB2)
+                  : false;
+    float dB = 0.0f;
+    float3 wB = float3(0.0f);
+    float3 nnB = uu;
+    bool okB = false;
+    if (qA || qB) {
+      if (qA && qB) {
+        nnB = mA + mB;
+        float lmB = length(nnB);
+        nnB = lmB > 1e-24f ? nnB / lmB : uu;
+      } else if (qB) {
+        nnB = (tb == 7) ? mB : uu;
+      } else {
+        nnB = (ta == 7) ? mA : uu;
+      }
+      okB = cx_mesh_readout(ta, pa, Ra, sza, tb, pb, Rb, szb, ia, ib,
+                            hull, hull_info, nnB, qA, hA0, hA1, hA2,
+                            qB, hB0, hB1, hB2, dB, wB);
+    }
+    // Candidate C: axis-min over world axes (lateral-offset safety net).
+    // Center-delta discovery follows lateral offsets into side basins
+    // while the true minimum exit is vertical (measured fall-through
+    // with lateral garbage witnesses); the minimum axis overlap is a
+    // valid extent that can only approach the oracle global minimum from
+    // above, never below it. Witness is the binding-supports midpoint.
+    float dC = 0.0f;
+    float3 wC = float3(0.0f);
+    float3 nnC = uu;
+    bool okC = false;
+    {
+      float3 ab = pb - pa;
+      for (int ax = 0; ax < 3; ++ax) {
+        float3 e = (ax == 0) ? float3(1.0f, 0.0f, 0.0f)
+                   : ((ax == 1) ? float3(0.0f, 1.0f, 0.0f)
+                                : float3(0.0f, 0.0f, 1.0f));
+        float sg = dot(e, ab);
+        float3 n = (sg >= 0.0f) ? e : -e;
+        if (fabs(sg) < 1e-9f) {
+          n = (dot(e, uu) >= 0.0f) ? e : -e;
+        }
+        float dd = 0.0f;
+        float3 ww = float3(0.0f);
+        if (cx_mesh_readout(ta, pa, Ra, sza, tb, pb, Rb, szb, ia, ib,
+                            hull, hull_info, n, false, pa, pa, pa,
+                            false, pb, pb, pb, dd, ww)) {
+          if (!okC || dd < dC) {
+            okC = true;
+            dC = dd;
+            wC = ww;
+            nnC = n;
+          }
+        }
+      }
+    }
+    if (okA && okB && dot(nn, nnB) > 0.985f) {
+      // Agreeing basins keep terminal for continuity, unless the axis
+      // candidate is substantially shallower (lateral-garbage agreement
+      // with a true vertical exit falls here): axis overlap is a valid
+      // extent, so a 2x-shallower axis minimum is the truer contact.
+      float dab = min(dA, dB);
+      if (okC && dC < 0.5f * dab) {
+        normal = nnC;
+        wpa = wC;
+        wpb = wpa;
+        return dC;
+      }
+      normal = nn;
+      wpa = wA;
+      wpb = wpa;
+      return dA;
+    }
+    if (okC && (!okA || dC < dA) && (!okB || dC < dB)) {
+      normal = nnC;
+      wpa = wC;
+      wpb = wpa;
+      return dC;
+    }
+    if (okB && (!okA || dB < dA)) {
+      normal = nnB;
+      wpa = wB;
+      wpb = wpa;
+      return dB;
+    }
+    if (okA) {
+      normal = nn;
+      wpa = wA;
+      wpb = wpa;
+      return dA;
+    }
+    // All readouts failed (touching or side basin): fall through to the
+    // barycentric restore shared with analytic pairs.
   }
   // Restore the best certified portal for witness/depth readout.
   P[0] = bestP[0]; P[1] = bestP[1]; P[2] = bestP[2]; P[3] = bestP[3];
@@ -583,13 +1006,15 @@ inline void cx_fix_normal_side(int t, float3 p, float3x3 R, float3 sz,
 inline int cx_single_contact(int ta, float3 pa, float3x3 Ra, float3 sza,
                              int tb, float3 pb, float3x3 Rb, float3 szb,
                              float margin, float3 d0, bool raw,
-                             thread ContactGeom* out) {
+                             thread ContactGeom* out,
+                             int ia, int ib,
+                             device const float* hull, device const int* hull_info) {
   float3 wpa, wpb;
   CxVertex seed[4];
   int nseed = 0;
   bool overlap = false;
   float gap = cx_gjk(ta, pa, Ra, sza, tb, pb, Rb, szb, d0, wpa, wpb,
-                     overlap, seed, &nseed);
+                     overlap, seed, &nseed, ia, ib, hull, hull_info);
   if (!overlap) {
     if (gap > margin) return 0;
     float3 delta = wpa - wpb;
@@ -611,9 +1036,23 @@ inline int cx_single_contact(int ta, float3 pa, float3x3 Ra, float3 sza,
     return 1;
   }
   float3 nrm, ea, eb;
-  float depth = cx_mpr(ta, pa, Ra, sza, tb, pb, Rb, szb, raw, nrm, ea, eb);
+  float depth = cx_mpr(ta, pa, Ra, sza, tb, pb, Rb, szb, raw, nrm, ea, eb,
+                       ia, ib, hull, hull_info);
   // Guard against relative-enclosure false positives at ~1e-8 gaps.
   if (depth <= 1e-9f) return 0;
+  // Enforce the A->B normal convention (matches the GJK gap path and the
+  // dispatcher swap rule): portal winding can come back flipped after
+  // refinement expansion replaces vertices, which used to emit B->A
+  // witnesses that push bodies through each other in dynamics. Only the
+  // normal is flipped (portal witnesses stay side-tagged: P.a is always
+  // on A, P.b on B, by Minkowski construction). Degenerate centers keep
+  // the portal orientation.
+  {
+    float3 ab = pb - pa;
+    if (dot(ab, ab) > 1e-18f && dot(nrm, ab) < 0.0f) {
+      nrm = -nrm;
+    }
+  }
   out[0].normal = nrm;
   out[0].dist = -depth;
   out[0].pos = (ea + eb) * 0.5f;
@@ -648,12 +1087,14 @@ inline int cx_single_contact(int ta, float3 pa, float3x3 Ra, float3 sza,
 // Plane-convex (pinned mjc_PlaneConvex): support point in -normal.
 inline int collide_plane_convex(float3 p1, float4 q1,
                                 int t2, float3 p2, float4 q2, float3 sz2,
-                                float margin, thread ContactGeom* con) {
+                                float margin, thread ContactGeom* con,
+                                int ia, int ib,
+                                device const float* hull, device const int* hull_info) {
   float3 n = rotate_q(q1, float3(0.0f, 0.0f, 1.0f));
   float3x3 R2 = float3x3(rotate_q(q2, float3(1,0,0)),
                          rotate_q(q2, float3(0,1,0)),
                          rotate_q(q2, float3(0,0,1)));
-  float3 s = cx_support(t2, p2, R2, sz2, -n);
+  float3 s = cx_support(t2, p2, R2, sz2, -n, ib, hull, hull_info);
   float dist = dot(s - p1, n);
   if (dist > margin) return 0;
   con[0].dist = dist;
@@ -667,7 +1108,9 @@ inline int collide_plane_convex(float3 p1, float4 q1,
 // Quat-based single convex contact (matrix conversion wrapper).
 inline int collide_convex_single(int ta, float3 pa, float4 qa, float3 sza,
                                  int tb, float3 pb, float4 qb, float3 szb,
-                                 float margin, thread ContactGeom* con) {
+                                 float margin, thread ContactGeom* con,
+                                 int ia, int ib,
+                                 device const float* hull, device const int* hull_info) {
   float3x3 Ra = float3x3(rotate_q(qa, float3(1,0,0)),
                          rotate_q(qa, float3(0,1,0)),
                          rotate_q(qa, float3(0,0,1)));
@@ -676,7 +1119,8 @@ inline int collide_convex_single(int ta, float3 pa, float4 qa, float3 sza,
                          rotate_q(qb, float3(0,0,1)));
   float3 d0 = pa - pb;
   if (dot(d0, d0) < 1e-24f) d0 = float3(1.0f, 0.0f, 0.0f);
-  return cx_single_contact(ta, pa, Ra, sza, tb, pb, Rb, szb, margin, d0, false, con);
+  return cx_single_contact(ta, pa, Ra, sza, tb, pb, Rb, szb, margin, d0, false, con,
+                           ia, ib, hull, hull_info);
 }
 
 // In-place rigid rotation of a geom frame about origin (pinned
@@ -727,7 +1171,9 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
                                 int tb, float3 pb, float4 qb, float3 szb,
                                 float margin, int maxn,
                                 float rb1, float rb2, int disable_multiccd,
-                                thread ContactGeom* con) {
+                                thread ContactGeom* con,
+                                int ia, int ib,
+                                device const float* hull, device const int* hull_info) {
   float3x3 Ra = float3x3(rotate_q(qa, float3(1,0,0)),
                          rotate_q(qa, float3(0,1,0)),
                          rotate_q(qa, float3(0,0,1)));
@@ -736,7 +1182,8 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
                          rotate_q(qb, float3(0,0,1)));
   float3 d0 = pa - pb;
   if (dot(d0, d0) < 1e-24f) d0 = float3(1.0f, 0.0f, 0.0f);
-  int n = cx_single_contact(ta, pa, Ra, sza, tb, pb, Rb, szb, margin, d0, false, con);
+  int n = cx_single_contact(ta, pa, Ra, sza, tb, pb, Rb, szb, margin, d0, false, con,
+                            ia, ib, hull, hull_info);
   if (n == 0 || maxn <= 1) return n;
   // Pinned gates: no restarts with MULTICCD disabled, without exactly one
   // primary witness, or when either geom is spherical/ellipsoidal.
@@ -765,7 +1212,7 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
       float3 d1 = pa1 - pb1;
       if (dot(d1, d1) < 1e-24f) d1 = float3(1.0f, 0.0f, 0.0f);
       if (!cx_single_contact(ta, pa1, Ra1, sza, tb, pb1, Rb1, szb,
-                             margin, d1, true, &cand))
+                             margin, d1, true, &cand, ia, ib, hull, hull_info))
         continue;
       // Pinned distinctness: farther than tolerance from every previous.
       bool dup = false;

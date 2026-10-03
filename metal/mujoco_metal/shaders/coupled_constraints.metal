@@ -204,6 +204,8 @@ kernel void contact_normal(
     device float* jacobian [[buffer(26)]],
     constant int* dims [[buffer(27)]],
     device const float* geom_rbound [[buffer(28)]],
+    device const float* mesh_hull [[buffer(29)]],
+    device const int* mesh_hull_info [[buffer(30)]],
     uint tid [[thread_position_in_grid]]) {
   int nv = dims[0];
   int npairs = dims[1];
@@ -251,7 +253,8 @@ kernel void contact_normal(
     con[k].t2 = float3(0.0f);
   }
   int ncon = collide_pair(ta, pa, qa, sza, rba, tb, pb, qb, szb, rbb,
-                            m + g, disable_multiccd, con);
+                            m + g, disable_multiccd, con, a, b,
+                            mesh_hull, mesh_hull_info);
   ncon = min(ncon, max_con);
 
   int ba = geom_bodyid[a];

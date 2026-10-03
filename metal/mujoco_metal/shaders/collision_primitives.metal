@@ -1298,25 +1298,34 @@ inline int collide_sphere_cylinder(
 }
 
 // Forward declarations for milestone-010 convex pairs (defined in
-// convex_narrowphase.metal, compiled after this file).
+// convex_narrowphase.metal, compiled after this file). Milestone 011 adds
+// hull buffers + canonical geom ids for mesh support.
 inline int collide_plane_convex(float3 p1, float4 q1,
                                 int t2, float3 p2, float4 q2, float3 sz2,
-                                float margin, thread ContactGeom* con);
+                                float margin, thread ContactGeom* con,
+                                int ia, int ib,
+                                device const float* hull, device const int* hull_info);
 inline int collide_convex_single(int ta, float3 pa, float4 qa, float3 sza,
                                  int tb, float3 pb, float4 qb, float3 szb,
-                                 float margin, thread ContactGeom* con);
+                                 float margin, thread ContactGeom* con,
+                                 int ia, int ib,
+                                 device const float* hull, device const int* hull_info);
 inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
                                 int tb, float3 pb, float4 qb, float3 szb,
                                 float margin, int maxn,
                                 float rb1, float rb2, int disable_multiccd,
-                                thread ContactGeom* con);
+                                thread ContactGeom* con,
+                                int ia, int ib,
+                                device const float* hull, device const int* hull_info);
 
 // Unified Pair Dispatcher
 inline int collide_pair(
     int type1, float3 p1, float4 q1, float3 sz1, float rb1,
     int type2, float3 p2, float4 q2, float3 sz2, float rb2,
-    float margin, int disable_multiccd, thread ContactGeom* con) {
-  // Types: 0 = plane, 2 = sphere, 3 = capsule, 4 = ellipsoid, 5 = cylinder, 6 = box
+    float margin, int disable_multiccd, thread ContactGeom* con,
+    int gia, int gib,
+    device const float* hull, device const int* hull_info) {
+  // Types: 0 = plane, 2 = sphere, 3 = capsule, 4 = ellipsoid, 5 = cylinder, 6 = box, 7 = mesh
   bool swapped = (type1 > type2);
   int t1 = swapped ? type2 : type1;
   int t2 = swapped ? type1 : type2;
@@ -1328,6 +1337,8 @@ inline int collide_pair(
   float4 quat2 = swapped ? q1 : q2;
   float3 size2 = swapped ? sz1 : sz2;
   float r2 = swapped ? rb1 : rb2;
+  int gi1 = swapped ? gib : gia;
+  int gi2 = swapped ? gia : gib;
 
   int n = 0;
   if (t1 == 0 && t2 == 2) {
@@ -1353,13 +1364,25 @@ inline int collide_pair(
   } else if (t1 == 2 && t2 == 5) {
     n = collide_sphere_cylinder(pos1, quat1, size1, pos2, quat2, size2, margin, con);
   } else if (t1 == 0 && t2 == 4) {
-    n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, margin, con);
+    n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, margin, con,
+                             gi1, gi2, hull, hull_info);
   } else if ((t1 == 2 && t2 == 4) || (t1 == 3 && t2 == 4) || (t1 == 4 && t2 == 4)
              || (t1 == 4 && t2 == 5) || (t1 == 4 && t2 == 6)) {
-    n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con);
+    n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con,
+                              gi1, gi2, hull, hull_info);
   } else if ((t1 == 3 && t2 == 5) || (t1 == 5 && t2 == 5) || (t1 == 5 && t2 == 6)) {
     n = collide_convex_multi(t1, pos1, quat1, size1, t2, pos2, quat2, size2,
-                             margin, 5, r1, r2, disable_multiccd, con);
+                             margin, 5, r1, r2, disable_multiccd, con,
+                             gi1, gi2, hull, hull_info);
+  } else if (t1 == 0 && t2 == 7) {
+    // Milestone 011 convex mesh (single witness; multi-contact manifolds
+    // stay a documented restriction).
+    n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, margin, con,
+                             gi1, gi2, hull, hull_info);
+  } else if ((t1 == 2 && t2 == 7) || (t1 == 3 && t2 == 7) || (t1 == 4 && t2 == 7)
+             || (t1 == 5 && t2 == 7) || (t1 == 6 && t2 == 7) || (t1 == 7 && t2 == 7)) {
+    n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con,
+                              gi1, gi2, hull, hull_info);
   }
 
   // If order was swapped, normal points from pos1 to pos2, which is from original geom2 to geom1.
