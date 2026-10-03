@@ -64,16 +64,21 @@ outside, and the second ball lands on the pedestal top.
 The demo checks the moving palm, jaws and ledges against the floor, bin and
 pedestal throughout the native rollout, using geometry-distance queries on a
 separate CPU model. Those queries also cover pairs omitted from collision
-filtering; they do not advance the native physics. The CPU regression suite
-replays the complete schedule and verifies both deliveries and furniture
-clearance. Jaw self-pairs (finger-finger, ledge-ledge, ledge-opposite-jaw)
-clear by 29 mm or more at every sampled step; the symmetric fully-closed
-empty pose would intersect and is outside the schedule envelope (muscle
-closure is always asymmetric or ball-separated). Attached jaw parts
-intentionally meet at their mechanical joints. Slide limits act as compliant
-end-stops: the grasp transient overshoots the soft limits by up to ~88 mm
-of travel, inside the verified 150 mm envelope; this is limit-force
-equilibrium, not runaway.
+filtering; they do not advance the native physics. Output separates the
+minimum unnudged geometry query from a conservative lower bound built from
+nearby pose samples and analytic slab bounds; the reported uncertainty is the
+maximum nudge radius (0.5 mm), not a substitute for either distance value.
+The CPU regression suite replays the complete schedule, verifies both
+deliveries and furniture clearance, and drives empty jaws through all 16
+corners of the four-muscle [0, 1] control box. Both slide joints retain their
+[-0.065, 0.04] m travel interval. The two 48 mm support ledges flank a 2 mm
+center gap, and the finger pads stop 2 mm above their ledge tops. This geometry
+supports the balls while keeping ledge-ledge and ledge-opposite-jaw pairs
+separated through symmetric empty closure. Finger-finger, ledge-ledge and
+ledge-opposite-jaw pairs are checked for penetration at every tested control
+corner and trajectory step. Attached jaw parts intentionally meet at their
+mechanical joints. Slide limits remain compliant, so joint-limit travel is
+reported separately from geometry clearance.
 
 Lighting and the dark checkerboard match the robotic marble music machine.
 This is a deterministic open-loop manipulation demo, not a qualified general

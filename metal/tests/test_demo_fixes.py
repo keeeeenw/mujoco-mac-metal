@@ -10,6 +10,7 @@ deck/stop contact, centered strut) instead of passing silently.
 """
 
 import importlib
+import itertools
 from pathlib import Path
 
 import mujoco
@@ -27,16 +28,13 @@ def test_gripper_schedule_clears_furniture_and_delivers_both_balls(monkeypatch):
   module = _import("muscle_gripper", monkeypatch)
   result = module.run(mode="cpu", check=True)
   clears = result["minimum_geometry_distance"]
-  # run(check=True) already enforces the strict -1e-5 overlap gate on base
-  # readings; reported minima additionally subtract the 0.5 mm ensemble
-  # bound, so the floor here is bound-aware, not penetration.
-  assert min(clears.values()) >= -6e-4
-  # Jaw self-pairs clear by centimeters through the whole trajectory (the
-  # fully-closed empty pose would intersect; the schedule never goes there).
-  assert clears["ledgeL/ledgeR"] > 0.01, clears["ledgeL/ledgeR"]
+  assert min(clears.values()) >= -1e-5
+  assert min(result["conservative_geometry_distance_lower_bound"].values()) >= -6e-4
+  assert max(result["geometry_distance_uncertainty_bound"].values()) <= 5e-4 + 1e-10
+  # Jaw tips stay apart, and the two support ledges remain geometrically split.
   assert clears["fingerL_geom/fingerR_geom"] > 0.05
-  assert clears["ledgeL/fingerR_geom"] > 0.01
-  assert clears["ledgeR/fingerL_geom"] > 0.01
+  assert clears["ledgeL/fingerR_geom"] >= -1e-5
+  assert clears["ledgeR/fingerL_geom"] >= -1e-5
   # Functional grasp/rest penetration stays within the compliant bound.
   assert max(result["max_functional_penetration"].values()) < 0.015
   x, z = result["released_ball"]
@@ -48,26 +46,50 @@ def test_gripper_schedule_clears_furniture_and_delivers_both_balls(monkeypatch):
   assert result["finger_contacts"] > 100
 
 
-def test_gripper_monitor_rejects_fully_closed_empty_pose(monkeypatch):
-  """Negative control: symmetric full close with no ball intersects 16 mm.
-
-  Proves the jaw self-pair coverage is live: the same monitor that passes
-  the delivery schedule fails the unreachable fully-closed empty pose.
-  """
+def test_gripper_supported_joint_endpoints_clear_empty_jaws(monkeypatch):
+  """The staggered, outboard ledges remain clear at both joint endpoints."""
   module = _import("muscle_gripper", monkeypatch)
   model = module._load_model()
-  from demo_clearance import ClearanceMonitor
-  monitor = ClearanceMonitor(
-      model, [("ledgeL", "ledgeR"), ("ledgeL", "fingerR_geom"),
-              ("fingerL_geom", "fingerR_geom")])
+  grip_l = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "gripL")
+  grip_r = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "gripR")
+  for joint in (grip_l, grip_r):
+    assert model.jnt_limited[joint]
+    assert model.jnt_range[joint, 0] == pytest.approx(-0.065)
+  monitor = module._clearance_monitor(model)
   data = mujoco.MjData(model)
   mujoco.mj_resetDataKeyframe(model, data, 0)
+  data.qpos[2] = 2.0
+  data.qpos[9] = 3.0
   mujoco.mj_forward(model, data)
-  data.qpos[0] = -0.065
-  data.qpos[1] = -0.065
-  monitor.sample(data.qpos, data.mocap_pos, data.mocap_quat)
-  with pytest.raises(AssertionError, match="Geometry overlap"):
+  for _ in range(600):
+    data.ctrl[:] = (1.0, 0.0, 1.0, 0.0)
+    mujoco.mj_step(model, data)
+    monitor.sample(data.qpos, data.mocap_pos, data.mocap_quat)
+  monitor.check()
+  assert max(data.qpos[:2]) < -0.06, data.qpos[:2]
+  assert monitor.minimum["ledgeL/ledgeR"] > 0.0
+
+
+def test_gripper_actuator_control_corners_do_not_clip_empty_hardware(monkeypatch):
+  """All 16 corners of the admitted four-muscle control box remain clear."""
+  module = _import("muscle_gripper", monkeypatch)
+  model = module._load_model()
+  assert model.actuator_ctrllimited.all()
+  assert (model.actuator_ctrlrange == (0.0, 1.0)).all()
+  for control in itertools.product((0.0, 1.0), repeat=model.nu):
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, 0)
+    # Remove both spheres: this explicitly exercises empty-jaw closure.
+    data.qpos[2] = 2.0
+    data.qpos[9] = 3.0
+    mujoco.mj_forward(model, data)
+    monitor = module._clearance_monitor(model)
+    for _ in range(300):
+      data.ctrl[:] = control
+      mujoco.mj_step(model, data)
+      monitor.sample(data.qpos, data.mocap_pos, data.mocap_quat)
     monitor.check()
+    assert monitor.minimum["ledgeL/ledgeR"] > 0.0
 
 
 def test_gripper_slab_proves_far_pair_separation(monkeypatch):
@@ -194,3 +216,19 @@ def test_clearance_monitor_passes_near_and_flush_boxes(monkeypatch):
     mujoco.mj_forward(model, data)
     monitor.sample(data.qpos)
     monitor.check()  # must not raise
+
+
+def test_clearance_lower_bound_is_not_reported_as_measured_distance(monkeypatch):
+  monitor_type = _import("demo_clearance", monkeypatch).ClearanceMonitor
+  model = mujoco.MjModel.from_xml_string('''<mujoco><worldbody>
+    <geom name="floor" type="plane" size="2 2 0.1"/>
+    <body pos="0 0 0.1"><freejoint/><geom name="box" type="box" size="0.1 0.1 0.1"/></body>
+  </worldbody></mujoco>''')
+  monitor = monitor_type(model, [("floor", "box")])
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  monitor.sample(data.qpos)
+  assert abs(monitor.minimum["floor/box"]) < 1e-10
+  assert monitor.reported["floor/box"] < -1e-5
+  assert 1e-5 < monitor.uncertainty["floor/box"] <= 5e-4 + 1e-10
+  monitor.check()
