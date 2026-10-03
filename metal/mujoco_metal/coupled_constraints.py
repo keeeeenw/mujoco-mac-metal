@@ -43,6 +43,7 @@ _TOLERANCE = 1e-6
 _ADAPTIVE_MAX_ITERATIONS = 1024
 
 _PLANE = int(mujoco.mjtGeom.mjGEOM_PLANE)
+_HFIELD = int(mujoco.mjtGeom.mjGEOM_HFIELD)
 _SPHERE = int(mujoco.mjtGeom.mjGEOM_SPHERE)
 _CAPSULE = int(mujoco.mjtGeom.mjGEOM_CAPSULE)
 _BOX = int(mujoco.mjtGeom.mjGEOM_BOX)
@@ -68,7 +69,8 @@ _EQ_ROWS = {
 
 _SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_TENDON, _EQ_CONNECT, _EQ_WELD)
 
-_SUPPORTED_GEOM_TYPES = (_PLANE, _SPHERE, _CAPSULE, _BOX, _ELLIPSOID, _CYLINDER, _MESH)
+_SUPPORTED_GEOM_TYPES = (_PLANE, _HFIELD, _SPHERE, _CAPSULE, _BOX,
+                           _ELLIPSOID, _CYLINDER, _MESH)
 
 # Milestone 011 convex-mesh bounds: per-geom hull verts and total hull store.
 # Metal caps kernel buffers at 31, so faces pack into the same float store
@@ -118,6 +120,12 @@ def mesh_hull_is_convex(model, meshid, tol=1e-6):
   return True
 
 
+# Milestone 012 heightfield bounds: dims and total data floats.
+_HF_MAX_N = 64
+_HF_MAX_DATA = 4096
+_HF_MAX_GEOMS = 8
+
+
 def pair_max_contacts(t1: int, t2: int) -> int:
   """Derive upper bound on contact points for a primitive geometry pair.
 
@@ -126,8 +134,25 @@ def pair_max_contacts(t1: int, t2: int) -> int:
   involvement caps at 1; capsule pairs cap at 2 (mjraw_CapsuleBox emits at
   most best+second); plane-cylinder/box cap at 4; box-box 8; remaining
   cylinder-involved convex pairs cap at 5 (multiccd native witnesses).
+  Heightfield pairs emit one witness per overlapped terrain prism
+  (mjc_ConvexHField, pinned cap mjMAXCONPAIR=50); native caps below cover
+  the qualified demo budgets and are documented restrictions.
   """
   t_min, t_max = min(t1, t2), max(t1, t2)
+  if _HFIELD in (t_min, t_max):
+    if t_min == _HFIELD and t_max == _HFIELD:
+      raise ValueError("heightfield-heightfield pairs are unsupported")
+    if t_max == _MESH:
+      # Faceted-prism vs hull EPA basins need a dedicated snap treatment
+      # (measured 5x depth error on shallow presses); analytic types only.
+      raise ValueError("mesh-heightfield pairs are unsupported in 012")
+    if t_min == _PLANE:
+      return 0
+    if t_max == _SPHERE or t_max == _ELLIPSOID:
+      return 8
+    if t_max == _BOX:
+      return 16
+    return 8
   if _SPHERE in (t_min, t_max) or _ELLIPSOID in (t_min, t_max):
     # Pinned rule: any pair involving a sphere or an ellipsoid yields one
     # contact (sphere/python sphere pairs and all ellipsoid pairs). Checked
@@ -501,7 +526,8 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       if t1 not in _SUPPORTED_GEOM_TYPES or t2 not in _SUPPORTED_GEOM_TYPES:
         raise ValueError(
             f"explicit pair ({g1}, {g2}) with types ({t1}, {t2}) is unsupported; "
-            "only plane, sphere, capsule, box, ellipsoid, and cylinder are supported"
+            "only plane, heightfield, sphere, capsule, box, ellipsoid, cylinder "
+            "and convex mesh are supported"
         )
       # Canonicalize ordering matching MuJoCo C pushGeomGeom
       if t1 > t2 or (t1 == t2 and g1 > g2):
@@ -574,7 +600,8 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       if ta not in _SUPPORTED_GEOM_TYPES or tb not in _SUPPORTED_GEOM_TYPES:
         raise ValueError(
             f"collidable geom pair ({a}, {b}) with types ({ta}, {tb}) is unsupported; "
-            "only plane, sphere, capsule, box, ellipsoid, and cylinder contacts are supported"
+            "only plane, heightfield, sphere, capsule, box, ellipsoid, cylinder "
+            "and convex mesh contacts are supported"
         )
 
       # Canonical ordering
@@ -732,8 +759,9 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
   # calibrated against CPU contacts) and uploaded once per model.
   mesh_used = sorted({g for pr in pairs for g in (pr[0], pr[1])
                       if int(geoms[g]) == _MESH})
-  mesh_hull = np.zeros((_MESH_DATA_FLOATS,), dtype=np.float32)
-  mesh_hull_info = np.full((int(model.ngeom) * 5,), -1, dtype=np.int32)
+  mesh_hull = np.zeros((_MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA,),
+                     dtype=np.float32)
+  mesh_hull_info = np.full((int(model.ngeom) * 9,), -1, dtype=np.int32)
   mesh_rbound_extra = {}
   cursor = 0
   ncursor = 3 * _MESH_MAX_TOTAL
@@ -756,8 +784,8 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
     vadr = int(model.mesh_vertadr[mid])
     verts = np.asarray(model.mesh_vert[vadr:vadr + vnum], dtype=np.float32)
     mesh_hull[3 * cursor:3 * (cursor + vnum)] = verts.reshape(-1)
-    mesh_hull_info[5 * g] = cursor
-    mesh_hull_info[5 * g + 1] = vnum
+    mesh_hull_info[9 * g] = cursor
+    mesh_hull_info[9 * g + 1] = vnum
     mesh_rbound_extra[g] = float(np.max(np.linalg.norm(verts, axis=1)))
     cursor += vnum
     # Face-snap data: outward normals from consistent winding (verified by
@@ -771,9 +799,9 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
                        f"{_MESH_MAX_FACES}")
     vd = verts.astype(np.float64)
     interior = vd.mean(axis=0)
-    mesh_hull_info[5 * g + 2] = ncursor // 3
-    mesh_hull_info[5 * g + 3] = icursor // 3
-    mesh_hull_info[5 * g + 4] = fnum
+    mesh_hull_info[9 * g + 2] = ncursor // 3
+    mesh_hull_info[9 * g + 3] = icursor // 3
+    mesh_hull_info[9 * g + 4] = fnum
     for f in faces:
       i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
       n = np.cross(vd[i1] - vd[i0], vd[i2] - vd[i0])
@@ -790,6 +818,41 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
           [i0, i1, i2], dtype=np.float32)
       ncursor += 3
       icursor += 3
+
+  # Milestone 012: heightfield store. Per hfield geom: 4 size floats plus
+  # the compiled (normalized, row-flipped) data block. Like meshes, the
+  # world height is data*size2 over the grid; prism bottoms sit at -size3.
+  hf_used = sorted({g for pr in pairs for g in (pr[0], pr[1])
+                    if int(geoms[g]) == _HFIELD})
+  if len(hf_used) > _HF_MAX_GEOMS:
+    raise ValueError(f"at most {_HF_MAX_GEOMS} heightfield geoms; found "
+                     f"{len(hf_used)}")
+  scursor = _MESH_DATA_FLOATS
+  dcursor = _MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS
+  for g in hf_used:
+    hid = int(model.geom_dataid[g])
+    if hid < 0:
+      raise ValueError(f"heightfield geom {g} has no asset")
+    nrow = int(model.hfield_nrow[hid])
+    ncol = int(model.hfield_ncol[hid])
+    if not (2 <= nrow <= _HF_MAX_N and 2 <= ncol <= _HF_MAX_N):
+      raise ValueError(f"heightfield dims {(nrow, ncol)} outside 012 "
+                       f"bounds [2, {_HF_MAX_N}]")
+    ndata = nrow * ncol
+    if dcursor + ndata > len(mesh_hull):
+      raise ValueError("total heightfield data exceeds 012 capacity "
+                       f"{_HF_MAX_DATA}")
+    size = np.asarray(model.hfield_size[hid], dtype=np.float32)
+    mesh_hull[scursor:scursor + 4] = size
+    adr = int(model.hfield_adr[hid])
+    mesh_hull[dcursor:dcursor + ndata] = np.asarray(
+        model.hfield_data[adr:adr + ndata], dtype=np.float32)
+    mesh_hull_info[9 * g + 5] = dcursor
+    mesh_hull_info[9 * g + 6] = nrow
+    mesh_hull_info[9 * g + 7] = ncol
+    mesh_hull_info[9 * g + 8] = scursor
+    scursor += 4
+    dcursor += ndata
 
   iter_req = int(model.opt.iterations)
   if iter_req <= 0 or iter_req > _MAX_ITERATIONS:

@@ -522,10 +522,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-GEO-004", "heightfield collision",
-        Stage.COLLISION, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "rejected at lowering",
-        "engine/engine_collision_driver.c", "reject heightfields",
-        "none", "012", (),
+        Stage.COLLISION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "012 implements per-prism terrain collision vs sphere/capsule/box/cylinder/ellipsoid; mesh-hfield and hfield-hfield rejected, plane-hfield yields nothing",
+        "mujoco_metal/shaders/convex_narrowphase.metal", "admit heightfield pairs within dim/data caps with per-prism slot counts",
+        "MetalSimulation(profile='integrated_euler_v1')", "012", ("test_hfield_contact_012.py",),
         enums=("mjtGeom.mjGEOM_HFIELD",),
     ),
     Requirement(
