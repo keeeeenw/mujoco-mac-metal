@@ -227,6 +227,72 @@ kernel void evaluate_sensors(
 // length/velocity = stateless linear maps, or the general kinematics
 // workspace when act_kind==1. Joint/tendon limit distances reuse the
 // coupled-assembly formulas (lower row first).
+// Aligned per-world scratch: one reusable record per compiled body.
+struct SensorSubtree { float3 xipos, vcom, scom, slin, sang, smom, slv; float smass; };
+static_assert(sizeof(SensorSubtree)==128, "sensor subtree workspace ABI");
+kernel void build_sensor_subtrees(
+    device const float* inertial_pos [[buffer(0)]],
+    device const float* inertial_quat [[buffer(1)]],
+    device const float* cvel [[buffer(2)]],
+    device const float* root_com [[buffer(3)]],
+    device const float* massub [[buffer(4)]],
+    device const int* body_tree [[buffer(5)]],
+    constant int* dims [[buffer(6)]],
+    device float* runtime [[buffer(7)]],
+    uint world [[thread_position_in_grid]]) {
+  uint nbody=uint(dims[5]);
+  if (world>=uint(dims[8])) return;
+  device SensorSubtree* sub = reinterpret_cast<device SensorSubtree*>(runtime+4)+world*nbody;
+    // Shared subtree pass (pinned mj_subtreeVel): per-body COM velocity
+    // from com-based cvel, mass-weighted backward accumulation.
+
+    for (uint k=0;k<nbody;++k) {
+      sub[k].xipos=read3(inertial_pos,(world*nbody+k)*3);
+      float3 w=read3(cvel,(world*nbody+k)*6);
+      float3 vr=read3(cvel,(world*nbody+k)*6+3);
+      uint root=uint(body_tree[k*2+1]);
+      sub[k].vcom=vr+cross(w,sub[k].xipos-read3(root_com,(world*nbody+root)*3));
+      sub[k].scom=sub[k].xipos;
+      sub[k].slin=massub[k*5+0]*sub[k].vcom;
+      float4 iq=qunit(read4(inertial_quat,(world*nbody+k)*4));
+      float3 dv=qrot(qconj(iq),w);
+      dv*=float3(massub[k*5+2],massub[k*5+3],massub[k*5+4]);
+      sub[k].sang=qrot(iq,dv);
+    }
+    for (int k=int(nbody)-1;k>0;--k) {
+      uint p=uint(body_tree[uint(k)*2+0]);
+      sub[p].slin+=sub[uint(k)].slin;
+    }
+
+    for (uint k=0;k<nbody;++k) {
+      sub[k].smass=massub[k*5+0];
+      sub[k].smom=massub[k*5+0]*sub[k].xipos;
+    }
+    for (int k=int(nbody)-1;k>0;--k) {
+      uint p=uint(body_tree[uint(k)*2+0]);
+      sub[p].smass+=sub[uint(k)].smass;
+      sub[p].smom+=sub[uint(k)].smom;
+    }
+    for (uint k=0;k<nbody;++k) {
+      sub[k].scom=sub[k].smass>1e-15f ? sub[k].smom/sub[k].smass : sub[k].xipos;
+    }
+
+    for (uint k=0;k<nbody;++k) {
+      float sm=sub[k].smass;
+      sub[k].slv=sm>1e-30f ? sub[k].slin/sm : float3(0.0f);
+    }
+      for (int k=int(nbody)-1;k>0;--k) {
+        uint kk=uint(k), pp=uint(body_tree[kk*2+0]);
+        float3 dx=sub[kk].xipos-sub[kk].scom;
+        float3 dvv=sub[kk].vcom-sub[kk].slv;
+        sub[kk].sang+=cross(dx,massub[kk*5+0]*dvv);
+        sub[pp].sang+=sub[kk].sang;
+        float3 dx2=sub[kk].scom-sub[pp].scom;
+        float3 dv2=sub[kk].slv-sub[pp].slv;
+        sub[pp].sang+=cross(dx2,sub[kk].smass*dv2);
+      }
+}
+
 kernel void evaluate_state_sensors(
     device const float* qpos [[buffer(0)]],
     device const float* qvel [[buffer(1)]],
@@ -258,7 +324,7 @@ kernel void evaluate_state_sensors(
     device const float* econst [[buffer(27)]],
     constant int* dims [[buffer(28)]],
     device float* output [[buffer(29)]],
-    constant int* stage_mask [[buffer(30)]],
+    device const float* runtime [[buffer(30)]],
     uint index [[thread_position_in_grid]]) {
   // meta per sensor (10 ints): type, datatype, needstage, objtype, objid,
   //   dim, adr, cutoff_bits, reftype, refid.
@@ -279,10 +345,9 @@ kernel void evaluate_state_sensors(
   uint nt=uint(dims[10]), nu=uint(dims[11]);
   uint act_kind=uint(dims[12]), has_mass=uint(dims[13]);
   if (index >= batch*nsensor || (dims[9] & 8192)) return;
-  if (nbody > 64) return;
   uint world=index/nsensor, i=index-world*nsensor;
   uint stage=uint(meta[i*10+2]);
-  if ((uint(stage_mask[0]) & (1u<<stage)) == 0) return;
+  if ((uint(runtime[0]) & (1u<<stage)) == 0) return;
   int typ=meta[i*10+0], objid=meta[i*10+4];
   // This kernel serves POS/VEL state families only; force, contact and
   // spatial families have dedicated kernels.
@@ -381,62 +446,14 @@ kernel void evaluate_state_sensors(
     value[0]=v.x; value[1]=v.y; value[2]=v.z;
   }
   else if (typ>=35 && typ<=38) {
-    // Shared subtree pass (pinned mj_subtreeVel): per-body COM velocity
-    // from com-based cvel, mass-weighted backward accumulation.
-    float3 xipos[64], vcom[64], scom[64], slin[64], sang[64];
-    for (uint k=0;k<nbody;++k) {
-      xipos[k]=read3(inertial_pos,(world*nbody+k)*3);
-      float3 w=read3(cvel,(world*nbody+k)*6);
-      float3 vr=read3(cvel,(world*nbody+k)*6+3);
-      uint root=uint(body_tree[k*2+1]);
-      vcom[k]=vr+cross(w,xipos[k]-read3(root_com,(world*nbody+root)*3));
-      scom[k]=xipos[k];
-      slin[k]=massub[k*5+0]*vcom[k];
-      float4 iq=qunit(read4(inertial_quat,(world*nbody+k)*4));
-      float3 dv=qrot(qconj(iq),w);
-      dv*=float3(massub[k*5+2],massub[k*5+3],massub[k*5+4]);
-      sang[k]=qrot(iq,dv);
-    }
-    for (int k=int(nbody)-1;k>0;--k) {
-      uint p=uint(body_tree[uint(k)*2+0]);
-      slin[p]+=slin[uint(k)];
-    }
-    float smass[64];
-    float3 smom[64];
-    for (uint k=0;k<nbody;++k) {
-      smass[k]=massub[k*5+0];
-      smom[k]=massub[k*5+0]*xipos[k];
-    }
-    for (int k=int(nbody)-1;k>0;--k) {
-      uint p=uint(body_tree[uint(k)*2+0]);
-      smass[p]+=smass[uint(k)];
-      smom[p]+=smom[uint(k)];
-    }
-    for (uint k=0;k<nbody;++k) {
-      scom[k]=smass[k]>1e-15f ? smom[k]/smass[k] : xipos[k];
-    }
-    float3 slv[64];
-    for (uint k=0;k<nbody;++k) {
-      float sm=smass[k];
-      slv[k]=sm>1e-30f ? slin[k]/sm : float3(0.0f);
-    }
+    device const SensorSubtree* sub = reinterpret_cast<device const SensorSubtree*>(runtime+4)+world*nbody;
     if (typ==35) {
-      value[0]=scom[uint(objid)].x; value[1]=scom[uint(objid)].y; value[2]=scom[uint(objid)].z;
+      value[0]=sub[uint(objid)].scom.x; value[1]=sub[uint(objid)].scom.y; value[2]=sub[uint(objid)].scom.z;
     } else if (typ==36) {
-      float3 lv=slv[uint(objid)];
+      float3 lv=sub[uint(objid)].slv;
       value[0]=lv.x; value[1]=lv.y; value[2]=lv.z;
     } else if (typ==37) {
-      for (int k=int(nbody)-1;k>0;--k) {
-        uint kk=uint(k), pp=uint(body_tree[kk*2+0]);
-        float3 dx=xipos[kk]-scom[kk];
-        float3 dvv=vcom[kk]-slv[kk];
-        sang[kk]+=cross(dx,massub[kk*5+0]*dvv);
-        sang[pp]+=sang[kk];
-        float3 dx2=scom[kk]-scom[pp];
-        float3 dv2=slv[kk]-slv[pp];
-        sang[pp]+=cross(dx2,smass[kk]*dv2);
-      }
-      value[0]=sang[uint(objid)].x; value[1]=sang[uint(objid)].y; value[2]=sang[uint(objid)].z;
+      value[0]=sub[uint(objid)].sang.x; value[1]=sub[uint(objid)].sang.y; value[2]=sub[uint(objid)].sang.z;
     } else {
       // Pinned INSIDESITE (massless-body rule uses subtree com).
       // Site zone types share mjtGeom values: 2 sphere, 3 capsule,
@@ -446,7 +463,7 @@ kernel void evaluate_state_sensors(
       if (otype==1) {
         pp=read3(inertial_pos,(world*nbody+uint(objid))*3);
         if (objid>0 && massub[uint(objid)*5+0]<1e-15f
-            && massub[uint(objid)*5+1]>=1e-15f) pp=scom[uint(objid)];
+            && massub[uint(objid)*5+1]>=1e-15f) pp=sub[uint(objid)].scom;
       }
       else if (otype==2) pp=read3(body_pos,(world*nbody+uint(objid))*3);
       else if (otype==5) pp=read3(geom_pos,(world*uint(dims[6])+uint(objid))*3);

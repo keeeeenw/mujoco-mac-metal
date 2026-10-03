@@ -58,6 +58,8 @@ inline void mul_inert(thread float* I, float3 va, float3 vl,
 inline float3 shift_torque(float3 torque, float3 force, float3 np_, float3 op) {
   return torque-cross(np_-op,force);
 }
+struct SensorComScratch { float3 scom; float smass; float3 smom; };
+static_assert(sizeof(SensorComScratch)==48, "sensor COM workspace ABI");
 // cfrc_ext assembly: xfrc_applied + solver-included contacts +
 // connect/weld equalities, all as subtree-com-based torque:force.
 kernel void assemble_cfrc_ext(
@@ -84,6 +86,7 @@ kernel void assemble_cfrc_ext(
     device const int* body_tree [[buffer(20)]],
     device float* cfrc_ext [[buffer(21)]],
     constant int* dims [[buffer(22)]],
+    device SensorComScratch* scratch [[buffer(23)]],
     uint world [[thread_position_in_grid]]) {
   // eq_meta per equality (4 ints): type, objtype, obj1, obj2. (objtype: 1
   // body, else site; world body 0 skipped like pinned.)
@@ -95,7 +98,7 @@ kernel void assemble_cfrc_ext(
   uint batch=uint(dims[0]), nbody=uint(dims[1]);
   uint neq=uint(dims[2]), nc=uint(dims[3]);
   uint has_xfrc=uint(dims[5]), nr=uint(dims[6]), S=uint(dims[7]);
-  if (world>=batch || nbody>64) return;
+  if (world>=batch) return;
   uint b3=world*nbody*3, b6=world*nbody*6;
   for (uint b=0;b<nbody;++b) {
     cfrc_ext[b6+b*6+0]=0.0f; cfrc_ext[b6+b*6+1]=0.0f; cfrc_ext[b6+b*6+2]=0.0f;
@@ -103,21 +106,19 @@ kernel void assemble_cfrc_ext(
   }
   // Subtree com (pinned mj_comPos: mass-weighted moments accumulated
   // backward, normalized by subtree mass; xipos fallback below MINVAL).
-  float3 scom[64];
-  float smass[64];
-  float3 smom[64];
+  device SensorComScratch* sub=scratch+world*nbody;
   for (uint b=0;b<nbody;++b) {
-    scom[b]=r3(inertial_pos,b3+b*3);
-    smass[b]=mass[b];
-    smom[b]=mass[b]*r3(inertial_pos,b3+b*3);
+    sub[b].scom=r3(inertial_pos,b3+b*3);
+    sub[b].smass=mass[b];
+    sub[b].smom=mass[b]*r3(inertial_pos,b3+b*3);
   }
   for (int k=int(nbody)-1;k>0;--k) {
     uint kk=uint(k), p=uint(body_tree[kk*2+0]);
-    smass[p]+=smass[kk];
-    smom[p]+=smom[kk];
+    sub[p].smass+=sub[kk].smass;
+    sub[p].smom+=sub[kk].smom;
   }
   for (uint b=0;b<nbody;++b) {
-    scom[b]=smass[b]>1e-15f ? smom[b]/smass[b] : r3(inertial_pos,b3+b*3);
+    sub[b].scom=sub[b].smass>1e-15f ? sub[b].smom/sub[b].smass : r3(inertial_pos,b3+b*3);
   }
   // xfrc_applied: torque:force rearranged, mapped to com.
   if (has_xfrc!=0) {
@@ -125,7 +126,7 @@ kernel void assemble_cfrc_ext(
       float3 F=r3(xfrc,b6+b*6), T=r3(xfrc,b6+b*6+3);
       if (dot(F,F)+dot(T,T)==0.0f) continue;
       uint root=uint(body_tree[b*2+1]);
-      T=shift_torque(T,F,scom[root],r3(inertial_pos,b3+b*3));
+      T=shift_torque(T,F,sub[root].scom,r3(inertial_pos,b3+b*3));
       cfrc_ext[b6+b*6+0]+=T.x; cfrc_ext[b6+b*6+1]+=T.y; cfrc_ext[b6+b*6+2]+=T.z;
       cfrc_ext[b6+b*6+3]+=F.x; cfrc_ext[b6+b*6+4]+=F.y; cfrc_ext[b6+b*6+5]+=F.z;
     }
@@ -186,13 +187,13 @@ kernel void assemble_cfrc_ext(
     }
     if (b1>0) {
       uint root=uint(body_tree[uint(b1)*2+1]);
-      float3 T=shift_torque(tw,fw,scom[root],ppos);
+      float3 T=shift_torque(tw,fw,sub[root].scom,ppos);
       cfrc_ext[b6+uint(b1)*6+0]-=T.x; cfrc_ext[b6+uint(b1)*6+1]-=T.y; cfrc_ext[b6+uint(b1)*6+2]-=T.z;
       cfrc_ext[b6+uint(b1)*6+3]-=fw.x; cfrc_ext[b6+uint(b1)*6+4]-=fw.y; cfrc_ext[b6+uint(b1)*6+5]-=fw.z;
     }
     if (b2>0) {
       uint root=uint(body_tree[uint(b2)*2+1]);
-      float3 T=shift_torque(tw,fw,scom[root],ppos);
+      float3 T=shift_torque(tw,fw,sub[root].scom,ppos);
       cfrc_ext[b6+uint(b2)*6+0]+=T.x; cfrc_ext[b6+uint(b2)*6+1]+=T.y; cfrc_ext[b6+uint(b2)*6+2]+=T.z;
       cfrc_ext[b6+uint(b2)*6+3]+=fw.x; cfrc_ext[b6+uint(b2)*6+4]+=fw.y; cfrc_ext[b6+uint(b2)*6+5]+=fw.z;
     }
@@ -229,7 +230,7 @@ kernel void assemble_cfrc_ext(
       }
       if (k>0) {
         uint root=uint(body_tree[uint(k)*2+1]);
-        float3 Tc=shift_torque(T,F,scom[root],pos);
+        float3 Tc=shift_torque(T,F,sub[root].scom,pos);
         cfrc_ext[b6+uint(k)*6+0]+=Tc.x; cfrc_ext[b6+uint(k)*6+1]+=Tc.y; cfrc_ext[b6+uint(k)*6+2]+=Tc.z;
         cfrc_ext[b6+uint(k)*6+3]+=F.x; cfrc_ext[b6+uint(k)*6+4]+=F.y; cfrc_ext[b6+uint(k)*6+5]+=F.z;
       }
@@ -251,7 +252,7 @@ kernel void assemble_cfrc_ext(
       }
       if (k>0) {
         uint root=uint(body_tree[uint(k)*2+1]);
-        float3 Tc=shift_torque(T,F,scom[root],pos);
+        float3 Tc=shift_torque(T,F,sub[root].scom,pos);
         cfrc_ext[b6+uint(k)*6+0]-=Tc.x; cfrc_ext[b6+uint(k)*6+1]-=Tc.y; cfrc_ext[b6+uint(k)*6+2]-=Tc.z;
         cfrc_ext[b6+uint(k)*6+3]-=F.x; cfrc_ext[b6+uint(k)*6+4]-=F.y; cfrc_ext[b6+uint(k)*6+5]-=F.z;
       }
@@ -282,36 +283,35 @@ kernel void rne_post(
     device float* scom_out [[buffer(17)]],
     constant int* dims [[buffer(18)]],
     device const float* gravity [[buffer(19)]],
+    device SensorComScratch* scratch [[buffer(20)]],
     uint world [[thread_position_in_grid]]) {
   // body_jnt per body (4 ints): jntadr, jntnum, dofadr, dofnum.
   // dims (5 ints): batch, nbody, nv, njnt, grav_off.
   uint batch=uint(dims[0]), nbody=uint(dims[1]), nv=uint(dims[2]);
   uint njnt=uint(dims[3]);
-  if (world>=batch || nbody>64 || nv>64) return;
+  if (world>=batch) return;
   uint vb=world*nv, b3=world*nbody*3, b6=world*nbody*6;
   // Subtree com (pinned mj_comPos: moment accumulation + MINVAL fallback).
-  float3 scom[64];
-  float smass[64];
-  float3 smom[64];
+  device SensorComScratch* sub=scratch+world*nbody;
   for (uint b=0;b<nbody;++b) {
-    scom[b]=r3(inertial_pos,b3+b*3);
-    smass[b]=mass[b];
-    smom[b]=mass[b]*r3(inertial_pos,b3+b*3);
+    sub[b].scom=r3(inertial_pos,b3+b*3);
+    sub[b].smass=mass[b];
+    sub[b].smom=mass[b]*r3(inertial_pos,b3+b*3);
   }
   for (int k=int(nbody)-1;k>0;--k) {
     uint kk=uint(k), p=uint(body_tree[kk*2+0]);
-    smass[p]+=smass[kk];
-    smom[p]+=smom[kk];
+    sub[p].smass+=sub[kk].smass;
+    sub[p].smom+=sub[kk].smom;
   }
   for (uint b=0;b<nbody;++b) {
-    scom[b]=smass[b]>1e-15f ? smom[b]/smass[b] : r3(inertial_pos,b3+b*3);
+    sub[b].scom=sub[b].smass>1e-15f ? sub[b].smom/sub[b].smass : r3(inertial_pos,b3+b*3);
   }
   // Root-com-per-body for downstream kernels.
   for (uint b=0;b<nbody;++b) {
     uint r=uint(body_tree[b*2+1]);
-    scom_out[(world*nbody+b)*3+0]=scom[r].x;
-    scom_out[(world*nbody+b)*3+1]=scom[r].y;
-    scom_out[(world*nbody+b)*3+2]=scom[r].z;
+    scom_out[(world*nbody+b)*3+0]=sub[r].scom.x;
+    scom_out[(world*nbody+b)*3+1]=sub[r].scom.y;
+    scom_out[(world*nbody+b)*3+2]=sub[r].scom.z;
   }
   // World cacc = -gravity.
   float3 wg=float3(0.0f);
@@ -324,7 +324,7 @@ kernel void rne_post(
     uint root=uint(body_tree[b*2+1]);
     float3 cw=r3(cvel,b6+p*6), cv=r3(cvel,b6+p*6+3);
     float3 ca=r3(cacc,b6+p*6), cl=r3(cacc,b6+p*6+3);
-    float3 com=scom[root];
+    float3 com=sub[root].scom;
     int ja=body_jnt[b*4+0], jn=body_jnt[b*4+1];
     for (int j=0;j<jn;++j) {
       int jj=ja+j;
@@ -457,7 +457,7 @@ kernel void evaluate_acc_sensors(
     constant int* stage_mask [[buffer(29)]],
     constant int* dims [[buffer(30)]],
     uint index [[thread_position_in_grid]]) {
-  // scom (buffer 2) carries each body's ROOT subtree com: scom[b] gives the
+  // scom (buffer 2) carries each body's ROOT subtree com: sub[b].scom gives the
   // com frame of body b's own dynamics (written by rne_post).
   // meta (10 ints): type, datatype, needstage, objtype, objid, dim, adr,
   //   cutoff_bits, reftype, refid. jnt_map per joint (3 ints): row_lo,

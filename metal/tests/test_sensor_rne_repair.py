@@ -50,8 +50,8 @@ def _cpu_frame(model, qpos, qvel, time=0.0, ctrl=None, xfrc=None):
 def test_sensor_kernel_arity_matches_python_calls_cpu():
   # Static contract: every sensor kernel's declared buffers are contiguous
   # from zero (dispatcher displacement tripwire; see R01).
-  assert _kernel_buffers("sensors_rne.metal", "assemble_cfrc_ext") == 23
-  assert _kernel_buffers("sensors_rne.metal", "rne_post") == 20
+  assert _kernel_buffers("sensors_rne.metal", "assemble_cfrc_ext") == 24
+  assert _kernel_buffers("sensors_rne.metal", "rne_post") == 21
   assert _kernel_buffers("sensors_rne.metal", "evaluate_acc_sensors") == 31
   assert _kernel_buffers("sensors.metal", "evaluate_state_sensors") == 31
 
@@ -75,7 +75,7 @@ def test_assemble_dispatch_arity_and_contiguity_gpu():
 
   import torch
   orig = {}
-  for attr, expect in (("_rne_assemble", 23), ("_rne_post", 20), ("_rne_acc", 31)):
+  for attr, expect in (("_rne_assemble", 24), ("_rne_post", 21), ("_rne_acc", 31)):
     orig[attr] = getattr(sim._sensors, attr)
 
   def _make(attr, expect, kernel):
@@ -91,7 +91,7 @@ def test_assemble_dispatch_arity_and_contiguity_gpu():
     return wrap
 
   wrappers = {a: _make(a, e, orig[a]) for a, e in
-              (("_rne_assemble", 23), ("_rne_post", 20), ("_rne_acc", 31))}
+              (("_rne_assemble", 24), ("_rne_post", 21), ("_rne_acc", 31))}
   for a, w in wrappers.items():
     setattr(sim._sensors, a, w)
   sim.sensor_values()

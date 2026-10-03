@@ -467,15 +467,6 @@ def lower_sensors(model) -> SensorDescriptor:
   arrays["ntendon"] = nt
   arrays["nu"] = nu
   arrays["ncam"] = ncam
-  _STATE_TYPES = {int(getattr(mujoco.mjtSensor, n)) for n in (
-      "mjSENS_TENDONPOS", "mjSENS_TENDONVEL", "mjSENS_ACTUATORPOS",
-      "mjSENS_ACTUATORVEL", "mjSENS_JOINTLIMITPOS", "mjSENS_JOINTLIMITVEL",
-      "mjSENS_TENDONLIMITPOS", "mjSENS_TENDONLIMITVEL",
-      "mjSENS_SUBTREECOM", "mjSENS_SUBTREELINVEL", "mjSENS_SUBTREEANGMOM",
-      "mjSENS_INSIDESITE", "mjSENS_E_POTENTIAL", "mjSENS_E_KINETIC",
-      "mjSENS_MAGNETOMETER", "mjSENS_CAMPROJECTION")}
-  if nb > 64 and bool(np.any(np.isin(sensor, list(_STATE_TYPES)))):
-    raise ValueError("state-family sensors bound nbody to 64")
   # Timing is applied by the canonical DeviceHistory stage. Pinned 3.10
   # retains sensor_noise as metadata but does not sample noise in mj_sensor.
   from mujoco_metal.history import lower_history
@@ -1225,6 +1216,19 @@ def _object_velocity(desc, poses, world, objtype, objid, pos):
   return np.concatenate((cvel[:3], cvel[3:] + np.cross(cvel[:3], pos-root_com)))
 
 
+def sensor_workspace_sizes(descriptor, batch_size):
+  """Check compiled workspace products before importing Torch or allocating."""
+  sizes = {
+      "subtree_runtime": 4 + batch_size * descriptor.nbody * 32,
+      "com_scratch": batch_size * descriptor.nbody * 12,
+      "sensor_output": batch_size * descriptor.nsensordata,
+      "body_spatial": batch_size * descriptor.nbody * 6,
+  }
+  if any(size > (1 << 31)-1 for size in sizes.values()):
+    raise ValueError("sensor workspace exceeds the Metal int32 index capacity")
+  return sizes
+
+
 class SensorProgram:
   """Batched MSL sensor evaluator. Constructor is the explicit MPS boundary."""
 
@@ -1235,8 +1239,7 @@ class SensorProgram:
     batch_size = int(batch_size)
     if batch_size > (1 << 31) - 1 or batch_size * max(self.descriptor.nsensor, 1) > (1 << 31) - 1:
       raise ValueError("sensor dispatch exceeds the Metal int32 thread limit")
-    if batch_size * self.descriptor.nsensordata > (1 << 32):
-      raise ValueError("sensor output exceeds the Metal uint32 index capacity")
+    self._workspace_sizes = sensor_workspace_sizes(self.descriptor, batch_size)
     import torch
     if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
       raise RuntimeError("PyTorch MPS with compile_shader is required")
@@ -1402,6 +1405,11 @@ class SensorProgram:
     self._s_act_stat_lmap = torch.as_tensor(act_lmap.copy(), dtype=torch.float32, device=self._device)
     self._s_act_stat_mmap = torch.as_tensor(act_mmap.copy(), dtype=torch.float32, device=self._device)
     self._s_state_kernel = self._library.evaluate_state_sensors
+    self._s_subtree_kernel = self._library.build_sensor_subtrees
+    # Four leading floats preserve 16-byte alignment and carry the stage mask;
+    # each body record is 128 bytes, verified in the Metal source ABI.
+    self._s_subtree_runtime = torch.zeros(
+        self._workspace_sizes["subtree_runtime"], dtype=torch.float32, device=self._device)
     self._s_dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
     self._s_state_out = torch.zeros((self.batch_size, d.nsensordata), dtype=torch.float32, device=self._device)
     self._build_rne_constants(model)
@@ -1531,6 +1539,12 @@ class SensorProgram:
          d.nsite, b, d.disableflags, d.ntendon, d.nu, int(act_kind),
          1 if has_ke else 0],
         dtype=torch.int32, device=self._device)
+    self._s_subtree_runtime[0:1].fill_(int(mask))
+    self._s_subtree_kernel(
+        poses["inertial_pos"].reshape(-1), poses["inertial_quat"].reshape(-1),
+        poses["cvel"].reshape(-1), poses["root_com"].reshape(-1),
+        self._s_massub.reshape(-1), self._s_body_tree.reshape(-1), sdims,
+        self._s_subtree_runtime, threads=(b,), group_size=(1,))
     self._s_state_kernel(
         qpos.reshape(-1) if d.nq else self._s_dummy,
         qvel.reshape(-1) if d.nv else self._s_dummy,
@@ -1547,7 +1561,7 @@ class SensorProgram:
         self._s_jnt_meta.reshape(-1), self._s_jnt_lim.reshape(-1),
         self._s_ten_lim.reshape(-1), self._s_massub.reshape(-1),
         self._s_body_tree.reshape(-1), self._s_site_geom.reshape(-1),
-        self._s_econst, sdims, dest.reshape(-1), self._stage_mask,
+        self._s_econst, sdims, dest.reshape(-1), self._s_subtree_runtime,
         threads=(b * max(d.nsensor, 1),), group_size=(1,))
     return dest
 
@@ -1610,6 +1624,9 @@ class SensorProgram:
     self._rne_cfrc = torch.zeros_like(self._rne_cacc)
     self._rne_scom = torch.zeros((b, max(nb, 1), 3), dtype=torch.float32, device=self._device)
     self._rne_ext = torch.zeros_like(self._rne_cacc)
+    # Reused sequentially by external-force assembly and the RNE post pass.
+    self._rne_com_scratch = torch.zeros(
+        (b, max(nb, 1), 12), dtype=torch.float32, device=self._device)
     self._build_spatial_constants(model)
 
   def _build_spatial_constants(self, model):
@@ -2061,7 +2078,7 @@ class SensorProgram:
         lam, poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),
         poses["inertial_pos"].reshape(-1),
         self._rne_mass, self._rne_body_tree.reshape(-1),
-        self._rne_ext.reshape(-1), adims,
+        self._rne_ext.reshape(-1), adims, self._rne_com_scratch.reshape(-1),
         threads=(b,), group_size=(1,))
     grav_off = 1 if d.disableflags & int(mujoco.mjtDisableBit.mjDSBL_GRAVITY) else 0
     rdims = torch.tensor(
@@ -2083,7 +2100,7 @@ class SensorProgram:
         self._rne_ext.reshape(-1),
         self._rne_cacc.reshape(-1), self._rne_cfrc.reshape(-1),
         self._rne_scom.reshape(-1),
-        rdims, self._rne_gravity,
+        rdims, self._rne_gravity, self._rne_com_scratch.reshape(-1),
         threads=(b,), group_size=(1,))
     dest = self._s_state_out if out is None else out
     if dest.device.type != "mps" or tuple(dest.shape) != (b, d.nsensordata) \

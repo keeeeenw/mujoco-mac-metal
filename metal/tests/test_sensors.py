@@ -117,7 +117,7 @@ def test_sensor_shader_buffer_abi_is_contiguous_and_matches_host_arguments():
   source = base.joinpath("sensors.metal").read_text()
   kernels = _re.split(r"(?=^kernel void )", source, flags=_re.M)
   kernels = [k for k in kernels if "[[buffer(" in k]
-  assert len(kernels) == 2
+  assert len(kernels) == 3
   for block in kernels:
     indices = [int(x) for x in _re.findall(r"\[\[buffer\((\d+)\)\]\]", block)]
     assert indices == list(range(len(indices)))
