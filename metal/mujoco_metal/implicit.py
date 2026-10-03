@@ -30,18 +30,17 @@ def implicitfast_supports_automatic(model):
   """Whether velocity derivatives assemble automatically (R06b, no guards moved).
 
   True when the smooth generalized force has no velocity dependence outside
-  the passive damper (linear + polynomial) and fixed-tendon damping: no
-  fluid forces, no activation state, and only fixed-gain/no-bias/no-dynamics
-  scalar motors (zero velocity derivative). Tendon stiffness/limits are
-  position-only and contribute a zero block. This is an admission predicate
-  only; assembly lives in :func:`implicit_derivative_reference`.
+  the passive damper (linear + polynomial), fixed-tendon damping and fluid
+  drag (inertia-box and per-geom ellipsoid models): no activation state,
+  and only fixed-gain/no-bias/no-dynamics scalar motors (zero velocity
+  derivative). Tendon stiffness/limits are position-only and contribute a
+  zero block. This is an admission predicate only; assembly lives in
+  :func:`implicit_derivative_reference`.
   """
   if not isinstance(model, mujoco.MjModel):
     raise TypeError("implicitfast lowering requires a MuJoCo MjModel")
   if mujoco.__version__ != "3.10.0":
     raise RuntimeError("implicitfast lowering requires MuJoCo 3.10.0")
-  if model.opt.density != 0 or model.opt.viscosity != 0 or np.any(model.opt.wind != 0):
-    return False
   if int(model.na) > 0:
     return False
   if int(model.nu) > 0:
@@ -59,15 +58,13 @@ def implicit_derivative_reference(model, qpos, qvel):
   Host float64 reference for the exact subset admitted by
   :func:`implicitfast_supports_automatic`: passive joint damping (linear +
   polynomial, pinned ``mju_polyForce`` derivative), fixed-tendon damping
-  tangents (``-J' diag(c) J`` with the pinned polynomial tangent), and a
-  zero block for admitted scalar motors. Fluid Jacobians, activation-state
-  dynamics and velocity-dependent actuator forces raise instead of
-  returning a silently incomplete matrix. Disable flags are honored.
+  tangents (``-J' diag(c) J`` with the pinned polynomial tangent), fluid
+  drag (R06d analytic Jacobian), and a zero block for admitted scalar
+  motors. Activation-state dynamics and velocity-dependent actuator forces
+  raise instead of returning a silently incomplete matrix. Disable flags
+  are honored.
   """
   if not implicitfast_supports_automatic(model):
-    if (model.opt.density != 0 or model.opt.viscosity != 0
-            or np.any(model.opt.wind != 0)):
-      raise ValueError("implicitfast fluid velocity derivatives are unsupported")
     raise ValueError("automatic implicitfast derivatives exclude this model")
   nv = int(model.nv)
   qpos = np.asarray(qpos, dtype=np.float64)
@@ -80,6 +77,7 @@ def implicit_derivative_reference(model, qpos, qvel):
     raise ValueError("qpos and qvel must be finite")
   from mujoco_metal.passive import PassiveForceModel
   from mujoco_metal.tendons import FixedTendonModel
+  from mujoco_metal.fluid import fluid_derivative_reference
   deriv = np.zeros((qpos.shape[0], nv, nv), dtype=np.float64)
   if nv:
     damper = PassiveForceModel(model).damping_derivative(qvel)
@@ -88,6 +86,8 @@ def implicit_derivative_reference(model, qpos, qvel):
     if int(model.ntendon) > 0:
       _, tangent, _ = FixedTendonModel(model).run(qpos, qvel)
       deriv -= tangent
+    if (model.opt.density != 0 or model.opt.viscosity != 0):
+      deriv += fluid_derivative_reference(model, qpos, qvel)
   return deriv
 
 

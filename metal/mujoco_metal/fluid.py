@@ -26,6 +26,227 @@ def _frozen(value):
   return np.frombuffer(value.tobytes(), dtype=np.float32).reshape(value.shape)
 
 
+def _skew(v):
+  v = np.asarray(v, dtype=np.float64).reshape(3)
+  return np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+
+
+def _added_mass_jac(lvel, density, vmass, vinertia):
+  """6x6 df/du of pinned mj_addedMassForces ([ang; lin] order)."""
+  v = np.asarray(lvel[3:6], dtype=np.float64)
+  w = np.asarray(lvel[0:3], dtype=np.float64)
+  A = np.diag(density * np.asarray(vmass, dtype=np.float64))
+  B = np.diag(density * np.asarray(vinertia, dtype=np.float64))
+  Av, Bw = A @ v, B @ w
+  J = np.zeros((6, 6))
+  J[3:6, 3:6] = -_skew(w) @ A
+  J[3:6, 0:3] = _skew(Av)
+  J[0:3, 3:6] = -_skew(v) @ A + _skew(Av)
+  J[0:3, 0:3] = -_skew(w) @ B + _skew(Bw)
+  return J
+
+
+def _viscous_jac(lvel, density, viscosity, size, magnus, kutta,
+                 blunt, slender, ang_drag):
+  """6x6 df/du of pinned mj_viscousForces ([ang; lin] order, R06d).
+
+  Term-by-term analytic derivative of `_viscous_forces`; quotient branches
+  (`num`, `denom`, norms) mirror the force guards exactly. Nonsmooth at
+  `lin == 0` / `mom == 0` exactly like the force (FD validation stays at
+  nonzero velocities).
+  """
+  v = np.asarray(lvel[3:6], dtype=np.float64)
+  w = np.asarray(lvel[0:3], dtype=np.float64)
+  s = np.asarray(size, dtype=np.float64).reshape(3)
+  J = np.zeros((6, 6))
+  volume = 4.0 / 3.0 * np.pi * s[0] * s[1] * s[2]
+  # Magnus lift: m*V*(w x v).
+  mV = magnus * density * volume
+  J[3:6, 3:6] += mV * _skew(w)
+  J[3:6, 0:3] += -mV * _skew(v)
+  # Kutta lift scaffolding (shared with drag below).
+  c2 = np.array([(s[1] * s[2]) ** 2, (s[2] * s[0]) ** 2, (s[0] * s[1]) ** 2])
+  c4 = c2 ** 2
+  spd = float(np.linalg.norm(v))
+  num = float(c2[0] * v[0] ** 2 + c2[1] * v[1] ** 2 + c2[2] * v[2] ** 2)
+  den = float(c4[0] * v[0] ** 2 + c4[1] * v[1] ** 2 + c4[2] * v[2] ** 2)
+  ap = float(np.pi * np.sqrt(den / max(mujoco.mjMINVAL, num))) if num > 0 else 0.0
+  nvec = c2 * v
+  ca = (num / max(mujoco.mjMINVAL, spd * den) if den > 0 and spd > 0 else 0.0)
+  dmax = float(np.max(s))
+  dmin = float(np.min(s))
+  dmid = float(s[0] + s[1] + s[2] - dmax - dmin)
+  amax = np.pi * dmax * dmid
+  # d(ap)/dv and d(ca)/dv (zero when their guards fail).
+  dap = np.zeros(3)
+  if num > mujoco.mjMINVAL:
+    dnum = 2 * c2 * v
+    dden = 2 * c4 * v
+    dap = (np.pi * 0.5 / np.sqrt(den / num)
+           * (dden * num - den * dnum) / num ** 2)
+  dca = np.zeros(3)
+  if den > 0 and spd > 0:
+    dnum = 2 * c2 * v
+    dden = 2 * c4 * v
+    m0 = max(mujoco.mjMINVAL, spd * den)
+    dca = (dnum * m0 - num * (v / spd * den + spd * dden)) / m0 ** 2
+  dnvec = np.diag(c2)
+  # circ = (n x v) * k*d*ca*ap; g = circ; f += g x v.
+  kdc = kutta * density
+  g = np.cross(nvec, v) * (kdc * ca * ap)
+  dg = np.zeros((3, 3))
+  if kdc != 0.0:
+    # d[(n x v)]/dv = -skew(v) diag(c2) + skew(n).
+    dnx = -_skew(v) @ dnvec + _skew(nvec)
+    dg = (dnx * (kdc * ca * ap)
+          + np.outer(np.cross(nvec, v), kdc * (dca * ap + ca * dap)))
+  J[3:6, 3:6] += -_skew(v) @ dg + _skew(g)
+  # Linear drag: Dl = mu*lc + rho*|v|*(ap*bl + sl*(am-ap)); f -= Dl*v.
+  eq_d = 2.0 / 3.0 * float(s[0] + s[1] + s[2])
+  Dl = viscosity * 3.0 * np.pi * eq_d + density * spd * (ap * blunt + slender * (amax - ap))
+  dDl = np.zeros(3)
+  if spd > 0:
+    dDl = density * ((ap * blunt + slender * (amax - ap)) * v / spd
+                     + spd * (blunt - slender) * dap)
+  J[3:6, 3:6] += -(Dl * np.eye(3) + np.outer(v, dDl))
+  # Angular drag: Da = mu*tc + rho*|mom|; f -= Da*w,
+  # mom = w * (ad*ii + sl*(imax-ii)) elementwise.
+  def _max_moment(d):
+    d0, d1, d2 = s[d], s[(d + 1) % 3], s[(d + 2) % 3]
+    return 8.0 / 15.0 * np.pi * d0 * max(d1, d2) ** 4
+  ii = np.array([_max_moment(0), _max_moment(1), _max_moment(2)])
+  imax = 8.0 / 15.0 * np.pi * dmid * dmax ** 4
+  kk = ang_drag * ii + slender * (imax - ii)
+  mom = w * kk
+  msp = float(np.linalg.norm(mom))
+  Da = viscosity * np.pi * eq_d ** 3 + density * msp
+  dDa = np.zeros(3)
+  if msp > 0:
+    dDa = density * (mom / msp) * kk
+  J[0:3, 0:3] += -(Da * np.eye(3) + np.outer(w, dDa))
+  return J
+
+
+def _body_jac6(model, data, body):
+  jacp = np.zeros((3, model.nv))
+  jacr = np.zeros((3, model.nv))
+  mujoco.mj_jacBody(model, data, jacp, jacr, int(body))
+  return np.vstack([jacr, jacp])
+
+
+def _geom_jac6(model, data, geom):
+  jacp = np.zeros((3, model.nv))
+  jacr = np.zeros((3, model.nv))
+  mujoco.mj_jacGeom(model, data, jacp, jacr, int(geom))
+  return np.vstack([jacr, jacp])
+
+
+def _rot6(rot):
+  rot = np.asarray(rot, dtype=np.float64).reshape(3, 3)
+  out = np.zeros((6, 6))
+  out[:3, :3] = rot
+  out[3:, 3:] = rot
+  return out
+
+
+def fluid_derivative_reference(model, qpos, qvel):
+  """Assemble ``d(qfrc_fluid)/d(qvel)`` in host float64 (R06d).
+
+  Mirrors ``InertiaBoxFluidModel.run`` term-by-term: per-geom ellipsoid
+  model (added-mass + Magnus/Kutta + viscous Jacobians above) where a body
+  has an interacting ellipsoid geom, otherwise the inertia-box model
+  (linear Stokes + per-axis quadratic blunt drag). Wind is a constant
+  offset (no Jacobian). Disable-flag and model gating match ``run``.
+  """
+  if not isinstance(model, mujoco.MjModel):
+    raise TypeError("model must be a compiled mujoco.MjModel")
+  nq, nv = int(model.nq), int(model.nv)
+  qpos = np.asarray(qpos, dtype=np.float64)
+  qvel = np.asarray(qvel, dtype=np.float64)
+  if qpos.ndim != 2 or qpos.shape[1] != nq or qvel.shape != (qpos.shape[0], nv):
+    raise ValueError(f"qpos/qvel must have shapes (B, {nq}) and (B, {nv})")
+  if not qpos.shape[0]:
+    raise ValueError("batch must be nonempty")
+  if not np.all(np.isfinite(qpos)) or not np.all(np.isfinite(qvel)):
+    raise ValueError("qpos and qvel must be finite")
+  spring = int(mujoco.mjtDisableBit.mjDSBL_SPRING)
+  damper = int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
+  if int(model.opt.disableflags) & spring and int(model.opt.disableflags) & damper:
+    return np.zeros((qpos.shape[0], nv, nv))
+  density, viscosity = float(model.opt.density), float(model.opt.viscosity)
+  if not density and not viscosity:
+    return np.zeros((qpos.shape[0], nv, nv))
+  wind = np.r_[np.zeros(3), np.asarray(model.opt.wind, dtype=np.float64)]
+  gf = np.asarray(model.geom_fluid, dtype=np.float64).reshape(-1, 12)
+  out = np.zeros((qpos.shape[0], nv, nv))
+  for row in range(qpos.shape[0]):
+    data = mujoco.MjData(model)
+    data.qpos[:] = qpos[row]
+    data.qvel[:] = qvel[row]
+    mujoco.mj_forward(model, data)
+    for body in range(1, int(model.nbody)):
+      mass = float(model.body_mass[body])
+      if mass < mujoco.mjMINVAL:
+        continue
+      adr, num = int(model.body_geomadr[body]), int(model.body_geomnum[body])
+      use_ellipsoid = bool(np.any(gf[adr:adr + num, 0] > 0)) if num else False
+      if use_ellipsoid:
+        for j in range(num):
+          gid = adr + j
+          if float(gf[gid, 0]) == 0.0:
+            continue
+          size = _geom_semiaxes(np.asarray(model.geom_size[gid]),
+                                int(np.asarray(model.geom_type[gid])))
+          lvel = np.zeros(6)
+          mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_GEOM, gid, lvel, 1)
+          lw = np.zeros(6)
+          root = int(model.body_rootid[body])
+          mujoco.mju_transformSpatial(
+              lw, wind, 0, np.asarray(data.geom_xpos[gid]),
+              np.asarray(data.subtree_com[root]),
+              np.asarray(data.geom_xmat[gid]).reshape(-1))
+          u = lvel.copy()
+          u[3:] -= lw[3:]
+          rot = np.asarray(data.geom_xmat[gid]).reshape(3, 3)
+          Dl = (_added_mass_jac(u, density, gf[gid, 6:9], gf[gid, 9:12])
+                + _viscous_jac(u, density, viscosity, size, gf[gid, 5],
+                               gf[gid, 4], gf[gid, 1], gf[gid, 2], gf[gid, 3]))
+          Dl *= float(gf[gid, 0])
+          J = _geom_jac6(model, data, gid)
+          R = _rot6(rot)
+          out[row] += J.T @ R @ Dl @ R.T @ J
+        continue
+      inertia = np.asarray(model.body_inertia[body], dtype=np.float64)
+      box = np.sqrt(np.maximum(mujoco.mjMINVAL, np.array(
+          [inertia[1] + inertia[2] - inertia[0], inertia[0] + inertia[2] - inertia[1],
+           inertia[0] + inertia[1] - inertia[2]]) / mass * 6))
+      u = np.zeros(6)
+      mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY, body, u, 1)
+      lw = np.zeros(6)
+      root = int(model.body_rootid[body])
+      mujoco.mju_transformSpatial(lw, wind, 0, data.xipos[body],
+                                  data.subtree_com[root], data.ximat[body].reshape(-1))
+      u[3:] -= lw[3:]
+      Dl = np.zeros((6, 6))
+      if viscosity > 0:
+        diameter = float(np.sum(box) / 3)
+        Dl[:3, :3] = -np.pi * diameter ** 3 * viscosity * np.eye(3)
+        Dl[3:, 3:] = -3 * np.pi * diameter * viscosity * np.eye(3)
+      if density > 0:
+        for axis in range(3):
+          other = [i for i in range(3) if i != axis]
+          j, k = other
+          v = u[3 + axis]
+          Dl[3 + axis, 3 + axis] += -density * box[j] * box[k] * abs(v)
+          w = u[axis]
+          Dl[axis, axis] += (-density * box[axis] * (box[j] ** 4 + box[k] ** 4)
+                             * abs(w) / 32)
+      J = _body_jac6(model, data, body)
+      R = _rot6(data.ximat[body].reshape(3, 3))
+      out[row] += J.T @ R @ Dl @ R.T @ J
+  return out
+
+
 def _supported_model(model):
   if mujoco.__version__ != "3.10.0":
     raise RuntimeError(f"fluid lowering requires MuJoCo 3.10.0; found {mujoco.__version__}")

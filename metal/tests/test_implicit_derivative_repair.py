@@ -54,22 +54,93 @@ def test_automatic_derivative_matches_finite_differences_cpu():
 def test_automatic_derivative_admission_cpu():
   from mujoco_metal.implicit import implicitfast_supports_automatic
   assert implicitfast_supports_automatic(_hinge_model()) is True
-  # Fluid Jacobians stay rejected.
+  # Fluid now assembles automatically (R06d analytic Jacobian).
   m = mujoco.MjModel.from_xml_string(
       "<mujoco><option timestep='0.002' integrator='Euler' density='1000'/>"
       "<worldbody><body pos='0 0 0.5'>"
       "<joint name='h' type='hinge' axis='0 0 1'/>"
       "<geom type='sphere' size='0.1' mass='0.5'/>"
       "</body></worldbody></mujoco>")
-  assert implicitfast_supports_automatic(m) is False
-  with pytest.raises(ValueError, match="fluid"):
+  assert implicitfast_supports_automatic(m) is True
+  # Activation state stays excluded.
+  m2 = mujoco.MjModel.from_xml_string(
+      "<mujoco><option timestep='0.002' integrator='Euler'/>"
+      "<worldbody><body pos='0 0 0.5'>"
+      "<joint name='h' type='hinge' axis='0 0 1'/>"
+      "<geom type='sphere' size='0.1' mass='0.5'/>"
+      "</body></worldbody>"
+      "<actuator><general name='g' joint='h' dyntype='filter'/></actuator></mujoco>")
+  assert implicitfast_supports_automatic(m2) is False
+  with pytest.raises(ValueError, match="exclude"):
     from mujoco_metal.implicit import implicit_derivative_reference
-    implicit_derivative_reference(m, np.array([[0.0]]), np.array([[0.0]]))
+    implicit_derivative_reference(m2, np.array([[0.0]]), np.array([[0.0]]))
 
 
 def _needs_gpu():
   import os
   return pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+
+
+def _fluid_model(density="1000", viscosity="0", wind="0 0 0"):
+  return mujoco.MjModel.from_xml_string(
+      f"<mujoco><option timestep='0.002' integrator='Euler' density='{density}' "
+      f"viscosity='{viscosity}' wind='{wind}'/>"
+      "<worldbody><body pos='0 0 0.5'>"
+      "<joint name='h' type='hinge' axis='0 0 1'/>"
+      "<geom type='sphere' size='0.1' mass='0.5'/>"
+      "</body></worldbody></mujoco>")
+
+
+def test_fluid_derivative_matches_finite_differences_cpu():
+  # Ladder: Stokes-linear (density 0), added-mass/Magnus/Kutta
+  # (viscosity 0), full model, then wind-shifted operating point.
+  from mujoco_metal.fluid import fluid_derivative_reference
+  from mujoco_metal.fluid import InertiaBoxFluidModel
+  h = 1e-6
+  for density, viscosity, wind in (("0", "0.5", "0 0 0"),
+                                   ("1000", "0", "0 0 0"),
+                                   ("1000", "0.5", "0 0 0"),
+                                   ("1000", "0.5", "0.3 -0.2 0.1")):
+    m = _fluid_model(density, viscosity, wind)
+    meta = InertiaBoxFluidModel(m)
+    qpos = np.array([[0.4]])
+    qvel = np.array([[1.7]])
+    got = fluid_derivative_reference(m, qpos, qvel)
+    assert got.shape == (1, 1, 1)
+    fp = lambda v: meta.run(qpos, v)
+    fd = (fp(qvel + h) - fp(qvel - h)) / (2 * h)
+    np.testing.assert_allclose(got[0], fd, rtol=1e-4, atol=1e-6,
+                               err_msg=f"rho={density} mu={viscosity}")
+  # Stokes-only case is exactly linear: derivative is velocity-independent.
+  m = _fluid_model("0", "0.5", "0 0 0")
+  a = fluid_derivative_reference(m, np.array([[0.1]]), np.array([[0.3]]))
+  b = fluid_derivative_reference(m, np.array([[0.5]]), np.array([[-2.1]]))
+  np.testing.assert_allclose(a, b, rtol=1e-9, atol=1e-12)
+
+
+def test_ellipsoid_fluid_derivative_matches_fd_cpu():
+  # Per-geom ellipsoid path (6x6, added-mass + Magnus/Kutta + viscous).
+  from mujoco_metal.fluid import fluid_derivative_reference
+  from mujoco_metal.fluid import InertiaBoxFluidModel
+  m = mujoco.MjModel.from_xml_string(
+      "<mujoco><option timestep='0.002' integrator='Euler' density='1000' viscosity='0.3'/>"
+      "<worldbody><body pos='0 0 0.5'><freejoint/>"
+      "<geom type='ellipsoid' size='.1 .07 .05' mass='.5' fluidshape='ellipsoid'/>"
+      "</body></worldbody></mujoco>")
+  meta = InertiaBoxFluidModel(m)
+  rng = np.random.default_rng(3)
+  qpos = np.array([[0.1, -0.2, 0.05, 1.0, 0.0, 0.0, 0.0]])
+  qvel = rng.normal(size=(1, 6))
+  got = fluid_derivative_reference(m, qpos, qvel)
+  assert got.shape == (1, 6, 6)
+  h = 1e-6
+  fp = lambda v: meta.run(qpos, v)
+  fd = np.zeros((1, 6, 6))
+  for j in range(6):
+    e = np.zeros((1, 6))
+    e[0, j] = h
+    fd[0, :, j] = (fp(qvel + e) - fp(qvel - e))[0] / (2 * h)
+  np.testing.assert_allclose(got[0], fd[0], rtol=1e-3, atol=1e-5)
 
 
 @_needs_gpu()
@@ -173,3 +244,48 @@ def test_automatic_derivative_pinned_step_parity_gpu():
     mujoco.mj_step(m, d2)
   np.testing.assert_allclose(nq[0], np.asarray(d2.qpos), rtol=1e-4, atol=1e-5)
   np.testing.assert_allclose(nv[0], np.asarray(d2.qvel), rtol=1e-4, atol=1e-5)
+
+
+@_needs_gpu()
+def test_fluid_implicitfast_trajectory_parity_gpu():
+  # R06d end-to-end: native solve with automatic derivatives (passive +
+  # fluid) plus pinned advance math reproduces CPU implicitfast stepping
+  # on a viscous + dense fluid hinge.
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  from mujoco_metal.implicit import ImplicitFastProgram, implicit_derivative_reference
+  from mujoco_metal.model import load_model
+  from mujoco_metal.passive import PassiveForceModel
+  from mujoco_metal.fluid import InertiaBoxFluidModel
+  from mujoco_metal.smooth_metal import MetalSmoothDynamics
+  import torch
+  m = _fluid_model("1000", "0.5", "0 0 0")
+  m.opt.integrator = int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST)
+  m.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+  h = float(m.opt.timestep)
+  desc = load_model(m)
+  smooth = MetalSmoothDynamics(desc, batch_size=1)
+  passive = PassiveForceModel(m)
+  fluid = InertiaBoxFluidModel(m)
+  prog = ImplicitFastProgram(m, batch_size=1, external_derivative=True)
+  nq, nv = np.array([[0.2]]), np.array([[2.5]])
+  d2 = mujoco.MjData(m)
+  d2.qpos[:] = nq[0]
+  d2.qvel[:] = nv[0]
+  for _ in range(20):
+    dyn = smooth.run_device(torch.as_tensor(nq.astype(np.float32), device="mps"),
+                            torch.as_tensor(nv.astype(np.float32), device="mps"),
+                            None, None)
+    auto = implicit_derivative_reference(m, nq, nv)
+    rhs = (dyn["qfrc_bias"].cpu().numpy() + passive.force(nq, nv)
+           + fluid.run(nq, nv))
+    sol = prog.run_device(dyn["mass_matrix"],
+                          torch.as_tensor(rhs.astype(np.float32), device="mps"),
+                          torch.as_tensor(auto.astype(np.float32), device="mps"))
+    a = sol["qacc"].cpu().numpy()
+    assert int(sol["status"].cpu().numpy()[0]) == 0
+    nv = nv + h * a
+    nq = nq + h * nv
+    mujoco.mj_step(m, d2)
+  np.testing.assert_allclose(nq[0], np.asarray(d2.qpos), rtol=1e-3, atol=1e-4)
+  np.testing.assert_allclose(nv[0], np.asarray(d2.qvel), rtol=1e-3, atol=1e-4)
