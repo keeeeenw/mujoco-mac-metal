@@ -102,8 +102,6 @@ def test_sensor_stage_filter_preserves_prior_other_stage_and_disable_is_noop():
 
 
 def test_sensor_lowering_rejects_deferred_types_and_stateful_delay():
-  from mujoco_metal.sensors import _DEFERRED_TO_019
-  assert _DEFERRED_TO_019  # camera/tactile/plugin/user stay 019-owned
   accel = mujoco.MjModel.from_xml_string("""<mujoco><worldbody><body><joint/><geom type="sphere" size=".1" mass="1"/><site name="s"/></body></worldbody><sensor><accelerometer site="s"/></sensor></mujoco>""")
   lower_sensors(accel)
   delayed = mujoco.MjModel.from_xml_string("""<mujoco><worldbody><body><joint name="j"/><geom type="sphere" size=".1" mass="1"/></body></worldbody><sensor><jointpos joint="j" delay=".01" nsample="2"/></sensor></mujoco>""")

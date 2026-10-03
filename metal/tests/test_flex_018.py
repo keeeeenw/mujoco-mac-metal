@@ -13,11 +13,20 @@ Validates native MPS flex implementation:
 - State snapshot, copy, restore, and reset lifecycle.
 """
 
+import os
 import math
 import mujoco
 import numpy as np
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
+
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU"
+    ),
+]
 
 from mujoco_metal import MetalSimulation
 from mujoco_metal.flex import MetalFlex, lower_flex_descriptor

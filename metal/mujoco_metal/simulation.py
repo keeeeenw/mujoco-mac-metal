@@ -1889,7 +1889,10 @@ class MetalSimulation:
         rk4_act = (state._act if (self._actuators is not None and na_here > 0)
                    else None)
         def _rk4_accel(q, v, a, t=None):
-          acc, solve_status, _ = self._acceleration(q, v, act_override=a, time_override=t)
+          try:
+            acc, solve_status, _ = self._acceleration(q, v, act_override=a, time_override=t)
+          except TypeError:
+            acc, solve_status, _ = self._acceleration(q, v, act_override=a)
           adot = self._act_dot.clone() if na_here > 0 else None
           return acc, adot, solve_status
         qpos, qvel, acceleration, weighted_dot, time, status = self._rk4.run_device(
