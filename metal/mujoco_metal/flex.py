@@ -722,13 +722,29 @@ class MetalFlex:
         "flexedge_velocity": self._flexedge_velocity.clone(),
     }
 
-  def set_state(self, state: Dict[str, torch.Tensor]):
+  def set_state(self, state: Dict[str, torch.Tensor], env_ids=None):
     """Restore flex state from snapshot."""
-    if "flexvert_xpos" in state:
-      self._flexvert_xpos.copy_(state["flexvert_xpos"])
-    if "flexvert_xvel" in state:
-      self._flexvert_xvel.copy_(state["flexvert_xvel"])
-    if "flexedge_length" in state:
-      self._flexedge_length.copy_(state["flexedge_length"])
-    if "flexedge_velocity" in state:
-      self._flexedge_velocity.copy_(state["flexedge_velocity"])
+    if env_ids is None:
+      if "flexvert_xpos" in state:
+        self._flexvert_xpos.copy_(state["flexvert_xpos"])
+      if "flexvert_xvel" in state:
+        self._flexvert_xvel.copy_(state["flexvert_xvel"])
+      if "flexedge_length" in state:
+        self._flexedge_length.copy_(state["flexedge_length"])
+      if "flexedge_velocity" in state:
+        self._flexedge_velocity.copy_(state["flexedge_velocity"])
+    else:
+      ids = [int(i) for i in env_ids]
+      idx = torch.tensor(ids, device=self._device, dtype=torch.long)
+      for k, buf in [
+          ("flexvert_xpos", self._flexvert_xpos),
+          ("flexvert_xvel", self._flexvert_xvel),
+          ("flexedge_length", self._flexedge_length),
+          ("flexedge_velocity", self._flexedge_velocity),
+      ]:
+        if k in state:
+          src = state[k]
+          if src.shape[0] == len(ids):
+            buf[idx] = src.to(device=self._device)
+          else:
+            buf[idx] = src[idx].to(device=self._device)

@@ -195,14 +195,25 @@ def mj_fwdConstraint(sim, qpos=None, qvel=None, poses=None, dynamics=None):
 
 class StateSpec:
   """Bitmask specification matching mjtState for state selection."""
-  TIME = 1 << 0
-  QPOS = 1 << 1
-  QVEL = 1 << 2
-  ACT = 1 << 3
-  QACC = 1 << 4
-  CTRL = 1 << 5
-  WARMSTART = 1 << 6
-  ALL = (1 << 7) - 1
+  TIME = 1
+  QPOS = 2
+  QVEL = 4
+  ACT = 8
+  HISTORY = 16
+  WARMSTART = 32
+  CTRL = 64
+  QFRC_APPLIED = 128
+  XFRC_APPLIED = 256
+  EQ_ACTIVE = 512
+  MOCAP_POS = 1024
+  MOCAP_QUAT = 2048
+  USERDATA = 4096
+  PLUGIN = 8192
+  PHYSICS = 30
+  USER = 8128
+  FULLPHYSICS = 8223
+  INTEGRATION = 16383
+  ALL = 16383
 
 
 def mj_getState(sim, spec: int = StateSpec.ALL, env_ids=None) -> dict[str, torch.Tensor | np.ndarray]:
@@ -223,9 +234,6 @@ def mj_getState(sim, spec: int = StateSpec.ALL, env_ids=None) -> dict[str, torch
     act = state.act
     if act is not None:
       res["act"] = act if ids is None else act[ids]
-  if spec & StateSpec.QACC:
-    qa = state.qacc
-    res["qacc"] = qa if ids is None else qa[ids]
   if spec & StateSpec.CTRL:
     ctrl = sim._control
     if ctrl is not None:
@@ -235,19 +243,183 @@ def mj_getState(sim, spec: int = StateSpec.ALL, env_ids=None) -> dict[str, torch
     if cc is not None and cc.descriptor.nr > 0:
       w = cc.get_warmstart()
       res["warmstart"] = w if ids is None else w[ids]
+  if spec & StateSpec.EQ_ACTIVE:
+    eq = state.eq_active
+    if eq is not None:
+      res["eq_active"] = eq if ids is None else eq[ids]
+  if spec & StateSpec.MOCAP_POS:
+    mp = state.mocap_pos
+    if mp is not None:
+      res["mocap_pos"] = mp if ids is None else mp[ids]
+  if spec & StateSpec.MOCAP_QUAT:
+    mq = state.mocap_quat
+    if mq is not None:
+      res["mocap_quat"] = mq if ids is None else mq[ids]
   return res
 
 
-def mj_setState(sim, values: dict[str, torch.Tensor | np.ndarray], env_ids=None):
+def mj_setState(sim, values: dict[str, Any], env_ids=None):
   """NATIVE GPU state setter: atomically apply provided state arrays."""
-  qpos = values.get("qpos", None)
-  qvel = values.get("qvel", None)
-  act = values.get("act", None)
-  if qpos is not None or qvel is not None or act is not None:
-    sim.reset(env_ids=env_ids, qpos=qpos, qvel=qvel, act=act)
-  if "ctrl" in values:
-    sim._prepare_control(values["ctrl"])
-  if "warmstart" in values:
-    cc = getattr(sim, "_coupled_constraints", None)
-    if cc is not None:
-      cc.set_warmstart(values["warmstart"], env_ids=env_ids)
+  if not isinstance(values, dict):
+    raise TypeError(f"values must be a dict, got {type(values)}")
+
+  recognized_keys = {
+      "time", "qpos", "qvel", "act", "qacc", "ctrl", "warmstart",
+      "eq_active", "xfrc_applied", "qfrc_applied", "mocap_pos", "mocap_quat"
+  }
+  for k in values:
+    if k not in recognized_keys:
+      raise ValueError(f"Unknown state key: {k}")
+
+  model = getattr(sim, "model", None) or getattr(sim, "_mjmodel", None) or sim.state._model
+  batch = sim.batch_size
+  device = getattr(sim, "device", None) or getattr(sim.state, "device", "mps")
+
+  if env_ids is None:
+    target_idx = None
+    target_count = batch
+  else:
+    target_idx = [int(i) for i in env_ids]
+    target_count = len(target_idx)
+    for idx in target_idx:
+      if idx < 0 or idx >= batch:
+        raise IndexError(f"env_id {idx} out of range [0, {batch})")
+
+  to_apply = {}
+
+  for k, val in values.items():
+    if val is None:
+      continue
+    if isinstance(val, np.ndarray):
+      t = torch.from_numpy(val).to(device=device)
+    elif isinstance(val, torch.Tensor):
+      t = val.to(device=device)
+    else:
+      t = torch.as_tensor(val, device=device)
+
+    if k == "time":
+      if t.numel() == 1:
+        t = t.view(1).expand(target_count).to(torch.float32)
+      elif t.shape == (target_count,) or t.shape == (target_count, 1):
+        t = t.view(target_count).to(torch.float32)
+      elif env_ids is not None and (t.shape == (batch,) or t.shape == (batch, 1)):
+        t = t.view(batch)[target_idx].to(torch.float32)
+      else:
+        raise ValueError(f"time shape mismatch: got {t.shape}")
+      to_apply["time"] = t
+
+    elif k == "qacc":
+      if t.shape == (target_count, model.nv):
+        t = t.to(torch.float32)
+      elif env_ids is not None and t.shape == (batch, model.nv):
+        t = t[target_idx].to(torch.float32)
+      elif t.numel() == 1 and model.nv == 1:
+        t = t.view(1, 1).expand(target_count, 1).to(torch.float32)
+      else:
+        raise ValueError(f"qacc shape mismatch: expected (_, {model.nv}), got {t.shape}")
+      to_apply["qacc"] = t
+
+    elif k == "qpos":
+      if t.shape == (target_count, model.nq):
+        t = t.to(torch.float32)
+      elif env_ids is not None and t.shape == (batch, model.nq):
+        t = t[target_idx].to(torch.float32)
+      else:
+        raise ValueError(f"qpos shape mismatch: expected (_, {model.nq}), got {t.shape}")
+      to_apply["qpos"] = t
+
+    elif k == "qvel":
+      if t.shape == (target_count, model.nv):
+        t = t.to(torch.float32)
+      elif env_ids is not None and t.shape == (batch, model.nv):
+        t = t[target_idx].to(torch.float32)
+      else:
+        raise ValueError(f"qvel shape mismatch: expected (_, {model.nv}), got {t.shape}")
+      to_apply["qvel"] = t
+
+    elif k == "act":
+      if model.na == 0:
+        continue
+      if t.shape == (target_count, model.na):
+        t = t.to(torch.float32)
+      elif env_ids is not None and t.shape == (batch, model.na):
+        t = t[target_idx].to(torch.float32)
+      else:
+        raise ValueError(f"act shape mismatch: expected (_, {model.na}), got {t.shape}")
+      to_apply["act"] = t
+
+    elif k == "ctrl":
+      if model.nu == 0:
+        continue
+      if t.shape == (target_count, model.nu):
+        t = t.to(torch.float32)
+      elif env_ids is not None and t.shape == (batch, model.nu):
+        t = t[target_idx].to(torch.float32)
+      else:
+        raise ValueError(f"ctrl shape mismatch: expected (_, {model.nu}), got {t.shape}")
+      to_apply["ctrl"] = t
+
+    elif k == "warmstart":
+      cc = getattr(sim, "_coupled_constraints", None)
+      if cc is not None and cc.descriptor.nr > 0:
+        nr = cc.descriptor.nr
+        if t.shape == (target_count, nr):
+          t = t.to(torch.float32)
+        elif env_ids is not None and t.shape == (batch, nr):
+          t = t[target_idx].to(torch.float32)
+        else:
+          raise ValueError(f"warmstart shape mismatch: expected (_, {nr}), got {t.shape}")
+        to_apply["warmstart"] = t
+
+    elif k == "eq_active":
+      if model.neq > 0:
+        if t.shape == (target_count, model.neq):
+          t = t.to(torch.int32)
+        elif env_ids is not None and t.shape == (batch, model.neq):
+          t = t[target_idx].to(torch.int32)
+        else:
+          raise ValueError(f"eq_active shape mismatch: expected (_, {model.neq}), got {t.shape}")
+        to_apply["eq_active"] = t
+
+  state = sim.state
+  if target_idx is None:
+    if "time" in to_apply:
+      state._time.copy_(to_apply["time"].view(state._time.shape))
+    if "qacc" in to_apply:
+      state._qacc.copy_(to_apply["qacc"])
+    if "qpos" in to_apply:
+      state._qpos.copy_(to_apply["qpos"])
+      if hasattr(sim, "flex") and sim.flex is not None:
+        dyn = sim._smooth.run_device(state._qpos, state._qvel)
+        sim.flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
+    if "qvel" in to_apply:
+      state._qvel.copy_(to_apply["qvel"])
+    if "act" in to_apply and state._act is not None:
+      state._act.copy_(to_apply["act"])
+    if "ctrl" in to_apply and sim._control is not None:
+      sim._control.copy_(to_apply["ctrl"])
+    if "warmstart" in to_apply:
+      sim._coupled_constraints.set_warmstart(to_apply["warmstart"], env_ids=None)
+    if "eq_active" in to_apply and state._eq_active is not None:
+      state._eq_active.copy_(to_apply["eq_active"])
+  else:
+    idx_tensor = torch.tensor(target_idx, device=device, dtype=torch.long)
+    if "time" in to_apply:
+      state._time[idx_tensor] = to_apply["time"].view(-1)
+    if "qacc" in to_apply:
+      state._qacc[idx_tensor] = to_apply["qacc"]
+    if "qpos" in to_apply:
+      state._qpos[idx_tensor] = to_apply["qpos"]
+      if hasattr(sim, "flex") and sim.flex is not None:
+        dyn = sim._smooth.run_device(state._qpos, state._qvel)
+        sim.flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
+    if "qvel" in to_apply:
+      state._qvel[idx_tensor] = to_apply["qvel"]
+    if "act" in to_apply and state._act is not None:
+      state._act[idx_tensor] = to_apply["act"]
+    if "ctrl" in to_apply and sim._control is not None:
+      sim._control[idx_tensor] = to_apply["ctrl"]
+    if "warmstart" in to_apply:
+      sim._coupled_constraints.set_warmstart(to_apply["warmstart"], env_ids=target_idx)
+    if "eq_active" in to_apply and state._eq_active is not None:
+      state._eq_active[idx_tensor] = to_apply["eq_active"]

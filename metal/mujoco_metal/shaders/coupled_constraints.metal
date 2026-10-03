@@ -820,7 +820,7 @@ kernel void solve_coupled_constraints(
       ar[r] = dbg[nr * nr + nr + r];
       lo[r] = -INFINITY;
       hi[r] = INFINITY;
-      enabled[r] = true;
+      enabled[r] = (R[r] > 0.0f || abs(ar[r]) > 0.0f);
     }
     // Tendon limit/friction rows in the reserved ten region.
     for (int r = ten_base; r < nr; ++r) {
@@ -2105,7 +2105,7 @@ kernel void solve_coupled_constraints_block(
     }
     lo[r] = -INFINITY;
     hi[r] = INFINITY;
-    enabled[r] = true;
+    enabled[r] = (R[r] > 0.0f || abs(ar[r]) > 0.0f);
   }
   for (int r = ten_base; r < nr; ++r) {
     if (meta[r] > 0.5f) enabled[r] = true;

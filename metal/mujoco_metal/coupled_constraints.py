@@ -1741,16 +1741,17 @@ class MetalCoupledConstraints:
           row_span = int(d.eq_rownum[eid])
           J_w = w["workspace_J"].view(b, nr_val, max(nv, 1))
           dbg_w = w["workspace_debug"].view(b, -1)
+          is_active = (eq_active_tensor[:, eid] != 0).float()
           for k in range(row_span):
             r = row_start + k
             e = edge_start + k
             if r < nr_val and e < flex.descriptor.nflexedge:
-              J_w[:, r, :nv] = f_J[:, e, :nv]
-              dbg_w[:, nr_val * nr_val + r] = f_R[:, e]
-              dbg_w[:, nr_val * nr_val + nr_val + r] = f_aref[:, e]
+              J_w[:, r, :nv] = f_J[:, e, :nv] * is_active.unsqueeze(-1)
+              dbg_w[:, nr_val * nr_val + r] = torch.where(is_active > 0, f_R[:, e], 0.0)
+              dbg_w[:, nr_val * nr_val + nr_val + r] = f_aref[:, e] * is_active
               dbg_w[:, nr_val * nr_val + 4 * nr_val + r] = -float("inf")
               dbg_w[:, nr_val * nr_val + 5 * nr_val + r] = float("inf")
-              dbg_w[:, nr_val * nr_val + 6 * nr_val + r] = 1.0
+              dbg_w[:, nr_val * nr_val + 6 * nr_val + r] = is_active
 
     # 2. Coupled constraint solver kernel
     solve_fn = self._solve_kernel if self.descriptor.dense_path else self._solve_block_kernel

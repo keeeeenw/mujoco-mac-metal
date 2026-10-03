@@ -569,6 +569,16 @@ class MetalSimulation:
     return self._state
 
   @property
+  def model(self):
+    """The underlying MuJoCo MjModel."""
+    return self._mjmodel
+
+  @property
+  def device(self):
+    """The device backing simulation state."""
+    return self._state.device
+
+  @property
   def execution_plan(self):
     """The model-derived execution plan for the active stepping profile."""
     return self.profile.execution_plan
@@ -914,10 +924,10 @@ class MetalSimulation:
           self._islands._stationary_steps[row] = snapshot["islands"]["_stationary_steps"][row]
     if getattr(self, "_flex", None) is not None:
       if "flex" in snapshot and snapshot["flex"] is not None:
-        self._flex.set_state(snapshot["flex"])
+        self._flex.set_state(snapshot["flex"], env_ids=env_ids)
       else:
-        body_pos, body_quat, _, _ = self._smooth.forward_kinematics(self._state.qpos)
-        self._flex.update_kinematics({"body_pos": body_pos, "body_quat": body_quat})
+        dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
+        self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -953,8 +963,8 @@ class MetalSimulation:
     if getattr(self, "_islands", None) is not None:
       self._islands.wake_all(env_ids=env_ids)
     if getattr(self, "_flex", None) is not None:
-      body_pos, body_quat, _, _ = self._smooth.forward_kinematics(self._state.qpos)
-      self._flex.update_kinematics({"body_pos": body_pos, "body_quat": body_quat})
+      dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
+      self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
     self._assembled_system_valid = False
     self._accepted_step = None
     if hasattr(self, "_last_coupled"):
@@ -1045,8 +1055,8 @@ class MetalSimulation:
     if getattr(self, "_islands", None) is not None:
       self._islands.wake_all(env_ids=env_ids)
     if getattr(self, "_flex", None) is not None:
-      body_pos, body_quat, _, _ = self._smooth.forward_kinematics(self._state.qpos)
-      self._flex.update_kinematics({"body_pos": body_pos, "body_quat": body_quat})
+      dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
+      self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
     self._assembled_system_valid = False
     self._accepted_step = None
     if hasattr(self, "_last_coupled"):
