@@ -1,0 +1,53 @@
+<mujoco model="pinball_table">
+  <compiler angle="radian"/>
+  <option timestep="0.002" integrator="Euler" iterations="100" tolerance="1e-8" gravity="0 0 -9.81" cone="pyramidal"/>
+  <worldbody>
+    <light directional="true" pos="0 -2 5" dir="0 0.3 -1" diffuse="0.9 0.9 0.9" specular="0.3 0.3 0.3"/>
+    <geom name="floor" type="plane" size="5 5 0.1" contype="1" conaffinity="7"/>
+    <geom name="wallN" type="box" size="1.0 0.05 0.2" pos="0 0.6 0.2" rgba="0.3 0.3 0.4 1" contype="0" conaffinity="0"/>
+    <geom name="wallS" type="box" size="1.0 0.05 0.2" pos="0 -0.6 0.2" rgba="0.3 0.3 0.4 1" contype="0" conaffinity="0"/>
+    <geom name="wallE" type="box" size="0.05 1.0 0.2" pos="0.9 0 0.2" rgba="0.3 0.3 0.4 1" contype="0" conaffinity="0"/>
+    <geom name="wallW" type="box" size="0.05 1.0 0.2" pos="-0.9 0 0.2" rgba="0.3 0.3 0.4 1" contype="0" conaffinity="0"/>
+    <site name="padA" pos="-0.3 0 0.02" size="0.18 0.18 0.03"/>
+    <site name="padB" pos="0.35 0.1 0.02" size="0.18 0.18 0.03"/>
+    <site name="eye0" pos="-0.3 0 1.2" quat="0 1 0 0"/>
+    <site name="eye1" pos="0 0 1.2" quat="0 1 0 0"/>
+    <site name="eye2" pos="0.35 0.1 1.2" quat="0 1 0 0"/>
+    <body name="flipL" pos="-0.2 -0.45 0.08">
+      <joint name="flipL_j" type="hinge" axis="0 0 1" limited="true" range="-0.6 0.6"/>
+      <geom name="flipL_geom" type="capsule" size="0.04 0.18" quat="0.707 0 0.707 0" rgba="0.9 0.6 0.2 1" mass="0.2" contype="4" conaffinity="3"/>
+    </body>
+    <body name="flipR" pos="0.2 -0.45 0.08">
+      <joint name="flipR_j" type="hinge" axis="0 0 1" limited="true" range="-0.6 0.6"/>
+      <geom name="flipR_geom" type="capsule" size="0.04 0.18" quat="0.707 0 0.707 0" rgba="0.2 0.6 0.9 1" mass="0.2" contype="4" conaffinity="3"/>
+    </body>
+    <body name="ballA" pos="-0.3 0 0.4">
+      <freejoint name="freeA"/>
+      <geom name="ballA_geom" type="sphere" size="0.07" rgba="0.9 0.2 0.2 1" mass="0.3" contype="2" conaffinity="7"/>
+      <site name="imuA"/>
+      <site name="gaugeA" pos="0.05 0 0"/>
+    </body>
+    <body name="ballB" pos="0.35 0.1 0.5">
+      <freejoint name="freeB"/>
+      <geom name="ballB_geom" type="sphere" size="0.06" rgba="0.2 0.9 0.3 1" mass="0.25" contype="2" conaffinity="7"/>
+      <site name="imuB"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="driveL" joint="flipL_j" gear="1"/>
+    <motor name="driveR" joint="flipR_j" gear="1"/>
+  </actuator>
+  <sensor>
+    <touch site="padA"/>
+    <touch site="padB"/>
+    <accelerometer site="imuA"/>
+    <accelerometer site="imuB"/>
+    <rangefinder site="eye0"/>
+    <rangefinder site="eye1"/>
+    <rangefinder site="eye2" data="dist normal"/>
+    <jointpos joint="flipL_j"/>
+    <jointpos joint="flipR_j"/>
+    <actuatorfrc actuator="driveL"/>
+    <jointlimitfrc joint="flipL_j"/>
+  </sensor>
+</mujoco>

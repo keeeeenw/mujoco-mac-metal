@@ -352,7 +352,8 @@ class MetalSimulation:
       types = np.asarray(self._sensors.descriptor.sensor_type)
       ACC = int(mujoco.mjtStage.mjSTAGE_ACC)
       self._has_acc_sensors = bool(np.any(need == ACC))
-      self._has_contact_sensors = bool(np.any(types == int(ST.mjSENS_CONTACT)))
+      self._has_contact_sensors = bool(np.any(np.isin(types, [
+          int(ST.mjSENS_CONTACT), int(ST.mjSENS_TOUCH)])))
       self._has_ray_sensors = bool(np.any(types == int(ST.mjSENS_RANGEFINDER)))
       self._has_geomdist_sensors = bool(np.any(np.isin(types, [
           int(ST.mjSENS_GEOMDIST), int(ST.mjSENS_GEOMNORMAL),
