@@ -304,3 +304,44 @@ def test_model_rebuilding_with_actuator_inheritance():
   snap = snapshot_descriptor(desc)
   assert snap.actuator_armature[0] == desc.actuator_armature[0]
   assert snap.actuator_damping[0] == desc.actuator_damping[0]
+
+
+@_needs_gpu()
+def test_inherited_vs_explicit_damping_equivalence_gpu():
+  # Pinned inheritance semantics: actuator damping d with gear g on a joint
+  # behaves exactly like dof damping d*g^2 (and armature likewise). Two
+  # models differing only in placement must produce identical trajectories
+  # on both engines.
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  from mujoco_metal.simulation import MetalSimulation
+  m_inh = mujoco.MjModel.from_xml_string(
+      "<mujoco><option timestep='0.002' integrator='Euler'/>"
+      "<worldbody><body pos='0 0 0.5'>"
+      "<joint name='h' type='hinge' axis='0 0 1'/>"
+      "<geom type='sphere' size='0.1' mass='0.5'/>"
+      "</body></worldbody>"
+      "<actuator><motor name='m' joint='h' gear='2' armature='0.4' damping='0.7'/></actuator>"
+      "</mujoco>")
+  m_exp = mujoco.MjModel.from_xml_string(
+      "<mujoco><option timestep='0.002' integrator='Euler'/>"
+      "<worldbody><body pos='0 0 0.5'>"
+      "<joint name='h' type='hinge' axis='0 0 1' armature='1.6' damping='2.8'/>"
+      "<geom type='sphere' size='0.1' mass='0.5'/>"
+      "</body></worldbody>"
+      "<actuator><motor name='m' joint='h' gear='2'/></actuator>"
+      "</mujoco>")
+  sims = []
+  for m in (m_inh, m_exp):
+    sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+    sim.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1),
+              qvel=np.array([[1.5]], dtype=np.float32))
+    sims.append(sim)
+  for _ in range(60):
+    for sim in sims:
+      sim.step(1, ctrl=np.array([[0.6]], dtype=np.float32))
+  for a, b in ((sims[0], sims[1]),):
+    np.testing.assert_array_equal(a.state.qpos.cpu().numpy(),
+                                  b.state.qpos.cpu().numpy())
+    np.testing.assert_array_equal(a.state.qvel.cpu().numpy(),
+                                  b.state.qvel.cpu().numpy())
