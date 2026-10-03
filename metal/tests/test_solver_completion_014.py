@@ -33,30 +33,134 @@ def _press_model(cone="pyramidal", condim=3, solver="PGS", iterations=100,
       '</worldbody></mujoco>')
 
 
-def kkt_violation(asm):
+def kkt_violation(asm, elliptic_blocks=None):
   """Host float64 KKT check on the retained solution (independent of the
   device certification path): normalized projected-gradient residual with
-  the same row scaling the kernel certifies."""
+  the same row scaling the kernel certifies. Box rows use exact box
+  projection; rows covered by ``elliptic_blocks`` use the Lorentz
+  projection over their contact blocks instead (box-clamping them is not
+  a valid cone certificate)."""
   g = lambda k: np.asarray(asm[k].cpu().numpy(), dtype=np.float64)
   W, R, ar, rhs, lam, lo, hi = (g("W"), g("R"), g("ar"), g("rhs"),
                                 g("lambda"), g("lo"), g("hi"))
   b = W.shape[0]
   worst = 0.0
   for world in range(b):
+    emembers = set()
+    if elliptic_blocks is not None:
+      for (start, dim, _friction) in elliptic_blocks[world]:
+        emembers.update(range(start, start + dim))
     grad = (W[world] + np.diag(R[world])) @ lam[world] - rhs[world]
     for r in range(W.shape[1]):
+      if r in emembers:
+        continue
       diag = max(float(W[world][r, r] + R[world][r]), 1e-15)
-      if lam[world][r] <= lo[world][r] + 1e-9:
-        proj = min(lam[world][r] - grad[r] / diag, hi[world][r])
-      elif lam[world][r] >= hi[world][r] - 1e-9:
-        proj = max(lam[world][r] - grad[r] / diag, lo[world][r])
-      else:
-        proj = lam[world][r] - grad[r] / diag
+      # Exact box projection (the at-bound branches must clamp both sides;
+      # clamping only one bound reports residual 1.0 at the true optimum).
+      proj = min(max(lam[world][r] - grad[r] / diag, lo[world][r]), hi[world][r])
       scale = abs(ar[world][r]) + abs(R[world][r] * lam[world][r])
       scale += float(np.sum(np.abs(W[world][r] * lam[world])))
       scale = max(scale, 1.0)
       worst = max(worst, abs(proj - lam[world][r]) * diag / scale)
+    if elliptic_blocks is not None:
+      for (start, dim, friction) in elliptic_blocks[world]:
+        worst = max(worst, _lorentz_violation(
+            W[world], R[world], rhs[world], lam[world], start, dim, friction))
   return worst
+
+
+def _lorentz_violation(W, R, rhs, lam, start, dim, friction):
+  """Stationarity residual of one elliptic block under Lorentz projection
+  (host mirror of the kernel-side cone certificate)."""
+  scale = np.ones(dim)
+  for i in range(1, dim):
+    scale[i] = max(float(friction[i - 1]), 0.0)
+  force = lam[start:start + dim].copy()
+  y = np.zeros(dim)
+  y[0] = force[0]
+  for i in range(1, dim):
+    y[i] = force[i] / scale[i] if scale[i] > 1e-12 else 0.0
+  H = np.zeros((dim, dim))
+  linear = np.zeros(dim)
+  for i in range(dim):
+    linear[i] = scale[i] * (-rhs[start + i])
+    for j in range(dim):
+      H[i, j] = scale[i] * (W[start + i, start + j]
+                            + (R[start + i] if i == j else 0.0)) * scale[j]
+  lipschitz = 1e-15
+  for i in range(dim):
+    lipschitz = max(lipschitz, float(np.sum(np.abs(H[i]))))
+  projected = y - (H @ y + linear) / lipschitz
+  projected = _project_lorentz(projected)
+  scale_ref = 1.0 + float(np.sum(np.abs(linear)))
+  for j in range(dim):
+    scale_ref += float(np.sum(np.abs(H[:, j] * y[j])))
+  return float(np.max(np.abs(y - projected)) * lipschitz / scale_ref)
+
+
+def _project_lorentz(x):
+  x = np.asarray(x, dtype=np.float64).copy()
+  norm = float(np.linalg.norm(x[1:]))
+  if norm <= x[0]:
+    return x
+  if norm <= -x[0]:
+    return np.zeros_like(x)
+  head = 0.5 * (norm + x[0])
+  out = np.zeros_like(x)
+  out[0] = head
+  out[1:] = x[1:] * (head / max(norm, 1e-20))
+  return out
+
+
+class _HostArray(np.ndarray):
+  """numpy array with torch-like .cpu().numpy() for oracle-only KKT checks."""
+
+  def cpu(self):
+    return self
+
+  def numpy(self):
+    return np.asarray(self)
+
+
+def _fake_asm(W, R, ar, rhs, lam, lo, hi):
+  t = lambda a: np.asarray(a, dtype=np.float64).reshape(1, -1).view(_HostArray)
+  W = np.asarray(W, dtype=np.float64)
+  W = W.reshape(1, *W.shape).view(_HostArray)
+  return {"W": W,
+          "R": t(R), "ar": t(ar), "rhs": t(rhs), "lambda": t(lam),
+          "lo": t(lo), "hi": t(hi)}
+
+
+def test_kkt_box_projection_analytic_cpu():
+  # min 0.5*x^2 + x s.t. x >= 0: optimum x = 0 with gradient +1 (stationary
+  # at the bound). The old one-sided clamp reported residual 1.0 here.
+  asm = _fake_asm([[1.0]], [0.0], [0.0], [-1.0], [0.0], [0.0], [np.inf])
+  assert kkt_violation(asm) == pytest.approx(0.0)
+  # Interior optimum: min 0.5*(x-2)^2.
+  asm = _fake_asm([[1.0]], [0.0], [0.0], [2.0], [2.0], [-np.inf], [np.inf])
+  assert kkt_violation(asm) == pytest.approx(0.0)
+  # Upper-bound optimum: min 0.5*(x-3)^2 s.t. x <= 1.
+  asm = _fake_asm([[1.0]], [0.0], [0.0], [3.0], [1.0], [-np.inf], [1.0])
+  assert kkt_violation(asm) == pytest.approx(0.0)
+  # Deliberately invalid candidate must bite.
+  asm = _fake_asm([[1.0]], [0.0], [0.0], [3.0], [5.0], [-np.inf], [1.0])
+  assert kkt_violation(asm) > 0.5
+
+
+def test_lorentz_projector_analytic_cpu():
+  np.testing.assert_allclose(_project_lorentz([2.0, 1.0, 0.0]), [2.0, 1.0, 0.0])
+  np.testing.assert_allclose(_project_lorentz([-2.0, 1.0, 0.0]), [0.0, 0.0, 0.0])
+  np.testing.assert_allclose(_project_lorentz([1.0, 2.0, 0.0]), [1.5, 1.5, 0.0])
+  # Feasible cone optimum (min 0.5*|x|^2 + x_0 over the cone sits at the
+  # apex 0) has zero stationarity residual.
+  W = np.eye(3)
+  asm = _fake_asm(W, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], -np.array([1.0, 0.0, 0.0]),
+                  [0.0, 0.0, 0.0], [-np.inf] * 3, [np.inf] * 3)
+  assert kkt_violation(asm, elliptic_blocks=[[(0, 3, [0.5, 0.5])]]) == pytest.approx(0.0)
+  # Infeasible cone point (negative normal force) is flagged.
+  asm = _fake_asm(W, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], -np.array([1.0, 0.0, 0.0]),
+                  [-1.0, 0.0, 0.0], [-np.inf] * 3, [np.inf] * 3)
+  assert kkt_violation(asm, elliptic_blocks=[[(0, 3, [0.5, 0.5])]]) > 0.0
 
 
 @pytest.mark.gpu
@@ -251,8 +355,6 @@ def test_soft_stiff_mix_gpu():
 def test_kkt_retained_solution_gpu(condim, cone):
   # Independent float64 KKT residual on the retained complete solution and
   # the actual assembled system (never a helper-only certificate).
-  if cone == "elliptic" and condim in (4, 6):
-    pytest.skip("elliptic condim 4/6 covered by dedicated suites")
   m = _press_model(cone=cone, condim=condim)
   sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
   qp = np.asarray(m.qpos0, dtype=np.float32)
@@ -261,7 +363,55 @@ def test_kkt_retained_solution_gpu(condim, cone):
     sim.step(1)
   asm = sim.assembled_system(recompute=True)
   assert int(sim.state.status.cpu().numpy()[0]) == 0
-  assert kkt_violation(asm) < 1e-3
+  assert kkt_violation(asm, _elliptic_blocks(sim, cone)) < 1e-3
+
+
+def _elliptic_blocks(sim, cone):
+  """Per-world elliptic contact blocks from retained slot metadata."""
+  if cone != "elliptic":
+    return [[] for _ in range(sim.batch_size)]
+  cc = sim._coupled_constraints
+  d = cc.descriptor
+  import torch
+  packed = cc._constants["contact_condim"].detach().cpu().numpy().reshape(-1, 3)
+  friction = cc._constants["contact_friction"].detach().cpu().numpy().reshape(-1, 5)
+  base = int(d.n_eq_rows) + int(d.nv) + 2 * int(d.njnt) + int(d.ten_friction_rows + d.ten_limit_rows)
+  per_world = []
+  for _ in range(sim.batch_size):
+    blocks = []
+    for s in range(int(d.ncontacts_max)):
+      cdim = int(packed[s, 0])
+      if cdim > 1:
+        blocks.append((base + int(packed[s, 1]), cdim, friction[s].copy()))
+    per_world.append(blocks)
+  return per_world
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+def test_kkt_certifies_retained_accepted_step_gpu(cone):
+  # The certificate binds the RETAINED accepted-step system: cached assembly
+  # (no recompute) certifies, its status matches the recorded step status,
+  # and recomputing after a state change solves anew (different system).
+  m = _press_model(cone=cone)
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  qp = np.asarray(m.qpos0, dtype=np.float32)
+  sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
+  for _ in range(30):
+    sim.step(1)
+  status = int(sim.state.status.cpu().numpy()[0])
+  assert status == 0
+  asm = sim.assembled_system()
+  assert int(asm["status"].cpu().numpy()[0]) == status
+  assert kkt_violation(asm, _elliptic_blocks(sim, cone)) < 1e-3
+  lam_before = np.asarray(asm["lambda"].cpu().numpy()).copy()
+  # Perturb the state: recompute must solve anew for the new system.
+  qpos = sim.state.qpos.cpu().numpy()
+  qpos[0, 2] += 0.02
+  sim.state._qpos.copy_(sim.state._torch.as_tensor(qpos))
+  asm2 = sim.assembled_system(recompute=True)
+  assert not np.allclose(np.asarray(asm2["lambda"].cpu().numpy()), lam_before)
 
 
 @pytest.mark.gpu
