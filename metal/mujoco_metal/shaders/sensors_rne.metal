@@ -155,20 +155,28 @@ kernel void assemble_cfrc_ext(
     float3 t1=r3(contact_frame,(world*nc+s)*12+3);
     float3 t2=r3(contact_frame,(world*nc+s)*12+6);
     float3 ppos=r3(contact_frame,(world*nc+s)*12+9);
-    float3 fl=float3(0.0f);
+    // Six-component contact-local wrench (pinned mj_contactForce +
+    // mju_decodePyramid: frictionless condim-1 reads the single pyramid
+    // value; pyramidal torque is zero for point contacts; elliptic
+    // condim>3 carries torsional/rolling torque in entries 3-5).
+    float fl[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (cone==0) {
-      float fn=0.0f;
-      int ne2=2*(cdim-1);
-      for (int k=0;k<ne2;++k) fn+=contact_force[(world*nc+s)*11+1+k];
-      fl=float3(fn,0.0f,0.0f);
-      for (int k=0;k<cdim-1;++k) {
-        float mu=contact_mu[s*5+k];
-        fl[k+1]=(contact_force[(world*nc+s)*11+1+2*k]-contact_force[(world*nc+s)*11+2+2*k])*mu;
+      if (cdim==1) {
+        fl[0]=contact_force[(world*nc+s)*11];
+      } else {
+        float fn=0.0f;
+        int ne2=2*(cdim-1);
+        for (int k=0;k<ne2;++k) fn+=contact_force[(world*nc+s)*11+1+k];
+        fl[0]=fn;
+        for (int k=0;k<cdim-1;++k) {
+          float mu=contact_mu[s*5+k];
+          fl[1+k]=(contact_force[(world*nc+s)*11+1+2*k]-contact_force[(world*nc+s)*11+2+2*k])*mu;
+        }
       }
     } else {
       for (int k=0;k<cdim && k<6;++k) fl[k]=contact_force[(world*nc+s)*11+k];
     }
-    float3 fw=n*fl.x+t1*fl.y+t2*fl.z;
+    float3 fw=n*fl[0]+t1*fl[1]+t2*fl[2];
     float3 tw=float3(0.0f);
     if (cone!=0 && cdim>3) {
       float3 tl=float3(fl[3],fl[4],fl[5]);
