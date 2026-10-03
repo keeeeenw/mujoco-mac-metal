@@ -67,10 +67,46 @@ def test_coupled_lowering_and_immutability():
 
 
 def test_coupled_lowering_unsupported_geoms_rejected():
-  xml = COUPLED_XML.replace('type="sphere" size="0.2"', 'type="cylinder" size="0.1 0.1"')
-  m = mujoco.MjModel.from_xml_string(xml)
-  with pytest.raises(ValueError, match="only plane, sphere, capsule, and box"):
+  # Mesh (011), heightfield (012) and SDF (013) stay rejected in 010.
+  m = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.002"/><asset>'
+      '<mesh name="tet" vertex="0 0 0 1 0 0 0 1 0 0 0 1" face="0 2 1 0 1 3 0 3 2 1 2 3"/>'
+      '</asset><worldbody>'
+      '<geom name="floor" type="plane" size="5 5 0.1"/>'
+      '<body pos="0 0 1"><freejoint/><geom mesh="tet" type="mesh" mass="1"/>'
+      '</body></worldbody></mujoco>')
+  with pytest.raises(ValueError, match="ellipsoid, and cylinder"):
     lower_coupled_constraints(m)
+
+
+def test_coupled_lowering_cylinder_ellipsoid_admitted():
+  # 010: cylinder/ellipsoid pairs are admitted with pinned slot counts.
+  from mujoco_metal.coupled_constraints import pair_max_contacts
+  import mujoco_metal.coupled_constraints as cc
+  cyl, ell = cc._CYLINDER, cc._ELLIPSOID
+  assert pair_max_contacts(cc._PLANE, cyl) == 4
+  assert pair_max_contacts(cc._SPHERE, cyl) == 1
+  assert pair_max_contacts(cc._PLANE, ell) == 1
+  assert pair_max_contacts(cc._SPHERE, ell) == 1
+  assert pair_max_contacts(cc._CAPSULE, ell) == 1
+  assert pair_max_contacts(ell, ell) == 1
+  assert pair_max_contacts(ell, cyl) == 1
+  assert pair_max_contacts(ell, cc._BOX) == 1
+  assert pair_max_contacts(cc._CAPSULE, cyl) == 5
+  assert pair_max_contacts(cyl, cyl) == 5
+  assert pair_max_contacts(cyl, cc._BOX) == 5
+  # Pre-existing pairs unchanged.
+  assert pair_max_contacts(cc._PLANE, cc._SPHERE) == 1
+  assert pair_max_contacts(cc._CAPSULE, cc._CAPSULE) == 2
+  assert pair_max_contacts(cc._CAPSULE, cc._BOX) == 4
+  assert pair_max_contacts(cc._PLANE, cc._BOX) == 4
+  assert pair_max_contacts(cc._BOX, cc._BOX) == 8
+  xml = COUPLED_XML.replace('type="sphere" size="0.2"', 'type="cylinder" size="0.1 0.2"')
+  desc = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml))
+  assert desc.nc >= 1
+  xml = COUPLED_XML.replace('type="sphere" size="0.2"', 'type="ellipsoid" size="0.2 0.1 0.15"')
+  desc = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml))
+  assert desc.nc >= 1
 
 
 

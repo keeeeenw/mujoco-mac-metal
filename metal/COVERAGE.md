@@ -24,7 +24,7 @@ renderer), not future physics work.
 | REQ-JNT-002 | scalar hinge/slide joint limits | device | native_gpu/gpu_qualified | baseline | ball/tendon limits rejected | accept limited hinge/slide, reject limited ball | test_coupled_constraints.py |
 | REQ-JNT-003 | ball joint limits | device | native_gpu/gpu_qualified | 009 | pinned axis-angle rows in reserved slots (integrated profile; legacy joint-constraints profile stays scalar-only) | ball branch in joint-limit loop | test_rigid_constraints_009.py |
 | REQ-GEO-001 | plane/sphere/capsule/box collision | device | native_gpu/gpu_qualified | baseline | all 9 valid unordered pairs; plane-plane yields nothing | accept the four primitives, reject others | test_primitive_collision_qualification.py |
-| REQ-GEO-002 | cylinder/ellipsoid collision | none | not_implemented/unqualified | 010 | rejected at lowering | reject cylinders and ellipsoids | — |
+| REQ-GEO-002 | cylinder/ellipsoid collision | device | native_gpu/unqualified | 010 | 010 implements plane/sphere-cylinder analytic pairs + convex MPR pairs | admit cylinder/ellipsoid pairs with pinned slot counts | test_coupled_constraints.py |
 | REQ-GEO-003 | convex mesh collision | none | not_implemented/unqualified | 011 | rejected at lowering; visual meshes unaffected | reject meshes | — |
 | REQ-GEO-004 | heightfield collision | none | not_implemented/unqualified | 012 | rejected at lowering | reject heightfields | — |
 | REQ-GEO-005 | SDF collision | none | not_implemented/unqualified | 013 | rejected at lowering; third-party SDF plugins per 019 contract | reject SDFs | — |

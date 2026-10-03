@@ -506,10 +506,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-GEO-002", "cylinder/ellipsoid collision",
-        Stage.COLLISION, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "rejected at lowering",
-        "engine/engine_collision_primitive.c", "reject cylinders and ellipsoids",
-        "none", "010", (),
+        Stage.COLLISION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "010 implements plane/sphere-cylinder analytic pairs + convex MPR pairs",
+        "mujoco_metal/shaders/collision_primitives.metal", "admit cylinder/ellipsoid pairs with pinned slot counts",
+        "MetalSimulation(profile='integrated_euler_v1')", "010", ("test_coupled_constraints.py",),
         enums=("mjtGeom.mjGEOM_CYLINDER", "mjtGeom.mjGEOM_ELLIPSOID"),
     ),
     Requirement(

@@ -45,6 +45,8 @@ _PLANE = int(mujoco.mjtGeom.mjGEOM_PLANE)
 _SPHERE = int(mujoco.mjtGeom.mjGEOM_SPHERE)
 _CAPSULE = int(mujoco.mjtGeom.mjGEOM_CAPSULE)
 _BOX = int(mujoco.mjtGeom.mjGEOM_BOX)
+_ELLIPSOID = int(mujoco.mjtGeom.mjGEOM_ELLIPSOID)
+_CYLINDER = int(mujoco.mjtGeom.mjGEOM_CYLINDER)
 _HINGE = int(mujoco.mjtJoint.mjJNT_HINGE)
 _SLIDE = int(mujoco.mjtJoint.mjJNT_SLIDE)
 _BALL = int(mujoco.mjtJoint.mjJNT_BALL)
@@ -64,29 +66,40 @@ _EQ_ROWS = {
 
 _SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_TENDON, _EQ_CONNECT, _EQ_WELD)
 
-_SUPPORTED_GEOM_TYPES = (_PLANE, _SPHERE, _CAPSULE, _BOX)
+_SUPPORTED_GEOM_TYPES = (_PLANE, _SPHERE, _CAPSULE, _BOX, _ELLIPSOID, _CYLINDER)
 
 
 def pair_max_contacts(t1: int, t2: int) -> int:
-  """Derive upper bound on contact points for a primitive geometry pair."""
+  """Derive upper bound on contact points for a primitive geometry pair.
+
+  Mirrors pinned `mj_maxContact` (3.10.0) under default flags
+  (multiccd + nativeccd enabled): sphere/ellipsoid involvement caps at 1;
+  box-box 8; capsule-capsule 2; capsule-box and plane-cylinder/box 4;
+  remaining cylinder-involved convex pairs 5.
+  """
   t_min, t_max = min(t1, t2), max(t1, t2)
-  if (t_min, t_max) in (
-      (_PLANE, _SPHERE),
-      (_SPHERE, _SPHERE),
-      (_SPHERE, _CAPSULE),
-      (_SPHERE, _BOX),
-  ):
+  if _SPHERE in (t_min, t_max) or _ELLIPSOID in (t_min, t_max):
+    # Pinned rule: any pair involving a sphere or an ellipsoid yields one
+    # contact (sphere/python sphere pairs and all ellipsoid pairs). Checked
+    # before the multi-contact rules below, matching mj_maxContact order.
     return 1
   if (t_min, t_max) in (
       (_PLANE, _CAPSULE),
       (_CAPSULE, _CAPSULE),
-      (_CAPSULE, _BOX),
   ):
     return 2
-  if (t_min, t_max) == (_PLANE, _BOX):
+  if (t_min, t_max) in (
+      (_CAPSULE, _BOX),
+      (_PLANE, _CYLINDER),
+      (_PLANE, _BOX),
+  ):
     return 4
   if (t_min, t_max) == (_BOX, _BOX):
     return 8
+  if t_min == _CYLINDER or t_max == _CYLINDER:
+    # Remaining cylinder-involved convex pairs (capsule/sphere excluded
+    # above): multiccd native path yields up to 5 witnesses.
+    return 5
   return 0
 
 
@@ -430,7 +443,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       if t1 not in _SUPPORTED_GEOM_TYPES or t2 not in _SUPPORTED_GEOM_TYPES:
         raise ValueError(
             f"explicit pair ({g1}, {g2}) with types ({t1}, {t2}) is unsupported; "
-            "only plane, sphere, capsule, and box are supported"
+            "only plane, sphere, capsule, box, ellipsoid, and cylinder are supported"
         )
       # Canonicalize ordering matching MuJoCo C pushGeomGeom
       if t1 > t2 or (t1 == t2 and g1 > g2):
@@ -503,7 +516,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       if ta not in _SUPPORTED_GEOM_TYPES or tb not in _SUPPORTED_GEOM_TYPES:
         raise ValueError(
             f"collidable geom pair ({a}, {b}) with types ({ta}, {tb}) is unsupported; "
-            "only plane, sphere, capsule, and box contacts are supported"
+            "only plane, sphere, capsule, box, ellipsoid, and cylinder contacts are supported"
         )
 
       # Canonical ordering
