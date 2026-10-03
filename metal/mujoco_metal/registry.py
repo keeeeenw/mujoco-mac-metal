@@ -370,7 +370,7 @@ def _inventory():
       (
           "inertia-box fluid",
           Stage.DYNAMICS,
-          "body drag, viscosity and wind; no geom ellipsoid, lift or buoyancy",
+          "body drag, viscosity and wind, plus per-geom ellipsoid added-mass/lift/viscous terms with pinned body/geom selection; no buoyancy beyond the pinned models",
       ),
       (
           "bounded implicitfast",
@@ -1002,7 +1002,7 @@ REQUIREMENTS = (
         "mujoco_metal/stepping.py", "accept listed profile/model pairs",
         "MetalSimulation", "baseline",
         ("test_forces.py", "test_transmissions.py", "test_fluid.py",
-         "test_passive.py", "test_sensors.py"),
+         "test_passive.py", "test_sensors.py", "test_integrators_015.py"),
     ),
     Requirement(
         "REQ-PROF-003", "joint_constraints_euler_v1 scalar stage",

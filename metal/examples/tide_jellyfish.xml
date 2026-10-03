@@ -1,0 +1,31 @@
+<mujoco model="tide_jellyfish">
+  <compiler angle="radian"/>
+  <option timestep="0.002" integrator="Euler" iterations="100" tolerance="1e-8" gravity="0 0 -0.5" density="1.0" viscosity="0.08" wind="0.25 0 0" cone="pyramidal"/>
+  <asset>
+    <texture name="floor_grid" type="2d" builtin="checker" rgb1="0.10 0.14 0.20" rgb2="0.18 0.26 0.34" width="512" height="512"/>
+    <material name="floor_material" texture="floor_grid" texrepeat="8 8" reflectance="0.1"/>
+  </asset>
+  <worldbody>
+    <light directional="true" pos="0 -2 5" dir="0 0.3 -1" diffuse="0.9 0.9 0.9" specular="0.3 0.3 0.3"/>
+    <geom name="floor" type="plane" size="5 5 0.1" pos="0 0 -0.5" material="floor_material" contype="0" conaffinity="0"/>
+    <body name="mount" pos="0 0 0.6">
+      <geom name="mast" type="box" size="0.04 0.04 0.3" rgba="0.3 0.3 0.3 1" contype="0" conaffinity="0"/>
+      <body name="finL" pos="-0.06 0 0.1">
+        <joint name="flapL" type="hinge" axis="0 1 0" damping="0.4" stiffness="2.0"/>
+        <geom name="finL_geom" type="ellipsoid" size="0.16 0.02 0.09" rgba="0.9 0.3 0.5 1" mass="0.2" fluidshape="ellipsoid" fluidcoef="0.9 0.4 0.6 0.5 0.7" contype="0" conaffinity="0"/>
+      </body>
+      <body name="finR" pos="0.06 0 0.1">
+        <joint name="flapR" type="hinge" axis="0 1 0" damping="0.4" stiffness="2.0"/>
+        <geom name="finR_geom" type="ellipsoid" size="0.16 0.02 0.09" rgba="0.9 0.3 0.5 1" mass="0.2" fluidshape="ellipsoid" fluidcoef="0.9 0.4 0.6 0.5 0.7" contype="0" conaffinity="0"/>
+      </body>
+    </body>
+    <body name="floater" pos="0.8 0.1 0.5">
+      <freejoint name="freeF"/>
+      <geom name="float_geom" type="sphere" size="0.07" rgba="0.2 0.7 0.9 1" mass="0.3" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <general name="swimL" joint="flapL" dyntype="filter" gainprm="6" biasprm="0 -6 0" ctrlrange="-1 1" gear="1"/>
+    <general name="swimR" joint="flapR" dyntype="filter" gainprm="6" biasprm="0 -6 0" ctrlrange="-1 1" gear="1"/>
+  </actuator>
+</mujoco>
