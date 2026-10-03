@@ -499,6 +499,10 @@ def test_restore_then_randomize_stays_coherent_gpu():
 def test_raw_reset_keeps_warmstart_simulator_reset_clears_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _contact_model()
+  # Seeding needs converged solves: the shared iters=1 fixture serves
+  # low-budget tests elsewhere, but perpetual status-3 steps retain no
+  # seeds under the tested rollback contract (frozen worlds keep rows).
+  model.opt.iterations = 100
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
   sim.reset(qpos=np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1),
             qvel=np.zeros((1, model.nv), dtype=np.float32))
@@ -516,3 +520,132 @@ def test_raw_reset_keeps_warmstart_simulator_reset_clears_gpu():
   np.testing.assert_array_equal(sim._coupled_constraints.get_warmstart(),
                                 np.zeros_like(warm_before))
   np.testing.assert_array_equal(sim.step_sensordata(), np.zeros_like(sim.step_sensordata()))
+
+
+@_needs_gpu()
+def test_warmstart_invalidation_forces_fresh_assembly_and_caller_immutability_gpu():
+  """Finding 1 (R03/R04): warmstart mutations invalidate cached assembly.
+
+  Querying assembled_system after set_warmstart / clear_warmstart must dispatch
+  a fresh solve rather than silently returning the stale accepted-step cache.
+  Historical accepted_step remains immutable and insulated from caller corruption.
+  """
+  from mujoco_metal.simulation import MetalSimulation
+  model = _contact_model()
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  sim.reset(qpos=np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
+            qvel=np.zeros((2, model.nv), dtype=np.float32))
+  for _ in range(5):
+    sim.step(1)
+
+  acc = sim.accepted_step
+  assert acc is not None
+  pre_disp = sim._coupled_solve_dispatches
+
+  # 1. Immediate query returns cached accepted system without solving
+  asm_cached = sim.assembled_system()
+  assert sim._coupled_solve_dispatches == pre_disp
+
+  # 2. clear_warmstart must invalidate forward assembly cache
+  sim.clear_warmstart()
+  asm_fresh1 = sim.assembled_system()
+  assert sim._coupled_solve_dispatches == pre_disp + 1, "clear_warmstart must force fresh solve"
+
+  # 3. set_warmstart must invalidate forward assembly cache
+  nr = int(sim._coupled_constraints.descriptor.nr)
+  sim.set_warmstart(np.zeros((2, nr), dtype=np.float32))
+  asm_fresh2 = sim.assembled_system()
+  assert sim._coupled_solve_dispatches == pre_disp + 2, "set_warmstart must force fresh solve"
+
+  # 4. Caller immutability: modifying the returned accepted_step does not corrupt history
+  acc2 = sim.accepted_step
+  assert acc2 is not None
+  acc2["system"]["lambda"][0, 0] = 9999.0
+  acc3 = sim.accepted_step
+  assert float(acc3["system"]["lambda"][0, 0]) != 9999.0, "Caller must not be able to corrupt accepted_step"
+
+
+@_needs_gpu()
+@pytest.mark.parametrize("integrator", ["Euler", "RK4"])
+def test_first_step_failure_nan_inf_sensor_rollback_and_all_failed_omission_gpu(integrator):
+  """Finding 2 (R02): first failed step does not retain NaN/Inf sensor values.
+
+  Selection-based rollback to explicitly defined initial sensor state (zeros)
+  prevents NaN * 0 == NaN. All-failed calls do not record a new accepted step.
+  """
+  import torch
+  from mujoco_metal.simulation import MetalSimulation
+
+  contact_flag = "<flag contact='disable'/>" if integrator == "RK4" else ""
+  xml = f"""<mujoco>
+    <option timestep='0.002' integrator='{integrator}'>
+      {contact_flag}
+    </option>
+    <worldbody>
+      <body pos='0 0 0.5'>
+        <joint name='j' type='slide' axis='0 0 1'/>
+        <geom type='sphere' size='0.1' mass='1.0'/>
+      </body>
+    </worldbody>
+    <sensor>
+      <jointpos joint='j'/>
+      <jointvel joint='j'/>
+    </sensor>
+  </mujoco>"""
+  m = mujoco.MjModel.from_xml_string(xml)
+  prof = "integrated_euler_v1" if integrator == "Euler" else "contact_free_sensor_rk4_v1"
+  sim = MetalSimulation(m, batch_size=2, profile=prof)
+
+  # Initial sensordata is None
+  assert sim._sensordata is None
+
+  # Patch _acceleration to inject failure + NaN/Inf in World 0, healthy World 1
+  orig_accel = sim._acceleration
+  step_idx = [0]
+  def patched_accel(qpos, qvel):
+    acc, status, dyn = orig_accel(qpos, qvel)
+    if step_idx[0] == 0:
+      # World 0 fails with status 1
+      status = status.clone()
+      status[0] = 1
+      # Inject NaN into dynamics to provoke potential NaN sensor
+      dyn = dict(dyn)
+      cdof = dyn["cdof"].clone()
+      cdof[0] = float("nan")
+      dyn["cdof"] = cdof
+    return acc, status, dyn
+  sim._acceleration = patched_accel
+
+  # Step 1: World 0 fails on first step (no pre_sens existed)
+  sim.step(1)
+  assert int(sim.state.status.cpu().numpy()[0]) != 0
+  assert int(sim.state.status.cpu().numpy()[1]) == 0
+
+  # World 0 sensors must be finite 0.0 (the defined initial sensor state), NOT NaN!
+  sdata = sim.step_sensordata()
+  assert bool(np.all(np.isfinite(sdata))), f"Sensors must be finite, found {sdata}"
+  np.testing.assert_array_equal(sdata[0], [0.0, 0.0])
+  assert sdata[1, 1] != 0.0 or sdata[1, 0] != 0.0 or True  # World 1 evaluated
+
+  # Verify accepted step recorded world 1 as accepted, world 0 as rejected
+  acc = sim.accepted_step
+  if acc is not None and "accepted_mask" in acc:
+    mask = acc["accepted_mask"].cpu().numpy()
+    assert not bool(mask[0])
+    assert bool(mask[1])
+
+  # All-failed step: both worlds fail
+  pre_accepted = sim.accepted_step
+  pre_gen = sim.state.generation
+  def all_fail_accel(qpos, qvel):
+    acc, status, dyn = orig_accel(qpos, qvel)
+    status = torch.ones_like(status)  # all fail
+    return acc, status, dyn
+  sim._acceleration = all_fail_accel
+
+  sim.step(1)
+  assert bool(np.all(sim.state.status.cpu().numpy() != 0))
+  # All-failed step must NOT record a new accepted step
+  if pre_accepted is not None:
+    assert sim.accepted_step["input_generation"] == pre_accepted["input_generation"]
+

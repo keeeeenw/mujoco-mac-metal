@@ -199,13 +199,13 @@ class MetalSimulation:
       # keeping activation owned end-to-end (R02).
       _act_disabled = bool(int(model.opt.disableflags)
                            & int(_mj_init.mjtDisableBit.mjDSBL_ACTUATION))
-      if plan.is_stage_enabled("actuation") or (_act_disabled and int(model.nu) > 0):
+      if plan.is_stage_enabled("actuation") or (_act_disabled and int(model.na) > 0):
         from mujoco_metal.stateful_actuation import ActuatorModel
         from mujoco_metal.stateful_actuation import MetalActuators
         actuator_meta = ActuatorModel(model, allow_inherited=True)
         if actuator_meta.needs_general_path:
           self._actuators = MetalActuators(model, batch_size)
-        else:
+        elif plan.is_stage_enabled("actuation"):
           from mujoco_metal.transmissions import MetalTransmissions
           self._transmissions = MetalTransmissions(model)
       if plan.is_stage_enabled("fixed_tendons"):
@@ -454,6 +454,67 @@ class MetalSimulation:
     else:
       self._rk4 = None
 
+    self._assembled_system_valid = False
+
+    def _handle_state_snapshot(snap):
+      # Attached solver seeds ride the documented StateSnapshot field
+      # (validated by its __post_init__). The raw-device snapshot alone
+      # owns kinematics/equality/mocap/activation only.
+      if self._coupled_constraints is not None:
+        warm = self._coupled_constraints.get_warmstart()
+        object.__setattr__(snap, "warmstart_multiplier", warm)
+
+    def _handle_state_validate_restore(snap, env_ids=None):
+      # Runs BEFORE any live tensor is touched: a bad seed payload raises
+      # with all state unchanged. None (unknown/old snapshots) is valid
+      # and restores cold seeds.
+      if self._coupled_constraints is None:
+        if getattr(snap, "warmstart_multiplier", None) is not None:
+          raise ValueError("snapshot seeds do not match this simulation")
+        return
+      nr = int(self._coupled_constraints.descriptor.nr)
+      warm = getattr(snap, "warmstart_multiplier", None)
+      if warm is None:
+        return
+      import numpy as _np
+      arr = _np.asarray(warm, dtype=_np.float64)
+      if arr.shape != (self.batch_size, nr) or not _np.all(_np.isfinite(arr)):
+        raise ValueError("snapshot seeds have an invalid shape or nonfinite values")
+      with _np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        if not _np.all(_np.isfinite(arr.astype(_np.float32))):
+          raise ValueError("snapshot seeds must be float32-representable")
+
+    def _handle_state_restore(snap, env_ids=None):
+      self._assembled_system_valid = False
+      if hasattr(self, "_last_coupled"):
+        self._last_coupled = None
+      if hasattr(self, "_last_coupled_generation"):
+        self._last_coupled_generation = None
+      self._accepted_step = None
+      if self._coupled_constraints is not None:
+        warm = getattr(snap, "warmstart_multiplier", None)
+        if warm is not None:
+          import numpy as _np
+          self._coupled_constraints.set_warmstart(
+              _np.asarray(warm, dtype=_np.float32)
+              if env_ids is None else _np.asarray(warm, dtype=_np.float32)[_np.asarray(env_ids)],
+              env_ids=env_ids)
+        else:
+          self._coupled_constraints.clear_warmstart(env_ids=env_ids)
+
+    def _handle_state_reset(env_ids=None):
+      self._assembled_system_valid = False
+      if hasattr(self, "_last_coupled"):
+        self._last_coupled = None
+      if hasattr(self, "_last_coupled_generation"):
+        self._last_coupled_generation = None
+      self._accepted_step = None
+
+    self._state._on_snapshot = _handle_state_snapshot
+    self._state._on_validate_restore = _handle_state_validate_restore
+    self._state._on_restore = _handle_state_restore
+    self._state._on_reset = _handle_state_reset
+
   @property
   def state(self):
     """The owned :class:`DeviceState` lifecycle and checkpoint interface."""
@@ -494,6 +555,7 @@ class MetalSimulation:
     if self._coupled_constraints is None:
       raise ValueError("set_warmstart requires a coupled constraint profile")
     self._coupled_constraints.set_warmstart(values, env_ids=env_ids)
+    self._assembled_system_valid = False
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -505,6 +567,7 @@ class MetalSimulation:
     if self._coupled_constraints is None:
       return self._state.generation
     self._coupled_constraints.clear_warmstart(env_ids=env_ids)
+    self._assembled_system_valid = False
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -540,6 +603,7 @@ class MetalSimulation:
     gen = self._state.set_equality_active(values, env_ids=env_ids)
     # Invalidate cached assembly so next assembled_system recomputes with new
     # activity and fresh diagnostics. Do not touch failure status.
+    self._assembled_system_valid = False
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -558,6 +622,7 @@ class MetalSimulation:
     if getattr(self._state, "_nmocap", 0) == 0:
       raise ValueError("model has no mocap bodies")
     gen = self._state.set_mocap(pos, quat, env_ids=env_ids)
+    self._assembled_system_valid = False
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -596,6 +661,7 @@ class MetalSimulation:
       tensor = getattr(self, held, None)
       if tensor is not None:
         tensor[dst_i] = tensor[src_i].clone()
+    self._assembled_system_valid = False
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -752,6 +818,7 @@ class MetalSimulation:
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
       self._last_coupled_generation = None
+    self._assembled_system_valid = False
     self._accepted_step = None
     return self._state.generation
 
@@ -777,6 +844,8 @@ class MetalSimulation:
         ids = self._state._env_ids(env_ids)
         if ids.size:
           self._sensordata[ids.tolist()] = 0.0
+    self._assembled_system_valid = False
+    self._accepted_step = None
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -860,6 +929,8 @@ class MetalSimulation:
         ids = self._state._env_ids(env_ids)
         if ids.size:
           self._sensordata[ids.tolist()] = 0.0
+    self._assembled_system_valid = False
+    self._accepted_step = None
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -908,6 +979,8 @@ class MetalSimulation:
       if key not in keep:
         setattr(self, key, value)
     self._state.adopt_descriptor(fresh._state)
+    self._assembled_system_valid = False
+    self._accepted_step = None
     self._last_coupled = None
     self._last_coupled_generation = None
     self._spatial_cache_key = None
@@ -1038,9 +1111,10 @@ class MetalSimulation:
         state._qpos, state._qvel, state._time, poses, sensordata=base)
     out = self._run_state_sensors(state._qpos, state._qvel, poses, dynamics,
                                   out=out)
-    if self._has_acc_sensors:
-      # ACC families need the solved forward state (pinned sensorAcc runs
-      # post-constraint); evaluate the full forward, then the ACC kernel.
+    need_acc_or_contact = self._has_acc_sensors or self._has_contact_sensors
+    if need_acc_or_contact:
+      # ACC and CONTACT families need the solved forward state (pinned sensorAcc runs
+      # post-constraint); evaluate the full forward, then the ACC/contact kernels.
       # Queries must not perturb future trajectory: the forward solve
       # refreshes retained warmstarts and the coupled cache, so both are
       # saved and restored around the query (R03 isolation).
@@ -1049,14 +1123,18 @@ class MetalSimulation:
       last_coupled = getattr(self, "_last_coupled", None)
       last_gen = getattr(self, "_last_coupled_generation", None)
       accepted_step = getattr(self, "_accepted_step", None)
+      asm_valid = getattr(self, "_assembled_system_valid", True)
       ws_saved = {k: v.clone() for k, v in cc._workspace.items()} if cc is not None else None
       rhs_saved = self._rhs.clone() if getattr(self, "_rhs", None) is not None else None
       try:
         acceleration, _, acc_dyn = self._acceleration(state._qpos, state._qvel)
         acc_poses = dict(acc_dyn["poses"], cvel=acc_dyn["cvel"],
                          root_com=acc_dyn["root_com"])
-        out = self._run_acc_into(state._qpos, state._qvel, acceleration,
-                                 acc_poses, acc_dyn, out)
+        if self._has_acc_sensors:
+          out = self._run_acc_into(state._qpos, state._qvel, acceleration,
+                                   acc_poses, acc_dyn, out)
+        if self._has_contact_sensors or self._has_ray_sensors or self._has_geomdist_sensors:
+          out = self._run_spatial_into(acc_poses, out)
       finally:
         if ws_saved is not None:
           for k, v in ws_saved.items():
@@ -1074,7 +1152,8 @@ class MetalSimulation:
         if hasattr(self, "_last_coupled_generation"):
           self._last_coupled_generation = last_gen
         self._accepted_step = accepted_step
-    if self._has_contact_sensors or self._has_ray_sensors or self._has_geomdist_sensors:
+        self._assembled_system_valid = asm_valid
+    elif self._has_ray_sensors or self._has_geomdist_sensors:
       out = self._run_spatial_into(poses, out)
     return out.clone()
 
@@ -1135,7 +1214,7 @@ class MetalSimulation:
     if qfrc_applied is not None:
       self._prepare_force(qfrc_applied)
       recompute = True
-    if not recompute:
+    if not recompute and getattr(self, "_assembled_system_valid", False):
       if (
           getattr(self, "_accepted_step", None) is not None
           and self._accepted_step["generation"] == self._state.generation
@@ -1197,12 +1276,24 @@ class MetalSimulation:
     coupled["mass_matrix"] = dynamics["mass_matrix"]
     self._last_coupled = coupled
     self._last_coupled_generation = self._state.generation
+    self._assembled_system_valid = True
     return coupled
 
   @property
   def accepted_step(self):
     """The explicit accepted-step record from the most recent trajectory advancement."""
-    return getattr(self, "_accepted_step", None)
+    if self._accepted_step is None:
+      return None
+    return {
+        "system": _clone_system_dict(self._accepted_step["system"]),
+        "generation": self._accepted_step["generation"],
+        "input_generation": self._accepted_step["input_generation"],
+        "input_time": self._accepted_step["input_time"],
+        "status": self._accepted_step["status"].clone(),
+        "acceleration": self._accepted_step["acceleration"].clone(),
+        "accepted_mask": (self._accepted_step["accepted_mask"].clone()
+                          if "accepted_mask" in self._accepted_step else None),
+    }
 
   def _prepare_force(self, qfrc_applied):
     torch = self._state._torch
@@ -1640,25 +1731,28 @@ class MetalSimulation:
         state._generation += 1
         if not bool(torch.all(success)):
           if self._sensordata is not None:
-            if pre_sens is not None:
-              self._sensordata.copy_(torch.where(success.unsqueeze(1), self._sensordata, pre_sens))
-            else:
-              self._sensordata.mul_(success.unsqueeze(1).float())
+            rollback_sens = pre_sens if pre_sens is not None else torch.zeros_like(self._sensordata)
+            self._sensordata.copy_(torch.where(success.unsqueeze(1), self._sensordata, rollback_sens))
           if pre_warm is not None and cc is not None:
             failed_mask = ~success
             nr = int(cc.descriptor.nr)
             w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, nr * nr + 7 * nr)
             slice_w = w_dbg[:, nr * nr + 3 * nr:nr * nr + 4 * nr]
             slice_w.copy_(torch.where(failed_mask.unsqueeze(1), pre_warm, slice_w))
-        if getattr(self, "_last_coupled", None) is not None:
-          self._accepted_step = {
-              "system": _clone_system_dict(self._last_coupled),
-              "generation": state.generation,
-              "input_generation": pre_step_gen,
-              "input_time": pre_step_time,
-              "status": state._status.clone(),
-              "acceleration": state._qacc.clone(),
-          }
+        if bool(torch.any(success)):
+          self._assembled_system_valid = True
+          if getattr(self, "_last_coupled", None) is not None:
+            self._accepted_step = {
+                "system": _clone_system_dict(self._last_coupled),
+                "generation": state.generation,
+                "input_generation": pre_step_gen,
+                "input_time": pre_step_time,
+                "status": state._status.clone(),
+                "acceleration": state._qacc.clone(),
+                "accepted_mask": success.clone(),
+            }
+        else:
+          self._assembled_system_valid = False
         continue
       acceleration, solve_status, dynamics = self._acceleration(
           state._qpos, state._qvel
@@ -1768,10 +1862,8 @@ class MetalSimulation:
       # Failure atomicity (R02): rollback sensor samples and warmstarts for failed worlds
       if not bool(torch.all(self._success)):
         if self._sensordata is not None:
-          if pre_sens is not None:
-            self._sensordata.copy_(torch.where(self._success.unsqueeze(1), self._sensordata, pre_sens))
-          else:
-            self._sensordata.mul_(self._success.unsqueeze(1).float())
+          rollback_sens = pre_sens if pre_sens is not None else torch.zeros_like(self._sensordata)
+          self._sensordata.copy_(torch.where(self._success.unsqueeze(1), self._sensordata, rollback_sens))
         if pre_warm is not None and cc is not None:
           failed_mask = ~self._success
           nr = int(cc.descriptor.nr)
@@ -1780,15 +1872,20 @@ class MetalSimulation:
           slice_w.copy_(torch.where(failed_mask.unsqueeze(1), pre_warm, slice_w))
 
       # Accepted step record (R03/R04): exact immutable snapshot of the solved system
-      if getattr(self, "_last_coupled", None) is not None:
-        self._accepted_step = {
-            "system": _clone_system_dict(self._last_coupled),
-            "generation": state.generation,
-            "input_generation": pre_step_gen,
-            "input_time": pre_step_time,
-            "status": state._status.clone(),
-            "acceleration": state._qacc.clone(),
-        }
+      if bool(torch.any(self._success)):
+        self._assembled_system_valid = True
+        if getattr(self, "_last_coupled", None) is not None:
+          self._accepted_step = {
+              "system": _clone_system_dict(self._last_coupled),
+              "generation": state.generation,
+              "input_generation": pre_step_gen,
+              "input_time": pre_step_time,
+              "status": state._status.clone(),
+              "acceleration": state._qacc.clone(),
+              "accepted_mask": self._success.clone(),
+          }
+      else:
+        self._assembled_system_valid = False
     return state._status
 
   def step_sensordata(self):

@@ -86,6 +86,11 @@ class StateSnapshot:
   mquat: np.ndarray | None = None
   nact: int = 0
   act: np.ndarray | None = None
+  # Attached simulation-level state (R03): retained constraint multipliers
+  # captured by the owning simulator's snapshot hook. None means unknown
+  # (cold start on restore); a finite 2D array restores seeds. Validated
+  # below; never silently fabricated.
+  warmstart_multiplier: np.ndarray | None = None
 
   def __post_init__(self):
     if self.schema_version not in (1, 2, 3, 4):
@@ -205,6 +210,20 @@ class StateSnapshot:
           object.__setattr__(
               self, "act", _freeze_float32(self.act, (batch, self.nact), "act")
           )
+    # Attached solver seeds (any schema): None (unknown) or a finite 2D
+    # (batch, nr) array. Shape is checked against the live descriptor at
+    # restore time by the owning simulator's validate hook.
+    if self.warmstart_multiplier is None:
+      object.__setattr__(self, "warmstart_multiplier", None)
+    else:
+      raw_warm = np.asarray(self.warmstart_multiplier)
+      if (raw_warm.ndim != 2 or raw_warm.shape[0] != batch
+              or raw_warm.dtype.kind not in "fiu"):
+        raise ValueError("warmstart_multiplier must be numeric 2D with batch rows")
+      object.__setattr__(
+          self, "warmstart_multiplier",
+          _freeze_float32(raw_warm, raw_warm.shape, "warmstart_multiplier"),
+      )
 
 
 class DeviceState:
@@ -865,6 +884,8 @@ class DeviceState:
           self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device))
       self._act = next_act
     self._generation += 1
+    if hasattr(self, "_on_reset") and callable(self._on_reset):
+      self._on_reset(env_ids=ids)
     return self._generation
 
   def snapshot(self):
@@ -875,7 +896,7 @@ class DeviceState:
     :meth:`MetalSimulation.snapshot` for full replayable checkpoints (R03).
     """
     if self._neq == 0 and self._nmocap == 0 and self._na == 0:
-      return StateSnapshot(
+      snap = StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
         timestep=self.profile.timestep,
@@ -891,8 +912,8 @@ class DeviceState:
         neq=0,
         eq_active=None,
       )
-    if self._nmocap == 0 and self._na == 0:
-      return StateSnapshot(
+    elif self._nmocap == 0 and self._na == 0:
+      snap = StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
         timestep=self.profile.timestep,
@@ -908,8 +929,8 @@ class DeviceState:
         neq=self._neq,
         eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
       )
-    if self._na == 0:
-      return StateSnapshot(
+    elif self._na == 0:
+      snap = StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
         timestep=self.profile.timestep,
@@ -927,8 +948,9 @@ class DeviceState:
         nmocap=self._nmocap,
         mpos=self._mpos.detach().cpu().numpy(),
         mquat=self._mquat.detach().cpu().numpy(),
-    )
-    return StateSnapshot(
+      )
+    else:
+      snap = StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
         timestep=self.profile.timestep,
@@ -948,7 +970,10 @@ class DeviceState:
         mquat=self._mquat.detach().cpu().numpy() if self._nmocap else None,
         nact=self._na,
         act=self._act.detach().cpu().numpy(),
-    )
+      )
+    if hasattr(self, "_on_snapshot") and callable(self._on_snapshot):
+      self._on_snapshot(snap)
+    return snap
 
   def restore(self, snapshot, env_ids=None):
     """Restore a matching checkpoint only after validating every field."""
@@ -968,6 +993,11 @@ class DeviceState:
     ids = self._env_ids(env_ids) if env_ids is not None else None
     if ids is not None and ids.size == 0:
       raise ValueError("env_ids must select at least one world")
+    # Attached-state pre-commit validation: owning simulators validate
+    # hook-carried payloads (e.g. solver seeds) BEFORE any live tensor is
+    # touched, so a rejected restore leaves all state unchanged.
+    if hasattr(self, "_on_validate_restore") and callable(self._on_validate_restore):
+      self._on_validate_restore(snapshot, env_ids=ids)
     # Equality compatibility: never silently lose activity.
     if self._neq == 0:
       if snapshot.schema_version >= 2 and snapshot.neq != 0:
@@ -1074,6 +1104,8 @@ class DeviceState:
       if self._na > 0:
         self._act[index] = self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device)[index]
     self._generation += 1
+    if hasattr(self, "_on_restore") and callable(self._on_restore):
+      self._on_restore(snapshot, env_ids=ids)
     return self._generation
 
   def reset_to_default(self, env_ids=None):
