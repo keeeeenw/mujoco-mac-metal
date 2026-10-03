@@ -109,10 +109,16 @@ The integrated Euler pipeline enforces explicit hardware-tailored capacity bound
   collide per overlapped terrain prism (one witness each, same traversal as
   the pinned engine) against sphere/capsule/box/cylinder/ellipsoid within
   dim/data caps; mesh-heightfield and heightfield-heightfield pairs stay
-  rejected and margin is qualified at 0 only. Concave assets and SDFs stay
-  rejected. Models exceeding bounds, requesting non-Euler integrators, flex,
-  or plugins are rejected cleanly during profile validation before GPU
-  execution.
+  rejected and margin is qualified at 0 only. Signed-distance (SDF) geoms
+  reference mesh assets whose compiled octrees evaluate on device:
+  Halton-seeded gradient descent finds per-seed witnesses against analytic
+  geoms and SDF-vs-SDF (same seeds/traversal as the pinned engine) within
+  oct/node/initpoint caps; mesh-SDF pairs, plugin SDF geoms,
+  heightfield-SDF and margin stay restricted (plugin SDFs are third-party
+  CPU code with no native path; see the 019 extension contract). Concave
+  visual/collision meshes stay rejected. Models exceeding bounds, requesting
+  non-Euler integrators, flex, or plugins are rejected cleanly during profile
+  validation before GPU execution.
 - Supported equality types: joint, connect, weld (body-body, body-world, site-site, including mocap bodies as kinematic anchors; both-mocap equalities reserve rows but assemble zero rows/forces, matching MuJoCo skipping its empty Jacobian). Tendon/flex equalities, ball limits and non-finite `torquescale` are rejected, even when initially inactive.
 - Mocap bodies: jointless direct children of world only (pinned compiler restriction, re-validated at lowering). Prescribed per-environment poses via `sim.set_mocap`.
 
