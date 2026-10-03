@@ -196,28 +196,31 @@ class IslandManager:
     qvel_np = qvel.detach().cpu().numpy()
     b_size = qvel_np.shape[0]
 
-    # Wake islands with active external control or forces
-    ctrl_active = False
-    if ctrl is not None:
-      ctrl_np = ctrl.detach().cpu().numpy()
-      ctrl_active = bool(np.any(np.abs(ctrl_np) > 1e-6))
+    ctrl_np = ctrl.detach().cpu().numpy() if ctrl is not None else None
+    xfrc_np = xfrc_applied.detach().cpu().numpy() if xfrc_applied is not None else None
 
     islands = self.discover_islands(active_contacts)
 
     for w in range(b_size):
+      ctrl_w = bool(np.any(np.abs(ctrl_np[w]) > 1e-6)) if ctrl_np is not None else False
       for island_trees in islands:
-        # Collect DOFs in this island
         island_dofs = []
+        island_bodies = []
         for t in island_trees:
           island_dofs.extend(self.partition.tree_dofs[t])
+          island_bodies.extend(self.partition.tree_bodies[t])
 
         if not island_dofs:
           continue
 
         v_max = float(np.max(np.abs(qvel_np[w, island_dofs])))
 
+        xfrc_active = False
+        if xfrc_np is not None and island_bodies:
+          xfrc_active = bool(np.any(np.abs(xfrc_np[w, island_bodies]) > 1e-6))
+
         # Check if island is stationary and unforced
-        if v_max < self.sleep_tolerance and not ctrl_active:
+        if v_max < self.sleep_tolerance and not ctrl_w and not xfrc_active:
           for t in island_trees:
             self._stationary_steps[w, t] += 1
             if self._stationary_steps[w, t] >= self.sleep_delay_steps:

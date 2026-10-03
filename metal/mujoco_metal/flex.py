@@ -122,14 +122,24 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
   lame_lambda = np.zeros(nflex, dtype=np.float32)
   lame_mu = np.zeros(nflex, dtype=np.float32)
 
+  has_stiffness = hasattr(model, "flex_stiffnessadr") and hasattr(model, "flex_stiffness")
+  stiffnessadr = _frozen(model.flex_stiffnessadr, np.int32) if has_stiffness else np.full(nflex, -1, dtype=np.int32)
+
   for f in range(nflex):
-    k = float(edgestiffness[f])
-    if k <= 0.0:
-      k = 1000.0  # Default continuum stiffness if unspecified
-    young[f] = k
-    nu = float(poisson[f])
-    lame_lambda[f] = (k * nu) / ((1.0 + nu) * max(1.0 - 2.0 * nu, 1e-4))
-    lame_mu[f] = k / (2.0 * (1.0 + nu))
+    sadr = int(stiffnessadr[f]) if f < len(stiffnessadr) else -1
+    if sadr >= 0 and has_stiffness and sadr < len(model.flex_stiffness):
+      k = float(model.flex_stiffness[sadr])
+    else:
+      k = float(edgestiffness[f]) if f < len(edgestiffness) else 0.0
+    if k > 0.0:
+      young[f] = k
+      nu = float(poisson[f])
+      lame_lambda[f] = (k * nu) / ((1.0 + nu) * max(1.0 - 2.0 * nu, 1e-4))
+      lame_mu[f] = k / (2.0 * (1.0 + nu))
+    else:
+      young[f] = 0.0
+      lame_lambda[f] = 0.0
+      lame_mu[f] = 0.0
 
   return FlexDescriptor(
       nflex=nflex,
