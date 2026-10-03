@@ -172,8 +172,16 @@ class MetalSimulation:
     self._coupled_constraints = None
 
     if is_integrated:
+      import mujoco as _mj_init
       plan = profile.execution_plan
-      if plan.is_stage_enabled("actuation"):
+      # Actuation state ownership requires the actuator objects whenever the
+      # model has actuators, even with mjDSBL_ACTUATION: the disable bit
+      # gates force output (kernels emit zeros) and freezes the advance
+      # (next carries live state), matching pinned skip semantics while
+      # keeping activation owned end-to-end (R02).
+      _act_disabled = bool(int(model.opt.disableflags)
+                           & int(_mj_init.mjtDisableBit.mjDSBL_ACTUATION))
+      if plan.is_stage_enabled("actuation") or (_act_disabled and int(model.nu) > 0):
         from mujoco_metal.stateful_actuation import ActuatorModel
         from mujoco_metal.stateful_actuation import MetalActuators
         actuator_meta = ActuatorModel(model)
@@ -1519,12 +1527,16 @@ class MetalSimulation:
   def _advance_activations(self, state):
     """Advance activation state with pinned mj_nextActivation semantics.
 
-    Skipped under mjDSBL_ACTUATION (pinned advance guard). Failed worlds keep
-    their previous activation, matching the qpos/qvel rollback contract.
+    Under mjDSBL_ACTUATION the advance is skipped but the next buffer is
+    still defined (live state carried over), so the end-of-step transaction
+    preserves activation exactly. Failed worlds keep their previous
+    activation via the final accepted-step mask, matching the qpos/qvel
+    rollback contract.
     """
     import mujoco as _mj
     torch = state._torch
     if int(self._mjmodel.opt.disableflags) & int(_mj.mjtDisableBit.mjDSBL_ACTUATION):
+      self._next_act.copy_(state._act)
       return
     new_act = self._actuators.advance(state._act, self._act_dot, self._act_vel)
     torch.where(
