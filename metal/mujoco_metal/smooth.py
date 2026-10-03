@@ -160,6 +160,8 @@ def smooth_dynamics(model: ModelDescriptor, qpos, qvel):
           "ngeom",
           "nsite",
           "ntendon",
+          "ntendon_jnnz",
+          "nmass_nnz",
       )
   }
   values = {

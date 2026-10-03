@@ -47,6 +47,46 @@ def test_immutable_lowering_and_empty_world():
   assert pose["geom_pos"].shape == (1, 3)
 
 
+@pytest.mark.parametrize("with_tendon", [False, True])
+def test_compiled_sparse_metadata_survives_descriptor_snapshot_and_host_lowering(with_tendon):
+  xml = '''<mujoco><worldbody>
+    <body><joint name="a"/><geom size=".1" mass="1"/>
+      <body pos="0 0 .4"><joint name="b"/><geom size=".1" mass="1"/></body>
+    </body>
+    <body pos="1 0 0"><joint name="c"/><geom size=".1" mass="1"/></body>
+    </worldbody>'''
+  if with_tendon:
+    xml += '<tendon><fixed armature=".2"><joint joint="a" coef="2"/>'
+    xml += '<joint joint="c" coef="-1"/></fixed></tendon>'
+  compiled = mujoco.MjModel.from_xml_string(xml + '</mujoco>')
+  descriptor = load_model(compiled)
+  snapshot = model_module.snapshot_descriptor(descriptor)
+  host = _prepare_host_arrays(snapshot)
+  expected = {
+      "tendon_treeid": np.asarray(compiled.tendon_treeid).reshape(compiled.ntendon, 2),
+      "tendon_treenum": compiled.tendon_treenum,
+      "tendon_j_rowadr": compiled.ten_J_rowadr,
+      "tendon_j_rownnz": compiled.ten_J_rownnz,
+      "tendon_j_colind": compiled.ten_J_colind,
+      "mass_rowadr": compiled.M_rowadr,
+      "mass_rownnz": compiled.M_rownnz,
+      "mass_colind": compiled.M_colind,
+  }
+  assert descriptor.ntendon_jnnz == np.asarray(compiled.ten_J_colind).size
+  assert descriptor.nmass_nnz == np.asarray(compiled.M_colind).size
+  for name, value in expected.items():
+    for lowered in (descriptor, snapshot):
+      np.testing.assert_array_equal(getattr(lowered, name), value)
+      assert not np.shares_memory(getattr(lowered, name), value)
+      with pytest.raises(ValueError):
+        getattr(lowered, name).setflags(write=True)
+    # Kernel bindings flatten logical arrays and guard zero-length inputs.
+    if np.asarray(value).size:
+      np.testing.assert_array_equal(host[name], np.asarray(value).reshape(-1))
+    else:
+      np.testing.assert_array_equal(host[name], [0])
+
+
 def test_mixed_topology_matches_mujoco_oracle():
   xml = """<mujoco><worldbody>
     <geom type="plane" size="2 2 .1"/>

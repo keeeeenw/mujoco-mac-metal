@@ -181,6 +181,8 @@ class ModelDescriptor:
   ngeom: int
   nsite: int
   ntendon: int
+  ntendon_jnnz: int
+  nmass_nnz: int
   body_rootid: np.ndarray
   body_dofadr: np.ndarray
   body_dofnum: np.ndarray
@@ -210,6 +212,14 @@ class ModelDescriptor:
   actuator_damping: np.ndarray
   actuator_dampingpoly: np.ndarray
   tendon_armature: np.ndarray
+  tendon_treeid: np.ndarray
+  tendon_treenum: np.ndarray
+  tendon_j_rowadr: np.ndarray
+  tendon_j_rownnz: np.ndarray
+  tendon_j_colind: np.ndarray
+  mass_rowadr: np.ndarray
+  mass_rownnz: np.ndarray
+  mass_colind: np.ndarray
   jnt_type: np.ndarray
   jnt_qposadr: np.ndarray
   jnt_dofadr: np.ndarray
@@ -351,6 +361,8 @@ def snapshot_descriptor(model):
           "ngeom",
           "nsite",
           "ntendon",
+          "ntendon_jnnz",
+          "nmass_nnz",
           "disableflags",
       )
   }
@@ -409,6 +421,14 @@ def _validate_lowered(counts, values):
       "actuator_damping": (counts["nu"],),
       "actuator_dampingpoly": (counts["nu"], 2),
       "tendon_armature": (counts["ntendon"],),
+      "tendon_treeid": (counts["ntendon"], 2),
+      "tendon_treenum": (counts["ntendon"],),
+      "tendon_j_rowadr": (counts["ntendon"],),
+      "tendon_j_rownnz": (counts["ntendon"],),
+      "tendon_j_colind": (counts["ntendon_jnnz"],),
+      "mass_rowadr": (nv,),
+      "mass_rownnz": (nv,),
+      "mass_colind": (counts["nmass_nnz"],),
       "jnt_type": (nj,),
       "jnt_qposadr": (nj,),
       "jnt_dofadr": (nj,),
@@ -443,6 +463,22 @@ def _validate_lowered(counts, values):
     raise ValueError("body mass and inertia values must be nonnegative")
   if np.any(values["dof_armature"] < 0):
     raise ValueError("dof armature values must be nonnegative")
+  if (np.any(values["tendon_treenum"] < 0)
+      or np.any(values["tendon_j_rowadr"] < 0)
+      or np.any(values["tendon_j_rownnz"] < 0)
+      or np.any(values["tendon_j_rowadr"].astype(np.int64)
+                + values["tendon_j_rownnz"].astype(np.int64)
+                > counts["ntendon_jnnz"])
+      or np.any(values["tendon_j_colind"] < 0)
+      or np.any(values["tendon_j_colind"] >= nv)):
+    raise ValueError("invalid tendon tree or structural Jacobian metadata")
+  if (np.any(values["mass_rowadr"] < 0)
+      or np.any(values["mass_rownnz"] < 0)
+      or np.any(values["mass_rowadr"].astype(np.int64)
+                + values["mass_rownnz"].astype(np.int64) > counts["nmass_nnz"])
+      or np.any(values["mass_colind"] < 0)
+      or np.any(values["mass_colind"] >= nv)):
+    raise ValueError("invalid compiled mass matrix sparsity metadata")
   # Pinned MuJoCo permits signed linear damping. Finiteness is checked above;
   # a negative coefficient is an explicit energy source, not malformed data.
   if np.any(values["actuator_armature"] < 0):
@@ -644,6 +680,17 @@ def load_model(source):
   ):
     source_value = m.opt.gravity if name == "gravity" else getattr(m, name)
     values[name] = _frozen(source_value)
+  values["tendon_treeid"] = _frozen(
+      np.asarray(m.tendon_treeid, dtype=np.int32).reshape(m.ntendon, 2))
+  values["tendon_treenum"] = _frozen(m.tendon_treenum, np.int32)
+  tendon_colind = np.asarray(m.ten_J_colind, dtype=np.int32).reshape(-1)
+  values["tendon_j_rowadr"] = _frozen(m.ten_J_rowadr, np.int32)
+  values["tendon_j_rownnz"] = _frozen(m.ten_J_rownnz, np.int32)
+  values["tendon_j_colind"] = _frozen(tendon_colind, np.int32)
+  mass_colind = np.asarray(m.M_colind, dtype=np.int32).reshape(-1)
+  values["mass_rowadr"] = _frozen(m.M_rowadr, np.int32)
+  values["mass_rownnz"] = _frozen(m.M_rownnz, np.int32)
+  values["mass_colind"] = _frozen(mass_colind, np.int32)
   counts = dict(
       nq=m.nq,
       nv=m.nv,
@@ -654,6 +701,8 @@ def load_model(source):
       ngeom=m.ngeom,
       nsite=m.nsite,
       ntendon=m.ntendon,
+      ntendon_jnnz=int(tendon_colind.size),
+      nmass_nnz=int(mass_colind.size),
       disableflags=int(m.opt.disableflags),
   )
   _validate_lowered(counts, values)
