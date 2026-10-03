@@ -28,7 +28,10 @@
     </body>
   </worldbody>
   <contact>
-    <pair geom1="deckB_geom" geom2="tray" solref="0.006 1" solimp="0.99 0.999 0.001"/>
+    <!-- Landing stop: normal-only support (condim=1 keeps the 8-point
+         box-box manifold within the native 96-row budget); tangential
+         restraint comes from the deckA hinge + deck_link connect. -->
+    <pair geom1="deckB_geom" geom2="tray" condim="1" solref="0.006 1" solimp="0.99 0.999 0.001"/>
     <pair geom1="payload_geom" geom2="deckA_geom"/>
     <pair geom1="payload_geom" geom2="deckB_geom"/>
     <pair geom1="payload_geom" geom2="tray"/>

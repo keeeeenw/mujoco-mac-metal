@@ -8,7 +8,7 @@ published 0.4.0 wheel alone.
 Two rigid deck sections are joined through a ball-like connect constraint at
 midspan. DeckA is hinged to a fixed frame; deckB is free and latched to the
 world frame through a weld brace. A payload sphere rests on the decks and
-contacts the decks and the floor. A solid landing stop supports the released deck. At a deterministic release
+contacts the decks. A solid landing stop supports the released deck. At a deterministic release
 step the brace weld is deactivated through the public
 `sim.set_equality_active` API; the connected sections articulate under gravity
 and the deck lands on the stop while the payload shifts along the bridge. A paired always-latched run shows the

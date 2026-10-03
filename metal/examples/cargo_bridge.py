@@ -4,12 +4,13 @@
 
 Two deck sections (deckA hinged to frame, deckB free) are joined through a
 ball-like connect constraint at midspan and latched to the world frame through
-a weld brace (deckB-to-world). A payload sphere rests on the decks and contacts
-deck/tray/floor. At t=0.6s (step 300, dt=0.002s) the brace weld is released via
-the public set_equality_active API; the connected sections articulate under
-gravity and the payload slides into the receiving tray. A paired always-latched
-run shows the physical effect of release. Release schedule is identical in
-CPU/native runs.
+a weld brace (deckB-to-world). A payload sphere rests on the decks. At
+release step 50 (t=0.1s) the brace weld is released via the public
+set_equality_active API; the connected sections articulate under gravity,
+deckB lands on the solid tray stop (explicit deck-tray contact, no
+pass-through), and the payload shifts along the bridge but remains aboard.
+A paired always-latched run shows the physical effect of release. Release
+schedule is identical in CPU/native runs.
 """
 
 import argparse
@@ -227,7 +228,7 @@ def run(steps=1200, mode="metal", check=False, record=None, release_step=RELEASE
       "released_payload_z": released_payload_z, "latched_payload_z": latched_payload_z,
       "release_step": release_step, "steps": steps,
       "support_contact_steps_cpu": support_contacts,
-      "minimum_geometry_distance": clearance.minimum,
+      "minimum_geometry_distance": clearance.reported,
   }
   if check:
     # Impact contact is compliant; reject gross overlap through the stop.

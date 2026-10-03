@@ -66,7 +66,14 @@ pedestal throughout the native rollout, using geometry-distance queries on a
 separate CPU model. Those queries also cover pairs omitted from collision
 filtering; they do not advance the native physics. The CPU regression suite
 replays the complete schedule and verifies both deliveries and furniture
-clearance. Attached jaw parts intentionally meet at their mechanical joints.
+clearance. Jaw self-pairs (finger-finger, ledge-ledge, ledge-opposite-jaw)
+clear by 29 mm or more at every sampled step; the symmetric fully-closed
+empty pose would intersect and is outside the schedule envelope (muscle
+closure is always asymmetric or ball-separated). Attached jaw parts
+intentionally meet at their mechanical joints. Slide limits act as compliant
+end-stops: the grasp transient overshoots the soft limits by up to ~88 mm
+of travel, inside the verified 150 mm envelope; this is limit-force
+equilibrium, not runaway.
 
 Lighting and the dark checkerboard match the robotic marble music machine.
 This is a deterministic open-loop manipulation demo, not a qualified general

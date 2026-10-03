@@ -58,3 +58,5 @@ Measured native results on the qualified run (MuJoCo 3.10.0, MPS float32):
 - Hook mocap tracking error: `0.0` (exact prescribed poses).
 - Cargo contact steps: `218`; cargo-bin contact steps released/latched: `218` / `0`.
 - Released cargo `(x, z)`: (`0.700`, `0.200`) inside right-bin footprint; latched cargo `(x, z)`: (`0.700`, `0.850`) suspended.
+
+Lighting and the dark checkerboard match the robotic marble music machine.

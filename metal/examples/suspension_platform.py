@@ -170,7 +170,7 @@ def run(steps=1200, mode="metal", check=False, record=None):
       "swing": swing,
       "level": level,
       "steps": steps,
-      "minimum_geometry_distance": clearance.minimum,
+      "minimum_geometry_distance": clearance.reported,
   }
   if check:
     clearance.check()

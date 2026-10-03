@@ -67,3 +67,5 @@ Measured CPU results on the qualified run (MuJoCo 3.10.0):
   transient at step 651, reconverges to `4.1e-03`), crate orientation `3.7e-02`
   (same transient), actuator state `5e-4`. Position/orientation reported
   separately per the roadmap; the transient is a contact event, not drift.
+
+Lighting and the dark checkerboard match the robotic marble music machine.
