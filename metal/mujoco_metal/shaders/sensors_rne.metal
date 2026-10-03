@@ -130,8 +130,9 @@ kernel void assemble_cfrc_ext(
   }
   // Contacts with solver rows: skip undetected slots and static-static
   // pairs (pinned NV==0 exclusion: neither ancestor chain has joints).
+  // contact_row is per-world flattened (world*nc+s); packed/mu are per-slot.
   for (uint s=0;s<nc;++s) {
-    if (contact_row[s]<=0.5f) continue;
+    if (contact_row[world*nc+s]<=0.5f) continue;
     int cdim=contact_packed[s*3+0], cone=contact_packed[s*3+2];
     uint pair=0;
     for (uint pp=0;pp<uint(dims[4]);++pp) {

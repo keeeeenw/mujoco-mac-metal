@@ -1810,11 +1810,14 @@ class SensorProgram:
       npairs = 0
     else:
       cfr, cfo = contact["frame"].reshape(-1), contact["force"].reshape(-1)
-      crow, cpk = contact["row"].reshape(-1), contact["packed"].reshape(-1)
+      # Active-flag view may be strided upstream; materialize the documented
+      # contiguous per-world row-major contract before flattening.
+      crow, cpk = contact["row"].contiguous().reshape(-1), contact["packed"].reshape(-1)
       cmu, pge = contact["mu"].reshape(-1), contact["pair_geoms"].reshape(-1)
-      pof, plv = contact["pair_offset"].reshape(-1), contact["pair_live"].reshape(-1)
+      pof = contact["pair_offset"].reshape(-1)
+      plv = contact["pair_live"].reshape(-1)
       npairs = int(contact.get("npairs", 0))
-    bjn = self._rne_body_jnt[:, 1].reshape(-1)
+    bjn = self._rne_body_jnt[:, 1].contiguous().reshape(-1)
     eqr = eq_rowadr.reshape(-1) if eq_rowadr is not None else torch.zeros(1, dtype=torch.int32, device=self._device)
     neq_eff = int(eqr.numel()) if eq_rowadr is not None else 0
     jm = jnt_map.reshape(-1) if jnt_map is not None else torch.full((max(nj, 1) * 3,), -1, dtype=torch.int32, device=self._device)
@@ -1827,7 +1830,7 @@ class SensorProgram:
         [b, nb, neq_eff, nc, npairs, has_x, lam_nr, lam_stride],
         dtype=torch.int32, device=self._device)
     self._rne_assemble(
-        XF, cfr, cfo, crow, cpk, cmu, pge, pof, plv,
+        XF, cfr, cfo, crow, cpk, cmu, pge, pof,
         self._rne_geom_bodyid, bjn,
         self._rne_eq_meta.reshape(-1), eqr,
         self._rne_eq_data.reshape(-1), self._rne_site_lpos.reshape(-1),
