@@ -1317,6 +1317,11 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
                                 thread ContactGeom* con,
                                 int ia, int ib,
                                 device const float* hull, device const int* hull_info, thread float3* prismV);
+inline int collide_mesh_plane_manifold(float3 p1, float4 q1,
+                                int t2, float3 p2, float4 q2, float3 sz2,
+                                float margin, int maxn, thread ContactGeom* con,
+                                int ia, int ib,
+                                device const float* hull, device const int* hull_info);
 // Milestone 012 heightfield: per-prism terrain collision vs convex geoms
 // (pinned mjc_ConvexHField). Hfield side first (canonical t1 == 1).
 inline int collide_hfield(
@@ -1392,14 +1397,24 @@ inline int collide_pair(
                              margin, 5, r1, r2, disable_multiccd, con,
                              gi1, gi2, hull, hull_info, nullptr);
   } else if (t1 == 0 && t2 == 7) {
-    // Milestone 011 convex mesh (single witness; multi-contact manifolds
-    // stay a documented restriction).
-    n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, margin, con,
-                             gi1, gi2, hull, hull_info, nullptr);
+    // R05-1 mesh-plane face manifold (bounded face-clip expansion, host
+    // budget 4, sorted identity).
+    n = collide_mesh_plane_manifold(pos1, quat1, t2, pos2, quat2, size2,
+                             margin, maxn, con,
+                             gi1, gi2, hull, hull_info);
   } else if ((t1 == 2 && t2 == 7) || (t1 == 3 && t2 == 7) || (t1 == 4 && t2 == 7)
              || (t1 == 5 && t2 == 7) || (t1 == 6 && t2 == 7) || (t1 == 7 && t2 == 7)) {
-    n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con,
-                              gi1, gi2, hull, hull_info, nullptr);
+    // R05-1: sphere/ellipsoid-involved mesh pairs stay single (pinned
+    // rule); box/cylinder/capsule/mesh-vs-mesh use the bounded multiCCD
+    // manifold with the pair slot budget.
+    if (t1 == 2 || t2 == 2 || t1 == 4 || t2 == 4) {
+      n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con,
+                                gi1, gi2, hull, hull_info, nullptr);
+    } else {
+      n = collide_convex_multi(t1, pos1, quat1, size1, t2, pos2, quat2, size2,
+                               margin, maxn, r1, r2, disable_multiccd, con,
+                               gi1, gi2, hull, hull_info, nullptr);
+    }
   } else if (t1 == 0 && t2 == 1) {
     // Milestone 012: plane-heightfield pairs yield no contacts (pinned
     // static-static skip; lowering reserves zero slots for them).

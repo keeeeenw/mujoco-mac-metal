@@ -185,10 +185,11 @@ def pair_max_contacts(t1: int, t2: int, sdf_initpoints: int = 8) -> int:
     # before the multi-contact rules below, matching mj_maxContact order.
     return 1
   if _MESH in (t_min, t_max):
-    # Milestone 011: convex mesh pairs yield one native witness (support
-    # GJK/MPR single). Multi-contact mesh manifolds stay a documented
-    # restriction; the CPU oracle may emit face-manifold points.
-    return 1
+    # R05-1 bounded mesh manifolds: convex mesh pairs yield up to 4 native
+    # witnesses (face-clip expansion on planes, perturbed-restart multiCCD
+    # on box/cylinder/capsule/mesh). Sphere/ellipsoid involvement returns
+    # above (pinned single). Deterministic slot identity via spatial sort.
+    return 4
   if (t_min, t_max) in (
       (_PLANE, _CAPSULE),
       (_CAPSULE, _CAPSULE),

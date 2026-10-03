@@ -1187,6 +1187,88 @@ inline void cx_contact_tangents(float3 n, thread float3& t1, thread float3& t2) 
   t2 = cross(nn, t1);
 }
 
+// Deterministic slot identity (R05-1): insertion sort of witnesses by
+// world position (x, then y, then z). Manifold cardinality changes across
+// steps keep stable row mapping instead of restart-order churn.
+inline void cx_sort_contacts(thread ContactGeom* con, int n) {
+  for (int i = 1; i < n; ++i) {
+    ContactGeom key = con[i];
+    int j = i - 1;
+    while (j >= 0 && (con[j].pos.x > key.pos.x + 1e-9f ||
+           (abs(con[j].pos.x - key.pos.x) <= 1e-9f && con[j].pos.y > key.pos.y + 1e-9f) ||
+           (abs(con[j].pos.x - key.pos.x) <= 1e-9f && abs(con[j].pos.y - key.pos.y) <= 1e-9f &&
+            con[j].pos.z > key.pos.z + 1e-9f))) {
+      con[j + 1] = con[j];
+      --j;
+    }
+    con[j + 1] = key;
+  }
+}
+
+// R05-1 mesh-plane face manifold: the single deepest support seeds the
+// witness, then hull verts within a 2 mm depth band of it join as face
+// contacts (same normal, own depths/positions, tangent frames rebuilt).
+// Bounded by maxn (host mesh budget 4) and sorted for stable identity.
+inline int collide_mesh_plane_manifold(float3 p1, float4 q1,
+                                int t2, float3 p2, float4 q2, float3 sz2,
+                                float margin, int maxn, thread ContactGeom* con,
+                                int ia, int ib,
+                                device const float* hull, device const int* hull_info) {
+  int n = collide_plane_convex(p1, q1, t2, p2, q2, sz2, margin, con,
+                               ia, ib, hull, hull_info, nullptr);
+  if (n == 0 || maxn <= 1 || t2 != CX_MESH) return n;
+  float3 nrm = con[0].normal;
+  float3x3 R2 = float3x3(rotate_q(q2, float3(1,0,0)),
+                         rotate_q(q2, float3(0,1,0)),
+                         rotate_q(q2, float3(0,0,1)));
+  int off = hull_info[ib * 9];
+  int cnt = hull_info[ib * 9 + 1];
+  if (cnt < 0) cnt = 0;
+  if (cnt > CX_MESH_MAXSCAN) cnt = CX_MESH_MAXSCAN;
+  // Deepest hull vert in world (recompute to map ties to verts, not the
+  // averaged support centroid).
+  float deepest = 3.4028235e+38f;
+  for (int k = 0; k < cnt; ++k) {
+    float3 v = float3(hull[(off + k) * 3], hull[(off + k) * 3 + 1],
+                      hull[(off + k) * 3 + 2]);
+    float3 w = p2 + R2 * v;
+    float dv = dot(w - p1, nrm);
+    if (dv < deepest) deepest = dv;
+  }
+  // Collect face-band hull verts into a local manifold, then replace the
+  // centroid-seeded primary: the averaged support point is not a hull
+  // feature (face centers / edge midpoints), so pure vert witnesses give
+  // true moment arms. The band always contains the deepest vert itself,
+  // so vertex/edge/face contacts yield 1/2/4 witnesses respectively.
+  ContactGeom verts[8];
+  int nvert = 0;
+  for (int k = 0; k < cnt && nvert < maxn && nvert < 8; ++k) {
+    float3 v = float3(hull[(off + k) * 3], hull[(off + k) * 3 + 1],
+                      hull[(off + k) * 3 + 2]);
+    float3 w = p2 + R2 * v;
+    float dv = dot(w - p1, nrm);
+    if (dv > margin) continue;
+    if (dv > deepest + 2e-3f) continue;
+    bool dup = false;
+    for (int j = 0; j < nvert; ++j) {
+      float3 dq = (w - nrm * (dv * 0.5f)) - verts[j].pos;
+      if (dot(dq, dq) <= 1e-6f) { dup = true; break; }
+    }
+    if (dup) continue;
+    verts[nvert].dist = dv;
+    verts[nvert].normal = nrm;
+    verts[nvert].pos = w - nrm * (dv * 0.5f);
+    cx_contact_tangents(nrm, verts[nvert].t1, verts[nvert].t2);
+    ++nvert;
+  }
+  if (nvert == 0) return n;  // keep the single primary (no band verts)
+  n = min(nvert, maxn);
+  for (int k = 0; k < n; ++k) con[k] = verts[k];
+  cx_sort_contacts(con, n);
+  // Face-vert own-depths differ by < 2 mm; keep own depths (matches
+  // per-point CPU depths) — depths already stored per witness.
+  return n;
+}
 // Pinned multiCCD manifold port (MuJoCo mjc_Convex): after one primary
 // witness, rotate both geometry frames in opposite directions about the
 // primary contact point (tangent axes, +/-1e-3 rad), re-run the isolated
@@ -1248,6 +1330,11 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
         if (dot(dd, dd) <= tol * tol) { dup = true; break; }
       }
       if (dup) continue;
+      // R05-1 mesh-manifold coherence: restart witnesses must share the
+      // primary face normal (2 deg). Tilted EPA basins on sharp hull
+      // features are multi-basin regime (excluded from tight parity);
+      // admitting them corrupts the manifold frame gates.
+      if ((ta == CX_MESH || tb == CX_MESH) && dot(cand.normal, n0) < 0.9994f) continue;
       cand.dist = dd0;
       con[n] = cand;
       n++;
@@ -1290,6 +1377,7 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
       }
     }
   }
+  cx_sort_contacts(con, n);
   return n;
 }
 
