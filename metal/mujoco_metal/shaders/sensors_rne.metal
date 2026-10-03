@@ -180,7 +180,7 @@ kernel void assemble_cfrc_ext(
     }
     float3 fw=n*fl[0]+t1*fl[1]+t2*fl[2];
     float3 tw=float3(0.0f);
-    if (cone!=0 && cdim>3) {
+    if (cdim>3) {
       float3 tl=float3(fl[3],fl[4],fl[5]);
       tw=n*tl.x+t1*tl.y+t2*tl.z;
     }

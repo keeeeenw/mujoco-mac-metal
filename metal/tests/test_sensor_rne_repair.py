@@ -222,71 +222,106 @@ def test_cfrc_composition_connect_weld_xfrc_gpu():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-@pytest.mark.parametrize("condim,cone", [(1, "pyramidal"), (3, "pyramidal"),
-                                         (4, "elliptic"), (6, "elliptic")])
+@pytest.mark.parametrize("condim,cone", [
+    (1, "pyramidal"), (1, "elliptic"),
+    (3, "pyramidal"), (3, "elliptic"),
+    (4, "pyramidal"), (4, "elliptic"),
+    (6, "pyramidal"), (6, "elliptic"),
+])
 def test_condim_cone_force_matrix_gpu(condim, cone):
   from mujoco_metal.simulation import MetalSimulation
-  # Contact forces on a free body read ~0 through cfrc balance, so the
-  # matrix presses a slide-driven pad into the floor: contact forces
-  # transmit through the joint (jointactfrc) and the site wrench
-  # (force/torque). Lateral slide velocity engages friction, exercising
-  # per-slot mu indexing of the pyramid/elliptic decode (unequal geom
-  # frictions: floor 0.9 vs pad 0.7).
-  xml = ('<mujoco><option timestep="0.002" integrator="Euler" cone="%s"/>'
-         '<worldbody><geom name="floor" type="plane" size="5 5 0.1" friction="0.9 0.05 0.02"/>'
-         '<body name="press" pos="0 0 0.3">'
-         '<joint name="s" type="slide" axis="0.196116 0 -0.980581" damping="0.5" limited="true" range="0 0.25"/>'
-         '<geom name="pad" type="sphere" size="0.1" mass="0.4" friction="0.7 0.08 0.03"/>'
-         '<site name="g"/></body></worldbody>'
-         '<actuator><motor name="m" joint="s" gear="3"/></actuator>'
-         '<sensor><jointactuatorfrc joint="s"/><actuatorfrc actuator="m"/>'
-         '<force site="g"/><torque site="g"/></sensor></mujoco>') % cone
-  if condim != 3:
-    xml = xml.replace("<sensor>", '<contact><pair geom1="floor" geom2="pad" condim="%d"/></contact><sensor>' % condim)
+  # Multi-DOF test body (slide + normal hinge + tangential hinges) pressing
+  # and rotating against the floor: exercises full 6D contact wrench
+  # (normal, tangential friction, torsional friction, rolling friction)
+  # across all 8 cone/condim combinations with unequal friction coefficients.
+  xml = (
+      f'<mujoco><option timestep="0.002" integrator="Euler" cone="{cone}"/>'
+      '<worldbody><geom name="floor" type="plane" size="5 5 0.1" friction="0.9 0.05 0.02"/>'
+      '<body name="press" pos="0 0 0.2">'
+      '<joint name="s" type="slide" axis="0 0 -1" damping="0.5" limited="true" range="0 0.25"/>'
+      '<joint name="h_z" type="hinge" axis="0 0 1" damping="0.1"/>'
+      '<joint name="h_x" type="hinge" axis="1 0 0" damping="0.1"/>'
+      '<joint name="h_y" type="hinge" axis="0 1 0" damping="0.1"/>'
+      '<geom name="pad" type="sphere" size="0.1" mass="0.4" friction="0.7 0.08 0.03"/>'
+      '<site name="g"/></body></worldbody>'
+      '<actuator>'
+      '<motor name="m_s" joint="s" gear="3"/>'
+      '<motor name="m_z" joint="h_z" gear="1"/>'
+      '<motor name="m_x" joint="h_x" gear="1"/>'
+      '<motor name="m_y" joint="h_y" gear="1"/>'
+      '</actuator>'
+      '<sensor>'
+      '<jointactuatorfrc joint="s"/>'
+      '<jointactuatorfrc joint="h_z"/>'
+      '<jointactuatorfrc joint="h_x"/>'
+      '<jointactuatorfrc joint="h_y"/>'
+      '<force site="g"/><torque site="g"/>'
+      '</sensor>'
+      f'<contact><pair geom1="floor" geom2="pad" condim="{condim}" friction="0.85 0.85 0.06 0.03 0.02"/></contact>'
+      '</mujoco>'
+  )
   model = mujoco.MjModel.from_xml_string(xml)
   sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
-  qp = np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0)
-  qv = np.zeros((2, model.nv), dtype=np.float32)
-  qv[:, 0] = [0.8, -0.6]
+  qp = np.array([[0.11, 0.0, 0.0, 0.0], [0.11, 0.0, 0.0, 0.0]], dtype=np.float32)
+  qv = np.array([[0.1, 1.0, 1.0, 1.0], [0.1, -1.0, 1.0, -1.0]], dtype=np.float32)
   sim.reset(qpos=qp, qvel=qv)
+  ctrl = np.array([[5.0, 0.2, 0.2, 0.2], [5.0, -0.2, 0.2, -0.2]], dtype=np.float32)
   cpus = []
   for w in range(2):
     dd = mujoco.MjData(model)
     dd.qpos[:] = qp[w]
     dd.qvel[:] = qv[w]
     cpus.append(dd)
-  max_diff, joint_peak, force_peak = 0.0, 0.0, 0.0
-  for _ in range(120):
-    ctrl = np.array([[0.8], [1.0]], dtype=np.float32)
+
+  max_diff = 0.0
+  for _ in range(30):
     sim.step(1, ctrl=ctrl)
-    for w, dd in enumerate(cpus):
-      dd.ctrl[:] = [0.8 + 0.2 * w]
-      mujoco.mj_step(model, dd)
+    for w in range(2):
+      cpus[w].ctrl[:] = ctrl[w]
+      mujoco.mj_step(model, cpus[w])
     stored = sim.step_sensordata()
     for w, dd in enumerate(cpus):
       ref = np.asarray(dd.sensordata)
       max_diff = max(max_diff, float(np.max(np.abs(stored[w] - ref))))
-      joint_peak = max(joint_peak, float(abs(ref[0])))
-      force_peak = max(force_peak, float(np.max(np.abs(ref[2:8]))))
-  # Non-vacuous: joint drive and transmitted site wrench both engage.
-  assert joint_peak > 0.5, (condim, cone, joint_peak)
-  assert force_peak > 0.5, (condim, cone, force_peak)
-  # Pyramidal decode is exact; elliptic carries the native-FISTA vs CPU
-  # cone-solver budget difference (same iteration budget, ≤0.5% of ~6 N
-  # contact forces here). R04 owns cone-solver convergence; the decode
-  # itself is pinned-formula exact on both paths.
-  gate = 2e-3 if cone == "pyramidal" else 5e-2
-  assert max_diff < gate, (condim, cone, max_diff)
-  # Post-step query against matching forward oracles.
+
+  # Pinned CPU contact force verification and non-vacuous contact engagement
+  for w in range(2):
+    cf = np.zeros(6)
+    mujoco.mj_contactForce(model, cpus[w], 0, cf)
+    assert abs(cf[0]) > 1.0, f"Normal contact force must engage: {cf[0]}"
+    if condim >= 3:
+      assert abs(cf[1]) > 0.1 or abs(cf[2]) > 0.1, f"Tangential friction must engage: {cf[1:3]}"
+    if condim >= 4:
+      assert abs(cf[3]) > 1e-3, f"Torsional torque must engage for condim {condim}: {cf[3]}"
+    if condim == 6:
+      assert abs(cf[4]) > 1e-3 or abs(cf[5]) > 1e-3, f"Rolling torque must engage for condim 6: {cf[4:6]}"
+
+  # Check step sensor agreement
+  gate = 5e-4 if cone == "pyramidal" else 5e-2
+  assert max_diff < gate, f"Sensordata mismatch ({condim}, {cone}): max_diff={max_diff}"
+
+  # Compare same-state cfrc_ext and cfrc_int on GPU
+  ext = sim._sensors._rne_ext.cpu().numpy()
+  cfrc = sim._sensors._rne_cfrc.cpu().numpy()
+  for w in range(2):
+    ref_ext = np.asarray(cpus[w].cfrc_ext[1])
+    ref_int = np.asarray(cpus[w].cfrc_int[1])
+    gate_cfrc = 5e-4 if cone == "pyramidal" else 5e-2
+    np.testing.assert_allclose(ext[w, 1], ref_ext, rtol=2e-3, atol=gate_cfrc,
+                               err_msg=f"cfrc_ext {condim}/{cone} w{w}")
+    np.testing.assert_allclose(cfrc[w, 1], ref_int, rtol=2e-3, atol=gate_cfrc,
+                               err_msg=f"cfrc_int {condim}/{cone} w{w}")
+
+  # Post-step query against matching forward oracles
   gq = sim.state.qpos.cpu().numpy().astype(float)
   gv = sim.state.qvel.cpu().numpy().astype(float)
   got = sim.sensor_values().cpu().numpy()
   for w in range(2):
-    dd = _cpu_frame(model, gq[w], gv[w], ctrl=[0.8 + 0.2 * w])
-    gate_q = 2e-3 if cone == "pyramidal" else 5e-2
+    dd = _cpu_frame(model, gq[w], gv[w], ctrl=ctrl[w])
+    gate_q = 5e-4 if cone == "pyramidal" else 5e-2
     np.testing.assert_allclose(got[w], np.asarray(dd.sensordata),
                                rtol=2e-3, atol=gate_q,
-                               err_msg=f"{condim}/{cone} w{w}")
+                               err_msg=f"sensor_values {condim}/{cone} w{w}")
 
 
 @pytest.mark.gpu
