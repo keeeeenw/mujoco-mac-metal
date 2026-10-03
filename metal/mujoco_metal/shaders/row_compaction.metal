@@ -9,7 +9,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constexpr int kScanBlockSize = 256;
+constant int kScanBlockSize = 256;
 
 kernel void compact_flag_blocks(
     device const float* flags [[buffer(0)]],
