@@ -167,14 +167,24 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None,
     saved_workspace = {k: v.clone() for k, v in cc._workspace.items()}
     saved_last = getattr(sim, "_last_coupled", None)
     saved_last_generation = getattr(sim, "_last_coupled_generation", None)
-    _ten_J, _ten_L = sim._spatial_for_coupled(qv, dynamics["poses"]) if hasattr(sim, "_spatial_for_coupled") else (None, None)
     eq_act = getattr(state, "_eq_active", None)
-    cc.run_device(
-        dynamics["poses"], M, -bias, qp, qv,
-        eq_active=eq_act, cvel=dynamics.get("cvel", None),
-        tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
-        flex=getattr(sim, "_flex", None),
-    )
+    try:
+      _ten_J, _ten_L = sim._spatial_for_coupled(qv, dynamics["poses"]) if hasattr(sim, "_spatial_for_coupled") else (None, None)
+      constraint_result = cc.run_device(
+          dynamics["poses"], M, -bias, qp, qv,
+          eq_active=eq_act, cvel=dynamics.get("cvel", None),
+          tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
+          flex=getattr(sim, "_flex", None),
+      )
+    except Exception:
+      for key, saved in saved_workspace.items():
+        cc._workspace[key].copy_(saved)
+      sim._last_coupled = saved_last
+      sim._last_coupled_generation = saved_last_generation
+      if hasattr(sim, "_spatial_kin"):
+        sim._spatial_kin = saved_spatial_kin
+        sim._spatial_cache_key = saved_spatial_key
+      raise
     w = cc._workspace
     b = sim.batch_size
     nr = cc.descriptor.nr
@@ -196,6 +206,57 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None,
       if n_eq:
         bounded[:, :n_eq] = raw_force[:, :n_eq]
       force = torch.where(R > 0, bounded, torch.zeros_like(raw_force))
+      # Elliptic contacts use MuJoCo's group cone cost (mj_constraintUpdate),
+      # whose tangential gradient couples every row in a contact. Applying
+      # independent scalar bounds here is correct for pyramidal friction but
+      # gives a different force for the elliptic middle-cone region.
+      desc = cc.descriptor
+      if (int(desc.cone_type) == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
+          and int(desc.ncontacts_max) > 0):
+        packed = np.asarray(desc.contact_condim_packed, dtype=np.int32).reshape(-1, 3)
+        friction = cc._constants["contact_friction"].reshape(-1, 5)
+        contact_mask = constraint_result.get("contact_mask")
+        contact_base = int(desc.nr_joint)
+        for slot, (condim, offset, cone) in enumerate(packed.tolist()):
+          if cone != int(mujoco.mjtCone.mjCONE_ELLIPTIC) or condim <= 1:
+            continue
+          row0 = contact_base + int(offset)
+          if row0 + condim > nr:
+            raise RuntimeError("elliptic contact rows exceed the native row layout")
+          # `mj_makeImpedance` scales the regularized elliptic-cone slope
+          # by sqrt(R_tangent / R_normal), so it depends on the assembled
+          # soft-contact rows (and opt.impratio), not just material friction.
+          mu = friction[slot, 0] * torch.sqrt(
+              torch.clamp(R[:, row0 + 1], min=0.0) /
+              torch.clamp(R[:, row0], min=1e-12))
+          coeff = friction[slot, :condim - 1]
+          rows = slice(row0, row0 + condim)
+          local_jar = jar[:, rows]
+          U = torch.cat((local_jar[:, :1] * mu[:, None],
+                         local_jar[:, 1:] * coeff.reshape(1, -1)), dim=1)
+          N = U[:, 0]
+          T = torch.linalg.vector_norm(U[:, 1:], dim=1)
+          top = (N >= mu * T) | ((T <= 0) & (N >= 0))
+          bottom = (mu * N + T <= 0) | ((T <= 0) & (N < 0))
+          Dm = (1.0 / torch.clamp(R[:, row0], min=1e-12)) / torch.clamp(
+              mu * mu * (1.0 + mu * mu), min=1e-24)
+          middle_scale = -Dm * (N - mu * T) * mu
+          cone_force = torch.empty_like(local_jar)
+          cone_force[:, 0] = middle_scale
+          Tsafe = torch.clamp(T, min=1e-20)
+          for axis in range(1, condim):
+            cone_force[:, axis] = (
+                -middle_scale / Tsafe * U[:, axis] * coeff[axis - 1])
+          quadratic_force = raw_force[:, rows]
+          cone_force = torch.where(top[:, None], torch.zeros_like(cone_force),
+                                   torch.where(bottom[:, None], quadratic_force,
+                                               cone_force))
+          if contact_mask is not None:
+            active = contact_mask[:, slot] > 0.5
+            active &= R[:, row0] > 0
+            cone_force = torch.where(active[:, None], cone_force,
+                                     torch.zeros_like(cone_force))
+          force[:, rows] = cone_force
       qfrc_constraint = torch.bmm(J.transpose(1, 2), force.unsqueeze(-1)).squeeze(-1)
       qfrc_inv = qfrc_inv - qfrc_constraint
     for key, saved in saved_workspace.items():
@@ -226,9 +287,10 @@ def _stage_tensor(sim, value, shape, name):
       raise ValueError(f"{name} tensor must be on {sim.state._device}")
     if value.dtype not in (torch.float32, torch.float64):
       raise TypeError(f"{name} tensor must be floating point")
-    out = value.to(dtype=torch.float32)
+    out = value.to(dtype=torch.float32).contiguous()
     if tuple(out.shape) != tuple(shape) or not bool(torch.isfinite(out).all()):
       raise ValueError(f"{name} must be finite with shape {tuple(shape)}")
+    _validate_stage_quaternions(sim, out, name)
     return out
   arr = np.asarray(value)
   if arr.dtype.kind not in "fiu" or arr.shape != tuple(shape):
@@ -237,7 +299,29 @@ def _stage_tensor(sim, value, shape, name):
     arr = np.asarray(arr, dtype=np.float32)
   if not np.all(np.isfinite(arr)):
     raise ValueError(f"{name} must be finite and float32-representable")
-  return torch.as_tensor(arr, dtype=torch.float32, device=sim.state._device)
+  out = torch.as_tensor(arr, dtype=torch.float32, device=sim.state._device)
+  _validate_stage_quaternions(sim, out, name)
+  return out
+
+
+def _validate_stage_quaternions(sim, value, name):
+  model = sim._mjmodel
+  if name == "qpos":
+    q = value.reshape(sim.batch_size, int(model.nq))
+    for jid in range(int(model.njnt)):
+      jt, adr = int(model.jnt_type[jid]), int(model.jnt_qposadr[jid])
+      if jt == int(mujoco.mjtJoint.mjJNT_FREE):
+        quat = q[:, adr + 3:adr + 7]
+      elif jt == int(mujoco.mjtJoint.mjJNT_BALL):
+        quat = q[:, adr:adr + 4]
+      else:
+        continue
+      if not bool((torch.abs(torch.linalg.vector_norm(quat, dim=-1) - 1) <= 1e-5).all()):
+        raise ValueError("qpos contains a non-unit joint quaternion")
+  elif name == "mocap_quat" and value.numel():
+    quat = value.reshape(sim.batch_size, -1, 4)
+    if not bool((torch.abs(torch.linalg.vector_norm(quat, dim=-1) - 1) <= 1e-5).all()):
+      raise ValueError("mocap_quat values must be unit quaternions")
 
 
 def _stage_dynamics(sim, dynamics):

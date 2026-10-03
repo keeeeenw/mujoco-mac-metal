@@ -7,7 +7,6 @@ import os
 import mujoco
 import numpy as np
 import pytest
-import torch
 
 from mujoco_metal import MetalSimulation
 from mujoco_metal.native_api import (
@@ -100,3 +99,78 @@ def test_inverse_includes_armature_mass_and_preserves_solver_cache():
   result = _host(mj_inverse(sim, qacc=np.ones((1, model.nv), dtype=np.float32)))[0]
   np.testing.assert_allclose(result, data.qfrc_inverse, atol=1e-4, rtol=1e-4)
   assert sim._assembled_system_valid == cache_valid
+
+
+@pytest.mark.parametrize("cone,condim", [
+    ("elliptic", 3), ("elliptic", 4), ("elliptic", 6),
+    ("pyramidal", 3), ("pyramidal", 4), ("pyramidal", 6),
+])
+def test_inverse_contact_friction_cone_matches_pinned_force_gradient(cone, condim):
+  model = mujoco.MjModel.from_xml_string(f"""<mujoco>
+    <option gravity="0 0 -9.81" cone="{cone}" solver="PGS" iterations="100" impratio="2"/>
+    <worldbody><geom name="floor" type="plane" size="2 2 .1"/>
+      <body pos="0 0 .09"><freejoint/>
+        <geom name="ball" type="sphere" size=".1" mass="1"/>
+      </body>
+    </worldbody><contact><pair geom1="floor" geom2="ball"
+      friction="1 .7 .2 .15 .1" condim="{condim}"/></contact></mujoco>""")
+  data = mujoco.MjData(model)
+  data.qvel[:] = [.3, -.2, 0., .1, -.2, .5]
+  data.qacc[:] = [.2, -.1, -1., .1, .2, -.3]
+  mujoco.mj_inverse(model, data)
+  sim = MetalSimulation(model, qpos=data.qpos[None].astype(np.float32),
+                        qvel=data.qvel[None].astype(np.float32),
+                        profile="integrated_euler_v1")
+  result = _host(mj_inverse(sim, qacc=data.qacc[None].astype(np.float32)))[0]
+  np.testing.assert_allclose(result, data.qfrc_inverse, atol=3e-2, rtol=3e-4)
+
+
+@pytest.mark.parametrize("qpos,qvel,qacc", [
+    (-.49, .1, 1.), (-.49, -.1, -1.), (.49, -.1, -1.), (.49, .1, 1.)
+])
+def test_inverse_dry_friction_and_limit_rows_keep_both_signs(qpos, qvel, qacc):
+  model = mujoco.MjModel.from_xml_string("""<mujoco>
+    <option gravity="0 0 0" solver="PGS" iterations="100"/>
+    <worldbody><body><joint name="j" type="slide" axis="1 0 0"
+      range="-.5 .5" limited="true" frictionloss=".4"/>
+      <geom type="sphere" size=".1" mass="1" contype="0" conaffinity="0"/>
+    </body></worldbody></mujoco>""")
+  data = mujoco.MjData(model)
+  data.qpos[:] = [qpos]
+  data.qvel[:] = [qvel]
+  data.qacc[:] = [qacc]
+  mujoco.mj_inverse(model, data)
+  sim = MetalSimulation(model, qpos=data.qpos[None].astype(np.float32),
+                        qvel=data.qvel[None].astype(np.float32),
+                        profile="integrated_euler_v1")
+  result = _host(mj_inverse(sim, qacc=data.qacc[None].astype(np.float32)))[0]
+  np.testing.assert_allclose(result, data.qfrc_inverse, atol=2e-3, rtol=2e-3)
+
+
+def test_inverse_uses_supplied_mocap_pose_without_mutating_owned_state():
+  model = mujoco.MjModel.from_xml_string("""<mujoco>
+    <option gravity="0 0 -9.81"/>
+    <worldbody><body name="platform" mocap="true">
+      <body pos=".5 0 0"><joint name="j" type="hinge" axis="0 1 0"/>
+        <geom type="capsule" fromto="0 0 0 1 0 0" size=".08" mass="1"/>
+      </body>
+    </body></worldbody></mujoco>""")
+  data = mujoco.MjData(model)
+  data.qpos[:] = [.4]
+  data.qvel[:] = [.2]
+  data.qacc[:] = [.7]
+  data.mocap_pos[:] = [[.2, -.1, .3]]
+  data.mocap_quat[:] = [[1., 0., 0., 0.]]
+  mujoco.mj_inverse(model, data)
+  sim = MetalSimulation(model, profile="integrated_euler_v1")
+  before_qpos = _host(sim.state.qpos)
+  before_mocap = _host(sim.state.mocap_pos)
+  result = _host(mj_inverse(
+      sim, qpos=data.qpos[None].astype(np.float32),
+      qvel=data.qvel[None].astype(np.float32),
+      qacc=data.qacc[None].astype(np.float32),
+      mocap_pos=data.mocap_pos[None].astype(np.float32),
+      mocap_quat=data.mocap_quat[None].astype(np.float32)))[0]
+  np.testing.assert_allclose(result, data.qfrc_inverse, atol=2e-4, rtol=2e-4)
+  np.testing.assert_array_equal(_host(sim.state.qpos), before_qpos)
+  np.testing.assert_array_equal(_host(sim.state.mocap_pos), before_mocap)
