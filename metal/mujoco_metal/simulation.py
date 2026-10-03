@@ -633,6 +633,15 @@ class MetalSimulation:
     from mujoco_metal.history import DeviceHistory
     self._history_program = DeviceHistory(model, batch_size, self._state._device)
     self._raw_sensordata = None
+    self._raw_sensor_program = self._sensors
+    if (self._sensors is not None and not self._history_program.sensor_enabled
+        and bool(np.any(np.asarray(model.sensor_delay) > 0))):
+      # Pinned mj_advance computes delayed raw samples even when the normal
+      # forward sensor stage is disabled. Pure built-ins can share physics.
+      reference = copy.copy(model)
+      reference.opt.disableflags &= ~int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
+      from mujoco_metal.sensors import SensorProgram
+      self._raw_sensor_program = SensorProgram(reference, batch_size)
     self._delay = None  # Legacy snapshot key; no duplicate ring is maintained.
 
     from mujoco_metal.islands import IslandManager
@@ -1431,8 +1440,9 @@ class MetalSimulation:
     )
     torch = state._torch
     b = state.batch_size
-    base = torch.zeros((b, self._mjmodel.nsensordata), dtype=torch.float32,
-                       device=state._device)
+    base = (self._sensordata.clone() if self._sensordata is not None else
+            torch.zeros((b, self._mjmodel.nsensordata), dtype=torch.float32,
+                        device=state._device))
     out = self._sensors.run_device(
         state._qpos, state._qvel, state._time, poses, sensordata=base)
     out = self._run_state_sensors(state._qpos, state._qvel, poses, dynamics,
@@ -1481,8 +1491,9 @@ class MetalSimulation:
         self._assembled_system_valid = asm_valid
     elif self._has_ray_sensors or self._has_geomdist_sensors:
       out = self._run_spatial_into(poses, out)
-    return self._history_program.samples(
-        out, state._history, state._time, kind=1).clone()
+    return (self._history_program.samples(
+        out, state._history, state._time, kind=1) if
+        self._history_program.sensor_enabled else out).clone()
 
   def _state_sensor_inputs(self, qpos, qvel, poses, dynamics):
     """Borrowed (ten_spa_len, ten_spa_vel, act_dyn_len, act_dyn_vel, kind).
@@ -1513,12 +1524,13 @@ class MetalSimulation:
       act_v = kin["velocity"].reshape(self._state.batch_size, -1)
     return ten_l, ten_v, act_l, act_v, kind
 
-  def _run_state_sensors(self, qpos, qvel, poses, dynamics, out):
+  def _run_state_sensors(self, qpos, qvel, poses, dynamics, out, *, program=None):
     """Evaluate milestone-016 state families into ``out`` (borrowed)."""
+    program = self._sensors if program is None else program
     ten_l, ten_v, act_l, act_v, kind = self._state_sensor_inputs(
         qpos, qvel, poses, dynamics)
     mm = dynamics.get("mass_matrix", None)
-    return self._sensors.run_state_device(
+    return program.run_state_device(
         qpos, qvel, poses, mass_matrix=mm,
         ten_spa_len=ten_l, ten_spa_vel=ten_v,
         act_dyn_len=act_l, act_dyn_vel=act_v, act_kind=kind, out=out)
@@ -1901,24 +1913,26 @@ class MetalSimulation:
         "npairs": int(d.npairs),
     }
 
-  def _run_spatial_into(self, poses, out):
+  def _run_spatial_into(self, poses, out, *, program=None):
     """Evaluate CONTACT/ray/geomdist families into ``out`` (borrowed)."""
+    program = self._sensors if program is None else program
     # Rays/geomdist use the sensor hull store (all scene meshes/hfields,
     # including contype-0 geoms that never appear in contact pairs).
-    hull = self._sensors._sp_hull.reshape(-1)
-    hinfo = self._sensors._sp_hull_info.reshape(-1)
+    hull = program._sp_hull.reshape(-1)
+    hinfo = program._sp_hull_info.reshape(-1)
     if self._has_contact_sensors:
-      out = self._sensors.run_contact_device(
+      out = program.run_contact_device(
           poses, self._contact_views(), out=out)
     if self._has_ray_sensors or self._has_geomdist_sensors:
       if self._has_ray_sensors:
-        out = self._sensors.run_rays_device(poses, hull, hinfo, out=out)
+        out = program.run_rays_device(poses, hull, hinfo, out=out)
       if self._has_geomdist_sensors:
-        out = self._sensors.run_geomdist_device(poses, hull, hinfo, out=out)
+        out = program.run_geomdist_device(poses, hull, hinfo, out=out)
     return out
 
-  def _run_acc_into(self, qpos, qvel, qacc, poses, dynamics, out):
+  def _run_acc_into(self, qpos, qvel, qacc, poses, dynamics, out, *, program=None):
     """Evaluate ACC force families into ``out`` (borrowed, merged)."""
+    program = self._sensors if program is None else program
     cc = getattr(self, "_coupled_constraints", None)
     lam = None
     lam_nr = lam_s = 0
@@ -1931,7 +1945,7 @@ class MetalSimulation:
       eqr = cc._constants["eq_rowadr"].reshape(-1)
     jm, tm = self._limit_row_maps()
     contact = self._contact_views()
-    return self._sensors.run_acc_device(
+    return program.run_acc_device(
         qpos, qvel, qacc, poses, xfrc=self._body_wrench, contact=contact,
         eq_rowadr=eqr, jnt_map=jm, ten_map=tm, slot_pair=self._sen_slot_pair,
         lam_raw=lam, lam_nr=lam_nr, lam_stride=lam_s,
@@ -2407,19 +2421,21 @@ class MetalSimulation:
       self._sensordata = torch.zeros(
           (self._state.batch_size, self._mjmodel.nsensordata),
           dtype=torch.float32, device=self._state._device)
+    previous = self._sensordata.clone()
+    program = self._raw_sensor_program
     poses = dict(dynamics["poses"], cvel=dynamics["cvel"],
                  root_com=dynamics["root_com"])
     stages = [_mj.mjtStage.mjSTAGE_POS, _mj.mjtStage.mjSTAGE_VEL]
-    old = self._sensors.run_device(
+    old = program.run_device(
         qpos, qvel, self._state._time, poses, stages=tuple(stages),
-        sensordata=self._sensordata)
-    merged = self._run_state_sensors(qpos, qvel, poses, dynamics, out=old)
+        sensordata=previous.clone())
+    merged = self._run_state_sensors(qpos, qvel, poses, dynamics, out=old, program=program)
     if self._has_acc_sensors and qacc is not None:
       # _acceleration just ran at this exact state; its cached actuator
       # rows plus the solved constraint rows feed the ACC kernel.
-      merged = self._run_acc_into(qpos, qvel, qacc, poses, dynamics, merged)
+      merged = self._run_acc_into(qpos, qvel, qacc, poses, dynamics, merged, program=program)
     if self._has_contact_sensors or self._has_ray_sensors or self._has_geomdist_sensors:
-      merged = self._run_spatial_into(poses, merged)
+      merged = self._run_spatial_into(poses, merged, program=program)
     if getattr(self, "_has_user_plugin_sensors", False):
       import mujoco as _mj
       sensor_plugins = [p for p in self._native_plugins
@@ -2455,7 +2471,7 @@ class MetalSimulation:
     self._raw_sensordata = merged.contiguous().clone()
     sampled = self._history_program.samples(
         merged, self._state._history, self._state._time, kind=1)
-    self._sensordata.copy_(sampled)
+    self._sensordata.copy_(sampled if self._history_program.sensor_enabled else previous)
 
   def _advance_activations(self, state):
     """Advance activation state with pinned mj_nextActivation semantics.

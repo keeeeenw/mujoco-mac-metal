@@ -66,10 +66,15 @@ class DeviceHistory:
     import torch
     self._torch = torch
     self.batch_size, self.nhistory = int(batch_size), int(model.nhistory)
+    if self.batch_size <= 0:
+      raise ValueError("history batch size must be positive")
     self.nu, self.nsensordata = int(model.nu), int(model.nsensordata)
     self.device = torch.device(device)
     info, params, self.reset_template = lower_history(model)
     self.entries = info
+    self._kinds = frozenset(info[:, 0].tolist())
+    self.sensor_enabled = not bool(int(model.opt.disableflags)
+                                   & int(mujoco.mjtDisableBit.mjDSBL_SENSOR))
     self._meta = torch.as_tensor(info.reshape(-1), device=self.device)
     self._parameters = torch.as_tensor(params.reshape(-1), device=self.device)
     self._dims = torch.tensor([self.batch_size, len(info), self.nhistory,
@@ -96,11 +101,12 @@ class DeviceHistory:
     torch = self._torch
     self._validate(history, time)
     size = self.nu if kind == 0 else self.nsensordata
-    if kind not in (0, 1) or (raw.device != self.device or raw.dtype != torch.float32
+    if kind not in (0, 1) or (not isinstance(raw, torch.Tensor)
+                             or raw.device != self.device or raw.dtype != torch.float32
                              or tuple(raw.shape) != (self.batch_size, size)):
       raise ValueError("history samples require float32 device raw data of matching kind")
     result = raw.contiguous().clone()
-    if self.entries.size:
+    if kind in self._kinds:
       flags = torch.tensor([kind, int(force_read)], dtype=torch.int32, device=self.device)
       self._library.history_samples(
           history.reshape(-1), time, result.reshape(-1), self._meta,
@@ -114,10 +120,13 @@ class DeviceHistory:
     self._validate(history, time)
     for values, shape in ((controls, (self.batch_size, self.nu)),
                           (sensors, (self.batch_size, self.nsensordata))):
-      if (values.device != self.device or values.dtype != torch.float32
+      if (not isinstance(values, torch.Tensor)
+          or values.device != self.device or values.dtype != torch.float32
           or tuple(values.shape) != shape or not values.is_contiguous()):
         raise ValueError("history recording requires contiguous raw device samples")
-    if success.device != self.device or tuple(success.shape) != (self.batch_size,):
+    if (not isinstance(success, torch.Tensor) or success.device != self.device
+        or success.dtype != torch.bool or not success.is_contiguous()
+        or tuple(success.shape) != (self.batch_size,)):
       raise ValueError("history recording requires a per-world device success mask")
     if self.entries.size:
       # Empty arrays cannot be passed as MPS shader buffers. No entry of that
@@ -128,3 +137,23 @@ class DeviceHistory:
           sensors.reshape(-1) if self.nsensordata else dummy,
           success.to(dtype=torch.int32), self._meta, self._parameters, self._dims,
           threads=(self.batch_size*len(self.entries),), group_size=(1,))
+
+  def sensor_compute_mask(self, history, time):
+    """Device mask for pure raw evaluation and stateful sensor tick updates.
+
+    Delayed raw samples are computed by mj_advance even if the forward sensor
+    stage is disabled. Interval-only disabled sensors copy stored samples.
+    """
+    torch = self._torch
+    self._validate(history, time)
+    mask = torch.full((self.batch_size, self.nsensordata),
+                      int(self.sensor_enabled), dtype=torch.int32,
+                      device=self.device)
+    if 1 in self._kinds:
+      enabled = torch.tensor([int(self.sensor_enabled)], dtype=torch.int32,
+                             device=self.device)
+      self._library.history_sensor_compute_mask(
+          history.reshape(-1), time, mask.reshape(-1), self._meta,
+          self._parameters, self._dims, enabled,
+          threads=(self.batch_size*len(self.entries),), group_size=(1,))
+    return mask.to(torch.bool)

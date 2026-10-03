@@ -141,3 +141,20 @@ kernel void history_record(
   device const float* raw=kind==0?controls+w*dims[3]+out:sensors+w*dims[4]+out;
   for(int c=0;c<dim;c++)buf[2+n+p*dim+c]=raw[c];
 }
+
+// Raw evaluations needed by the forward sensor and/or history-advance stage.
+// Built-in raw evaluation is pure; stateful sensor extensions use this mask.
+kernel void history_sensor_compute_mask(
+    device const float* history [[buffer(0)]], device const float* time [[buffer(1)]],
+    device int* mask [[buffer(2)]], device const int* meta [[buffer(3)]],
+    device const float* parameters [[buffer(4)]], device const int* dims [[buffer(5)]],
+    device const int* enabled [[buffer(6)]], uint tid [[thread_position_in_grid]]) {
+  int ne=dims[1];if(!ne||tid>=uint(dims[0]*ne))return;
+  int w=int(tid)/ne,e=int(tid)%ne;
+  if(meta[6*e]!=1)return;
+  int adr=meta[6*e+1],dim=meta[6*e+3],out=meta[6*e+5];
+  float delay=parameters[6*e],period=parameters[6*e+1];
+  bool tick=period<=0||history_tick_due(history[w*dims[2]+adr],time[w],parameters+6*e);
+  bool compute=tick&&(enabled[0]||delay>0);
+  for(int c=0;c<dim;c++)mask[w*dims[4]+out+c]=int(compute);
+}

@@ -160,3 +160,81 @@ def test_pinned_noise_metadata_does_not_add_stochastic_sensor_samples():
   for _ in range(5):
     mujoco.mj_forward(model, data)
     np.testing.assert_array_equal(data.sensordata, expected)
+
+@pytest.mark.gpu
+@gpu
+def test_history_public_validation_is_atomic_and_empty_kinds_are_safe():
+  import torch
+  from mujoco_metal.history import DeviceHistory
+  model = _model()
+  program = DeviceHistory(model)
+  history = torch.as_tensor(program.reset_template[None].copy(), device="mps")
+  before = history.clone()
+  time = torch.zeros(1, device="mps")
+  raw = torch.ones((1, 1), device="mps")
+  for success in [torch.ones(1, device="mps"), torch.ones(2, dtype=torch.bool, device="mps")]:
+    with pytest.raises(ValueError, match="success mask"):
+      program.record(raw, raw, history, time, success)
+    torch.testing.assert_close(history, before, rtol=0, atol=0)
+  with pytest.raises(ValueError, match="raw data"):
+    program.samples(np.ones((1, 1)), history, time, kind=0)
+  with pytest.raises(ValueError, match="batch size"):
+    DeviceHistory(model, batch_size=0)
+  spec = mujoco.MjSpec.from_string('''<mujoco><worldbody><body><joint name="j"/>
+    <geom type="sphere" size=".1"/></body></worldbody>
+    <actuator><motor name="m" joint="j"/></actuator></mujoco>''')
+  motor = spec.actuator("m")
+  motor.nsample, motor.delay = 4, .002
+  model = spec.compile()
+  program = DeviceHistory(model)
+  history = torch.as_tensor(program.reset_template[None].copy(), device="mps")
+  empty = torch.zeros((1, 0), device="mps")
+  torch.testing.assert_close(program.samples(empty, history, time, kind=1), empty)
+
+@pytest.mark.gpu
+@gpu
+@pytest.mark.parametrize("disabled,delay", [(False, .003), (True, .003), (True, 0)])
+def test_sensor_raw_compute_mask_follows_interval_and_disabled_stage(disabled, delay):
+  import torch
+  from mujoco_metal.history import DeviceHistory
+  model = _model(delay=delay, interval=.006, phase=-.002)
+  if disabled:
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
+  program = DeviceHistory(model, batch_size=2)
+  history = torch.as_tensor(np.tile(program.reset_template, (2, 1)), device="mps")
+  actual = program.sensor_compute_mask(history, torch.tensor([0, .0041], device="mps"))
+  assert actual.cpu().numpy().tolist() == [[False], [not disabled or delay>0]]
+
+
+def test_pinned_delayed_raw_sample_is_recorded_even_when_sensor_stage_disabled():
+  model = _model(delay=.003)
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
+  data = mujoco.MjData(model)
+  data.qpos[0] = .2
+  mujoco.mj_step(model, data)
+  np.testing.assert_array_equal(data.sensordata, 0)
+  adr = int(model.sensor_historyadr[0])
+  cursor = int(data.history[adr+1])
+  assert data.history[adr+2+8+cursor] == pytest.approx(.2)
+
+@pytest.mark.gpu
+@gpu
+@pytest.mark.parametrize("delay,interval", [(0, .006), (.003, 0), (.003, .006)])
+def test_disabled_sensor_stage_retains_sample_but_records_pinned_delayed_raw(delay, interval):
+  from mujoco_metal import MetalSimulation
+  model = _model(delay=delay, interval=interval, phase=-.002 if interval else 0)
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
+  data = mujoco.MjData(model)
+  data.qpos[0], data.qvel[0] = .2, .1
+  sim = MetalSimulation(model, qpos=data.qpos[None].astype(np.float32),
+                        qvel=data.qvel[None].astype(np.float32), profile="integrated_euler_v1")
+  for _ in range(9):
+    data.time = float(sim.state._time.cpu().numpy()[0])
+    mujoco.mj_step(model, data)
+    sim.step()
+    np.testing.assert_array_equal(sim.step_sensordata()[0], data.sensordata)
+    np.testing.assert_allclose(sim.state._history.cpu().numpy()[0], data.history,
+                               atol=5e-6, rtol=5e-6)
+    before = sim.state._history.cpu().numpy().copy()
+    np.testing.assert_array_equal(sim.sensor_values()[0], data.sensordata)
+    np.testing.assert_array_equal(sim.state._history.cpu().numpy(), before)
