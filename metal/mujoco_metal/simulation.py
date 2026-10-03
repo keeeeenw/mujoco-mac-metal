@@ -431,6 +431,10 @@ class MetalSimulation:
     )
 
     torch = self._state._torch
+    from mujoco_metal.stepping import _euler_damping_dofs
+    self._euler_damping_dofs = torch.as_tensor(
+        _euler_damping_dofs(model).copy(), dtype=torch.bool,
+        device=self._state._device)
     self._rhs = torch.empty(
         (batch_size, descriptor.nv),
         dtype=torch.float32,
@@ -2297,9 +2301,22 @@ class MetalSimulation:
             if self._passive is not None
             else self._implicit_damping
         )
-        integration_acceleration, euler_status = self._euler_solver.run_device(
+        euler_acceleration, euler_status = self._euler_solver.run_device(
             self._effective_mass, self._rhs
         )
+        # mj_EulerSkip checks only awake DOFs. A world whose damping lives
+        # exclusively in sleeping trees must retain the forward iterate,
+        # including at a finite/zero constraint-solver iteration budget.
+        scheduler = getattr(self, "_sleep_schedule", None)
+        if scheduler is not None:
+          awake = scheduler.tree_awake.index_select(
+              1, self._sleep_dof_treeid) != 0
+          enabled = (awake & self._euler_damping_dofs).any(dim=1)
+          integration_acceleration = torch.where(
+              enabled[:, None], euler_acceleration, integration_acceleration)
+          euler_status = torch.where(enabled, euler_status, 0)
+        else:
+          integration_acceleration = euler_acceleration
         torch.where(
             (solve_status == 0),
             euler_status,

@@ -145,6 +145,23 @@ _REJECTED = (
 )
 
 
+def _euler_damping_dofs(model):
+  """Compiled DOF eligibility from pinned ``mj_EulerSkip``.
+
+  Tendon/flex damping and a constraint force alone must not trigger a second
+  acceleration solve: without eligible joint damping Euler advances the
+  finite-budget forward acceleration, which need not equal M^-1 times force.
+  Runtime sleep filtering further restricts this mask to awake DOFs.
+  """
+  disabled = int(model.opt.disableflags)
+  if disabled & (int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
+                 | int(mujoco.mjtDisableBit.mjDSBL_DAMPER)):
+    return np.zeros(int(model.nv), dtype=bool)
+  return ((np.asarray(model.dof_damping) > 0)
+          | np.any(np.asarray(model.dof_dampingpoly) != 0, axis=1)
+          | (np.asarray(model.jnt_actuatorid)[model.dof_jntid] != -1))
+
+
 def _build_integrated_execution_plan(
     model, timestep, implicit_euler_damping, passive_damping_enabled, coupled_desc
 ) -> ExecutionPlan:
@@ -162,7 +179,8 @@ def _build_integrated_execution_plan(
       (coupled_desc.nc > 0 or coupled_desc.nr_joint > 0)
       and not (dis & int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT))
   )
-  euler_damping_enabled = bool(implicit_euler_damping)
+  euler_damping_enabled = bool(implicit_euler_damping
+                              and np.any(_euler_damping_dofs(model)))
 
   smooth_assembly_deps = ["smooth_dynamics"]
   smooth_assembly_inputs = ["qfrc_bias", "qfrc_applied", "mass_matrix"]
@@ -452,7 +470,7 @@ def validate_stepping_profile(
     if coupled_desc.nc > 0 or coupled_desc.nr_joint > 0:
       supported_list.append("coupled constraint solve for contacts (plane, sphere, capsule, box, cylinder, ellipsoid, convex mesh, heightfield, SDF), joint limits, dry friction, and joint/connect/weld equalities")
 
-    implicit_euler_damping = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP))
+    implicit_euler_damping = bool(np.any(_euler_damping_dofs(model)))
     passive_damping_enabled = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
 
     execution_plan = _build_integrated_execution_plan(
@@ -1063,9 +1081,6 @@ def validate_stepping_profile(
           )
           and not disable & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
           and not disable & int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
-          and bool(
-              np.any(damping32 > 0)
-              or (advanced_passive and np.any(model.dof_dampingpoly))
-          )
+          and bool(np.any(_euler_damping_dofs(model)))
       ),
   )
