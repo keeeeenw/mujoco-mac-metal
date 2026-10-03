@@ -1173,6 +1173,7 @@ class MetalCoupledConstraints:
 
   def __init__(self, model, batch_size=1):
     self.descriptor = lower_coupled_constraints(model)
+    self._mjmodel_ref = model
     self.solver_settings = self.descriptor.solver_settings
     self.batch_size = int(batch_size)
     if self.batch_size <= 0:
@@ -1338,6 +1339,14 @@ class MetalCoupledConstraints:
     b = int(batch_size)
     if b <= 0:
       raise ValueError("batch_size must be positive")
+    # R08a allocation gate: enforce the real batch and the exact owned
+    # workspace BEFORE partial allocation (lowering-time checks used
+    # batch=1 and an approximate memory model).
+    from mujoco_metal.capacity import check_capacity as _check_capacity
+    from mujoco_metal.capacity import estimate_capacity as _estimate_capacity
+    _check_capacity(_estimate_capacity(
+        self._mjmodel_ref, b, d.npairs, d.ncontacts_max, d.nr,
+        neq=d.neq, nr_joint=d.nr_joint))
     self.batch_size = b
     nv, nc, nr = d.nv, d.ncontacts_max, d.nr
 

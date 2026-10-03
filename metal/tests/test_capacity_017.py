@@ -43,7 +43,9 @@ def test_estimate_is_deterministic_and_counts_memory():
   assert est1.memory_bytes == sum(v for _, v in est1.memory_breakdown)
   assert est1.memory_bytes > 0
   names = [k for k, _ in est1.memory_breakdown]
-  assert "delassus_W" in names and "warmstart" in names
+  # R08a: parts mirror prepare_workspace buffer-for-buffer.
+  assert "workspace_debug" in names and "contact_row_data" in names
+  assert "workspace_J" in names and "out_contact_force" in names
 
 
 def test_default_limits_preserve_historical_ceilings():

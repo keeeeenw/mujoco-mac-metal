@@ -75,12 +75,46 @@ def _bytes(n):
   return int(n) * 4
 
 
-def estimate_capacity(model, batch_size, npairs, nslots, nr) -> CapacityEstimate:
+def _bytes_i32(n):
+  return int(n) * 4
+
+
+def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch):
+  """Mirror ``MetalCoupledConstraints.prepare_workspace`` exactly (R08a).
+
+  Returns ``(parts, total)`` with one entry per allocated device buffer so
+  the estimate and the allocation cannot drift: any buffer added to
+  ``prepare_workspace`` must appear here. Counts use ``max(..., 1)`` empty
+  guards exactly like the allocator.
+  """
+  b, v = int(batch), int(max(nv, 1))
+  nc = int(nslots)
+  parts = (
+      ("contact_row_data", _bytes(b * nc * 6 * 6)),
+      ("contact_frame", _bytes(b * nc * 12)),
+      ("contact_jacobian", _bytes(b * nc * 6 * v)),
+      ("pair_mask", _bytes(b * max(int(npairs), 1))),
+      ("workspace_J", _bytes(b * int(nr) * v)),
+      ("workspace_debug", _bytes(b * (int(nr) * int(nr) + 7 * int(nr)))),
+      ("out_force", _bytes(b * v)),
+      ("out_acc", _bytes(b * v)),
+      ("out_status", _bytes_i32(b)),
+      ("out_diagnostics", _bytes(b * 10)),
+      ("out_contact_force", _bytes(b * nc * 11)),
+      ("out_joint_force", _bytes(b * max(int(nr_joint), 1))),
+      ("eq_active", _bytes_i32(b * max(int(neq), 1))),
+  )
+  return parts, sum(value for _, value in parts)
+
+
+def estimate_capacity(model, batch_size, npairs, nslots, nr, *, neq=0, nr_joint=0) -> CapacityEstimate:
   """Build a deterministic estimate from lowering counts.
 
   `npairs`/`nslots`/`nr` come from the coupled lowering (candidate counts,
-  before broadphase pruning); memory covers the dense Delassus, Jacobian,
-  contact frames/Jacobians/forces, and retained warmstarts. Deterministic:
+  before broadphase pruning); `neq`/`nr_joint` size the equality/joint
+  outputs. Memory mirrors ``prepare_workspace`` exactly (see
+  :func:`estimate_workspace`) at the REAL batch size: lowering-time calls
+  must pass the construction batch, never a hardcoded 1. Deterministic:
   pure function of the inputs, no device state.
   """
   if not isinstance(model, mujoco.MjModel):
@@ -91,17 +125,7 @@ def estimate_capacity(model, batch_size, npairs, nslots, nr) -> CapacityEstimate
   nv = int(model.nv)
   nbody, ngeom = int(model.nbody), int(model.ngeom)
   nr = int(nr)
-  parts = (
-      ("delassus_W", _bytes(batch * max(nr, 0) * max(nr, 0))),
-      ("delassus_vectors", _bytes(batch * 7 * max(nr, 0))),
-      ("jacobian_J", _bytes(batch * max(nr, 0) * max(nv, 1))),
-      ("contact_row_data", _bytes(batch * max(int(nslots), 0) * 36)),
-      ("contact_frame", _bytes(batch * max(int(nslots), 0) * 12)),
-      ("contact_jacobian", _bytes(batch * max(int(nslots), 0) * 6 * max(nv, 1))),
-      ("contact_force", _bytes(batch * max(int(nslots), 0) * 11)),
-      ("warmstart", _bytes(batch * max(nr, 0))),
-  )
-  total = sum(value for _, value in parts)
+  parts, total = estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch)
   return CapacityEstimate(
       nv=nv, nbody=nbody, ngeom=ngeom, npairs=int(npairs),
       nslots=int(nslots), nr=nr, batch=batch,
