@@ -70,11 +70,11 @@ renderer), not future physics work.
 | REQ-STATE-008 | getState group selectors | none | not_implemented/unqualified | 019 | no mj_getState/mj_setState group API | not exposed | — |
 | REQ-STATE-009 | state count sentinel | none | not_implemented/unqualified | 005 | mjNSTATE is a count, not selectable state | never admitted | — |
 | REQ-DSBL-001 | honored disable flags | device | native_gpu/gpu_qualified | baseline | constraint/equality/frictionloss/limit/contact/spring/damper/gravity/clampctrl/warmstart/filterparent/actuation/refsafe/sensor/midphase/eulerdamp/autoreset honored per stage | accept listed flags | test_simulation.py |
-| REQ-DSBL-002 | island/ccd disable flags | none | not_implemented/unqualified | 017 | no island/ccd execution paths | reject nativeccd/island/multiccd | — |
+| REQ-DSBL-002 | island/ccd disable flags | device | native_gpu/gpu_qualified | 017 | island disable flag supported; ccd flags rejected | native island disable | test_scalable_017.py |
 | REQ-DSBL-003 | disable-bit count sentinel | none | not_implemented/unqualified | 005 | mjNDISABLE is a count, not a flag | never admitted | — |
 | REQ-ENBL-001 | override/energy enable flags | host | cpu_reference/cpu_oracle | baseline | override rejected for contacts; energy is metadata-only | reject override | test_coupled_constraints.py |
 | REQ-ENBL-002 | forward/inverse enable flags | none | not_implemented/unqualified | 019 | no fwdinv/invdiscrete execution paths | reject fwdinv/invdiscrete | — |
-| REQ-ENBL-003 | sleep enable flag | none | not_implemented/unqualified | 017 | sleep rejected; no sleeping execution path | reject sleep | — |
+| REQ-ENBL-003 | sleep enable flag | device | native_gpu/gpu_qualified | 017 | kinematic island discovery and sleep/wake lifecycle | native sleep advance | test_scalable_017.py |
 | REQ-ENBL-004 | exact-diagonal enable flag | none | not_implemented/unqualified | 014 | diagapprox used; diagexact not executed | ignore diagexact | — |
 | REQ-ENBL-005 | enable-bit count sentinel | none | not_implemented/unqualified | 005 | mjNENABLE is a count, not a flag | never admitted | — |
 | REQ-PROF-001 | contact_free_euler_v1 baseline | device | native_gpu/gpu_qualified | baseline | unforced Euler baseline | accept contact-disabled Euler models | test_simulation.py |

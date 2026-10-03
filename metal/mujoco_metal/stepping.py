@@ -332,7 +332,7 @@ def _build_integrated_execution_plan(
 
 
 def validate_stepping_profile(
-    model, timestep=None, profile="contact_free_euler_v1"
+    model, timestep=None, profile="contact_free_euler_v1", limits=None
 ):
   """Validate a compiled ``MjModel`` without allocating device state.
 
@@ -340,7 +340,7 @@ def validate_stepping_profile(
   separate from ``load_model``: generalized mass and bias queries support a
   broader model set than this stepping profile.
   """
-  if profile == "integrated_euler_v1":
+  if profile in ("integrated_euler_v1", "integrated_scalable_v1"):
     if not isinstance(model, mujoco.MjModel):
       raise TypeError("model must be a compiled mujoco.MjModel")
     if mujoco.__version__ != TARGET_MUJOCO_VERSION:
@@ -363,16 +363,17 @@ def validate_stepping_profile(
 
     opt = model.opt
     if int(opt.integrator) != int(mujoco.mjtIntegrator.mjINT_EULER):
-      raise ValueError("integrated_euler_v1 requires the Euler integrator")
+      raise ValueError(f"{profile} requires the Euler integrator")
     if not math.isfinite(float(opt.timestep)) or opt.timestep <= 0:
       raise ValueError("compiled model timestep must be finite and positive")
 
-    if model.nv > 32:
-      raise ValueError(f"integrated_euler_v1 bounds nv to 32; found {model.nv}")
+    max_nv = 64 if profile == "integrated_scalable_v1" else 32
+    if model.nv > max_nv:
+      raise ValueError(f"{profile} bounds nv to {max_nv}; found {model.nv}")
 
     enable = int(opt.enableflags)
     sleep = int(mujoco.mjtEnableBit.mjENBL_SLEEP)
-    if enable & sleep:
+    if enable & sleep and profile != "integrated_scalable_v1":
       raise ValueError("sleep mode is unsupported by integrated_euler_v1")
     energy = int(mujoco.mjtEnableBit.mjENBL_ENERGY)
     unknown_enable = enable & ~(energy | sleep)
@@ -453,7 +454,11 @@ def validate_stepping_profile(
       supported_list.append("stateless current-state sensor queries")
 
     from mujoco_metal.coupled_constraints import lower_coupled_constraints
-    coupled_desc = lower_coupled_constraints(model)
+    lim = limits
+    if lim is None and profile == "integrated_scalable_v1":
+      from mujoco_metal.capacity import CapacityLimits
+      lim = CapacityLimits(max_nv=64, max_pairs=64, max_slots=64, max_rows=256)
+    coupled_desc = lower_coupled_constraints(model, limits=lim)
     if coupled_desc.nc > 0 or coupled_desc.nr_joint > 0:
       supported_list.append("coupled constraint solve for contacts (plane, sphere, capsule, box, cylinder, ellipsoid, convex mesh, heightfield, SDF), joint limits, dry friction, and joint/connect/weld equalities")
 
@@ -465,7 +470,7 @@ def validate_stepping_profile(
     )
 
     return SteppingProfile(
-        name="integrated_euler_v1",
+        name=profile,
         timestep=float(native_dt),
         model_fingerprint=_fingerprint(model),
         descriptor_fingerprint=_fingerprint(load_model(model)),

@@ -333,6 +333,7 @@ class CoupledConstraintDescriptor:
   ten_solimp_fri: np.ndarray = None
   ten_length_map: np.ndarray = None
   ten_moment_map: np.ndarray = None
+  dense_path: bool = True
 
 
 def _mix_contact_parameters(model, g1, g2):
@@ -391,14 +392,16 @@ def _fixed_tendon_maps(model):
   return length_map.astype(np.float32), moment_map.astype(np.float32)
 
 
-def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
+def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor:
   """Validate and lower combined joint and contact constraints from an MjModel."""
   if not isinstance(model, mujoco.MjModel):
     raise TypeError("coupled constraint lowering requires a MuJoCo MjModel")
   if mujoco.__version__ != "3.10.0":
     raise RuntimeError(f"coupled constraint lowering requires MuJoCo 3.10.0; found {mujoco.__version__}")
-  if model.nv > _MAX_NV:
-    raise ValueError(f"coupled constraint stage bounds nv to {_MAX_NV}; found {model.nv}")
+  from mujoco_metal.capacity import CapacityOverflow
+  max_nv = limits.max_nv if limits is not None else _MAX_NV
+  if model.nv > max_nv:
+    raise CapacityOverflow(f"coupled constraint stage bounds nv to {max_nv}; found {model.nv}")
   # Pinned no-slip post-stage (R04): admitted with validated budget; the
   # native solver runs exact friction subproblem sweeps after the main
   # solve (zero iterations = skipped, bit-identical to before).
@@ -716,7 +719,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
   # deterministic via eq_rowadr/eq_rownum. Do not replace all uses of neq
   # indiscriminately.
   _estimate = _estimate_capacity(model, 1, npairs, total_candidate_contacts, nr)
-  _check_capacity(_estimate)
+  _check_capacity(_estimate, limits=limits)
 
   # Assemble packed joint parameters
   joint_sol_params = (
@@ -1081,6 +1084,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       body_jntadr=_frozen(model.body_jntadr, np.int32),
       body_jntnum=_frozen(model.body_jntnum, np.int32),
       body_invweight0=_frozen(model.body_invweight0.reshape(-1, 2), np.float32),
+      dense_path=bool(_estimate.dense_path),
   )
 
 
@@ -1171,8 +1175,10 @@ def coupled_constraint_oracle(
 class MetalCoupledConstraints:
   """Batched native MPS execution for coupled joint and primitive contact constraints."""
 
-  def __init__(self, model, batch_size=1):
-    self.descriptor = lower_coupled_constraints(model)
+  def __init__(self, model, batch_size=1, limits=None):
+    from mujoco_metal.capacity import CapacityLimits
+    self.limits = limits or CapacityLimits()
+    self.descriptor = lower_coupled_constraints(model, limits=self.limits)
     self._mjmodel_ref = model
     self.solver_settings = self.descriptor.solver_settings
     self.batch_size = int(batch_size)
@@ -1198,6 +1204,10 @@ class MetalCoupledConstraints:
     except AttributeError:
       self._tendon_kernel = None
     self._solve_kernel = self._library.solve_coupled_constraints
+    try:
+      self._solve_block_kernel = self._library.solve_coupled_constraints_block
+    except AttributeError:
+      self._solve_block_kernel = self._solve_kernel
     self._broadphase_lib = torch.mps.compile_shader(_BROADPHASE_SHADER.read_text())
     self._broadphase_kernel = self._broadphase_lib.broadphase_mask
 
@@ -1349,7 +1359,7 @@ class MetalCoupledConstraints:
     from mujoco_metal.capacity import estimate_capacity as _estimate_capacity
     _check_capacity(_estimate_capacity(
         self._mjmodel_ref, b, d.npairs, d.ncontacts_max, d.nr,
-        neq=d.neq, nr_joint=d.nr_joint))
+        neq=d.neq, nr_joint=d.nr_joint), limits=self.limits)
     self.batch_size = b
     nv, nc, nr = d.nv, d.ncontacts_max, d.nr
 
@@ -1530,6 +1540,38 @@ class MetalCoupledConstraints:
       out.append((m, s))
     return out
 
+  def active_counts(self):
+    """Return `(mask_active, slot_active, active_rows)` candidate counts per world."""
+    counts = self.broadphase_counts()
+    d = self.descriptor
+    out = []
+    cone_type = int(self._mjmodel_ref.opt.cone)
+    rows_per_con = 4 if cone_type == 0 else 3
+    for w in range(self.batch_size):
+      mask_act, slot_act = counts[w]
+      act_rows = min(d.nr, d.nr_joint + slot_act * rows_per_con)
+      out.append((mask_act, slot_act, act_rows))
+    return out
+
+  def candidate_compaction_metrics(self):
+    """Return telemetry demonstrating numerical work avoidance under compaction."""
+    d = self.descriptor
+    counts = self.active_counts()
+    metrics = []
+    for w in range(self.batch_size):
+      mask_act, slot_act, act_rows = counts[w]
+      alloc_rows = d.nr
+      work_ratio = float(act_rows) / float(max(alloc_rows, 1))
+      metrics.append({
+          "allocated_slots": d.ncontacts_max,
+          "active_slots": slot_act,
+          "allocated_rows": alloc_rows,
+          "active_rows": act_rows,
+          "dense_path": d.dense_path,
+          "work_ratio": work_ratio,
+      })
+    return metrics
+
   def contact_buffers(self):
     """Return borrowed candidate-contact workspace views for BODY adhesion."""
     w, d = self._workspace, self.descriptor
@@ -1671,7 +1713,8 @@ class MetalCoupledConstraints:
       )
 
     # 2. Coupled constraint solver kernel
-    self._solve_kernel(
+    solve_fn = self._solve_kernel if self.descriptor.dense_path else self._solve_block_kernel
+    solve_fn(
         mass.reshape(-1), qfrc_smooth.reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
         eq_active_tensor.reshape(-1),
         self._constants["joint_qposadr"], self._constants["qpos0"],

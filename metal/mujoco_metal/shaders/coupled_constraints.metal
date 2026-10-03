@@ -1976,3 +1976,849 @@ kernel void tendon_constraint_rows(
     dbg[nr*nr+6*nr+row]=1.0f;
   }
 }
+
+// Device-memory overload of cert_block_residual for the scalable block solver.
+inline float cert_block_residual(int start, int dim, thread const float* mu,
+    device const float* W, device const float* R, device const float* rhs,
+    device const float* lam, thread const bool* enabled,
+    int nr, int total_nr) {
+  thread float A[36], g[6], frc[6], mulo[5];
+  for (int i = 0; i < 36; ++i) A[i] = 0.0f;
+  for (int i = 0; i < 6; ++i) { g[i] = 0.0f; frc[i] = 0.0f; }
+  for (int i = 0; i < 5; ++i) mulo[i] = mu[i];
+  for (int i = 0; i < dim; ++i) {
+    int ri = start + i;
+    frc[i] = lam[ri];
+    g[i] = -rhs[ri];
+    for (int col = 0; col < total_nr; ++col)
+      if (enabled[col] && (col < start || col >= start + dim))
+        g[i] += W[ri * nr + col] * lam[col];
+    for (int j = 0; j < dim; ++j) {
+      int cj = start + j;
+      A[i * 6 + j] = W[ri * nr + cj] + (i == j ? R[ri] : 0.0f);
+    }
+  }
+  return elliptic_projected_residual(A, g, mulo, dim, frc);
+}
+
+// Scalable block-row coupled constraint solver (milestone 017).
+// Uses device memory for Delassus matrix storage and candidate compaction,
+// scaling beyond 96 rows up to 256 rows and 64 DOFs without thread stack overflow.
+kernel void solve_coupled_constraints_block(
+    device const float* mass [[buffer(0)]],
+    device const float* qfrc [[buffer(1)]],
+    device const float* qpos [[buffer(2)]],
+    device const float* qvel [[buffer(3)]],
+    device const int* eq_active [[buffer(4)]],
+    device const int* joint_qadr [[buffer(5)]],
+    device const float* qpos0 [[buffer(6)]],
+    device const int* joint_dadr [[buffer(7)]],
+    device const uchar* joint_limited [[buffer(8)]],
+    device const float* joint_limit_params [[buffer(9)]],
+    device const float* joint_sol_params [[buffer(10)]],
+    device const float* frictionloss [[buffer(11)]],
+    device const float* invweight [[buffer(12)]],
+    device const float* dof_sol_params [[buffer(13)]],
+    device const int* eq_obj [[buffer(14)]],
+    device const float* eq_data [[buffer(15)]],
+    device const float* eq_sol_params [[buffer(16)]],
+    device const float* contact_jacobian [[buffer(17)]],
+    device const float* contact_row_data [[buffer(18)]],
+    device const float* contact_friction [[buffer(19)]],
+    device const int* contact_condim [[buffer(20)]],
+    constant int* dims [[buffer(21)]],
+    constant float* params [[buffer(22)]],
+    device float* out_force [[buffer(23)]],
+    device float* out_acc [[buffer(24)]],
+    device int* out_status [[buffer(25)]],
+    device float* out_diagnostics [[buffer(26)]],
+    device float* out_contact_force [[buffer(27)]],
+    device float* out_joint_force [[buffer(28)]],
+    device float* workspace_J [[buffer(29)]],
+    device float* workspace_debug [[buffer(30)]],
+    uint world [[thread_position_in_grid]]) {
+  int nq = dims[0];
+  int nv = dims[1];
+  int nj = dims[2];
+  int neq = dims[3];
+  int ncontacts_max = dims[4];
+  int batch = dims[5];
+  int flags = dims[6];
+  bool refsafe = dims[7] != 0;
+  int maxiter = dims[8];
+  int nr = dims[9];
+  int cone_type = dims[10];
+  int n_eq_rows = nr > 0 ? dims[14] : 0;
+  if (n_eq_rows < 0) n_eq_rows = 0;
+  if (n_eq_rows > nr) n_eq_rows = nr;
+  int ten_base = nr > 0 ? dims[16] : 0;
+  if (ten_base < 0) ten_base = 0;
+  if (ten_base > nr) ten_base = nr;
+  if (world >= uint(batch)) return;
+
+  int mb = world * nv * nv;
+  int qb = world * nv;
+  int pb = world * nq;
+  out_status[world] = 0;
+  out_diagnostics[world * 10] = 0.0f;
+  out_diagnostics[world * 10 + 1] = 0.0f;
+  for (int k = 0; k < 8; ++k) out_diagnostics[world * 10 + 2 + k] = 0.0f;
+  for (int i = 0; i < nv; ++i) { out_force[qb + i] = 0.0f; out_acc[qb + i] = 0.0f; }
+
+  if (nv == 0) return;
+  if (nv > 64 || nr > 256) { out_status[world] = 2; return; }
+
+  device float* dbg = workspace_debug + world * (nr * nr + 7 * nr);
+  device float* W = dbg;
+  device float* R = dbg + nr * nr;
+  device float* ar = dbg + nr * nr + nr;
+  device float* rhs = dbg + nr * nr + 2 * nr;
+  device float* lam = dbg + nr * nr + 3 * nr;
+  device float* lo = dbg + nr * nr + 4 * nr;
+  device float* hi = dbg + nr * nr + 5 * nr;
+  device float* meta = dbg + nr * nr + 6 * nr;
+  device float* J_world = workspace_J + world * nr * nv;
+
+  for (int i = 0; i < nr * nr; ++i) W[i] = 0.0f;
+  for (int i = 0; i < nr; ++i) rhs[i] = 0.0f;
+
+  thread bool enabled[256];
+  for (int i = 0; i < nr; ++i) enabled[i] = false;
+
+  bool warm_ok = (nr > 0) && ((flags & 512) == 0);
+  if (!warm_ok) {
+    for (int i = 0; i < nr; ++i) lam[i] = 0.0f;
+  }
+
+  for (int r = n_eq_rows; r < nr; ++r) {
+    if (meta[r] > 0.5f) continue;
+    R[r] = 0.0f;
+    ar[r] = 0.0f;
+    lo[r] = 0.0f;
+    hi[r] = 0.0f;
+    for (int i = 0; i < nv; ++i) J_world[r * nv + i] = 0.0f;
+  }
+  for (int r = 0; r < n_eq_rows && r < nr; ++r) {
+    if (meta[r] > 0.5f) {
+      enabled[r] = true;
+      continue;
+    }
+    lo[r] = -INFINITY;
+    hi[r] = INFINITY;
+    enabled[r] = true;
+  }
+  for (int r = ten_base; r < nr; ++r) {
+    if (meta[r] > 0.5f) enabled[r] = true;
+  }
+
+  int base_contact = n_eq_rows + nv + 2 * nj;
+  if (nr > 0) {
+    int ten_rows = dims[17];
+    if (ten_rows < 0) ten_rows = 0;
+    if (ten_rows > nr) ten_rows = nr;
+    base_contact += ten_rows;
+  }
+
+  // 1. Joint constraints
+  if ((flags & 1) == 0) {
+    // Frictionloss
+    for (int d = 0; d < nv; ++d) {
+      int row = n_eq_rows + d;
+      float loss = frictionloss[d];
+      if ((flags & 4) != 0 || loss <= 0.0f) continue;
+      J_world[row * nv + d] = 1.0f;
+      float comp = 0.0f, aref = 0.0f;
+      reference_params(dof_sol_params + d * 7, dof_sol_params + d * 7 + 2, 0, 0.0f, 0.0f, qvel[qb + d], invweight[d], true, params[0], refsafe, comp, aref);
+      R[row] = comp;
+      ar[row] = aref;
+      lo[row] = -loss;
+      hi[row] = loss;
+      enabled[row] = true;
+    }
+
+    // Joint Limits
+    for (int j = 0; j < nj; ++j) {
+      int limpack = joint_limited[j];
+      if ((limpack & 1) == 0) continue;
+      int d = joint_dadr[j];
+      int q = joint_qadr[j];
+      float margin = joint_limit_params[j * 3 + 2];
+      if (((limpack >> 1) & 3) == 1) {
+        // Ball limit
+        float4 quat = float4(qpos[pb+q], qpos[pb+q+1], qpos[pb+q+2], qpos[pb+q+3]);
+        float nq4 = length(quat);
+        quat = nq4 > 1e-30f ? quat / nq4 : float4(1, 0, 0, 0);
+        float3 vv = quat.yzw;
+        float s = length(vv);
+        float speed = 2.0f * atan2(s, quat.x);
+        if (speed > 3.14159265358979f) speed -= 2.0f * 3.14159265358979f;
+        float3 aa = s > 1e-30f ? vv * (speed / s) : float3(0.0f);
+        float value = length(aa);
+        float3 naxis = value > 1e-30f ? aa / value : float3(0.0f);
+        float rmax = max(joint_limit_params[j * 3], joint_limit_params[j * 3 + 1]);
+        float dist = rmax - value;
+        int rowb = n_eq_rows + nv + 2 * j;
+        if ((flags & 8) == 0 && dist < margin) {
+          for (int k = 0; k < 3; ++k) {
+            int dof = d + k;
+            if (dof >= 0 && dof < nv) J_world[rowb * nv + dof] = -naxis[k];
+          }
+          float vel = 0.0f;
+          for (int k = 0; k < 3; ++k) {
+            int dof = d + k;
+            if (dof >= 0 && dof < nv) vel += -naxis[k] * qvel[qb + dof];
+          }
+          float comp = 0.0f, aref = 0.0f;
+          reference_params(joint_sol_params + j * 7, joint_sol_params + j * 7 + 2, 0, dist, margin, vel, invweight[d], false, params[0], refsafe, comp, aref);
+          R[rowb] = comp;
+          ar[rowb] = aref;
+          lo[rowb] = 0.0f;
+          hi[rowb] = INFINITY;
+          enabled[rowb] = true;
+        }
+      } else {
+        // Hinge / Slide
+        int row0 = n_eq_rows + nv + 2 * j;
+        float dist0 = qpos[pb + q] - joint_limit_params[j * 3 + 0];
+        if ((flags & 8) == 0 && dist0 < margin) {
+          J_world[row0 * nv + d] = 1.0f;
+          float comp = 0.0f, aref = 0.0f;
+          reference_params(joint_sol_params + j * 7, joint_sol_params + j * 7 + 2, 0, dist0, margin, qvel[qb + d], invweight[d], false, params[0], refsafe, comp, aref);
+          R[row0] = comp;
+          ar[row0] = aref;
+          lo[row0] = 0.0f;
+          hi[row0] = INFINITY;
+          enabled[row0] = true;
+        }
+        int row1 = n_eq_rows + nv + 2 * j + 1;
+        float dist1 = joint_limit_params[j * 3 + 1] - qpos[pb + q];
+        if ((flags & 8) == 0 && dist1 < margin) {
+          J_world[row1 * nv + d] = -1.0f;
+          float comp = 0.0f, aref = 0.0f;
+          reference_params(joint_sol_params + j * 7, joint_sol_params + j * 7 + 2, 0, dist1, margin, -qvel[qb + d], invweight[d], false, params[0], refsafe, comp, aref);
+          R[row1] = comp;
+          ar[row1] = aref;
+          lo[row1] = 0.0f;
+          hi[row1] = INFINITY;
+          enabled[row1] = true;
+        }
+      }
+    }
+  }
+
+  // 2. Contacts with Candidate Compaction
+  thread int contact_block_start[96];
+  thread int contact_block_size[96];
+  thread int contact_slot_id[96];
+  thread int contact_block_count = 0;
+  thread int elliptic_start[96];
+  thread int elliptic_dim[96];
+  thread float elliptic_friction[96 * 5];
+  thread int elliptic_count = 0;
+  thread bool elliptic_member[256];
+  for (int i = 0; i < 256; ++i) elliptic_member[i] = false;
+
+  if ((flags & 1) == 0 && (flags & 16) == 0) {
+    for (int s = 0; s < ncontacts_max; ++s) {
+      int cdim = contact_condim[s * 3 + 0];
+      int row_offset = contact_condim[s * 3 + 1];
+      int row_start = base_contact + row_offset;
+      int cb = world * ncontacts_max + s;
+      int cjbase = cb * 6 * nv;
+      int crbase = cb * 6 * 6;
+
+      if (cdim == 1) {
+        int r = crbase;
+        if (contact_row_data[r] > 0.5f) {
+          if (row_start + 1 > nr) { out_status[world] = 2; return; }
+          int row = row_start;
+          for (int i = 0; i < nv; ++i) J_world[row * nv + i] = contact_jacobian[cjbase + i];
+          float imp = clamp(contact_row_data[r + 4], 1e-6f, 0.999999f);
+          float diag_approx = max(contact_row_data[r + 5], 1e-15f);
+          R[row] = max(1e-15f, (1.0f - imp) * diag_approx / imp);
+          ar[row] = contact_row_data[r + 3];
+          lo[row] = 0.0f;
+          hi[row] = INFINITY;
+          enabled[row] = true;
+        } else {
+          lam[row_start] = 0.0f;
+        }
+      } else if (contact_row_data[crbase] > 0.5f) {
+        int edge_count = 2 * (cdim - 1);
+        int block_rows = cone_type == 0 ? edge_count : cdim;
+        if (row_start + block_rows > nr) { out_status[world] = 2; return; }
+        float imp = clamp(contact_row_data[crbase + 4], 1e-6f, 0.999999f);
+        float diag_approx = max(contact_row_data[crbase + 5], 1e-15f);
+        float normal_R = max(1e-15f, (1.0f - imp) * diag_approx / imp);
+        if (cone_type == 1) {
+          if (elliptic_count < 96) {
+            elliptic_start[elliptic_count] = row_start;
+            elliptic_dim[elliptic_count] = cdim;
+            for (int k = 0; k < 5; ++k) elliptic_friction[elliptic_count * 5 + k] = contact_friction[s * 5 + k];
+            ++elliptic_count;
+          }
+          for (int k = 0; k < cdim; ++k) {
+            int row = row_start + k;
+            elliptic_member[row] = true;
+            int r = crbase + k * 6;
+            for (int i = 0; i < nv; ++i) J_world[row * nv + i] = contact_jacobian[cjbase + k * nv + i];
+            if (k == 0) {
+              R[row] = normal_R;
+              lo[row] = 0.0f;
+              hi[row] = INFINITY;
+            } else {
+              float mu = contact_friction[s * 5 + k - 1];
+              float mu0 = contact_friction[s * 5];
+              float tangent_R = normal_R / max(params[1], 1e-15f);
+              R[row] = tangent_R * mu0 * mu0 / max(mu * mu, 1e-12f);
+              lo[row] = -INFINITY;
+              hi[row] = INFINITY;
+            }
+            ar[row] = contact_row_data[r + 3];
+            enabled[row] = true;
+          }
+        } else if (cdim == 3) {
+          if (contact_block_count < 96) {
+            contact_block_start[contact_block_count] = row_start;
+            contact_block_size[contact_block_count] = 4;
+            contact_slot_id[contact_block_count] = s;
+            ++contact_block_count;
+          }
+          float mu0 = contact_friction[s * 5];
+          for (int k = 0; k < 4; ++k) {
+            int row = row_start + k;
+            int r = crbase + (k + 1) * 6;
+            int axis = k / 2 + 1;
+            float sign = (k & 1) == 0 ? 1.0f : -1.0f;
+            float mu = contact_friction[s * 5 + axis - 1];
+            for (int i = 0; i < nv; ++i) {
+              J_world[row * nv + i] = contact_jacobian[cjbase + i]
+                  + sign * mu * contact_jacobian[cjbase + axis * nv + i];
+            }
+            float edge_imp = clamp(contact_row_data[r + 4], 1e-6f, 0.999999f);
+            float edge_diag = max(contact_row_data[r + 5], 1e-15f);
+            float edge_R = max(1e-15f, (1.0f - edge_imp) * edge_diag / edge_imp) * (1.0f + mu0 * mu0);
+            R[row] = 2.0f * mu0 * mu0 / max(params[1], 1e-15f) * edge_R;
+            ar[row] = contact_row_data[r + 3];
+            lo[row] = 0.0f;
+            hi[row] = INFINITY;
+            enabled[row] = true;
+          }
+        } else {
+          int edge_cnt = 2 * (cdim - 1);
+          if (cdim > 1 && contact_block_count < 96) {
+            contact_block_start[contact_block_count] = row_start;
+            contact_block_size[contact_block_count] = edge_cnt;
+            contact_slot_id[contact_block_count] = s;
+            ++contact_block_count;
+          }
+          float mu0 = contact_friction[s * 5];
+          float mu_master = mu0 / sqrt(max(params[1], 1e-15f));
+          float pyramid_R = max(1e-15f, 2.0f * mu_master * mu_master * normal_R * (1.0f + mu0 * mu0));
+          for (int axis = 0; axis < cdim - 1; ++axis) {
+            float mu = contact_friction[s * 5 + axis];
+            for (int side = 0; side < 2; ++side) {
+              int k = axis * 2 + side;
+              int row = row_start + k;
+              float sign = side == 0 ? 1.0f : -1.0f;
+              int r0 = crbase;
+              int rt = crbase + (axis + 1) * 6;
+              for (int i = 0; i < nv; ++i) {
+                J_world[row * nv + i] = contact_jacobian[cjbase + i] + sign * mu * contact_jacobian[cjbase + (axis + 1) * nv + i];
+              }
+              R[row] = pyramid_R;
+              ar[row] = contact_row_data[r0 + 3] + sign * mu * contact_row_data[rt + 3];
+              lo[row] = 0.0f;
+              hi[row] = INFINITY;
+              enabled[row] = true;
+            }
+          }
+        }
+      } else {
+        int edge_cnt = (cone_type == 1) ? cdim : 2 * (cdim - 1);
+        for (int k = 0; k < edge_cnt; ++k) {
+          if (row_start + k < nr) lam[row_start + k] = 0.0f;
+        }
+      }
+    }
+  }
+
+  // 3. Dense Cholesky of M
+  thread float L[64 * 64];
+  thread float y[64], x[64];
+  for (int i = 0; i < nv; ++i) for (int j = 0; j < nv; ++j) L[i * nv + j] = 0.0f;
+  for (int i = 0; i < nv; ++i) for (int j = 0; j <= i; ++j) {
+    float v = mass[mb + i * nv + j];
+    for (int k = 0; k < j; ++k) v -= L[i * nv + k] * L[j * nv + k];
+    if (i == j) {
+      if (!(v > 1e-12f) || !isfinite(v)) { out_status[world] = 2; return; }
+      L[i * nv + j] = sqrt(v);
+    } else {
+      L[i * nv + j] = v / L[j * nv + j];
+    }
+  }
+
+  // 4. Solve M q0 = qfrc (unconstrained acceleration)
+  for (int i = 0; i < nv; ++i) {
+    float v = qfrc[qb + i];
+    for (int k = 0; k < i; ++k) v -= L[i * nv + k] * y[k];
+    y[i] = v / L[i * nv + i];
+  }
+  for (int i = nv - 1; i >= 0; --i) {
+    float v = y[i];
+    for (int k = i + 1; k < nv; ++k) v -= L[k * nv + i] * x[k];
+    x[i] = v / L[i * nv + i];
+  }
+  thread float q0[64];
+  for (int i = 0; i < nv; ++i) { q0[i] = x[i]; out_acc[qb + i] = x[i]; }
+
+  // 5 & 6. Assemble Delassus matrix W = J M^-1 J^T into device memory W
+  thread float z_b[64];
+  for (int b = 0; b < nr; ++b) {
+    if (!enabled[b]) continue;
+    for (int i = 0; i < nv; ++i) {
+      float v = J_world[b * nv + i];
+      for (int k = 0; k < i; ++k) v -= L[i * nv + k] * y[k];
+      y[i] = v / L[i * nv + i];
+    }
+    for (int i = nv - 1; i >= 0; --i) {
+      float v = y[i];
+      for (int k = i + 1; k < nv; ++k) v -= L[k * nv + i] * z_b[k];
+      z_b[i] = v / L[i * nv + i];
+    }
+    for (int a = 0; a < nr; ++a) {
+      if (!enabled[a]) continue;
+      float v = 0.0f;
+      for (int k = 0; k < nv; ++k) v += J_world[a * nv + k] * z_b[k];
+      W[a * nr + b] = v;
+    }
+  }
+
+  // 7. Form RHS
+  for (int row = 0; row < nr; ++row) {
+    if (enabled[row]) {
+      float ja = 0.0f;
+      for (int k = 0; k < nv; ++k) ja += J_world[row * nv + k] * q0[k];
+      rhs[row] = ar[row] - ja;
+    } else {
+      rhs[row] = 0.0f;
+    }
+  }
+
+  // 7b. Warmstart cost check
+  if (warm_ok && nr > 0) {
+    float wcost = 0.0f;
+    for (int row = 0; row < nr; ++row) if (enabled[row]) {
+      wcost -= lam[row] * rhs[row];
+      for (int col = 0; col < nr; ++col) if (enabled[col]) {
+        float a = W[row * nr + col] + (row == col ? R[row] : 0.0f);
+        wcost += 0.5f * lam[row] * a * lam[col];
+      }
+    }
+    if (wcost > 0.0f || !isfinite(wcost)) {
+      for (int row = 0; row < nr; ++row) lam[row] = 0.0f;
+    }
+  }
+
+  // 8. Projected Gauss-Seidel solve
+  float tol = params[2];
+  bool converged = false;
+  float max_res = 0.0f;
+  thread float hist[8];
+  int hsamp = 0;
+  int hstep = max(1, maxiter / 7);
+  for (int k = 0; k < 8; ++k) hist[k] = 0.0f;
+
+  if (elliptic_count > 0) {
+    thread float dscale[256], z[256], extrapolated[256], candidate[256], gradient_z[256];
+    for (int row = 0; row < 256; ++row) {
+      dscale[row] = 1.0f;
+      z[row] = extrapolated[row] = candidate[row] = 0.0f;
+      gradient_z[row] = 0.0f;
+    }
+    for (int block = 0; block < elliptic_count; ++block) {
+      int start = elliptic_start[block];
+      int dim = elliptic_dim[block];
+      for (int k = 1; k < dim; ++k)
+        dscale[start + k] = max(elliptic_friction[block * 5 + k - 1], 0.0f);
+    }
+    float lipschitz = 1e-15f;
+    int enabled_count = 0;
+    for (int row = 0; row < nr; ++row) if (enabled[row]) {
+      ++enabled_count;
+      float row_sum = 0.0f;
+      for (int col = 0; col < nr; ++col) if (enabled[col]) {
+        float value = dscale[row] * W[row * nr + col] * dscale[col];
+        if (row == col) value += dscale[row] * R[row] * dscale[col];
+        row_sum += abs(value);
+      }
+      lipschitz = max(lipschitz, row_sum);
+      float scale = dscale[row];
+      z[row] = scale > 1e-12f ? lam[row] / scale : 0.0f;
+      extrapolated[row] = z[row];
+    }
+    float gershgorin_bound = lipschitz;
+    thread float power_vector[256], power_product[256];
+    float inv_norm = rsqrt(float(max(enabled_count, 1)));
+    for (int row = 0; row < 256; ++row)
+      power_vector[row] = row < nr && enabled[row] ? inv_norm : 0.0f;
+    for (int iteration = 0; iteration < 24; ++iteration) {
+      float norm_sq = 0.0f;
+      for (int row = 0; row < nr; ++row) {
+        float value = 0.0f;
+        if (enabled[row]) {
+          for (int col = 0; col < nr; ++col) if (enabled[col]) {
+            float entry = dscale[row] * W[row * nr + col] * dscale[col];
+            if (row == col) entry += dscale[row] * R[row] * dscale[col];
+            value += entry * power_vector[col];
+          }
+        }
+        power_product[row] = value;
+        norm_sq += value * value;
+      }
+      float inv_power_norm = rsqrt(max(norm_sq, 1e-30f));
+      for (int row = 0; row < nr; ++row)
+        power_vector[row] = power_product[row] * inv_power_norm;
+    }
+    float rayleigh = 0.0f;
+    for (int row = 0; row < nr; ++row) if (enabled[row]) {
+      float value = 0.0f;
+      for (int col = 0; col < nr; ++col) if (enabled[col]) {
+        float entry = dscale[row] * W[row * nr + col] * dscale[col];
+        if (row == col) entry += dscale[row] * R[row] * dscale[col];
+        value += entry * power_vector[col];
+      }
+      rayleigh += power_vector[row] * value;
+    }
+    lipschitz = min(gershgorin_bound, max(1e-15f, rayleigh * 1.1f));
+    float momentum = 1.0f;
+    for (int it = 0; it < maxiter; ++it) {
+      for (int row = 0; row < nr; ++row)
+        lam[row] = enabled[row] ? dscale[row] * extrapolated[row] : 0.0f;
+      for (int row = 0; row < nr; ++row) if (enabled[row]) {
+        float gradient = -rhs[row];
+        for (int col = 0; col < nr; ++col) if (enabled[col])
+          gradient += W[row * nr + col] * lam[col];
+        gradient += R[row] * lam[row];
+        gradient_z[row] = dscale[row] * gradient;
+      } else {
+        gradient_z[row] = 0.0f;
+      }
+      bool step_accepted = false;
+      for (int backtrack = 0; backtrack < 12; ++backtrack) {
+        for (int row = 0; row < nr; ++row)
+          candidate[row] = enabled[row]
+              ? extrapolated[row] - gradient_z[row] / lipschitz : 0.0f;
+        for (int block = 0; block < elliptic_count; ++block) {
+          int start = elliptic_start[block];
+          int dim = elliptic_dim[block];
+          thread float cone_value[6];
+          for (int k = 0; k < 6; ++k) cone_value[k] = k < dim ? candidate[start + k] : 0.0f;
+          project_lorentz(cone_value, dim);
+          for (int k = 0; k < dim; ++k) candidate[start + k] = cone_value[k];
+        }
+        for (int row = 0; row < nr; ++row)
+          if (enabled[row] && !elliptic_member[row])
+            candidate[row] = clamp(candidate[row], lo[row], hi[row]);
+
+        float objective_base = 0.0f, objective_candidate = 0.0f;
+        float linear_delta = 0.0f, delta_norm_sq = 0.0f;
+        for (int row = 0; row < nr; ++row) if (enabled[row]) {
+          float base_lambda = dscale[row] * extrapolated[row];
+          float candidate_lambda = dscale[row] * candidate[row];
+          float base_product = 0.0f;
+          float candidate_product = 0.0f;
+          for (int col = 0; col < nr; ++col) if (enabled[col]) {
+            float base_col = dscale[col] * extrapolated[col];
+            float candidate_col = dscale[col] * candidate[col];
+            base_product += W[row * nr + col] * base_col;
+            candidate_product += W[row * nr + col] * candidate_col;
+          }
+          base_product += R[row] * base_lambda;
+          candidate_product += R[row] * candidate_lambda;
+          objective_base += 0.5f * base_lambda * base_product - rhs[row] * base_lambda;
+          objective_candidate += 0.5f * candidate_lambda * candidate_product - rhs[row] * candidate_lambda;
+          float delta = candidate[row] - extrapolated[row];
+          linear_delta += gradient_z[row] * delta;
+          delta_norm_sq += delta * delta;
+        }
+        float majorizer = objective_base + linear_delta + 0.5f * lipschitz * delta_norm_sq;
+        if (objective_candidate <= majorizer + 1e-6f * max(1.0f, abs(objective_candidate))) {
+          step_accepted = true;
+          break;
+        }
+        lipschitz *= 2.0f;
+      }
+      if (!step_accepted) { out_status[world] = 2; return; }
+
+      float next_momentum = 0.5f * (1.0f + sqrt(1.0f + 4.0f * momentum * momentum));
+      float beta = (momentum - 1.0f) / next_momentum;
+      float restart_dot = 0.0f;
+      for (int row = 0; row < nr; ++row) if (enabled[row])
+        restart_dot += (candidate[row] - z[row]) * (extrapolated[row] - candidate[row]);
+      if (restart_dot > 0.0f) {
+        next_momentum = 1.0f;
+        beta = 0.0f;
+      }
+      for (int row = 0; row < nr; ++row) if (enabled[row]) {
+        float previous = z[row];
+        z[row] = candidate[row];
+        extrapolated[row] = candidate[row] + beta * (candidate[row] - previous);
+        lam[row] = dscale[row] * z[row];
+      }
+      momentum = next_momentum;
+
+      max_res = 0.0f;
+      for (int row = 0; row < nr; ++row) if (enabled[row]) {
+        if (elliptic_member[row]) {
+          int block = -1;
+          for (int b = 0; b < elliptic_count; ++b) if (elliptic_start[b] == row) block = b;
+          if (block < 0) continue;
+          int dim = elliptic_dim[block];
+          thread float A[36], g[6], mu[5], force[6];
+          for (int i = 0; i < 36; ++i) A[i] = 0.0f;
+          for (int i = 0; i < 6; ++i) { g[i] = 0.0f; force[i] = 0.0f; }
+          for (int i = 0; i < 5; ++i) mu[i] = elliptic_friction[block * 5 + i];
+          for (int i = 0; i < dim; ++i) {
+            int ri = row + i;
+            force[i] = lam[ri];
+            g[i] = -rhs[ri];
+            for (int col = 0; col < nr; ++col)
+              if (enabled[col] && (col < row || col >= row + dim))
+                g[i] += W[ri * nr + col] * lam[col];
+            for (int j = 0; j < dim; ++j) {
+              int rj = row + j;
+              A[i * 6 + j] = W[ri * nr + rj] + (i == j ? R[ri] : 0.0f);
+            }
+          }
+          max_res = max(max_res, elliptic_projected_residual(A, g, mu, dim, force));
+          continue;
+        }
+        float grad = -rhs[row];
+        for (int col = 0; col < nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
+        grad += R[row] * lam[row];
+        float diag = max(1e-15f, W[row * nr + row] + R[row]);
+        float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
+        float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
+        for (int col = 0; col < nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
+        row_scale = max(1.0f, row_scale);
+        max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
+      }
+      out_diagnostics[world * 10] = max_res;
+      out_diagnostics[world * 10 + 1] = float(it + 1);
+      if (hsamp < 7 && ((it + 1) % hstep == 0 || it + 1 == maxiter)) {
+        hist[hsamp++] = max_res;
+      }
+      if (max_res <= tol) { converged = true; break; }
+    }
+  } else {
+    int pgs_cap = maxiter;
+    for (int it = 0; it < pgs_cap; ++it) {
+      for (int row = 0; row < nr; ++row) if (enabled[row]) {
+        float diag = max(1e-15f, W[row * nr + row] + R[row]);
+        float v = rhs[row];
+        for (int col = 0; col < nr; ++col) if (enabled[col] && col != row)
+          v -= W[row * nr + col] * lam[col];
+        lam[row] = clamp(v / diag, lo[row], hi[row]);
+      }
+      max_res = 0.0f;
+      for (int row = 0; row < nr; ++row) if (enabled[row]) {
+        float grad = -rhs[row];
+        for (int col = 0; col < nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
+        grad += R[row] * lam[row];
+        float diag = max(1e-15f, W[row * nr + row] + R[row]);
+        float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
+        float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
+        for (int col = 0; col < nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
+        row_scale = max(1.0f, row_scale);
+        max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
+      }
+      out_diagnostics[world * 10] = max_res;
+      out_diagnostics[world * 10 + 1] = float(it + 1);
+      if (hsamp < 7 && ((it + 1) % hstep == 0 || it + 1 == maxiter)) {
+        hist[hsamp++] = max_res;
+      }
+      if (max_res <= tol) { converged = true; break; }
+    }
+
+    // Refinement sweeps
+    int ref_sweeps = dims[11];
+    if (ref_sweeps <= 0) ref_sweeps = 64;
+    for (int ref = 0; ref < ref_sweeps; ++ref) {
+      for (int b = 0; b < contact_block_count; ++b) {
+        int row_start = contact_block_start[b];
+        int block_size = contact_block_size[b];
+        if (block_size <= 4 && ref >= 64) continue;
+        int local_rows[10];
+        int nlocal = 0;
+        for (int k = 0; k < block_size; ++k) {
+          int row = row_start + k;
+          if (enabled[row]) local_rows[nlocal++] = row;
+        }
+        if (nlocal == 0) continue;
+        thread float local_A[100], local_b[10], local_sol[10];
+        for (int i = 0; i < 100; ++i) local_A[i] = 0.0f;
+        for (int i = 0; i < 10; ++i) { local_b[i] = 0.0f; local_sol[i] = 0.0f; }
+        for (int i = 0; i < nlocal; ++i) {
+          int row = local_rows[i];
+          float v = -rhs[row];
+          for (int col = 0; col < nr; ++col) if (enabled[col] && (col < row_start || col >= row_start + block_size)) {
+            v += W[row * nr + col] * lam[col];
+          }
+          local_b[i] = v;
+          local_sol[i] = lam[row];
+          for (int j = 0; j < nlocal; ++j) {
+            int other = local_rows[j];
+            local_A[i * 10 + j] = W[row * nr + other] + (i == j ? R[row] : 0.0f);
+          }
+        }
+        float b_err;
+        if (nlocal <= 4) {
+          thread float small_A[16], small_b[4], small_sol[4];
+          for (int i = 0; i < 16; ++i) small_A[i] = 0.0f;
+          for (int i = 0; i < 4; ++i) { small_b[i] = 0.0f; small_sol[i] = 0.0f; }
+          for (int i = 0; i < nlocal; ++i) {
+            small_b[i] = local_b[i];
+            for (int j = 0; j < nlocal; ++j) small_A[i * 4 + j] = local_A[i * 10 + j];
+          }
+          b_err = solve_contact_block(small_A, small_b, nlocal, small_sol);
+          for (int i = 0; i < nlocal; ++i) local_sol[i] = small_sol[i];
+        } else {
+          b_err = solve_contact_block_iterative(local_A, local_b, nlocal, local_sol);
+        }
+        if (b_err < 1e-5f) {
+          for (int i = 0; i < nlocal; ++i) lam[local_rows[i]] = max(0.0f, local_sol[i]);
+        }
+      }
+    }
+  }
+
+  // 9b. No-slip post-pass
+  int noslip_iters = dims[18];
+  float noslip_tol = params[3];
+  float mean_inertia = params[4];
+  if (!isfinite(mean_inertia) || mean_inertia <= 1e-6f) mean_inertia = 1.0f;
+  float noslip_scale = 1.0f / (mean_inertia * float(max(1, nv)));
+  if (noslip_iters > 0 && nr > 0) {
+    int ns_done = 0;
+    for (int nsit = 0; nsit < noslip_iters; ++nsit) {
+      float improvement = 0.0f;
+      if (nsit == 0) {
+        for (int row = 0; row < nr; ++row) {
+          if (enabled[row]) {
+            improvement += 0.5f * lam[row] * lam[row] * R[row];
+          }
+        }
+      }
+      // Dry friction rows
+      for (int row = 0; row < nr; ++row) if (enabled[row]) {
+        float lorb = lo[row], hib = hi[row];
+        if (!(lorb < 0.0f && hib == -lorb && hib < INFINITY)) continue;
+        float diag = max(1e-10f, W[row * nr + row]);
+        float res = -rhs[row];
+        for (int col = 0; col < nr; ++col) if (enabled[col]) res += W[row * nr + col] * lam[col];
+        float old = lam[row];
+        float v = clamp(old - res / diag, lorb, hib);
+        float delta = v - old;
+        float change = 0.5f * delta * delta * diag + delta * res;
+        if (change > 1e-10f) { v = old; change = 0.0f; }
+        lam[row] = v;
+        improvement -= change;
+      }
+      // Contact friction blocks
+      for (int b = 0; b < contact_block_count; ++b) {
+        int row_start = contact_block_start[b];
+        int block_size = contact_block_size[b];
+        for (int k = 0; k + 1 < block_size; k += 2) {
+          int j0 = row_start + k, j1 = row_start + k + 1;
+          if (!(enabled[j0] && enabled[j1])) continue;
+          float r0 = -rhs[j0], r1 = -rhs[j1];
+          for (int col = 0; col < nr; ++col) if (enabled[col]) {
+            r0 += W[j0 * nr + col] * lam[col];
+            r1 += W[j1 * nr + col] * lam[col];
+          }
+          float old0 = lam[j0], old1 = lam[j1];
+          float A00 = W[j0 * nr + j0], A11 = W[j1 * nr + j1];
+          float A01 = W[j0 * nr + j1];
+          float bc0 = r0 - (A00 * old0 + A01 * old1);
+          float bc1 = r1 - (A01 * old0 + A11 * old1);
+          float mid = 0.5f * (old0 + old1);
+          float y_val = 0.5f * (old0 - old1);
+          float K1 = A00 + A11 - 2.0f * A01;
+          float K0 = mid * (A00 - A11) + bc0 - bc1;
+          float ny = y_val;
+          if (K1 < 1e-15f) {
+            ny = y_val;
+          } else {
+            ny = -K0 / K1;
+            ny = ny < -mid ? -mid : (ny > mid ? mid : ny);
+          }
+          float f0 = mid + ny, f1 = mid - ny;
+          float d0 = f0 - old0, d1 = f1 - old1;
+          float change = 0.5f * (d0 * (A00 * d0 + A01 * d1) + d1 * (A01 * d0 + A11 * d1))
+              + d0 * r0 + d1 * r1;
+          if (change > 1e-10f) { f0 = old0; f1 = old1; change = 0.0f; }
+          lam[j0] = f0;
+          lam[j1] = f1;
+          improvement -= change;
+        }
+      }
+      ns_done++;
+      improvement *= noslip_scale;
+      if (improvement < noslip_tol) break;
+    }
+    out_diagnostics[world * 10 + 1] += float(ns_done);
+  }
+
+  if (!isfinite(max_res) || !converged) out_status[world] = 3;
+
+  // 10. Reconstruct forces and acceleration
+  thread float f_tot[64];
+  for (int i = 0; i < nv; ++i) f_tot[i] = 0.0f;
+  for (int row = 0; row < nr; ++row) if (enabled[row]) {
+    for (int i = 0; i < nv; ++i) f_tot[i] += J_world[row * nv + i] * lam[row];
+  }
+  for (int i = 0; i < nv; ++i) out_force[qb + i] = f_tot[i];
+
+  // Solve M delta_a = f_tot using Cholesky factor L
+  for (int i = 0; i < nv; ++i) {
+    float v = f_tot[i];
+    for (int k = 0; k < i; ++k) v -= L[i * nv + k] * y[k];
+    y[i] = v / L[i * nv + i];
+  }
+  for (int i = nv - 1; i >= 0; --i) {
+    float v = y[i];
+    for (int k = i + 1; k < nv; ++k) v -= L[k * nv + i] * x[k];
+    x[i] = v / L[i * nv + i];
+  }
+  for (int i = 0; i < nv; ++i) out_acc[qb + i] = q0[i] + x[i];
+
+  // 11. Write joint forces
+  for (int row = 0; row < base_contact; ++row) {
+    out_joint_force[world * max(base_contact, 1) + row] = enabled[row] ? lam[row] : 0.0f;
+  }
+
+  // 12. Write contact forces
+  for (int s = 0; s < ncontacts_max; ++s) {
+    int cdim = contact_condim[s * 3 + 0];
+    int row_offset = contact_condim[s * 3 + 1];
+    int row_start = base_contact + row_offset;
+    int ofb = (world * ncontacts_max + s) * 11;
+    for (int k = 0; k < 11; ++k) out_contact_force[ofb + k] = 0.0f;
+    if (cdim == 0 || !enabled[row_start]) continue;
+    if (cdim == 1) {
+      out_contact_force[ofb] = lam[row_start];
+    } else if (cone_type == 1) {
+      for (int k = 0; k < cdim; ++k) out_contact_force[ofb + k] = enabled[row_start + k] ? lam[row_start + k] : 0.0f;
+    } else {
+      int edge_count = 2 * (cdim - 1);
+      float normal = 0.0f;
+      for (int k = 0; k < edge_count; ++k) {
+        float value = lam[row_start + k];
+        normal += value;
+        out_contact_force[ofb + 1 + k] = value;
+      }
+      out_contact_force[ofb] = normal;
+    }
+  }
+}

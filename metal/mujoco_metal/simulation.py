@@ -77,6 +77,7 @@ class MetalSimulation:
       qvel=None,
       *,
       profile="contact_free_euler_v1",
+      limits=None,
   ):
     if not isinstance(model, mujoco.MjModel):
       raise TypeError("model must be a compiled mujoco.MjModel")
@@ -87,10 +88,11 @@ class MetalSimulation:
     if batch_size <= 0:
       raise ValueError("batch_size must be positive")
     batch_size = int(batch_size)
+    self.limits = limits
     # This CPU-only contract check must finish before any constructor can
     # initialize MPS or compile a shader.
-    profile = validate_stepping_profile(model, profile=profile)
-    is_integrated = profile.name in ("integrated_euler_v1", "integrated_rk4_v1", "integrated_implicit_v1")
+    profile = validate_stepping_profile(model, profile=profile, limits=limits)
+    is_integrated = profile.name in ("integrated_euler_v1", "integrated_rk4_v1", "integrated_implicit_v1", "integrated_scalable_v1")
     with_transmissions = "transmission" in profile.name or is_integrated
     motor_model = (
         ScalarMotorModel.from_model(model)
@@ -224,7 +226,7 @@ class MetalSimulation:
         self._fluid = MetalInertiaBoxFluid(model, batch_size)
       if plan.is_stage_enabled("coupled_constraints"):
         from mujoco_metal.coupled_constraints import MetalCoupledConstraints
-        self._coupled_constraints = MetalCoupledConstraints(model, batch_size)
+        self._coupled_constraints = MetalCoupledConstraints(model, batch_size, limits=self.limits)
       if plan.is_stage_enabled("sensor_query"):
         from mujoco_metal.sensors import SensorProgram
         self._sensors = SensorProgram(model, batch_size)
@@ -543,6 +545,14 @@ class MetalSimulation:
       if bool(np.any(_ns > 0)):
         self._delay = _DelayLine(_ns, _ip, _dl, batch_size=batch_size)
 
+    from mujoco_metal.islands import IslandManager
+    self._islands = IslandManager(model, batch_size=batch_size, device=self._state._device)
+
+  @property
+  def islands(self):
+    """Kinematic island discovery and sleep/wake manager (milestone 017)."""
+    return self._islands
+
   @property
   def state(self):
     """The owned :class:`DeviceState` lifecycle and checkpoint interface."""
@@ -691,6 +701,9 @@ class MetalSimulation:
         tensor[dst_i] = tensor[src_i].clone()
     if getattr(self, "_delay", None) is not None:
       self._delay.copy_row(src_i, dst_i)
+    if getattr(self, "_islands", None) is not None:
+      self._islands.tree_asleep[dst_i] = self._islands.tree_asleep[src_i].copy()
+      self._islands._stationary_steps[dst_i] = self._islands._stationary_steps[src_i].copy()
     self._assembled_system_valid = False
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
@@ -738,6 +751,10 @@ class MetalSimulation:
                           if getattr(self, "_sensordata", None) is not None else None)
     snap["delay"] = (self._delay.snapshot()
                      if getattr(self, "_delay", None) is not None else None)
+    snap["islands"] = ({
+        "tree_asleep": self._islands.tree_asleep.copy(),
+        "_stationary_steps": self._islands._stationary_steps.copy(),
+    } if getattr(self, "_islands", None) is not None else None)
     return snap
 
   def restore(self, snapshot, env_ids=None):
@@ -875,6 +892,14 @@ class MetalSimulation:
           cur["values"].reshape(self.batch_size, nu, nmax)[row] = \
               delay_checked["values"].reshape(self.batch_size, nu, nmax)[row].copy()
         self._delay.restore(cur)
+    if getattr(self, "_islands", None) is not None and "islands" in snapshot and snapshot["islands"] is not None:
+      if ids is None:
+        self._islands.tree_asleep[:] = snapshot["islands"]["tree_asleep"]
+        self._islands._stationary_steps[:] = snapshot["islands"]["_stationary_steps"]
+      else:
+        for row in np.asarray(ids).tolist():
+          self._islands.tree_asleep[row] = snapshot["islands"]["tree_asleep"][row]
+          self._islands._stationary_steps[row] = snapshot["islands"]["_stationary_steps"][row]
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -907,6 +932,8 @@ class MetalSimulation:
         ids = self._state._env_ids(env_ids)
         if ids.size:
           self._sensordata[ids.tolist()] = 0.0
+    if getattr(self, "_islands", None) is not None:
+      self._islands.wake_all(env_ids=env_ids)
     self._assembled_system_valid = False
     self._accepted_step = None
     if hasattr(self, "_last_coupled"):
@@ -994,6 +1021,8 @@ class MetalSimulation:
         ids = self._state._env_ids(env_ids)
         if ids.size:
           self._sensordata[ids.tolist()] = 0.0
+    if getattr(self, "_islands", None) is not None:
+      self._islands.wake_all(env_ids=env_ids)
     self._assembled_system_valid = False
     self._accepted_step = None
     if hasattr(self, "_last_coupled"):
@@ -1847,6 +1876,9 @@ class MetalSimulation:
           self._advance_activations(state)
           state._act, self._next_act = self._next_act, state._act
         self._record_delay(pre_step_time, success)
+        if getattr(self, "_islands", None) is not None:
+          self._islands.update_sleep(state._qvel, ctrl=self._control, xfrc_applied=self._body_wrench)
+          self._islands.apply_sleep_to_state(state._qvel, state._qacc)
         state._generation += 1
         if not bool(torch.all(success)):
           if self._sensordata is not None:
@@ -2025,6 +2057,9 @@ class MetalSimulation:
       # Pinned history advance (mj_advance records ctrl at the pre-step
       # time); successful worlds only, failed rows freeze (R02).
       self._record_delay(pre_step_time, self._success)
+      if getattr(self, "_islands", None) is not None:
+        self._islands.update_sleep(state._qvel, ctrl=self._control, xfrc_applied=self._body_wrench)
+        self._islands.apply_sleep_to_state(state._qvel, state._qacc)
       state._generation += 1
 
       # Failure atomicity (R02): rollback sensor samples and warmstarts for failed worlds
