@@ -1327,7 +1327,7 @@ inline int collide_mesh_plane_manifold(float3 p1, float4 q1,
 inline int collide_hfield(
     float3 ph, float4 qh,
     int t2, float3 po, float4 qo, float3 szo, float rbo,
-    float margin, int maxn, thread ContactGeom* con,
+    float margin, float gap, int maxn, thread ContactGeom* con,
     int gih, int gio,
     device const float* hull, device const int* hull_info);
 
@@ -1343,7 +1343,7 @@ inline int collide_sdf(
 inline int collide_pair(
     int type1, float3 p1, float4 q1, float3 sz1, float rb1,
     int type2, float3 p2, float4 q2, float3 sz2, float rb2,
-    float margin, int disable_multiccd, thread ContactGeom* con,
+    float margin, float gap, int disable_multiccd, thread ContactGeom* con,
     int gia, int gib,
     device const float* hull, device const int* hull_info,
     int maxn) {
@@ -1361,46 +1361,47 @@ inline int collide_pair(
   float r2 = swapped ? rb1 : rb2;
   int gi1 = swapped ? gib : gia;
   int gi2 = swapped ? gia : gib;
+  float mg = margin + gap;
 
   int n = 0;
   if (t1 == 0 && t2 == 2) {
-    n = collide_plane_sphere(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_plane_sphere(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 2 && t2 == 2) {
-    n = collide_sphere_sphere(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_sphere_sphere(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 0 && t2 == 3) {
-    n = collide_plane_capsule(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_plane_capsule(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 2 && t2 == 3) {
-    n = collide_sphere_capsule(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_sphere_capsule(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 3 && t2 == 3) {
-    n = collide_capsule_capsule(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_capsule_capsule(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 0 && t2 == 6) {
-    n = collide_plane_box(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_plane_box(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 2 && t2 == 6) {
-    n = collide_sphere_box(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_sphere_box(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 3 && t2 == 6) {
-    n = collide_capsule_box(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_capsule_box(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 6 && t2 == 6) {
-    n = collide_box_box(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_box_box(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 0 && t2 == 5) {
-    n = collide_plane_cylinder(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_plane_cylinder(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 2 && t2 == 5) {
-    n = collide_sphere_cylinder(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+    n = collide_sphere_cylinder(pos1, quat1, size1, pos2, quat2, size2, mg, con);
   } else if (t1 == 0 && t2 == 4) {
-    n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, margin, con,
+    n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, mg, con,
                              gi1, gi2, hull, hull_info, nullptr);
   } else if ((t1 == 2 && t2 == 4) || (t1 == 3 && t2 == 4) || (t1 == 4 && t2 == 4)
              || (t1 == 4 && t2 == 5) || (t1 == 4 && t2 == 6)) {
-    n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con,
+    n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, mg, con,
                               gi1, gi2, hull, hull_info, nullptr);
   } else if ((t1 == 3 && t2 == 5) || (t1 == 5 && t2 == 5) || (t1 == 5 && t2 == 6)) {
     n = collide_convex_multi(t1, pos1, quat1, size1, t2, pos2, quat2, size2,
-                             margin, 5, r1, r2, disable_multiccd, con,
+                             mg, 5, r1, r2, disable_multiccd, con,
                              gi1, gi2, hull, hull_info, nullptr);
   } else if (t1 == 0 && t2 == 7) {
     // R05-1 mesh-plane face manifold (bounded face-clip expansion, host
     // budget 4, sorted identity).
     n = collide_mesh_plane_manifold(pos1, quat1, t2, pos2, quat2, size2,
-                             margin, maxn, con,
+                             mg, maxn, con,
                              gi1, gi2, hull, hull_info);
   } else if ((t1 == 2 && t2 == 7) || (t1 == 3 && t2 == 7) || (t1 == 4 && t2 == 7)
              || (t1 == 5 && t2 == 7) || (t1 == 6 && t2 == 7) || (t1 == 7 && t2 == 7)) {
@@ -1408,11 +1409,11 @@ inline int collide_pair(
     // rule); box/cylinder/capsule/mesh-vs-mesh use the bounded multiCCD
     // manifold with the pair slot budget.
     if (t1 == 2 || t2 == 2 || t1 == 4 || t2 == 4) {
-      n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con,
+      n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, mg, con,
                                 gi1, gi2, hull, hull_info, nullptr);
     } else {
       n = collide_convex_multi(t1, pos1, quat1, size1, t2, pos2, quat2, size2,
-                               margin, maxn, r1, r2, disable_multiccd, con,
+                               mg, maxn, r1, r2, disable_multiccd, con,
                                gi1, gi2, hull, hull_info, nullptr);
     }
   } else if (t1 == 0 && t2 == 1) {
@@ -1426,8 +1427,10 @@ inline int collide_pair(
   } else if (t1 == 1 && (t2 == 2 || t2 == 3 || t2 == 4 || t2 == 5 || t2 == 6 || t2 == 7)) {
     // Milestone 012: per-prism terrain collision (pinned mjc_ConvexHField).
     // Hfield is canonical t1; maxn is this pair's contact-slot budget.
+    // Margin/gap travel separately (R05-2: margin raises/shifts, gap is
+    // detection range only).
     n = collide_hfield(pos1, quat1, t2, pos2, quat2, size2, r2,
-                       margin, maxn, con, gi1, gi2, hull, hull_info);
+                       margin, gap, maxn, con, gi1, gi2, hull, hull_info);
   } else if (t1 == 0 && t2 == 8) {
     // Milestone 013: plane-SDF pairs yield no contacts (pinned driver).
     n = 0;

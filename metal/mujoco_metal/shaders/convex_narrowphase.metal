@@ -1393,7 +1393,7 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
 inline int collide_hfield(
     float3 ph, float4 qh,
     int t2, float3 po, float4 qo, float3 szo, float rbo,
-    float margin, int maxn, thread ContactGeom* con,
+    float margin, float gap, int maxn, thread ContactGeom* con,
     int gih, int gio,
     device const float* hull, device const int* hull_info) {
   int doff = hull_info[gih * 9 + 5];
@@ -1484,8 +1484,12 @@ inline int collide_hfield(
         float h0 = hull[doff + n0r * ncol + n0c] * size2;
         float h1 = hull[doff + n1r * ncol + n1c] * size2;
         float h2 = hull[doff + n2r * ncol + n2c] * size2;
-        // Prism height test.
-        if (h0 < zmin && h1 < zmin && h2 < zmin) continue;
+        // Pinned height test (R05-2, mjc_ConvexHField): expanded tops
+        // (tops + margin) against the UNEXPANDED other-geom AABB floor
+        // (pinned zmin predates obj2.margin), i.e. tops < zmin - margin.
+        // Gap does not raise prisms (detection range only). Margin 0 is
+        // bit-identical.
+        if (h0 + margin < zmin && h1 + margin < zmin && h2 + margin < zmin) continue;
         float3 v0 = float3(dx * (float)n0c - size0, dy * (float)n0r - size1, 0.0f);
         float3 v1 = float3(dx * (float)n1c - size0, dy * (float)n1r - size1, 0.0f);
         float3 v2 = float3(dx * (float)n2c - size0, dy * (float)n2r - size1, 0.0f);
@@ -1505,10 +1509,17 @@ inline int collide_hfield(
         float3 zsz = float3(0.0f);
         int got = cx_single_contact(1, centroid, Im, zsz,
                                     t2, poh, Roh, szo,
-                                    margin, d0, false, &cand,
+                                    margin + gap, d0, false, &cand,
                                     gih, gio, hull, hull_info, prismV);
         if (got) {
-          con[ncon].dist = cand.dist;
+          // Pinned expanded-penetration report (R05-2): GJK runs on true
+          // geometry (preserving margin-0 witness quality); the reported
+          // dist subtracts the pinned expansions (prism tops +margin,
+          // other support +margin/2), i.e. true gap - 1.5*margin. Exact
+          // for face contacts along the normal, second-order elsewhere.
+          // Gap is detection range only (no shift). Margin 0 + gap 0 is
+          // bit-identical.
+          con[ncon].dist = cand.dist - 1.5f * margin;
           con[ncon].normal = Rh * cand.normal;
           con[ncon].pos = Rh * cand.pos + ph;
           con[ncon].t1 = Rh * cand.t1;

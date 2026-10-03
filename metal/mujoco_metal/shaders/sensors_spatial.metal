@@ -841,7 +841,7 @@ kernel void evaluate_geomdist(
       float rb1=geom_rbound[s1], rb2=geom_rbound[s2];
       ContactGeom con[16];
       int n=collide_pair(tt1,p1,q1,sz1,rb1,tt2,p2,q2,sz2,rb2,
-                         cutoff,multiccd_off,con,s1,s2,hull,hull_info,16);
+                         cutoff,0.0f,multiccd_off,con,s1,s2,hull,hull_info,16);
       for (int k=0;k<n;++k) {
         if (con[k].dist<best) {
           best=con[k].dist;

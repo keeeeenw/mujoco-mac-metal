@@ -72,6 +72,69 @@ def _needs_gpu():
   return pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 
 
+def _hfield_ball_xml(z, margin):
+  return (f'<mujoco><asset><hfield name="h" nrow="9" ncol="9" size="1 1 0.2 0.05"/></asset>'
+          f'<option timestep="0.002" integrator="Euler" iterations="100" tolerance="1e-8"/>'
+          '<worldbody><geom name="terrain" type="hfield" hfield="h"/>'
+          f'<body pos="0.1 0.1 {z}"><freejoint/>'
+          f'<geom name="ball" type="sphere" size="0.1" margin="{margin}"/></body>'
+          '</worldbody></mujoco>')
+
+
+def test_hfield_positive_margin_near_contact_cpu():
+  # Pinned oracle: a 5 mm margin detects near-contacts (positive dist)
+  # where margin 0 sees nothing (R05-2).
+  m0 = mujoco.MjModel.from_xml_string(_hfield_ball_xml(0.103, 0.0))
+  d0 = mujoco.MjData(m0)
+  d0.qpos[:] = np.asarray(m0.qpos0)
+  mujoco.mj_forward(m0, d0)
+  assert d0.ncon == 0
+  m1 = mujoco.MjModel.from_xml_string(_hfield_ball_xml(0.103, 0.005))
+  d1 = mujoco.MjData(m1)
+  d1.qpos[:] = np.asarray(m1.qpos0)
+  mujoco.mj_forward(m1, d1)
+  assert d1.ncon == 2, d1.ncon
+  for j in range(d1.ncon):
+    # Pinned expanded-penetration convention: dist = true gap - 1.5*margin
+    # (prism tops +margin, other support +margin/2), so margin-range
+    # witnesses report negative dists.
+    assert -1.5 * 0.005 - 1e-9 <= float(d1.contact[j].dist) <= 0.005, float(d1.contact[j].dist)
+
+
+@_needs_gpu()
+def test_hfield_positive_margin_parity_gpu():
+  # R05-2: native margin detection matches the CPU oracle (counts, depths,
+  # normals) in near-contact and in press; margin 0 unchanged.
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  from mujoco_metal.simulation import MetalSimulation
+  for z, margin in ((0.103, 0.005), (0.095, 0.005), (0.095, 0.0)):
+    m = mujoco.MjModel.from_xml_string(_hfield_ball_xml(z, margin))
+    sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+    sim.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1),
+              qvel=np.zeros((1, m.nv), dtype=np.float32))
+    n_nat = _native_active_slots(sim)
+    d = mujoco.MjData(m)
+    d.qpos[:] = np.asarray(m.qpos0)
+    mujoco.mj_forward(m, d)
+    assert n_nat == int(d.ncon), (z, margin, n_nat, int(d.ncon))
+    if d.ncon:
+      asm = sim.assembled_system()
+      mask = np.asarray(asm["contact_mask"].cpu().numpy()[0])
+      nat_d = sorted(float(v) for v, on in
+                     zip(np.asarray(asm["contact_distance"].cpu().numpy()[0]), mask) if on > 0.5)
+      cpu_d = sorted(float(d.contact[j].dist) for j in range(d.ncon))
+      assert len(nat_d) == len(cpu_d) == n_nat
+      for a, b in zip(nat_d, cpu_d):
+        assert abs(a - b) < 1e-3, (z, margin, a, b)
+      fr = sim._coupled_constraints._workspace["contact_frame"].detach().cpu().numpy().reshape(-1, 12)
+      # 012-consistent gates (see test_hfield_contact_012): sphere normal
+      # atol 0.1, depths 1 mm. Margin near-contacts share the shallow tier.
+      for j in range(d.ncon):
+        np.testing.assert_allclose(fr[j, :3], np.asarray(d.contact[j].frame[:3]), atol=0.1,
+                                   err_msg=f"margin nrm z={z}")
+
+
 @_needs_gpu()
 def test_mesh_plane_manifold_counts_and_wrench_gpu():
   # Bounded native manifold (R05-1): the cube face yields true hull-vert

@@ -253,7 +253,7 @@ kernel void contact_normal(
     con[k].t2 = float3(0.0f);
   }
   int ncon = collide_pair(ta, pa, qa, sza, rba, tb, pb, qb, szb, rbb,
-                            m + g, disable_multiccd, con, a, b,
+                            m, g, disable_multiccd, con, a, b,
                             mesh_hull, mesh_hull_info, max_con);
   ncon = min(ncon, max_con);
 
