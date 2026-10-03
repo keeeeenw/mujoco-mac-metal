@@ -2050,7 +2050,10 @@ class MetalCoupledConstraints:
     }
 
     if nr > 0:
-      w_debug = w["workspace_debug"][: b * (nr * nr + 7 * nr)].reshape(b, nr * nr + 7 * nr)
+      # Each world owns its full persistent debug + solver-scratch stride.
+      # Reshape the complete allocation so borrowed prefix views keep the
+      # correct batch offset when per-world scratch follows the debug prefix.
+      w_debug = w["workspace_debug"].reshape(b, self._debug_stride)
       W = w_debug[:, : nr * nr].reshape(b, nr, nr)
       R = w_debug[:, nr * nr : nr * nr + nr].reshape(b, nr)
       ar = w_debug[:, nr * nr + nr : nr * nr + 2 * nr].reshape(b, nr)

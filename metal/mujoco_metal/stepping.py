@@ -314,13 +314,20 @@ def _build_integrated_execution_plan(
       {"name": "qfrc_bias", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv})", "dtype": "float32"},
       {"name": "qfrc_smooth", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv})", "dtype": "float32"},
   ]
+  coupled_debug_stride = None
+  if coupled_constraints_enabled:
+    from mujoco_metal.capacity import primal_scratch_floats
+    coupled_debug_stride = (
+        coupled_desc.nr * coupled_desc.nr + 7 * coupled_desc.nr
+        + primal_scratch_floats(
+            model.nv, coupled_desc.nr, coupled_desc.solver_type))
   if euler_damping_enabled:
     audit.append({"name": "effective_mass", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv}, {model.nv})", "dtype": "float32"})
   if coupled_constraints_enabled:
     audit.extend([
         {"name": "_eq_active_default", "residency": "MPS device-resident", "lifetime": "persistent preallocated", "shape": f"(batch, {max(model.neq, 1)})", "dtype": "int32"},
         {"name": "workspace_J", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nr}, {model.nv})", "dtype": "float32"},
-        {"name": "workspace_debug", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nr * coupled_desc.nr + 7 * coupled_desc.nr})", "dtype": "float32"},
+        {"name": "workspace_debug", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_debug_stride})", "dtype": "float32"},
         {"name": "out_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
         {"name": "out_acc", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
         {"name": "out_status", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch,)", "dtype": "int32"},

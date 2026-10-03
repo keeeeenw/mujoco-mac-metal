@@ -188,7 +188,7 @@ kernel void equality_assembly(
   int so = int(world) * max(nsite, 1);
 
   device float* J_world = workspace_J + int(world) * nr * max(nv, 1);
-  device float* dbg = workspace_debug + int(world) * (nr * nr + 7 * nr);
+  device float* dbg = workspace_debug + int(world) * max(dims[21], nr * nr + 7 * nr);
 
   for (int e = 0; e < neq; ++e) {
     int typ = eq_type[e];

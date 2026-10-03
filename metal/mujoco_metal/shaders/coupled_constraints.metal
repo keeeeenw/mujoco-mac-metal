@@ -2936,7 +2936,7 @@ kernel void tendon_constraint_rows(
   if (uint(world)>=uint(batch)) return;
   if (nr<=0||nv<=0) return;
   device float* Jw = workspace_J + uint(world)*uint(nr)*uint(max(nv,1));
-  device float* dbg = workspace_debug + uint(world)*(uint(nr*nr)+uint(7*nr));
+  device float* dbg = workspace_debug + uint(world)*uint(max(dims[21], nr*nr+7*nr));
   uint vbase=uint(world)*uint(max(nv,1)), qbase=uint(world)*uint(max(nq,1));
   uint tbase=uint(world)*uint(max(nt,1));
   for (int r=0;r<nr;++r) {

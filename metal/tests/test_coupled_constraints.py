@@ -1078,6 +1078,129 @@ def test_batched_second_pair_contact_routing():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_batched_debug_views_keep_full_scratch_stride():
+  """Borrowed result views use each world's full debug/scratch stride."""
+  import torch
+
+  model = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep=".002" iterations="100" tolerance="1e-8"/>'
+      '<worldbody><geom type="plane" size="2 2 .1"/>'
+      '<body pos="0 0 .4"><freejoint/><geom type="sphere" size=".1" '
+      'mass="1" condim="1"/></body>'
+      '<body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1" '
+      'mass="1" condim="1"/></body></worldbody></mujoco>')
+  batch = 3
+  qpos = np.tile(model.qpos0, (batch, 1)).astype(np.float32)
+  qpos[1, 2] += 0.4
+  qpos[1, 9] += 0.4
+  qpos[2, 9] -= 0.015
+  qvel = np.zeros((batch, model.nv), dtype=np.float32)
+  qpos_device = torch.as_tensor(qpos, device="mps")
+  qvel_device = torch.as_tensor(qvel, device="mps")
+  desc = load_model(model)
+  smooth = MetalSmoothDynamics(desc, batch)
+  coupled = MetalCoupledConstraints(model, batch)
+  dynamics = smooth.run_device(qpos_device, qvel_device)
+  result = coupled.run_device(
+      dynamics["poses"], dynamics["mass_matrix"], -dynamics["qfrc_bias"],
+      qpos_device, qvel_device)
+  debug = coupled._workspace["workspace_debug"].reshape(
+      batch, coupled._debug_stride)
+  prefix = coupled._debug_prefix
+  nr = coupled.descriptor.nr
+  torch.testing.assert_close(
+      result["W"], debug[:, :nr * nr].reshape(batch, nr, nr))
+  torch.testing.assert_close(result["R"], debug[:, nr * nr:nr * nr + nr])
+  torch.testing.assert_close(result["ar"], debug[:, nr * nr + nr:nr * nr + 2 * nr])
+  torch.testing.assert_close(result["rhs"], debug[:, nr * nr + 2 * nr:nr * nr + 3 * nr])
+  torch.testing.assert_close(result["lambda"], debug[:, nr * nr + 3 * nr:nr * nr + 4 * nr])
+  assert prefix == nr * nr + 7 * nr
+  storage = debug.untyped_storage().data_ptr()
+  assert result["W"].untyped_storage().data_ptr() == storage
+  assert result["lambda"].data_ptr() == storage + (nr * nr + 3 * nr) * 4
+
+  # Distinct world geometry is reflected in native contact diagnostics and
+  # the accelerated solutions stay aligned with MuJoCo's per-world oracle.
+  assert torch.any(result["contact_mask"][0] > 0.5)
+  assert not torch.any(result["contact_mask"][1] > 0.5)
+  assert torch.any(result["contact_mask"][2] > 0.5)
+  oracle = coupled_constraint_oracle(model, qpos, qvel)
+  np.testing.assert_allclose(result["qacc"].cpu().numpy(), oracle["qacc"],
+                             rtol=2e-3, atol=2e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_batched_stride_mixed_equality_and_tendon_rows():
+  """Equality and tendon writers preserve row data at the B3 debug stride."""
+  from mujoco_metal import MetalSimulation
+  from mujoco_metal.native_api import mj_setState
+
+  model = mujoco.MjModel.from_xml_string("""<mujoco>
+    <option gravity="0 0 0" solver="PGS" iterations="20"/>
+    <worldbody>
+      <body><joint name="a" type="slide" axis="1 0 0"/>
+        <geom type="sphere" size=".1" mass="1" contype="0" conaffinity="0"/></body>
+      <body pos="1 0 0"><joint name="b" type="slide" axis="1 0 0"/>
+        <geom type="sphere" size=".1" mass="1" contype="0" conaffinity="0"/></body>
+    </worldbody>
+    <tendon><fixed name="t" limited="true" range="-.1 .1" frictionloss=".2">
+      <joint joint="a" coef="1"/><joint joint="b" coef="-.5"/>
+    </fixed></tendon>
+    <equality><joint joint1="a" joint2="b" polycoef="0 1 0 0 0"/></equality>
+  </mujoco>""")
+  sim = MetalSimulation(model, batch_size=3, profile="integrated_euler_v1")
+  qpos = np.array([[0.0, 0.0], [0.3, 0.0], [0.0, 0.6]], dtype=np.float32)
+  qvel = np.array([[0.0, 0.25], [1.0, 0.0], [0.0, -1.0]], dtype=np.float32)
+  eq_active = np.array([[1], [0], [1]], dtype=np.int32)
+  sim.reset(qpos=qpos, qvel=qvel)
+  mj_setState(sim, {"eq_active": eq_active})
+  asm = sim.assembled_system(recompute=True)
+  J = asm["J"].cpu().numpy()
+  R = asm["R"].cpu().numpy()
+  aref = asm["ar"].cpu().numpy()
+  desc = sim._coupled_constraints.descriptor
+  eq_row = int(desc.eq_rowadr[0])
+  friction_row = int(desc.ten_base)
+  limit_rows = (friction_row + 1, friction_row + 2)
+  np.testing.assert_array_equal(eq_active[:, 0], [1, 0, 1])
+
+  for world in range(3):
+    data = mujoco.MjData(model)
+    data.qpos[:] = qpos[world]
+    data.qvel[:] = qvel[world]
+    data.eq_active[:] = eq_active[world]
+    mujoco.mj_forward(model, data)
+    cpu_types = np.asarray(data.efc_type[:data.nefc])
+    cpu_ids = np.asarray(data.efc_id[:data.nefc])
+
+    def compare_native_row(native_row, constraint_type):
+      cpu_row = np.flatnonzero(
+          (cpu_types == int(constraint_type)) & (cpu_ids == 0))
+      assert cpu_row.size == 1, (world, constraint_type, cpu_types, cpu_ids)
+      row = int(cpu_row[0])
+      cpu_J = np.asarray(data.efc_J).reshape(data.nefc, model.nv)
+      np.testing.assert_allclose(J[world, native_row],
+                                 cpu_J[row], atol=2e-6)
+      np.testing.assert_allclose(R[world, native_row],
+                                 np.asarray(data.efc_R)[row], atol=2e-5, rtol=2e-5)
+      np.testing.assert_allclose(aref[world, native_row],
+                                 np.asarray(data.efc_aref)[row], atol=2e-3, rtol=2e-5)
+
+    if eq_active[world, 0]:
+      compare_native_row(eq_row, mujoco.mjtConstraint.mjCNSTR_EQUALITY)
+    compare_native_row(friction_row, mujoco.mjtConstraint.mjCNSTR_FRICTION_TENDON)
+    cpu_limit = np.flatnonzero(cpu_types == int(mujoco.mjtConstraint.mjCNSTR_LIMIT_TENDON))
+    if cpu_limit.size:
+      active_native = [r for r in limit_rows if np.any(np.abs(J[world, r]) > 0)]
+      assert len(active_native) == 1, (world, active_native)
+      compare_native_row(active_native[0], mujoco.mjtConstraint.mjCNSTR_LIMIT_TENDON)
+    else:
+      assert all(not np.any(J[world, r]) for r in limit_rows)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 @pytest.mark.parametrize("pruning", [False, True])
 def test_pair_header_routes_after_four_slot_first_pair(pruning):
   """The fixed header routes past a 4-slot pair to the later sphere pair."""
