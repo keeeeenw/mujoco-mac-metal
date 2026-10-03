@@ -524,7 +524,7 @@ def validate_stepping_profile(
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
     if profile == "integrated_implicit_v1":
       base = validate_stepping_profile(
-          reference, timestep, "integrated_euler_v1"
+          reference, timestep, "integrated_euler_v1", limits=limits
       )
     else:
       base_name = (
@@ -533,7 +533,7 @@ def validate_stepping_profile(
           else ("contact_free_transmission_euler_v1" if model.ntendon else "contact_free_passive_euler_v1")
       )
       base = validate_stepping_profile(
-          reference, timestep, base_name
+          reference, timestep, base_name, limits=limits
       )
     return replace(
         base,
