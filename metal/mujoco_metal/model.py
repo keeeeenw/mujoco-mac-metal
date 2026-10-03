@@ -441,8 +441,8 @@ def _validate_lowered(counts, values):
     raise ValueError("body mass and inertia values must be nonnegative")
   if np.any(values["dof_armature"] < 0):
     raise ValueError("dof armature values must be nonnegative")
-  if np.any(values["dof_damping"] < 0):
-    raise ValueError("dof damping values must be nonnegative")
+  # Pinned MuJoCo permits signed linear damping. Finiteness is checked above;
+  # a negative coefficient is an explicit energy source, not malformed data.
   if np.any(values["actuator_armature"] < 0):
     raise ValueError("actuator armature values must be nonnegative")
   if np.any(values["geom_size"] < 0):

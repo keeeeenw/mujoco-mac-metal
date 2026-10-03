@@ -104,8 +104,8 @@ def test_forces_profile_rejects_polynomial_and_invalid_linear_damping():
   with pytest.raises(ValueError, match="polynomial damping"):
     validate_stepping_profile(model, profile="contact_free_forces_euler_v1")
   model.dof_dampingpoly.fill(0)
-  model.dof_damping[0] = -1
-  with pytest.raises(ValueError, match="finite and nonnegative"):
+  model.dof_damping[0] = np.nan
+  with pytest.raises(ValueError, match="must be finite"):
     validate_stepping_profile(model, profile="contact_free_forces_euler_v1")
 
 

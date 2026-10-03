@@ -867,8 +867,8 @@ def validate_stepping_profile(
   if np.any(model.dof_dampingpoly) and not advanced_passive:
     raise ValueError("polynomial damping is unsupported")
   damping = np.asarray(model.dof_damping, dtype=np.float64)
-  if np.any(~np.isfinite(damping)) or np.any(damping < 0):
-    raise ValueError("linear joint damping must be finite and nonnegative")
+  if np.any(~np.isfinite(damping)):
+    raise ValueError("linear joint damping must be finite")
   with np.errstate(over="ignore", invalid="ignore"):
     damping32 = np.asarray(damping, dtype=np.float32)
   if np.any(~np.isfinite(damping32)):
@@ -1064,7 +1064,7 @@ def validate_stepping_profile(
           )
           and not disable & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
           and bool(
-              np.any(damping32 > 0)
+              np.any(damping32 != 0)
               or (advanced_passive and np.any(model.dof_dampingpoly))
           )
       ),
