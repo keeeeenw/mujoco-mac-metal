@@ -73,10 +73,10 @@ _SUPPORTED = {
     int(mujoco.mjtSensor.mjSENS_CAMPROJECTION),
 }
 _DEFERRED_TO_019 = {
-    # TACTILE needs contact-to-mesh-vertex force accumulation over the
-    # retained contact manifold (future contact-kernel work); PLUGIN/USER
-    # need the explicit host extension route (019). SDF rays/distances go
-    # through the SDF plugin (pinned mjc_getSDF), likewise 019.
+    # TACTILE evaluates per-vertex SDF distances against every contacting
+    # counter-geom (pinned tactile_taxel_batch via mjSDF/octrees/plugins);
+    # that SDF-evaluation machinery is extension scope (019). PLUGIN/USER
+    # need the explicit host extension route (019).
     int(mujoco.mjtSensor.mjSENS_TACTILE),
     int(mujoco.mjtSensor.mjSENS_PLUGIN),
     int(mujoco.mjtSensor.mjSENS_USER),
