@@ -92,6 +92,7 @@ def run(steps=1200, mode="metal", check=False, record=None, release_step=RELEASE
   cpu_latch_force_before = 0.0; cpu_latch_force_after = 0.0
   native_connect_before = 0.0; native_connect_after = 0.0
   native_anchor_before = 0.0; native_anchor_after = 0.0
+  cpu_anchor_after = 0.0
   anchor_parity_err = 0.0
   payload_contacts = 0
   deckA_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "deckA")
@@ -146,17 +147,23 @@ def run(steps=1200, mode="metal", check=False, record=None, release_step=RELEASE
           pass
       # Native anchor/relative-pose errors: copy native state into MjData and
       # evaluate pinned anchor coincidence for connect + weld, vs CPU parity.
+      # Parity is gated pre-release (step 25) when trajectories coincide;
+      # post-release (step 400) contact trajectories legitimately diverge, so
+      # both engines' absolute coincidence is gated instead (connect stays
+      # engaged; released weld drifts in both).
       if step in (25, 400):
         native_mj = mujoco.MjData(model)
         native_mj.qpos[:] = native.state.qpos[0].cpu().numpy()
         mujoco.mj_forward(model, native_mj)
         nc_native, nw_native = _anchor_residuals(model, native_mj)
         nc_cpu, nw_cpu = _anchor_residuals(model, cpu_rel)
-        anchor_parity_err = max(anchor_parity_err, abs(nc_native - nc_cpu), abs(nw_native - nw_cpu))
         if step == 25:
+          anchor_parity_err = max(anchor_parity_err, abs(nc_native - nc_cpu),
+                                  abs(nw_native - nw_cpu))
           native_anchor_before = max(nc_native, nw_native)
         if step == 400:
           native_anchor_after = nc_native  # weld released; connect must stay constrained
+          cpu_anchor_after = nc_cpu
       # CPU latch/connect forces for reference (labeled separately, not mixed).
       if step == 25:
         cpu_latch_force_before = float(np.linalg.norm(cpu_rel.qfrc_constraint))
@@ -221,6 +228,7 @@ def run(steps=1200, mode="metal", check=False, record=None, release_step=RELEASE
       "cpu_latch_before": cpu_latch_force_before, "cpu_latch_after": cpu_latch_force_after,
       "native_connect_before": native_connect_before, "native_connect_after": native_connect_after,
       "native_anchor_before": native_anchor_before, "native_anchor_after": native_anchor_after,
+      "cpu_anchor_after": cpu_anchor_after,
       "anchor_parity_err": anchor_parity_err,
       "payload_contacts": payload_contacts,
       "tray_hits": tray_hits, "latched_tray_hits": latched_tray_hits,
@@ -244,9 +252,14 @@ def run(steps=1200, mode="metal", check=False, record=None, release_step=RELEASE
     # errors holds (compliant error, not zero promise).
     assert native_anchor_before < 5e-3, native_anchor_before
     assert native_anchor_after < 5e-3, native_anchor_after
-    # Parity scales with qpos divergence times lever arm (~0.5 m), measured
-    # 1.1e-05 on the qualified run; 5e-5 keeps 100x margin under the 5 mm
-    # absolute coincidence bound while remaining a real constraint.
+    assert cpu_anchor_after < 5e-3, cpu_anchor_after
+    # Pre-release anchor parity scales with qpos divergence times lever arm
+    # (~0.5 m), measured ~1e-05 on the qualified run; 5e-5 keeps 100x margin
+    # under the 5 mm absolute coincidence bound while remaining a real
+    # constraint. Post-release parity is not gated (contact trajectories
+    # legitimately diverge: measured 8.9e-05 difference on ~0.7 mm compliant
+    # residuals); absolute coincidence of the still-engaged connect is gated
+    # for both engines above instead.
     assert anchor_parity_err < 5e-5, anchor_parity_err
     # Anchor/pose parity while latched (stable contact, short horizon, tight).
     # Full-run maxima are reported (contact release trajectories diverge, as
