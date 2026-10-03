@@ -21,6 +21,9 @@ from mujoco_metal.capacity import (
     CapacityOverflow,
     check_capacity,
     estimate_capacity,
+    estimate_workspace,
+    _check_i32_elements,
+    SIGNED_I32_ELEMENT_LIMIT,
     NATIVE_MAX_NV,
     NATIVE_MAX_ROWS,
     selected_jacobian_kind,
@@ -52,7 +55,16 @@ def test_estimate_is_deterministic_and_counts_memory():
   assert "workspace_debug" in names and "contact_row_data" in names
   assert "workspace_J" in names and "out_contact_force" in names
   assert "eq_active_default" in names
-  assert est1.memory_breakdown == estimate_workspace_expected(model, 2, 3, 5, 20)
+  solver_parts = estimate_workspace_expected(model, 2, 3, 5, 20)
+  assert est1.memory_breakdown[:len(solver_parts)] == solver_parts
+  runtime = dict(est1.memory_breakdown[len(solver_parts):])
+  assert runtime["smooth.crb"] == 2 * model.nbody * 36 * 4
+  assert runtime["smooth.local_inertia"] == 2 * model.nbody * 36 * 4
+  assert runtime["smooth.cdof_dot"] == 2 * model.nv * 6 * 4
+  assert runtime["simulation.body_wrench"] == 2 * model.nbody * 6 * 4
+  assert runtime["sensor.sensor_meta"] == max(model.nsensor, 1) * 10 * 4
+  assert runtime["sensor.subtree_runtime"] == (
+      4 + 2 * model.nbody * 32 + 2 * max(model.nsensor, 1)) * 4
 
 
 def test_default_limits_preserve_historical_ceilings():
@@ -110,6 +122,42 @@ def test_overflow_is_valueerror_and_batch_checked():
     estimate_capacity("not-a-model", 1, 0, 0, 0)
   with pytest.raises(ValueError, match="positive"):
     estimate_capacity(model, 0, 0, 0, 0)
+
+
+def test_signed_int32_buffer_addressing_precedes_user_memory_budget():
+  # Arithmetic only: these dimensions must fail before any device allocation
+  # even when a caller configures a very large byte budget.
+  model = mujoco.MjModel.from_xml_string(
+      "<mujoco><worldbody><geom type='plane' size='1 1 .1'/></worldbody></mujoco>")
+  with pytest.raises(CapacityOverflow, match="workspace_debug.*signed 32-bit"):
+    estimate_capacity(model, 32768, npairs=0, nslots=0, nr=256)
+
+  with pytest.raises(CapacityOverflow, match="contact_jacobian.*signed 32-bit"):
+    estimate_workspace(
+        nv=64, npairs=0, nslots=100, nr=1, nr_joint=0, neq=0,
+        batch=100000, solver_type=int(mujoco.mjtSolver.mjSOL_PGS))
+  _check_i32_elements("boundary", SIGNED_I32_ELEMENT_LIMIT)
+  with pytest.raises(CapacityOverflow, match="boundary.*signed 32-bit"):
+    _check_i32_elements("boundary", SIGNED_I32_ELEMENT_LIMIT + 1)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("batch", True), ("batch", 1.5), ("nv", -1), ("npairs", 1.5),
+    ("nslots", -1), ("nr", True), ("nr_joint", -1), ("neq", 2.0),
+])
+def test_workspace_dimensions_reject_bool_fractional_and_negative(field, value):
+  args = dict(nv=1, npairs=0, nslots=0, nr=0, nr_joint=0, neq=0, batch=1)
+  args[field] = value
+  with pytest.raises(ValueError):
+    estimate_workspace(**args)
+
+
+def test_public_capacity_batch_rejects_fractional_and_boolean_values():
+  model = mujoco.MjModel.from_xml_string(
+      "<mujoco><worldbody><geom type='plane' size='1 1 .1'/></worldbody></mujoco>")
+  for batch in (True, 1.5, 0, -1):
+    with pytest.raises(ValueError):
+      estimate_capacity(model, batch, 0, 0, 0)
 
 
 def estimate_workspace_expected(model, batch, npairs, nslots, nr):

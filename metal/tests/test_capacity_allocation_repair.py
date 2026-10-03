@@ -18,6 +18,8 @@ from mujoco_metal.capacity import (
     check_capacity,
     estimate_capacity,
     estimate_workspace,
+    SIGNED_I32_ELEMENT_LIMIT,
+    _check_i32_elements,
 )
 
 
@@ -53,8 +55,61 @@ def test_estimate_scales_linearly_with_real_batch_cpu():
   e1 = estimate_capacity(m, 1, npairs=1, nslots=2, nr=4)
   e4 = estimate_capacity(m, 4, npairs=1, nslots=2, nr=4)
   assert e4.batch == 4
-  assert e4.memory_bytes == 4 * e1.memory_bytes
+  assert e4.memory_bytes > e1.memory_bytes
+  assert e4.memory_breakdown == estimate_capacity(
+      m, 4, npairs=1, nslots=2, nr=4).memory_breakdown
+  assert dict(e4.memory_breakdown)["smooth.crb"] == 4 * dict(e1.memory_breakdown)["smooth.crb"]
   assert e1.memory_bytes == sum(v for _, v in e1.memory_breakdown)
+
+
+def test_static_heavy_model_checks_real_spatial_matrix_buffer_before_allocation():
+  # Keep fixed bodies through compilation without adding generalized
+  # coordinates, isolating body-spatial buffers from nv/mass guards.
+  xml = "".join(
+      f'<body pos="0 0 {0.01 * i}"><geom type="sphere" size="0.01"/></body>'
+      for i in range(400))
+  model = mujoco.MjModel.from_xml_string(
+      f"<mujoco><compiler fusestatic='false'/><worldbody>{xml}</worldbody></mujoco>")
+  assert model.nbody == 401 and model.nv == 0
+  # The estimator itself is the exercised pre-allocation path. A nearby
+  # legal arithmetic shape remains below int32; the next batch crosses the
+  # actual crb[batch,nbody,6,6] backing allocation.
+  boundary_batch = (SIGNED_I32_ELEMENT_LIMIT // (model.nbody * 36))
+  below = estimate_capacity(model, boundary_batch, 0, 0, 0)
+  assert dict(below.memory_breakdown)["smooth.crb"] <= SIGNED_I32_ELEMENT_LIMIT * 4
+  with pytest.raises(CapacityOverflow, match="smooth.crb.*signed 32-bit"):
+    estimate_capacity(model, boundary_batch + 1, 0, 0, 0)
+  _check_i32_elements("exact-boundary", SIGNED_I32_ELEMENT_LIMIT)
+  with pytest.raises(CapacityOverflow, match="exact-boundary"):
+    _check_i32_elements("exact-boundary", SIGNED_I32_ELEMENT_LIMIT + 1)
+
+
+def test_simulation_constructor_checks_body_spatial_stride_before_device_init():
+  from mujoco_metal.simulation import MetalSimulation
+  xml = "".join(
+      f'<body pos="0 0 {0.01 * i}"><geom type="sphere" size="0.01"/></body>'
+      for i in range(400))
+  model = mujoco.MjModel.from_xml_string(
+      f"<mujoco><compiler fusestatic='false'/><worldbody>{xml}</worldbody></mujoco>")
+  boundary_batch = SIGNED_I32_ELEMENT_LIMIT // (model.nbody * 36)
+  # This exercises the constructor's early guard. Without it the call would
+  # proceed into MPS initialization rather than rejecting the invalid shape.
+  with pytest.raises(CapacityOverflow, match="smooth.crb.*signed 32-bit"):
+    MetalSimulation(model, batch_size=boundary_batch + 1,
+                    profile="contact_free_euler_v1")
+
+
+def test_simulation_constructor_rejects_invalid_batch_before_device_init():
+  from mujoco_metal.simulation import MetalSimulation
+  model = _model()
+  for batch in (True, np.bool_(True), 1.5, np.float32(2)):
+    with pytest.raises(TypeError):
+      MetalSimulation(model, batch_size=batch,
+                      profile="contact_free_euler_v1")
+  for batch in (0, -1):
+    with pytest.raises(ValueError, match="batch_size"):
+      MetalSimulation(model, batch_size=batch,
+                      profile="contact_free_euler_v1")
 
 
 def test_batch_and_memory_overflow_cpu():

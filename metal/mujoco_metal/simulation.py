@@ -224,6 +224,10 @@ class MetalSimulation:
       raise TypeError("batch_size must be an integer")
     if batch_size <= 0:
       raise ValueError("batch_size must be positive")
+    # Guard profile-independent buffers after public type/range validation,
+    # but before coercion or any component allocation/compilation.
+    from mujoco_metal.capacity import validate_runtime_buffers
+    validate_runtime_buffers(model, batch_size)
     batch_size = int(batch_size)
     self.limits = limits
     if self.limits is None and getattr(profile, "name", profile) == "integrated_scalable_v1":
