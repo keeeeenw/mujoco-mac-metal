@@ -21,6 +21,8 @@ preserving full batching, device memory residency, and zero CPU fallbacks.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
+from dataclasses import fields, is_dataclass
 import mujoco
 import numpy as np
 
@@ -92,8 +94,119 @@ def mju_cholSolve(L: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
 # Native Inverse Dynamics (runs on device)
 # -------------------------------------------------------------------------
 
+def _contains_device_tensor(value):
+  if torch is not None and isinstance(value, torch.Tensor):
+    return True
+  if isinstance(value, dict):
+    return any(_contains_device_tensor(item) for item in value.values())
+  if isinstance(value, (list, tuple)):
+    return any(_contains_device_tensor(item) for item in value)
+  if is_dataclass(value) and not isinstance(value, type):
+    return any(_contains_device_tensor(getattr(value, field.name))
+               for field in fields(value))
+  return False
+
+
+def _capture_query_storage(value, memo):
+  """Retain original storage owners and container bindings, not just values."""
+  if id(value) in memo:
+    return memo[id(value)]
+  if isinstance(value, torch.Tensor):
+    node = ("tensor", value, value.detach().clone())
+  elif isinstance(value, dict):
+    children = {}
+    node = ("dict", value, children)
+    memo[id(value)] = node
+    children.update({key: _capture_query_storage(item, memo) for key, item in value.items()})
+  elif isinstance(value, (list, tuple)):
+    node = ("sequence", value, [_capture_query_storage(item, memo) for item in value])
+  elif is_dataclass(value) and not isinstance(value, type):
+    node = ("record", value, {field.name: _capture_query_storage(getattr(value, field.name), memo)
+                              for field in fields(value)})
+  else:
+    node = ("leaf", value, None)
+  memo[id(value)] = node
+  return node
+
+
+def _restore_query_storage(node):
+  kind, original, saved = node
+  if kind == "tensor":
+    original.copy_(saved)
+  elif kind == "dict":
+    original.clear()
+    original.update({name: _restore_query_storage(value) for name, value in saved.items()})
+  elif kind == "sequence":
+    values = [_restore_query_storage(value) for value in saved]
+    if isinstance(original, list):
+      original[:] = values
+  elif kind == "record":
+    for name, value in saved.items():
+      object.__setattr__(original, name, _restore_query_storage(value))
+  return original
+
+
+@contextmanager
+def _inverse_query_workspaces(sim):
+  """Preserve stage storage and cache identity at an explicit query boundary.
+
+  Stage outputs are borrowed by assembled-system views, tendon sensors and
+  cached forward contexts. Restoring only constraint rows leaves their smooth
+  mass/pose buffers describing the temporary query. Snapshot device storage
+  in place (including nested stage programs) without numerical readback.
+  This allocation cost belongs to the explicit inverse query, not stepping.
+  """
+  roots = ("_smooth", "_passive", "_fluid", "_tendons", "_spatial_tendons",
+           "_flex", "_coupled_constraints")
+  seen, saved, memo = set(), [], {}
+  def collect(program):
+    if program is None or id(program) in seen or not hasattr(program, "__dict__"):
+      return
+    seen.add(id(program))
+    attributes = dict(vars(program))
+    storage = {name: _capture_query_storage(value, memo)
+               for name, value in attributes.items() if _contains_device_tensor(value)}
+    saved.append((program, attributes, storage))
+    for value in attributes.values():
+      # Programs own subordinate FK, broadphase, compaction and flex stages;
+      # arbitrary third-party objects and Torch internals are not traversed.
+      if type(value).__module__.startswith("mujoco_metal."):
+        collect(value)
+  for name in roots:
+    collect(getattr(sim, name, None))
+  spatial = {name: getattr(sim, name) for name in ("_spatial_kin", "_spatial_cache_key")
+             if hasattr(sim, name)}
+  try:
+    yield
+  finally:
+    for program, attributes, storage in reversed(saved):
+      # Restore the schema and original storage owners before copying values;
+      # a failed query may have replaced a buffer or published an extra map.
+      vars(program).clear()
+      vars(program).update(attributes)
+      for name, value in storage.items():
+        setattr(program, name, _restore_query_storage(value))
+    for name in ("_spatial_kin", "_spatial_cache_key"):
+      if name in spatial:
+        setattr(sim, name, spatial[name])
+      elif hasattr(sim, name):
+        delattr(sim, name)
+
+
 def mj_inverse(sim, qpos=None, qvel=None, qacc=None,
                mocap_pos=None, mocap_quat=None) -> torch.Tensor:
+  """NATIVE GPU inverse dynamics: compute qfrc_inverse on MPS.
+  
+  qfrc_inverse = M(qpos) * qacc + qfrc_bias(qpos, qvel) - qfrc_passive(qpos, qvel)
+  Operates natively on device tensors without host roundtrips.
+  Returns an owned MPS tensor [batch, nv]. Temporary stage workspaces and
+  cached forward records are preserved on success and failure.
+  """
+  with _inverse_query_workspaces(sim):
+    return _inverse_impl(sim, qpos, qvel, qacc, mocap_pos, mocap_quat)
+
+
+def _inverse_impl(sim, qpos, qvel, qacc, mocap_pos, mocap_quat):
   """NATIVE GPU inverse dynamics: compute qfrc_inverse on MPS.
   
   qfrc_inverse = M(qpos) * qacc + qfrc_bias(qpos, qvel) - qfrc_passive(qpos, qvel)
