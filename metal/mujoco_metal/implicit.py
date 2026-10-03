@@ -26,6 +26,71 @@ class ImplicitFastDescriptor:
   dof_damping: np.ndarray
 
 
+def implicitfast_supports_automatic(model):
+  """Whether velocity derivatives assemble automatically (R06b, no guards moved).
+
+  True when the smooth generalized force has no velocity dependence outside
+  the passive damper (linear + polynomial) and fixed-tendon damping: no
+  fluid forces, no activation state, and only fixed-gain/no-bias/no-dynamics
+  scalar motors (zero velocity derivative). Tendon stiffness/limits are
+  position-only and contribute a zero block. This is an admission predicate
+  only; assembly lives in :func:`implicit_derivative_reference`.
+  """
+  if not isinstance(model, mujoco.MjModel):
+    raise TypeError("implicitfast lowering requires a MuJoCo MjModel")
+  if mujoco.__version__ != "3.10.0":
+    raise RuntimeError("implicitfast lowering requires MuJoCo 3.10.0")
+  if model.opt.density != 0 or model.opt.viscosity != 0 or np.any(model.opt.wind != 0):
+    return False
+  if int(model.na) > 0:
+    return False
+  if int(model.nu) > 0:
+    try:
+      from mujoco_metal.actuation import ScalarMotorModel
+      ScalarMotorModel.from_model(model)
+    except ValueError:
+      return False
+  return True
+
+
+def implicit_derivative_reference(model, qpos, qvel):
+  """Assemble ``d(qfrc_passive + qfrc_tendon + qfrc_actuator)/d(qvel)`` (R06b).
+
+  Host float64 reference for the exact subset admitted by
+  :func:`implicitfast_supports_automatic`: passive joint damping (linear +
+  polynomial, pinned ``mju_polyForce`` derivative), fixed-tendon damping
+  tangents (``-J' diag(c) J`` with the pinned polynomial tangent), and a
+  zero block for admitted scalar motors. Fluid Jacobians, activation-state
+  dynamics and velocity-dependent actuator forces raise instead of
+  returning a silently incomplete matrix. Disable flags are honored.
+  """
+  if not implicitfast_supports_automatic(model):
+    if (model.opt.density != 0 or model.opt.viscosity != 0
+            or np.any(model.opt.wind != 0)):
+      raise ValueError("implicitfast fluid velocity derivatives are unsupported")
+    raise ValueError("automatic implicitfast derivatives exclude this model")
+  nv = int(model.nv)
+  qpos = np.asarray(qpos, dtype=np.float64)
+  qvel = np.asarray(qvel, dtype=np.float64)
+  if qpos.ndim != 2 or qpos.shape[1] != int(model.nq) or qvel.shape != (qpos.shape[0], nv):
+    raise ValueError(f"qpos/qvel must have shapes (B, {int(model.nq)}) and (B, {nv})")
+  if not qpos.shape[0]:
+    raise ValueError("batch must be nonempty")
+  if not np.all(np.isfinite(qpos)) or not np.all(np.isfinite(qvel)):
+    raise ValueError("qpos and qvel must be finite")
+  from mujoco_metal.passive import PassiveForceModel
+  from mujoco_metal.tendons import FixedTendonModel
+  deriv = np.zeros((qpos.shape[0], nv, nv), dtype=np.float64)
+  if nv:
+    damper = PassiveForceModel(model).damping_derivative(qvel)
+    for b in range(qpos.shape[0]):
+      deriv[b] -= np.diag(damper[b])
+    if int(model.ntendon) > 0:
+      _, tangent, _ = FixedTendonModel(model).run(qpos, qvel)
+      deriv -= tangent
+  return deriv
+
+
 def lower_implicitfast(model, *, external_derivative=False):
   """Validate the subset whose velocity derivative and advance are exact here.
 
