@@ -214,6 +214,7 @@ kernel void flex_interp_force(
     device float* elem_node_force [[buffer(11)]],
     uint tid [[thread_position_in_grid]]) {
   int batch=dims[0], nv=dims[1], nelem=dims[2], nnode=dims[3];
+  bool spring=dims[4]!=0, damper=dims[5]!=0;
   if (tid>=uint(batch*nelem)) return;
   int e=int(tid)%nelem, b=int(tid)/nelem;
   int meta=5*e, npe=elem_meta[meta], ax0=elem_meta[meta+1];
@@ -251,8 +252,8 @@ kernel void flex_interp_force(
   float localf[81]={0}, locald[81]={0};
   for (int r=0;r<nd;++r) for (int c=0;c<nd;++c) {
     float k=elem_K[(e*81+r)*81+c];
-    localf[r]+=k*disp[c/3][c%3];
-    locald[r]+=k*vel[c/3][c%3];
+    if (spring) localf[r]+=k*disp[c/3][c%3];
+    if (damper) locald[r]+=k*vel[c/3][c%3];
   }
   float dmp=flex_damping[e];
   for (int n=0;n<npe;++n) {
@@ -352,6 +353,7 @@ kernel void flex_shell_bend_force(
     device const float* records [[buffer(5)]],
     constant int* dims [[buffer(6)]],
     device float* elem_force [[buffer(7)]],
+    device float* elem_node_force [[buffer(8)]],
     uint tid [[thread_position_in_grid]]) {
   int batch=dims[0],nv=dims[1],nedge=dims[2],nnode=dims[3];
   if (tid>=uint(batch*nedge)) return;
@@ -382,6 +384,17 @@ kernel void flex_shell_bend_force(
   float3 wb=(residual-nb*dot(nb,residual))/lenb;
   float3 wa_t2=cross(wa,ta1),wa_t1=cross(wa,ta0);
   float3 wb_t2=cross(wb,tb1),wb_t1=cross(wb,tb0);
+  for (int n=0;n<9;++n) {
+    float3 fna=float3(0),fnb=float3(0);
+    if (n<(order_a+1)*(order_a+1))
+      fna=stiffness*(ga[n][0]*wa_t2-ga[n][1]*wa_t1);
+    if (n<(order_b+1)*(order_b+1))
+      fnb=-stiffness*(gb[n][0]*wb_t2-gb[n][1]*wb_t1);
+    for (int d=0;d<3;++d) {
+      elem_node_force[(b*nedge+e)*54+3*n+d]=fna[d];
+      elem_node_force[(b*nedge+e)*54+27+3*n+d]=fnb[d];
+    }
+  }
   for (int dof=0;dof<nv;++dof) {
     float qf=0;
     for (int n=0;n<(order_a+1)*(order_a+1);++n) {

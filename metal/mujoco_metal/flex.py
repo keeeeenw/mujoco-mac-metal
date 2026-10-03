@@ -568,7 +568,9 @@ class MetalFlex:
     if order == 1:
       phi, dphi = (0.5, 0.5), (-1.0, 1.0)
     elif order == 2:
-      phi, dphi = (0.25, 0.5, 0.25), (-1.0, 0.0, 1.0)
+      # Quadratic Lagrange basis values at the cell center. Only the midpoint
+      # node is nonzero there; endpoint basis values are exactly zero.
+      phi, dphi = (0.0, 1.0, 0.0), (-1.0, 0.0, 1.0)
     else:
       raise ValueError(f"unsupported pinned flex interpolation order {order}")
     grad = []
@@ -842,6 +844,86 @@ class MetalFlex:
           value = torch.sum(force * d_jac, dim=-1)
           self._stiffness_tangent[:, dof_i, dof_j].add_(value)
 
+  def _point_velocity_qpos_jacobian(self, body_ids, points, jacobian, qvel, poses):
+    """Return ``d(J*qvel)/dq`` for rigidly attached force points.
+
+    This term matters for passive damping: changing a parent's pose rotates
+    the child joint axes and therefore changes point velocity even when the
+    generalized velocity vector is held fixed. The topology loops are over
+    immutable compiled body/joint descriptors; all state arithmetic remains
+    on the active tensor device.
+    """
+    b = self.batch_size
+    nv = self.descriptor.nv
+    result = torch.zeros((b, len(body_ids), 3, nv), dtype=points.dtype,
+                         device=self._device)
+    if nv <= 0:
+      return result
+    body_quat = poses["body_quat"]
+    body_pos = poses["body_pos"]
+    anchors = poses.get("joint_anchor")
+    axes = poses.get("joint_axis")
+    if axes is None:
+      return result
+    eye = torch.eye(3, dtype=points.dtype, device=self._device)
+    for pi, body_value in enumerate(body_ids):
+      body = int(body_value)
+      if body <= 0:
+        continue
+      specs = []
+      for chain_index, joint in enumerate(self._body_joint_chain[body]):
+        typ = int(self._jnt_type[joint])
+        dofadr = int(self._jnt_dofadr[joint])
+        joint_body = int(self._jnt_bodyid[joint])
+        anchor = (anchors[:, joint, :] if anchors is not None
+                  else body_pos[:, joint_body, :])
+        if typ in (0, 1):
+          quat = body_quat[:, joint_body, :]
+          for component in range(3 if typ == 0 else 0,
+                                6 if typ == 0 else 3):
+            local_component = component - (3 if typ == 0 else 0)
+            basis = eye[local_component].expand(b, 3)
+            qv, qw = quat[:, 1:], quat[:, :1]
+            t = 2.0 * torch.cross(qv, basis, dim=-1)
+            axis = basis + qw * t + torch.cross(qv, t, dim=-1)
+            specs.append((dofadr + component, joint, chain_index,
+                          "rot", axis, anchor))
+          if typ == 0:
+            for component in range(3):
+              specs.append((dofadr + component, joint, chain_index,
+                            "slide", eye[component].expand(b, 3), anchor))
+        else:
+          mode = "slide" if typ == 2 else "rot"
+          specs.append((dofadr, joint, chain_index, mode,
+                        axes[:, joint, :], anchor))
+      point = points[:, pi, :]
+      point_jac = jacobian[:, pi, :, :]
+      for dof_j, joint_j, order_j, mode_j, axis_j, anchor_j in specs:
+        dvelocity = torch.zeros_like(point)
+        for dof_i, joint_i, order_i, mode_i, axis_i, anchor_i in specs:
+          strict_ancestor = order_j < order_i
+          same_joint = joint_i == joint_j
+          d_axis = torch.zeros_like(axis_i)
+          d_anchor = torch.zeros_like(anchor_i)
+          if mode_j == "rot" and (strict_ancestor or
+                                  (same_joint and mode_i == "rot")):
+            d_axis = torch.cross(axis_j, axis_i, dim=-1)
+          if strict_ancestor:
+            if mode_j == "rot":
+              d_anchor = torch.cross(axis_j, anchor_i - anchor_j, dim=-1)
+            else:
+              d_anchor = axis_j
+          dpoint = point_jac[:, :, dof_j]
+          if mode_i == "slide":
+            d_jac = d_axis
+          else:
+            lever = point - anchor_i
+            d_jac = (torch.cross(d_axis, lever, dim=-1)
+                     + torch.cross(axis_i, dpoint - d_anchor, dim=-1))
+          dvelocity += d_jac * qvel[:, dof_i:dof_i + 1]
+        result[:, pi, :, dof_j] = dvelocity
+    return result
+
   def run_device(
       self,
       qpos: torch.Tensor,
@@ -906,6 +988,13 @@ class MetalFlex:
     stiff_tang -= torch.einsum("be,benm->bnm", tension, geom)
     if qvel is not None:
       rate_gradient = torch.einsum("bn,benm->bem", qvel[:, :nv], geom)
+      point_vq = self._point_velocity_qpos_jacobian(
+          self.descriptor.vertbodyid, self._flexvert_xpos,
+          self._flexvert_J, qvel, poses)
+      relative_vq = (point_vq[:, self._edge[:, 1], :, :]
+                     - point_vq[:, self._edge[:, 0], :, :])
+      rate_gradient += torch.einsum("bei,bein->ben", self._flexedge_dir,
+                                    relative_vq)
       stiff_tang -= torch.einsum("be,ben,bem->bnm", c_eff, J_e, rate_gradient)
     self._damping_tangent.add_(damp_tang)
     self._stiffness_tangent.add_(stiff_tang)
@@ -921,7 +1010,7 @@ class MetalFlex:
 
     # 2. Pinned 2D membrane and 3D tetrahedral material forces.
     if self._stretch_count:
-      self._compute_pinned_stretch(poses)
+      self._compute_pinned_stretch(poses, qvel)
     if self._bend_count:
       self._compute_pinned_bend()
     if self._interp_count or self._shell_bend_count:
@@ -947,8 +1036,10 @@ class MetalFlex:
         (b, self._interp_count, nv), dtype=torch.float32, device=self._device)
     elem_node_force = torch.empty(
         (b, self._interp_count, 81), dtype=torch.float32, device=self._device)
+    spring = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
+    damper = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
     dims = torch.tensor(
-        [b, nv, self._interp_count, node_count],
+        [b, nv, self._interp_count, node_count, int(spring), int(damper)],
         dtype=torch.int32, device=self._device)
     self._material_shader.flex_interp_force(
         self._node_xpos.reshape(-1), self._node_xvel.reshape(-1),
@@ -958,12 +1049,28 @@ class MetalFlex:
         elem_force.reshape(-1), elem_node_force.reshape(-1),
         threads=(b * self._interp_count,), group_size=(32,))
     self._qfrc_passive[:, :nv].add_(elem_force.sum(dim=1))
+    # The material kernel emits Cartesian element forces as well as their
+    # generalized projection. Contract the rigid attachment Jacobian Hessian
+    # on-device so an articulated node's changing point Jacobian contributes
+    # to the configuration tangent. The FE topology is immutable host data;
+    # force values remain resident on the selected tensor device.
+    if nv:
+      for fe, node_ids in enumerate(self._interp_nodes_host):
+        npe = self._interp_npe_host[fe]
+        ids = np.asarray(node_ids, dtype=np.int32)
+        node_force = elem_node_force[:, fe, :3*npe].reshape(b, npe, 3)
+        self._add_attachment_tangent(
+            ids, self._node_xpos[:, ids, :], self._node_J[:, ids, :, :],
+            node_force, poses)
 
   def _compute_interpolated_shell_bend_mps(self):
     """Dispatch compiled Crouzeix-Raviart shell-bend forces on MPS."""
     b, nv = self.batch_size, self.descriptor.nv
     elem_force = torch.empty(
         (b, self._shell_bend_count, nv), dtype=torch.float32,
+        device=self._device)
+    elem_node_force = torch.empty(
+        (b, self._shell_bend_count, 54), dtype=torch.float32,
         device=self._device)
     dims = torch.tensor(
         [b, nv, self._shell_bend_count, len(self.descriptor.nodebodyid)],
@@ -976,9 +1083,23 @@ class MetalFlex:
         self._node_xpos.reshape(-1), self._node_J.reshape(-1),
         self._shell_face_nodes.reshape(-1), self._shell_face_axes.reshape(-1),
         self._shell_face_order, records.reshape(-1), dims,
-        elem_force.reshape(-1),
+        elem_force.reshape(-1), elem_node_force.reshape(-1),
         threads=(b * self._shell_bend_count,), group_size=(32,))
     self._qfrc_passive[:, :nv].add_(elem_force.sum(dim=1))
+    if nv:
+      for bend, record in enumerate(self._shell_bend_records_host):
+        face_a, face_b = int(record[0]), int(record[1])
+        for side, face in enumerate((face_a, face_b)):
+          node_ids = self._shell_face_nodes_host[face]
+          order = self._shell_face_order_host[face]
+          npe = (order + 1) ** 2
+          ids = np.asarray(node_ids[:npe], dtype=np.int32)
+          start = side * 27
+          node_force = elem_node_force[:, bend, start:start + 3*npe].reshape(
+              b, npe, 3)
+          self._add_attachment_tangent(
+              ids, self._node_xpos[:, ids, :], self._node_J[:, ids, :, :],
+              node_force, poses)
 
   def _compute_interpolated(self, poses):
     """Evaluate compiled Q1/Q2 corotational FE matrices (CPU test backend)."""
@@ -1137,7 +1258,7 @@ class MetalFlex:
         self.descriptor.nodebodyid, self._node_xpos, self._node_J,
         node_force, poses)
 
-  def _compute_pinned_stretch(self, poses):
+  def _compute_pinned_stretch(self, poses, qvel):
     """Evaluate MuJoCo 3.10's compiled simplex stiffness representation."""
     b, nv = self.batch_size, self.descriptor.nv
     d = self.descriptor
@@ -1213,6 +1334,13 @@ class MetalFlex:
           "bei,bein->ben",
           (vdiffs - unit * rates.unsqueeze(-1)) /
           torch.clamp(lengths.unsqueeze(-1), min=1e-10), jrel)
+      point_vq = self._point_velocity_qpos_jacobian(
+          d.vertbodyid[np.asarray(self._stretch_vertex_host[e], dtype=np.int32)],
+          x, jv, qvel, poses)
+      rel_vq = torch.stack([
+          point_vq[:, a, :, :] - point_vq[:, c, :, :]
+          for a, c in pairs], dim=1)
+      jrate += torch.einsum("bei,bein->ben", unit, rel_vq)
       kd = self._stretch_damping_host[e] / d.timestep if d.timestep > 0 else 0.0
       previous = lengths - rates * d.timestep
       elong = lengths.square() - self._edge_length0[edge_ids].square().unsqueeze(0)

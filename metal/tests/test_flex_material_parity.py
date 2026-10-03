@@ -38,6 +38,17 @@ def _model(dim):
   """)
 
 
+def _root_com(model, data):
+  """Repeat each kinematic root's subtree COM for its descendant bodies."""
+  out = np.zeros((model.nbody, 3), dtype=np.float64)
+  for body in range(1, model.nbody):
+    root = body
+    while int(model.body_parentid[root]) > 0:
+      root = int(model.body_parentid[root])
+    out[body] = data.subtree_com[root]
+  return out
+
+
 def _evaluate(model, qpos, qvel):
   MetalFlex, _ = _flex_api()
   data = mujoco.MjData(model)
@@ -51,7 +62,7 @@ def _evaluate(model, qpos, qvel):
       "joint_anchor": torch.tensor(data.xanchor[None], dtype=torch.float32),
       "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32),
       "root_com": torch.tensor(
-          data.subtree_com.reshape(model.nbody, 3)[None], dtype=torch.float32),
+          _root_com(model, data)[None], dtype=torch.float32),
   }
   force, damping, stiffness = flex.run_device(
       torch.tensor(qpos[None], dtype=torch.float32),
@@ -98,7 +109,7 @@ def test_mps_simplex_kernel_matches_pinned_cpu(dim):
       "joint_anchor": torch.tensor(data.xanchor[None], dtype=torch.float32, device="mps"),
       "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32, device="mps"),
       "root_com": torch.tensor(
-          data.subtree_com.reshape(model.nbody, 3)[None],
+          _root_com(model, data)[None],
           dtype=torch.float32, device="mps"),
   }
   force, _, _ = flex.run_device(
@@ -232,13 +243,60 @@ def test_material_force_uses_articulated_off_center_flex_vertices():
   qpos[0] = 0.31
   qpos[1] += 0.035
   qvel = np.linspace(-0.1, 0.1, model.nv)
-  data, flex, force, _, _ = _evaluate(model, qpos, qvel)
+  data, flex, force, _, stiffness = _evaluate(model, qpos, qvel)
   assert np.ptp(data.flexvert_xpos.reshape(-1, 3), axis=0).max() > 0.05
   assert np.max(np.abs(data.qfrc_passive)) > 1e-3
   np.testing.assert_allclose(force, data.qfrc_passive, rtol=1e-3, atol=8e-5)
   np.testing.assert_allclose(
       flex.flexvert_xpos.detach().numpy()[0], data.flexvert_xpos.reshape(-1, 3),
       rtol=1e-5, atol=2e-6)
+  eps = 2e-3
+  qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
+  qpos_hi[0] += eps
+  qpos_lo[0] -= eps
+  _, _, force_hi, _, _ = _evaluate(model, qpos_hi, qvel)
+  _, _, force_lo, _, _ = _evaluate(model, qpos_lo, qvel)
+  numerical = (force_hi - force_lo) / (2 * eps)
+  np.testing.assert_allclose(
+      stiffness.detach().numpy()[0, :, 0], numerical,
+      rtol=5e-2, atol=2e-3)
+
+
+@pytest.mark.parametrize(("joint_type", "rot_dof"), [("ball", 1), ("free", 4)])
+def test_material_force_tangent_tracks_articulated_rotation(joint_type, rot_dof):
+  model = mujoco.MjModel.from_xml_string(f"""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <body name="arm" pos=".2 -.1 1">
+        <joint name="root" type="{joint_type}" axis="0 1 0"/>
+        <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+        <flexcomp name="attached" type="grid" count="2 2 1"
+                  pos=".13 .21 -.07" spacing=".1 .1 .1" mass="1" dim="2">
+          <contact contype="0" conaffinity="0"/>
+          <edge stiffness="0" damping="0"/>
+          <elasticity young="1000" poisson=".2" damping=".4"
+                      thickness=".01" elastic2d="stretch"/>
+        </flexcomp>
+      </body>
+    </worldbody></mujoco>
+  """)
+  qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+  qpos[-1] += 0.035
+  qvel = np.linspace(-0.1, 0.1, model.nv)
+  data, _, _, _, stiffness = _evaluate(model, qpos, qvel)
+  rot_start = 0 if joint_type == "ball" else 3
+  assert np.max(np.abs(data.qfrc_passive[rot_start:rot_start + 3])) < 2e-5
+  eps = 2e-2
+  perturb = np.zeros(model.nv, dtype=np.float64)
+  perturb[rot_dof] = eps
+  qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
+  mujoco.mj_integratePos(model, qpos_hi, perturb, 1.0)
+  mujoco.mj_integratePos(model, qpos_lo, perturb, -1.0)
+  _, _, force_hi, _, _ = _evaluate(model, qpos_hi, qvel)
+  _, _, force_lo, _, _ = _evaluate(model, qpos_lo, qvel)
+  numerical = (force_hi - force_lo) / (2 * eps)
+  np.testing.assert_allclose(
+      stiffness.detach().numpy()[0, :, rot_dof], numerical,
+      rtol=8e-2, atol=2e-4)
 
 
 def test_interpolated_q1_volume_uses_compiled_element_matrix():
@@ -287,7 +345,7 @@ def test_mps_interpolated_q1_volume_kernel_matches_pinned_cpu():
       "joint_anchor": torch.tensor(data.xanchor[None], dtype=torch.float32, device="mps"),
       "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32, device="mps"),
       "root_com": torch.tensor(
-          data.subtree_com.reshape(model.nbody, 3)[None],
+          _root_com(model, data)[None],
           dtype=torch.float32, device="mps"),
   }
   force, _, _ = flex.run_device(
@@ -297,10 +355,24 @@ def test_mps_interpolated_q1_volume_kernel_matches_pinned_cpu():
   np.testing.assert_allclose(
       force.detach().cpu().numpy()[0], data.qfrc_passive,
       rtol=3e-4, atol=1e-5)
+  spring_bit = int(mujoco.mjtDisableBit.mjDSBL_SPRING)
+  damper_bit = int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
+  for disable in (spring_bit, damper_bit, spring_bit | damper_bit):
+    model.opt.disableflags = disable
+    disabled_data = mujoco.MjData(model)
+    disabled_data.qpos[:], disabled_data.qvel[:] = qpos, qvel
+    mujoco.mj_forward(model, disabled_data)
+    flex._disableflags = disable
+    disabled_force = flex.run_device(
+        torch.tensor(qpos[None], dtype=torch.float32, device="mps"),
+        torch.tensor(qvel[None], dtype=torch.float32, device="mps"), poses,
+        torch.tensor(disabled_data.cvel[None], dtype=torch.float32, device="mps"))[0]
+    np.testing.assert_allclose(
+        disabled_force.detach().cpu().numpy()[0], disabled_data.qfrc_passive,
+        rtol=3e-4, atol=1e-5)
+  model.opt.disableflags = 0
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "known Q2 compiled interpolation discrepancy: force mismatch remains under source review"))
 def test_mps_interpolated_q2_volume_kernel_matches_pinned_cpu():
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -329,7 +401,7 @@ def test_mps_interpolated_q2_volume_kernel_matches_pinned_cpu():
       "joint_anchor": torch.tensor(data.xanchor[None], dtype=torch.float32, device="mps"),
       "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32, device="mps"),
       "root_com": torch.tensor(
-          data.subtree_com.reshape(model.nbody, 3)[None],
+          _root_com(model, data)[None],
           dtype=torch.float32, device="mps"),
   }
   force, _, _ = flex.run_device(
@@ -339,6 +411,27 @@ def test_mps_interpolated_q2_volume_kernel_matches_pinned_cpu():
   np.testing.assert_allclose(
       force.detach().cpu().numpy()[0], data.qfrc_passive,
       rtol=3e-4, atol=1e-5)
+
+
+def test_interpolated_q2_volume_uses_compiled_element_matrix():
+  model = mujoco.MjModel.from_xml_string("""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <flexcomp name="q2" type="grid" count="3 3 3"
+                spacing=".1 .1 .1" mass="1" dim="3" dof="quadratic">
+        <contact contype="0" conaffinity="0" selfcollide="none"/>
+        <elasticity young="1000" poisson=".2" damping=".1"/>
+      </flexcomp>
+    </worldbody></mujoco>
+  """)
+  assert model.flex_interp[0] == 2
+  qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+  qpos[3] += 0.02
+  qpos[-4] -= 0.01
+  qvel = np.linspace(-0.03, 0.04, model.nv)
+  data, flex, force, _, _ = _evaluate(model, qpos, qvel)
+  assert flex._interp_npe_host == (27,)
+  assert np.max(np.abs(data.qfrc_passive)) > 1e-4
+  np.testing.assert_allclose(force, data.qfrc_passive, rtol=3e-4, atol=1e-5)
 
 
 def test_mps_interpolated_q1_shell_bending_matches_pinned_cpu():
@@ -369,7 +462,7 @@ def test_mps_interpolated_q1_shell_bending_matches_pinned_cpu():
       "joint_anchor": torch.tensor(data.xanchor[None], dtype=torch.float32, device="mps"),
       "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32, device="mps"),
       "root_com": torch.tensor(
-          data.subtree_com.reshape(model.nbody, 3)[None],
+          _root_com(model, data)[None],
           dtype=torch.float32, device="mps"),
   }
   force, _, _ = flex.run_device(
