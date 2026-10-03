@@ -655,8 +655,11 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       pairs.append((g1, g2, solref, solimp, condim, friction5, np.zeros(2), margin, gap))
 
   npairs = len(pairs)
-  if npairs > _MAX_PAIRS:
-    raise ValueError(f"candidate contact pairs ({npairs}) exceeds capacity {_MAX_PAIRS}")
+  # 017 capacity: candidate counts flow through the explicit estimator so
+  # overflow carries requested-vs-allowed detail; default limits preserve the
+  # historical ceilings until the matching scalable path lands.
+  from mujoco_metal.capacity import check_capacity as _check_capacity
+  from mujoco_metal.capacity import estimate_capacity as _estimate_capacity
 
   # 3. Contact slots and offsets derivation
   pair_contact_offset = [0]
@@ -689,18 +692,16 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       contact_condim_packed.extend([condim, row_offset, cone_type])
       row_offset += rows_per_con
 
-  if total_candidate_contacts > _MAX_CONTACTS:
-    raise ValueError(f"total candidate contact slots ({total_candidate_contacts}) exceeds capacity {_MAX_CONTACTS}")
-
-  # 4. Capacity calculation from explicit equality spans plus joint/contact spans.
-  # The activity array still has one entry per equality; row mapping is
-  # deterministic via eq_rowadr/eq_rownum. Do not replace all uses of neq
-  # indiscriminately.
   nr_joint = int(n_eq_rows + model.nv + 2 * model.njnt + n_ten_rows)
   nr_contact = int(row_offset)
   nr = int(nr_joint + nr_contact)
-  if nr > _MAX_ROWS:
-    raise ValueError(f"total candidate constraint rows ({nr}) exceeds capacity {_MAX_ROWS}")
+  # Single capacity gate (pairs/slots/rows/nv/batch/memory) with
+  # requested-vs-allowed diagnostics; messages preserve historical text.
+  # The activity array still has one entry per equality; row mapping is
+  # deterministic via eq_rowadr/eq_rownum. Do not replace all uses of neq
+  # indiscriminately.
+  _estimate = _estimate_capacity(model, 1, npairs, total_candidate_contacts, nr)
+  _check_capacity(_estimate)
 
   # Assemble packed joint parameters
   joint_sol_params = (
