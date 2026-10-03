@@ -337,6 +337,8 @@ class CoupledConstraintDescriptor:
   ten_length_map: np.ndarray = None
   ten_moment_map: np.ndarray = None
   dense_path: bool = True
+  n_flex_contact_rows: int = 0
+  flex_contact_base: int = 0
 
 
 def _mix_contact_parameters(model, g1, g2):
@@ -729,7 +731,16 @@ def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor
 
   nr_joint = int(n_eq_rows + model.nv + 2 * model.njnt + n_ten_rows)
   nr_contact = int(row_offset)
-  nr = int(nr_joint + nr_contact)
+  n_flex_contact_rows = 0
+  if int(model.nflexvert) > 0 and int(model.nflex) > 0:
+    has_flex_contact = any(
+        int(model.flex_contype[f]) != 0 or int(model.flex_conaffinity[f]) != 0
+        for f in range(int(model.nflex))
+    )
+    if has_flex_contact:
+      n_flex_contact_rows = int(model.nflexvert) * 4
+  flex_contact_base = int(nr_joint + nr_contact)
+  nr = int(nr_joint + nr_contact + n_flex_contact_rows)
   # Single capacity gate (pairs/slots/rows/nv/batch/memory) with
   # requested-vs-allowed diagnostics; messages preserve historical text.
   # The activity array still has one entry per equality; row mapping is
@@ -1038,6 +1049,8 @@ def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor
                     else 1.0),
       solver_settings=solver_settings,
       n_eq_rows=n_eq_rows,
+      n_flex_contact_rows=n_flex_contact_rows,
+      flex_contact_base=flex_contact_base,
       ntendon=int(model.ntendon),
       ten_base=ten_base,
       ten_friction_rows=ten_friction_rows,
@@ -1752,6 +1765,143 @@ class MetalCoupledConstraints:
               dbg_w[:, nr_val * nr_val + 4 * nr_val + r] = -float("inf")
               dbg_w[:, nr_val * nr_val + 5 * nr_val + r] = float("inf")
               dbg_w[:, nr_val * nr_val + 6 * nr_val + r] = is_active
+
+    # 1d. Flex contact constraint rows (milestone 018: flex-obstacle contacts).
+    if d.n_flex_contact_rows > 0 and flex is not None:
+      nr_val = int(d.nr)
+      J_w = w["workspace_J"].view(b, nr_val, max(nv, 1))
+      dbg_w = w["workspace_debug"].view(b, -1)
+      timestep = float(d.timestep)
+      impratio = float(d.impratio)
+      refsafe = bool(d.refsafe)
+      nvert = int(flex.descriptor.nflexvert)
+      xpos = flex._flexvert_xpos
+      vert_J = flex._flexvert_J
+
+      for k in range(d.n_flex_contact_rows):
+        r = d.flex_contact_base + k
+        J_w[:, r, :nv] = 0.0
+        dbg_w[:, nr_val * nr_val + r] = 0.0
+        dbg_w[:, nr_val * nr_val + nr_val + r] = 0.0
+        dbg_w[:, nr_val * nr_val + 6 * nr_val + r] = 0.0
+
+      for g in range(d.ngeom):
+        gtype = int(d.geom_type[g])
+        gpos = poses["geom_pos"][:, g, :]
+        gquat = poses["geom_quat"][:, g, :]
+        qw, qx, qy, qz = gquat[:, 0:1], gquat[:, 1:2], gquat[:, 2:3], gquat[:, 3:4]
+
+        sr = np.asarray(self._mjmodel_ref.geom_solref[g]).copy()
+        si = np.asarray(self._mjmodel_ref.geom_solimp[g]).copy()
+        fr = np.asarray(self._mjmodel_ref.geom_friction[g]).copy()
+        mu0 = float(fr[0])
+        tc, dr = float(sr[0]), float(sr[1])
+        if refsafe and tc > 0:
+          tc = max(tc, 2.0 * timestep)
+        k0 = 1.0 / max(1e-15, tc * tc * dr * dr) if tc > 0 else 100.0
+        b0 = 2.0 / max(1e-15, tc) if tc > 0 else 10.0
+        dmin, dmax, width, mid, power = float(si[0]), float(si[1]), float(si[2]), float(si[3]), float(si[4])
+        width = max(width, 1e-15)
+
+        for v in range(nvert):
+          fid = int(flex._vert_flexid[v])
+          rv = float(flex._radius[fid])
+          pv = xpos[:, v, :]
+          rel = pv - gpos
+          qv = torch.cat([-qx, -qy, -qz], dim=-1)
+          t = 2.0 * torch.cross(qv, rel, dim=-1)
+          lpos = rel + qw * t + torch.cross(qv, t, dim=-1)
+
+          if gtype == 0:
+            dist = lpos[:, 2] - rv
+            n_vec = torch.cat([2.0*(qx*qz + qw*qy), 2.0*(qy*qz - qw*qx), 1.0 - 2.0*(qx*qx + qy*qy)], dim=-1)
+            t1_vec = torch.cat([2.0*(qx*qy - qw*qz), 1.0 - 2.0*(qx*qx + qz*qz), 2.0*(qy*qz + qw*qx)], dim=-1)
+            t2_vec = torch.cat([1.0 - 2.0*(qy*qy + qz*qz), 2.0*(qx*qy + qw*qz), 2.0*(qx*qz - qw*qy)], dim=-1)
+          elif gtype == 2:
+            s_rad = float(d.geom_size[g, 0])
+            n_len = torch.clamp(torch.norm(lpos, dim=-1, keepdim=True), min=1e-8)
+            dist = n_len.squeeze(-1) - (s_rad + rv)
+            l_n = lpos / n_len
+            qv_pos = torch.cat([qx, qy, qz], dim=-1)
+            t_n = 2.0 * torch.cross(qv_pos, l_n, dim=-1)
+            n_vec = l_n + qw * t_n + torch.cross(qv_pos, t_n, dim=-1)
+            up = torch.tensor([0.0, 0.0, 1.0], device=self._device).expand(b, 3)
+            alt = torch.tensor([1.0, 0.0, 0.0], device=self._device).expand(b, 3)
+            ref_vec = torch.where(torch.abs(n_vec[:, 2:3]) < 0.9, up, alt)
+            t1_vec = torch.cross(n_vec, ref_vec, dim=-1)
+            t1_vec = t1_vec / torch.clamp(torch.norm(t1_vec, dim=-1, keepdim=True), min=1e-8)
+            t2_vec = torch.cross(n_vec, t1_vec, dim=-1)
+          elif gtype == 6:
+            bs = d.geom_size[g]
+            bx, by, bz = float(bs[0]), float(bs[1]), float(bs[2])
+            dx = torch.abs(lpos[:, 0]) - bx
+            dy = torch.abs(lpos[:, 1]) - by
+            dz = torch.abs(lpos[:, 2]) - bz
+            dmax = torch.maximum(dx, torch.maximum(dy, dz))
+            dist = dmax - rv
+            sgn_x = torch.sign(lpos[:, 0:1])
+            sgn_y = torch.sign(lpos[:, 1:2])
+            sgn_z = torch.sign(lpos[:, 2:3])
+            l_n = torch.where(dx.unsqueeze(-1) >= torch.maximum(dy, dz).unsqueeze(-1),
+                              torch.cat([sgn_x, torch.zeros_like(sgn_x), torch.zeros_like(sgn_x)], dim=-1),
+                              torch.where(dy.unsqueeze(-1) >= dz.unsqueeze(-1),
+                                          torch.cat([torch.zeros_like(sgn_y), sgn_y, torch.zeros_like(sgn_y)], dim=-1),
+                                          torch.cat([torch.zeros_like(sgn_z), torch.zeros_like(sgn_z), sgn_z], dim=-1)))
+            qv_pos = torch.cat([qx, qy, qz], dim=-1)
+            t_n = 2.0 * torch.cross(qv_pos, l_n, dim=-1)
+            n_vec = l_n + qw * t_n + torch.cross(qv_pos, t_n, dim=-1)
+            up = torch.tensor([0.0, 0.0, 1.0], device=self._device).expand(b, 3)
+            alt = torch.tensor([1.0, 0.0, 0.0], device=self._device).expand(b, 3)
+            ref_vec = torch.where(torch.abs(n_vec[:, 2:3]) < 0.9, up, alt)
+            t1_vec = torch.cross(n_vec, ref_vec, dim=-1)
+            t1_vec = t1_vec / torch.clamp(torch.norm(t1_vec, dim=-1, keepdim=True), min=1e-8)
+            t2_vec = torch.cross(n_vec, t1_vec, dim=-1)
+          else:
+            continue
+
+          in_con = dist < 0.005
+          if not bool(torch.any(in_con)):
+            continue
+
+          pos_val = dist
+          x_val = torch.abs(pos_val / width)
+          y_val = torch.where(x_val <= mid,
+                              (1.0 / (mid ** (power - 1))) * (x_val ** power),
+                              1.0 - (1.0 / ((1.0 - mid) ** (power - 1))) * ((1.0 - x_val) ** power))
+          y_val = torch.clamp(y_val, 0.0, 1.0)
+          imp = dmin + y_val * (dmax - dmin)
+          imp = torch.clamp(imp, min=1e-4, max=0.9999)
+
+          bvid = int(self._mjmodel_ref.flex_vertbodyid[v])
+          invw0 = float(self._mjmodel_ref.body_invweight0[bvid, 0])
+          diagA = invw0 * (1.0 + mu0 * mu0)
+          Rnormal = (1.0 - imp) / imp * diagA
+          Rpy = torch.clamp(2.0 * (mu0 * mu0 / max(impratio, 1e-15)) * Rnormal, min=1e-15)
+
+          Jv = vert_J[:, v, :, :]
+          Jn = torch.sum(n_vec.unsqueeze(-1) * Jv, dim=1)
+          Jt1 = torch.sum(t1_vec.unsqueeze(-1) * Jv, dim=1)
+          Jt2 = torch.sum(t2_vec.unsqueeze(-1) * Jv, dim=1)
+
+          J_rows = [
+              Jt1 + mu0 * Jn,
+              -Jt1 + mu0 * Jn,
+              -Jt2 + mu0 * Jn,
+              Jt2 + mu0 * Jn,
+          ]
+
+          act_f = in_con.float()
+          for k in range(4):
+            r = d.flex_contact_base + v * 4 + k
+            Jr = J_rows[k]
+            v_row = torch.sum(Jr * qvel, dim=-1)
+            aref = -b0 * v_row - k0 * imp * dist
+            J_w[:, r, :nv] = Jr * act_f.unsqueeze(-1)
+            dbg_w[:, nr_val * nr_val + r] = torch.where(in_con, Rpy, 0.0)
+            dbg_w[:, nr_val * nr_val + nr_val + r] = aref * act_f
+            dbg_w[:, nr_val * nr_val + 4 * nr_val + r] = 0.0
+            dbg_w[:, nr_val * nr_val + 5 * nr_val + r] = float("inf")
+            dbg_w[:, nr_val * nr_val + 6 * nr_val + r] = act_f
 
     # 2. Coupled constraint solver kernel
     solve_fn = self._solve_kernel if self.descriptor.dense_path else self._solve_block_kernel
