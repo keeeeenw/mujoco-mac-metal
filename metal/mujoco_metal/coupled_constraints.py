@@ -163,12 +163,16 @@ def pair_max_contacts(t1: int, t2: int, sdf_initpoints: int = 8) -> int:
     return min(int(sdf_initpoints), _SDF_MAX_PER_PAIR)
   if _HFIELD in (t_min, t_max):
     if t_min == _HFIELD and t_max == _HFIELD:
+      # Pinned mjCOLLISIONFUNC has no heightfield-heightfield entry (NULL):
+      # rejection matches the engine, it is not a coverage gap.
       raise ValueError("heightfield-heightfield pairs are unsupported")
     if t_max == _MESH:
       # Faceted-prism vs hull EPA basins need a dedicated snap treatment
       # (measured 5x depth error on shallow presses); analytic types only.
       raise ValueError("mesh-heightfield pairs are unsupported in 012")
     if t_min == _PLANE:
+      # Pinned mjCOLLISIONFUNC has no plane-heightfield entry (NULL):
+      # zero slots match the engine, not a coverage gap.
       return 0
     if t_max == _SPHERE or t_max == _ELLIPSOID:
       return 8
