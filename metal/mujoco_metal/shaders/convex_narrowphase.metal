@@ -244,201 +244,250 @@ inline float cx_gjk(int ta, float3 pa, float3x3 Ra, float3 sza,
   return length(closest);
 }
 
-// EPA penetration query seeded by the GJK terminal simplex (which encloses
-// the origin). Returns depth (>0), normal, and witness points. The normal
-// direction is validated against the CPU oracle (g1 -> g2 on overlap).
-inline float cx_epa(int ta, float3 pa, float3x3 Ra, float3 sza,
+// MPR penetration query (Minkowski Portal Refinement; pinned MuJoCo uses
+// the same algorithm family via mjc_Convex/libccd for these pairs).
+// Portal = tetrahedron (v0 = Minkowski center + face v1,v2,v3 facing
+// outside). Returns depth (>0), normal, and witness points. Returns 0
+// (touching, center-delta normal) in degenerate configurations.
+#define CX_MPR_TOL 1e-6f
+#define CX_MPR_MAXITER 64
+
+// Outward face normal + signed dist (origin strictly inside iff dist > 0).
+// Outward is defined against the opposite tetra vertex `o`.
+inline float cx_face_out(float3 a, float3 b, float3 c, float3 o, thread float3& n) {
+  n = cross(b - a, c - a);
+  float l = length(n);
+  if (l < 1e-24f) { n = float3(1.0f, 0.0f, 0.0f); return 0.0f; }
+  n = n / l;
+  if (dot(n, o - a) > 0.0f) n = -n;
+  return dot(n, a);
+}
+
+// Portal face direction (v1,v2,v3): outward by construction (legacy helper
+// for the portal-only MPR path; winding fixed by the caller).
+inline float3 cx_portal_dir(float3 v1, float3 v2, float3 v3) {
+  float3 n = cross(v2 - v1, v3 - v1);
+  float l = length(n);
+  return l > 1e-24f ? n / l : float3(1.0f, 0.0f, 0.0f);
+}
+
+// Ensure strict origin containment, repairing with support points.
+// Returns false when unfixable (caller reports no contact).
+inline bool cx_ensure_contained(thread CxVertex* P, int ta, float3 pa, float3x3 Ra, float3 sza,
+                                int tb, float3 pb, float3x3 Rb, float3 szb) {
+  for (int guard = 0; guard < 16; ++guard) {
+    float3 n0, n1, n2, n3;
+    float d0 = cx_face_out(P[1].m, P[2].m, P[3].m, P[0].m, n0);
+    float d1 = cx_face_out(P[0].m, P[3].m, P[2].m, P[1].m, n1);
+    float d2 = cx_face_out(P[0].m, P[1].m, P[3].m, P[2].m, n2);
+    float d3 = cx_face_out(P[0].m, P[2].m, P[1].m, P[3].m, n3);
+    float worst = d0;
+    int wi = 0;
+    float3 wn = n0;
+    if (d1 < worst) { worst = d1; wi = 1; wn = n1; }
+    if (d2 < worst) { worst = d2; wi = 2; wn = n2; }
+    if (d3 < worst) { worst = d3; wi = 3; wn = n3; }
+    if (worst > 0.0f) return true;
+    CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, wn);
+    if (dot(v.m, wn) <= worst) return false;
+    // Replace the vertex opposite the worst face (faces omit vertex wi).
+    int drop = wi;
+    P[drop] = v;
+  }
+  return false;
+}
+
+// Expand portal with v4, keeping v0 and outward facing (libccd expandPortal).
+inline void cx_expand_portal(thread CxVertex* P, thread CxVertex* v4) {
+  float3 t = cross(v4->m, P[0].m);
+  if (dot(P[1].m, t) > 0.0f) {
+    if (dot(P[2].m, t) > 0.0f) {
+      P[1] = *v4;
+    } else {
+      P[3] = *v4;
+    }
+  } else {
+    if (dot(P[3].m, t) > 0.0f) {
+      P[2] = *v4;
+    } else {
+      P[1] = *v4;
+    }
+  }
+}
+
+// Strict origin-in-tetrahedron test (all faces separate origin).
+inline bool cx_tet_contains(thread CxVertex* P) {
+  float3 n;
+  if (cx_face_out(P[1].m, P[2].m, P[3].m, P[0].m, n) <= 0.0f) return false;
+  if (cx_face_out(P[0].m, P[3].m, P[2].m, P[1].m, n) <= 0.0f) return false;
+  if (cx_face_out(P[0].m, P[1].m, P[3].m, P[2].m, n) <= 0.0f) return false;
+  if (cx_face_out(P[0].m, P[2].m, P[1].m, P[3].m, n) <= 0.0f) return false;
+  return true;
+}
+
+// MPR penetration query (Minkowski Portal Refinement; pinned MuJoCo uses
+// the same algorithm family via mjc_Convex/libccd for these pairs).
+// Portal = tetrahedron (v0 = Minkowski center + face v1,v2,v3 facing
+// outside). Returns depth (>0), normal, and witness points. Returns 0
+// (touching, center-delta normal) in degenerate configurations.
+inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
                     int tb, float3 pb, float3x3 Rb, float3 szb,
-                    thread CxVertex* seed, int nseed,
                     thread float3& normal, thread float3& wpa, thread float3& wpb) {
-  float3 d0 = pa - pb;
-  CxVertex V[8];
-  int nv = 0;
-  float3 dirs[6] = {float3(1,0,0), float3(-1,0,0), float3(0,1,0),
-                    float3(0,-1,0), float3(0,0,1), float3(0,0,-1)};
-  for (int i = 0; i < nseed && nv < 8; ++i) {
-    bool dup = false;
-    for (int j = 0; j < nv; ++j) {
-      if (dot(V[j].m - seed[i].m, V[j].m - seed[i].m) < 1e-18f) { dup = true; break; }
+  CxVertex P[4];
+  P[0].a = pa; P[0].b = pb; P[0].m = pa - pb;
+  float3 c0 = P[0].m;
+  if (dot(c0, c0) < 1e-30f) {
+    c0 = float3(CX_MPR_TOL * 10.0f, 0.0f, 0.0f);
+    P[0].m = c0;
+  }
+  // v1 = support toward origin.
+  float3 dir = -c0;
+  float dl = length(dir);
+  dir = dl > 1e-24f ? dir / dl : float3(1.0f, 0.0f, 0.0f);
+  P[1] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir);
+  if (dot(P[1].m, dir) <= 0.0f) return 0.0f;
+  // v2 perpendicular to plane (origin, v0, v1). The cross-product sign
+  // is ambiguous: try both and keep a strictly containing portal.
+  CxVertex v1v = P[1];
+  bool have_portal = false;
+  for (int attempt = 0; attempt < 2 && !have_portal; ++attempt) {
+    P[1] = v1v;
+    dir = cross(P[0].m, P[1].m);
+    if (attempt == 1) dir = -dir;
+    if (dot(dir, dir) < 1e-30f) {
+      // Origin on segment v0-v1 (libccd findPenetrSegment): depth = |v1|.
+      float l1 = length(P[1].m);
+      normal = l1 > 1e-24f ? P[1].m / l1 : c0 / max(length(c0), 1e-24f);
+      wpa = (P[1].a + P[1].b) * 0.5f;
+      wpb = wpa;
+      return l1;
     }
-    if (!dup) { V[nv] = seed[i]; nv++; }
-  }
-  for (int i = 0; i < 6 && nv < 8; ++i) {
-    CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dirs[i]);
-    bool dup = false;
-    for (int j = 0; j < nv; ++j) {
-      if (dot(V[j].m - v.m, V[j].m - v.m) < 1e-18f) { dup = true; break; }
+    dl = length(dir); dir = dir / dl;
+    P[2] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir);
+    if (dot(P[2].m, dir) <= 0.0f) {
+      if (attempt == 1) return 0.0f;
+      continue;
     }
-    if (!dup) { V[nv] = v; nv++; }
-  }
-  if (nv < 4) {
-    // Degenerate (coincident shapes): use center delta.
-    normal = length(d0) > 1e-12f ? d0 / length(d0) : float3(1,0,0);
-    wpa = pa; wpb = pb;
-    return length(d0) > 1e-12f ? 0.0f : 0.0f;
-  }
-  // Select 4 points whose tetrahedron strictly contains the origin
-  // (C(8,4) search; the GJK edge passes through the origin, so a container
-  // exists for genuine overlap). Falls back to the first 4 points.
-  int S_[4] = {0, 1, 2, 3};
-  {
-    bool found = false;
-    for (int i0 = 0; i0 < nv && !found; ++i0)
-    for (int i1 = i0 + 1; i1 < nv && !found; ++i1)
-    for (int i2 = i1 + 1; i2 < nv && !found; ++i2)
-    for (int i3 = i2 + 1; i3 < nv && !found; ++i3) {
-      float3 p0 = V[i0].m, p1 = V[i1].m, p2 = V[i2].m, p3 = V[i3].m;
-      float Vt = cx_svol(p0, p1, p2, p3);
-      if (fabs(Vt) < 1e-24f) continue;
-      float l0 = cx_svol(float3(0.0f), p1, p2, p3) / Vt;
-      float l1 = cx_svol(p0, float3(0.0f), p2, p3) / Vt;
-      float l2 = cx_svol(p0, p1, float3(0.0f), p3) / Vt;
-      float l3 = cx_svol(p0, p1, p2, float3(0.0f)) / Vt;
-      float m = min(min(l0, l1), min(l2, l3));
-      if (m > 1e-6f) {
-        S_[0] = i0; S_[1] = i1; S_[2] = i2; S_[3] = i3;
-        found = true;
+    // v3: perpendicular to plane (v0, v1, v2), oriented outside origin.
+    {
+      float3 e1 = P[1].m - P[0].m, e2 = P[2].m - P[0].m;
+      dir = cross(e1, e2);
+      dl = length(dir);
+      if (dl < 1e-24f) {
+        normal = c0 / max(length(c0), 1e-24f);
+        wpa = (P[0].a + P[1].a + P[2].a) / 3.0f;
+        wpb = (P[0].b + P[1].b + P[2].b) / 3.0f;
+        return 0.0f;
       }
+      dir = dir / dl;
+      if (dot(dir, P[0].m) > 0.0f) dir = -dir;
     }
-  }
-  CxVertex W[8];
-  for (int i = 0; i < nv; ++i) W[i] = V[i];
-  // Move the enclosing tet to the front.
-  {
-    CxVertex T[8];
-    bool used[8];
-    for (int i = 0; i < 8; ++i) used[i] = false;
-    for (int i = 0; i < 4; ++i) { T[i] = W[S_[i]]; used[S_[i]] = true; }
-    int m = 4;
-    for (int i = 0; i < nv; ++i) {
-      if (!used[i] && m < 8) { T[m] = W[i]; m++; }
-    }
-    for (int i = 0; i < m; ++i) V[i] = T[i];
-    nv = m;
-  }
-  int F[CX_EPA_MAXFACES * 3];
-  int nf = 0;
-  int topo[4][3] = {{0,1,2},{0,3,1},{0,2,3},{1,3,2}};
-  {
-    float3 cen = (V[0].m + V[1].m + V[2].m + V[3].m) * 0.25f;
-    for (int i = 0; i < 4; ++i) {
-      F[nf*3+0] = topo[i][0]; F[nf*3+1] = topo[i][1]; F[nf*3+2] = topo[i][2];
-      float3 a = V[F[nf*3]].m, b = V[F[nf*3+1]].m, c = V[F[nf*3+2]].m;
-      float3 nrm = cross(b - a, c - a);
-      if (dot(nrm, a - cen) < 0.0f) {
-        int t = F[nf*3+1]; F[nf*3+1] = F[nf*3+2]; F[nf*3+2] = t;
-      }
-      nf++;
-    }
-  }
-  float best = 0.0f;
-  int bi = 0;
-  float3 bn = float3(1,0,0);
-  for (int iter = 0; iter < CX_EPA_MAXITER; ++iter) {
-    // Find face closest to origin.
-    best = 1e30f; bi = -1;
-    for (int i = 0; i < nf; ++i) {
-      float3 a = V[F[i*3]].m, b = V[F[i*3+1]].m, c = V[F[i*3+2]].m;
-      float3 nrm = cross(b - a, c - a);
-      float l = length(nrm);
-      if (l < 1e-24f) continue;
-      nrm = nrm / l;
-      float dist = dot(nrm, a);
-      if (dist < best) { best = dist; bi = i; bn = nrm; }
-    }
-    if (bi < 0) break;
-    CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, bn);
-    float adv = dot(v.m, bn) - best;
-    if (adv < 1e-6f * max(1.0f, best)) {
-      // Converged: barycentric witness on best face.
-      float u, w, x;
-      float3 a = V[F[bi*3]].m, b = V[F[bi*3+1]].m, c = V[F[bi*3+2]].m;
-      cx_tri_closest(a, b, c, &u, &w, &x);
-      wpa = V[F[bi*3]].a * u + V[F[bi*3+1]].a * w + V[F[bi*3+2]].a * x;
-      wpb = V[F[bi*3]].b * u + V[F[bi*3+1]].b * w + V[F[bi*3+2]].b * x;
-      normal = bn;
-      return best;
-    }
-    // Expand: remove visible faces, stitch horizon.
-    if (nv >= 8) break;  // vertex budget exhausted
-    V[nv] = v;
-    int vnew = nv; nv++;
-    int kept[CX_EPA_MAXFACES * 3];
-    int nk = 0;
-    int horizon[64];
-    int nh = 0;
-    for (int i = 0; i < nf; ++i) {
-      float3 a = V[F[i*3]].m;
-      // Face visible if new vertex is strictly outside it.
-      float3 b = V[F[i*3+1]].m, c = V[F[i*3+2]].m;
-      float3 nrm = cross(b - a, c - a);
-      float l = length(nrm);
-      bool vis = false;
-      if (l > 1e-24f) {
-        nrm = nrm / l;
-        vis = dot(v.m - a, nrm) > 1e-9f;
-      }
-      if (!vis) {
-        kept[nk*3] = F[i*3]; kept[nk*3+1] = F[i*3+1]; kept[nk*3+2] = F[i*3+2];
-        nk++;
+    bool failed = false;
+    for (int guard = 0; guard < 8; ++guard) {
+      P[3] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir);
+      if (dot(P[3].m, dir) <= 0.0f) { failed = true; break; }
+      // Origin outside face (v1,v0,v3)? -> v2 = v3 (libccd absolute test).
+      float3 va = cross(P[1].m, P[3].m);
+      if (dot(va, P[0].m) < 0.0f && dot(va, va) > 1e-30f) {
+        P[2] = P[3];
       } else {
-        // Boundary edges: add all three, duplicates cancel below.
-        int e[3][2] = {{F[i*3],F[i*3+1]},{F[i*3+1],F[i*3+2]},{F[i*3+2],F[i*3]}};
-        for (int e2 = 0; e2 < 3 && nh < 62; ++e2) {
-          horizon[nh++] = e[e2][0]; horizon[nh++] = e[e2][1];
+        // Origin outside face (v3,v0,v2)? -> v1 = v3.
+        va = cross(P[3].m, P[2].m);
+        if (dot(va, P[0].m) < 0.0f && dot(va, va) > 1e-30f) {
+          P[1] = P[3];
+        } else {
+          break;  // portal established
         }
       }
+      float3 e1 = P[1].m - P[0].m, e2 = P[2].m - P[0].m;
+      dir = cross(e1, e2);
+      dl = length(dir);
+      if (dl < 1e-24f) { failed = true; break; }
+      dir = dir / dl;
+      if (dot(dir, P[0].m) > 0.0f) dir = -dir;
     }
-    // Cancel shared (opposite) edges; keep boundary loop edges.
-    bool used[64];
-    for (int i = 0; i < nh; ++i) used[i] = false;
-    for (int i = 0; i < nf && nk * 3 + 3 <= CX_EPA_MAXFACES * 3; ++i) {
-      (void)i;
-      break;
+    if (failed) {
+      if (attempt == 1) return 0.0f;
+      continue;
     }
-    for (int i = 0; i < nh; i += 2) {
-      if (used[i]) continue;
-      bool shared = false;
-      for (int j = 0; j < nh; j += 2) {
-        if (i == j || used[j]) continue;
-        if (horizon[i] == horizon[j+1] && horizon[i+1] == horizon[j]) {
-          used[j] = true; shared = true; break;
-        }
-      }
-      if (!shared && nk * 3 + 3 <= CX_EPA_MAXFACES * 3) {
-        kept[nk*3] = horizon[i]; kept[nk*3+1] = horizon[i+1]; kept[nk*3+2] = vnew;
-        nk++;
-      }
+    if (cx_tet_contains(P)) {
+      have_portal = true;
+    } else if (attempt == 1) {
+      // Neither winding contains the origin: report no contact rather
+      // than refining an invalid portal (prevents wander like capsule-cyl
+      // converging to a tilted face with overestimated depth).
+      normal = c0 / max(length(c0), 1e-24f);
+      wpa = pa; wpb = pb;
+      return 0.0f;
     }
-    nf = 0;
-    for (int i = 0; i < nk && i < CX_EPA_MAXFACES; ++i) {
-      // Orient new faces away from the polytope interior (vertex centroid).
-      float3 cen = float3(0.0f);
-      for (int k = 0; k < nv; ++k) cen += V[k].m;
-      cen = cen / float(max(nv, 1));
-      float3 a = V[kept[i*3]].m, b = V[kept[i*3+1]].m, c = V[kept[i*3+2]].m;
-      float3 nrm = cross(b - a, c - a);
-      if (dot(nrm, a - cen) < 0.0f) {
-        int t = kept[i*3+1]; kept[i*3+1] = kept[i*3+2]; kept[i*3+2] = t;
-      }
-      F[nf*3] = kept[i*3]; F[nf*3+1] = kept[i*3+1]; F[nf*3+2] = kept[i*3+2];
-      nf++;
-    }
-    if (nf == 0) break;
   }
-  // Fallback: best face found.
-  if (bi >= 0 && bi < nf) {
-    float u, w, x;
-    float3 a = V[F[bi*3]].m, b = V[F[bi*3+1]].m, c = V[F[bi*3+2]].m;
-    cx_tri_closest(a, b, c, &u, &w, &x);
-    wpa = V[F[bi*3]].a * u + V[F[bi*3+1]].a * w + V[F[bi*3+2]].a * x;
-    wpb = V[F[bi*3]].b * u + V[F[bi*3+1]].b * w + V[F[bi*3+2]].b * x;
-    normal = bn;
-    return max(best, 0.0f);
+  // Force the portal face outward (origin strictly on the inner side).
+  // All subsequent faces are maintained outward by expandPortal's rule.
+  {
+    float3 n0 = cx_portal_dir(P[1].m, P[2].m, P[3].m);
+    if (dot(n0, P[1].m) < 0.0f) {
+      CxVertex tmp = P[2]; P[2] = P[3]; P[3] = tmp;
+    }
   }
-  normal = length(d0) > 1e-12f ? d0 / length(d0) : float3(1,0,0);
-  wpa = pa; wpb = pb;
-  return 0.0f;
+  // Encapsulation phase (libccd refinePortal): expand until the portal
+  // face strictly separates the origin (dist > 0) or prove impossibility.
+  for (int guard = 0; guard < 64; ++guard) {
+    float3 fdir = cx_portal_dir(P[1].m, P[2].m, P[3].m);
+    if (dot(fdir, P[1].m) > 0.0f) break;
+    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, fdir);
+    if (dot(v4.m, fdir) <= 0.0f) return 0.0f;
+    float adv0 = dot(v4.m, fdir) - dot(P[1].m, fdir);
+    adv0 = min(adv0, dot(v4.m, fdir) - dot(P[2].m, fdir));
+    adv0 = min(adv0, dot(v4.m, fdir) - dot(P[3].m, fdir));
+    if (adv0 < CX_MPR_TOL) return 0.0f;
+    cx_expand_portal(P, &v4);
+  }
+  // Refine portal face toward origin, then read depth. Tracks the best
+  // (deepest) certified state so post-convergence wander cannot regress.
+  float3 nrm = cx_portal_dir(P[1].m, P[2].m, P[3].m);
+  float best = dot(nrm, P[1].m);
+  CxVertex bestP[4];
+  float bestVal = best;
+  float3 bestNrm = nrm;
+  bestP[0] = P[0]; bestP[1] = P[1]; bestP[2] = P[2]; bestP[3] = P[3];
+  for (int iter = 0; iter < CX_MPR_MAXITER; ++iter) {
+    nrm = cx_portal_dir(P[1].m, P[2].m, P[3].m);
+    best = dot(nrm, P[1].m);
+    if (best > bestVal) {
+      bestVal = best; bestNrm = nrm;
+      bestP[0] = P[0]; bestP[1] = P[1]; bestP[2] = P[2]; bestP[3] = P[3];
+    }
+    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, nrm);
+    float adv = dot(v4.m, nrm) - best;
+    if (adv < CX_MPR_TOL * max(1.0f, best)) break;
+    cx_expand_portal(P, &v4);
+  }
+  // Restore the best certified portal for witness/depth readout.
+  P[0] = bestP[0]; P[1] = bestP[1]; P[2] = bestP[2]; P[3] = bestP[3];
+  nrm = bestNrm;
+  best = bestVal;
+  // Witnesses: tetrahedron barycentric of origin (libccd findPos).
+  {
+    float3 t0 = P[0].m, t1 = P[1].m, t2 = P[2].m, t3 = P[3].m;
+    float b0 = dot(cross(t1, t2), t3);
+    float b1 = dot(cross(t3, t2), t0);
+    float b2 = dot(cross(t0, t1), t3);
+    float b3 = dot(cross(t2, t1), t0);
+    float sum = b0 + b1 + b2 + b3;
+    if (fabs(sum) < 1e-30f || sum < 0.0f) {
+      float u, w, x;
+      cx_tri_closest(t1, t2, t3, &u, &w, &x);
+      wpa = P[1].a * u + P[2].a * w + P[3].a * x;
+      wpb = P[1].b * u + P[2].b * w + P[3].b * x;
+    } else {
+      float inv = 1.0f / sum;
+      wpa = (P[0].a * b0 + P[1].a * b1 + P[2].a * b2 + P[3].a * b3) * inv;
+      wpb = (P[0].b * b0 + P[1].b * b1 + P[2].b * b2 + P[3].b * b3) * inv;
+    }
+    best = dot(nrm, P[1].m);
+  }
+  normal = nrm;
+  return max(best, 0.0f);
 }
 
 // High-level convex entry points used by collide_pair (milestone 010).
@@ -477,8 +526,7 @@ inline int cx_single_contact(int ta, float3 pa, float3x3 Ra, float3 sza,
     return 1;
   }
   float3 nrm, ea, eb;
-  float depth = cx_epa(ta, pa, Ra, sza, tb, pb, Rb, szb, seed, nseed,
-                       nrm, ea, eb);
+  float depth = cx_mpr(ta, pa, Ra, sza, tb, pb, Rb, szb, nrm, ea, eb);
   // Guard against relative-enclosure false positives at ~1e-8 gaps.
   if (depth <= 1e-9f) return 0;
   out[0].normal = nrm;
