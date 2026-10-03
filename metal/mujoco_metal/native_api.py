@@ -164,7 +164,8 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None,
   # 8. Subtract constraint forces (mj_invConstraint)
   if getattr(sim, "_coupled_constraints", None) is not None:
     cc = sim._coupled_constraints
-    saved_workspace = {k: v.clone() for k, v in cc._workspace.items()}
+    from mujoco_metal.simulation import _clone_system_dict, _restore_system_buffers
+    saved_workspace = _clone_system_dict(cc._workspace)
     saved_last = getattr(sim, "_last_coupled", None)
     saved_last_generation = getattr(sim, "_last_coupled_generation", None)
     eq_act = getattr(state, "_eq_active", None)
@@ -176,96 +177,87 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None,
           tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
           flex=getattr(sim, "_flex", None),
       )
-    except Exception:
-      for key, saved in saved_workspace.items():
-        cc._workspace[key].copy_(saved)
+      w = cc._workspace
+      b = sim.batch_size
+      nr = cc.descriptor.nr
+      nv = sim.model.nv
+      if nr > 0:
+        J = w["workspace_J"].view(b, nr, nv)
+        dbg = w["workspace_debug"].view(b, -1)
+        R = dbg[:, nr * nr : nr * nr + nr]
+        aref = dbg[:, nr * nr + nr : nr * nr + 2 * nr]
+        jar = torch.bmm(J, qa.unsqueeze(-1)).squeeze(-1) - aref
+        # MuJoCo's inverse constraint force is the gradient of the row cost.
+        # Bilateral rows are quadratic for either sign. Remaining scalar rows
+        # are bounded/unilateral; their bounds are assembled with the row.
+        raw_force = -jar / torch.clamp(R, min=1e-12)
+        n_eq = int(cc.descriptor.n_eq_rows)
+        lo = w["workspace_debug"].view(b, -1)[:, nr * nr + 4 * nr:nr * nr + 5 * nr]
+        hi = w["workspace_debug"].view(b, -1)[:, nr * nr + 5 * nr:nr * nr + 6 * nr]
+        bounded = torch.minimum(torch.maximum(raw_force, lo), hi)
+        if n_eq:
+          bounded[:, :n_eq] = raw_force[:, :n_eq]
+        force = torch.where(R > 0, bounded, torch.zeros_like(raw_force))
+        # Elliptic contacts use MuJoCo's group cone cost (mj_constraintUpdate),
+        # whose tangential gradient couples every row in a contact. Applying
+        # independent scalar bounds here is correct for pyramidal friction but
+        # gives a different force for the elliptic middle-cone region.
+        desc = cc.descriptor
+        if (int(desc.cone_type) == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
+            and int(desc.ncontacts_max) > 0):
+          packed = np.asarray(desc.contact_condim_packed, dtype=np.int32).reshape(-1, 3)
+          friction = cc._constants["contact_friction"].reshape(-1, 5)
+          contact_mask = constraint_result.get("contact_mask")
+          contact_base = int(desc.nr_joint)
+          for slot, (condim, offset, cone) in enumerate(packed.tolist()):
+            if cone != int(mujoco.mjtCone.mjCONE_ELLIPTIC) or condim <= 1:
+              continue
+            row0 = contact_base + int(offset)
+            if row0 + condim > nr:
+              raise RuntimeError("elliptic contact rows exceed the native row layout")
+            # `mj_makeImpedance` scales the regularized elliptic-cone slope
+            # by sqrt(R_tangent / R_normal), so it depends on the assembled
+            # soft-contact rows (and opt.impratio), not just material friction.
+            mu = friction[slot, 0] * torch.sqrt(
+                torch.clamp(R[:, row0 + 1], min=0.0) /
+                torch.clamp(R[:, row0], min=1e-12))
+            coeff = friction[slot, :condim - 1]
+            rows = slice(row0, row0 + condim)
+            local_jar = jar[:, rows]
+            U = torch.cat((local_jar[:, :1] * mu[:, None],
+                           local_jar[:, 1:] * coeff.reshape(1, -1)), dim=1)
+            N = U[:, 0]
+            T = torch.linalg.vector_norm(U[:, 1:], dim=1)
+            top = (N >= mu * T) | ((T <= 0) & (N >= 0))
+            bottom = (mu * N + T <= 0) | ((T <= 0) & (N < 0))
+            Dm = (1.0 / torch.clamp(R[:, row0], min=1e-12)) / torch.clamp(
+                mu * mu * (1.0 + mu * mu), min=1e-24)
+            middle_scale = -Dm * (N - mu * T) * mu
+            cone_force = torch.empty_like(local_jar)
+            cone_force[:, 0] = middle_scale
+            Tsafe = torch.clamp(T, min=1e-20)
+            for axis in range(1, condim):
+              cone_force[:, axis] = (
+                  -middle_scale / Tsafe * U[:, axis] * coeff[axis - 1])
+            quadratic_force = raw_force[:, rows]
+            cone_force = torch.where(top[:, None], torch.zeros_like(cone_force),
+                                     torch.where(bottom[:, None], quadratic_force,
+                                                 cone_force))
+            if contact_mask is not None:
+              active = contact_mask[:, slot] > 0.5
+              active &= R[:, row0] > 0
+              cone_force = torch.where(active[:, None], cone_force,
+                                       torch.zeros_like(cone_force))
+            force[:, rows] = cone_force
+        qfrc_constraint = torch.bmm(J.transpose(1, 2), force.unsqueeze(-1)).squeeze(-1)
+        qfrc_inv = qfrc_inv - qfrc_constraint
+    finally:
+      _restore_system_buffers(cc._workspace, saved_workspace)
       sim._last_coupled = saved_last
       sim._last_coupled_generation = saved_last_generation
       if hasattr(sim, "_spatial_kin"):
         sim._spatial_kin = saved_spatial_kin
         sim._spatial_cache_key = saved_spatial_key
-      raise
-    w = cc._workspace
-    b = sim.batch_size
-    nr = cc.descriptor.nr
-    nv = sim.model.nv
-    if nr > 0:
-      J = w["workspace_J"].view(b, nr, nv)
-      dbg = w["workspace_debug"].view(b, -1)
-      R = dbg[:, nr * nr : nr * nr + nr]
-      aref = dbg[:, nr * nr + nr : nr * nr + 2 * nr]
-      jar = torch.bmm(J, qa.unsqueeze(-1)).squeeze(-1) - aref
-      # MuJoCo's inverse constraint force is the gradient of the row cost.
-      # Bilateral rows are quadratic for either sign. Remaining scalar rows
-      # are bounded/unilateral; their bounds are assembled with the row.
-      raw_force = -jar / torch.clamp(R, min=1e-12)
-      n_eq = int(cc.descriptor.n_eq_rows)
-      lo = w["workspace_debug"].view(b, -1)[:, nr * nr + 4 * nr:nr * nr + 5 * nr]
-      hi = w["workspace_debug"].view(b, -1)[:, nr * nr + 5 * nr:nr * nr + 6 * nr]
-      bounded = torch.minimum(torch.maximum(raw_force, lo), hi)
-      if n_eq:
-        bounded[:, :n_eq] = raw_force[:, :n_eq]
-      force = torch.where(R > 0, bounded, torch.zeros_like(raw_force))
-      # Elliptic contacts use MuJoCo's group cone cost (mj_constraintUpdate),
-      # whose tangential gradient couples every row in a contact. Applying
-      # independent scalar bounds here is correct for pyramidal friction but
-      # gives a different force for the elliptic middle-cone region.
-      desc = cc.descriptor
-      if (int(desc.cone_type) == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
-          and int(desc.ncontacts_max) > 0):
-        packed = np.asarray(desc.contact_condim_packed, dtype=np.int32).reshape(-1, 3)
-        friction = cc._constants["contact_friction"].reshape(-1, 5)
-        contact_mask = constraint_result.get("contact_mask")
-        contact_base = int(desc.nr_joint)
-        for slot, (condim, offset, cone) in enumerate(packed.tolist()):
-          if cone != int(mujoco.mjtCone.mjCONE_ELLIPTIC) or condim <= 1:
-            continue
-          row0 = contact_base + int(offset)
-          if row0 + condim > nr:
-            raise RuntimeError("elliptic contact rows exceed the native row layout")
-          # `mj_makeImpedance` scales the regularized elliptic-cone slope
-          # by sqrt(R_tangent / R_normal), so it depends on the assembled
-          # soft-contact rows (and opt.impratio), not just material friction.
-          mu = friction[slot, 0] * torch.sqrt(
-              torch.clamp(R[:, row0 + 1], min=0.0) /
-              torch.clamp(R[:, row0], min=1e-12))
-          coeff = friction[slot, :condim - 1]
-          rows = slice(row0, row0 + condim)
-          local_jar = jar[:, rows]
-          U = torch.cat((local_jar[:, :1] * mu[:, None],
-                         local_jar[:, 1:] * coeff.reshape(1, -1)), dim=1)
-          N = U[:, 0]
-          T = torch.linalg.vector_norm(U[:, 1:], dim=1)
-          top = (N >= mu * T) | ((T <= 0) & (N >= 0))
-          bottom = (mu * N + T <= 0) | ((T <= 0) & (N < 0))
-          Dm = (1.0 / torch.clamp(R[:, row0], min=1e-12)) / torch.clamp(
-              mu * mu * (1.0 + mu * mu), min=1e-24)
-          middle_scale = -Dm * (N - mu * T) * mu
-          cone_force = torch.empty_like(local_jar)
-          cone_force[:, 0] = middle_scale
-          Tsafe = torch.clamp(T, min=1e-20)
-          for axis in range(1, condim):
-            cone_force[:, axis] = (
-                -middle_scale / Tsafe * U[:, axis] * coeff[axis - 1])
-          quadratic_force = raw_force[:, rows]
-          cone_force = torch.where(top[:, None], torch.zeros_like(cone_force),
-                                   torch.where(bottom[:, None], quadratic_force,
-                                               cone_force))
-          if contact_mask is not None:
-            active = contact_mask[:, slot] > 0.5
-            active &= R[:, row0] > 0
-            cone_force = torch.where(active[:, None], cone_force,
-                                     torch.zeros_like(cone_force))
-          force[:, rows] = cone_force
-      qfrc_constraint = torch.bmm(J.transpose(1, 2), force.unsqueeze(-1)).squeeze(-1)
-      qfrc_inv = qfrc_inv - qfrc_constraint
-    for key, saved in saved_workspace.items():
-      cc._workspace[key].copy_(saved)
-    sim._last_coupled = saved_last
-    sim._last_coupled_generation = saved_last_generation
-    if hasattr(sim, "_spatial_kin"):
-      sim._spatial_kin = saved_spatial_kin
-      sim._spatial_cache_key = saved_spatial_key
 
   if hasattr(sim, "_spatial_kin"):
     sim._spatial_kin = saved_spatial_kin

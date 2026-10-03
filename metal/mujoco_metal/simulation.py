@@ -54,6 +54,12 @@ def _restore_system_buffers(current, saved):
   if isinstance(saved, torch.Tensor):
     current.copy_(saved)
   elif isinstance(saved, dict):
+    # A query may publish additional structured maps while evaluating its
+    # temporary forward system. Restore the dictionary schema as well as
+    # tensors so it cannot retain maps describing the discarded query.
+    for key in tuple(current):
+      if key not in saved:
+        del current[key]
     for key, value in saved.items():
       _restore_system_buffers(current[key], value)
   elif is_dataclass(saved) and not isinstance(saved, type):

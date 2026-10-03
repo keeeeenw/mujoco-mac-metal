@@ -101,13 +101,78 @@ def test_inverse_includes_armature_mass_and_preserves_solver_cache():
   assert sim._assembled_system_valid == cache_valid
 
 
+@pytest.mark.parametrize("stepped", [False, True])
+@pytest.mark.parametrize("fail_gradient", [False, True])
+def test_inverse_preserves_structured_contact_workspace_and_next_step(
+    stepped, fail_gradient, monkeypatch):
+  """Queries and late errors preserve canonical map storage and replay."""
+  import dataclasses
+  import torch
+
+  model = mujoco.MjModel.from_xml_string('''<mujoco>
+    <option timestep=".002" solver="PGS" iterations="100"/>
+    <worldbody><geom type="plane" size="2 2 .1"/>
+    <body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1"
+      mass="1" condim="3"/></body></worldbody></mujoco>''')
+  qpos = np.tile(model.qpos0, (2, 1)).astype(np.float32)
+  qpos[1, 2] += .4
+  sim = MetalSimulation(model, 2, qpos=qpos, profile="integrated_euler_v1")
+  if stepped:
+    sim.step()
+  checkpoint = sim.snapshot()
+  control = MetalSimulation(model, 2, profile="integrated_euler_v1")
+  control.restore(checkpoint)
+  workspace = sim._coupled_constraints._workspace
+
+  def tensors(value, prefix=""):
+    if isinstance(value, torch.Tensor):
+      yield prefix, value
+    elif isinstance(value, dict):
+      for key, item in value.items():
+        yield from tensors(item, prefix + "/" + key)
+    elif dataclasses.is_dataclass(value):
+      for field in dataclasses.fields(value):
+        yield from tensors(getattr(value, field.name), prefix + "/" + field.name)
+
+  original_keys = set(workspace)
+  saved = {key: (_host(value), value.data_ptr()) for key, value in tensors(workspace)}
+  qacc = torch.ones((2, model.nv), dtype=torch.float32, device="mps")
+  if fail_gradient:
+    original_bmm = torch.bmm
+    nr = sim._coupled_constraints.descriptor.nr
+
+    def fail_after_constraint_assembly(left, right, *args, **kwargs):
+      if left.shape[-2:] == (nr, model.nv):
+        raise RuntimeError("inverse row-gradient failure")
+      return original_bmm(left, right, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+      patch.setattr(torch, "bmm", fail_after_constraint_assembly)
+      with pytest.raises(RuntimeError, match="inverse row-gradient failure"):
+        mj_inverse(sim, qacc=qacc)
+  else:
+    mj_inverse(sim, qacc=qacc)
+  assert set(workspace) == original_keys
+  current = dict(tensors(workspace))
+  assert set(current) == set(saved)
+  for key, (expected, pointer) in saved.items():
+    np.testing.assert_array_equal(_host(current[key]), expected, err_msg=key)
+    assert current[key].data_ptr() == pointer, key
+  sim.step()
+  control.step()
+  for field in ("qpos", "qvel", "qacc", "time", "status", "qacc_warmstart"):
+    np.testing.assert_array_equal(_host(getattr(sim.state, "_" + field)),
+                                  _host(getattr(control.state, "_" + field)))
+
+
 @pytest.mark.parametrize("cone,condim", [
     ("elliptic", 3), ("elliptic", 4), ("elliptic", 6),
     ("pyramidal", 3), ("pyramidal", 4), ("pyramidal", 6),
 ])
-def test_inverse_contact_friction_cone_matches_pinned_force_gradient(cone, condim):
+@pytest.mark.parametrize("solver", ["PGS", "CG", "Newton"])
+def test_inverse_contact_friction_cone_matches_pinned_force_gradient(cone, condim, solver):
   model = mujoco.MjModel.from_xml_string(f"""<mujoco>
-    <option gravity="0 0 -9.81" cone="{cone}" solver="PGS" iterations="100" impratio="2"/>
+    <option gravity="0 0 -9.81" cone="{cone}" solver="{solver}" iterations="100" impratio="2"/>
     <worldbody><geom name="floor" type="plane" size="2 2 .1"/>
       <body pos="0 0 .09"><freejoint/>
         <geom name="ball" type="sphere" size=".1" mass="1"/>

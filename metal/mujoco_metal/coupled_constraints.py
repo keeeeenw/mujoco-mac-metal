@@ -1472,6 +1472,13 @@ class MetalCoupledConstraints:
         b, d.npairs, d.npairs, device=self._device) if d.npairs else None)
     self._slot_compaction = (self._CompactionWorkspace(
         b, nc, nc, device=self._device) if nc else None)
+    # Canonical map storage exists before the first query/solve. This lets
+    # query transactions restore both a mask and its corresponding packed
+    # identities instead of leaving a lazily published map from the query.
+    if self._pair_compaction is not None:
+      self._workspace["pair_maps"] = self._pair_compaction.output
+    if self._slot_compaction is not None:
+      self._workspace["slot_maps"] = self._slot_compaction.output
     self._empty_compaction_map = torch.full((1,), -1, dtype=torch.int32,
                                             device=self._device)
     if d.neq > 0:
