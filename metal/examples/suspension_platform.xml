@@ -3,15 +3,22 @@
   <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6" gravity="0 0 -9.81">
     <flag contact="enable" equality="enable" limit="enable" frictionloss="disable"/>
   </option>
+  <asset>
+    <texture name="floor_grid" type="2d" builtin="checker" rgb1="0.12 0.15 0.20" rgb2="0.22 0.28 0.35" width="512" height="512"/>
+    <material name="floor_material" texture="floor_grid" texrepeat="8 8" reflectance="0.1"/>
+  </asset>
   <worldbody>
-    <geom name="floor" type="plane" size="5 5 0.1" pos="0 0 0" condim="1" priority="1" contype="1" conaffinity="0"/>
+    <light directional="true" pos="0 -2 5" dir="0 0.3 -1" diffuse="0.9 0.9 0.9" specular="0.3 0.3 0.3"/>
+
+    <geom material="floor_material" name="floor" type="plane" size="5 5 0.1" pos="0 0 0" condim="1" priority="1" contype="1" conaffinity="0"/>
     <body name="carrier" pos="0 0 1.6" mocap="true">
       <geom name="carrier_geom" type="box" size="0.5 0.08 0.06" rgba="0.5 0.5 0.55 1" mass="0.5" contype="0" conaffinity="0"/>
       <site name="c0" pos="-0.4 0.3 -0.03"/>
       <site name="c1" pos="0.4 0.3 -0.03"/>
       <site name="c2" pos="-0.4 -0.3 -0.03"/>
       <site name="c3" pos="0.4 -0.3 -0.03"/>
-      <body name="strut" pos="0 0 -0.03">
+      <geom name="strut_mount" type="capsule" fromto="0 0 -0.03 0 -0.5 -0.03" size="0.025" mass="0" contype="0" conaffinity="0" rgba="0.5 0.5 0.55 1"/>
+      <body name="strut" pos="0 -0.5 -0.03">
         <joint name="swivel" type="ball" limited="true" range="0 0.28"/>
         <geom name="strut_geom" type="capsule" size="0.02 0.25" pos="0 0 -0.25" rgba="0.8 0.6 0.2 1" mass="0.2" contype="0" conaffinity="0"/>
         <geom name="bob_geom" type="sphere" size="0.05" pos="0 0 -0.5" rgba="0.8 0.6 0.2 1" mass="0.3" contype="0" conaffinity="0"/>

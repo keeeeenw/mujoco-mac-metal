@@ -4,9 +4,9 @@
 
 A mocap gantry carries two muscle-driven fingers (antagonistic flexor/
 extensor pairs with MuJoCo muscle dynamics, force-length-velocity gains and
-passive biases) plus a palm contact pad, so each grasp is a three-sided cage
-(fingers + palm) rather than a friction-only pinch. Phase A delivers a sphere to a bin (grasp, carry, set-down
-release). Phase B delivers a larger, heavier sphere onto a pedestal (grasp,
+passive biases). Parallel jaws include supporting ledges; the schedule clears
+the bin walls and pedestal. Phase A delivers a sphere to a bin (grasp, carry,
+release). Phase B delivers a second sphere onto a pedestal (grasp,
 carry, set-down release). Gantry motion and finger schedules are deterministic
 open-loop inputs identical in CPU/native runs; a paired always-open run shows
 the physical effect of grasping.
@@ -36,17 +36,18 @@ WPS = [
     (500, 0.0, 0.15, FIRM),
     (700, 0.53, 0.40, FIRM),
     (1000, 0.53, 0.40, FIRM),
-    (1100, 0.53, 0.165, FIRM),
-    (1150, 0.53, 0.165, OPEN),
+    (1100, 0.53, 0.37, FIRM),
+    (1150, 0.53, 0.37, OPEN),
     (1300, 0.53, 0.45, OPEN),
     (1450, 0.30, 0.45, OPEN),
-    (1600, 0.30, 0.16, OPEN),
-    (1750, 0.30, 0.16, FIRM),
+    (1600, 0.30, 0.15, OPEN),
+    (1750, 0.30, 0.15, FIRM),
     (1900, 0.30, 0.40, FIRM),
-    (2400, -0.15, 0.40, FIRM),
-    (2500, -0.15, 0.285, FIRM),
-    (2550, -0.15, 0.285, OPEN),
-    (2700, -0.15, 0.50, OPEN),
+    (2400, -0.5, 0.40, FIRM),
+    (2500, -0.5, 0.38, FIRM),
+    (2550, -0.5, 0.38, OPEN),
+    (2700, -0.5, 0.50, OPEN),
+    (3000, -0.5, 0.50, OPEN),
 ]
 
 
@@ -74,7 +75,7 @@ def _sched(step):
   return np.array([WPS[-1][1], 0, WPS[-1][2]]), WPS[-1][3]
 
 
-def run(steps=2700, mode="metal", check=False, record=None):
+def run(steps=3000, mode="metal", check=False, record=None):
   if mode not in ("metal", "cpu"):
     raise ValueError(f"Unknown mode {mode!r}")
   model = _load_model()
@@ -99,11 +100,18 @@ def run(steps=2700, mode="metal", check=False, record=None):
   finger_geoms = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n)
                   for n in ("fingerL_geom", "fingerR_geom")]
 
+  from demo_clearance import ClearanceMonitor
+  clearance = ClearanceMonitor(model, [
+      (moving, fixed)
+      for moving in ("palm_geom", "fingerL_geom", "fingerR_geom", "ledgeL", "ledgeR")
+      for fixed in ("bin_geom", "wallL_geom", "wallR_geom", "pedestal_geom", "floor")
+  ])
+
   recorder = None
   if record:
     from demo_recording import ComparisonRecorder
     recorder = ComparisonRecorder(model, record, "Muscle Gripper | Grasp and Carry",
-                                  [0.1, 0, 0.3], 2.6, azimuth=135, elevation=-20)
+                                  [0.1, 0, 0.30], 1.8, azimuth=110, elevation=-30)
 
   max_qpos_err = 0.0; max_qvel_err = 0.0
   max_act_err = 0.0
@@ -153,6 +161,9 @@ def run(steps=2700, mode="metal", check=False, record=None):
       if (g1 in finger_geoms or g2 in finger_geoms):
         finger_contacts += 1
         break
+    clearance.sample(
+        native.state.qpos[0].cpu().numpy() if native is not None else cpu_grasp.qpos,
+        cpu_grasp.mocap_pos, cpu_grasp.mocap_quat)
     if recorder and native is not None:
       actual = mujoco.MjData(model)
       actual.qpos[:] = native.state.qpos[0].cpu().numpy()
@@ -195,7 +206,10 @@ def run(steps=2700, mode="metal", check=False, record=None):
       "released_ball": released, "latched_ball": latched,
       "block_rel": block_rel, "block_lat": block_lat,
       "steps": steps,
+      "minimum_geometry_distance": clearance.minimum,
   }
+  if check:
+    clearance.check()
   if check and mode == "metal":
     assert pre_qpos_err < 2e-3, pre_qpos_err
     assert pre_qvel_err < 0.2, pre_qvel_err
@@ -208,13 +222,13 @@ def run(steps=2700, mode="metal", check=False, record=None):
     # Always-open counterfactual never delivers (ball stays on the floor outside).
     assert not (0.45 <= latched[0] <= 0.75 and latched[1] < 0.25), latched
     # Second ball set down onto the pedestal (top z=0.2, rest center 0.255).
-    assert abs(block_rel[0] - -0.15) < 0.10, block_rel
+    assert abs(block_rel[0] - -0.5) < 0.10, block_rel
     assert abs(block_rel[1] - 0.255) < 0.03, block_rel
     assert abs(block_rel[0] - block_lat[0]) > 0.1
   return result
 
 
-def run_viewer(steps=2700, seconds=0):
+def run_viewer(steps=3000, seconds=0):
   """Interactive native viewer (requires a display; headless uses --headless).
 
   Steps the native simulation with the deterministic gantry/finger schedule
@@ -239,10 +253,10 @@ def run_viewer(steps=2700, seconds=0):
   mujoco.mj_forward(model, actual)
   max_err = 0.0
   with mj_viewer.launch_passive(model, actual) as viewer:
-    viewer.cam.lookat[:] = [0.1, 0, 0.3]
-    viewer.cam.distance = 2.6
-    viewer.cam.azimuth = 135
-    viewer.cam.elevation = -20
+    viewer.cam.lookat[:] = [0.1, 0, 0.30]
+    viewer.cam.distance = 1.8
+    viewer.cam.azimuth = 110
+    viewer.cam.elevation = -30
     deadline = time.monotonic() + seconds
     for step in range(steps):
       if not viewer.is_running():
@@ -269,7 +283,7 @@ def run_viewer(steps=2700, seconds=0):
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--steps", type=int, default=2700)
+  parser.add_argument("--steps", type=int, default=3000)
   parser.add_argument("--mode", choices=["metal", "cpu"], default="metal")
   parser.add_argument("--headless", action="store_true")
   parser.add_argument("--check", action="store_true", help="check native/CPU rollout")

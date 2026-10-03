@@ -64,11 +64,17 @@ def run(steps=1200, mode="metal", check=False, record=None):
     mujoco.mj_resetDataKeyframe(model, d, 0)
     mujoco.mj_forward(model, d)
 
+  from demo_clearance import ClearanceMonitor
+  clearance = ClearanceMonitor(model, [
+      (strut, cargo) for strut in ("strut_geom", "bob_geom")
+      for cargo in ("platform_geom", "cargo_geom")
+  ])
+
   recorder = None
   if record:
     from demo_recording import ComparisonRecorder
     recorder = ComparisonRecorder(model, record, "Suspension Platform | Mixed Constraints",
-                                  [0.0, 0, 0.8], 3.4, azimuth=135, elevation=-12)
+                                  [0.0, -0.1, 1.0], 2.8, azimuth=120, elevation=-20)
 
   max_qpos_err = 0.0
   max_pos_err = 0.0
@@ -118,6 +124,9 @@ def run(steps=1200, mode="metal", check=False, record=None):
       max_qpos_err = max(max_qpos_err, float(np.max(np.abs(gq - cpu_swing.qpos))))
       if step == steps - 1:
         end_pos_err, end_quat_err = epos, equat
+    clearance.sample(
+        native.state.qpos[0].cpu().numpy() if native is not None else cpu_swing.qpos,
+        cpu_swing.mocap_pos, cpu_swing.mocap_quat)
     if recorder and native is not None:
       actual = mujoco.MjData(model)
       actual.qpos[:] = native.state.qpos[0].cpu().numpy()
@@ -161,7 +170,10 @@ def run(steps=1200, mode="metal", check=False, record=None):
       "swing": swing,
       "level": level,
       "steps": steps,
+      "minimum_geometry_distance": clearance.minimum,
   }
+  if check:
+    clearance.check()
   if check and mode == "metal":
     assert max_pos_err < 5e-3, max_pos_err
     assert max_quat_err < 1.5e-2, max_quat_err

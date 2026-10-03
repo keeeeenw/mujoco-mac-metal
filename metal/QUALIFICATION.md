@@ -21,7 +21,7 @@ float32; CPU MuJoCo provides the numerical oracle. Native checks use
 | Full suite with native GPU execution | 518 passed, 336.75 s | Recorded physics qualification |
 | Focused armature/spatial/coupled suite | 105 passed | Native regression checks |
 | Gripper and drawbridge native headless gates | Exit 0 for both | Bounded demo behavior and CPU comparisons |
-| Full suite without Torch | 211 passed, 304 skipped, 2.45 s | Final publication check |
+| Full suite without Torch | 215 passed, 304 skipped, 2.57 s | Final publication check |
 | Shader source inventory, including missing-file negative control | Included in the passing CPU suite | Source completeness |
 | Built-wheel contents and installation for this increment | Pending | Source checks are not a wheel-install test |
 | Interactive display and broader hardware/OS behavior | Not requalified | Separate validation required |
@@ -51,7 +51,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 MUJOCO_METAL_RUN_GPU=1 PYTHONPATH=metal \
   python -m pytest metal/tests -q -p no:cacheprovider
 
 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples \
-  python metal/examples/muscle_gripper.py --headless --check --steps 2700
+  python metal/examples/muscle_gripper.py --headless --check --steps 3000
 
 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples \
   python metal/examples/cable_drawbridge.py --headless --check --steps 1400

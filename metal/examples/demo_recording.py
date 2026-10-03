@@ -43,12 +43,14 @@ class ComparisonRecorder:
       mujoco.mj_forward(self.model, data)
       self.renderer.update_scene(data, self.camera)
       panels.append(self.renderer.render().copy())
-    image = self.Image.fromarray(np.concatenate(panels, axis=1))
+    # Dedicated caption bands keep labels readable without covering geometry.
+    image = self.Image.new("RGB", (1200, 412), (24, 34, 48))
+    image.paste(self.Image.fromarray(np.concatenate(panels, axis=1)), (0, 26))
     draw = self.ImageDraw.Draw(image)
-    draw.text((12, 12), self.title + ' | Native Metal', fill='white')
-    draw.text((612, 12), 'CPU MuJoCo reference', fill='white')
+    draw.text((12, 8), self.title + ' | Native Metal', fill='white')
+    draw.text((612, 8), 'CPU MuJoCo reference', fill='white')
     draw.text(
-        (12, 338), extra or 'Actual simulation | 1x playback', fill='white'
+        (12, 394), extra or 'Actual simulation | 1x playback', fill='white'
     )
     self.frames.append(image)
 

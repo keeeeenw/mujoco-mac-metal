@@ -3,9 +3,15 @@
   <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6" cone="pyramidal" gravity="0 0 -9.81">
     <flag contact="enable" equality="enable" limit="enable" frictionloss="disable"/>
   </option>
+  <asset>
+    <texture name="floor_grid" type="2d" builtin="checker" rgb1="0.12 0.15 0.20" rgb2="0.22 0.28 0.35" width="512" height="512"/>
+    <material name="floor_material" texture="floor_grid" texrepeat="8 8" reflectance="0.1"/>
+  </asset>
   <worldbody>
-    <geom name="floor" type="plane" size="5 5 0.1" pos="0 0 0" condim="1" priority="1" contype="1" conaffinity="0"/>
-    <body name="pedestal" pos="-0.15 0 0">
+    <light directional="true" pos="0 -2 5" dir="0 0.3 -1" diffuse="0.9 0.9 0.9" specular="0.3 0.3 0.3"/>
+
+    <geom material="floor_material" name="floor" type="plane" size="5 5 0.1" pos="0 0 0" condim="1" priority="1" contype="1" conaffinity="0"/>
+    <body name="pedestal" pos="-0.5 0 0">
       <geom name="pedestal_geom" type="box" size="0.12 0.07 0.1" pos="0 0 0.1" rgba="0.5 0.5 0.55 1" mass="0" contype="1" conaffinity="0" condim="3"/>
     </body>
     <body name="bin" pos="0.62 0 0">
@@ -16,12 +22,14 @@
     <body name="gantry" pos="0 0 0.62" mocap="true">
       <geom name="palm_geom" type="box" size="0.13 0.05 0.03" rgba="0.85 0.55 0.15 1" mass="0.3" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
       <body name="fingerL" pos="-0.095 0 -0.02">
-        <joint name="gripL" type="hinge" axis="0 1 0" limited="true" range="-0.45 0.55" damping="1.0"/>
-        <geom name="fingerL_geom" type="box" size="0.02 0.04 0.09" rgba="0.9 0.5 0.1 1" mass="0.15" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
+        <joint name="gripL" type="slide" axis="-1 0 0" limited="true" range="-0.065 0.04" damping="1.0"/>
+        <geom name="fingerL_geom" type="box" size="0.02 0.04 0.11" pos="0 0 -0.02" rgba="0.9 0.5 0.1 1" mass="0.15" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
+        <geom name="ledgeL" type="box" size="0.035 0.04 0.008" pos="0.025 0 -0.12" mass="0" contype="1" conaffinity="0" rgba="0.9 0.6 0.2 1"/>
       </body>
       <body name="fingerR" pos="0.095 0 -0.02">
-        <joint name="gripR" type="hinge" axis="0 1 0" limited="true" range="-0.55 0.45" damping="1.0"/>
-        <geom name="fingerR_geom" type="box" size="0.02 0.04 0.09" rgba="0.85 0.55 0.15 1" mass="0.15" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
+        <joint name="gripR" type="slide" axis="1 0 0" limited="true" range="-0.065 0.04" damping="1.0"/>
+        <geom name="fingerR_geom" type="box" size="0.02 0.04 0.11" pos="0 0 -0.02" rgba="0.85 0.55 0.15 1" mass="0.15" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
+        <geom name="ledgeR" type="box" size="0.035 0.04 0.008" pos="-0.025 0 -0.12" mass="0" contype="1" conaffinity="0" rgba="0.9 0.6 0.2 1"/>
       </body>
     </body>
     <body name="ball" pos="0 0 0.055">
@@ -34,26 +42,30 @@
     </body>
   </worldbody>
   <contact>
-    <pair geom1="ball_geom" geom2="fingerL_geom"/>
-    <pair geom1="ball_geom" geom2="palm_geom"/>
-    <pair geom1="ball2_geom" geom2="palm_geom"/>
-    <pair geom1="ball_geom" geom2="fingerR_geom"/>
-    <pair geom1="ball_geom" geom2="bin_geom" condim="4"/>
-    <pair geom1="ball_geom" geom2="wallL_geom"/>
-    <pair geom1="ball_geom" geom2="wallR_geom"/>
-    <pair geom1="ball2_geom" geom2="fingerL_geom"/>
-    <pair geom1="ball2_geom" geom2="fingerR_geom"/>
-    <pair geom1="ball2_geom" geom2="floor"/>
-    <pair geom1="ball2_geom" geom2="pedestal_geom" condim="1"/>
-    <pair geom1="ball_geom" geom2="floor"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball2_geom" geom2="ledgeR"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="ledgeR"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball2_geom" geom2="ledgeL"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="ledgeL"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="fingerL_geom"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="palm_geom"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball2_geom" geom2="palm_geom"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="fingerR_geom"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="bin_geom" condim="4"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="wallL_geom"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="wallR_geom"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball2_geom" geom2="fingerL_geom"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball2_geom" geom2="fingerR_geom"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball2_geom" geom2="floor"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball2_geom" geom2="pedestal_geom" condim="6" friction="1 1 0.005 0.02 0.02"/>
+    <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="floor"/>
   </contact>
   <actuator>
     <general joint="gripL" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="1"/>
     <general joint="gripL" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="-1"/>
-    <general joint="gripR" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="-1"/>
     <general joint="gripR" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="1"/>
+    <general joint="gripR" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="-1"/>
   </actuator>
   <keyframe>
-    <key name="start" qpos="0.3 -0.3 0 0 0.055 1 0 0 0 0.3 0 0.055 1 0 0 0" mpos="0 0 0.62" mquat="1 0 0 0" act="0 0 0 0"/>
+    <key name="start" qpos="0.04 0.04 0 0 0.055 1 0 0 0 0.3 0 0.055 1 0 0 0" mpos="0 0 0.62" mquat="1 0 0 0" act="0 0 0 0"/>
   </keyframe>
 </mujoco>

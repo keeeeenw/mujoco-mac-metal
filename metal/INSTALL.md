@@ -116,6 +116,6 @@ GitHub Actions OIDC; no PyPI token is needed.
 Current source extends the earlier qualification with connect/weld,
 mocap/state lifecycle, stateful actuators, spatial tendons and ball limits.
 See [validation results](QUALIFICATION.md): 518 native GPU tests passed during
-physics qualification, and 211 CPU tests passed in the final publication check.
+physics qualification, and 215 CPU tests passed in the final publication check.
 The GPU suite was not repeated for that publication check. These features are
 not included in the published 0.4.0 wheel; use the source setup above.

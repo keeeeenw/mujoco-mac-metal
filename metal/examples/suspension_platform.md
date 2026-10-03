@@ -8,7 +8,8 @@ published 0.4.0 wheel alone.
 A mocap carrier tilts sinusoidally (±0.35 rad, 0.8 s period). A platform hangs
 from four spatial-tendon cables (one travel-limited, one pair coupled by a
 tendon equality) with a loose cargo crate riding aboard on frictional contact.
-A ball-jointed pendulum strut swings into its angular-stop limit. Ball limits,
+A ball-jointed pendulum strut, mounted alongside the platform, swings into its
+angular-stop limit. Its offset mount keeps the strut and bob clear of the cargo. Ball limits,
 tendon limits, tendon equality, dry contact and mocap motion all participate
 in the same coupled solve. A paired level-hold run shows the limits never
 spuriously engage. The simulation starts from the compiled `start` keyframe
@@ -34,22 +35,20 @@ right CPU):
 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/suspension_platform.py --record metal/examples/assets/suspension_platform.gif --steps 1200
 ```
 
-Launch the interactive viewer on a Mac:
-
-```bash
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples mjpython metal/examples/suspension_platform.py --steps 1200
-```
-
 ![Suspension platform](assets/suspension_platform.gif)
 
 The `--headless --check` run asserts actual native behavior: native/CPU pose
 parity, ball-stop engagement (strut past 0.28 rad), cable-limit engagement
 (cable length past 0.66 m), cargo contact on a majority of steps, platform
-sway in the tilt run and near-stillness in the level run.
+sway in the tilt run and near-stillness in the level run. Geometry-distance
+checks verify that the strut and bob stay clear of both the platform and cargo
+through the complete native trajectory. A CPU regression repeats this check.
 
 Measured CPU results on the qualified run (MuJoCo 3.10.0):
 
-- Strut peak angle: `0.30` rad (stop at `0.28` rad, `396` engaged steps).
+- Strut peak angle: `0.361` rad (stop at `0.28` rad, `396` engaged steps).
 - Cable peak length: `0.68` m (limit at `0.66` m, `359` engaged steps).
 - Cargo contact steps: `1170` of `1200`; cargo stays aboard (peak z `1.07` m).
 - Swing-run platform sway vs level-run: `0.029` m vs `0.021` m lateral.
+
+Lighting and the dark checkerboard match the robotic marble music machine.

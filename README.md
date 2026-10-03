@@ -25,7 +25,7 @@ available alongside the optional package.
   These features extend the bounded integrated Euler profile; they do not imply
   full MuJoCo compatibility.
 - **Qualification:** **518 native GPU tests passed** in the recorded physics
-  qualification, and **211 CPU tests passed** in the final publication check
+  qualification, and **215 CPU tests passed** in the final publication check
   (304 GPU-dependent checks skipped in the no-Torch environment). See the
   [validation results and limits](metal/QUALIFICATION.md) for test scope,
   reproducibility and outstanding checks.
@@ -101,7 +101,7 @@ physics capability.
 
 ### [Muscle-powered gripper](metal/examples/muscle_gripper.md)
 
-A three-sided gripper delivers a ball into a bin and places a second ball on a
+A muscle-driven parallel-jaw gripper delivers a ball into a bin and places a second ball on a
 pedestal, exercising stateful actuation and contact-rich manipulation. The guide
 reports both successful behavior and numerical comparison boundaries.
 
@@ -124,8 +124,8 @@ combining mocap inputs, runtime equality activation and keyframe reset.
 
 ### [Latch-and-release cargo bridge](metal/examples/cargo_bridge.md)
 
-Two connected deck sections release a weld brace and tip a payload into a tray,
-exercising coupled connect/weld constraints and contact dynamics.
+Two connected deck sections release a weld brace and settle onto a solid stop
+while carrying a payload, exercising coupled connect/weld constraints and contact dynamics.
 
 ![Cargo bridge: native Metal beside CPU MuJoCo](metal/examples/assets/cargo_bridge.gif)
 

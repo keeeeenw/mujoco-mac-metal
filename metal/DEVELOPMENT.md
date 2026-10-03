@@ -29,7 +29,7 @@ constraint rows and ball-joint limits.
 
 The recorded native qualification passed **518 GPU tests**, including the
 gripper and drawbridge headless checks. The final no-Torch publication check
-passed **211 tests, 304 skipped**. The GPU suite was not repeated for the
+passed **215 tests, 304 skipped**. The GPU suite was not repeated for the
 publication check, and no new performance measurements were taken.
 [Validation results and reproducibility](QUALIFICATION.md) describe the scope
 of these results. Cylinder/ellipsoid collision support remains in development.
@@ -219,8 +219,8 @@ not throughput measurements. [Explore the gallery](examples/demo_gallery.md).
   across the fixture's mixed sensor units, including accumulated float32 time.
 - Clockwork parcel sorter: 600 steps; pre-impact mixed-coordinate generalized coordinate errors against CPU MuJoCo `3.74e-6` (`qpos`) and `1.30e-4` (`qvel`), with decoupled parcel translation error $< 3.2 \times 10^{-7}$ m and hinge angle error $< 1.83 \times 10^{-6}$ rad; stage sensor difference `0.0`, equality residual match within `3.2e-5` rad; full-run physical errors bounded within 0.0164 m translation, 0.048 m/s linear velocity, 0.00207 rad hinge angle, 0.400 rad/s hinge velocity, 0.544 rad rotation, and 1.82 rad/s angular velocity; exercises 9 active contact pairs across 5 collision combinations (plane-sphere, sphere-box, capsule-box, capsule-capsule, box-box; all 9 canonical pairs verified in the qualification suite) with 536 native active contact steps, peak 7 simultaneous contacts, 443 active joint limit steps; demonstrates actual physical routing sending box parcels to the left chute ($Y = -0.405$ m), capsule parcels to the right chute ($Y = +0.402$ m), and sphere parcels down the center ($Y = 0.000$ m).
 - Robotic marble music machine: 400 steps; maximum absolute qpos/qvel differences
-  `8.94e-6` / `1.97e-4`; stage sensor difference `0.0`, trajectory sensor difference `8.57e-6`; exercises all Euler feature families simultaneously in one coupled Delassus solve (211 active joint limit steps, 238 near limit steps, chime oscillations 0.091 rad / 0.066 rad, 4 active contact pairs).
-- Latch-and-release cargo bridge: 1200 steps with weld release at step 50; pre-release native/CPU parity `1.93e-07` (`qpos`) / `8.77e-06` (`qvel`) over 50 stable latched steps; full-run maxima `1.33e-03` / `3.75e-01` (contact-release divergence documented, not a tolerance); native latch force `109.95` before release and `0.0` after; connect force engaged throughout (`86.19` / `44.01`); released payload reaches the tray (`0.699`, `0.230`, 1011 payload-tray contact steps) while the always-latched counterfactual stays on deck (`0.730`, `0.603`, 0 tray steps).
+  `8.94e-6` / `1.97e-4`; stage sensor difference `0.0`, trajectory sensor difference `8.57e-6`; exercises all Euler feature families simultaneously in one coupled Delassus solve (215 active joint limit steps, 238 near limit steps, chime oscillations 0.091 rad / 0.066 rad, 4 active contact pairs).
+- Latch-and-release cargo bridge: the released deck now lands on an explicit solid stop instead of passing through a receiving tray. See the [demo guide](examples/cargo_bridge.md) for the current behavior and geometry checks.
 - Magnetic crane: 900 steps with hook carry (hold/translate/hold) and weld release at step 500; pre-release native/CPU parity `2.97e-07` (`qpos`) / `9.72e-06` (`qvel`) over 100 stable hold steps; full-run maxima `6.16e-07` / `2.16e-05` (rigid carry, no contact divergence); native weld force `3.93` before release and `0.0` after; hook mocap tracking exact (`0.0`); released cargo lands in the right bin (`0.700`, `0.200`, 218 cargo-bin contact steps) while the always-attached counterfactual stays suspended (`0.700`, `0.850`, 0 bin steps).
 
 These measured errors describe the fixtures, not universal tolerances.
