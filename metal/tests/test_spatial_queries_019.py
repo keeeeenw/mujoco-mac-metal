@@ -48,7 +48,8 @@ def _stages(model, seed, device):
       ('body_pos', data.xpos), ('body_quat', data.xquat),
       ('inertial_pos', data.xipos), ('inertial_quat', None),
       ('geom_pos', data.geom_xpos), ('geom_quat', None),
-      ('site_pos', data.site_xpos), ('site_quat', None)) if values is not None}
+      ('site_pos', data.site_xpos), ('site_quat', None),
+      ('joint_anchor', data.xanchor), ('joint_axis', data.xaxis)) if values is not None}
   for prefix, matrices in (('inertial', data.ximat), ('geom', data.geom_xmat), ('site', data.site_xmat)):
     quat = np.empty((len(matrices), 4))
     for i, matrix in enumerate(matrices):
@@ -173,6 +174,34 @@ def test_spatial_queries_keep_worlds_distinct_and_handle_zero_dofs():
   assert jp.shape == jr.shape == (1, 3, 0)
   np.testing.assert_array_equal(zero.object_acceleration(static, velocity, acceleration,
       mujoco.mjtObj.mjOBJ_SITE, 0).numpy(), 0)
+
+
+@pytest.mark.parametrize('field', ['cvel', 'cdof', 'cdof_dot', 'root_com', 'poses'])
+def test_public_spatial_queries_validate_supplied_stage_before_computation(field):
+  torch = pytest.importorskip('torch')
+  from types import SimpleNamespace
+  from mujoco_metal import native_api
+  model = _fixture()
+  data, dynamics, qvel, qacc = _stages(model, 17, 'cpu')
+  state = SimpleNamespace(_device=torch.device('cpu'), _qpos=torch.tensor(data.qpos[None], dtype=torch.float32),
+      _qvel=qvel, _qacc=qacc)
+  sim = SimpleNamespace(model=model, _mjmodel=model, batch_size=1, state=state)
+  expected = np.empty(6)
+  mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_SITE, 0, expected, 0)
+  actual = native_api.mj_objectVelocity(sim, mujoco.mjtObj.mjOBJ_SITE, 0, dynamics=dynamics)
+  np.testing.assert_allclose(actual.numpy()[0], expected, atol=4e-6, rtol=4e-5)
+  with pytest.raises(TypeError, match='objtype'):
+    native_api.mj_objectVelocity(sim, float(mujoco.mjtObj.mjOBJ_SITE), 0, dynamics=dynamics)
+  malformed = dict(dynamics)
+  if field == 'poses':
+    malformed[field] = dict(dynamics[field])
+    malformed[field]['joint_axis'] = dynamics[field]['joint_axis'].clone()
+    malformed[field]['joint_axis'].reshape(-1)[0] = float('nan')
+  else:
+    malformed[field] = dynamics[field].clone()
+    malformed[field].reshape(-1)[0] = float('nan')
+  with pytest.raises(ValueError, match='nonfinite|invalid native'):
+    native_api.mj_objectVelocity(sim, mujoco.mjtObj.mjOBJ_SITE, 0, dynamics=malformed)
 
 
 @pytest.mark.gpu

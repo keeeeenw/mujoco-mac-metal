@@ -150,6 +150,8 @@ class DeviceSpatialQueries:
 
   def object_frame(self, dynamics, objtype, objid):
     poses = dynamics["poses"]
+    if isinstance(objtype, bool) or not isinstance(objtype, (numbers.Integral, mujoco.mjtObj)):
+      raise TypeError("objtype must be an integer object type")
     kind = int(objtype)
     O = mujoco.mjtObj
     mapping = {int(O.mjOBJ_BODY): (self.model.nbody, None, "inertial"),

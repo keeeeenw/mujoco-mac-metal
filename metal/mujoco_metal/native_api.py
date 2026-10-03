@@ -567,11 +567,34 @@ def _spatial_query(sim, operation, dynamics=None):
       or program.batch_size != sim.batch_size or program.device != sim.state._device):
     program = DeviceSpatialQueries(sim.model, sim.batch_size, sim.state._device)
     sim._spatial_queries = program
+  if dynamics is not None:
+    _validate_spatial_stage(sim, dynamics)
   with _inverse_query_workspaces(sim):
     stage = dynamics if dynamics is not None else sim._smooth.run_device(
         sim.state._qpos, sim.state._qvel,
         getattr(sim.state, "_mpos", None), getattr(sim.state, "_mquat", None))
     return operation(program, stage)
+
+
+def _validate_spatial_stage(sim, dynamics):
+  """Check a caller-supplied smooth motion record at the query boundary.
+
+  Spatial queries consume no mass layout. A stage from either dense or sparse
+  dynamics is valid, with the same full position and motion ABI.
+  """
+  if not isinstance(dynamics, dict):
+    raise TypeError("dynamics must be a smooth motion dictionary")
+  from mujoco_metal.smooth_metal import validate_pose_dict
+  validate_pose_dict(sim._mjmodel, dynamics.get("poses"), sim.batch_size,
+                     sim.state._device, torch)
+  b, nb, nv = sim.batch_size, int(sim._mjmodel.nbody), int(sim._mjmodel.nv)
+  for name, shape in (("root_com", (b, nb, 3)), ("cvel", (b, nb, 6)),
+                      ("cdof", (b, nv, 6)), ("cdof_dot", (b, nv, 6))):
+    value = dynamics.get(name)
+    if (not isinstance(value, torch.Tensor) or tuple(value.shape) != shape
+        or value.device != sim.state._device or value.dtype != torch.float32
+        or not value.is_contiguous() or not bool(torch.isfinite(value).all())):
+      raise ValueError(f"dynamics.{name} has invalid native layout or values")
 
 def mj_jac(sim, point, body, *, dynamics=None):
   """Owned world point translation/rotation Jacobians [batch,3,nv]."""
