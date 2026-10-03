@@ -1,7 +1,7 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
 
-"""Bounded native implicitfast velocity solve for rigid joints."""
+"""Native implicit velocity solves using compiled-size device workspaces."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +16,30 @@ _FULL_SHADER = Path(__file__).parent / "shaders" / "implicit_full.metal"
 def _frozen(value, dtype):
   array = np.asarray(value, dtype=dtype, order="C")
   return np.frombuffer(array.tobytes(), dtype=array.dtype).reshape(array.shape)
+
+
+def _derivative_pattern(model):
+  """Compiled sparse D structure, retained by dense native storage."""
+  pattern = np.zeros((int(model.nv), int(model.nv)), dtype=np.float32)
+  for row in range(int(model.nv)):
+    adr, count = int(model.D_rowadr[row]), int(model.D_rownnz[row])
+    pattern[row, model.D_colind[adr:adr+count]] = 1
+  return pattern
+
+
+def implicit_workspace_elements(nv, batch_size):
+  """Validate signed shader offsets before imports, compilation or allocation."""
+  for name, value in (("nv", nv), ("batch_size", batch_size)):
+    if (isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))):
+      raise ValueError(f"{name} must be an integer")
+  nv, batch_size = int(nv), int(batch_size)
+  if nv < 0 or batch_size <= 0:
+    raise ValueError("nv must be nonnegative and batch_size must be positive")
+  count = batch_size * max(nv*nv, 1)
+  if max(nv, batch_size, count) > (1 << 31)-1:
+    raise ValueError("implicit workspace exceeds signed int32 shader indexing capacity")
+  return count
 
 
 @dataclass(frozen=True)
@@ -34,19 +58,18 @@ def implicitfast_auto_servable(model):
   True when every smooth-force velocity dependence is natively covered:
   passive dampers (linear + polynomial, device diagonal), fixed-tendon
   damping tangents (device rank updates), and fluid forces (device
-  derivative via MetalInertiaBoxFluid); no activation state, and only
-  zero-derivative scalar motors. Tendon stiffness/limits are position-only.
+  derivative via MetalInertiaBoxFluid), and analytical native actuator
+  derivatives including activation-state families. Tendon stiffness/limits
+  are position-only. The host reference has its own narrower admission check.
   """
   if not isinstance(model, mujoco.MjModel):
     raise TypeError("implicitfast lowering requires a MuJoCo MjModel")
   if mujoco.__version__ != "3.10.0":
     raise RuntimeError("implicitfast lowering requires MuJoCo 3.10.0")
-  if int(model.na) > 0:
-    return False
   if int(model.nu) > 0:
     try:
-      from mujoco_metal.actuation import ScalarMotorModel
-      ScalarMotorModel.from_model(model)
+      from mujoco_metal.stateful_actuation import ActuatorModel
+      ActuatorModel(model, allow_inherited=True)
     except ValueError:
       return False
   return True
@@ -130,18 +153,10 @@ def lower_implicitfast(model, *, external_derivative=False):
     raise RuntimeError("implicitfast lowering requires MuJoCo 3.10.0")
   if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST):
     raise ValueError("implicitfast stage requires MuJoCo's implicitfast integrator")
-  if not int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_CONTACT):
-    raise ValueError("implicitfast stage requires contact explicitly disabled")
-  if model.nv > 24:
-    raise ValueError("implicitfast stage currently bounds nv to 24")
-  if model.neq or np.any(model.jnt_limited) or np.any(model.dof_frictionloss):
-    raise ValueError("implicitfast stage currently excludes joint constraints")
   if model.nflex or model.nflexvert or model.nflexelem:
     raise ValueError("implicitfast stage currently excludes flex dynamics")
-  if model.nplugin or model.nmocap:
-    raise ValueError("implicitfast stage excludes MuJoCo plugins and mocap bodies")
-  if int(model.na) > 0:
-    raise ValueError("implicitfast stage excludes activation state (owned by milestone 015)")
+  if model.nplugin:
+    raise ValueError("implicitfast native plugin derivatives require the extension derivative contract")
   # Nonlinear velocity dependence (tendon damping, polynomial dampers)
   # Nonlinear velocity dependence (tendon damping, polynomial dampers, fluid)
   # is served by native automatic assembly when auto-servable; otherwise
@@ -154,14 +169,14 @@ def lower_implicitfast(model, *, external_derivative=False):
           "implicitfast nonlinear velocity derivatives require an external "
           "full qDeriv")
   if model.nu and not external_derivative:
-    from mujoco_metal.actuation import ScalarMotorModel
-    ScalarMotorModel.from_model(model)
+    from mujoco_metal.stateful_actuation import ActuatorModel
+    ActuatorModel(model, allow_inherited=True)
   if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
     raise ValueError("implicitfast timestep must be finite and positive")
   # Native automatic assembly engages where the baseline is inexact
   # (tendon damping, polynomial dampers, or fluid drag present).
   auto = (implicitfast_auto_servable(model)
-          and (int(model.ntendon) > 0
+          and (int(model.nu) > 0 or int(model.ntendon) > 0
                or bool(np.any(np.asarray(model.dof_dampingpoly) != 0))
                or bool(model.opt.density != 0 or model.opt.viscosity != 0)))
   return ImplicitFastDescriptor(
@@ -209,6 +224,7 @@ def implicitfast_oracle(model, mass_matrix, qfrc_smooth,
       raise ValueError(f"force_velocity_derivative must have shape ({batch}, {d.nv}, {d.nv})")
   if not all(np.all(np.isfinite(v)) for v in (mass, force, deriv)):
     raise ValueError("implicitfast inputs must be finite")
+  deriv = deriv * _derivative_pattern(model)
   # mj_implicitfast gathers the sparse qDeriv block into the lower-triangular
   # mass pattern; that lower triangle is authoritative for factorization.
   lower = np.tril(deriv)
@@ -240,8 +256,7 @@ class ImplicitFastProgram:
     if isinstance(batch_size, (bool, np.bool_)) or not isinstance(batch_size, (int, np.integer)) or batch_size <= 0:
       raise ValueError("batch_size must be a positive integer")
     self.batch_size = int(batch_size)
-    if self.batch_size > 2**31-1 or self.batch_size*max(self.descriptor.nv**2, 1) > 2**32-1:
-      raise ValueError("batch dimensions exceed shader indexing capacity")
+    implicit_workspace_elements(self.descriptor.nv, self.batch_size)
     import torch
     if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
       raise RuntimeError("implicitfast stage requires PyTorch MPS compile_shader")
@@ -262,10 +277,12 @@ class ImplicitFastProgram:
         np.array(_baseline_derivative(self.descriptor), copy=True),
         dtype=torch.float32, device=self._device,
     ).contiguous()
+    self._derivative_pattern = torch.as_tensor(_derivative_pattern(model), device=self._device)
     self._dims = torch.tensor([self.batch_size, self.descriptor.nv], dtype=torch.int32, device=self._device)
     self._timestep = torch.tensor([self.descriptor.timestep], dtype=torch.float32, device=self._device)
 
-  def run_device_auto(self, mass_matrix, qfrc_smooth, passive_diag, tendon_tangent=None, fluid_jacobian=None):
+  def run_device_auto(self, mass_matrix, qfrc_smooth, passive_diag, tendon_tangent=None,
+                      fluid_jacobian=None, actuator_jacobian=None):
     """Solve with natively assembled velocity derivatives (R06/D2).
 
     ``passive_diag`` is the device per-dof damping tangent magnitudes
@@ -302,6 +319,12 @@ class ImplicitFastProgram:
               or tuple(fluid_jacobian.shape) != (b, nv, nv) or not fluid_jacobian.is_contiguous()):
         raise ValueError(f"fluid_jacobian must be contiguous float32 MPS with shape ({b}, {nv}, {nv})")
       combined = combined + fluid_jacobian
+    if actuator_jacobian is not None:
+      if (not isinstance(actuator_jacobian, torch.Tensor) or actuator_jacobian.device.type != "mps"
+              or actuator_jacobian.dtype != torch.float32
+              or tuple(actuator_jacobian.shape) != (b, nv, nv) or not actuator_jacobian.is_contiguous()):
+        raise ValueError(f"actuator_jacobian must be contiguous float32 MPS with shape ({b}, {nv}, {nv})")
+      combined = combined + actuator_jacobian
     return self.run_device(mass_matrix, qfrc_smooth, combined)
 
   def run_device(self, mass_matrix, qfrc_smooth, force_velocity_derivative=None):
@@ -320,6 +343,7 @@ class ImplicitFastProgram:
         raise ValueError(f"force_velocity_derivative must be contiguous float32 MPS with shape ({b}, {nv}, {nv})")
     elif self._requires_derivative:
       raise ValueError("this program requires the caller's full force velocity derivative")
+    derivative = (derivative * self._derivative_pattern).contiguous()
     if nv == 0:
       mass_buffer = derivative_buffer = self._empty_input
     else:
@@ -347,18 +371,10 @@ def lower_implicit(model, *, external_derivative=False):
     raise RuntimeError("implicit lowering requires MuJoCo 3.10.0")
   if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICIT):
     raise ValueError("implicit stage requires MuJoCo's implicit integrator")
-  if not int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_CONTACT):
-    raise ValueError("implicit stage requires contact explicitly disabled")
-  if model.nv > 32:
-    raise ValueError("implicit stage currently bounds nv to 32")
-  if model.nbody > 32:
-    raise ValueError("implicit stage currently bounds nbody to 32")
-  if model.neq or np.any(model.jnt_limited) or np.any(model.dof_frictionloss):
-    raise ValueError("implicit stage currently excludes joint constraints")
   if model.nflex or model.nflexvert or model.nflexelem:
     raise ValueError("implicit stage currently excludes flex dynamics")
-  if model.nplugin or model.nmocap:
-    raise ValueError("implicit stage excludes MuJoCo plugins and mocap bodies")
+  if model.nplugin:
+    raise ValueError("implicit native plugin derivatives require the extension derivative contract")
   if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
     raise ValueError("implicit timestep must be finite and positive")
   auto = True
@@ -393,6 +409,7 @@ def implicit_oracle(model, mass_matrix, qfrc_smooth,
       raise ValueError(f"force_velocity_derivative must have shape ({batch}, {d.nv}, {d.nv})")
   if not all(np.all(np.isfinite(v)) for v in (mass, force, deriv)):
     raise ValueError("implicit inputs must be finite")
+  deriv = deriv * _derivative_pattern(model)
   hessian = mass - d.timestep * deriv
   acceleration = np.zeros_like(force)
   status = np.zeros(batch, dtype=np.int32)
@@ -413,6 +430,7 @@ class ImplicitProgram:
     if isinstance(batch_size, (bool, np.bool_)) or not isinstance(batch_size, (int, np.integer)) or batch_size <= 0:
       raise ValueError("batch_size must be a positive integer")
     self.batch_size = int(batch_size)
+    implicit_workspace_elements(self.descriptor.nv, self.batch_size)
     import torch
     if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
       raise RuntimeError("implicit stage requires PyTorch MPS compile_shader")
@@ -433,6 +451,7 @@ class ImplicitProgram:
         np.array(_baseline_derivative(self.descriptor), copy=True),
         dtype=torch.float32, device=self._device,
     ).contiguous()
+    self._derivative_pattern = torch.as_tensor(_derivative_pattern(model), device=self._device)
     self._dims = torch.tensor([self.batch_size, self.descriptor.nv], dtype=torch.int32, device=self._device)
     self._timestep = torch.tensor([self.descriptor.timestep], dtype=torch.float32, device=self._device)
 
@@ -444,6 +463,7 @@ class ImplicitProgram:
       tendon_tangent=None,
       fluid_jacobian=None,
       bias_derivative=None,
+      actuator_jacobian=None,
   ):
     torch, nv, b = self._torch, self.descriptor.nv, self.batch_size
     if passive_diag is None:
@@ -455,6 +475,8 @@ class ImplicitProgram:
       combined = combined + fluid_jacobian
     if bias_derivative is not None:
       combined = combined + bias_derivative
+    if actuator_jacobian is not None:
+      combined = combined + actuator_jacobian
     return self.run_device(mass_matrix, qfrc_smooth, combined)
 
   def run_device(self, mass_matrix, qfrc_smooth, force_velocity_derivative=None):
@@ -472,6 +494,7 @@ class ImplicitProgram:
         raise ValueError(f"force_velocity_derivative must be contiguous float32 MPS with shape ({b}, {nv}, {nv})")
     elif self._requires_derivative:
       raise ValueError("this program requires the caller's full force velocity derivative")
+    derivative = (derivative * self._derivative_pattern).contiguous()
     if nv == 0:
       mass_buffer = derivative_buffer = self._empty_input
     else:
@@ -479,4 +502,3 @@ class ImplicitProgram:
     self._assemble(mass_buffer, derivative_buffer, self._mass_storage, self._dims, self._timestep, threads=(b*max(nv*nv, 1),), group_size=(1,))
     acceleration, status = self._solver.run_device(self._mass, qfrc_smooth)
     return {"effective_mass": self._mass, "qacc": acceleration, "status": status}
-

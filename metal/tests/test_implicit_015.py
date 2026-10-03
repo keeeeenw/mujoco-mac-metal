@@ -3,7 +3,7 @@
 """Milestone 015: Full implicit integrator (mjINT_IMPLICIT) qualification.
 
 Verifies:
-1. Pinned model lowering (nv <= 32, contact-free, mjINT_IMPLICIT).
+1. Pinned model lowering and compiled-size implicit device workspaces.
 2. MetalGeneralDenseSolve LU with partial pivoting on MPS.
 3. Automatic nonsymmetric derivative assembly (passive, tendon, fluid, Coriolis).
 4. Native MPS stepping parity against MuJoCo 3.10.0 CPU mj_step.
@@ -79,13 +79,15 @@ def test_implicit_lowering_and_profile_validation_cpu():
   with pytest.raises(ValueError, match="implicit integrator"):
     lower_implicit(m_euler)
 
-  # Rejection of enabled contact
+  # The stage can consume the total solved force for contact-enabled models.
   m_contact = mujoco.MjModel.from_xml_string(
       """<mujoco><option integrator="implicit"/>
       <worldbody><body pos="0 0 0"><joint type="hinge"/><geom type="sphere" size="0.1"/></body></worldbody></mujoco>"""
   )
-  with pytest.raises(ValueError, match="contact explicitly disabled"):
-    lower_implicit(m_contact)
+  assert lower_implicit(m_contact).nv == 1
+  prof = validate_stepping_profile(m_contact, profile="integrated_implicit_v1")
+  assert not prof.execution_plan.is_stage_enabled("euler_damping")
+  assert prof.execution_plan.is_stage_enabled("implicit_velocity")
 
 
 def test_implicit_oracle_matches_dense_lu_cpu():
