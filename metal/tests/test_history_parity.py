@@ -236,5 +236,9 @@ def test_disabled_sensor_stage_retains_sample_but_records_pinned_delayed_raw(del
     np.testing.assert_allclose(sim.state._history.cpu().numpy()[0], data.history,
                                atol=5e-6, rtol=5e-6)
     before = sim.state._history.cpu().numpy().copy()
-    np.testing.assert_array_equal(sim.sensor_values()[0], data.sensordata)
+    # sensor_values is a caller-owned device tensor; the oracle comparison
+    # is an explicit test-only readback, outside the native simulation path.
+    queried = sim.sensor_values()
+    assert queried.device.type == "mps"
+    np.testing.assert_array_equal(queried[0].detach().cpu().numpy(), data.sensordata)
     np.testing.assert_array_equal(sim.state._history.cpu().numpy(), before)
