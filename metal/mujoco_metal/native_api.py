@@ -192,7 +192,7 @@ def _inverse_query_workspaces(sim):
   scratch_names = ("_component_solve_rhs", "_component_world_status",
                    "_component_tendon_J", "_component_damping_deriv", "_rhs",
                    "_act_dot", "_actuator_velocity_derivative", "_sensordata",
-                   "_raw_sensordata")
+                   "_raw_sensordata", "_energy")
   scratch_names += tuple(name for name in vars(sim)
                          if name.startswith("_forward_stage_") and
                          isinstance(getattr(sim, name), torch.Tensor))

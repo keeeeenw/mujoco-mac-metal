@@ -59,3 +59,29 @@ def test_query_never_rehabilitates_a_record_already_stale_on_entry():
     pass
   with pytest.raises(ValueError, match='mutated'):
     sim._forward_stages.validate(record, generation=0)
+
+
+@pytest.mark.parametrize('fail', [False, True])
+@pytest.mark.parametrize('allocated', [False, True])
+def test_query_restores_energy_values_and_owner_even_if_buffer_is_replaced(
+    fail, allocated):
+  torch = pytest.importorskip('torch')
+  from mujoco_metal.native_api import _inverse_query_workspaces
+  owner = torch.tensor([[2., .5], [3., .7]]) if allocated else None
+  sim = SimpleNamespace(_energy=owner)
+  saved = owner.clone() if allocated else None
+  def query():
+    with _inverse_query_workspaces(sim):
+      if allocated:
+        sim._energy.add_(9)
+      sim._energy = torch.zeros(2, 2)
+      if fail:
+        raise RuntimeError('energy query failed')
+  if fail:
+    with pytest.raises(RuntimeError, match='energy query failed'):
+      query()
+  else:
+    query()
+  assert sim._energy is owner
+  if allocated:
+    torch.testing.assert_close(owner, saved, rtol=0, atol=0)
