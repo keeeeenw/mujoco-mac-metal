@@ -343,10 +343,28 @@ class MetalSimulation:
     self._sen_pair_live = None
     self._sen_slot_pair = None
     self._has_acc_sensors = False
+    self._has_contact_sensors = False
+    self._has_ray_sensors = False
+    self._has_geomdist_sensors = False
     if self._sensors is not None:
+      ST = mujoco.mjtSensor
+      need = np.asarray(self._sensors.descriptor.sensor_needstage)
+      types = np.asarray(self._sensors.descriptor.sensor_type)
       ACC = int(mujoco.mjtStage.mjSTAGE_ACC)
-      self._has_acc_sensors = bool(np.any(
-          np.asarray(self._sensors.descriptor.sensor_needstage) == ACC))
+      self._has_acc_sensors = bool(np.any(need == ACC))
+      self._has_contact_sensors = bool(np.any(types == int(ST.mjSENS_CONTACT)))
+      self._has_ray_sensors = bool(np.any(types == int(ST.mjSENS_RANGEFINDER)))
+      self._has_geomdist_sensors = bool(np.any(np.isin(types, [
+          int(ST.mjSENS_GEOMDIST), int(ST.mjSENS_GEOMNORMAL),
+          int(ST.mjSENS_GEOMFROMTO)])))
+      if (self._has_ray_sensors or self._has_geomdist_sensors) and profile.name != "integrated_euler_v1":
+        GT = mujoco.mjtGeom
+        stock = {int(GT.mjGEOM_MESH), int(GT.mjGEOM_HFIELD), int(GT.mjGEOM_SDF)}
+        if bool(np.any(np.isin(np.asarray(model.geom_type), list(stock)))):
+          raise ValueError(
+              f"{profile.name} supports rays/geom-distance only for analytic "
+              "scenes; mesh/heightfield/SDF spatial queries require "
+              "integrated_euler_v1")
       cc = getattr(self, "_coupled_constraints", None)
       if cc is not None:
         d = cc.descriptor
@@ -826,6 +844,8 @@ class MetalSimulation:
                        root_com=acc_dyn["root_com"])
       out = self._run_acc_into(state._qpos, state._qvel, acceleration,
                                acc_poses, acc_dyn, out)
+    if self._has_contact_sensors or self._has_ray_sensors or self._has_geomdist_sensors:
+      out = self._run_spatial_into(poses, out)
     return out.clone()
 
   def _state_sensor_inputs(self, qpos, qvel, poses, dynamics):
@@ -1179,9 +1199,26 @@ class MetalSimulation:
         "mu": cc._constants["contact_friction"].reshape(nc, 5),
         "pair_geoms": cc._constants["pair_geoms"].reshape(-1),
         "pair_offset": cc._constants["pair_contact_offset"].reshape(-1),
+        "slot_pair": self._sen_slot_pair,
         "pair_live": self._sen_pair_live,
         "npairs": int(d.npairs),
     }
+
+  def _run_spatial_into(self, poses, out):
+    """Evaluate CONTACT/ray/geomdist families into ``out`` (borrowed)."""
+    # Rays/geomdist use the sensor hull store (all scene meshes/hfields,
+    # including contype-0 geoms that never appear in contact pairs).
+    hull = self._sensors._sp_hull.reshape(-1)
+    hinfo = self._sensors._sp_hull_info.reshape(-1)
+    if self._has_contact_sensors:
+      out = self._sensors.run_contact_device(
+          poses, self._contact_views(), out=out)
+    if self._has_ray_sensors or self._has_geomdist_sensors:
+      if self._has_ray_sensors:
+        out = self._sensors.run_rays_device(poses, hull, hinfo, out=out)
+      if self._has_geomdist_sensors:
+        out = self._sensors.run_geomdist_device(poses, hull, hinfo, out=out)
+    return out
 
   def _run_acc_into(self, qpos, qvel, qacc, poses, dynamics, out):
     """Evaluate ACC force families into ``out`` (borrowed, merged)."""
@@ -1474,6 +1511,8 @@ class MetalSimulation:
       # _acceleration just ran at this exact state; its cached actuator
       # rows plus the solved constraint rows feed the ACC kernel.
       merged = self._run_acc_into(qpos, qvel, qacc, poses, dynamics, merged)
+    if self._has_contact_sensors or self._has_ray_sensors or self._has_geomdist_sensors:
+      merged = self._run_spatial_into(poses, merged)
     self._sensordata.copy_(merged)
 
   def _advance_activations(self, state):

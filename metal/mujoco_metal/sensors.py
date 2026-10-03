@@ -110,6 +110,7 @@ class SensorDescriptor:
   sensor_dim: np.ndarray
   sensor_adr: np.ndarray
   sensor_cutoff: np.ndarray
+  sensor_intprm: np.ndarray
   jnt_type: np.ndarray
   jnt_qposadr: np.ndarray
   jnt_dofadr: np.ndarray
@@ -357,6 +358,10 @@ def lower_sensors(model) -> SensorDescriptor:
         raise ValueError(f"sensor {i}: only site rangefinders are supported")
       if not 0 <= int(arrays["sensor_objid"][i]) < nsite:
         raise ValueError(f"sensor {i}: invalid rangefinder site id")
+      if np.any(np.asarray(model.geom_type) == int(mujoco.mjtGeom.mjGEOM_SDF)):
+        raise ValueError(
+            f"sensor {i}: rangefinders in SDF scenes are unsupported in 016"
+            " (pinned SDF ray path is plugin-defined)")
     if typ == int(S.mjSENS_CONTACT):
       for key in ("sensor_objtype", "sensor_reftype"):
         t = int(arrays[key][i])
@@ -380,6 +385,23 @@ def lower_sensors(model) -> SensorDescriptor:
           raise ValueError(f"sensor {i}: geom sensors need body/geom pairs")
         if not 0 <= int(arrays[key][i]) < _object_count(t, nb, ng, nsite):
           raise ValueError(f"sensor {i}: invalid geom sensor id")
+      # Mirror the coupled pair matrix: unsupported narrow-phase pairs stay
+      # rejected here instead of silently reporting cutoff. SDF-involved
+      # pairs have plugin-defined ray/distance paths (019).
+      from mujoco_metal.coupled_constraints import pair_max_contacts
+      _sdf_ip = int(model.opt.sdf_initpoints)
+      _SDF_T = int(mujoco.mjtGeom.mjGEOM_SDF)
+      for _ga in _sensor_geoms(model, int(arrays["sensor_objtype"][i]),
+                               int(arrays["sensor_objid"][i])):
+        for _gb in _sensor_geoms(model, int(arrays["sensor_reftype"][i]),
+                                 int(arrays["sensor_refid"][i])):
+          _ta, _tb = int(model.geom_type[_ga]), int(model.geom_type[_gb])
+          if _ga == _gb:
+            raise ValueError(f"sensor {i}: geom pair must be different")
+          if _ta == _SDF_T or _tb == _SDF_T:
+            raise ValueError(
+                f"sensor {i}: SDF geom distance is unsupported in 016")
+          pair_max_contacts(_ta, _tb, _sdf_ip)
     if typ in (int(S.mjSENS_FRAMELINACC), int(S.mjSENS_FRAMEANGACC)):
       objtype, objid = int(arrays["sensor_objtype"][i]), int(arrays["sensor_objid"][i])
       if objtype not in valid_objtypes or objtype == int(mujoco.mjtObj.mjOBJ_UNKNOWN) or not 0 <= objid < _object_count(objtype, nb, ng, nsite):
@@ -407,6 +429,14 @@ def lower_sensors(model) -> SensorDescriptor:
       model.nsensor, model.nsensordata, model.nq, model.nv, nj, nb, ng, nsite,
       **arrays, disableflags=int(model.opt.disableflags),
   )
+
+
+def _sensor_geoms(model, objtype, objid):
+  """Geom ids covered by a geom-sensor object (body expands to its geoms)."""
+  if int(objtype) == int(mujoco.mjtObj.mjOBJ_GEOM):
+    return [int(objid)]
+  adr, num = int(model.body_geomadr[objid]), int(model.body_geomnum[objid])
+  return [adr + k for k in range(num)]
 
 
 def _object_count(objtype, nbody, ngeom, nsite):
@@ -572,6 +602,91 @@ def _ray_quad_roots(a, b, c):
   return [(-b - root) / a, (-b + root) / a]
 
 
+def _check_match(desc, body, geom, objtype, objid):
+  # Pinned checkMatch (rigid bodies only; flex absent by admission).
+  if int(objtype) == int(mujoco.mjtObj.mjOBJ_UNKNOWN):
+    return True
+  if int(objtype) == int(mujoco.mjtObj.mjOBJ_SITE):
+    return True
+  if int(objtype) == int(mujoco.mjtObj.mjOBJ_GEOM):
+    return int(objid) == int(geom)
+  if int(objtype) == int(mujoco.mjtObj.mjOBJ_BODY):
+    return int(objid) == int(body)
+  if int(objtype) == int(mujoco.mjtObj.mjOBJ_XBODY):
+    b = int(body)
+    while b > int(objid):
+      b = int(np.asarray(desc.body_parentid)[b])
+    return b == int(objid)
+  return False
+
+
+def _match_contact(desc, poses, w, ex, j, type1, id1, type2, id2):
+  # Pinned matchContact; returns 0/1/-1. Site filter uses inside-geom.
+  U = int(mujoco.mjtObj.mjOBJ_UNKNOWN)
+  if type1 == U and type2 == U:
+    return 1
+  if type1 == int(mujoco.mjtObj.mjOBJ_SITE):
+    sp = np.asarray(poses["site_pos"])[w, id1]
+    sq = _unit(np.asarray(poses["site_quat"])[w, id1], "site quaternion")
+    if not _inside_geom(sp, _quat_mat(sq), np.asarray(desc.site_size)[id1],
+                        int(np.asarray(desc.site_type)[id1]),
+                        np.asarray(ex["contact_pos"][w, j], dtype=np.float64)):
+      return 0
+  g1, g2 = int(ex["contact_geom"][w, j, 0]), int(ex["contact_geom"][w, j, 1])
+  b1 = int(desc.geom_bodyid[g1]) if g1 >= 0 else -1
+  b2 = int(desc.geom_bodyid[g2]) if g2 >= 0 else -1
+  m11 = _check_match(desc, b1, g1, type1, id1)
+  m12 = _check_match(desc, b2, g2, type1, id1)
+  m21 = _check_match(desc, b1, g1, type2, id2)
+  m22 = _check_match(desc, b2, g2, type2, id2)
+  if not (m11 or m12) or not (m21 or m22):
+    return 0
+  if type1 != U and type2 != U:
+    reg = m11 and m22
+    rev = m12 and m21
+    if reg and not rev:
+      return 1
+    if rev and not reg:
+      return -1
+    if reg and rev:
+      return 1
+  elif type1 != U:
+    return 1 if m11 else -1
+  elif type2 != U:
+    return 1 if m22 else -1
+  return 0
+
+
+def _fill_contact_slot(value, dataspec, nfound, force, torque, dist, pos,
+                       normal, tangent, flip=1):
+  # Pinned copySensorData single-slot layout with flip handling.
+  off = 0
+  if dataspec & 1:
+    value[off] = nfound
+    off += 1
+  if dataspec & 2:
+    f = np.asarray(force, dtype=np.float64).copy()
+    if flip < 0:
+      f[2] *= -1
+    value[off:off + 3] = f
+    off += 3
+  if dataspec & 4:
+    t = np.asarray(torque, dtype=np.float64).copy()
+    if flip < 0:
+      t[2] *= -1
+    value[off:off + 3] = t
+    off += 3
+  if dataspec & 8:
+    value[off] = dist
+    off += 1
+  if dataspec & 16:
+    value[off:off + 3] = normal
+    off += 3
+  if dataspec & 32:
+    value[off:off + 3] = tangent
+    off += 3
+
+
 def _quat_mat(q):
   q = _unit(np.asarray(q, dtype=np.float64), "quaternion")
   w, x, y, z = q
@@ -722,6 +837,116 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
             int(np.asarray(desc.site_type)[refid]), np.asarray(p, dtype=np.float64)))])
       elif typ in (int(S.mjSENS_E_POTENTIAL), int(S.mjSENS_E_KINETIC)):
         value = np.array([float(Need("energy")["energy"][w, 0 if typ == int(S.mjSENS_E_POTENTIAL) else 1])])
+      elif typ == int(S.mjSENS_RANGEFINDER):
+        ex = Need("ray")
+        r = np.asarray(ex["ray"][w, i], dtype=np.float64)
+        dataspec = int(desc.sensor_intprm[i, 0])
+        sid = objid
+        origin = np.asarray(poses["site_pos"])[w, sid].copy()
+        sq = _unit(np.asarray(poses["site_quat"])[w, sid], "site quaternion")
+        direction = _quat_rot(sq, np.array([0.0, 0.0, 1.0]))
+        hit = float(r[0]) >= 0
+        parts = []
+        if dataspec & 1:
+          parts += [float(r[0])]
+        if dataspec & 2:
+          parts += list(direction if hit else np.zeros(3))
+        if dataspec & 4:
+          parts += list(origin)
+        point = origin + direction * float(r[0]) if hit else np.zeros(3)
+        if dataspec & 8:
+          parts += list(point)
+        if dataspec & 16:
+          parts += list(r[4:7] if hit else np.zeros(3))
+        if dataspec & 32:
+          parts += [float(r[0]) if hit else -1.0]
+        value = np.array(parts)
+      elif typ in (int(S.mjSENS_GEOMDIST), int(S.mjSENS_GEOMNORMAL),
+                    int(S.mjSENS_GEOMFROMTO)):
+        ex = Need("geom")
+        g = np.asarray(ex["geom"][w, i], dtype=np.float64)
+        if typ == int(S.mjSENS_GEOMDIST):
+          value = np.array([float(g[0])])
+        elif typ == int(S.mjSENS_GEOMNORMAL):
+          seg = g[4:7] - g[1:4]
+          n = float(np.linalg.norm(seg))
+          value = seg / n if n > 0 else np.zeros(3)
+        else:
+          value = g[1:7].copy()
+      elif typ == int(S.mjSENS_CONTACT):
+        ex = Need("contact_geom", "contact_frame", "contact_pos",
+                  "contact_dist", "contact_force", "contact_efc", "ncon")
+        dataspec = int(desc.sensor_intprm[i, 0])
+        reduce = int(desc.sensor_intprm[i, 1])
+        reftype, refid = int(desc.sensor_reftype[i]), int(desc.sensor_refid[i])
+        otype, oid = int(desc.sensor_objtype[i]), objid
+        BEST = None
+        order = []
+        for j in range(int(ex["ncon"][w])):
+          if int(ex["contact_efc"][w, j]) < 0:
+            continue
+          m = _match_contact(desc, poses, w, ex, j, otype, oid, reftype, refid)
+          if not m:
+            continue
+          order.append((j, m))
+        crit = []
+        for (j, m) in order:
+          if reduce == 1:
+            c = float(ex["contact_dist"][w, j])
+          elif reduce == 2:
+            f = np.asarray(ex["contact_force"][w, j], dtype=np.float64)
+            c = -float(np.dot(f[:3], f[:3]))
+          else:
+            c = 0.0
+          crit.append(c)
+        value = np.zeros(int(desc.sensor_dim[i]))
+        if reduce == 3:
+          # Net-force aggregation over all matches.
+          F = np.zeros(3)
+          T = np.zeros(3)
+          P = np.zeros(3)
+          tot = 0.0
+          for (j, m) in order:
+            f = np.asarray(ex["contact_force"][w, j], dtype=np.float64)[:3]
+            t = np.asarray(ex["contact_force"][w, j], dtype=np.float64)[3:6]
+            fr = np.asarray(ex["contact_frame"][w, j]).reshape(3, 3)
+            F += fr.T @ f
+            T += fr.T @ t
+            p = np.asarray(ex["contact_pos"][w, j], dtype=np.float64)
+            wgt = float(np.linalg.norm(np.concatenate((f, t))))
+            P += wgt * p
+            tot += wgt
+          if tot > 0:
+            P /= tot
+          for (j, m) in order:
+            f = np.asarray(ex["contact_force"][w, j], dtype=np.float64)[:3]
+            t = np.asarray(ex["contact_force"][w, j], dtype=np.float64)[3:6]
+            fr = np.asarray(ex["contact_frame"][w, j]).reshape(3, 3)
+            T += np.cross(np.asarray(ex["contact_pos"][w, j], dtype=np.float64) - P,
+                          fr.T @ f)
+          _fill_contact_slot(value, dataspec, len(order), F, T, 0.0, P,
+                             np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]))
+        else:
+          pick = None
+          if order and reduce == 0:
+            pick = order[0]
+          elif order:
+            k = int(np.argmin(np.asarray(crit)))
+            pick = order[k]
+          nmatch = len(order)
+          if pick is not None:
+            j, m = pick
+            f = np.asarray(ex["contact_force"][w, j], dtype=np.float64)
+            _fill_contact_slot(
+                value, dataspec, nmatch, f[:3].copy(), f[3:6].copy(),
+                float(ex["contact_dist"][w, j]),
+                np.asarray(ex["contact_pos"][w, j], dtype=np.float64),
+                np.asarray(ex["contact_frame"][w, j]).reshape(3, 3)[0] * m,
+                np.asarray(ex["contact_frame"][w, j]).reshape(3, 3)[1] * m,
+                flip=m)
+          else:
+            _fill_contact_slot(value, dataspec, 0, np.zeros(3), np.zeros(3),
+                               0.0, np.zeros(3), np.zeros(3), np.zeros(3))
       elif typ == int(S.mjSENS_TOUCH):
         ex = Need("contact_geom", "contact_frame", "contact_pos",
                   "contact_dist", "contact_force", "contact_efc", "ncon")
@@ -748,8 +973,8 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
           sq = _unit(np.asarray(poses["site_quat"])[w, sid], "site quaternion")
           sm = _quat_mat(sq)
           if _ray_geom(sp, sm, np.asarray(desc.site_size)[sid],
-                       int(np.asarray(desc.site_type)[sid]),
-                       np.asarray(ex["contact_pos"][w, j]), nray) >= 0:
+                       np.asarray(ex["contact_pos"][w, j]), nray,
+                       int(np.asarray(desc.site_type)[sid])) >= 0:
             total += fn
         value = np.array([total])
       elif typ == int(S.mjSENS_ACCELEROMETER):
@@ -1256,10 +1481,280 @@ class SensorProgram:
     self._rne_post = self._rne_lib.rne_post
     self._rne_acc = self._rne_lib.evaluate_acc_sensors
     b = self.batch_size
+    nb = self.descriptor.nbody
     self._rne_cacc = torch.zeros((b, max(nb, 1), 6), dtype=torch.float32, device=self._device)
     self._rne_cfrc = torch.zeros_like(self._rne_cacc)
     self._rne_scom = torch.zeros((b, max(nb, 1), 3), dtype=torch.float32, device=self._device)
     self._rne_ext = torch.zeros_like(self._rne_cacc)
+    self._build_spatial_constants(model)
+
+  def _build_spatial_constants(self, model):
+    """Host constants for the milestone-016 spatial-query kernels."""
+    torch = self._torch
+    ng = int(model.ngeom)
+    nb = self.descriptor.nbody
+    nsite = self.descriptor.nsite
+    nmat = int(model.nmat)
+    def itensor(values, shape):
+      arr = np.asarray(values, dtype=np.int32).reshape(-1)
+      if arr.size == 0:
+        arr = np.zeros(int(np.prod(shape, dtype=np.int64)), dtype=np.int32)
+      return torch.as_tensor(arr.reshape(shape).copy(), dtype=torch.int32, device=self._device)
+    def ftensor(values, shape):
+      arr = np.asarray(values, dtype=np.float32).reshape(-1)
+      if arr.size == 0:
+        arr = np.zeros(int(np.prod(shape, dtype=np.int64)), dtype=np.float32)
+      if not np.all(np.isfinite(arr)):
+        raise ValueError("spatial constants must be finite float32")
+      return torch.as_tensor(arr.reshape(shape).copy(), dtype=torch.float32, device=self._device)
+    self._sp_geom_type = itensor(model.geom_type, (max(ng, 1),))
+    self._sp_geom_size = ftensor(model.geom_size, (max(ng, 1), 3))
+    self._sp_geom_bodyid = itensor(model.geom_bodyid, (max(ng, 1),))
+    self._sp_geom_matid = itensor(model.geom_matid, (max(ng, 1),))
+    self._sp_geom_rgba = ftensor(model.geom_rgba, (max(ng, 1), 4))
+    self._sp_nmat = nmat
+    self._sp_mat_rgba = ftensor(model.mat_rgba, (max(nmat, 1), 4))
+    badr = np.zeros((max(nb, 1), 2), dtype=np.int32)
+    for b in range(nb):
+      badr[b] = [int(model.body_geomadr[b]), int(model.body_geomnum[b])]
+    self._sp_body_geoms = itensor(badr, (max(nb, 1), 2))
+    rb = np.asarray(model.geom_rbound, dtype=np.float32).reshape(-1).copy()
+    for g in range(ng):
+      if int(model.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_MESH):
+        mid = int(model.geom_dataid[g])
+        if mid >= 0:
+          vadr = int(model.mesh_vertadr[mid])
+          import numpy as _np
+          verts = _np.asarray(model.mesh_vert[vadr:vadr + int(model.mesh_vertnum[mid])],
+                              dtype=_np.float64).reshape(-1, 3)
+          if len(verts):
+            rb[g] = max(float(rb[g]), float(_np.max(_np.linalg.norm(verts, axis=1))))
+    self._sp_geom_rbound = ftensor(rb.reshape(max(ng, 1)), (max(ng, 1),))
+    self._sp_sdf_maxn = min(int(model.opt.sdf_initpoints), 8)
+    # Sensor hull store for rays/geomdist: same layout as the coupled
+    # mesh/hfield sections, but built for ALL scene meshes/hfields (rays
+    # need occlusion hulls even for contype-0 geoms that never appear in
+    # contact pairs). SDF section omitted: SDF spatial queries are rejected.
+    from mujoco_metal.coupled_constraints import (
+        _HF_MAX_DATA, _HF_MAX_GEOMS, _HF_MAX_N, _MESH_DATA_FLOATS,
+        _MESH_MAX_FACES, _MESH_MAX_TOTAL, _MESH_MAX_VERTS,
+        mesh_hull_is_convex)
+    _MESH_T = int(mujoco.mjtGeom.mjGEOM_MESH)
+    _HF_T = int(mujoco.mjtGeom.mjGEOM_HFIELD)
+    _mesh_used = sorted(g for g in range(ng) if int(model.geom_type[g]) == _MESH_T)
+    _hf_used = sorted(g for g in range(ng) if int(model.geom_type[g]) == _HF_T)
+    if _mesh_used or _hf_used:
+      if len(_hf_used) > _HF_MAX_GEOMS:
+        raise ValueError(f"at most {_HF_MAX_GEOMS} heightfield geoms; found {len(_hf_used)}")
+      _hull = np.zeros((_MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA,), dtype=np.float32)
+      _hinfo = np.full((max(ng, 1) * 9,), -1, dtype=np.int32)
+      _cursor, _ncursor = 0, 3 * _MESH_MAX_TOTAL
+      _icursor = 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES)
+      for g in _mesh_used:
+        mid = int(model.geom_dataid[g])
+        if mid < 0:
+          raise ValueError(f"mesh geom {g} has no asset")
+        vnum = int(model.mesh_vertnum[mid])
+        if vnum <= 0 or vnum > _MESH_MAX_VERTS:
+          raise ValueError(f"mesh geom {g} has {vnum} verts; 011 supports 1..{_MESH_MAX_VERTS}")
+        if not mesh_hull_is_convex(model, mid):
+          raise ValueError(f"mesh geom {g} is non-convex; 016 geomdist requires convex meshes")
+        if _cursor + vnum > _MESH_MAX_TOTAL:
+          raise ValueError("total mesh hull verts exceed 011 capacity")
+        vadr = int(model.mesh_vertadr[mid])
+        verts = np.asarray(model.mesh_vert[vadr:vadr + vnum], dtype=np.float32)
+        _hull[3 * _cursor:3 * (_cursor + vnum)] = verts.reshape(-1)
+        _hinfo[9 * g] = _cursor
+        _hinfo[9 * g + 1] = vnum
+        _cursor += vnum
+        fadr = int(model.mesh_faceadr[mid])
+        fnum = int(model.mesh_facenum[mid])
+        faces = np.asarray(model.mesh_face[fadr:fadr + fnum], dtype=np.int64)
+        if _ncursor + 3 * fnum > 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES) or \
+            _icursor + 3 * fnum > _MESH_DATA_FLOATS:
+          raise ValueError("total mesh faces exceed 011 capacity")
+        vd = verts.astype(np.float64)
+        interior = vd.mean(axis=0)
+        _hinfo[9 * g + 2] = _ncursor // 3
+        _hinfo[9 * g + 3] = _icursor // 3
+        _hinfo[9 * g + 4] = fnum
+        for f in faces:
+          i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
+          n = np.cross(vd[i1] - vd[i0], vd[i2] - vd[i0])
+          nl = float(np.linalg.norm(n))
+          if nl < 1e-12:
+            n = np.zeros(3)
+          else:
+            n = n / nl
+            if float(n @ (vd[[i0, i1, i2]].mean(axis=0) - interior)) < 0.0:
+              n = -n
+          _hull[_ncursor:_ncursor + 3] = n.astype(np.float32)
+          _hull[_icursor:_icursor + 3] = np.array([i0, i1, i2], dtype=np.float32)
+          _ncursor += 3
+          _icursor += 3
+      _scursor = _MESH_DATA_FLOATS
+      _dcursor = _MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS
+      for g in _hf_used:
+        hid = int(model.geom_dataid[g])
+        if hid < 0:
+          raise ValueError(f"heightfield geom {g} has no asset")
+        nrow, ncol = int(model.hfield_nrow[hid]), int(model.hfield_ncol[hid])
+        if not (2 <= nrow <= _HF_MAX_N and 2 <= ncol <= _HF_MAX_N):
+          raise ValueError(f"heightfield dims {(nrow, ncol)} outside 012 bounds")
+        ndata = nrow * ncol
+        if _dcursor + ndata > len(_hull):
+          raise ValueError("total heightfield data exceeds 012 capacity")
+        _hull[_scursor:_scursor + 4] = np.asarray(model.hfield_size[hid], dtype=np.float32)
+        adr = int(model.hfield_adr[hid])
+        _hull[_dcursor:_dcursor + ndata] = np.asarray(
+            model.hfield_data[adr:adr + ndata], dtype=np.float32)
+        _hinfo[9 * g + 5] = _dcursor
+        _hinfo[9 * g + 6] = nrow
+        _hinfo[9 * g + 7] = ncol
+        _hinfo[9 * g + 8] = _scursor
+        _scursor += 4
+        _dcursor += ndata
+      self._sp_hull = torch.as_tensor(_hull.copy(), dtype=torch.float32, device=self._device)
+      self._sp_hull_info = torch.as_tensor(_hinfo.copy(), dtype=torch.int32, device=self._device)
+    else:
+      self._sp_hull = torch.zeros(1, dtype=torch.float32, device=self._device)
+      self._sp_hull_info = torch.zeros(9, dtype=torch.int32, device=self._device)
+    from pathlib import Path as _Path
+    _base = _Path(__file__).parent / "shaders"
+    from mujoco_metal.coupled_constraints import (
+        _COLLISION_SHADER, _CONVEX_SHADER, _SDF_SHADER)
+    src = (_COLLISION_SHADER.read_text() + "\n" + _CONVEX_SHADER.read_text()
+           + "\n" + _SDF_SHADER.read_text() + "\n"
+           + (_base / "sensors_spatial.metal").read_text())
+    self._sp_lib = torch.mps.compile_shader(src)
+    self._sp_contact = self._sp_lib.evaluate_contact_sensors
+    self._sp_rays = self._sp_lib.evaluate_rays
+    self._sp_geomdist = self._sp_lib.evaluate_geomdist
+
+  def _sp_validate_poses(self, poses, need_geom_quat=True):
+    torch, d, b = self._torch, self.descriptor, self.batch_size
+    for key, shape in (
+        ("site_pos", (b, d.nsite, 3)), ("site_quat", (b, d.nsite, 4)),
+        ("geom_pos", (b, d.ngeom, 3))):
+      v = poses.get(key, None)
+      if (not isinstance(v, torch.Tensor) or v.device.type != "mps"
+          or v.dtype != torch.float32 or tuple(v.shape) != shape
+          or not v.is_contiguous()):
+        raise ValueError(f"poses[{key!r}] must be contiguous float32 MPS with shape {shape}")
+    if need_geom_quat:
+      v = poses.get("geom_quat", None)
+      if (not isinstance(v, torch.Tensor) or v.device.type != "mps"
+          or v.dtype != torch.float32 or tuple(v.shape) != (b, d.ngeom, 4)
+          or not v.is_contiguous()):
+        raise ValueError("poses['geom_quat'] must be contiguous float32 MPS")
+
+  def run_contact_device(self, poses, contact, out=None):
+    """Evaluate CONTACT sensors into ``out`` (borrowed, merged)."""
+    torch, d, b = self._torch, self.descriptor, self.batch_size
+    self._sp_validate_poses(poses, need_geom_quat=False)
+    nc = 0 if contact is None else int(contact["frame"].shape[1])
+    dummy = self._s_dummy
+    if contact is None:
+      cfr = cfo = crow = cmu = dummy
+      cpk = torch.zeros(3, dtype=torch.int32, device=self._device)
+      slot = torch.zeros(1, dtype=torch.int32, device=self._device)
+      live = torch.zeros(1, dtype=torch.int32, device=self._device)
+      pge = torch.zeros(2, dtype=torch.int32, device=self._device)
+    else:
+      cfr, cfo = contact["frame"].reshape(-1), contact["force"].reshape(-1)
+      crow, cpk = contact["row"].reshape(-1), contact["packed"].reshape(-1)
+      cmu = contact["mu"].reshape(-1)
+      slot, live = contact["slot_pair"].reshape(-1), contact["pair_live"].reshape(-1)
+      pge = contact["pair_geoms"].reshape(-1)
+    dest = self._s_state_out if out is None else out
+    if dest.device.type != "mps" or tuple(dest.shape) != (b, d.nsensordata) \
+        or dest.dtype != torch.float32 or not dest.is_contiguous():
+      raise ValueError("out must be contiguous float32 MPS with shape (batch, nsensordata)")
+    if dest is not self._s_state_out:
+      self._s_state_out.copy_(dest)
+      dest = self._s_state_out
+    self._stage_mask.fill_(1 << int(mujoco.mjtStage.mjSTAGE_ACC))
+    cdims = torch.tensor(
+        [b, d.nsensor, d.nsensordata, nc, d.nsite, d.nbody, d.disableflags],
+        dtype=torch.int32, device=self._device)
+    self._sp_contact(
+        cfr, cfo, crow, cpk, cmu, slot, live, pge,
+        self._rne_geom_bodyid, self._rne_site_bodyid, self._s_body_tree.reshape(-1),
+        poses["site_pos"].reshape(-1), poses["site_quat"].reshape(-1),
+        self._s_site_geom.reshape(-1),
+        self._s_meta.reshape(-1),
+        self._s_intprm(),
+        dest.reshape(-1), self._stage_mask, cdims,
+        threads=(b * max(d.nsensor, 1),), group_size=(1,))
+    return dest
+
+  def _s_intprm(self):
+    import numpy as _np
+    return self._torch.as_tensor(
+        _np.asarray(self.descriptor.sensor_intprm, dtype=_np.int32).reshape(-1).copy(),
+        dtype=self._torch.int32, device=self._device)
+
+  def run_rays_device(self, poses, hull, hull_info, out=None):
+    """Evaluate site rangefinders into ``out`` (borrowed, merged)."""
+    torch, d, b = self._torch, self.descriptor, self.batch_size
+    self._sp_validate_poses(poses, need_geom_quat=True)
+    dest = self._s_state_out if out is None else out
+    if dest.device.type != "mps" or tuple(dest.shape) != (b, d.nsensordata) \
+        or dest.dtype != torch.float32 or not dest.is_contiguous():
+      raise ValueError("out must be contiguous float32 MPS with shape (batch, nsensordata)")
+    if dest is not self._s_state_out:
+      self._s_state_out.copy_(dest)
+      dest = self._s_state_out
+    self._stage_mask.fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
+    rdims = torch.tensor(
+        [b, d.nsensor, d.nsensordata, d.ngeom, d.nsite, self._sp_nmat,
+         d.disableflags, 0],
+        dtype=torch.int32, device=self._device)
+    self._sp_rays(
+        poses["site_pos"].reshape(-1), poses["site_quat"].reshape(-1),
+        poses["geom_pos"].reshape(-1), poses["geom_quat"].reshape(-1),
+        self._sp_geom_type.reshape(-1), self._sp_geom_size.reshape(-1),
+        self._rne_geom_bodyid,
+        self._sp_geom_matid.reshape(-1), self._sp_geom_rgba.reshape(-1),
+        self._sp_mat_rgba.reshape(-1), hull.reshape(-1), hull_info.reshape(-1),
+        self._rne_site_bodyid,
+        self._s_meta.reshape(-1), self._s_intprm(),
+        dest.reshape(-1), self._stage_mask, rdims,
+        threads=(b * max(d.nsensor, 1),), group_size=(1,))
+    return dest
+
+  def run_geomdist_device(self, poses, hull, hull_info, out=None):
+    """Evaluate geom-distance witnesses into ``out`` (borrowed, merged)."""
+    torch, d, b = self._torch, self.descriptor, self.batch_size
+    for key, shape in (("geom_pos", (b, d.ngeom, 3)),
+                       ("geom_quat", (b, d.ngeom, 4))):
+      v = poses.get(key, None)
+      if (not isinstance(v, torch.Tensor) or v.device.type != "mps"
+          or v.dtype != torch.float32 or tuple(v.shape) != shape
+          or not v.is_contiguous()):
+        raise ValueError(f"poses[{key!r}] must be contiguous float32 MPS with shape {shape}")
+    dest = self._s_state_out if out is None else out
+    if dest.device.type != "mps" or tuple(dest.shape) != (b, d.nsensordata) \
+        or dest.dtype != torch.float32 or not dest.is_contiguous():
+      raise ValueError("out must be contiguous float32 MPS with shape (batch, nsensordata)")
+    if dest is not self._s_state_out:
+      self._s_state_out.copy_(dest)
+      dest = self._s_state_out
+    self._stage_mask.fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
+    gdims = torch.tensor(
+        [b, d.nsensor, d.nsensordata, d.ngeom, d.nbody, d.disableflags,
+         0, int(self._sp_sdf_maxn), 0],
+        dtype=torch.int32, device=self._device)
+    self._sp_geomdist(
+        poses["geom_pos"].reshape(-1), poses["geom_quat"].reshape(-1),
+        self._sp_geom_type.reshape(-1), self._sp_geom_size.reshape(-1),
+        self._sp_geom_rbound.reshape(-1),
+        self._sp_body_geoms.reshape(-1),
+        hull.reshape(-1), hull_info.reshape(-1),
+        self._s_meta.reshape(-1),
+        dest.reshape(-1), self._stage_mask, gdims,
+        threads=(b * max(d.nsensor, 1),), group_size=(1,))
+    return dest
 
   def run_acc_device(self, qpos, qvel, qacc, poses, *, xfrc=None,
                      contact=None, eq_rowadr=None, jnt_map=None,

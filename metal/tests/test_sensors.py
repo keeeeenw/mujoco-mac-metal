@@ -112,17 +112,25 @@ def test_sensor_lowering_rejects_deferred_types_and_stateful_delay():
 
 
 def test_sensor_shader_buffer_abi_is_contiguous_and_matches_host_arguments():
-  source = Path(__file__).parents[1].joinpath(
-      "mujoco_metal", "shaders", "sensors.metal"
-  ).read_text()
-  kernels = re.split(r"(?=^kernel void )", source, flags=re.M)
+  import re as _re
+  base = Path(__file__).parents[1].joinpath("mujoco_metal", "shaders")
+  source = base.joinpath("sensors.metal").read_text()
+  kernels = _re.split(r"(?=^kernel void )", source, flags=_re.M)
   kernels = [k for k in kernels if "[[buffer(" in k]
   assert len(kernels) == 2
   for block in kernels:
-    indices = [int(x) for x in re.findall(r"\[\[buffer\((\d+)\)\]\]", block)]
+    indices = [int(x) for x in _re.findall(r"\[\[buffer\((\d+)\)\]\]", block)]
     assert indices == list(range(len(indices)))
     assert len(indices) <= 31
-  assert len(re.findall(r"\[\[buffer\((\d+)\)\]\]", kernels[0])) == _KERNEL_FIXED_BUFFER_COUNT + len(_KERNEL_METADATA)
+  assert len(_re.findall(r"\[\[buffer\((\d+)\)\]\]", kernels[0])) == _KERNEL_FIXED_BUFFER_COUNT + len(_KERNEL_METADATA)
+  for name in ("sensors_rne.metal", "sensors_spatial.metal"):
+    src = base.joinpath(name).read_text()
+    blocks = [k for k in _re.split(r"(?=^kernel void )", src, flags=_re.M) if "[[buffer(" in k]
+    assert blocks, name
+    for block in blocks:
+      indices = [int(x) for x in _re.findall(r"\[\[buffer\((\d+)\)\]\]", block)]
+      assert indices == list(range(len(indices))), (name, indices)
+      assert len(indices) <= 31, (name, len(indices))
 
 
 def test_sensor_oracle_accepts_empty_world_without_sensor_buffers():
