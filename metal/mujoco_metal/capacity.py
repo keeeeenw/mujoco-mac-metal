@@ -39,6 +39,7 @@ BASE_MAX_ROWS = 96
 # the exact small-model dense path (unchanged math). Above it the block
 # path takes over (017 follow-up commits).
 DENSE_ROW_THRESHOLD = 96
+AUTO_JACOBIAN_DENSE_NV = 60
 
 
 class CapacityOverflow(ValueError):
@@ -69,6 +70,8 @@ class CapacityEstimate:
   nr: int
   batch: int
   dense_path: bool
+  jacobian_kind: str
+  jacobian_auto_threshold: int
   memory_bytes: int
   memory_breakdown: tuple
 
@@ -81,30 +84,73 @@ def _bytes_i32(n):
   return int(n) * 4
 
 
-def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch):
-  """Mirror ``MetalCoupledConstraints.prepare_workspace`` exactly (R08a).
+def selected_jacobian_kind(model: mujoco.MjModel, nv=None):
+  """Return the pinned MuJoCo 3.10 Jacobian storage selection.
 
-  Returns ``(parts, total)`` with one entry per allocated device buffer so
-  the estimate and the allocation cannot drift: any buffer added to
-  ``prepare_workspace`` must appear here. Counts use ``max(..., 1)`` empty
-  guards exactly like the allocator.
+  AUTO selects dense storage through 60 DOFs and sparse storage above 60.
+  This decision is independent of solver-row path selection.
+  """
+  jac = int(model.opt.jacobian)
+  if jac == int(mujoco.mjtJacobian.mjJAC_DENSE):
+    return "dense"
+  if jac == int(mujoco.mjtJacobian.mjJAC_SPARSE):
+    return "sparse"
+  if jac != int(mujoco.mjtJacobian.mjJAC_AUTO):
+    raise ValueError(f"unknown MuJoCo Jacobian mode: {jac}")
+  dofs = int(model.nv if nv is None else nv)
+  return "dense" if dofs <= AUTO_JACOBIAN_DENSE_NV else "sparse"
+
+
+def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch):
+  """Budget solver buffers and the fixed-capacity milestone-017 maps.
+
+  Returns ``(parts, total)`` with exact sizes for current coupled solver
+  allocations plus the reserved pair/slot/row maps and scan scratch required
+  by 017. Counts use ``max(..., 1)`` empty guards. The compact-map entries
+  are reservations until the packing path binds them into
+  ``prepare_workspace``; they must remain here so the allocation budget
+  continues to cover the integrated implementation.
   """
   b, v = int(batch), int(max(nv, 1))
   nc = int(nslots)
+  # Both ``empty`` and torch.zeros in prepare_workspace allocate one element
+  # for an otherwise empty buffer. Keep that guard explicit so the estimate
+  # covers the zero-contact/zero-row cases too.
+  def guarded(n):
+    return max(int(n), 1)
+  blocks = max((int(nr) + 255) // 256, 1)
   parts = (
-      ("contact_row_data", _bytes(b * nc * 6 * 6)),
-      ("contact_frame", _bytes(b * nc * 12)),
-      ("contact_jacobian", _bytes(b * nc * 6 * v)),
-      ("pair_mask", _bytes(b * max(int(npairs), 1))),
-      ("workspace_J", _bytes(b * int(nr) * v)),
-      ("workspace_debug", _bytes(b * (int(nr) * int(nr) + 7 * int(nr)))),
-      ("out_force", _bytes(b * v)),
-      ("out_acc", _bytes(b * v)),
+      ("contact_row_data", _bytes(guarded(b * nc * 6 * 6))),
+      ("contact_frame", _bytes(guarded(b * nc * 12))),
+      ("contact_jacobian", _bytes(guarded(b * nc * 6 * v))),
+      ("pair_mask", _bytes(guarded(b * max(int(npairs), 1)))),
+      ("workspace_J", _bytes(guarded(b * int(nr) * v))),
+      ("workspace_debug", _bytes(guarded(b * (int(nr) * int(nr) + 7 * int(nr))))),
+      ("out_force", _bytes(guarded(b * v))),
+      ("out_acc", _bytes(guarded(b * v))),
       ("out_status", _bytes_i32(b)),
-      ("out_diagnostics", _bytes(b * 10)),
-      ("out_contact_force", _bytes(b * nc * 11)),
-      ("out_joint_force", _bytes(b * max(int(nr_joint), 1))),
+      ("out_diagnostics", _bytes(guarded(b * 10))),
+      ("out_contact_force", _bytes(guarded(b * nc * 11))),
+      ("out_joint_force", _bytes(guarded(b * max(int(nr_joint), 1)))),
       ("eq_active", _bytes_i32(b * max(int(neq), 1))),
+      ("eq_active_default", _bytes_i32(b * max(int(neq), 1))),
+      # Compaction maps preserve canonical logical identity while reducing
+      # pair, slot, and row execution spans. The conservative budget assumes
+      # every candidate can be active and accounts for independent scan
+      # scratch for all three domains.
+      ("packed_to_pair", _bytes_i32(b * int(npairs))),
+      ("pair_to_packed", _bytes_i32(b * int(npairs))),
+      ("packed_to_slot", _bytes_i32(b * nc)),
+      ("slot_to_packed", _bytes_i32(b * nc)),
+      ("packed_to_logical_row", _bytes_i32(b * int(nr))),
+      ("logical_to_packed_row", _bytes_i32(b * int(nr))),
+      ("compaction_counts_overflow", _bytes_i32(b * 4)),
+      ("pair_scan_prefix", _bytes_i32(b * guarded(int(npairs)))),
+      ("pair_scan_blocks", _bytes_i32(b * max((int(npairs) + 255) // 256, 1) * 2)),
+      ("slot_scan_prefix", _bytes_i32(b * guarded(nc))),
+      ("slot_scan_blocks", _bytes_i32(b * max((nc + 255) // 256, 1) * 2)),
+      ("row_scan_prefix", _bytes_i32(b * guarded(int(nr)))),
+      ("row_scan_blocks", _bytes_i32(b * blocks * 2)),
   )
   return parts, sum(value for _, value in parts)
 
@@ -114,8 +160,8 @@ def estimate_capacity(model, batch_size, npairs, nslots, nr, *, neq=0, nr_joint=
 
   `npairs`/`nslots`/`nr` come from the coupled lowering (candidate counts,
   before broadphase pruning); `neq`/`nr_joint` size the equality/joint
-  outputs. Memory mirrors ``prepare_workspace`` exactly (see
-  :func:`estimate_workspace`) at the REAL batch size: lowering-time calls
+  outputs. Memory includes the current solver workspace and full compact-map
+  reservation (see :func:`estimate_workspace`) at the REAL batch size: lowering-time calls
   must pass the construction batch, never a hardcoded 1. Deterministic:
   pure function of the inputs, no device state.
   """
@@ -132,6 +178,8 @@ def estimate_capacity(model, batch_size, npairs, nslots, nr, *, neq=0, nr_joint=
       nv=nv, nbody=nbody, ngeom=ngeom, npairs=int(npairs),
       nslots=int(nslots), nr=nr, batch=batch,
       dense_path=(nr <= DENSE_ROW_THRESHOLD and nv <= 32),
+      jacobian_kind=selected_jacobian_kind(model),
+      jacobian_auto_threshold=AUTO_JACOBIAN_DENSE_NV,
       memory_bytes=total, memory_breakdown=parts)
 
 

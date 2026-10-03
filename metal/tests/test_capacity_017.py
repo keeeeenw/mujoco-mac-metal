@@ -15,11 +15,13 @@ from mujoco_metal.capacity import (
     BASE_MAX_ROWS,
     BASE_MAX_SLOTS,
     BASE_NVIDIA_NV,
+    AUTO_JACOBIAN_DENSE_NV,
     DENSE_ROW_THRESHOLD,
     CapacityLimits,
     CapacityOverflow,
     check_capacity,
     estimate_capacity,
+    selected_jacobian_kind,
 )
 
 
@@ -46,6 +48,8 @@ def test_estimate_is_deterministic_and_counts_memory():
   # R08a: parts mirror prepare_workspace buffer-for-buffer.
   assert "workspace_debug" in names and "contact_row_data" in names
   assert "workspace_J" in names and "out_contact_force" in names
+  assert "eq_active_default" in names
+  assert est1.memory_breakdown == estimate_workspace_expected(model, 2, 3, 5, 20)
 
 
 def test_default_limits_preserve_historical_ceilings():
@@ -88,3 +92,54 @@ def test_overflow_is_valueerror_and_batch_checked():
     estimate_capacity("not-a-model", 1, 0, 0, 0)
   with pytest.raises(ValueError, match="positive"):
     estimate_capacity(model, 0, 0, 0, 0)
+
+
+def estimate_workspace_expected(model, batch, npairs, nslots, nr):
+  """Independent exact byte count for the currently allocated 13 buffers."""
+  b, v = batch, max(int(model.nv), 1)
+  nc = nslots
+  sizes = (
+      max(b * nc * 36, 1), max(b * nc * 12, 1),
+      max(b * nc * 6 * v, 1), max(b * max(npairs, 1), 1),
+      max(b * nr * v, 1), max(b * (nr * nr + 7 * nr), 1),
+      max(b * v, 1), max(b * v, 1), b, max(b * 10, 1),
+      max(b * nc * 11, 1), max(b, 1), max(b, 1), max(b, 1),
+      b * npairs, b * npairs, b * nc, b * nc, b * nr, b * nr, b * 4,
+      b * max(npairs, 1), b * max((npairs + 255) // 256, 1) * 2,
+      b * max(nc, 1), b * max((nc + 255) // 256, 1) * 2,
+      b * max(nr, 1), b * max((nr + 255) // 256, 1) * 2,
+  )
+  names = (
+      "contact_row_data", "contact_frame", "contact_jacobian", "pair_mask",
+      "workspace_J", "workspace_debug", "out_force", "out_acc", "out_status",
+      "out_diagnostics", "out_contact_force", "out_joint_force", "eq_active",
+      "eq_active_default", "packed_to_pair", "pair_to_packed", "packed_to_slot",
+      "slot_to_packed", "packed_to_logical_row", "logical_to_packed_row",
+      "compaction_counts_overflow", "pair_scan_prefix", "pair_scan_blocks",
+      "slot_scan_prefix", "slot_scan_blocks", "row_scan_prefix", "row_scan_blocks",
+  )
+  return tuple(zip(names, (n * 4 for n in sizes)))
+
+
+def _jacobian_model(nv, setting="auto"):
+  bodies = "".join(
+      '<body><joint type="slide" axis="1 0 0"/><geom type="sphere" size=".01"/></body>'
+      for _ in range(nv))
+  return mujoco.MjModel.from_xml_string(
+      f'<mujoco><option jacobian="{setting}"/><worldbody>{bodies}</worldbody></mujoco>')
+
+
+@pytest.mark.parametrize("nv, expected", [(60, "dense"), (61, "sparse")])
+def test_auto_jacobian_uses_pinned_sixty_dof_dispatch(nv, expected):
+  model = _jacobian_model(nv)
+  assert selected_jacobian_kind(model) == expected
+  estimate = estimate_capacity(model, 1, 0, 0, 0)
+  assert estimate.jacobian_kind == expected
+  assert estimate.jacobian_auto_threshold == AUTO_JACOBIAN_DENSE_NV == 60
+
+
+@pytest.mark.parametrize("setting, expected", [("dense", "dense"), ("sparse", "sparse")])
+def test_explicit_jacobian_setting_overrides_auto_dispatch(setting, expected):
+  model = _jacobian_model(61, setting)
+  assert selected_jacobian_kind(model) == expected
+  assert estimate_capacity(model, 1, 0, 0, 0).jacobian_kind == expected
