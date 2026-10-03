@@ -31,6 +31,7 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Muscle-powered gripper](muscle_gripper.md) | Parallel jaws with supporting ledges, bin delivery and pedestal placement | Stateful actuation and contact-rich manipulation |
 | [Cable drawbridge](cable_drawbridge.md) | A routed cable hauls, goes slack and re-tensions a loaded deck | Spatial tendon wrapping, pulley division and spring/damping forces |
 | [Suspension platform](suspension_platform.md) | A suspended platform and payload | Tendon constraints and ball-joint limits |
+| [Deformable cable cradle](deformable_cable_cradle.md) | A flexible suspended cable swings through a wide arc under gravity | Native deformable flexcomp kinematics, edge equalities, Delassus block-row solve |
 | [Chaotic pendulum](README.md) | Four connected arms swing and tumble | Generalized rigid-body mass and bias |
 
 Use current `main` and the [demo/source setup](../INSTALL.md#development-source).
