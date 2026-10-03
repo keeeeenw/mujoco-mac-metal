@@ -199,12 +199,10 @@ def test_geom_candidates_include_inactive_tetrahedra_like_pinned_source():
 def test_cpu_contact_cap_and_group_route_follow_midphase_selection():
   xml = """
     <mujoco><option gravity="0 0 0"/><worldbody>
-      <body pos="0 0 .15"><freejoint/>
-        <geom type="sphere" size=".5" contype="0" conaffinity="1"/>
-        <geom type="sphere" pos=".3 0 0" size=".5"
-              contype="0" conaffinity="1"/>
-      </body>
-      <flexcomp name="cloth" type="grid" count="8 8 1" pos="0 0 .1"
+      <geom type="plane" size="0 0 .1" contype="0" conaffinity="1"/>
+      <geom type="plane" pos="0 0 .2" size="0 0 .1"
+            contype="0" conaffinity="1"/>
+      <flexcomp name="cloth" type="grid" count="8 8 1" pos="0 0 -.1"
                 spacing=".1 .1 .1" mass="1" dim="2">
         <contact contype="1" conaffinity="0" selfcollide="none"/>
         <edge stiffness="0" damping="0"/>
@@ -234,6 +232,9 @@ def test_cpu_contact_cap_and_group_route_follow_midphase_selection():
               for geom in (0, 1)}
     if midphase and can_use_tree:
       assert data.ncon == 50
+      assert 0 < counts[0] < 50 and 0 < counts[1] < 50
+      assert [int(c.geom[0]) for c in data.contact] == (
+          [0] * counts[0] + [1] * counts[1])
     else:
       assert counts == {0: 50, 1: 50}
       assert [int(c.geom[0]) for c in data.contact] == [0] * 50 + [1] * 50
@@ -244,6 +245,23 @@ def test_cpu_contact_cap_and_group_route_follow_midphase_selection():
                            tuple(int(x) for x in c.elem)) for c in repeat.contact]
   assert len(records[True]) == 50
   assert len(records[False]) == 100
+
+
+@pytest.mark.parametrize("missing_bvh", ["body", "flex"])
+def test_midphase_filter_group_requires_both_compiled_bvhs(missing_bvh):
+  model = _model(
+      '<body><geom type="sphere" size=".2"/></body>',
+      _flex("cloth", "0 0 .1", 1, 0))
+  body = int(model.geom_bodyid[0])
+  assert int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_MIDPHASE) == 0
+  assert int(model.body_bvhadr[body]) >= 0
+  assert int(model.flex_bvhadr[0]) >= 0
+  if missing_bvh == "body":
+    model.body_bvhadr[body] = -1
+  else:
+    model.flex_bvhadr[0] = -1
+  descriptor = lower_flex_contacts(model)
+  assert descriptor.filter_group_count == 1
 
 
 def test_self_collision_requires_matching_contype_and_conaffinity():
