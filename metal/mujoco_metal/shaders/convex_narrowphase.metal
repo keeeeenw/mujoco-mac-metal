@@ -13,6 +13,7 @@
 using namespace metal;
 
 // Geom type codes must match MuJoCo mjtGeom.
+#define CX_HFIELD 1
 #define CX_SPHERE 2
 #define CX_CAPSULE 3
 #define CX_ELLIPSOID 4
@@ -22,7 +23,10 @@ using namespace metal;
 
 // Milestone 011: convex-hull vertex support. Hull verts are geom-local
 // (world = geom frame composed with mesh_vert, calibrated against CPU
-// contacts); hull_info holds per-geom (offset, count).
+// contacts); hull_info holds per-geom (hull offset, hull count, face
+// normal offset, face index offset, face count, hfield data offset,
+// hfield nrow, hfield ncol, hfield size offset) — 9 ints (hfield fields
+// are -1 for non-heightfield geoms).
 #define CX_MESH_MAXSCAN 64
 
 #define CX_MINVAL 1e-15f
@@ -32,7 +36,8 @@ using namespace metal;
 
 // Analytic support point of a convex geom in world direction d.
 inline float3 cx_support(int type, float3 p, float3x3 R, float3 sz, float3 d,
-                         int gi, device const float* hull, device const int* hull_info) {
+                         int gi, device const float* hull, device const int* hull_info,
+                     thread float3* prismV) {
   float dl = length(d);
   float3 dn = dl > 1e-12f ? d / dl : float3(1.0f, 0.0f, 0.0f);
   // Local direction.
@@ -60,8 +65,8 @@ inline float3 cx_support(int type, float3 p, float3x3 R, float3 sz, float3 d,
     // the tied feature's centroid so portal seeding stays symmetric: a
     // bottom-face tie seeds the face basin, not an arbitrary tied vertex's
     // edge basin. Tie eps 1e-6 m never merges distinct mm-scale features.
-    int off = hull_info[gi * 5];
-    int cnt = hull_info[gi * 5 + 1];
+    int off = hull_info[gi * 9];
+    int cnt = hull_info[gi * 9 + 1];
     if (cnt < 0) cnt = 0;
     if (cnt > CX_MESH_MAXSCAN) cnt = CX_MESH_MAXSCAN;
     float best = -3.4028235e+38f;
@@ -79,6 +84,19 @@ inline float3 cx_support(int type, float3 p, float3x3 R, float3 sz, float3 d,
       if (dot(v, l) >= best - 1e-6f) { bs += v; nw += 1.0f; }
     }
     s = nw > 0.0f ? bs / nw : float3(0.0f);
+  } else if (type == CX_HFIELD) {
+    // Milestone 012 terrain prism: 6 verts in the working frame
+    // (collide_hfield runs GJK in the hfield frame, so these are local).
+    // Pinned halfspace rule (mjc_prism_support): bottom triangle for -z,
+    // top triangle otherwise; strict > keeps the first best vertex.
+    int istart = (l.z < 0.0f) ? 0 : 3;
+    float best = dot(prismV[istart], l);
+    float3 bs = prismV[istart];
+    for (int k = 1; k < 3; ++k) {
+      float q = dot(prismV[istart + k], l);
+      if (q > best) { best = q; bs = prismV[istart + k]; }
+    }
+    return bs;
   } else {  // CX_BOX
     s = float3(l.x >= 0.0f ? sz.x : -sz.x,
                l.y >= 0.0f ? sz.y : -sz.y,
@@ -97,10 +115,11 @@ struct CxVertex {
 inline CxVertex cx_minkowski(int ta, float3 pa, float3x3 Ra, float3 sza,
                              int tb, float3 pb, float3x3 Rb, float3 szb,
                              float3 d, int ia, int ib,
-                             device const float* hull, device const int* hull_info) {
+                             device const float* hull, device const int* hull_info,
+                     thread float3* prismV) {
   CxVertex v;
-  v.a = cx_support(ta, pa, Ra, sza, d, ia, hull, hull_info);
-  v.b = cx_support(tb, pb, Rb, szb, -d, ib, hull, hull_info);
+  v.a = cx_support(ta, pa, Ra, sza, d, ia, hull, hull_info, prismV);
+  v.b = cx_support(tb, pb, Rb, szb, -d, ib, hull, hull_info, prismV);
   v.m = v.a - v.b;
   return v;
 }
@@ -204,7 +223,8 @@ inline float cx_gjk(int ta, float3 pa, float3x3 Ra, float3 sza,
                     float3 d0, thread float3& wpa, thread float3& wpb,
                     thread bool& overlap, thread CxVertex* seed, thread int* nseed,
                     int ia, int ib,
-                    device const float* hull, device const int* hull_info) {
+                    device const float* hull, device const int* hull_info,
+                     thread float3* prismV) {
   CxVertex S[4];
   int n = 0;
   float3 d = d0;
@@ -216,7 +236,7 @@ inline float cx_gjk(int ta, float3 pa, float3x3 Ra, float3 sza,
   overlap = false;
   *nseed = 0;
   for (int iter = 0; iter < CX_GJK_MAXITER; ++iter) {
-    CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, d, ia, ib, hull, hull_info);
+    CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, d, ia, ib, hull, hull_info, prismV);
     if (n == 0) {
       S[0] = v; n = 1;
       closest = v.m; wts[0] = 1.0f;
@@ -350,8 +370,8 @@ inline bool cx_mesh_snap(int gi, float3 p, float3x3 R,
   // (body-center delta). Robust for deep/oblique penetration where portal
   // witnesses sit far from the contact region. Moller-Trumbore, nearest
   // hit wins; the 0.5 gate rejects grazing hits.
-  int hoff = hull_info[gi * 5];
-  int hcnt = hull_info[gi * 5 + 1];
+  int hoff = hull_info[gi * 9];
+  int hcnt = hull_info[gi * 9 + 1];
   if (hcnt <= 0 || hcnt > CX_MESH_MAXSCAN) return false;
   float rl = length(rayDir);
   if (rl < 1e-24f) return false;
@@ -367,9 +387,9 @@ inline bool cx_mesh_snap(int gi, float3 p, float3x3 R,
   // face plane (mesh bodies often rest at face height), which would make
   // the ray start on the boundary and miss. 1 mm ≪ hull scale.
   float3 org = cw - rd * 1e-3f;
-  int foff = hull_info[gi * 5 + 3];
-  int fcnt = hull_info[gi * 5 + 4];
-  int noff = hull_info[gi * 5 + 2];
+  int foff = hull_info[gi * 9 + 3];
+  int fcnt = hull_info[gi * 9 + 4];
+  int noff = hull_info[gi * 9 + 2];
   if (fcnt < 0) return false;
   float bestT = 3.4028235e+38f;
   float3 bestN = float3(0.0f);
@@ -427,8 +447,8 @@ inline bool cx_mesh_snap_u(int gi, float3 p, float3x3 R,
                          thread float3& fw0, thread float3& fw1, thread float3& fw2) {
   float3 d = eaW - p;
   float3 el = float3(dot(R[0], d), dot(R[1], d), dot(R[2], d));
-  int hoff = hull_info[gi * 5];
-  int hcnt = hull_info[gi * 5 + 1];
+  int hoff = hull_info[gi * 9];
+  int hcnt = hull_info[gi * 9 + 1];
   if (hcnt <= 0 || hcnt > CX_MESH_MAXSCAN) return false;
   int bestV = -1;
   float bestD2 = 3.4028235e+38f;
@@ -440,9 +460,9 @@ inline bool cx_mesh_snap_u(int gi, float3 p, float3x3 R,
     if (q < bestD2) { bestD2 = q; bestV = k; }
   }
   if (bestV < 0) return false;
-  int foff = hull_info[gi * 5 + 3];
-  int fcnt = hull_info[gi * 5 + 4];
-  int noff = hull_info[gi * 5 + 2];
+  int foff = hull_info[gi * 9 + 3];
+  int fcnt = hull_info[gi * 9 + 4];
+  int noff = hull_info[gi * 9 + 2];
   if (fcnt < 0) return false;
   float bestS = 0.7f;
   float3 bestN = float3(0.0f);
@@ -526,11 +546,12 @@ inline bool cx_mesh_readout(int ta, float3 pa, float3x3 Ra, float3 sza,
                             int tb, float3 pb, float3x3 Rb, float3 szb,
                             int ia, int ib,
                             device const float* hull, device const int* hull_info,
+                            thread float3* prismV,
                             float3 nn, bool sA, float3 fA0, float3 fA1, float3 fA2,
                             bool sB, float3 fB0, float3 fB1, float3 fB2,
                             thread float& depth, thread float3& wmid) {
-  float3 seedA = cx_support(ta, pa, Ra, sza, nn, ia, hull, hull_info);
-  float3 seedB = cx_support(tb, pb, Rb, szb, -nn, ib, hull, hull_info);
+  float3 seedA = cx_support(ta, pa, Ra, sza, nn, ia, hull, hull_info, prismV);
+  float3 seedB = cx_support(tb, pb, Rb, szb, -nn, ib, hull, hull_info, prismV);
   // Box sides clamp to the facing face (corner ties sit far from
   // localized contacts); other analytic supports are already unique.
   // Canonical order puts box first in mesh-box pairs, but both sides
@@ -563,10 +584,10 @@ inline bool cx_mesh_readout(int ta, float3 pa, float3x3 Ra, float3 sza,
                               &u, &v, &w);
     ifA = q + seedB;
   }
-  float3 saP = cx_support(ta, pa, Ra, sza, nn, ia, hull, hull_info);
-  float3 saM = cx_support(ta, pa, Ra, sza, -nn, ia, hull, hull_info);
-  float3 sbP = cx_support(tb, pb, Rb, szb, nn, ib, hull, hull_info);
-  float3 sbM = cx_support(tb, pb, Rb, szb, -nn, ib, hull, hull_info);
+  float3 saP = cx_support(ta, pa, Ra, sza, nn, ia, hull, hull_info, prismV);
+  float3 saM = cx_support(ta, pa, Ra, sza, -nn, ia, hull, hull_info, prismV);
+  float3 sbP = cx_support(tb, pb, Rb, szb, nn, ib, hull, hull_info, prismV);
+  float3 sbM = cx_support(tb, pb, Rb, szb, -nn, ib, hull, hull_info, prismV);
   float ha = dot(saP, nn), la = dot(saM, nn);
   float hb = dot(sbP, nn), lb = dot(sbM, nn);
   depth = min(ha, hb) - max(la, lb);
@@ -579,7 +600,8 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
                     bool raw, thread float3& normal,
                     thread float3& wpa, thread float3& wpb,
                     int ia, int ib,
-                    device const float* hull, device const int* hull_info) {
+                    device const float* hull, device const int* hull_info,
+                     thread float3* prismV) {
   CxVertex P[4];
   P[0].a = pa; P[0].b = pb; P[0].m = pa - pb;
   float3 c0 = P[0].m;
@@ -592,7 +614,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
   float3 dir = -c0;
   float dl = length(dir);
   dir = dl > 1e-24f ? dir / dl : float3(1.0f, 0.0f, 0.0f);
-  P[1] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir, ia, ib, hull, hull_info);
+  P[1] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir, ia, ib, hull, hull_info, prismV);
   if (dot(P[1].m, dir) <= 0.0f) return 0.0f;
   // v2 perpendicular to plane (origin, v0, v1). The cross-product sign
   // is ambiguous: try both, keep the portal with the best containment
@@ -615,7 +637,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
       return l1;
     }
     dl = length(dir); dir = dir / dl;
-    P[2] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir, ia, ib, hull, hull_info);
+    P[2] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir, ia, ib, hull, hull_info, prismV);
     if (dot(P[2].m, dir) <= 0.0f) {
       if (attempt == 1 && !established) return 0.0f;
       continue;
@@ -641,7 +663,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
     }
     bool failed = false;
     for (int guard = 0; guard < 8; ++guard) {
-      P[3] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir, ia, ib, hull, hull_info);
+      P[3] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dir, ia, ib, hull, hull_info, prismV);
       if (dot(P[3].m, dir) <= 0.0f) { failed = true; break; }
       // Origin outside face (v1,v0,v3)? -> v2 = v3 (libccd absolute test).
       float3 va = cross(P[1].m, P[3].m);
@@ -690,7 +712,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
   for (int guard = 0; guard < 64; ++guard) {
     float3 fdir = cx_portal_dir(P[1].m, P[2].m, P[3].m);
     if (dot(fdir, P[1].m) > 0.0f) break;
-    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, fdir, ia, ib, hull, hull_info);
+    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, fdir, ia, ib, hull, hull_info, prismV);
     if (dot(v4.m, fdir) <= 0.0f) return 0.0f;
     float adv0 = dot(v4.m, fdir) - dot(P[1].m, fdir);
     adv0 = min(adv0, dot(v4.m, fdir) - dot(P[2].m, fdir));
@@ -716,7 +738,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
       bestVal = best; bestNrm = nrm;
       bestP[0] = P[0]; bestP[1] = P[1]; bestP[2] = P[2]; bestP[3] = P[3];
     }
-    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, nrm, ia, ib, hull, hull_info);
+    CxVertex v4 = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, nrm, ia, ib, hull, hull_info, prismV);
     float adv = dot(v4.m, nrm) - best;
     if (adv < CX_MPR_TOL * max(1.0f, best)) break;
     cx_expand_portal(P, &v4);
@@ -764,7 +786,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
     float dA = 0.0f;
     float3 wA = float3(0.0f);
     bool okA = cx_mesh_readout(ta, pa, Ra, sza, tb, pb, Rb, szb, ia, ib,
-                               hull, hull_info, nn, sA, fA0, fA1, fA2,
+                               hull, hull_info, prismV, nn, sA, fA0, fA1, fA2,
                                sB, fB0, fB1, fB2, dA, wA);
     // Candidate B: center-ray snap.
     float3 mA = uu, mB = uu;
@@ -793,7 +815,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
         nnB = (ta == 7) ? mA : uu;
       }
       okB = cx_mesh_readout(ta, pa, Ra, sza, tb, pb, Rb, szb, ia, ib,
-                            hull, hull_info, nnB, qA, hA0, hA1, hA2,
+                            hull, hull_info, prismV, nnB, qA, hA0, hA1, hA2,
                             qB, hB0, hB1, hB2, dB, wB);
     }
     // Candidate C: axis-min over world axes (lateral-offset safety net).
@@ -820,7 +842,7 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
         float dd = 0.0f;
         float3 ww = float3(0.0f);
         if (cx_mesh_readout(ta, pa, Ra, sza, tb, pb, Rb, szb, ia, ib,
-                            hull, hull_info, n, false, pa, pa, pa,
+                            hull, hull_info, prismV, n, false, pa, pa, pa,
                             false, pb, pb, pb, dd, ww)) {
           if (!okC || dd < dC) {
             okC = true;
@@ -1008,13 +1030,14 @@ inline int cx_single_contact(int ta, float3 pa, float3x3 Ra, float3 sza,
                              float margin, float3 d0, bool raw,
                              thread ContactGeom* out,
                              int ia, int ib,
-                             device const float* hull, device const int* hull_info) {
+                             device const float* hull, device const int* hull_info,
+                     thread float3* prismV) {
   float3 wpa, wpb;
   CxVertex seed[4];
   int nseed = 0;
   bool overlap = false;
   float gap = cx_gjk(ta, pa, Ra, sza, tb, pb, Rb, szb, d0, wpa, wpb,
-                     overlap, seed, &nseed, ia, ib, hull, hull_info);
+                     overlap, seed, &nseed, ia, ib, hull, hull_info, prismV);
   if (!overlap) {
     if (gap > margin) return 0;
     float3 delta = wpa - wpb;
@@ -1037,7 +1060,7 @@ inline int cx_single_contact(int ta, float3 pa, float3x3 Ra, float3 sza,
   }
   float3 nrm, ea, eb;
   float depth = cx_mpr(ta, pa, Ra, sza, tb, pb, Rb, szb, raw, nrm, ea, eb,
-                       ia, ib, hull, hull_info);
+                       ia, ib, hull, hull_info, prismV);
   // Guard against relative-enclosure false positives at ~1e-8 gaps.
   if (depth <= 1e-9f) return 0;
   // Enforce the A->B normal convention (matches the GJK gap path and the
@@ -1064,12 +1087,13 @@ inline int cx_single_contact(int ta, float3 pa, float3x3 Ra, float3 sza,
   // itself facet-tilted (e.g. cylinder-ellipsoid, whose MPR facet tilt
   // matches), analytic "correction" moves away from the oracle. Box
   // sides are never processed.
-  if (ta == 3 || tb == 3) {
+  // Pinned native path (NATIVECCD, the default) runs no fixNormal on
+  // heightfield pairs; the libccd path does. Gate capsules accordingly.
+  if ((ta == 3 || tb == 3) && ta != 1 && tb != 1) {
     float3 n0, n1;
     bool p0 = false, p1 = false;
     cx_fix_normal_side(ta, pa, Ra, sza, out[0].pos, nrm, n0, p0);
-    cx_fix_normal_side(tb, pb, Rb, szb, out[0].pos, -nrm, n1, p1);
-    if (p0 && p1) {
+    cx_fix_normal_side(tb, pb, Rb, szb, out[0].pos, -nrm, n1, p1);    if (p0 && p1) {
       float3 c = n0 - n1;
       float l = length(c);
       if (l > 1e-24f) out[0].normal = c / l;
@@ -1089,12 +1113,13 @@ inline int collide_plane_convex(float3 p1, float4 q1,
                                 int t2, float3 p2, float4 q2, float3 sz2,
                                 float margin, thread ContactGeom* con,
                                 int ia, int ib,
-                                device const float* hull, device const int* hull_info) {
+                                device const float* hull, device const int* hull_info,
+                     thread float3* prismV) {
   float3 n = rotate_q(q1, float3(0.0f, 0.0f, 1.0f));
   float3x3 R2 = float3x3(rotate_q(q2, float3(1,0,0)),
                          rotate_q(q2, float3(0,1,0)),
                          rotate_q(q2, float3(0,0,1)));
-  float3 s = cx_support(t2, p2, R2, sz2, -n, ib, hull, hull_info);
+  float3 s = cx_support(t2, p2, R2, sz2, -n, ib, hull, hull_info, prismV);
   float dist = dot(s - p1, n);
   if (dist > margin) return 0;
   con[0].dist = dist;
@@ -1110,7 +1135,8 @@ inline int collide_convex_single(int ta, float3 pa, float4 qa, float3 sza,
                                  int tb, float3 pb, float4 qb, float3 szb,
                                  float margin, thread ContactGeom* con,
                                  int ia, int ib,
-                                 device const float* hull, device const int* hull_info) {
+                                 device const float* hull, device const int* hull_info,
+                     thread float3* prismV) {
   float3x3 Ra = float3x3(rotate_q(qa, float3(1,0,0)),
                          rotate_q(qa, float3(0,1,0)),
                          rotate_q(qa, float3(0,0,1)));
@@ -1120,7 +1146,7 @@ inline int collide_convex_single(int ta, float3 pa, float4 qa, float3 sza,
   float3 d0 = pa - pb;
   if (dot(d0, d0) < 1e-24f) d0 = float3(1.0f, 0.0f, 0.0f);
   return cx_single_contact(ta, pa, Ra, sza, tb, pb, Rb, szb, margin, d0, false, con,
-                           ia, ib, hull, hull_info);
+                           ia, ib, hull, hull_info, prismV);
 }
 
 // In-place rigid rotation of a geom frame about origin (pinned
@@ -1173,7 +1199,8 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
                                 float rb1, float rb2, int disable_multiccd,
                                 thread ContactGeom* con,
                                 int ia, int ib,
-                                device const float* hull, device const int* hull_info) {
+                                device const float* hull, device const int* hull_info,
+                     thread float3* prismV) {
   float3x3 Ra = float3x3(rotate_q(qa, float3(1,0,0)),
                          rotate_q(qa, float3(0,1,0)),
                          rotate_q(qa, float3(0,0,1)));
@@ -1183,7 +1210,7 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
   float3 d0 = pa - pb;
   if (dot(d0, d0) < 1e-24f) d0 = float3(1.0f, 0.0f, 0.0f);
   int n = cx_single_contact(ta, pa, Ra, sza, tb, pb, Rb, szb, margin, d0, false, con,
-                            ia, ib, hull, hull_info);
+                            ia, ib, hull, hull_info, prismV);
   if (n == 0 || maxn <= 1) return n;
   // Pinned gates: no restarts with MULTICCD disabled, without exactly one
   // primary witness, or when either geom is spherical/ellipsoidal.
@@ -1212,7 +1239,7 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
       float3 d1 = pa1 - pb1;
       if (dot(d1, d1) < 1e-24f) d1 = float3(1.0f, 0.0f, 0.0f);
       if (!cx_single_contact(ta, pa1, Ra1, sza, tb, pb1, Rb1, szb,
-                             margin, d1, true, &cand, ia, ib, hull, hull_info))
+                             margin, d1, true, &cand, ia, ib, hull, hull_info, prismV))
         continue;
       // Pinned distinctness: farther than tolerance from every previous.
       bool dup = false;
@@ -1264,4 +1291,146 @@ inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
     }
   }
   return n;
+}
+
+// Milestone 012 heightfield collision (pinned mjc_ConvexHField, 3.10.0).
+// The terrain is a grid of triangular prisms: surface triangle tops at
+// data*size2 over (x, y), flat bottoms at -size3. Each overlapped prism is
+// tested independently with one GJK/MPR witness (penetration margin 0);
+// results transform back to world. Margin handling: qualified at margin 0
+// (prism tops unexpanded, cutoff at 0, exactly matching the pinned path);
+// margin > 0 runs the same cutoff and stays a documented restriction.
+// Per-prism witnesses make native-vs-CPU comparison nearly 1:1 (same loop
+// order, same support rule), unlike mesh singles-vs-manifolds.
+inline int collide_hfield(
+    float3 ph, float4 qh,
+    int t2, float3 po, float4 qo, float3 szo, float rbo,
+    float margin, int maxn, thread ContactGeom* con,
+    int gih, int gio,
+    device const float* hull, device const int* hull_info) {
+  int doff = hull_info[gih * 9 + 5];
+  int nrow = hull_info[gih * 9 + 6];
+  int ncol = hull_info[gih * 9 + 7];
+  int soff = hull_info[gih * 9 + 8];
+  if (doff < 0 || nrow < 2 || ncol < 2 || soff < 0) return 0;
+  if (maxn <= 0) return 0;
+  float size0 = hull[soff];
+  float size1 = hull[soff + 1];
+  float size2 = hull[soff + 2];
+  float size3 = hull[soff + 3];
+  if (size0 <= 0.0f || size1 <= 0.0f) return 0;
+
+  float3x3 Rh = float3x3(rotate_q(qh, float3(1,0,0)),
+                         rotate_q(qh, float3(0,1,0)),
+                         rotate_q(qh, float3(0,0,1)));
+  float3x3 RhT = transpose(Rh);
+  float3x3 Ro = float3x3(rotate_q(qo, float3(1,0,0)),
+                         rotate_q(qo, float3(0,1,0)),
+                         rotate_q(qo, float3(0,0,1)));
+  // Other geom center in the hfield frame.
+  float3 lp = RhT * (po - ph);
+
+  // Early return: box-sphere test with rbound + margin.
+  float radius = rbo + margin;
+  if ((size0 < lp.x - radius) || (-size0 > lp.x + radius) ||
+      (size1 < lp.y - radius) || (-size1 > lp.y + radius) ||
+      (size2 < lp.z - radius) || (-size3 > lp.z + radius)) {
+    return 0;
+  }
+
+  // Other geom frame in hfield coordinates; GJK runs in this frame.
+  float3x3 Roh = RhT * Ro;
+  float3 poh = lp;
+  float3 I0 = float3(1,0,0), I1 = float3(0,1,0), I2 = float3(0,0,1);
+  float3x3 Im = float3x3(I0, I1, I2);
+
+  // Other geom AABB in the hfield frame via supports.
+  float3 sx = cx_support(t2, poh, Roh, szo, I0, gio, hull, hull_info, nullptr);
+  float3 nx = cx_support(t2, poh, Roh, szo, -I0, gio, hull, hull_info, nullptr);
+  float3 sy = cx_support(t2, poh, Roh, szo, I1, gio, hull, hull_info, nullptr);
+  float3 ny = cx_support(t2, poh, Roh, szo, -I1, gio, hull, hull_info, nullptr);
+  float3 sz = cx_support(t2, poh, Roh, szo, I2, gio, hull, hull_info, nullptr);
+  float3 nz = cx_support(t2, poh, Roh, szo, -I2, gio, hull, hull_info, nullptr);
+  float xmax = sx.x, xmin = nx.x;
+  float ymax = sy.y, ymin = ny.y;
+  float zmax = sz.z, zmin = nz.z;
+
+  // AABB box-box test.
+  if ((xmin - margin > size0) || (xmax + margin < -size0) ||
+      (ymin - margin > size1) || (ymax + margin < -size1) ||
+      (zmin - margin > size2) || (zmax + margin < -size3)) {
+    return 0;
+  }
+
+  // Sub-grid bounds (pinned floor/ceil + clamp).
+  float fx = (float)(ncol - 1) / max(2.0f * size0, 1e-30f);
+  float fy = (float)(nrow - 1) / max(2.0f * size1, 1e-30f);
+  int cmin = (int)floor((xmin + size0) * fx);
+  int cmax = (int)ceil((xmax + size0) * fx);
+  int rmin = (int)floor((ymin + size1) * fy);
+  int rmax = (int)ceil((ymax + size1) * fy);
+  cmin = max(0, cmin);
+  cmax = min(ncol - 1, cmax);
+  rmin = max(0, rmin);
+  rmax = min(nrow - 1, rmax);
+
+  float dx = (2.0f * size0) / (float)(ncol - 1);
+  float dy = (2.0f * size1) / (float)(nrow - 1);
+
+  int ncon = 0;
+  for (int r = rmin; r < rmax; ++r) {
+    for (int c = cmin + 1; c <= cmax; ++c) {
+      for (int i = 0; i < 2; ++i) {
+        // Surface-triangle nodes in pinned traversal order: the last
+        // three pushed verts; i selects the row offset within the strip.
+        int n0r, n0c, n1r, n1c, n2r, n2c;
+        if (i == 0) {
+          n0r = r + 1; n0c = c - 1;
+          n1r = r;     n1c = c - 1;
+          n2r = r + 1; n2c = c;
+        } else {
+          n0r = r;     n0c = c - 1;
+          n1r = r + 1; n1c = c;
+          n2r = r;     n2c = c;
+        }
+        float h0 = hull[doff + n0r * ncol + n0c] * size2;
+        float h1 = hull[doff + n1r * ncol + n1c] * size2;
+        float h2 = hull[doff + n2r * ncol + n2c] * size2;
+        // Prism height test.
+        if (h0 < zmin && h1 < zmin && h2 < zmin) continue;
+        float3 v0 = float3(dx * (float)n0c - size0, dy * (float)n0r - size1, 0.0f);
+        float3 v1 = float3(dx * (float)n1c - size0, dy * (float)n1r - size1, 0.0f);
+        float3 v2 = float3(dx * (float)n2c - size0, dy * (float)n2r - size1, 0.0f);
+        float3 bot = float3(0.0f, 0.0f, -size3);
+        thread float3 prismV[6];
+        prismV[0] = v0 + bot; prismV[1] = v1 + bot; prismV[2] = v2 + bot;
+        prismV[3] = v0 + float3(0.0f, 0.0f, h0);
+        prismV[4] = v1 + float3(0.0f, 0.0f, h1);
+        prismV[5] = v2 + float3(0.0f, 0.0f, h2);
+        float3 centroid = (v0 + v1 + v2) / 3.0f
+                        + float3(0.0f, 0.0f, (h0 + h1 + h2) / 3.0f - size3) * 0.5f;
+        float3 d0 = centroid - poh;
+        if (dot(d0, d0) < 1e-24f) d0 = float3(1.0f, 0.0f, 0.0f);
+        ContactGeom cand;
+        cand.dist = 1e30f; cand.pos = float3(0.0f);
+        cand.normal = float3(0.0f); cand.t1 = float3(0.0f); cand.t2 = float3(0.0f);
+        float3 zsz = float3(0.0f);
+        int got = cx_single_contact(1, centroid, Im, zsz,
+                                    t2, poh, Roh, szo,
+                                    margin, d0, false, &cand,
+                                    gih, gio, hull, hull_info, prismV);
+        if (got) {
+          con[ncon].dist = cand.dist;
+          con[ncon].normal = Rh * cand.normal;
+          con[ncon].pos = Rh * cand.pos + ph;
+          con[ncon].t1 = Rh * cand.t1;
+          con[ncon].t2 = Rh * cand.t2;
+          ++ncon;
+          if (ncon >= maxn) return ncon;
+          if (ncon >= 50) return ncon;  // pinned mjMAXCONPAIR cap
+        }
+      }
+    }
+  }
+  return ncon;
 }

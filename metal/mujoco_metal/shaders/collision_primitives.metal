@@ -1304,19 +1304,27 @@ inline int collide_plane_convex(float3 p1, float4 q1,
                                 int t2, float3 p2, float4 q2, float3 sz2,
                                 float margin, thread ContactGeom* con,
                                 int ia, int ib,
-                                device const float* hull, device const int* hull_info);
+                                device const float* hull, device const int* hull_info, thread float3* prismV);
 inline int collide_convex_single(int ta, float3 pa, float4 qa, float3 sza,
                                  int tb, float3 pb, float4 qb, float3 szb,
                                  float margin, thread ContactGeom* con,
                                  int ia, int ib,
-                                 device const float* hull, device const int* hull_info);
+                                 device const float* hull, device const int* hull_info, thread float3* prismV);
 inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
                                 int tb, float3 pb, float4 qb, float3 szb,
                                 float margin, int maxn,
                                 float rb1, float rb2, int disable_multiccd,
                                 thread ContactGeom* con,
                                 int ia, int ib,
-                                device const float* hull, device const int* hull_info);
+                                device const float* hull, device const int* hull_info, thread float3* prismV);
+// Milestone 012 heightfield: per-prism terrain collision vs convex geoms
+// (pinned mjc_ConvexHField). Hfield side first (canonical t1 == 1).
+inline int collide_hfield(
+    float3 ph, float4 qh,
+    int t2, float3 po, float4 qo, float3 szo, float rbo,
+    float margin, int maxn, thread ContactGeom* con,
+    int gih, int gio,
+    device const float* hull, device const int* hull_info);
 
 // Unified Pair Dispatcher
 inline int collide_pair(
@@ -1324,8 +1332,9 @@ inline int collide_pair(
     int type2, float3 p2, float4 q2, float3 sz2, float rb2,
     float margin, int disable_multiccd, thread ContactGeom* con,
     int gia, int gib,
-    device const float* hull, device const int* hull_info) {
-  // Types: 0 = plane, 2 = sphere, 3 = capsule, 4 = ellipsoid, 5 = cylinder, 6 = box, 7 = mesh
+    device const float* hull, device const int* hull_info,
+    int maxn) {
+  // Types: 0 = plane, 1 = hfield, 2 = sphere, 3 = capsule, 4 = ellipsoid, 5 = cylinder, 6 = box, 7 = mesh
   bool swapped = (type1 > type2);
   int t1 = swapped ? type2 : type1;
   int t2 = swapped ? type1 : type2;
@@ -1365,24 +1374,37 @@ inline int collide_pair(
     n = collide_sphere_cylinder(pos1, quat1, size1, pos2, quat2, size2, margin, con);
   } else if (t1 == 0 && t2 == 4) {
     n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, margin, con,
-                             gi1, gi2, hull, hull_info);
+                             gi1, gi2, hull, hull_info, nullptr);
   } else if ((t1 == 2 && t2 == 4) || (t1 == 3 && t2 == 4) || (t1 == 4 && t2 == 4)
              || (t1 == 4 && t2 == 5) || (t1 == 4 && t2 == 6)) {
     n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con,
-                              gi1, gi2, hull, hull_info);
+                              gi1, gi2, hull, hull_info, nullptr);
   } else if ((t1 == 3 && t2 == 5) || (t1 == 5 && t2 == 5) || (t1 == 5 && t2 == 6)) {
     n = collide_convex_multi(t1, pos1, quat1, size1, t2, pos2, quat2, size2,
                              margin, 5, r1, r2, disable_multiccd, con,
-                             gi1, gi2, hull, hull_info);
+                             gi1, gi2, hull, hull_info, nullptr);
   } else if (t1 == 0 && t2 == 7) {
     // Milestone 011 convex mesh (single witness; multi-contact manifolds
     // stay a documented restriction).
     n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, margin, con,
-                             gi1, gi2, hull, hull_info);
+                             gi1, gi2, hull, hull_info, nullptr);
   } else if ((t1 == 2 && t2 == 7) || (t1 == 3 && t2 == 7) || (t1 == 4 && t2 == 7)
              || (t1 == 5 && t2 == 7) || (t1 == 6 && t2 == 7) || (t1 == 7 && t2 == 7)) {
     n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con,
-                              gi1, gi2, hull, hull_info);
+                              gi1, gi2, hull, hull_info, nullptr);
+  } else if (t1 == 0 && t2 == 1) {
+    // Milestone 012: plane-heightfield pairs yield no contacts (pinned
+    // static-static skip; lowering reserves zero slots for them).
+    n = 0;
+  } else if (t1 == 1 && t2 == 1) {
+    // Milestone 012: heightfield-heightfield is rejected at lowering;
+    // this arm is unreachable defense.
+    n = 0;
+  } else if (t1 == 1 && (t2 == 2 || t2 == 3 || t2 == 4 || t2 == 5 || t2 == 6 || t2 == 7)) {
+    // Milestone 012: per-prism terrain collision (pinned mjc_ConvexHField).
+    // Hfield is canonical t1; maxn is this pair's contact-slot budget.
+    n = collide_hfield(pos1, quat1, t2, pos2, quat2, size2, r2,
+                       margin, maxn, con, gi1, gi2, hull, hull_info);
   }
 
   // If order was swapped, normal points from pos1 to pos2, which is from original geom2 to geom1.

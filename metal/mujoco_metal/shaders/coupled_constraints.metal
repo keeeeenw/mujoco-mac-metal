@@ -244,8 +244,8 @@ kernel void contact_normal(
   int max_con = pair_contact_offset[pair_idx + 1] - offset;
 
   // Run collision algorithm
-  ContactGeom con[8];
-  for (int k = 0; k < 8; ++k) {
+  ContactGeom con[16];
+  for (int k = 0; k < 16; ++k) {
     con[k].dist = 1e30f;
     con[k].pos = float3(0.0f);
     con[k].normal = float3(0.0f);
@@ -254,7 +254,7 @@ kernel void contact_normal(
   }
   int ncon = collide_pair(ta, pa, qa, sza, rba, tb, pb, qb, szb, rbb,
                             m + g, disable_multiccd, con, a, b,
-                            mesh_hull, mesh_hull_info);
+                            mesh_hull, mesh_hull_info, max_con);
   ncon = min(ncon, max_con);
 
   int ba = geom_bodyid[a];
