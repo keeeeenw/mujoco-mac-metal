@@ -243,6 +243,26 @@ kernel void contact_normal(
   int offset = pair_contact_offset[pair_idx];
   int max_con = pair_contact_offset[pair_idx + 1] - offset;
 
+  // R08/F1 broadphase-fed pruning: the conservative sphere test mirrors
+  // broadphase_mask exactly (planes always overlap; otherwise skip when
+  // center distance exceeds rbound sum + margin + gap + 1e-6). Skipped
+  // pairs stamp a finite sentinel into their slots (active flag stays 0)
+  // so tests can prove the skip path executed instead of a silent zero.
+  // dims[9] toggles pruning for on/off physics-equivalence qualification.
+  if (dims[9] != 0 && ta != 0 && tb != 0) {
+    float3 delta_pb = pb - pa;
+    float prune_R = rba + rbb + m + g;
+    if (length(delta_pb) > prune_R + 1e-6f) {
+      for (int k = 0; k < max_con; ++k) {
+        int slot = offset + k;
+        if (slot >= ncontacts_max) break;
+        int fb = (world * ncontacts_max + slot) * 12;
+        frame[fb + 0] = 1234.0f;
+      }
+      return;
+    }
+  }
+
   // Run collision algorithm
   ContactGeom con[16];
   for (int k = 0; k < 16; ++k) {

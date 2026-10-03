@@ -1309,7 +1309,10 @@ class MetalCoupledConstraints:
         "c_dims": torch.tensor(
 
             [d.nv, d.npairs, d.ncontacts_max, self.batch_size, d.nbody, d.njnt, d.ngeom, d.cone_type,
-             1 if (int(d.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)) else 0],
+             1 if (int(d.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)) else 0,
+             # Tail index 9 toggles broadphase-fed narrowphase pruning
+             # (R08/F1); earlier indices are frozen for every consumer.
+             1],
             dtype=torch.int32, device=self._device,
         ),
         "body_dims": torch.tensor(
@@ -1498,6 +1501,15 @@ class MetalCoupledConstraints:
           self._constants["mesh_hull"], self._constants["mesh_hull_info"],
           threads=(b * d.npairs,), group_size=(1,),
       )
+
+  def set_broadphase_pruning(self, enabled):
+    """Toggle narrowphase broadphase-fed pruning (R08/F1 test hook).
+
+    Enabled (default) pruned pairs skip the narrowphase and stamp a finite
+    sentinel; disabled runs every pair. Physics must be identical either
+    way (equivalence test).
+    """
+    self._constants["c_dims"][9] = 1 if enabled else 0
 
   def broadphase_counts(self):
     """Diagnostics-only readback: per-env (mask_active, slot_active) counts.
