@@ -1,0 +1,39 @@
+<mujoco model="friction_carousel">
+  <compiler angle="radian"/>
+  <option timestep="0.002" integrator="Euler" iterations="600" tolerance="1e-4" gravity="0 0 -9.81" cone="elliptic"/>
+  <asset>
+    <texture name="floor_grid" type="2d" builtin="checker" rgb1="0.12 0.15 0.20" rgb2="0.22 0.28 0.35" width="512" height="512"/>
+    <material name="floor_material" texture="floor_grid" texrepeat="8 8" reflectance="0.1"/>
+  </asset>
+  <worldbody>
+    <light directional="true" pos="0 -2 5" dir="0 0.3 -1" diffuse="0.9 0.9 0.9" specular="0.3 0.3 0.3"/>
+    <geom name="floor" type="plane" size="5 5 0.1" pos="0 0 -0.02" material="floor_material" contype="32" conaffinity="16"/>
+    <body name="turntable" pos="0 0 0">
+      <joint name="spin" type="hinge" axis="0 0 1" damping="0.5"/>
+      <geom name="hub" type="cylinder" size="0.05 0.1" pos="0 0 0.1" rgba="0.3 0.3 0.3 1" mass="0.5" contype="0" conaffinity="0"/>
+      <geom name="grip_high" type="box" size="0.25 0.3 0.02" pos="0.25 0 0.2" rgba="0.1 0.7 0.2 1" mass="0.4" friction="0.5 0.05 0.02" contype="1" conaffinity="2" condim="3"/>
+      <geom name="grip_low" type="box" size="0.25 0.3 0.02" pos="-0.25 0 0.2" rgba="0.7 0.7 0.1 1" mass="0.4" friction="0.01 0.05 0.02" contype="8" conaffinity="16" condim="3"/>
+    </body>
+    <body name="rider_high" pos="0.25 0 0.29">
+      <freejoint name="freeRH"/>
+      <geom name="rider_high_geom" type="box" size="0.05 0.05 0.04" rgba="0.9 0.1 0.1 1" mass="0.3" friction="0.6 0.05 0.02" contype="2" conaffinity="5" condim="3"/>
+    </body>
+    <body name="rider_low" pos="-0.25 0 0.29">
+      <freejoint name="freeRL"/>
+      <geom name="rider_low_geom" type="sphere" size="0.05" rgba="0.9 0.5 0.1 1" mass="0.3" friction="0.6 0.05 0.02" contype="16" conaffinity="40" condim="3"/>
+    </body>
+    <body name="stacker" pos="0.25 0 0.37">
+      <freejoint name="freeS"/>
+      <geom name="stacker_geom" type="box" size="0.04 0.04 0.03" rgba="0.2 0.5 0.9 1" mass="0.15" friction="0.6 0.05 0.02" contype="4" conaffinity="2" condim="3"/>
+    </body>
+  </worldbody>
+  <contact>
+    <pair geom1="grip_high" geom2="rider_high_geom" condim="3" friction="1.0 0.05 0.02"/>
+    <pair geom1="grip_low" geom2="rider_low_geom" condim="3" friction="0.001 0.05 0.02"/>
+    <pair geom1="rider_high_geom" geom2="stacker_geom" condim="3"/>
+    <exclude body1="stacker" body2="turntable"/>
+  </contact>
+  <actuator>
+    <motor name="drive" joint="spin" gear="1"/>
+  </actuator>
+</mujoco>

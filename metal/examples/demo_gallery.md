@@ -24,6 +24,7 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Assembly puzzle](assembly_puzzle.md) | Procedural convex hulls drop and settle into a walled tray | Convex mesh collision: hull vertex-support GJK/MPR singles with face-snap readout |
 | [Rock-garden axle cart](terrain_rover.md) | A passive two-wheel cart rolls across a rock garden and stops at a berm | Heightfield collision: per-prism terrain witnesses vs spheres |
 | [SDF screw chute](sdf_chute.md) | Three balls traverse a helical SDF chute to the floor | SDF collision: Halton/descent witnesses vs spheres |
+| [Friction carousel](friction_carousel.md) | A high-grip box stack rides a turntable while a low-grip sphere slips and rolls off | Solver completion: warm starts, convergence history, no-slip subsumption across grip stations |
 | [Latch-and-release cargo bridge](cargo_bridge.md) | Two deck sections joined by a connect constraint unlatch a weld brace and spill a payload into a tray | Connect/weld equalities with per-environment activation, coupled contact solve |
 | [Magnetic crane](magnetic_crane.md) | A mocap hook carries a welded cargo box to a bin and releases it | Per-environment mocap inputs, weld attach/release, keyframe reset |
 | [Muscle-powered gripper](muscle_gripper.md) | Parallel jaws with supporting ledges, bin delivery and pedestal placement | Stateful actuation and contact-rich manipulation |

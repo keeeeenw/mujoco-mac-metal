@@ -38,7 +38,7 @@ renderer), not future physics work.
 | REQ-JAC-001 | dense Jacobians | device | native_gpu/gpu_qualified | baseline | native pipeline is dense | accept dense | test_coupled_constraints.py |
 | REQ-JAC-002 | sparse/auto Jacobians | none | not_implemented/unqualified | 017 | no sparse path; auto must not silently select one | reject sparse | — |
 | REQ-SOL-001 | PGS/Newton selector mapping | device | native_gpu/gpu_qualified | baseline | accepted names run the native projected solver, documented as a mapping | accept PGS/Newton as mapped | test_coupled_constraints.py |
-| REQ-SOL-002 | CG solver selection | none | not_implemented/unqualified | 014 | rejected at lowering | reject CG | — |
+| REQ-SOL-002 | CG solver selection | device | native_gpu/unqualified | 014 | accepted as mapped to the native projected solver (same as Newton); selection name does not change execution | accept CG as mapped | test_solver_completion_014.py |
 | REQ-EQ-001 | joint/connect/weld equalities with per-env activity | device | native_gpu/gpu_qualified | 004 | 1/3/6 rows, body/world/site forms incl. mocap anchors, torquescale, schema-2/3 activity state | accept joint/connect/weld body/site/world/mocap, reject others even if inactive | test_connect_weld.py, test_equality_activity.py, test_equality_qualification.py, test_mocap_state.py |
 | REQ-EQ-002 | tendon equality | device | native_gpu/gpu_qualified | 008 | cubic tendon-length coupling as coupled rows (single or paired tendons) | tendon_constraint_rows equality branch | test_spatial_tendons_008.py |
 | REQ-EQ-003 | flex equalities | none | not_implemented/unqualified | 018 | rejected at lowering | reject flex/flexvert/flexstrain | — |
@@ -63,7 +63,7 @@ renderer), not future physics work.
 | REQ-STATE-002 | control/applied-force state ownership | device | native_gpu/gpu_qualified | baseline | per-call held inputs validated before the device loop | accept finite host/device inputs | test_simulation.py |
 | REQ-STATE-003 | mocap position/quaternion inputs | device | native_gpu/gpu_qualified | 006 | jointless world-child mocap bodies; per-env poses, keyframe reset, schema-3 snapshots | accept valid mocap, reject non-world-child | test_mocap_state.py |
 | REQ-STATE-004 | actuator activation state | device | native_gpu/gpu_qualified | 007 | schema-4 act storage, reset/keyframe/restore/copy, exact-slot advance | na rows with actearly/actrange semantics | test_actuators_007.py |
-| REQ-STATE-005 | warmstart state | none | not_implemented/unqualified | 014 | cold starts only | ignore warmstart content | — |
+| REQ-STATE-005 | warmstart state | device | native_gpu/unqualified | 014 | retained multipliers seed the next solve with cost-gated fallback; get/set/clear API; reset/keyframe clear; WARMSTART disable honored | warm lam retention + cost check | test_solver_completion_014.py |
 | REQ-STATE-006 | history state | none | not_implemented/unqualified | 015 | no sensor/actuator history storage | reject history-dependent models | — |
 | REQ-STATE-007 | userdata/plugin state | none | not_implemented/unqualified | 019 | no userdata/plugin state ownership | reject stateful plugins | — |
 | REQ-STATE-008 | getState group selectors | none | not_implemented/unqualified | 019 | no mj_getState/mj_setState group API | not exposed | — |
