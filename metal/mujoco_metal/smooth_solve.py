@@ -144,3 +144,85 @@ class MetalGeneralDenseSolve(MetalDenseSolve):
     super().__init__(nv, batch_size, nrhs)
     self._kernel = self._library.dense_general_solve
 
+
+def factored_workspace_elements(nv, batch_size, nrhs=1):
+  """Validate compiled dimensions before importing Torch or allocating MPS."""
+  import numbers
+  for name, value in (("nv", nv), ("batch_size", batch_size), ("nrhs", nrhs)):
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+      raise TypeError(f"{name} must be an integer")
+    if value < (0 if name == "nv" else 1):
+      raise ValueError(f"{name} is outside its valid range")
+    if value > (1 << 31) - 1:
+      raise ValueError("dimensions must fit signed 32-bit shader arguments")
+  nv, batch_size, nrhs = int(nv), int(batch_size), int(nrhs)
+  counts = {"factor": batch_size*nv*nv, "pivots": batch_size*nv,
+            "solution": batch_size*nv*nrhs, "status": batch_size}
+  if max(counts.values()) > (1 << 32) - 1:
+    raise ValueError("factor workspace dimensions exceed shader indexing range")
+  return counts
+
+
+class MetalFactorizedSolve(MetalDenseSolve):
+  """Factor a matrix once and apply it to subsequent right-hand sides.
+
+  ``general=False`` uses Cholesky; ``general=True`` uses LU with recorded row
+  pivots. Matrix and RHS validation retain the ordinary dense solver status
+  codes. A bad RHS cannot invalidate a previously valid factor. An invalid
+  factor affects only its own world and is replaced by the next factor call.
+  Factors and outputs stay in reusable device buffers. No inverse is formed.
+  """
+  def __init__(self, nv, batch_size, nrhs=1, *, general=False):
+    counts = factored_workspace_elements(nv, batch_size, nrhs)
+    if not isinstance(general, bool):
+      raise TypeError("general must be a bool")
+    import torch
+    if not torch.backends.mps.is_available():
+      raise RuntimeError("PyTorch MPS is unavailable")
+    if not hasattr(torch.mps, "compile_shader"):
+      raise RuntimeError("PyTorch does not provide torch.mps.compile_shader")
+    self._torch, self._device = torch, torch.device("mps")
+    self.nv, self.batch_size, self.nrhs = int(nv), int(batch_size), int(nrhs)
+    self._library = torch.mps.compile_shader(
+        _SHADER.with_name("smooth_factor_solve.metal").read_text())
+    self._factor = torch.empty(max(counts["factor"],1), dtype=torch.float32, device=self._device)
+    self._pivots = torch.empty(max(counts["pivots"],1), dtype=torch.int32, device=self._device)
+    self._solution = torch.empty(max(counts["solution"],1), dtype=torch.float32, device=self._device)
+    self._factor_status = torch.empty(self.batch_size, dtype=torch.int32, device=self._device)
+    self._status = torch.empty_like(self._factor_status)
+    self._empty_input = torch.zeros(1, dtype=torch.float32, device=self._device)
+    self._dims = torch.tensor([self.nv,self.batch_size,self.nrhs,int(general)],
+                              dtype=torch.int32, device=self._device)
+    self._factor_ready = False
+
+  def factor_device(self, matrix):
+    """Replace the stored factor, returning its borrowed per-world status."""
+    self._validate_tensor(matrix,"matrix",(self.batch_size,self.nv,self.nv))
+    value = matrix.reshape(-1) if self.nv else self._empty_input
+    self._library.dense_factor(value,self._factor,self._pivots,
+        self._factor_status,self._dims,threads=(self.batch_size,),group_size=(1,))
+    self._factor_ready = True
+    return self._factor_status
+
+  def solve_factored_device(self, rhs):
+    """Solve with the last submitted factor, without reading input values."""
+    if not self._factor_ready:
+      raise RuntimeError("factor_device must be called before solving")
+    shape = ((self.batch_size,self.nv) if self.nrhs==1
+             else (self.batch_size,self.nv,self.nrhs))
+    self._validate_tensor(rhs,"rhs",shape)
+    value = rhs.reshape(-1) if self.nv else self._empty_input
+    self._library.dense_solve_factored(self._factor,self._pivots,
+        self._factor_status,value,self._solution,self._status,self._dims,
+        threads=(self.batch_size,),group_size=(1,))
+    count = self.batch_size*self.nv*self.nrhs
+    return self._solution[:count].reshape(shape),self._status
+
+  def run_device(self, matrix, rhs):
+    # Reject bad metadata before replacing a previously valid factor.
+    shape = ((self.batch_size,self.nv) if self.nrhs==1
+             else (self.batch_size,self.nv,self.nrhs))
+    self._validate_tensor(matrix,"matrix",(self.batch_size,self.nv,self.nv))
+    self._validate_tensor(rhs,"rhs",shape)
+    self.factor_device(matrix)
+    return self.solve_factored_device(rhs)
