@@ -67,15 +67,16 @@ def test_coupled_lowering_and_immutability():
 
 
 def test_coupled_lowering_unsupported_geoms_rejected():
-  # Mesh (011), heightfield (012) and SDF (013) stay rejected in 010.
+  # Heightfield (012) and SDF (013) stay rejected; mesh (011) is admitted
+  # for convex assets (see test_mesh_contact_011.py for mesh gates).
   m = mujoco.MjModel.from_xml_string(
       '<mujoco><option timestep="0.002"/><asset>'
-      '<mesh name="tet" vertex="0 0 0 1 0 0 0 1 0 0 0 1" face="0 2 1 0 1 3 0 3 2 1 2 3"/>'
+      '<hfield name="h" nrow="4" ncol="4" size="1 1 0.2 0.1"/>'
       '</asset><worldbody>'
       '<geom name="floor" type="plane" size="5 5 0.1"/>'
-      '<body pos="0 0 1"><freejoint/><geom mesh="tet" type="mesh" mass="1"/>'
+      '<body pos="0 0 1"><freejoint/><geom hfield="h" type="hfield" mass="1"/>'
       '</body></worldbody></mujoco>')
-  with pytest.raises(ValueError, match="ellipsoid, and cylinder"):
+  with pytest.raises(ValueError, match="heightfield|hfield|unsupported"):
     lower_coupled_constraints(m)
 
 
