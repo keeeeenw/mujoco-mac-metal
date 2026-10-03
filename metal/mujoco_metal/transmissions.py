@@ -185,6 +185,7 @@ class MetalTransmissions:
   def __init__(self, model):
     self.model = model
     self._meta = TransmissionModel(model)
+    self._last_force = None
     import torch
     self._torch = torch
     self._device = torch.device("mps")
@@ -239,6 +240,7 @@ class MetalTransmissions:
     ):
       raise ValueError("transmission kernel offsets exceed uint32")
     output = torch.empty((batch, self._meta.nv), dtype=torch.float32, device=self._device)
+    force = torch.empty((batch, max(self._meta.nu, 1)), dtype=torch.float32, device=self._device)
     self._kernel(
         qpos.reshape(-1) if self._meta.nq else self._dummy,
         qvel.reshape(-1) if self._meta.nv else self._dummy,
@@ -247,6 +249,8 @@ class MetalTransmissions:
         self._bias_enabled, self._biasprm, self._ctrl_limited, self._ctrl_range,
         self._force_limited, self._force_range, self._group, self._dims,
         output.reshape(-1) if self._meta.nv else self._dummy,
+        force.reshape(-1) if self._meta.nu else self._dummy,
         threads=(batch,), group_size=(1,),
     )
+    self._last_force = force
     return output

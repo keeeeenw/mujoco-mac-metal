@@ -334,6 +334,58 @@ class MetalSimulation:
     self._success = torch.empty(
         (batch_size,), dtype=torch.bool, device=self._state._device
     )
+    self._cached_act_force = None
+    self._cached_qfrc_act = None
+    self._sen_act_force = None
+    self._sen_qfrc_act = None
+    self._sen_jnt_map = None
+    self._sen_ten_map = None
+    self._sen_pair_live = None
+    self._sen_slot_pair = None
+    self._has_acc_sensors = False
+    if self._sensors is not None:
+      ACC = int(mujoco.mjtStage.mjSTAGE_ACC)
+      self._has_acc_sensors = bool(np.any(
+          np.asarray(self._sensors.descriptor.sensor_needstage) == ACC))
+      cc = getattr(self, "_coupled_constraints", None)
+      if cc is not None:
+        d = cc.descriptor
+        g1 = np.asarray(d.geom1).reshape(-1)
+        g2 = np.asarray(d.geom2).reshape(-1)
+        gb = np.asarray(model.geom_bodyid, dtype=np.int64)
+        jn = np.asarray(model.body_jntnum, dtype=np.int64)
+        par = np.asarray(model.body_parentid, dtype=np.int64)
+        live = []
+        for a, b in zip(g1.tolist(), g2.tolist()):
+          ok = False
+          for bb in (int(gb[int(a)]), int(gb[int(b)])):
+            while bb > 0:
+              if int(jn[bb]) > 0:
+                ok = True
+                break
+              bb = int(par[bb])
+            if ok:
+              break
+          live.append(1 if ok else 0)
+        self._sen_pair_live = self._state._torch.as_tensor(
+            np.array(live if live else [1], dtype=np.int32),
+            dtype=self._state._torch.int32, device=self._state._device)
+        off = np.asarray(d.pair_contact_offset, dtype=np.int64)
+        slot = np.zeros(int(d.ncontacts_max), dtype=np.int32)
+        for p in range(int(d.npairs)):
+          slot[off[p]:off[p + 1]] = p
+        self._sen_slot_pair = self._state._torch.as_tensor(
+            slot.copy(), dtype=self._state._torch.int32,
+            device=self._state._device)
+      if profile.name != "integrated_euler_v1":
+        S = mujoco.mjtSensor
+        gated = {int(S.mjSENS_TOUCH), int(S.mjSENS_CONTACT),
+                 int(S.mjSENS_JOINTLIMITFRC), int(S.mjSENS_TENDONLIMITFRC)}
+        if bool(np.any(np.isin(np.asarray(
+                self._sensors.descriptor.sensor_type), list(gated)))):
+          raise ValueError(
+              f"{profile.name} supports touch/contact/limit-force sensors "
+              "only under integrated_euler_v1")
     self._combined_status = torch.empty_like(self._state._status)
     self._next_qpos = torch.empty_like(self._state._qpos)
     self._next_qvel = torch.empty_like(self._state._qvel)
@@ -766,6 +818,14 @@ class MetalSimulation:
         state._qpos, state._qvel, state._time, poses, sensordata=base)
     out = self._run_state_sensors(state._qpos, state._qvel, poses, dynamics,
                                   out=out)
+    if self._has_acc_sensors:
+      # ACC families need the solved forward state (pinned sensorAcc runs
+      # post-constraint); evaluate the full forward, then the ACC kernel.
+      acceleration, _, acc_dyn = self._acceleration(state._qpos, state._qvel)
+      acc_poses = dict(acc_dyn["poses"], cvel=acc_dyn["cvel"],
+                       root_com=acc_dyn["root_com"])
+      out = self._run_acc_into(state._qpos, state._qvel, acceleration,
+                               acc_poses, acc_dyn, out)
     return out.clone()
 
   def _state_sensor_inputs(self, qpos, qvel, poses, dynamics):
@@ -1035,6 +1095,10 @@ class MetalSimulation:
     if actuators.meta.na > 0 and act is None:
       raise ValueError("activation state is missing")
     out = actuators.run_forces(self._control, act, kin, gravcomp)
+    if self._sensors is not None and self._has_acc_sensors:
+      self._lazy_sensor_scratch()
+      self._sen_act_force.add_(out["force"].reshape(self._sen_act_force.shape))
+      self._sen_qfrc_act.add_(out["qfrc"].reshape(self._sen_qfrc_act.shape))
     na, nu = actuators.meta.na, actuators.meta.nu
     if na > 0:
       self._act_dot.copy_(out["act_dot"].reshape(self._act_dot.shape))
@@ -1044,10 +1108,109 @@ class MetalSimulation:
       return self._state._torch.zeros_like(self._rhs)
     return out["qfrc"].reshape(self._rhs.shape)
 
+  def _lazy_sensor_scratch(self):
+    """Allocate (no-op after first call) ACC capture scratch."""
+    if self._sen_act_force is None:
+      torch = self._state._torch
+      dev = self._state._device
+      b, nu, nv = self.batch_size, int(self._mjmodel.nu), int(self._mjmodel.nv)
+      self._sen_act_force = torch.zeros((b, max(nu, 1)), dtype=torch.float32, device=dev)
+      self._sen_qfrc_act = torch.zeros((b, max(nv, 1)), dtype=torch.float32, device=dev)
+      self._sen_jnt_map = None
+      self._sen_ten_map = None
+
+  def _limit_row_maps(self):
+    """Host (nj,3)/(nt,2) candidate limit-row maps for ACC sensors.
+
+    Joint rows follow the coupled layout (ball joints use the first
+    reserved row only); tendon rows follow ten_base + friction-count
+    ordering. Models without the integrated coupled stage get all -1
+    (limit-force sensors there are rejected at construction).
+    """
+    if self._sen_jnt_map is not None:
+      return self._sen_jnt_map, self._sen_ten_map
+    import mujoco as _mj
+    torch = self._state._torch
+    dev = self._state._device
+    m = self._mjmodel
+    nj, nt = int(m.njnt), int(m.ntendon)
+    jmap = np.full((max(nj, 1), 3), -1, dtype=np.int32)
+    tmap = np.full((max(nt, 1), 2), -1, dtype=np.int32)
+    cc = getattr(self, "_coupled_constraints", None)
+    if cc is not None:
+      d = cc.descriptor
+      HINGE, SLIDE, BALL = (int(_mj.mjtJoint.mjJNT_HINGE),
+                            int(_mj.mjtJoint.mjJNT_SLIDE),
+                            int(_mj.mjtJoint.mjJNT_BALL))
+      for j in range(nj):
+        t = int(np.asarray(m.jnt_type)[j])
+        if t in (HINGE, SLIDE):
+          jmap[j] = [d.n_eq_rows + d.nv + 2 * j, d.n_eq_rows + d.nv + 2 * j + 1,
+                     int(np.asarray(m.jnt_dofadr)[j])]
+        elif t == BALL:
+          jmap[j] = [d.n_eq_rows + d.nv + 2 * j, -1,
+                     int(np.asarray(m.jnt_dofadr)[j])]
+      nfric = int(d.ten_friction_rows)
+      pre = 0
+      for t in range(nt):
+        if bool(np.asarray(m.tendon_limited)[t]):
+          tmap[t] = [d.ten_base + nfric + 2 * pre, d.ten_base + nfric + 2 * pre + 1]
+          pre += 1
+    self._sen_jnt_map = torch.as_tensor(jmap.copy(), dtype=torch.int32, device=dev)
+    self._sen_ten_map = torch.as_tensor(tmap.copy(), dtype=torch.int32, device=dev)
+    return self._sen_jnt_map, self._sen_ten_map
+
+  def _contact_views(self):
+    """Borrowed coupled contact views for ACC sensors, or None."""
+    cc = getattr(self, "_coupled_constraints", None)
+    if cc is None:
+      return None
+    d = cc.descriptor
+    nc = int(d.ncontacts_max)
+    if nc == 0:
+      return None
+    w = cc._workspace
+    b = self.batch_size
+    return {
+        "frame": w["contact_frame"][: b * nc * 12].reshape(b, nc, 12),
+        "force": w["out_contact_force"][: b * nc * 11].reshape(b, nc, 11),
+        "row": w["contact_row_data"][: b * nc * 6 * 6].reshape(b, nc, 6, 6)[:, :, 0, 0],
+        "packed": cc._constants["contact_condim"].reshape(-1),
+        "mu": cc._constants["contact_friction"].reshape(nc, 5),
+        "pair_geoms": cc._constants["pair_geoms"].reshape(-1),
+        "pair_offset": cc._constants["pair_contact_offset"].reshape(-1),
+        "pair_live": self._sen_pair_live,
+        "npairs": int(d.npairs),
+    }
+
+  def _run_acc_into(self, qpos, qvel, qacc, poses, dynamics, out):
+    """Evaluate ACC force families into ``out`` (borrowed, merged)."""
+    cc = getattr(self, "_coupled_constraints", None)
+    lam = None
+    lam_nr = lam_s = 0
+    eqr = None
+    if cc is not None:
+      d = cc.descriptor
+      lam_nr, lam_s = int(d.nr), int(d.nr * d.nr + 7 * d.nr)
+      lam = cc._workspace["workspace_debug"][: self.batch_size * lam_s].reshape(
+          self.batch_size, lam_s)
+      eqr = cc._constants["eq_rowadr"].reshape(-1)
+    jm, tm = self._limit_row_maps()
+    contact = self._contact_views()
+    return self._sensors.run_acc_device(
+        qpos, qvel, qacc, poses, xfrc=self._body_wrench, contact=contact,
+        eq_rowadr=eqr, jnt_map=jm, ten_map=tm, slot_pair=self._sen_slot_pair,
+        lam_raw=lam, lam_nr=lam_nr, lam_stride=lam_s,
+        act_force=self._sen_act_force, qfrc_act=self._sen_qfrc_act, out=out)
+
   def _acceleration(self, qpos, qvel):
     mpos = getattr(self._state, "_mpos", None)
     mquat = getattr(self._state, "_mquat", None)
     dynamics = self._smooth.run_device(qpos, qvel, mpos, mquat)
+    if self._sensors is not None and self._has_acc_sensors:
+      self._lazy_sensor_scratch()
+      self._sen_act_force.zero_()
+      self._sen_qfrc_act.zero_()
     self._state._torch.neg(dynamics["qfrc_bias"], out=self._rhs)
     if self._applied_force is not None:
       if (
@@ -1085,11 +1248,24 @@ class MetalSimulation:
       self._rhs.sub_(sbias.reshape(self._rhs.shape))
       dynamics["mass_matrix"].add_(sarm.reshape(dynamics["mass_matrix"].shape))
     if self._transmissions is not None:
-      self._rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
+      t_qfrc = self._transmissions.run_device(qpos, qvel, self._control)
+      self._rhs.add_(t_qfrc)
+      if self._sensors is not None and self._has_acc_sensors:
+        self._lazy_sensor_scratch()
+        self._sen_act_force.add_(self._transmissions._last_force.reshape(
+            self._sen_act_force.shape))
+        self._sen_qfrc_act.add_(t_qfrc.reshape(self._sen_qfrc_act.shape))
     if self._actuators is not None:
       self._rhs.add_(self._actuation_force(qpos, qvel, dynamics["poses"]))
     if self._motor is not None:
-      self._rhs.add_(self._motor.run_device(self._control))
+      m_qfrc = self._motor.run_device(self._control)
+      self._rhs.add_(m_qfrc)
+      if self._sensors is not None and self._has_acc_sensors:
+        self._lazy_sensor_scratch()
+        self._sen_act_force.add_(self._motor._last_force.reshape(
+            self._sen_act_force.shape) if self._motor._last_force is not None
+            else 0.0)
+        self._sen_qfrc_act.add_(m_qfrc.reshape(self._sen_qfrc_act.shape))
     acceleration, status = self._solver.run_device(
         dynamics["mass_matrix"], self._rhs
     )
@@ -1158,7 +1334,8 @@ class MetalSimulation:
           # Pinned RK4 evaluates the outer forward (with sensors) at the
           # step-start state; intermediate stages skip sensing.
           fwd_acc, _, fwd_dyn = self._acceleration(state._qpos, state._qvel)
-          self._store_step_sensors(state._qpos, state._qvel, fwd_dyn)
+          self._store_step_sensors(state._qpos, state._qvel, fwd_dyn,
+                                   qacc=fwd_acc)
         qpos, qvel, acceleration, time, status = self._rk4.run_device(
             state._qpos,
             state._qvel,
@@ -1177,10 +1354,13 @@ class MetalSimulation:
       acceleration, solve_status, dynamics = self._acceleration(
           state._qpos, state._qvel
       )
+      solved_acceleration = acceleration
       if self._sensors is not None:
         # Stored step-stage sample at the pre-integration (forward) state,
         # matching pinned mj_step sensor timing; see step_sensordata.
-        self._store_step_sensors(state._qpos, state._qvel, dynamics)
+        # ACC sensors observe the solved acceleration (pre-midpoint).
+        self._store_step_sensors(state._qpos, state._qvel, dynamics,
+                                 qacc=solved_acceleration)
       integration_acceleration = acceleration
       next_velocity = position_velocity = None
       if self._implicitfast is not None:
@@ -1276,8 +1456,8 @@ class MetalSimulation:
       raise ValueError("step_sensordata requires a sensor stepping profile")
     return self._sensordata.detach().cpu().numpy().copy()
 
-  def _store_step_sensors(self, qpos, qvel, dynamics):
-    """Evaluate position/velocity sensor stages into persistent storage."""
+  def _store_step_sensors(self, qpos, qvel, dynamics, qacc=None):
+    """Evaluate position/velocity (+ACC, when present) stages into storage."""
     import mujoco as _mj
     torch = self._state._torch
     if self._sensordata is None:
@@ -1290,6 +1470,10 @@ class MetalSimulation:
     old = self._sensors.run_device(
         qpos, qvel, self._state._time, poses, stages=tuple(stages))
     merged = self._run_state_sensors(qpos, qvel, poses, dynamics, out=old)
+    if self._has_acc_sensors and qacc is not None:
+      # _acceleration just ran at this exact state; its cached actuator
+      # rows plus the solved constraint rows feed the ACC kernel.
+      merged = self._run_acc_into(qpos, qvel, qacc, poses, dynamics, merged)
     self._sensordata.copy_(merged)
 
   def _advance_activations(self, state):

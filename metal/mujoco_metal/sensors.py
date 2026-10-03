@@ -115,6 +115,7 @@ class SensorDescriptor:
   jnt_dofadr: np.ndarray
   body_iquat: np.ndarray
   body_rootid: np.ndarray
+  body_weldid: np.ndarray
   geom_bodyid: np.ndarray
   geom_pos: np.ndarray
   geom_quat: np.ndarray
@@ -192,6 +193,7 @@ def lower_sensors(model) -> SensorDescriptor:
       "qpos_spring": (np.float32, (int(model.nq),)),
       "body_iquat": (np.float32, (nb, 4)),
       "body_rootid": (np.int32, (nb,)),
+      "body_weldid": (np.int32, (nb,)),
       "body_parentid": (np.int32, (nb,)),
       "body_mass": (np.float32, (nb,)),
       "body_inertia": (np.float32, (nb, 3)),
@@ -437,6 +439,139 @@ def _contact_dim(model, dataspec, arrays, i):
   return size
 
 
+def _transform_spatial(vec, newpos, oldpos, flg_force):
+  # Pinned mju_transformSpatial with identity rotation (global frame kept).
+  vec = np.asarray(vec, dtype=np.float64)
+  dif = np.asarray(newpos, dtype=np.float64) - np.asarray(oldpos, dtype=np.float64)
+  out = vec.copy()
+  if flg_force:
+    out[:3] = vec[:3] - np.cross(dif, vec[3:])
+  else:
+    out[3:] = vec[3:] - np.cross(dif, vec[:3])
+  return out
+
+
+def _ray_quad(a, b, c):
+  # Pinned ray_quad: solve a*x^2 + 2*b*x + c = 0, smallest nonneg root or -1.
+  disc = b * b - a * c
+  if disc < 0 or abs(a) < 1e-30:
+    return -1.0
+  root = np.sqrt(disc)
+  x0, x1 = (-b - root) / a, (-b + root) / a
+  if x0 >= 0:
+    return x0
+  if x1 >= 0:
+    return x1
+  return -1.0
+
+
+def _ray_map(pos, mat, pnt, vec):
+  # Pinned ray_map: rigid transform into geom local frame.
+  m = np.asarray(mat, dtype=np.float64).reshape(3, 3)
+  lpnt = m.T @ (np.asarray(pnt, dtype=np.float64) - np.asarray(pos, dtype=np.float64))
+  lvec = m.T @ np.asarray(vec, dtype=np.float64)
+  return lpnt, lvec
+
+
+def _ray_geom(pos, mat, size, pnt, vec, geom_type):
+  # Pinned mju_rayGeom for analytic site-zone shapes (touch sensors).
+  G = mujoco.mjtGeom
+  size = np.asarray(size, dtype=np.float64)
+  t = int(geom_type)
+  if t == int(G.mjGEOM_SPHERE):
+    dif = np.asarray(pnt) - np.asarray(pos)
+    a = float(np.dot(vec, vec))
+    b = float(np.dot(vec, dif))
+    return _ray_quad(a, b, float(np.dot(dif, dif)) - size[0] ** 2)
+  lpnt, lvec = _ray_map(pos, mat, pnt, vec)
+  if t == int(G.mjGEOM_BOX):
+    ssz = float(size[0] ** 2 + size[1] ** 2 + size[2] ** 2)
+    if _ray_geom(pos, None, np.array([np.sqrt(ssz)]), pnt, vec, G.mjGEOM_SPHERE) < 0:
+      return -1.0
+    faces = ((1, 2), (0, 2), (0, 1))
+    best = -1.0
+    for k in range(3):
+      if abs(lvec[k]) <= mujoco.mjMINVAL:
+        continue
+      for side in (-1, 1):
+        sol = (side * size[k] - lpnt[k]) / lvec[k]
+        if sol >= 0:
+          p0 = lpnt[faces[k][0]] + sol * lvec[faces[k][0]]
+          p1 = lpnt[faces[k][1]] + sol * lvec[faces[k][1]]
+          if abs(p0) <= size[faces[k][0]] and abs(p1) <= size[faces[k][1]]:
+            if best < 0 or sol < best:
+              best = sol
+    return best
+  if t == int(G.mjGEOM_PLANE):
+    if lvec[2] > -mujoco.mjMINVAL:
+      return -1.0
+    x = -lpnt[2] / lvec[2]
+    if x < 0:
+      return -1.0
+    p0, p1 = lpnt[0] + x * lvec[0], lpnt[1] + x * lvec[1]
+    if (size[0] <= 0 or abs(p0) <= size[0]) and (size[1] <= 0 or abs(p1) <= size[1]):
+      return x
+    return -1.0
+  if t == int(G.mjGEOM_CAPSULE):
+    ssz = size[0] + size[1]
+    if _ray_geom(pos, None, np.array([ssz]), pnt, vec, G.mjGEOM_SPHERE) < 0:
+      return -1.0
+    best = -1.0
+    a = lvec[0] ** 2 + lvec[1] ** 2
+    b = lvec[0] * lpnt[0] + lvec[1] * lpnt[1]
+    c = lpnt[0] ** 2 + lpnt[1] ** 2 - size[0] ** 2
+    sol = _ray_quad(a, b, c)
+    if sol >= 0 and abs(lpnt[2] + sol * lvec[2]) <= size[1]:
+      best = sol
+    a2 = float(np.dot(lvec, lvec))
+    for cap in (size[1], -size[1]):
+      ld = lpnt - np.array([0.0, 0.0, cap])
+      b2 = float(np.dot(lvec, ld))
+      c2 = float(np.dot(ld, ld)) - size[0] ** 2
+      for xx in _ray_quad_roots(a2, b2, c2):
+        if xx >= 0 and (lpnt[2] + xx * lvec[2] >= size[1] if cap > 0
+                        else lpnt[2] + xx * lvec[2] <= -size[1]):
+          if best < 0 or xx < best:
+            best = xx
+    return best
+  if t == int(G.mjGEOM_ELLIPSOID):
+    s = 1.0 / (size * size)
+    a = float(np.dot(s * lvec, lvec))
+    b = float(np.dot(s * lvec, lpnt))
+    c = float(np.dot(s * lpnt, lpnt)) - 1.0
+    return _ray_quad(a, b, c)
+  if t == int(G.mjGEOM_CYLINDER):
+    ssz = size[0] ** 2 + size[1] ** 2
+    if _ray_geom(pos, None, np.array([np.sqrt(ssz)]), pnt, vec, G.mjGEOM_SPHERE) < 0:
+      return -1.0
+    best = -1.0
+    if abs(lvec[2]) > mujoco.mjMINVAL:
+      for side in (-1, 1):
+        sol = (side * size[1] - lpnt[2]) / lvec[2]
+        if sol >= 0:
+          p0 = lpnt[0] + sol * lvec[0]
+          p1 = lpnt[1] + sol * lvec[1]
+          if p0 * p0 + p1 * p1 <= size[0] ** 2 and (best < 0 or sol < best):
+            best = sol
+    a = lvec[0] ** 2 + lvec[1] ** 2
+    b = lvec[0] * lpnt[0] + lvec[1] * lpnt[1]
+    c = lpnt[0] ** 2 + lpnt[1] ** 2 - size[0] ** 2
+    sol = _ray_quad(a, b, c)
+    if sol >= 0 and abs(lpnt[2] + sol * lvec[2]) <= size[1]:
+      if best < 0 or sol < best:
+        best = sol
+    return best
+  return -1.0
+
+
+def _ray_quad_roots(a, b, c):
+  disc = b * b - a * c
+  if disc < 0 or abs(a) < 1e-30:
+    return []
+  root = np.sqrt(disc)
+  return [(-b - root) / a, (-b + root) / a]
+
+
 def _quat_mat(q):
   q = _unit(np.asarray(q, dtype=np.float64), "quaternion")
   w, x, y, z = q
@@ -587,6 +722,103 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
             int(np.asarray(desc.site_type)[refid]), np.asarray(p, dtype=np.float64)))])
       elif typ in (int(S.mjSENS_E_POTENTIAL), int(S.mjSENS_E_KINETIC)):
         value = np.array([float(Need("energy")["energy"][w, 0 if typ == int(S.mjSENS_E_POTENTIAL) else 1])])
+      elif typ == int(S.mjSENS_TOUCH):
+        ex = Need("contact_geom", "contact_frame", "contact_pos",
+                  "contact_dist", "contact_force", "contact_efc", "ncon")
+        sid = objid
+        sbody = int(desc.site_bodyid[sid])
+        total = 0.0
+        for j in range(int(ex["ncon"][w])):
+          if int(ex["contact_efc"][w, j]) < 0:
+            continue
+          g0, g1 = int(ex["contact_geom"][w, j, 0]), int(ex["contact_geom"][w, j, 1])
+          b0 = int(desc.geom_bodyid[g0]) if g0 >= 0 else -1
+          b1 = int(desc.geom_bodyid[g1]) if g1 >= 0 else -1
+          if sbody != b0 and sbody != b1:
+            continue
+          fn = float(ex["contact_force"][w, j, 0])
+          if fn <= 0:
+            continue
+          frame = np.asarray(ex["contact_frame"][w, j]).reshape(3, 3)
+          ray = frame[0] * fn
+          nray = ray / max(np.linalg.norm(ray), 1e-30)
+          if sbody == b1:
+            nray = -nray
+          sp = np.asarray(poses["site_pos"])[w, sid]
+          sq = _unit(np.asarray(poses["site_quat"])[w, sid], "site quaternion")
+          sm = _quat_mat(sq)
+          if _ray_geom(sp, sm, np.asarray(desc.site_size)[sid],
+                       int(np.asarray(desc.site_type)[sid]),
+                       np.asarray(ex["contact_pos"][w, j]), nray) >= 0:
+            total += fn
+        value = np.array([total])
+      elif typ == int(S.mjSENS_ACCELEROMETER):
+        ex = Need("cacc", "subtree_com")
+        sbody = int(desc.site_bodyid[objid])
+        root = int(desc.body_rootid[sbody])
+        sp = np.asarray(poses["site_pos"])[w, objid]
+        sub = np.asarray(ex["subtree_com"][w, root], dtype=np.float64)
+        acc = np.asarray(ex["cacc"][w, sbody], dtype=np.float64)
+        res = _transform_spatial(acc, sp, sub, False)
+        cvel = np.asarray(poses["cvel"])[w, sbody]
+        vel = _transform_spatial(cvel, sp, sub, False)
+        res[3:] += np.cross(vel[:3], vel[3:])
+        sq = _unit(np.asarray(poses["site_quat"])[w, objid], "site quaternion")
+        value = _quat_rot(np.array([sq[0], *(-sq[1:])]), res[3:])
+      elif typ in (int(S.mjSENS_FORCE), int(S.mjSENS_TORQUE)):
+        ex = Need("cfrc_int", "subtree_com")
+        sbody = int(desc.site_bodyid[objid])
+        root = int(desc.body_rootid[sbody])
+        sp = np.asarray(poses["site_pos"])[w, objid]
+        sub = np.asarray(ex["subtree_com"])[w, root].astype(np.float64)
+        ci = np.asarray(ex["cfrc_int"])[w, sbody].astype(np.float64)
+        res = _transform_spatial(ci, sp, sub, True)
+        sq = _unit(np.asarray(poses["site_quat"])[w, objid], "site quaternion")
+        res[:3] = _quat_rot(np.array([sq[0], *(-sq[1:])]), res[:3])
+        res[3:] = _quat_rot(np.array([sq[0], *(-sq[1:])]), res[3:])
+        value = res[3:].copy() if typ == int(S.mjSENS_FORCE) else res[:3].copy()
+      elif typ == int(S.mjSENS_ACTUATORFRC):
+        value = np.array([float(Need("actuator_force")["actuator_force"][w, objid])])
+      elif typ == int(S.mjSENS_JOINTACTFRC):
+        da = int(desc.jnt_dofadr[objid])
+        value = np.array([float(Need("qfrc_actuator")["qfrc_actuator"][w, da])])
+      elif typ == int(S.mjSENS_TENDONACTFRC):
+        ex = Need("actuator_force", "actuator_trntype", "actuator_trnid")
+        frc = 0.0
+        for j in range(ex["actuator_force"].shape[1]):
+          if (int(ex["actuator_trntype"][j]) == int(mujoco.mjtTrn.mjTRN_TENDON)
+              and int(ex["actuator_trnid"][j][0]) == objid):
+            frc += float(ex["actuator_force"][w, j])
+        value = np.array([frc])
+      elif typ in (int(S.mjSENS_JOINTLIMITFRC), int(S.mjSENS_TENDONLIMITFRC)):
+        ex = Need("efc_type", "efc_id", "efc_force", "ne", "nf")
+        want_type = (_LIMIT_JOINT if typ == int(S.mjSENS_JOINTLIMITFRC)
+                     else _LIMIT_TENDON)
+        value = np.array([0.0])
+        for j in range(int(ex["ne"]) + int(ex["nf"]), ex["efc_type"].shape[1]):
+          if (int(ex["efc_type"][w, j]) == want_type and int(ex["efc_id"][w, j]) == objid):
+            value = np.array([float(ex["efc_force"][w, j])])
+            break
+      elif typ in (int(S.mjSENS_FRAMELINACC), int(S.mjSENS_FRAMEANGACC)):
+        ex = Need("cacc", "subtree_com")
+        otype = int(desc.sensor_objtype[i])
+        obody = objid
+        if otype == int(mujoco.mjtObj.mjOBJ_GEOM):
+          obody = int(desc.geom_bodyid[objid])
+        elif otype == int(mujoco.mjtObj.mjOBJ_SITE):
+          obody = int(desc.site_bodyid[objid])
+        if int(np.asarray(desc.body_weldid)[obody]) == 0:
+          value = np.zeros(3)
+        else:
+          root = int(desc.body_rootid[obody])
+          pos, _ = _frame_pose(desc, poses, w, otype, objid)
+          sub = np.asarray(ex["subtree_com"][w, root], dtype=np.float64)
+          acc = np.asarray(ex["cacc"][w, obody], dtype=np.float64)
+          res = _transform_spatial(acc, pos, sub, False)
+          cvel = np.asarray(poses["cvel"])[w, obody]
+          vel = _transform_spatial(cvel, pos, sub, False)
+          res[3:] += np.cross(vel[:3], vel[3:])
+          value = res[3:6].copy() if typ == int(S.mjSENS_FRAMELINACC) else res[0:3].copy()
       elif typ in (int(mujoco.mjtSensor.mjSENS_FRAMELINVEL), int(mujoco.mjtSensor.mjSENS_FRAMEANGVEL), int(mujoco.mjtSensor.mjSENS_GYRO), int(mujoco.mjtSensor.mjSENS_VELOCIMETER)):
         if "cvel" not in poses or "root_com" not in poses:
           raise ValueError("velocity sensors require cvel and root_com in poses")
@@ -823,6 +1055,7 @@ class SensorProgram:
     self._s_state_kernel = self._library.evaluate_state_sensors
     self._s_dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
     self._s_state_out = torch.zeros((self.batch_size, d.nsensordata), dtype=torch.float32, device=self._device)
+    self._build_rne_constants(model)
 
   def run_device(self, qpos, qvel, time, poses, *, stages=(_POS, _VEL), sensordata=None):
     """Update selected sensor stages and return borrowed device sensordata.
@@ -966,5 +1199,197 @@ class SensorProgram:
         self._s_ten_lim.reshape(-1), self._s_massub.reshape(-1),
         self._s_body_tree.reshape(-1), self._s_site_geom.reshape(-1),
         self._s_econst, sdims, dest.reshape(-1), self._stage_mask,
+        threads=(b * max(d.nsensor, 1),), group_size=(1,))
+    return dest
+
+  def _build_rne_constants(self, model):
+    """Host constants for the milestone-016 RNE-post/ACC kernels."""
+    torch, d = self._torch, self.descriptor
+    nb, nj, nv = d.nbody, d.njnt, d.nv
+    def itensor(values, shape):
+      arr = np.asarray(values, dtype=np.int32).reshape(-1)
+      if arr.size == 0:
+        arr = np.zeros(int(np.prod(shape, dtype=np.int64)), dtype=np.int32)
+      return torch.as_tensor(arr.reshape(shape).copy(), dtype=torch.int32, device=self._device)
+    def ftensor(values, shape):
+      arr = np.asarray(values, dtype=np.float32).reshape(-1)
+      if arr.size == 0:
+        arr = np.zeros(int(np.prod(shape, dtype=np.int64)), dtype=np.float32)
+      if not np.all(np.isfinite(arr)):
+        raise ValueError("RNE constants must be finite float32")
+      return torch.as_tensor(arr.reshape(shape).copy(), dtype=torch.float32, device=self._device)
+    bjj = np.zeros((max(nb, 1), 4), dtype=np.int32)
+    for b in range(nb):
+      bjj[b] = [int(model.body_jntadr[b]), int(model.body_jntnum[b]),
+                int(model.body_dofadr[b]), int(model.body_dofnum[b])]
+    self._rne_body_jnt = itensor(bjj, (max(nb, 1), 4))
+    self._rne_dof_jntid = itensor(model.dof_jntid, (max(nv, 1),))
+    self._rne_jnt_type = itensor(model.jnt_type, (max(nj, 1),))
+    self._rne_jnt_dofadr = itensor(model.jnt_dofadr, (max(nj, 1),))
+    self._rne_mass = ftensor(model.body_mass, (max(nb, 1),))
+    self._rne_body_tree = itensor(
+        np.stack([np.asarray(model.body_parentid).reshape(-1),
+                  np.asarray(model.body_rootid).reshape(-1)], axis=1),
+        (max(nb, 1), 2))
+    self._rne_inertia = ftensor(np.asarray(model.body_inertia).reshape(max(nb, 1), 3),
+                                (max(nb, 1), 3))
+    self._rne_gravity = ftensor(model.opt.gravity, (3,))
+    self._rne_body_weld = itensor(model.body_weldid, (max(nb, 1),))
+    self._rne_geom_bodyid = itensor(model.geom_bodyid, (max(int(model.ngeom), 1),))
+    self._rne_site_bodyid = itensor(model.site_bodyid, (max(int(model.nsite), 1),))
+    neq = int(model.neq)
+    eqm = np.zeros((max(neq, 1), 4), dtype=np.int32)
+    for e in range(neq):
+      eqm[e] = [int(model.eq_type[e]), int(model.eq_objtype[e]),
+                int(model.eq_obj1id[e]), int(model.eq_obj2id[e])]
+    self._rne_eq_meta = itensor(eqm, (max(neq, 1), 4))
+    self._rne_eq_data = ftensor(model.eq_data, (max(neq, 1), 11))
+    self._rne_site_lpos = ftensor(model.site_pos, (max(int(model.nsite), 1), 3))
+    self._rne_act_trn = itensor(
+        np.stack([np.asarray(model.actuator_trntype).reshape(-1),
+                  np.asarray(model.actuator_trnid).reshape(-1, 2)[:, 0]], axis=1),
+        (max(int(model.nu), 1), 2))
+    from pathlib import Path as _Path
+    self._rne_lib = torch.mps.compile_shader(
+        (_Path(__file__).parent / "shaders" / "sensors_rne.metal").read_text())
+    self._rne_assemble = self._rne_lib.assemble_cfrc_ext
+    self._rne_post = self._rne_lib.rne_post
+    self._rne_acc = self._rne_lib.evaluate_acc_sensors
+    b = self.batch_size
+    self._rne_cacc = torch.zeros((b, max(nb, 1), 6), dtype=torch.float32, device=self._device)
+    self._rne_cfrc = torch.zeros_like(self._rne_cacc)
+    self._rne_scom = torch.zeros((b, max(nb, 1), 3), dtype=torch.float32, device=self._device)
+    self._rne_ext = torch.zeros_like(self._rne_cacc)
+
+  def run_acc_device(self, qpos, qvel, qacc, poses, *, xfrc=None,
+                     contact=None, eq_rowadr=None, jnt_map=None,
+                     ten_map=None, slot_pair=None, lam_raw=None, lam_nr=0,
+                     lam_stride=0, act_force=None, qfrc_act=None, out=None):
+    """Evaluate ACC force families on MPS; returns borrowed device sensordata.
+
+    Runs cfrc_ext assembly, the RNE-post pass, then the ACC sensor kernel.
+    ``contact`` is a dict of coupled contact views (frame/force/row/packed/
+    mu/pair_geoms/pair_offset/pair_live) or None; ``eq_rowadr`` per-equality
+    first rows or None; ``jnt_map``/``ten_map`` candidate rows or None;
+    ``act_force``/``qfrc_act`` per-actuator/dof forces or None.
+    """
+    torch, d = self._torch, self.descriptor
+    b = self.batch_size
+    nb = d.nbody
+    for name, tensor, shape in (
+        ("qpos", qpos, (b, d.nq)), ("qvel", qvel, (b, d.nv)),
+        ("qacc", qacc, (b, d.nv))):
+      if (not isinstance(tensor, torch.Tensor) or tensor.device.type != "mps"
+          or tensor.dtype != torch.float32 or tuple(tensor.shape) != shape
+          or not tensor.is_contiguous()):
+        raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
+    for key, shape in (
+        ("body_pos", (b, nb, 3)), ("body_quat", (b, nb, 4)),
+        ("inertial_pos", (b, nb, 3)), ("inertial_quat", (b, nb, 4)),
+        ("site_pos", (b, d.nsite, 3)), ("site_quat", (b, d.nsite, 4)),
+        ("geom_pos", (b, d.ngeom, 3)),
+        ("cvel", (b, nb, 6)), ("root_com", (b, nb, 3))):
+      v = poses.get(key, None)
+      if (not isinstance(v, torch.Tensor) or v.device.type != "mps"
+          or v.dtype != torch.float32 or tuple(v.shape) != shape
+          or not v.is_contiguous()):
+        raise ValueError(f"poses[{key!r}] must be contiguous float32 MPS with shape {shape}")
+    for key, shape in (
+        ("joint_anchor", (b, d.njnt, 3)), ("joint_axis", (b, d.njnt, 3))):
+      v = poses.get(key, None)
+      if (not isinstance(v, torch.Tensor) or v.device.type != "mps"
+          or v.dtype != torch.float32 or tuple(v.shape) != shape
+          or not v.is_contiguous()):
+        raise ValueError(f"poses[{key!r}] must be contiguous float32 MPS with shape {shape}")
+    nv, nj, nt, nu = d.nv, d.njnt, d.ntendon, d.nu
+    nc = 0 if contact is None else int(contact["frame"].shape[1])
+    dummy = self._s_dummy
+    XF = xfrc.reshape(-1) if xfrc is not None else dummy
+    has_x = 0 if xfrc is None else 1
+    if contact is None:
+      cfr = cfo = crow = cmu = dummy
+      cpk = torch.zeros(3, dtype=torch.int32, device=self._device)
+      pge = torch.zeros(2, dtype=torch.int32, device=self._device)
+      pof = torch.zeros(2, dtype=torch.int32, device=self._device)
+      plv = torch.zeros(1, dtype=torch.int32, device=self._device)
+      npairs = 0
+    else:
+      cfr, cfo = contact["frame"].reshape(-1), contact["force"].reshape(-1)
+      crow, cpk = contact["row"].reshape(-1), contact["packed"].reshape(-1)
+      cmu, pge = contact["mu"].reshape(-1), contact["pair_geoms"].reshape(-1)
+      pof, plv = contact["pair_offset"].reshape(-1), contact["pair_live"].reshape(-1)
+      npairs = int(contact.get("npairs", 0))
+    bjn = self._rne_body_jnt[:, 1].reshape(-1)
+    eqr = eq_rowadr.reshape(-1) if eq_rowadr is not None else torch.zeros(1, dtype=torch.int32, device=self._device)
+    neq_eff = int(eqr.numel()) if eq_rowadr is not None else 0
+    jm = jnt_map.reshape(-1) if jnt_map is not None else torch.full((max(nj, 1) * 3,), -1, dtype=torch.int32, device=self._device)
+    tm = ten_map.reshape(-1) if ten_map is not None else torch.full((max(nt, 1) * 2,), -1, dtype=torch.int32, device=self._device)
+    lam = lam_raw.reshape(-1) if lam_raw is not None else dummy
+    af = act_force.reshape(-1) if act_force is not None else dummy
+    qa = qfrc_act.reshape(-1) if qfrc_act is not None else dummy
+    has_act = 0 if act_force is None else 1
+    adims = torch.tensor(
+        [b, nb, neq_eff, nc, npairs, has_x, lam_nr, lam_stride],
+        dtype=torch.int32, device=self._device)
+    self._rne_assemble(
+        XF, cfr, cfo, crow, cpk, cmu, pge, pof, plv,
+        self._rne_geom_bodyid, bjn,
+        self._rne_eq_meta.reshape(-1), eqr,
+        self._rne_eq_data.reshape(-1), self._rne_site_lpos.reshape(-1),
+        self._rne_site_bodyid,
+        lam, poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),
+        poses["inertial_pos"].reshape(-1),
+        self._rne_mass, self._rne_body_tree.reshape(-1),
+        self._rne_ext.reshape(-1), adims,
+        threads=(b,), group_size=(1,))
+    grav_off = 1 if d.disableflags & int(mujoco.mjtDisableBit.mjDSBL_GRAVITY) else 0
+    rdims = torch.tensor(
+        [b, nb, nv, nj, grav_off],
+        dtype=torch.int32, device=self._device)
+    # Root-com-per-body for the ACC kernel (written by rne_post).
+    self._rne_post(
+        qvel.reshape(-1) if nv else dummy,
+        qacc.reshape(-1) if nv else dummy,
+        poses["cvel"].reshape(-1),
+        self._rne_mass, self._rne_inertia.reshape(-1),
+        self._rne_body_tree.reshape(-1), self._rne_body_jnt.reshape(-1),
+        self._rne_jnt_type if nj else torch.zeros(1, dtype=torch.int32, device=self._device),
+        self._rne_jnt_dofadr if nj else torch.zeros(1, dtype=torch.int32, device=self._device),
+        poses["joint_anchor"].reshape(-1) if nj else dummy,
+        poses["joint_axis"].reshape(-1) if nj else dummy,
+        poses["inertial_pos"].reshape(-1), poses["inertial_quat"].reshape(-1),
+        poses["body_quat"].reshape(-1),
+        self._rne_ext.reshape(-1),
+        self._rne_cacc.reshape(-1), self._rne_cfrc.reshape(-1),
+        self._rne_scom.reshape(-1),
+        rdims, self._rne_gravity,
+        threads=(b,), group_size=(1,))
+    dest = self._s_state_out if out is None else out
+    if dest.device.type != "mps" or tuple(dest.shape) != (b, d.nsensordata) \
+        or dest.dtype != torch.float32 or not dest.is_contiguous():
+      raise ValueError("out must be contiguous float32 MPS with shape (batch, nsensordata)")
+    if dest is not self._s_state_out:
+      self._s_state_out.copy_(dest)
+      dest = self._s_state_out
+    self._stage_mask.fill_(1 << int(mujoco.mjtStage.mjSTAGE_ACC))
+    kdims = torch.tensor(
+        [b, d.nsensor, d.nsensordata, lam_nr, lam_stride, nc, nu, nt, nv,
+         nj, nb, has_act, d.nsite, d.ngeom],
+        dtype=torch.int32, device=self._device)
+    self._rne_acc(
+        self._rne_cacc.reshape(-1), self._rne_cfrc.reshape(-1),
+        self._rne_scom.reshape(-1), af, qa,
+        self._rne_act_trn.reshape(-1), jm, tm, lam,
+        poses["site_pos"].reshape(-1), poses["site_quat"].reshape(-1),
+        poses["body_pos"].reshape(-1), poses["inertial_pos"].reshape(-1),
+        poses["geom_pos"].reshape(-1) if d.ngeom else dummy,
+        poses["cvel"].reshape(-1), poses["root_com"].reshape(-1),
+        cfr, cfo, crow, cpk, cmu,
+        slot_pair.reshape(-1) if slot_pair is not None else torch.zeros(1, dtype=torch.int32, device=self._device),
+        plv,
+        self._s_site_geom.reshape(-1),
+        self._s_meta.reshape(-1),
+        self._rne_geom_bodyid, self._rne_site_bodyid, self._rne_body_weld,
+        dest.reshape(-1), self._stage_mask, kdims,
         threads=(b * max(d.nsensor, 1),), group_size=(1,))
     return dest

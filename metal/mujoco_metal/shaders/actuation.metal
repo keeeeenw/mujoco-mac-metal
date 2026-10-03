@@ -27,6 +27,7 @@ kernel void scalar_motor_force(
     device const int* actuator_group [[buffer(8)]],
     constant int* dims [[buffer(9)]],
     device float* qfrc [[buffer(10)]],
+    device float* act_force [[buffer(11)]],
     uint world [[thread_position_in_grid]]) {
   int nu = dims[0];
   int nv = dims[1];
@@ -37,7 +38,9 @@ kernel void scalar_motor_force(
   if (world >= uint(batch)) return;
 
   uint force_offset = world * uint(nv);
+  uint act_offset = world * uint(nu);
   for (int v = 0; v < nv; ++v) qfrc[force_offset + uint(v)] = 0.0f;
+  for (int a = 0; a < nu; ++a) act_force[act_offset + uint(a)] = 0.0f;
   if (actuation_disabled != 0) return;
 
   for (int actuator = 0; actuator < nu; ++actuator) {
@@ -46,6 +49,7 @@ kernel void scalar_motor_force(
     if ((control_bits & 0x7f800000u) == 0x7f800000u) {
       float invalid = as_type<float>(0x7fc00000u);
       for (int v = 0; v < nv; ++v) qfrc[force_offset + uint(v)] = invalid;
+      for (int a = 0; a < nu; ++a) act_force[act_offset + uint(a)] = invalid;
       return;
     }
   }
@@ -65,6 +69,7 @@ kernel void scalar_motor_force(
       float upper = force_range[2 * uint(actuator) + 1];
       force = clamp(force, lower, upper);
     }
+    act_force[act_offset + uint(actuator)] = force;
     qfrc[force_offset + uint(dof[actuator])] += gear[actuator] * force;
   }
 }

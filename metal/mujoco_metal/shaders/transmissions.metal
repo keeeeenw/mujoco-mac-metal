@@ -20,15 +20,18 @@ kernel void scalar_transmission_force(
     device const int* actuator_group [[buffer(13)]],
     constant int* dims [[buffer(14)]],
     device float* qfrc [[buffer(15)]],
+    device float* act_force [[buffer(16)]],
     uint world [[thread_position_in_grid]]) {
   int nq=dims[0], nv=dims[1], nu=dims[2];
   int actuation_disabled=dims[3], clampctrl_disabled=dims[4], disableactuator=dims[5];
   uint qbase=world*uint(nq), vbase=world*uint(nv), ubase=world*uint(nu);
   for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]=0.0f;
+  for (int a=0;a<nu;++a) act_force[ubase+uint(a)]=0.0f;
   for (int i=0;i<nq;++i) {
     if ((as_type<uint>(qpos[qbase+uint(i)]) & 0x7f800000u)==0x7f800000u) {
       float bad=as_type<float>(0x7fc00000u);
       for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]=bad;
+      for (int a=0;a<nu;++a) act_force[ubase+uint(a)]=bad;
       return;
     }
   }
@@ -36,6 +39,7 @@ kernel void scalar_transmission_force(
     if ((as_type<uint>(qvel[vbase+uint(i)]) & 0x7f800000u)==0x7f800000u) {
       float bad=as_type<float>(0x7fc00000u);
       for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]=bad;
+      for (int a=0;a<nu;++a) act_force[ubase+uint(a)]=bad;
       return;
     }
   }
@@ -62,6 +66,7 @@ kernel void scalar_transmission_force(
     float force=gain*input;
     if (bias_enabled[a]) force+=biasprm[3*a]+biasprm[3*a+1]*length+biasprm[3*a+2]*velocity;
     if (force_limited[a]) force=clamp(force,force_range[2*a],force_range[2*a+1]);
+    act_force[ubase+uint(a)]=force;
     for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]+=moment_map[a*nv+d]*force;
   }
   for (int d=0;d<nv;++d) {

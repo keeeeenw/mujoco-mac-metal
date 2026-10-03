@@ -333,6 +333,8 @@ class MetalScalarMotorForce:
         device=self._device,
     )
     self._workspace = None
+    self._force = None
+    self._last_force = None
     self.prepare_workspace(self._batch_size)
 
   def prepare_workspace(self, batch_size):
@@ -382,6 +384,8 @@ class MetalScalarMotorForce:
       raise ValueError("ctrl must be on the MPS device")
     self._check_capacity(batch)
     device_ctrl = self._empty_ctrl if self.model.nu == 0 else ctrl.reshape(-1)
+    if self._force is None or tuple(self._force.shape) != (batch, max(self.model.nu, 1)):
+      self._force = self._torch.empty((batch, max(self.model.nu, 1)), dtype=self._torch.float32, device=self._device)
     self._kernel(
         device_ctrl,
         self._dof,
@@ -394,9 +398,11 @@ class MetalScalarMotorForce:
         self._groups,
         self._dims,
         self._workspace.reshape(-1),
+        self._force.reshape(-1),
         threads=(batch,),
         group_size=(1,),
     )
+    self._last_force = self._force
     return self._workspace[:, : self.model.nv]
 
 
