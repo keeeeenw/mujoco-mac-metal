@@ -166,26 +166,9 @@ kernel void smooth_bias(
   }
 }
 
-inline void multiply_spatial_thread(device const float* matrix, uint offset,
-                                   thread const float* vector, thread float* result) {
-  for (uint row=0; row<6; ++row) {
-    result[row] = 0.0f;
-    for (uint col=0; col<6; ++col)
-      result[row] += matrix[offset+row*6+col]*vector[col];
-  }
-}
-
-inline void force_cross_thread(thread const float* motion, thread const float* force,
-                               thread float* result) {
-  float3 w = float3(motion[0],motion[1],motion[2]);
-  float3 v = float3(motion[3],motion[4],motion[5]);
-  float3 f = float3(force[0],force[1],force[2]);
-  float3 t = float3(force[3],force[4],force[5]);
-  float3 torque = cross_bias(w,f)+cross_bias(v,t);
-  float3 linear = cross_bias(w,t);
-  for (uint k=0;k<3;++k) { result[k]=torque[k]; result[k+3]=linear[k]; }
-}
-
+// Analytical RNE velocity derivative. Each (world,column) owns one reusable
+// device scratch slice; only spatial six-vectors remain in thread-local memory.
+// Position, inertial data and cdof are held fixed, as in mjd_rne_vel.
 kernel void smooth_bias_derivative(
     device const int* parent [[buffer(0)]],
     device const int* body_dofadr [[buffer(1)]],
@@ -202,123 +185,82 @@ kernel void smooth_bias_derivative(
     device const float* qvel [[buffer(12)]],
     device float* qderiv_bias [[buffer(13)]],
     constant uint* dims [[buffer(14)]],
+    device const float* primal_cvel [[buffer(15)]],
+    device const float* primal_cdof_dot [[buffer(16)]],
+    device float* scratch [[buffer(17)]],
     uint2 tid [[thread_position_in_grid]]) {
   uint nbody=dims[0], nv=dims[2], batch=dims[3];
-  uint col = tid.x;
-  uint world = tid.y;
-  if (world >= batch || col >= nv) return;
+  uint col=tid.x, world=tid.y;
+  if (world>=batch || col>=nv) return;
+  uint vb=world*nv, dof6=world*nv*6, body6=world*nbody*6;
+  uint inert=world*nbody*36;
+  uint stride=(3*nbody+nv)*6;
+  device float* dv=scratch+(world*nv+col)*stride;
+  device float* ddot=dv+nbody*6;
+  device float* da=ddot+nv*6;
+  device float* df=da+nbody*6;
+  for (uint k=0;k<stride;++k) dv[k]=0.0f;
 
-  uint vb = world * nv;
-  uint dof6 = world * nv * 6;
-  uint inert = world * nbody * 36;
-  float eps = 1e-3f;
-
-  float bias_plus[64];
-  float bias_minus[64];
-
-  for (int step = 0; step < 2; ++step) {
-    float sign = (step == 0) ? 1.0f : -1.0f;
-    float cvel[64 * 6];
-    float cdof_dot[64 * 6];
-    float cacc[64 * 6];
-    float body_force[64 * 6];
-
-    for (uint d=0; d<nv; ++d)
-      for (uint k=0; k<6; ++k) cdof_dot[d*6+k] = 0.0f;
-    for (uint b=0; b<nbody; ++b)
-      for (uint k=0; k<6; ++k) cvel[b*6+k] = 0.0f;
-
-    for (uint b=1; b<nbody; ++b) {
-      int p = parent[b];
-      float velocity[6];
-      for (uint k=0; k<6; ++k) velocity[k] = cvel[uint(p)*6+k];
-      int first = body_jntadr[b];
-      int count = body_jntnum[b];
-      for (int jj=0; jj<count; ++jj) {
-        uint j = uint(first+jj);
-        uint d = uint(jnt_dofadr[j]);
-        uint typ = uint(jnt_type[j]);
-        if (typ == 0 || typ == 1) {
-          uint skip = (typ == 0) ? 3 : 0;
-          if (typ == 0) {
-            for (uint k=0; k<3; ++k) {
-              float qv = qvel[vb+d+k] + ((d+k == col) ? sign * eps : 0.0f);
-              for (uint r=0; r<6; ++r)
-                velocity[r] += cdof[dof6+(d+k)*6+r] * qv;
-            }
-          }
-          float derivatives[18];
-          for (uint k=0; k<3; ++k)
-            motion_cross(velocity, cdof+dof6+(d+skip+k)*6, derivatives+k*6);
-          for (uint k=0; k<3; ++k) {
-            for (uint r=0; r<6; ++r)
-              cdof_dot[(d+skip+k)*6+r] = derivatives[k*6+r];
-          }
-          for (uint k=0; k<3; ++k) {
-            float qv = qvel[vb+d+skip+k] + ((d+skip+k == col) ? sign * eps : 0.0f);
-            for (uint r=0; r<6; ++r)
-              velocity[r] += cdof[dof6+(d+skip+k)*6+r] * qv;
-          }
-        } else {
+  // Differentiate comVel's joint grouping before each velocity increment.
+  for (uint b=1;b<nbody;++b) {
+    uint p=uint(parent[b]);
+    float velocity[6];
+    for (uint k=0;k<6;++k) velocity[k]=dv[p*6+k];
+    int first=body_jntadr[b], count=body_jntnum[b];
+    for (int jj=0;jj<count;++jj) {
+      uint j=uint(first+jj), d=uint(jnt_dofadr[j]), typ=uint(jnt_type[j]);
+      if (typ==0 || typ==1) {
+        uint skip=typ==0 ? 3 : 0;
+        if (typ==0 && col>=d && col<d+3)
+          for (uint r=0;r<6;++r) velocity[r]+=cdof[dof6+col*6+r];
+        // Ball/free angular triplet shares its pre-increment velocity.
+        for (uint k=0;k<3;++k) {
           float derivative[6];
-          motion_cross(velocity, cdof+dof6+d*6, derivative);
-          for (uint r=0; r<6; ++r) {
-            cdof_dot[d*6+r] = derivative[r];
-            float qv = qvel[vb+d] + ((d == col) ? sign * eps : 0.0f);
-            velocity[r] += cdof[dof6+d*6+r] * qv;
-          }
+          motion_cross(velocity,cdof+dof6+(d+skip+k)*6,derivative);
+          for (uint r=0;r<6;++r) ddot[(d+skip+k)*6+r]=derivative[r];
+        }
+        if (col>=d+skip && col<d+skip+3)
+          for (uint r=0;r<6;++r) velocity[r]+=cdof[dof6+col*6+r];
+      } else {
+        float derivative[6];
+        motion_cross(velocity,cdof+dof6+d*6,derivative);
+        for (uint r=0;r<6;++r) {
+          ddot[d*6+r]=derivative[r];
+          if (col==d) velocity[r]+=cdof[dof6+d*6+r];
         }
       }
-      for (uint k=0; k<6; ++k) cvel[b*6+k] = velocity[k];
     }
-
-    for (uint b=0; b<nbody; ++b) {
-      for (uint k=0; k<6; ++k) cacc[b*6+k] = 0.0f;
-      for (uint k=0; k<6; ++k) body_force[b*6+k] = 0.0f;
-    }
-    if ((disableflags[0] & 128) == 0) {
-      cacc[3] = -gravity[0];
-      cacc[4] = -gravity[1];
-      cacc[5] = -gravity[2];
-    }
-    for (uint b=1; b<nbody; ++b) {
-      uint p = uint(parent[b]);
-      uint first = uint(body_dofadr[b]);
-      uint count = uint(body_dofnum[b]);
-      for (uint k=0; k<6; ++k) {
-        float acceleration = cacc[p*6+k];
-        for (uint d=0; d<count; ++d) {
-          float qv = qvel[vb+first+d] + ((first+d == col) ? sign * eps : 0.0f);
-          acceleration += cdof_dot[(first+d)*6+k] * qv;
-        }
-        cacc[b*6+k] = acceleration;
-      }
-      float inertial_acc[6], inertial_vel[6], coriolis[6];
-      multiply_spatial_thread(local_inertia, inert+b*36, cacc+b*6, inertial_acc);
-      multiply_spatial_thread(local_inertia, inert+b*36, cvel+b*6, inertial_vel);
-      force_cross_thread(cvel+b*6, inertial_vel, coriolis);
-      for (uint k=0; k<6; ++k)
-        body_force[b*6+k] = inertial_acc[k] + coriolis[k];
-    }
-    for (int b=int(nbody)-1; b>0; --b) {
-      int p = parent[b];
-      if (p > 0)
-        for (uint k=0; k<6; ++k)
-          body_force[uint(p)*6+k] += body_force[uint(b)*6+k];
-    }
-    for (uint d=0; d<nv; ++d) {
-      uint body = uint(dof_bodyid[d]);
-      float value = 0.0f;
-      for (uint k=0; k<6; ++k)
-        value += cdof[dof6+d*6+k] * body_force[body*6+k];
-      if (step == 0) bias_plus[d] = value;
-      else bias_minus[d] = value;
-    }
+    for (uint k=0;k<6;++k) dv[b*6+k]=velocity[k];
   }
 
-  for (uint row=0; row<nv; ++row) {
-    float diff = -(bias_plus[row] - bias_minus[row]) / (2.0f * eps);
-    qderiv_bias[world * nv * nv + row * nv + col] = diff;
+  // D(cacc) = parent's derivative + D(cdof_dot)*v + cdof_dot*D(v).
+  // D(I*a + v x* I*v) follows the bilinear spatial cross-force rule.
+  for (uint b=1;b<nbody;++b) {
+    uint p=uint(parent[b]), first=uint(body_dofadr[b]), count=uint(body_dofnum[b]);
+    for (uint k=0;k<6;++k) {
+      float value=da[p*6+k];
+      for (uint d=first;d<first+count;++d) {
+        value+=ddot[d*6+k]*qvel[vb+d];
+        if (d==col) value+=primal_cdof_dot[dof6+d*6+k];
+      }
+      da[b*6+k]=value;
+    }
+    float ia[6], iv[6], idv[6], cross1[6], cross2[6];
+    multiply_spatial(local_inertia,inert+b*36,da+b*6,ia);
+    multiply_spatial(local_inertia,inert+b*36,primal_cvel+body6+b*6,iv);
+    multiply_spatial(local_inertia,inert+b*36,dv+b*6,idv);
+    force_cross(dv+b*6,iv,cross1);
+    force_cross(primal_cvel+body6+b*6,idv,cross2);
+    for (uint k=0;k<6;++k) df[b*6+k]=ia[k]+cross1[k]+cross2[k];
+  }
+  for (int b=int(nbody)-1;b>0;--b) {
+    int p=parent[b];
+    if (p>0) for (uint k=0;k<6;++k) df[uint(p)*6+k]+=df[uint(b)*6+k];
+  }
+  for (uint row=0;row<nv;++row) {
+    uint body=uint(dof_bodyid[row]);
+    float value=0.0f;
+    for (uint k=0;k<6;++k) value+=cdof[dof6+row*6+k]*df[body*6+k];
+    qderiv_bias[world*nv*nv+row*nv+col]=-value;
   }
 }
-

@@ -43,6 +43,19 @@ _DEVICE_ARRAYS = (
 )
 
 
+def bias_derivative_workspace_sizes(nbody, nv, batch_size):
+  """Checked sizes for analytical per-column RNE derivatives, without MPS."""
+  for name, value in (("nbody", nbody), ("nv", nv)):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+      raise ValueError(f"{name} must be a nonnegative integer")
+  stride = 6 * (3 * nbody + nv)
+  sizes = {"bias_derivative_scratch": batch_size * nv * stride,
+           "bias_derivative": batch_size * nv * nv}
+  _validate_workspace_index_capacity(batch_size, sizes,
+      {"nbody": nbody, "nv": nv, "derivative_stride": stride})
+  return sizes
+
+
 def validate_pose_dict(model, poses, batch, device, torch):
   """Validate the full device pose ABI consumed by native smooth stages."""
   if not isinstance(poses, dict):
@@ -450,7 +463,12 @@ class MetalSmoothDynamics:
     }
 
   def bias_derivative_device(self, qpos, qvel, dynamics=None):
-    """Compute batched -d(qfrc_bias)/d(qvel) on MPS."""
+    """Compute analytical -d(qfrc_bias)/d(qvel) in reusable device storage.
+
+    Held-position RNE is differentiated directly; there are no perturbed
+    physics evaluations or fixed-size body/DOF arrays. Returned storage is
+    borrowed and remains valid until the next derivative call.
+    """
     torch = self._torch
     batch = qpos.shape[0]
     nv = self.model.nv
@@ -459,7 +477,13 @@ class MetalSmoothDynamics:
     if dynamics is None:
       dynamics = self.run_device(qpos, qvel)
     w, arrays = self._workspace, self._arrays
-    qderiv = torch.empty((batch, nv, nv), dtype=torch.float32, device=self._fk._device)
+    if batch != w["batch_size"]:
+      raise ValueError("bias derivative batch does not match prepared smooth workspace")
+    if "bias_derivative" not in w:
+      sizes = bias_derivative_workspace_sizes(self.model.nbody, nv, batch)
+      for key, count in sizes.items():
+        w[key] = torch.empty(max(count, 1), dtype=torch.float32, device=self._fk._device)
+    qderiv = w["bias_derivative"].reshape(batch, nv, nv)
     cdof = dynamics["cdof"] if "cdof" in dynamics else w["cdof"]
     local_inertia = dynamics["local_inertia"] if "local_inertia" in dynamics else w["local_inertia"]
     args = [
@@ -478,6 +502,9 @@ class MetalSmoothDynamics:
         qvel.reshape(-1),
         qderiv.reshape(-1),
         w["bias_dims"],
+        dynamics.get("cvel", w["cvel"]).reshape(-1),
+        dynamics.get("cdof_dot", w["cdof_dot"]).reshape(-1),
+        w["bias_derivative_scratch"],
     ]
     self._bias_deriv_kernel(*args, threads=(nv, batch), group_size=(1, 1))
     return qderiv
