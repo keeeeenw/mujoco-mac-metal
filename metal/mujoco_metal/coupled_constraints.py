@@ -32,6 +32,7 @@ _SHADER = Path(__file__).parent / "shaders" / "coupled_constraints.metal"
 _EQUALITY_SHADER = Path(__file__).parent / "shaders" / "equality_assembly.metal"
 _COLLISION_SHADER = Path(__file__).parent / "shaders" / "collision_primitives.metal"
 _CONVEX_SHADER = Path(__file__).parent / "shaders" / "convex_narrowphase.metal"
+_SDF_SHADER = Path(__file__).parent / "shaders" / "sdf_narrowphase.metal"
 _MINVAL = 1e-15
 _MAX_NV = 32
 _MAX_PAIRS = 16
@@ -50,6 +51,7 @@ _BOX = int(mujoco.mjtGeom.mjGEOM_BOX)
 _ELLIPSOID = int(mujoco.mjtGeom.mjGEOM_ELLIPSOID)
 _CYLINDER = int(mujoco.mjtGeom.mjGEOM_CYLINDER)
 _MESH = int(mujoco.mjtGeom.mjGEOM_MESH)
+_SDF = int(mujoco.mjtGeom.mjGEOM_SDF)
 _HINGE = int(mujoco.mjtJoint.mjJNT_HINGE)
 _SLIDE = int(mujoco.mjtJoint.mjJNT_SLIDE)
 _BALL = int(mujoco.mjtJoint.mjJNT_BALL)
@@ -70,7 +72,14 @@ _EQ_ROWS = {
 _SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_TENDON, _EQ_CONNECT, _EQ_WELD)
 
 _SUPPORTED_GEOM_TYPES = (_PLANE, _HFIELD, _SPHERE, _CAPSULE, _BOX,
-                           _ELLIPSOID, _CYLINDER, _MESH)
+                           _ELLIPSOID, _CYLINDER, _MESH, _SDF)
+
+# Milestone 013 SDF bounds: octree nodes total, SDF geoms, per-pair slots.
+# Contact counts track opt.sdf_initpoints (upstream mj_maxContact); native
+# slots cap each SDF pair below, so lowering requires initpoints within it.
+_SDF_MAX_NODES = 262144
+_SDF_MAX_GEOMS = 8
+_SDF_MAX_PER_PAIR = 8
 
 # Milestone 011 convex-mesh bounds: per-geom hull verts and total hull store.
 # Metal caps kernel buffers at 31, so faces pack into the same float store
@@ -126,7 +135,7 @@ _HF_MAX_DATA = 4096
 _HF_MAX_GEOMS = 8
 
 
-def pair_max_contacts(t1: int, t2: int) -> int:
+def pair_max_contacts(t1: int, t2: int, sdf_initpoints: int = 8) -> int:
   """Derive upper bound on contact points for a primitive geometry pair.
 
   Bounds follow the pinned colliders' actual manifold sizes (3.10.0), not
@@ -137,8 +146,20 @@ def pair_max_contacts(t1: int, t2: int) -> int:
   Heightfield pairs emit one witness per overlapped terrain prism
   (mjc_ConvexHField, pinned cap mjMAXCONPAIR=50); native caps below cover
   the qualified demo budgets and are documented restrictions.
+  SDF pairs emit one witness per Halton seed (mjc_SDF, pinned bound
+  opt.sdf_initpoints); native caps each pair at _SDF_MAX_PER_PAIR.
   """
   t_min, t_max = min(t1, t2), max(t1, t2)
+  if _SDF in (t_min, t_max):
+    if t_min == _SDF and t_max == _SDF:
+      return min(int(sdf_initpoints), _SDF_MAX_PER_PAIR)
+    if t_min == _MESH:
+      # Mesh-SDF needs BVH face processing + FPS selection (follow-up);
+      # analytic and SDF-SDF pairs use the Halton/descent path.
+      raise ValueError("mesh-SDF pairs are unsupported in 013")
+    if t_min == _PLANE or t_min == _HFIELD:
+      return 0
+    return min(int(sdf_initpoints), _SDF_MAX_PER_PAIR)
   if _HFIELD in (t_min, t_max):
     if t_min == _HFIELD and t_max == _HFIELD:
       raise ValueError("heightfield-heightfield pairs are unsupported")
@@ -647,9 +668,11 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
   contact_condim_packed = []
 
   row_offset = 0
+  sdf_ip = int(model.opt.sdf_initpoints)
   for p in pairs:
     g1, g2, solref, solimp, condim, friction, solreffriction, margin, gap = p
-    mc = pair_max_contacts(int(geoms[g1]), int(geoms[g2]))
+    mc = pair_max_contacts(int(geoms[g1]), int(geoms[g2]),
+                           sdf_initpoints=sdf_ip)
     pair_max_c.append(mc)
     total_candidate_contacts += mc
     pair_contact_offset.append(total_candidate_contacts)
@@ -759,7 +782,46 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
   # calibrated against CPU contacts) and uploaded once per model.
   mesh_used = sorted({g for pr in pairs for g in (pr[0], pr[1])
                       if int(geoms[g]) == _MESH})
-  mesh_hull = np.zeros((_MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA,),
+  # Milestone 013 SDF pre-pass: exact oct sizing + validation. SDF geoms
+  # reference mesh assets whose compiled octrees (child/aabb/coeff per node)
+  # are uploaded below; third-party plugin SDFs have no native path (019).
+  sdf_geoms = sorted({g for pr in pairs for g in (pr[0], pr[1])
+                      if int(geoms[g]) == _SDF})
+  if len(sdf_geoms) > _SDF_MAX_GEOMS:
+    raise ValueError(f"at most {_SDF_MAX_GEOMS} SDF geoms; found "
+                     f"{len(sdf_geoms)}")
+  sdf_mesh_nodes = {}
+  for g in sdf_geoms:
+    if int(model.geom_plugin[g]) != -1:
+      raise ValueError(
+          f"SDF geom {g} uses a third-party CPU plugin with no native "
+          "path (see 019 extension contract)")
+    mid = int(model.geom_dataid[g])
+    if mid < 0:
+      raise ValueError(f"SDF geom {g} has no asset")
+    if mid not in sdf_mesh_nodes:
+      adr = int(model.mesh_octadr[mid])
+      num = int(model.mesh_octnum[mid])
+      if adr < 0 or num <= 0:
+        raise ValueError(f"SDF geom {g} mesh {mid} has no compiled octree")
+      sdf_mesh_nodes[mid] = (adr, num)
+  sdf_oct_total = sum(num for _, num in sdf_mesh_nodes.values())
+  if sdf_oct_total > _SDF_MAX_NODES:
+    raise ValueError(f"total SDF octree nodes {sdf_oct_total} exceeds 013 "
+                     f"capacity {_SDF_MAX_NODES}")
+  sdf_ip_global = int(model.opt.sdf_initpoints)
+  sdf_active = any(
+      (ta == _SDF or tb == _SDF) and ta not in (_PLANE, _HFIELD) and
+      tb not in (_PLANE, _HFIELD)
+      for ta, tb in [(int(geoms[p[0]]), int(geoms[p[1]])) for p in pairs])
+  if sdf_active and sdf_ip_global > _SDF_MAX_PER_PAIR:
+    raise ValueError(
+        f"opt.sdf_initpoints {sdf_ip_global} exceeds native SDF budget "
+        f"{_SDF_MAX_PER_PAIR} per pair; lower it (upstream default 40 "
+        "emits more contacts than device slots hold)")
+
+  mesh_hull = np.zeros((_MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA +
+                      22 * sdf_oct_total + (6 * int(model.ngeom) if sdf_geoms else 0),),
                      dtype=np.float32)
   mesh_hull_info = np.full((int(model.ngeom) * 9,), -1, dtype=np.int32)
   mesh_rbound_extra = {}
@@ -853,6 +915,40 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
     mesh_hull_info[9 * g + 8] = scursor
     scursor += 4
     dcursor += ndata
+
+  # Milestone 013 SDF octree + local-AABB upload. Oct blocks pack per SDF
+  # mesh as child[8N] (local indices as floats, exact below 2^24), then
+  # aabb[6N], then coeff[8N]; per-SDF-geom info holds child base, node
+  # count and sdf_iterations. Local AABBs (compiled, center+half) upload
+  # for every geom at a fixed stride for the seed-box computation.
+  oct_base = _MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA
+  sdf_aabb_base = oct_base + 22 * sdf_oct_total
+  ocursor = oct_base
+  mesh_oct_base = {}
+  for mid, (adr, num) in sorted(sdf_mesh_nodes.items()):
+    child = np.asarray(model.oct_child[adr:adr + num]).reshape(-1)
+    aabb = np.asarray(model.oct_aabb[adr:adr + num]).reshape(-1)
+    coeff = np.asarray(model.oct_coeff[adr:adr + num]).reshape(-1)
+    if child.size != 8 * num or aabb.size != 6 * num or coeff.size != 8 * num:
+      raise ValueError(f"SDF mesh {mid} octree layout mismatch")
+    mesh_hull[ocursor:ocursor + 8 * num] = child.astype(np.float32)
+    mesh_hull[ocursor + 8 * num:ocursor + 14 * num] = aabb.astype(np.float32)
+    mesh_hull[ocursor + 14 * num:ocursor + 22 * num] = coeff.astype(np.float32)
+    mesh_oct_base[mid] = ocursor
+    ocursor += 22 * num
+  sdf_iters = int(model.opt.sdf_iterations)
+  if sdf_geoms and sdf_iters <= 0:
+    raise ValueError("opt.sdf_iterations must be positive with SDF pairs")
+  for g in sdf_geoms:
+    mid = int(model.geom_dataid[g])
+    mesh_hull_info[9 * g] = mesh_oct_base[mid]
+    mesh_hull_info[9 * g + 1] = sdf_mesh_nodes[mid][1]
+    mesh_hull_info[9 * g + 2] = sdf_iters
+    mesh_hull_info[9 * g + 3] = sdf_aabb_base
+  if sdf_geoms:
+    for g in range(int(model.ngeom)):
+      mesh_hull[sdf_aabb_base + 6 * g:sdf_aabb_base + 6 * g + 6] = np.asarray(
+          model.geom_aabb[g], dtype=np.float32)
 
   iter_req = int(model.opt.iterations)
   if iter_req <= 0 or iter_req > _MAX_ITERATIONS:
@@ -1066,6 +1162,7 @@ class MetalCoupledConstraints:
     self._device = torch.device("mps")
 
     shader_source = (_COLLISION_SHADER.read_text() + "\n" + _CONVEX_SHADER.read_text()
+                     + "\n" + _SDF_SHADER.read_text()
                      + "\n" + _EQUALITY_SHADER.read_text() + "\n" + _SHADER.read_text())
     self._library = torch.mps.compile_shader(shader_source)
     self._contact_kernel = self._library.contact_normal

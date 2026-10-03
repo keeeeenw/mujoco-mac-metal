@@ -530,10 +530,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-GEO-005", "SDF collision",
-        Stage.COLLISION, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "rejected at lowering; third-party SDF plugins per 019 contract",
-        "engine/engine_collision_sdf.c", "reject SDFs",
-        "none", "013", (),
+        Stage.COLLISION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "013 implements plugin-free mesh-octree SDF vs analytic/SDF-SDF via Halton/descent; mesh-SDF gap, plugin SDFs per 019 contract",
+        "mujoco_metal/shaders/sdf_narrowphase.metal", "admit SDF pairs within oct/node/initpoint caps with per-seed slot counts",
+        "MetalSimulation(profile='integrated_euler_v1')", "013", ("test_sdf_contact_013.py",),
         enums=("mjtGeom.mjGEOM_SDF",),
     ),
     Requirement(
