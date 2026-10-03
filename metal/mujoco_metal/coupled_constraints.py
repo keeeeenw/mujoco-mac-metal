@@ -73,7 +73,7 @@ _EQ_ROWS = {
     _EQ_WELD: 6,
 }
 
-_SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_TENDON, _EQ_CONNECT, _EQ_WELD, _EQ_FLEX, _EQ_FLEXVERT, _EQ_FLEXSTRAIN)
+_SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_TENDON, _EQ_CONNECT, _EQ_WELD, _EQ_FLEX)
 
 _SUPPORTED_GEOM_TYPES = (_PLANE, _HFIELD, _SPHERE, _CAPSULE, _BOX,
                            _ELLIPSOID, _CYLINDER, _MESH, _SDF)
@@ -456,18 +456,14 @@ def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor
     if et == _EQ_FLEX:
       fid = int(model.eq_obj1id[eid])
       span = int(model.flex_edgenum[fid]) if model.nflex else 0
-    elif et == _EQ_FLEXVERT:
-      fid = int(model.eq_obj1id[eid])
-      span = int(model.flex_vertnum[fid]) * 3 if model.nflex else 0
-    elif et == _EQ_FLEXSTRAIN:
-      fid = int(model.eq_obj1id[eid])
-      span = int(model.flex_elemnum[fid]) if model.nflex else 0
+    elif et in (_EQ_FLEXVERT, _EQ_FLEXSTRAIN):
+      raise ValueError(f"equality {eid}: mjEQ_FLEXVERT and mjEQ_FLEXSTRAIN constraints are not supported")
     else:
       span = int(_EQ_ROWS[et])
     eq_rowadr_list.append(eq_row_cursor)
     eq_rownum_list.append(span)
     eq_row_cursor += span
-    if et in (_EQ_FLEX, _EQ_FLEXVERT, _EQ_FLEXSTRAIN):
+    if et == _EQ_FLEX:
       fid = int(model.eq_obj1id[eid])
       if not 0 <= fid < int(model.nflex):
         raise ValueError(f"equality {eid}: flex object id out of range")
