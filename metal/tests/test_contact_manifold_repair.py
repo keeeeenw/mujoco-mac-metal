@@ -344,3 +344,87 @@ def test_mesh_manifold_cardinality_change_and_settle_gpu():
                              np.asarray(d.qpos)[:3], atol=5e-3)
   w = sim._coupled_constraints.get_warmstart()
   assert bool(np.all(np.isfinite(w)))
+
+
+@_needs_gpu()
+def test_assembly_puzzle_boundaries_counterfactuals_and_containment_gpu():
+  """Finding 3 (R05/R09): assembly puzzle boundary and piece collision qualification.
+
+  Verifies functional physical boundaries (wallL, wallR, divider), piece-piece
+  interactions, counterfactual lateral pushes, native status, and containment.
+  """
+  from pathlib import Path
+  from mujoco_metal.stepping import validate_stepping_profile
+  from mujoco_metal.simulation import MetalSimulation
+
+  xml_path = Path("metal/examples/assembly_puzzle.xml")
+  m = mujoco.MjModel.from_xml_path(str(xml_path))
+
+  # 1. Admission under integrated_euler_v1 within capacity limits
+  prof = validate_stepping_profile(m, 0.002, "integrated_euler_v1")
+  assert prof is not None
+
+  # 2. Counterfactual 1: lateral push of brick into wallR
+  d_wallR = mujoco.MjData(m)
+  d_wallR.qpos[0:3] = [-1.0, 0.0, 1.0]   # move tetra aside
+  d_wallR.qpos[7:10] = [0.25, 0.05, 0.1] # brick pushed into wallR at x=0.26
+  d_wallR.qpos[14:17] = [1.0, 0.0, 1.0]  # move octa aside
+  mujoco.mj_forward(m, d_wallR)
+  assert d_wallR.ncon == 4, f"Expected 4 contacts with wallR, got {d_wallR.ncon}"
+
+  # 3. Counterfactual 2: lateral push of brick into divider
+  d_div = mujoco.MjData(m)
+  d_div.qpos[0:3] = [-1.0, 0.0, 1.0]
+  d_div.qpos[7:10] = [0.03, 0.05, 0.1]   # brick pushed into divider at x=0.02
+  d_div.qpos[14:17] = [1.0, 0.0, 1.0]
+  mujoco.mj_forward(m, d_div)
+  assert d_div.ncon == 4, f"Expected 4 contacts with divider, got {d_div.ncon}"
+
+  # 4. Counterfactual 3: lateral push of tetra into wallL
+  d_wallL = mujoco.MjData(m)
+  d_wallL.qpos[0:3] = [-0.25, 0.0, 0.1]  # tetra pushed into wallL at x=-0.26
+  d_wallL.qpos[7:10] = [1.0, 0.0, 1.0]
+  d_wallL.qpos[14:17] = [2.0, 0.0, 1.0]
+  mujoco.mj_forward(m, d_wallL)
+  assert d_wallL.ncon == 3, f"Expected 3 contacts with wallL, got {d_wallL.ncon}"
+
+  # 5. Counterfactual 4: piece-piece collision between brick and octa
+  d_piece = mujoco.MjData(m)
+  d_piece.qpos[0:3] = [-1.0, 0.0, 1.0]
+  d_piece.qpos[7:10] = [0.13, 0.05, 0.0525]
+  d_piece.qpos[14:17] = [0.13, 0.05, 0.08]
+  mujoco.mj_forward(m, d_piece)
+  assert d_piece.ncon >= 5, f"Expected >= 5 contacts (floor + piece-piece), got {d_piece.ncon}"
+  # Wall contacts carry nonzero force (boundaries are physical, not visual).
+  wall_force = 0.0
+  for c in range(d_wallR.ncon):
+    f = np.zeros(6)
+    mujoco.mj_contactForce(m, d_wallR, c, f)
+    wall_force = max(wall_force, float(np.max(np.abs(f))))
+  assert wall_force > 0.1, wall_force
+
+  # 6. Native simulation with lateral velocity pushes into wallL and wallR
+  q0 = m.qpos0.copy().astype(np.float32)
+  v0 = np.zeros((1, m.nv), dtype=np.float32)
+  v0[0, 0] = -0.5  # tetra pushed left into wallL
+  v0[0, 6] = 0.5   # brick pushed right into wallR
+  sim = MetalSimulation(m, batch_size=1, qpos=q0[None], qvel=v0, profile="integrated_euler_v1")
+  peak_push_force = 0.0
+  for step in range(200):
+    sim.step(1)
+    st = sim.state.status.cpu().numpy()[0]
+    assert st == 0, f"Native status {st} on step {step}"
+    # Impacts genuinely transmit force while pieces press the boundaries
+    # (not just contained by initial placement).
+    asm = sim.assembled_system()
+    f = np.asarray(asm["qfrc_constraint"].cpu().numpy()).reshape(-1)
+    peak_push_force = max(peak_push_force, float(np.max(np.abs(f))))
+  assert peak_push_force > 0.5, peak_push_force
+
+  # Containment gates: pieces remain inside tray (-0.26 < x < 0.26)
+  pos = sim.state.qpos.cpu().numpy()[0]
+  ax, bx, cx = pos[0], pos[7], pos[14]
+  assert -0.26 < ax < 0.26, f"Piece A escaped tray: x={ax}"
+  assert -0.26 < bx < 0.26, f"Piece B escaped tray: x={bx}"
+  assert -0.26 < cx < 0.26, f"Piece C escaped tray: x={cx}"
+

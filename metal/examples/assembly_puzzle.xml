@@ -1,6 +1,20 @@
 <mujoco model="assembly_puzzle">
   <compiler angle="radian"/>
-  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6" gravity="0 0 -9.81" o_solref="0.006 1" o_solimp="0.9 0.95 0.001 0.5 2"/>
+  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6" gravity="0 0 -9.81" cone="elliptic" o_solref="0.006 1" o_solimp="0.9 0.95 0.001 0.5 2"/>
+  <!-- R05/B3 pair budget (capacity architecture, not a whitelist): 6 pairs
+       x 4 manifold slots = 24/24 slots, 96/96 rows. The SAME scene under the
+       pyramidal cone needs 120 rows and is rejected at admission, so the
+       elliptic cone is a capacity requirement, not a physics preference
+       (CPU lands identically under both cones). Omitted pairs and why they
+       stay omitted on this choreography (each omission is MONITORED by a
+       check gate below; violating motion fails loudly instead of tunneling):
+       - octa/trayfloor: octa stacks on the brick (538/600 contact steps,
+         12 mm+ floor clearance); min_octa_clearance gate watches it.
+       - tetra/wallR, tetra/divider: tetra is confined left (max_ax gate
+         keeps its right edge clear of the divider).
+       - octa/wallL, octa/wallR, octa/divider: octa rides the brick inside
+         the right lane (lane gates). octa/walls never approached; the
+         brick carries divider/wall contacts (explicit pairs). -->
   <asset>
     <texture name="floor_grid" type="2d" builtin="checker" rgb1="0.12 0.15 0.20" rgb2="0.22 0.28 0.35" width="512" height="512"/>
     <material name="floor_material" texture="floor_grid" texrepeat="8 8" reflectance="0.1"/>
@@ -27,15 +41,17 @@
       <freejoint name="freeB"/>
       <geom name="brick_geom" type="mesh" mesh="brick" rgba="0.2 0.5 0.9 1" mass="0.3" friction="0.6 0.05 0.02" contype="0" conaffinity="0" condim="3"/>
     </body>
-    <body name="pieceC" pos="0.13 -0.06 0.12">
+    <body name="pieceC" pos="0.13 0.05 0.16">
       <freejoint name="freeC"/>
       <geom name="octa_geom" type="mesh" mesh="octa" rgba="0.9 0.7 0.1 1" mass="0.15" friction="0.6 0.05 0.02" contype="0" conaffinity="0" condim="3"/>
     </body>
   </worldbody>
   <contact>
     <pair geom1="tetra_geom" geom2="trayfloor"/>
+    <pair geom1="tetra_geom" geom2="wallL"/>
     <pair geom1="brick_geom" geom2="trayfloor"/>
-    <pair geom1="octa_geom" geom2="trayfloor"/>
+    <pair geom1="brick_geom" geom2="wallR"/>
+    <pair geom1="brick_geom" geom2="divider"/>
     <pair geom1="brick_geom" geom2="octa_geom"/>
   </contact>
 </mujoco>

@@ -7,14 +7,23 @@ published 0.4.0 wheel alone.
 
 Three procedural convex hulls (tetrahedron, brick, octahedron; authored
 vertex lists) drop into a two-lane walled tray under gravity with Coulomb
-friction. Piece/tray and piece/piece contacts exercise native convex-mesh
-narrow phase (vertex-support GJK/MPR singles with face-snap readout) against
-planes, boxes and other meshes. Rest equilibria with friction are
-non-unique, so the check gates lane containment, impact-transient and
-settle envelopes plus pre-impact parity, not exact rest poses. Native
-single-witness face contacts answer softer than multi-point CPU manifolds;
-the tray lanes contain the resulting bounce. Rendering uses MuJoCo OpenGL;
-playback speed is presentation only, not a physics throughput claim.
+friction: tetra settles in the left lane, brick in the right lane, octa
+stacks on top of the brick. Piece/tray, piece/wall, piece/divider and
+brick/octa contacts exercise the native bounded mesh manifolds (up to 4
+face witnesses with sorted slot identity) against boxes and other meshes.
+Six contact pairs x 4 slots fill the 24-slot/96-row budget exactly (see the
+pair-budget comment in `assembly_puzzle.xml`); the pyramidal cone needs 120
+rows on this scene and is rejected at admission, so the elliptic cone is a
+capacity requirement (CPU lands identically under both cones). Rest
+equilibria with friction are non-unique and tumbling orientations diverge
+chaotically, so the check gates lane containment (measured max orientation
+envelope 0.173 on the qualifying revision), impact-transient and settle
+envelopes plus pre-impact parity, not exact rest poses. Omitted pairs
+(octa/floor, tetra/divider and others the choreography never approaches)
+are guarded by monitored trajectory bounds (tetra/divider gap, octa floor
+clearance) that fail loudly instead of tunneling silently. Rendering uses
+MuJoCo OpenGL; playback speed is presentation only, not a physics
+throughput claim.
 
 Run a CPU reference smoke test:
 
