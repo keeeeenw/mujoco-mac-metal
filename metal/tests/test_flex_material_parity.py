@@ -225,10 +225,83 @@ def test_compiled_triangle_shell_bending_matches_pinned_cpu():
   qpos[3] += 0.04
   qpos[-1] -= 0.03
   qvel = np.linspace(-0.03, 0.04, model.nv)
-  data, flex, force, _, _ = _evaluate(model, qpos, qvel)
+  data, flex, force, damping_tangent, stiffness_tangent = _evaluate(model, qpos, qvel)
   assert flex._bend_count > 0
   assert np.max(np.abs(data.qfrc_passive)) > 1e-5
   np.testing.assert_allclose(force, data.qfrc_passive, rtol=5e-4, atol=5e-5)
+  eps = 2e-3
+  qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
+  qpos_hi[3] += eps
+  qpos_lo[3] -= eps
+  numerical_q = (_oracle_passive_force(model, qpos_hi, qvel)
+                 - _oracle_passive_force(model, qpos_lo, qvel)) / (2*eps)
+  np.testing.assert_allclose(
+      stiffness_tangent.detach().numpy()[0, :, 3], numerical_q,
+      rtol=3e-2, atol=5e-3)
+  qvel_hi, qvel_lo = qvel.copy(), qvel.copy()
+  qvel_hi[3] += eps
+  qvel_lo[3] -= eps
+  numerical_v = (_oracle_passive_force(model, qpos, qvel_hi)
+                 - _oracle_passive_force(model, qpos, qvel_lo)) / (2*eps)
+  np.testing.assert_allclose(
+      damping_tangent[:, 3], numerical_v,
+      rtol=3e-2, atol=5e-3)
+
+
+def test_mps_triangle_shell_bending_force_and_tangent():
+  if torch is None or not torch.backends.mps.is_available():
+    pytest.skip("Apple MPS is unavailable in this test process")
+  MetalFlex, _ = _flex_api()
+  model = mujoco.MjModel.from_xml_string("""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <flexcomp name="shell" type="grid" count="3 3 1"
+                spacing=".1 .1 .1" mass="1" dim="2">
+        <contact contype="0" conaffinity="0"/>
+        <elasticity young="3000" poisson=".2" damping=".15"
+                    thickness=".02" elastic2d="bend"/>
+      </flexcomp>
+    </worldbody></mujoco>
+  """)
+  qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+  qpos[3] += 0.04
+  qpos[-1] -= 0.03
+  qvel = np.linspace(-0.03, 0.04, model.nv)
+  data = mujoco.MjData(model)
+  data.qpos[:], data.qvel[:] = qpos, qvel
+  mujoco.mj_forward(model, data)
+  flex = MetalFlex(model, device="mps")
+  poses = {
+      "body_pos": torch.tensor(data.xpos[None], dtype=torch.float32, device="mps"),
+      "body_quat": torch.tensor(data.xquat[None], dtype=torch.float32, device="mps"),
+      "joint_anchor": torch.tensor(data.xanchor[None], dtype=torch.float32, device="mps"),
+      "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32, device="mps"),
+      "root_com": torch.tensor(_root_com(model, data)[None],
+                                dtype=torch.float32, device="mps"),
+  }
+  force, damping_tangent, stiffness_tangent = flex.run_device(
+      torch.tensor(qpos[None], dtype=torch.float32, device="mps"),
+      torch.tensor(qvel[None], dtype=torch.float32, device="mps"), poses,
+      torch.tensor(data.cvel[None], dtype=torch.float32, device="mps"))
+  np.testing.assert_allclose(
+      force.detach().cpu().numpy()[0], data.qfrc_passive,
+      rtol=5e-4, atol=5e-5)
+  eps = 2e-3
+  qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
+  qpos_hi[3] += eps
+  qpos_lo[3] -= eps
+  numerical_q = (_oracle_passive_force(model, qpos_hi, qvel)
+                 - _oracle_passive_force(model, qpos_lo, qvel)) / (2*eps)
+  np.testing.assert_allclose(
+      stiffness_tangent.detach().cpu().numpy()[0, :, 3], numerical_q,
+      rtol=3e-2, atol=5e-3)
+  qvel_hi, qvel_lo = qvel.copy(), qvel.copy()
+  qvel_hi[3] += eps
+  qvel_lo[3] -= eps
+  numerical_v = (_oracle_passive_force(model, qpos, qvel_hi)
+                 - _oracle_passive_force(model, qpos, qvel_lo)) / (2*eps)
+  np.testing.assert_allclose(
+      damping_tangent.detach().cpu().numpy()[0, :, 3], numerical_v,
+      rtol=3e-2, atol=5e-3)
 
 
 def test_material_force_uses_articulated_off_center_flex_vertices():
