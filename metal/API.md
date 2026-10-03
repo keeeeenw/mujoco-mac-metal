@@ -93,13 +93,13 @@ sensor_data = sim.sensor_values()
 ```
 
 ### Capacity limits and guards
-The integrated Euler pipeline enforces explicit hardware-tailored capacity bounds:
-- Generalized velocities: $nv \le 32$.
-- Candidate collision pairs: $npairs \le 16$.
-- Candidate contact point slots: $ncontacts \le 24$.
-- Total candidate constraint rows: $nr \le 96$.
-- Equality row spans: joint equality 1 row, connect 3 rows, weld 6 rows per equality (`n_eq_rows` total, deterministic `eq_rowadr`/`eq_rownum` mapping). The activity array keeps one entry per equality, not per row.
-- Contact row counts depend on cone and `condim`: pyramidal condim 1/3/4/6 expands to 1/4/6/10 rows; elliptic condim 1/3/4/6 uses 1/3/4/6 coupled rows. Lowering calculates row offsets and rejects models that exceed the total row cap before GPU execution.
+The default integrated Euler pipeline enforces hardware-tailored capacity bounds:
+- Generalized velocities: $nv \le 32$ for the dense path. Scalable block-row profile (`integrated_scalable_v1`) extends capacity up to $nv \le 64$ with configurable `CapacityLimits(max_rows=..., max_slots=..., max_pairs=..., max_nv=...)`.
+- Candidate collision pairs: $npairs \le 16$ (scalable up to 64).
+- Candidate contact point slots: $ncontacts \le 24$ (scalable up to 64).
+- Total candidate constraint rows: $nr \le 96$ (scalable up to 256 via block-row solver). Models with $nr \le 96$ and $nv \le 32$ select the dense kernel; models with $nr > 96$ or $nv > 32$ select the block-row scalable solver. Models exceeding configured limits raise `CapacityOverflow` with exact required vs allocated dimensions.
+- Equality row spans: joint equality 1 row, connect 3 rows, weld 6 rows per equality (`n_eq_rows` total, deterministic `eq_rowadr`/`eq_rownum` mapping). Flex edge distance equality (`mjEQ_FLEX`) allocates rows matching edge count. Vertex and strain equalities (`mjEQ_FLEXVERT`, `mjEQ_FLEXSTRAIN`) are rejected at admission.
+- Contact row counts depend on cone and `condim`: pyramidal condim 1/3/4/6 expands to 1/4/6/10 rows; elliptic condim 1/3/4/6 uses 1/3/4/6 coupled rows. Lowering calculates row offsets and rejects models that exceed the total row cap before GPU execution. Candidate compaction telemetry (`sim.candidate_compaction_metrics()`) reports active slots, active rows across condim dimensions, and effective work avoidance ratios.
 - Supported geometries: plane, sphere, capsule, box, cylinder, ellipsoid,
   convex meshes and heightfields. Cylinder/ellipsoid pairs use analytic
   ports plus convex GJK+MPR (with multiCCD manifolds where pinned). Meshes
@@ -114,13 +114,18 @@ The integrated Euler pipeline enforces explicit hardware-tailored capacity bound
   Halton-seeded gradient descent finds per-seed witnesses against analytic
   geoms and SDF-vs-SDF (same seeds/traversal as the pinned engine) within
   oct/node/initpoint caps; mesh-SDF pairs, plugin SDF geoms,
-  heightfield-SDF and margin stay restricted (plugin SDFs are third-party
-  CPU code with no native path; see the 019 extension contract). Concave
-  visual/collision meshes stay rejected. Models exceeding bounds, requesting
-  non-Euler integrators, flex, or plugins are rejected cleanly during profile
-  validation before GPU execution.
-- Supported equality types: joint, connect, weld (body-body, body-world, site-site, including mocap bodies as kinematic anchors; both-mocap equalities reserve rows but assemble zero rows/forces, matching MuJoCo skipping its empty Jacobian). Tendon/flex equalities, ball limits and non-finite `torquescale` are rejected, even when initially inactive.
+  heightfield-SDF and margin stay restricted. Concave
+  visual/collision meshes stay rejected.
+- Integrators: `contact_free_implicit_v1` profile admits `mjINT_IMPLICIT` using nonsymmetric LU factorization and automatic derivatives (passive, tendon, fluid with finite differences eps=1e-3, Coriolis), bounded to contact-free models with $nbody \le 32$ and $nv \le 32$. Coupled contacts/equalities/flex with implicit integration remain guarded.
+- Flex physics: `integrated_flex_v1` admits 1D, 2D, and 3D flex elements with pinned continuum materials/stiffness, edge distance equalities (`mjEQ_FLEX`), and narrowphase contact generation against rigid obstacle geoms coupled into the Delassus solve.
+- Plugins and extensions: User plugins registered via `mj_registerForcePlugin`, `mj_registerActuatorPlugin`, and `mj_registerSensorPlugin` execute stage callbacks (init, run_device, reset, snapshot, restore) synchronously within `MetalSimulation`. Tactile sensors evaluate pinned per-taxel penetration depth and velocity matching MuJoCo `tactile_taxel_batch`.
+- Supported equality types: joint, connect, weld (body-body, body-world, site-site, including mocap bodies as kinematic anchors), and flex edge distance (`mjEQ_FLEX`). Tendon/flex-vert/flex-strain equalities and non-finite `torquescale` are rejected.
 - Mocap bodies: jointless direct children of world only (pinned compiler restriction, re-validated at lowering). Prescribed per-environment poses via `sim.set_mocap`.
+
+### Native stages and state APIs
+- Native split-stage APIs: `mj_fwdPosition`, `mj_fwdVelocity`, `mj_fwdActuation`, `mj_fwdAcceleration` (unconstrained forward acceleration $M \hat{a} = \tau_{\text{smooth}}$), and `mj_fwdConstraint` (coupled contact/limit/equality solve).
+- Inverse dynamics: `mj_inverse` subtracts constraint forces ($qfrc\_constraint$), passive forces, and actuation forces matching pinned MuJoCo semantics.
+- Native state selectors: `mj_getState` and `mj_setState` conform to pinned `mjtState` bitmasks (TIME=1, QPOS=2, QVEL=4, ACT=8, HISTORY=16, WARMSTART=32, CTRL=64, QFRC_APPLIED=128, XFRC_APPLIED=256, EQ_ACTIVE=512, MOCAP_POS=1024, MOCAP_QUAT=2048, USERDATA=4096, PLUGIN=8192; groups PHYSICS=30, USER=8128, FULLPHYSICS=8223, INTEGRATION=16383) with atomic validation and per-world selection.
 
 ### Equality activation, reset, snapshots and failure
 
