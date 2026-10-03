@@ -618,13 +618,15 @@ kernel void delay_record(
     device int* cursor [[buffer(4)]],
     constant int* dims [[buffer(5)]],
     constant float* now [[buffer(6)]],
+    device const int* record_mask [[buffer(7)]],
     uint tid [[thread_position_in_grid]]) {
   int b = dims[0], nu = dims[1], nmax = dims[2];
   int world = int(tid) / max(nu, 1), i = int(tid) % max(nu, 1);
   if (world >= b || i >= nu) return;
+  if (!record_mask[world * nu + i]) return;
   int n = nsample[i];
   if (n <= 0) return;
-  float t = now[0];
+  float t = now[world];
   int base = (world * nu + i) * nmax;
   int cur = cursor[world * nu + i];
   int idx = dl_find(times + base, 0, cur, n, t);

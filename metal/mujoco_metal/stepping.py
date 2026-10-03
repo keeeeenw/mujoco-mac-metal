@@ -425,6 +425,10 @@ def validate_stepping_profile(
             "non-scalar gears, slider-crank/site/body transmissions, limits, gravcomp routing")
       else:
         supported_list.append("stateless scalar actuators and transmissions")
+      from mujoco_metal.stateful_actuation import actuator_delay_config as _dcfg
+      _ns, _ip, _dl = _dcfg(model)
+      if bool(np.any(_ns > 0)):
+        supported_list.append("actuator control-history (delay) lines with snapshot ownership")
     if model.ntendon > 0:
       from mujoco_metal.spatial_tendons import SpatialTendonModel
       from mujoco_metal.tendons import FixedTendonModel
@@ -478,8 +482,7 @@ def validate_stepping_profile(
             "flex/deformable elements",
             "MuJoCo plugins",
             "spatial/wrapping tendons, tendon limits, and tendon frictionloss",
-            "user-callback actuators, actuator delay/history, armature/damping "
-            "(owned by milestones 015/019)",
+            "user-callback actuators (owned by milestone 019)",
             "SDF collision geoms with third-party plugins, mesh-SDF pairs, heightfield-heightfield pairs, non-convex or oversize mesh/heightfield assets, SDF models with sdf_initpoints above the per-pair budget (supported: plugin-free SDF vs analytic/SDF-SDF within oct/node/initpoint caps)",
             "sleep mode",
             "non-Euler integrators",
@@ -570,6 +573,11 @@ def validate_stepping_profile(
       # stage; the native RK4 path holds controls with frozen activation.
       # Reject rather than silently integrate wrong dynamics (015).
       raise ValueError(f"{profile} excludes actuator activation state; use Euler")
+    if int(model.nu) > 0 and bool(np.any(np.asarray(model.actuator_history)[:, 0] != 0)):
+      # Pinned RK4 reads delayed control at per-stage times (d->time = T[i]);
+      # the native RK4 stages share the frozen step-start time. Reject
+      # rather than mis-time delayed forces (R06/D1).
+      raise ValueError(f"{profile} excludes actuator delay lines; use Euler")
     reference = copy.copy(model)
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
     result = validate_stepping_profile(

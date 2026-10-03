@@ -59,8 +59,9 @@ def test_admission_rejects_with_owners_cpu():
     ActuatorModel(_model(actuator='<general joint="j" biastype="user"/>'))
   m = _model(actuator='<general joint="j"/>')
   m.actuator_delay[0] = 0.01
-  with pytest.raises(ValueError, match="015"):
-    ActuatorModel(m)
+  # R06/D1: delay admitted with validated config (empty history here means
+  # live reads, exactly like pinned nsample==0); malformed config raises.
+  ActuatorModel(m)
   with pytest.raises(ValueError, match="015"):
     ActuatorModel(_model(actuator='<general joint="j" armature="0.1"/>'))
   m = _model(actuator='<general joint="j"/>')

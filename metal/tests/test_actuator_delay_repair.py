@@ -132,6 +132,53 @@ def test_invalid_config_cpu():
     ActuatorDelayLine(4, 0).read(np.inf)
 
 
+def _delayed_motor_model(delay=0.004, nsample=8, interp=0):
+  """Programmatic delay configuration (no 3.10.0 XML surface exists)."""
+  import mujoco
+  m = mujoco.MjModel.from_xml_string(
+      "<mujoco><option timestep='0.002' integrator='Euler'/>"
+      "<worldbody><body pos='0 0 0.5'>"
+      "<joint name='h' type='hinge' axis='0 0 1'/>"
+      "<geom type='sphere' size='0.1' mass='0.5'/>"
+      "</body></worldbody>"
+      "<actuator><motor name='m' joint='h' gear='1'/></actuator></mujoco>")
+  m.actuator_delay[0] = delay
+  hist = np.asarray(m.actuator_history)
+  hist[0, 0] = nsample
+  hist[0, 1] = interp
+  m.actuator_history[:] = hist
+  return m
+
+
+def test_delay_admission_and_config_cpu():
+  import mujoco
+  from mujoco_metal.stateful_actuation import actuator_delay_config
+  m = _delayed_motor_model(delay=0.004, nsample=8, interp=1)
+  ns, ip, dl = actuator_delay_config(m)
+  assert list(ns) == [8] and list(ip) == [1]
+  assert list(dl) == [0.004]
+  bad = _delayed_motor_model()
+  hist = np.asarray(bad.actuator_history)
+  hist[0, 0] = -1
+  try:
+    bad.actuator_history[:] = hist
+    with pytest.raises(ValueError):
+      actuator_delay_config(bad)
+  except ValueError:
+    pass  # bindings may reject the write itself
+
+
+def test_rk4_delay_rejected_cpu():
+  # Pinned RK4 reads delayed control at per-stage times; native RK4 stages
+  # share the frozen step-start time, so the combination is rejected.
+  import mujoco
+  from mujoco_metal.stepping import validate_stepping_profile
+  m = _delayed_motor_model(delay=0.004, nsample=8, interp=0)
+  m.opt.integrator = int(mujoco.mjtIntegrator.mjINT_RK4)
+  with pytest.raises(ValueError, match="delay lines"):
+    validate_stepping_profile(m, 0.002, "contact_free_rk4_v1")
+
+
 def _needs_gpu():
   import os
   return pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
@@ -184,3 +231,92 @@ def test_device_delay_snapshot_restore_gpu():
   dev.reset()
   np.testing.assert_allclose(dev.read(np.array([[0.0, 7.0]]), 0.0).cpu().numpy(),
                              np.array([[0.0, 7.0]]), atol=1e-6)
+
+
+@_needs_gpu()
+def test_delayed_step_response_onset_gpu():  # D1 integrated delay: constant control from t=0 with a 4 ms ZOH delay
+  # produces zero force until the first stamp at/after the delay, then the
+  # live value — onset pinned to the exact step (zero-state rings match
+  # pinned post-reset buffers).
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  import mujoco
+  from mujoco_metal.simulation import MetalSimulation
+  m = _delayed_motor_model(delay=0.004, nsample=8, interp=0)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  sim.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1),
+            qvel=np.zeros((1, m.nv), dtype=np.float32))
+  vels = []
+  for _ in range(6):
+    sim.step(1, ctrl=np.array([[1.0]], dtype=np.float32))
+    vels.append(float(sim.state.qvel.cpu().numpy()[0, 0]))
+  # Step 0 reads pre-delay stamps (0.0): no force, no motion. The step-0
+  # record then promotes the oldest slot (exact stamp match on the
+  # zero-state ring, exactly like pinned post-reset buffers), so step 1
+  # already reads the t=0.0 sample and motion starts.
+  assert vels[0] == 0.0, vels
+  assert all(v > 0.05 for v in vels[1:]), vels
+
+
+@_needs_gpu()
+def test_delay_lifecycle_and_failure_gpu():
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  import mujoco
+  import torch
+  from mujoco_metal.simulation import MetalSimulation
+  m = _delayed_motor_model(delay=0.004, nsample=8, interp=1)
+  sim = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
+  sim.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
+            qvel=np.zeros((2, m.nv), dtype=np.float32))
+  for _ in range(6):
+    sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
+  snap = sim.snapshot()
+  assert snap["delay"] is not None
+  ref = {k: np.asarray(v).copy() for k, v in snap["delay"].items()}
+  for _ in range(4):
+    sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
+  sim.restore(snap)
+  got = sim._delay.snapshot()
+  for k in ref:
+    np.testing.assert_array_equal(got[k], ref[k])
+  # Replay continues identically after restore.
+  for _ in range(4):
+    sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
+  q1 = sim.state.qpos.cpu().numpy().copy()
+  sim.restore(snap)
+  for _ in range(4):
+    sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
+  np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), q1)
+  # Invalid restore leaves everything untouched.
+  bad = dict(snap)
+  bad["delay"] = dict(ref)
+  bad["delay"]["values"] = np.full_like(ref["values"], np.nan)
+  with pytest.raises(ValueError):
+    sim.restore(bad)
+  np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), q1)
+  # Selected-world reset clears only that world's rings.
+  sim.reset(env_ids=[1])
+  s1 = sim._delay.snapshot()["values"].reshape(2, 1, -1)
+  assert bool(np.all(s1[1] == 0)) and bool(np.any(s1[0] != 0))
+  # Failed world freezes its delay rows; healthy rows advance.
+  sim.reset()
+  for _ in range(6):
+    sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
+  before = sim._delay.snapshot()["values"].copy()
+  bad_q = sim.state._qpos.cpu().numpy()
+  bad_q[1, 0] = np.nan
+  sim.state._qpos.copy_(torch.as_tensor(bad_q))
+  sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
+  after = sim._delay.snapshot()["values"].reshape(2, 1, -1)
+  np.testing.assert_array_equal(after[1], before.reshape(2, 1, -1)[1])
+  assert not np.array_equal(after[0], before.reshape(2, 1, -1)[0])
+  # Copy reproduces rows.
+  sim2 = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
+  sim2.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
+             qvel=np.zeros((2, m.nv), dtype=np.float32))
+  for _ in range(6):
+    sim2.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
+  sim2.copy_environment(0, 1)
+  v = sim2._delay.snapshot()["values"].reshape(2, 1, -1)
+  np.testing.assert_array_equal(v[0], v[1])

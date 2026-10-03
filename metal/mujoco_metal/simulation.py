@@ -514,6 +514,18 @@ class MetalSimulation:
     self._state._on_validate_restore = _handle_state_validate_restore
     self._state._on_restore = _handle_state_restore
     self._state._on_reset = _handle_state_reset
+    # R06/D1 actuator delay line: ring buffers owned here (model-level
+    # config, per-world rows), threaded through the force path with
+    # pre-step times and recorded after integration (pinned mj_readCtrl /
+    # mj_advance order). None when no actuator configures a history
+    # buffer; nsample==0 actuators always read live control.
+    self._delay = None
+    if int(model.nu) > 0:
+      from mujoco_metal.stateful_actuation import actuator_delay_config as _delay_cfg
+      from mujoco_metal.stateful_actuation import MetalDelayLine as _DelayLine
+      _ns, _ip, _dl = _delay_cfg(model)
+      if bool(np.any(_ns > 0)):
+        self._delay = _DelayLine(_ns, _ip, _dl, batch_size=batch_size)
 
   @property
   def state(self):
@@ -661,6 +673,8 @@ class MetalSimulation:
       tensor = getattr(self, held, None)
       if tensor is not None:
         tensor[dst_i] = tensor[src_i].clone()
+    if getattr(self, "_delay", None) is not None:
+      self._delay.copy_row(src_i, dst_i)
     self._assembled_system_valid = False
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
@@ -672,9 +686,10 @@ class MetalSimulation:
     """Capture a versioned simulation-level checkpoint (host, immutable).
 
     Covers everything needed for exact replay: the device state, retained
-    constraint multipliers, held per-call inputs and stored sensor samples.
-    The narrower :meth:`DeviceState.snapshot` owns only kinematic/equality/
-    mocap/activation rows; use this method for full trajectory replay.
+    constraint multipliers, held per-call inputs, stored sensor samples
+    and actuator delay rings. The narrower :meth:`DeviceState.snapshot`
+    owns only kinematic/equality/mocap/activation rows; use this method
+    for full trajectory replay.
     """
     import numpy as _np
     torch = self._state._torch
@@ -705,6 +720,8 @@ class MetalSimulation:
     snap["held"] = held
     snap["sensordata"] = (self._sensordata.detach().cpu().numpy().copy()
                           if getattr(self, "_sensordata", None) is not None else None)
+    snap["delay"] = (self._delay.snapshot()
+                     if getattr(self, "_delay", None) is not None else None)
     return snap
 
   def restore(self, snapshot, env_ids=None):
@@ -782,6 +799,19 @@ class MetalSimulation:
         raise ValueError("snapshot sensor sample values overflow float32")
       sens_checked = sens32.copy()
 
+    # Delay rings (R06/D1): validated pre-commit like everything else. A
+    # snapshot without delay state restores cold rings; a model without
+    # delay lines must not carry ring state.
+    delay_checked = None
+    delay_snap = snapshot.get("delay", None)
+    if getattr(self, "_delay", None) is None:
+      if delay_snap is not None:
+        raise ValueError("snapshot delay state does not match this simulation")
+    else:
+      if delay_snap is None:
+        raise ValueError("snapshot delay state is missing")
+      delay_checked = self._delay.checked_snapshot(delay_snap)
+
     # Commit boundary: DeviceState validates its fields atomically before mutating.
     self._state.restore(snapshot["device"], env_ids=ids)
     torch = self._state._torch
@@ -814,6 +844,21 @@ class MetalSimulation:
         self._sensordata = None
       elif self._sensordata is not None:
         self._sensordata[ids] = 0.0
+    if delay_checked is not None:
+      if ids is None:
+        self._delay.restore(delay_checked)
+      else:
+        cur = self._delay.snapshot()
+        nmax = self._delay.nmax
+        nu = self._delay.nu
+        for row in np.asarray(ids).tolist():
+          cur["cursor"].reshape(self.batch_size, nu)[row] = \
+              delay_checked["cursor"].reshape(self.batch_size, nu)[row].copy()
+          cur["times"].reshape(self.batch_size, nu, nmax)[row] = \
+              delay_checked["times"].reshape(self.batch_size, nu, nmax)[row].copy()
+          cur["values"].reshape(self.batch_size, nu, nmax)[row] = \
+              delay_checked["values"].reshape(self.batch_size, nu, nmax)[row].copy()
+        self._delay.restore(cur)
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -826,8 +871,8 @@ class MetalSimulation:
             mocap_pos=None, mocap_quat=None, act=None):
     """Reset selected worlds, clear held per-call inputs, invalidate cache.
 
-    Reset is cold: retained warmstart multipliers are cleared alongside
-    state, matching pinned reset semantics.
+    Reset is cold: retained warmstart multipliers and delay rings are
+    cleared alongside state, matching pinned reset semantics.
     """
     gen = self._state.reset(
         env_ids=env_ids, qpos=qpos, qvel=qvel, eq_active=eq_active,
@@ -836,6 +881,8 @@ class MetalSimulation:
     self._clear_held_inputs(env_ids)
     if getattr(self, "_coupled_constraints", None) is not None:
       self._coupled_constraints.clear_warmstart(env_ids=env_ids)
+    if getattr(self, "_delay", None) is not None:
+      self._delay.reset(env_ids=env_ids)
     if getattr(self, "_sensordata", None) is not None:
       # Stored step samples are state: reset zeroes selected worlds.
       if env_ids is None:
@@ -922,6 +969,8 @@ class MetalSimulation:
     # Keyframe reset is cold like reset.
     if getattr(self, "_coupled_constraints", None) is not None:
       self._coupled_constraints.clear_warmstart(env_ids=env_ids)
+    if getattr(self, "_delay", None) is not None:
+      self._delay.reset(env_ids=env_ids)
     if getattr(self, "_sensordata", None) is not None:
       if env_ids is None:
         self._sensordata.zero_()
@@ -985,6 +1034,8 @@ class MetalSimulation:
     self._last_coupled_generation = None
     self._spatial_cache_key = None
     self._spatial_kin = None
+    # Delay rings are model-owned: a rebuilt model starts cold history
+    # (fresh construction above replaces them; not in `keep`).
     self._state._generation += 1
     return self._state.generation
 
@@ -1260,11 +1311,12 @@ class MetalSimulation:
       rhs.sub_(sbias.reshape(rhs.shape))
       dynamics["mass_matrix"].add_(sarm.reshape(dynamics["mass_matrix"].shape))
     if self._transmissions is not None:
-      rhs.add_(self._transmissions.run_device(qpos, qvel, self._control))
+      rhs.add_(self._transmissions.run_device(
+          qpos, qvel, self._delayed_control(state._time)))
     if self._actuators is not None:
       rhs.add_(self._actuation_force(qpos, qvel, dynamics["poses"]))
     if self._motor is not None:
-      rhs.add_(self._motor.run_device(self._control))
+      rhs.add_(self._motor.run_device(self._delayed_control(state._time)))
     eq_active = getattr(state, "_eq_active", None)
     _ten_J, _ten_L = self._spatial_for_coupled(qvel, dynamics["poses"])
     self._coupled_solve_dispatches += 1
@@ -1411,6 +1463,31 @@ class MetalSimulation:
     kin = self._spatial_kin
     return kin["jacobian"], kin["length"]
 
+  def _delayed_control(self, time):
+    """Held control with per-actuator delay applied (pinned mj_fwdActuation).
+
+    ``time`` is a scalar or per-world stamp vector. Without a delay line
+    this is the live held control (borrowed); with one, each actuator
+    reads its ring at ``time - delay`` (live passthrough where nsample
+    is 0). Read-only: recording happens in :meth:`step` after integration.
+    """
+    if self._delay is None or self._control is None:
+      return self._control
+    return self._delay.read(self._control, time)
+
+  def _record_delay(self, time, success):
+    """Record held control into delay rings for successful worlds."""
+    if self._delay is None or self._control is None:
+      return
+    import numpy as _np
+    mask = _np.ones((self.batch_size, int(self._mjmodel.nu)), dtype=_np.int32)
+    if success is not None:
+      ok = _np.asarray(success.detach().cpu().numpy()).reshape(-1)
+      mask = (ok.astype(_np.int32).reshape(-1, 1) * _np.ones(
+          (1, int(self._mjmodel.nu)), dtype=_np.int32))
+    t = time.detach().cpu().numpy() if hasattr(time, "detach") else _np.asarray(time)
+    self._delay.record(self._control, t.reshape(-1), mask=mask)
+
   def _actuation_force(self, qpos, qvel, poses):
     """General actuator force stage with pinned mj_fwdActuation ordering.
 
@@ -1446,7 +1523,7 @@ class MetalSimulation:
     act = getattr(state, "_act", None)
     if actuators.meta.na > 0 and act is None:
       raise ValueError("activation state is missing")
-    out = actuators.run_forces(self._control, act, kin, gravcomp)
+    out = actuators.run_forces(self._delayed_control(state._time), act, kin, gravcomp)
     if self._sensors is not None and self._has_acc_sensors:
       self._lazy_sensor_scratch()
       self._sen_act_force.add_(out["force"].reshape(self._sen_act_force.shape))
@@ -1617,7 +1694,8 @@ class MetalSimulation:
       self._rhs.sub_(sbias.reshape(self._rhs.shape))
       dynamics["mass_matrix"].add_(sarm.reshape(dynamics["mass_matrix"].shape))
     if self._transmissions is not None:
-      t_qfrc = self._transmissions.run_device(qpos, qvel, self._control)
+      t_qfrc = self._transmissions.run_device(
+          qpos, qvel, self._delayed_control(self._state._time))
       self._rhs.add_(t_qfrc)
       if self._sensors is not None and self._has_acc_sensors:
         self._lazy_sensor_scratch()
@@ -1627,7 +1705,7 @@ class MetalSimulation:
     if self._actuators is not None:
       self._rhs.add_(self._actuation_force(qpos, qvel, dynamics["poses"]))
     if self._motor is not None:
-      m_qfrc = self._motor.run_device(self._control)
+      m_qfrc = self._motor.run_device(self._delayed_control(self._state._time))
       self._rhs.add_(m_qfrc)
       if self._sensors is not None and self._has_acc_sensors:
         self._lazy_sensor_scratch()
@@ -1728,6 +1806,7 @@ class MetalSimulation:
         state._qacc = torch.where(success[:, None], acceleration, state._qacc)
         state._time = torch.where(success, time, state._time)
         state._status = status.clone()
+        self._record_delay(pre_step_time, success)
         state._generation += 1
         if not bool(torch.all(success)):
           if self._sensordata is not None:
@@ -1857,6 +1936,9 @@ class MetalSimulation:
       state._status, self._next_status = self._next_status, state._status
       if self._actuators is not None and getattr(state, "_na", 0) > 0:
         state._act, self._next_act = self._next_act, state._act
+      # Pinned history advance (mj_advance records ctrl at the pre-step
+      # time); successful worlds only, failed rows freeze (R02).
+      self._record_delay(pre_step_time, self._success)
       state._generation += 1
 
       # Failure atomicity (R02): rollback sensor samples and warmstarts for failed worlds

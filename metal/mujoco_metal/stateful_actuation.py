@@ -365,6 +365,33 @@ def delay_reference(nsample, interp, delay, script):
   return out
 
 
+def actuator_delay_config(model):
+  """Per-actuator delay configuration from pinned model fields (R06/D1).
+
+  Returns ``(nsample, interp, delay)`` int/float arrays with shapes
+  ``(nu,)`` from ``actuator_history`` (``[nsample, interp]``) and
+  ``actuator_delay`` (seconds). Mirrors the ``mj_readCtrl`` contract: a
+  zero ``nsample`` reads live control regardless of delay; interpolation
+  follows the C fallback chain (0 hold, 1 linear, else cubic). MuJoCo
+  3.10.0 exposes no XML surface for these fields, so non-default configs
+  arrive programmatically with actual pinned shapes. Raises only on
+  malformed (negative/non-integer) configuration.
+  """
+  import mujoco as _mj
+  nu = int(model.nu)
+  hist = np.asarray(model.actuator_history).reshape(nu, 2) if nu else np.zeros((0, 2))
+  delay = np.asarray(model.actuator_delay, dtype=np.float64).reshape(-1) if nu else np.zeros(0)
+  if hist.shape != (nu, 2) or delay.shape != (nu,):
+    raise ValueError("actuator history/delay shapes do not match nu")
+  if not np.all(np.isfinite(delay)):
+    raise ValueError("actuator delay must be finite")
+  nsample = hist[:, 0].astype(np.int64)
+  interp = hist[:, 1].astype(np.int64)
+  if np.any(nsample < 0) or np.any(interp < 0):
+    raise ValueError("actuator history must hold nonnegative integers")
+  return nsample.astype(np.int32), interp.astype(np.int32), delay
+
+
 class ActuatorModel:
   """Immutable full-family actuator lowering for MuJoCo 3.10.0.
 
@@ -399,10 +426,11 @@ class ActuatorModel:
       from mujoco_metal.model import actuator_joint_inheritance, actuator_tendon_inheritance
       actuator_joint_inheritance(model, tendon_ok=True)
       actuator_tendon_inheritance(model)
-    if np.any(np.asarray(model.actuator_delay) != 0):
-      raise ValueError("actuator delay is unsupported (owned by milestone 015)")
-    if np.any(np.asarray(model.actuator_history) != 0):
-      raise ValueError("actuator history buffers are unsupported (owned by milestone 015)")
+    # R06/D1: delay/history admitted with validated configuration; the
+    # stepping layer owns the ring buffers and threads times through the
+    # force path (pinned mj_readCtrl/mj_advance semantics). Malformed
+    # configuration still raises via actuator_delay_config.
+    actuator_delay_config(model)
 
     dyn_none = int(mujoco.mjtDyn.mjDYN_NONE)
     dyn_int = int(mujoco.mjtDyn.mjDYN_INTEGRATOR)
@@ -1238,40 +1266,119 @@ class MetalDelayLine:
     self._cursor = _torch.zeros(self.batch_size * nu, dtype=_torch.int32, device=self._device)
     self._out = _torch.zeros(self.batch_size * nu, dtype=_torch.float32, device=self._device)
 
-  def reset(self):
-    """Clear rings to the pinned post-reset zero state."""
-    self._times.zero_()
-    self._values.zero_()
-    self._cursor.zero_()
-
-  def record(self, ctrl, time):
-    """Insert one control row per world at ``time`` (pinned history advance)."""
+  def reset(self, env_ids=None):
+    """Clear rings to the pinned post-reset zero state (all or selected rows)."""
+    if env_ids is None:
+      self._times.zero_()
+      self._values.zero_()
+      self._cursor.zero_()
+      return
+    import numpy as _np
+    ids = _np.asarray(env_ids).reshape(-1)
+    if ids.size == 0:
+      raise ValueError("env_ids must select at least one world")
     torch = self._torch
-    ctrl = torch.as_tensor(np.asarray(ctrl, dtype=np.float32),
-                           dtype=torch.float32, device=self._device)
+    for v in ids.tolist():
+      if not 0 <= int(v) < self.batch_size:
+        raise ValueError("delay reset env id out of range")
+    index = torch.as_tensor(np.asarray(ids, dtype=np.int64), device=self._device)
+    nu, nmax = self.nu, self.nmax
+    flat = torch.arange(self.batch_size * nu, device=self._device).reshape(self.batch_size, nu)
+    rows = flat[index].reshape(-1)
+    self._times.reshape(self.batch_size * nu, nmax)[rows] = 0
+    self._values.reshape(self.batch_size * nu, nmax)[rows] = 0
+    self._cursor.reshape(self.batch_size * nu)[rows] = 0
+
+  def copy_row(self, src, dst):
+    """Copy ring rows src -> dst (selected-world copy support)."""
+    for name, value in (("src", src), ("dst", dst)):
+      raw = np.asarray(value)
+      if raw.shape != () or raw.dtype.kind not in "iu":
+        raise ValueError("src/dst must be integer world indices")
+    src_i, dst_i = int(np.asarray(src)), int(np.asarray(dst))
+    for index in (src_i, dst_i):
+      if not 0 <= index < self.batch_size:
+        raise ValueError("delay world index out of range")
+    nu, nmax = self.nu, self.nmax
+    self._times.reshape(self.batch_size * nu, nmax)[dst_i * nu:(dst_i + 1) * nu] = \
+        self._times.reshape(self.batch_size * nu, nmax)[src_i * nu:(src_i + 1) * nu].clone()
+    self._values.reshape(self.batch_size * nu, nmax)[dst_i * nu:(dst_i + 1) * nu] = \
+        self._values.reshape(self.batch_size * nu, nmax)[src_i * nu:(src_i + 1) * nu].clone()
+    self._cursor.reshape(self.batch_size * nu)[dst_i * nu:(dst_i + 1) * nu] = \
+        self._cursor.reshape(self.batch_size * nu)[src_i * nu:(src_i + 1) * nu].clone()
+
+  def _to_device_vec(self, value, shape, what):
+    torch = self._torch
+    if isinstance(value, torch.Tensor):
+      out = value.to(dtype=torch.float32, device=self._device)
+    else:
+      out = torch.as_tensor(np.asarray(value, dtype=np.float32),
+                            dtype=torch.float32, device=self._device)
+    if tuple(out.shape) != tuple(shape):
+      raise ValueError(f"{what} must have shape {tuple(shape)}")
+    if not out.is_contiguous():
+      out = out.contiguous()
+    return out
+
+  def record(self, ctrl, time, mask=None):
+    """Insert one control row per world (pinned history advance).
+
+    ``time`` is a scalar or per-world ``(batch,)`` stamps (pre-step times,
+    matching pinned insert at ``d->time``). ``mask`` optionally selects
+    recording worlds (failed worlds freeze their rows); the default
+    records every world.
+    """
+    torch = self._torch
+    ctrl = self._to_device_vec(ctrl, (self.batch_size, self.nu), "ctrl")
     if tuple(ctrl.shape) != (self.batch_size, self.nu):
       raise ValueError(f"ctrl must have shape ({self.batch_size}, {self.nu})")
-    if not np.isfinite(float(time)):
-      raise ValueError("record requires a finite time")
-    now = torch.tensor([float(time)], dtype=torch.float32, device=self._device)
+    now = self._times_arg(time, "record requires finite time(s)")
+    if mask is None:
+      m = torch.ones((self.batch_size, self.nu), dtype=torch.int32, device=self._device)
+    else:
+      m = torch.as_tensor(np.asarray(mask, dtype=np.int32),
+                          dtype=torch.int32, device=self._device)
+      if tuple(m.shape) != (self.batch_size, self.nu):
+        raise ValueError(f"mask must have shape ({self.batch_size}, {self.nu})")
     self._record_kernel(ctrl.reshape(-1), self._nsample, self._times,
-                        self._values, self._cursor, self._dims, now,
+                        self._values, self._cursor, self._dims, now, m,
                         threads=(self.batch_size * self.nu,), group_size=(1,))
 
+  def _times_arg(self, time, what):
+    import numpy as _np
+    if isinstance(time, self._torch.Tensor):
+      out = time.to(dtype=self._torch.float32)
+      if tuple(out.shape) == ():
+        out = out.reshape(1).expand(self.batch_size).contiguous()
+      if tuple(out.shape) != (self.batch_size,):
+        raise ValueError(what)
+      if not bool(self._torch.all(self._torch.isfinite(out))):
+        raise ValueError(what)
+      return out.contiguous()
+    arr = _np.asarray(float(time) if _np.ndim(time) == 0 else time, dtype=_np.float64)
+    if arr.shape == ():
+      arr = _np.full((self.batch_size,), arr.item())
+    if arr.shape != (self.batch_size,) or not _np.all(_np.isfinite(arr)):
+      raise ValueError(what)
+    return self._torch.as_tensor(arr.astype(_np.float32).copy(),
+                                 dtype=self._torch.float32, device=self._device)
+
   def read(self, ctrl_live, time):
-    """Delayed control per actuator, live passthrough where nsample == 0."""
+    """Delayed control per actuator, live passthrough where nsample == 0.
+
+    ``time`` is a scalar or per-world ``(batch,)`` query stamps.
+    """
     torch = self._torch
-    live = torch.as_tensor(np.asarray(ctrl_live, dtype=np.float32),
-                           dtype=torch.float32, device=self._device)
+    live = self._to_device_vec(ctrl_live, (self.batch_size, self.nu), "ctrl_live")
     if tuple(live.shape) != (self.batch_size, self.nu):
       raise ValueError(f"ctrl_live must have shape ({self.batch_size}, {self.nu})")
-    if not np.isfinite(float(time)):
-      raise ValueError("read requires a finite time")
+    now = self._times_arg(time, "read requires finite time(s)")
     # Pinned evaluates time-delay in mjtNum: subtract host-side in float64
     # so exact-stamp hits survive the float32 cast on both sides.
-    delay = self._delay.detach().cpu().numpy().astype(np.float64)
-    qtime = (np.float64(float(time)) - delay).reshape(1, -1)
-    qtime = np.broadcast_to(qtime, (self.batch_size, self.nu)).astype(np.float32)
+    import numpy as _np
+    delay = self._delay.detach().cpu().numpy().astype(_np.float64)
+    base = now.detach().cpu().numpy().astype(_np.float64).reshape(-1, 1)
+    qtime = (base - delay.reshape(1, -1)).astype(_np.float32)
     qtensor = torch.as_tensor(qtime.copy(), dtype=torch.float32, device=self._device)
     self._read_kernel(self._times, self._values, self._cursor, self._nsample,
                       self._interp, qtensor, self._out, self._dims,
@@ -1285,25 +1392,37 @@ class MetalDelayLine:
             "times": self._times.detach().cpu().numpy().copy(),
             "values": self._values.detach().cpu().numpy().copy()}
 
-  def restore(self, snap):
-    """Validate-then-commit restore; rejects leave device state untouched."""
+  def checked_snapshot(self, snap):
+    """Validate a snapshot payload without mutating; return int32/float32 copies."""
+    import numpy as _np
     for key in ("cursor", "times", "values"):
-      if key not in snap:
+      if not isinstance(snap, dict) or key not in snap:
         raise ValueError(f"delay snapshot is missing {key!r}")
-    cursor = np.asarray(snap["cursor"], dtype=np.int64)
-    times = np.asarray(snap["times"], dtype=np.float64)
-    values = np.asarray(snap["values"], dtype=np.float64)
+    cursor = _np.asarray(snap["cursor"], dtype=_np.int64)
+    times = _np.asarray(snap["times"], dtype=_np.float64)
+    values = _np.asarray(snap["values"], dtype=_np.float64)
     want = (self.batch_size * self.nu * self.nmax,)
     if (cursor.shape != (self.batch_size * self.nu,)
             or times.shape != want or values.shape != want
-            or np.any(cursor < 0)
-            or not np.all(np.isfinite(times)) or not np.all(np.isfinite(values))):
+            or _np.any(cursor < 0)
+            or not _np.all(_np.isfinite(times)) or not _np.all(_np.isfinite(values))):
       raise ValueError("delay snapshot payload is invalid")
     ns = self._nsample.detach().cpu().numpy()
     for w in range(self.batch_size * self.nu):
       if int(cursor[w]) >= max(int(ns[w % self.nu]), 1):
         raise ValueError("delay snapshot cursor out of range")
+    with _np.errstate(over="ignore", under="ignore", invalid="ignore"):
+      times32 = _np.asarray(times, dtype=_np.float32)
+      values32 = _np.asarray(values, dtype=_np.float32)
+    if not _np.all(_np.isfinite(times32)) or not _np.all(_np.isfinite(values32)):
+      raise ValueError("delay snapshot values overflow float32")
+    return {"cursor": cursor.astype(_np.int32).copy(),
+            "times": times32.copy(), "values": values32.copy()}
+
+  def restore(self, snap):
+    """Validate-then-commit restore; rejects leave device state untouched."""
+    checked = self.checked_snapshot(snap)
     torch = self._torch
-    self._cursor.copy_(torch.as_tensor(cursor.astype(np.int32), device=self._device))
-    self._times.copy_(torch.as_tensor(times.astype(np.float32), device=self._device))
-    self._values.copy_(torch.as_tensor(values.astype(np.float32), device=self._device))
+    self._cursor.copy_(torch.as_tensor(checked["cursor"], device=self._device))
+    self._times.copy_(torch.as_tensor(checked["times"], device=self._device))
+    self._values.copy_(torch.as_tensor(checked["values"], device=self._device))

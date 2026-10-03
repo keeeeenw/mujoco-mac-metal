@@ -57,6 +57,10 @@ class TransmissionModel:
       from mujoco_metal.model import actuator_joint_inheritance, actuator_tendon_inheritance
       actuator_joint_inheritance(model, tendon_ok=True)
       actuator_tendon_inheritance(model)
+    # Delay/history validated here; the stepping layer applies the delay
+    # line above this scalar path (R06/D1).
+    from mujoco_metal.stateful_actuation import actuator_delay_config
+    actuator_delay_config(model)
     if np.any(np.asarray(model.jnt_actfrclimited)):
       raise ValueError("joint-level actuator force limits are unsupported")
     if np.any(np.asarray(model.jnt_actgravcomp)):
