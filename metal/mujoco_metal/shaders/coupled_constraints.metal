@@ -1396,7 +1396,9 @@ kernel void solve_coupled_constraints(
   // certificate must not survive it. Snapshot the certified candidate;
   // after refinement, re-certify from the FINAL multipliers: revert to the
   // snapshot if refinement lost certification, fail on nonfinite residuals.
-  if ((!converged || max_res > 1e-7f) && (contact_block_count > 0 || elliptic_count > 0)) {
+  // Tiny budgets (maxiter <= 2) skip refinement: the 256-round exact phase
+  // would dominate the reported iteration count and misreport exhaustion.
+  if (maxiter > 2 && (!converged || max_res > 1e-7f) && (contact_block_count > 0 || elliptic_count > 0)) {
     thread float snap_lam[96];
     for (int r = 0; r < 96; ++r) snap_lam[r] = lam[r];
     float snap_res = max_res;
@@ -1479,11 +1481,11 @@ kernel void solve_coupled_constraints(
                 oldf[i] = lam[ri];
                 float v = -rhs[ri];
                 for (int col = 0; col < total_nr; ++col)
-                  if (enabled[col] && (col < start || col >= start + dim))
+                  if (enabled[col] && (col < start + 1 || col >= start + dim))
                     v += W[ri * nr + col] * lam[col];
                 bc[i] = v;
                 for (int j = 0; j < nf; ++j)
-                  Ac[i * nf + j] = W[ri * nr + start + 1 + j];
+                  Ac[i * nf + j] = W[ri * nr + start + 1 + j] + (i == j ? R[ri] : 0.0f);
               }
               thread float qv[6];
               for (int i = 0; i < 6; ++i) qv[i] = 0.0f;
@@ -1582,29 +1584,11 @@ kernel void solve_coupled_constraints(
     int ns_done = 0;
     for (int nsit = 0; nsit < noslip_iters; ++nsit) {
       float improvement = 0.0f;
-      // At iteration 0, account for regularizer removal (pinned engine_solver.c:solNoSlip)
+      // At iteration 0, account for regularizer removal (pinned engine_solver.c:674-678)
       if (nsit == 0) {
-        for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
-          float lorb = lo[row], hib = hi[row];
-          if (lorb < 0.0f && hib == -lorb && hib < INFINITY) {
+        for (int row = 0; row < total_nr; ++row) {
+          if (enabled[row]) {
             improvement += 0.5f * lam[row] * lam[row] * R[row];
-          }
-        }
-        for (int b = 0; b < contact_block_count; ++b) {
-          int row_start = contact_block_start[b];
-          int block_size = contact_block_size[b];
-          for (int k = 0; k + 1 < block_size; k += 2) {
-            int j0 = row_start + k, j1 = row_start + k + 1;
-            if (enabled[j0]) improvement += 0.5f * lam[j0] * lam[j0] * R[j0];
-            if (enabled[j1]) improvement += 0.5f * lam[j1] * lam[j1] * R[j1];
-          }
-        }
-        for (int b = 0; b < elliptic_count; ++b) {
-          int start = elliptic_start[b];
-          int dim = elliptic_dim[b];
-          for (int i = 1; i < dim; ++i) {
-            int ri = start + i;
-            if (enabled[ri]) improvement += 0.5f * lam[ri] * lam[ri] * R[ri];
           }
         }
       }
