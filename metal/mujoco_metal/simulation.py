@@ -99,8 +99,69 @@ def _preflight_plugin_restores(plugin_map, payloads, env_ids=None):
       except Exception:
         pass
     raise
+  restore_errors = []
   for key in reversed(touched):
-    active[key].restore(copy.deepcopy(old[key]), env_ids=env_ids)
+    try:
+      active[key].restore(copy.deepcopy(old[key]), env_ids=env_ids)
+    except Exception as error:
+      restore_errors.append((key, error))
+  if restore_errors:
+    # A plugin can reject only its later restoration call. Retry the captured
+    # value once before propagating, and never hide a failed rollback.
+    retry_errors = []
+    for key, _ in restore_errors:
+      try:
+        active[key].restore(copy.deepcopy(old[key]), env_ids=env_ids)
+      except Exception as error:
+        retry_errors.append(error)
+    if retry_errors:
+      raise RuntimeError("plugin preflight restore could not roll back its probes") from retry_errors[0]
+    raise restore_errors[0][1]
+
+
+def _apply_plugin_restores(plugin_map, payloads, env_ids=None):
+  """Apply plugin payloads with rollback if an actual commit callback fails."""
+  active = {key: plugin for key, plugin in plugin_map.items()
+            if payloads[key] is not None}
+  old = {key: copy.deepcopy(plugin.snapshot()) for key, plugin in active.items()}
+  touched = []
+  try:
+    for key, plugin in active.items():
+      touched.append(key)
+      plugin.restore(copy.deepcopy(payloads[key]), env_ids=env_ids)
+  except Exception:
+    rollback_errors = []
+    for key in reversed(touched):
+      try:
+        active[key].restore(copy.deepcopy(old[key]), env_ids=env_ids)
+      except Exception as error:
+        rollback_errors.append(error)
+    if rollback_errors:
+      raise RuntimeError("plugin restore failed and plugin rollback was rejected") from rollback_errors[0]
+    raise
+
+
+def _reset_plugins_transactionally(plugins, env_ids=None):
+  """Reset plugin instances before native state commit and undo late errors."""
+  active = tuple(plugins)
+  old = tuple(copy.deepcopy(plugin.snapshot()) for plugin in active)
+  touched = []
+  try:
+    for index, plugin in enumerate(active):
+      touched.append(index)
+      plugin.reset(env_ids=env_ids)
+  except Exception:
+    rollback_errors = []
+    for index in reversed(touched):
+      plugin = active[index]
+      payload = copy.deepcopy(old[index])
+      try:
+        plugin.restore(payload, env_ids=env_ids)
+      except Exception as error:
+        rollback_errors.append(error)
+    if rollback_errors:
+      raise RuntimeError("plugin reset failed and plugin rollback was rejected") from rollback_errors[0]
+    raise
 
 
 class MetalSimulation:
@@ -763,6 +824,9 @@ class MetalSimulation:
                       if value is not None}
     active_targets = {key: plugin_targets[key] for key in active_plugins}
     _preflight_plugin_restores(active_plugins, active_targets, env_ids=[dst_i])
+    # A restore implementation can still fail on its later, real commit call.
+    # Apply it transactionally before touching any simulation-owned rows.
+    _apply_plugin_restores(active_plugins, active_targets, env_ids=[dst_i])
     gen = self._state.copy_environment(src, dst)
     # Full simulation state follows the device rows: retained warmstarts,
     # stored sensor samples and held per-call inputs. Caches invalidate.
@@ -781,8 +845,6 @@ class MetalSimulation:
     if getattr(self, "_delay", None) is not None:
       self._delay.copy_row(src_i, dst_i)
       self._sync_history_from_delay(env_ids=[dst_i])
-    for key, plugin in active_plugins.items():
-      plugin.restore(plugin_targets[key], env_ids=[dst_i])
     if getattr(self, "_delay", None) is not None:
       self._delay.copy_row(src_i, dst_i)
     if getattr(self, "_islands", None) is not None:
@@ -970,6 +1032,9 @@ class MetalSimulation:
         raise ValueError("snapshot delay state is missing")
       delay_checked = self._delay.checked_snapshot(delay_snap)
 
+    # Apply actual callbacks before the native commit: implementations may
+    # reject only on a later call after the preflight probe succeeded.
+    _apply_plugin_restores(plugin_map, plugins, env_ids=ids)
     # Commit boundary: DeviceState validates its fields atomically before mutating.
     self._state.restore(snapshot["device"], env_ids=ids)
     torch = self._state._torch
@@ -1043,8 +1108,6 @@ class MetalSimulation:
       else:
         dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
         self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
-    for key, plugin in plugin_map.items():
-      plugin.restore(plugins[key], env_ids=env_ids)
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -1060,10 +1123,19 @@ class MetalSimulation:
     Reset is cold: retained warmstart multipliers and delay rings are
     cleared alongside state, matching pinned reset semantics.
     """
-    gen = self._state.reset(
+    prepared = self._state.prepare_reset(
         env_ids=env_ids, qpos=qpos, qvel=qvel, eq_active=eq_active,
         mocap_pos=mocap_pos, mocap_quat=mocap_quat, act=act,
     )
+    if not prepared[0].size:
+      return self._state.generation
+    # Reset plugin-owned state before committing simulation-owned state. A
+    # plugin may mutate its state and then raise; its prior snapshot is restored
+    # transactionally while qpos, histories, warmstarts and held inputs remain
+    # untouched.
+    _reset_plugins_transactionally(getattr(self, "_native_plugins", ()),
+                                   env_ids=env_ids)
+    gen = self._state.reset(_prepared=prepared)
     self._clear_held_inputs(env_ids)
     if getattr(self, "_coupled_constraints", None) is not None:
       self._coupled_constraints.clear_warmstart(env_ids=env_ids)
@@ -1083,8 +1155,6 @@ class MetalSimulation:
     if getattr(self, "_flex", None) is not None:
       dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
       self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
-    for p in getattr(self, "_native_plugins", ()):
-      p.reset(env_ids=env_ids)
     self._assembled_system_valid = False
     self._accepted_step = None
     if hasattr(self, "_last_coupled"):
@@ -1142,10 +1212,15 @@ class MetalSimulation:
     else:
       key_act = None
     # Validate key payloads through the same paths as reset before mutating.
-    gen = self._state.reset(
+    prepared = self._state.prepare_reset(
         env_ids=env_ids, qpos=key_qpos, qvel=key_qvel,
         mocap_pos=key_mpos, mocap_quat=key_mquat, act=key_act,
     )
+    if not prepared[0].size:
+      return self._state.generation
+    _reset_plugins_transactionally(getattr(self, "_native_plugins", ()),
+                                   env_ids=env_ids)
+    gen = self._state.reset(_prepared=prepared)
     # mj_resetDataKeyframe sets time after _resetData; mirror per selected world.
     if env_ids is None:
       self._state._time.zero_().add_(key_time)
@@ -1165,6 +1240,7 @@ class MetalSimulation:
       self._coupled_constraints.clear_warmstart(env_ids=env_ids)
     if getattr(self, "_delay", None) is not None:
       self._delay.reset(env_ids=env_ids)
+      self._sync_history_from_delay(env_ids=env_ids)
     if getattr(self, "_sensordata", None) is not None:
       if env_ids is None:
         self._sensordata.zero_()

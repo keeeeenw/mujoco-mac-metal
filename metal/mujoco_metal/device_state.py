@@ -775,21 +775,12 @@ class DeviceState:
     self._generation += 1
     return self._generation
 
-  def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
-            mocap_pos=None, mocap_quat=None, act=None):
-    """Reset selected rows atomically from checked host arrays or model defaults.
-
-    `eq_active=None` restores compiled defaults for selected worlds; pass an
-    explicit `(neq,)` or `(len(env_ids), neq)` boolean/integer array to override.
-    `mocap_pos`/`mocap_quat=None` restore compiled reference frames; pass
-    explicit `(nmocap, 3/4)` or `(len(env_ids), nmocap, 3/4)` arrays to override.
-    `act=None` zeroes activation state for selected worlds; pass explicit
-    `(na,)` or `(len(env_ids), na)` arrays to override.
-    Unselected worlds keep their activity. Validation is atomic.
-    """
+  def prepare_reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
+                    mocap_pos=None, mocap_quat=None, act=None):
+    """Validate reset inputs and return normalized rows without mutation."""
     ids = self._env_ids(env_ids)
     if not ids.size:
-      return self._generation
+      return (ids, None, None, None, None, None)
     count = ids.size
     pos_default = np.broadcast_to(
         self._model.qpos0, (count, self._model.nq)
@@ -859,6 +850,27 @@ class DeviceState:
         if arr.shape == (self._na,):
           arr = np.broadcast_to(arr, (count, self._na)).copy()
         act_checked = self._host_values(arr, (count, self._na), "act")
+    return (ids, pos, vel, mocap_checked, eq_checked, act_checked)
+
+  def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
+            mocap_pos=None, mocap_quat=None, act=None, *, _prepared=None):
+    """Reset selected rows atomically from checked host arrays or model defaults.
+
+    `eq_active=None` restores compiled defaults for selected worlds; pass an
+    explicit `(neq,)` or `(len(env_ids), neq)` boolean/integer array to override.
+    `mocap_pos`/`mocap_quat=None` restore compiled reference frames; pass
+    explicit `(nmocap, 3/4)` or `(len(env_ids), nmocap, 3/4)` arrays to override.
+    `act=None` zeroes activation state for selected worlds; pass explicit
+    `(na,)` or `(len(env_ids), na)` arrays to override.
+    Unselected worlds keep their activity. Validation is atomic.
+    """
+    if _prepared is None:
+      _prepared = self.prepare_reset(env_ids, qpos, qvel, eq_active,
+                                     mocap_pos, mocap_quat, act)
+    ids, pos, vel, mocap_checked, eq_checked, act_checked = _prepared
+    if not ids.size:
+      return self._generation
+    count = ids.size
 
     index = self._torch.as_tensor(ids, dtype=self._torch.int64, device=self._device)
     pos_tensor = self._torch.as_tensor(
