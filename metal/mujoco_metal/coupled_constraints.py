@@ -42,6 +42,8 @@ _MAX_ROWS = 96
 _MAX_ITERATIONS = 2048
 _MAX_LINE_SEARCH_ITERATIONS = 2048
 _TOLERANCE = 1e-6
+# Per-world device scratch for acceleration-space primal CG/Newton. Keep this
+# in the existing debug-buffer binding so the Metal ABI remains at 31 slots.
 # G3: hard cap for adaptive PGS extension; must match the kernel constant.
 _ADAPTIVE_MAX_ITERATIONS = 0
 
@@ -1216,7 +1218,7 @@ class MetalCoupledConstraints:
   """Batched native MPS execution for coupled joint and primitive contact constraints."""
 
   def __init__(self, model, batch_size=1, limits=None):
-    from mujoco_metal.capacity import CapacityLimits
+    from mujoco_metal.capacity import CapacityLimits, primal_scratch_floats
     self.limits = limits or CapacityLimits()
     self.descriptor = lower_coupled_constraints(model, limits=self.limits)
     self._mjmodel_ref = model
@@ -1374,7 +1376,7 @@ class MetalCoupledConstraints:
         "solver_dims": torch.tensor(
             # Appended tail carries the no-slip budget (R04); earlier
             # indices are frozen for every consumer of this layout.
-            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows, d.ntendon, d.ten_base, d.ten_friction_rows + d.ten_limit_rows, d.noslip_iterations, d.solver_type, d.line_search_iterations],
+            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows, d.ntendon, d.ten_base, d.ten_friction_rows + d.ten_limit_rows, d.noslip_iterations, d.solver_type, d.line_search_iterations, d.nr * d.nr + 7 * d.nr + primal_scratch_floats(d.nv, d.nr, d.solver_type)],
             dtype=torch.int32, device=self._device,
         ),
         "solver_params": torch.tensor(
@@ -1413,6 +1415,10 @@ class MetalCoupledConstraints:
         neq=d.neq, nr_joint=d.nr_joint), limits=self.limits)
     self.batch_size = b
     nv, nc, nr = d.nv, d.ncontacts_max, d.nr
+    from mujoco_metal.capacity import primal_scratch_floats
+    self._primal_scratch_floats = primal_scratch_floats(nv, nr, d.solver_type)
+    self._debug_prefix = nr * nr + 7 * nr
+    self._debug_stride = self._debug_prefix + self._primal_scratch_floats
 
     def empty(size):
       return torch.zeros(max(size, 1), dtype=torch.float32, device=self._device)
@@ -1427,7 +1433,7 @@ class MetalCoupledConstraints:
         "contact_jacobian": empty(b * nc * 6 * nv),
         "pair_mask": torch.zeros(max(b * max(d.npairs, 1), 1), dtype=torch.float32, device=self._device),
         "workspace_J": empty(b * nr * nv),
-        "workspace_debug": empty(b * (nr * nr + 7 * nr)),
+        "workspace_debug": empty(b * self._debug_stride),
         "out_force": empty(b * nv),
         "out_acc": empty(b * nv),
         "out_status": torch.zeros(b, dtype=torch.int32, device=self._device),
@@ -1485,7 +1491,7 @@ class MetalCoupledConstraints:
     b, nr = int(self.batch_size), int(self.descriptor.nr)
     if nr == 0:
       return _np.zeros((b, 0), dtype=_np.float32)
-    w = self._workspace["workspace_debug"].reshape(b, nr * nr + 7 * nr)
+    w = self._workspace["workspace_debug"].reshape(b, self._debug_stride)
     return w[:, nr * nr + 3 * nr:nr * nr + 4 * nr].detach().cpu().numpy().copy()
 
   def set_warmstart(self, values, env_ids=None):
@@ -1517,7 +1523,7 @@ class MetalCoupledConstraints:
       arr32 = _np.asarray(arr, dtype=_np.float32)
     if not _np.all(_np.isfinite(arr32)):
       raise ValueError("warmstart must be float32-representable")
-    w = self._workspace["workspace_debug"].reshape(b, nr * nr + 7 * nr)
+    w = self._workspace["workspace_debug"].reshape(b, self._debug_stride)
     w[:, nr * nr + 3 * nr:nr * nr + 4 * nr][ids] = torch.as_tensor(
         arr32, dtype=torch.float32, device=self._device)
     if hasattr(self, "_last_coupled"):
@@ -1530,7 +1536,7 @@ class MetalCoupledConstraints:
       self._warm_rows(env_ids)
       return
     ids = self._warm_rows(env_ids)
-    w = self._workspace["workspace_debug"].reshape(b, nr * nr + 7 * nr)
+    w = self._workspace["workspace_debug"].reshape(b, self._debug_stride)
     w[:, nr * nr + 3 * nr:nr * nr + 4 * nr][ids] = 0.0
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
@@ -1671,7 +1677,8 @@ class MetalCoupledConstraints:
     }
 
   def run_device(self, poses, mass, qfrc_smooth, qpos, qvel, eq_active=None, cvel=None,
-                 tendon_J_spatial=None, tendon_length_spatial=None, flex=None):
+                 tendon_J_spatial=None, tendon_length_spatial=None, flex=None,
+                 qacc_warmstart=None):
     """Solve coupled contacts, limits, dry friction, and equalities on MPS.
 
     `poses` is the dict of FK outputs from `MetalKinematics`.
@@ -1687,6 +1694,30 @@ class MetalCoupledConstraints:
     """
     w, torch, d = self._workspace, self._torch, self.descriptor
     b, nv, nc, nr = self.batch_size, d.nv, d.ncontacts_max, d.nr
+
+    # MuJoCo's WARMSTART state is qacc_warmstart for every solver family.
+    # PGS maps it to row forces before its cost check; CG/Newton compare the
+    # acceleration-space cost with qacc_smooth. The final DOF-sized tail of
+    # persistent scratch carries it without adding a Metal buffer binding.
+    if qacc_warmstart is not None:
+      if (not isinstance(qacc_warmstart, torch.Tensor)
+          or qacc_warmstart.dtype != torch.float32
+          or tuple(qacc_warmstart.shape) != (b, nv)
+          or qacc_warmstart.device.type != self._device.type
+          or (self._device.index is not None
+              and qacc_warmstart.device.index != self._device.index)
+          or not qacc_warmstart.is_contiguous()):
+        raise ValueError(
+            f"qacc_warmstart must be contiguous float32 MPS with shape {(b, nv)}"
+        )
+    prefix = nr * nr + 7 * nr
+    scratch = self._workspace["workspace_debug"].reshape(b, self._debug_stride)
+    warm_offset = prefix + self._primal_scratch_floats - nv
+    tail = scratch[:, warm_offset:warm_offset + nv]
+    if qacc_warmstart is None:
+      tail.zero_()
+    else:
+      tail.copy_(qacc_warmstart)
 
     if eq_active is None:
       eq_active_tensor = self._eq_active_default

@@ -846,7 +846,7 @@ class MetalSimulation:
     cc = getattr(self, "_coupled_constraints", None)
     if cc is not None and int(cc.descriptor.nr) > 0:
       w = cc._workspace["workspace_debug"].reshape(
-          self.batch_size, cc.descriptor.nr * cc.descriptor.nr + 7 * cc.descriptor.nr)
+          self.batch_size, cc._debug_stride)
       nr = cc.descriptor.nr
       w[dst_i, nr * nr + 3 * nr:nr * nr + 4 * nr] = w[src_i, nr * nr + 3 * nr:nr * nr + 4 * nr].clone()
     if getattr(self, "_sensordata", None) is not None:
@@ -1406,7 +1406,7 @@ class MetalSimulation:
       entries.extend([
           {"name": "_eq_active_default", "residency": "MPS device-resident", "lifetime": "persistent preallocated", "shape": f"({b}, {max(d.neq, 1)})", "dtype": str(self._coupled_constraints._eq_active_default.dtype).replace("torch.", "")},
           {"name": "workspace_J", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nr}, {d.nv})", "dtype": "float32"},
-          {"name": "workspace_debug", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nr * d.nr + 7 * d.nr})", "dtype": "float32"},
+          {"name": "workspace_debug", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {self._coupled_constraints._debug_stride})", "dtype": "float32"},
           {"name": "out_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nv})", "dtype": "float32"},
           {"name": "out_acc", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nv})", "dtype": "float32"},
           {"name": "out_status", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b},)", "dtype": str(self._coupled_constraints._workspace["out_status"].dtype).replace("torch.", "")},
@@ -1622,7 +1622,7 @@ class MetalSimulation:
         dict(dynamics["poses"], root_com=dynamics["root_com"]), dynamics["mass_matrix"], rhs, qpos, qvel,
         eq_active=eq_active, cvel=dynamics.get("cvel", None),
         tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
-        flex=self._flex,
+        flex=self._flex, qacc_warmstart=state._qacc_warmstart,
     )
     coupled["mass_matrix"] = dynamics["mass_matrix"]
     self._last_coupled = coupled
@@ -1943,9 +1943,8 @@ class MetalSimulation:
     eqr = None
     if cc is not None:
       d = cc.descriptor
-      lam_nr, lam_s = int(d.nr), int(d.nr * d.nr + 7 * d.nr)
-      lam = cc._workspace["workspace_debug"][: self.batch_size * lam_s].reshape(
-          self.batch_size, lam_s)
+      lam_nr, lam_s = int(d.nr), int(cc._debug_stride)
+      lam = cc._workspace["workspace_debug"].reshape(-1)
       eqr = cc._constants["eq_rowadr"].reshape(-1)
     jm, tm = self._limit_row_maps()
     contact = self._contact_views()
@@ -2075,7 +2074,7 @@ class MetalSimulation:
           dict(dynamics["poses"], root_com=dynamics["root_com"]), dynamics["mass_matrix"], self._rhs, qpos, qvel,
           eq_active=eq_active, cvel=dynamics.get("cvel", None),
           tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
-          flex=self._flex,
+          flex=self._flex, qacc_warmstart=self._state._qacc_warmstart,
       )
       coupled["mass_matrix"] = dynamics["mass_matrix"]
       self._last_coupled = coupled
@@ -2137,7 +2136,7 @@ class MetalSimulation:
       pre_warm = None
       if cc is not None and int(cc.descriptor.nr) > 0:
         nr = int(cc.descriptor.nr)
-        w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, nr * nr + 7 * nr)
+        w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, cc._debug_stride)
         pre_warm = w_dbg[:, nr * nr + 3 * nr:nr * nr + 4 * nr].clone()
       pre_sens = self._sensordata.clone() if self._sensordata is not None else None
       if self._rk4 is not None:
@@ -2169,6 +2168,8 @@ class MetalSimulation:
         state._qpos = torch.where(success.unsqueeze(1), qpos, state._qpos)
         state._qvel = torch.where(success.unsqueeze(1), qvel, state._qvel)
         state._qacc = torch.where(success[:, None], acceleration, state._qacc)
+        state._qacc_warmstart.copy_(torch.where(
+            success[:, None], state._qacc, state._qacc_warmstart))
         state._time = torch.where(success, time, state._time)
         state._status = status.clone()
         if self._actuators is not None and na_here > 0 and weighted_dot is not None:
@@ -2196,7 +2197,7 @@ class MetalSimulation:
           if pre_warm is not None and cc is not None:
             failed_mask = ~success
             nr = int(cc.descriptor.nr)
-            w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, nr * nr + 7 * nr)
+            w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, cc._debug_stride)
             slice_w = w_dbg[:, nr * nr + 3 * nr:nr * nr + 4 * nr]
             slice_w.copy_(torch.where(failed_mask.unsqueeze(1), pre_warm, slice_w))
         if bool(torch.any(success)):
@@ -2372,6 +2373,9 @@ class MetalSimulation:
       state._qpos, self._next_qpos = self._next_qpos, state._qpos
       state._qvel, self._next_qvel = self._next_qvel, state._qvel
       state._qacc, self._next_qacc = self._next_qacc, state._qacc
+      state._qacc_warmstart.copy_(torch.where(
+          self._success.unsqueeze(1), state._qacc,
+          state._qacc_warmstart))
       state._time, self._next_time = self._next_time, state._time
       state._status, self._next_status = self._next_status, state._status
       if self._actuators is not None and getattr(state, "_na", 0) > 0:
@@ -2395,7 +2399,7 @@ class MetalSimulation:
         if pre_warm is not None and cc is not None:
           failed_mask = ~self._success
           nr = int(cc.descriptor.nr)
-          w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, nr * nr + 7 * nr)
+          w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, cc._debug_stride)
           slice_w = w_dbg[:, nr * nr + 3 * nr:nr * nr + 4 * nr]
           slice_w.copy_(torch.where(failed_mask.unsqueeze(1), pre_warm, slice_w))
 

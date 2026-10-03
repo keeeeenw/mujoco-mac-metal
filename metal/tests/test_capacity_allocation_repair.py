@@ -37,7 +37,7 @@ def test_workspace_mirror_is_byte_exact_cpu():
   assert by_name["contact_jacobian"] == 2 * 2 * 6 * 1 * 4
   assert by_name["pair_mask"] == 2 * 1 * 4
   assert by_name["workspace_J"] == 2 * 3 * 1 * 4
-  assert by_name["workspace_debug"] == 2 * (9 + 21) * 4
+  assert by_name["workspace_debug"] == 2 * (9 + 21 + 1) * 4
   assert by_name["out_force"] == 2 * 1 * 4
   assert by_name["out_acc"] == 2 * 1 * 4
   assert by_name["out_status"] == 2 * 4

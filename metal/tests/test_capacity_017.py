@@ -21,7 +21,10 @@ from mujoco_metal.capacity import (
     CapacityOverflow,
     check_capacity,
     estimate_capacity,
+    NATIVE_MAX_NV,
+    NATIVE_MAX_ROWS,
     selected_jacobian_kind,
+    primal_scratch_floats,
 )
 
 
@@ -83,6 +86,21 @@ def test_user_limits_and_memory_budget_are_honored():
   assert check_capacity(est) is est
 
 
+def test_user_limits_cannot_exceed_compiled_solver_abi():
+  import dataclasses
+  model = _model()
+  with pytest.raises(ValueError, match=f"bounds nv to {NATIVE_MAX_NV}"):
+    check_capacity(
+        dataclasses.replace(estimate_capacity(model, 1, 0, 0, 0),
+                            nv=NATIVE_MAX_NV + 1),
+        CapacityLimits(max_nv=NATIVE_MAX_NV + 100))
+  with pytest.raises(ValueError, match=f"capacity {NATIVE_MAX_ROWS}"):
+    check_capacity(
+        dataclasses.replace(estimate_capacity(model, 1, 0, 0, 0),
+                            nr=NATIVE_MAX_ROWS + 1),
+        CapacityLimits(max_rows=NATIVE_MAX_ROWS + 100))
+
+
 def test_overflow_is_valueerror_and_batch_checked():
   model = _model()
   est = estimate_capacity(model, 17, 0, 0, 0)
@@ -95,13 +113,14 @@ def test_overflow_is_valueerror_and_batch_checked():
 
 
 def estimate_workspace_expected(model, batch, npairs, nslots, nr):
-  """Independent exact byte count for the currently allocated 13 buffers."""
+  """Independent exact byte count for the allocated solver/map buffers."""
   b, v = batch, max(int(model.nv), 1)
   nc = nslots
   sizes = (
       max(b * nc * 36, 1), max(b * nc * 12, 1),
       max(b * nc * 6 * v, 1), max(b * max(npairs, 1), 1),
-      max(b * nr * v, 1), max(b * (nr * nr + 7 * nr), 1),
+      max(b * nr * v, 1), max(b * (nr * nr + 7 * nr
+                                    + primal_scratch_floats(v, nr, model.opt.solver)), 1),
       max(b * v, 1), max(b * v, 1), b, max(b * 10, 1),
       max(b * nc * 11, 1), max(b, 1), max(b, 1), max(b, 1),
       b * npairs, b * npairs, b * nc, b * nc, b * nr, b * nr, b * 4,

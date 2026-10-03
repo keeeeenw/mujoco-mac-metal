@@ -35,11 +35,34 @@ BASE_NVIDIA_NV = 32
 BASE_MAX_PAIRS = 32
 BASE_MAX_SLOTS = 48
 BASE_MAX_ROWS = 96
+# The current block-solver shader uses fixed per-thread arrays for at most 64
+# DOFs and 256 rows. User budgets may tighten these limits, but cannot raise
+# them past the compiled ABI.
+NATIVE_MAX_NV = 64
+NATIVE_MAX_ROWS = 256
 # Dense solver threshold: at or below this row count the native solver runs
 # the exact small-model dense path (unchanged math). Above it the block
 # path takes over (017 follow-up commits).
 DENSE_ROW_THRESHOLD = 96
 AUTO_JACOBIAN_DENSE_NV = 60
+
+
+def primal_scratch_floats(nv, nr, solver_type):
+  """Exact per-world scratch for the currently implemented primal solver.
+
+  PGS needs the supplied qacc warmstart. CG needs twelve DOF vectors, five
+  row vectors, and qacc warmstart. Newton adds one dense primal
+  Hessian/factor buffer.
+  """
+  v, r = max(int(nv), 1), max(int(nr), 1)
+  solver = int(solver_type)
+  if solver == int(mujoco.mjtSolver.mjSOL_PGS):
+    return v
+  if solver == int(mujoco.mjtSolver.mjSOL_CG):
+    return 13 * v + 5 * r
+  if solver == int(mujoco.mjtSolver.mjSOL_NEWTON):
+    return 13 * v + 5 * r + v * v
+  return 1
 
 
 class CapacityOverflow(ValueError):
@@ -101,7 +124,8 @@ def selected_jacobian_kind(model: mujoco.MjModel, nv=None):
   return "dense" if dofs <= AUTO_JACOBIAN_DENSE_NV else "sparse"
 
 
-def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch):
+def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
+                       solver_type=int(mujoco.mjtSolver.mjSOL_PGS)):
   """Budget solver buffers and the fixed-capacity milestone-017 maps.
 
   Returns ``(parts, total)`` with exact sizes for current coupled solver
@@ -113,6 +137,7 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch):
   """
   b, v = int(batch), int(max(nv, 1))
   nc = int(nslots)
+  primal_scratch = primal_scratch_floats(nv, nr, solver_type)
   # Both ``empty`` and torch.zeros in prepare_workspace allocate one element
   # for an otherwise empty buffer. Keep that guard explicit so the estimate
   # covers the zero-contact/zero-row cases too.
@@ -125,7 +150,9 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch):
       ("contact_jacobian", _bytes(guarded(b * nc * 6 * v))),
       ("pair_mask", _bytes(guarded(b * max(int(npairs), 1)))),
       ("workspace_J", _bytes(guarded(b * int(nr) * v))),
-      ("workspace_debug", _bytes(guarded(b * (int(nr) * int(nr) + 7 * int(nr))))),
+      # Reusable acceleration-space primal-solver scratch shares the debug
+      # binding to preserve Metal's 31-buffer ABI.
+      ("workspace_debug", _bytes(guarded(b * (int(nr) * int(nr) + 7 * int(nr) + primal_scratch)))),
       ("out_force", _bytes(guarded(b * v))),
       ("out_acc", _bytes(guarded(b * v))),
       ("out_status", _bytes_i32(b)),
@@ -173,7 +200,9 @@ def estimate_capacity(model, batch_size, npairs, nslots, nr, *, neq=0, nr_joint=
   nv = int(model.nv)
   nbody, ngeom = int(model.nbody), int(model.ngeom)
   nr = int(nr)
-  parts, total = estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch)
+  parts, total = estimate_workspace(
+      nv, npairs, nslots, nr, nr_joint, neq, batch,
+      solver_type=int(model.opt.solver))
   return CapacityEstimate(
       nv=nv, nbody=nbody, ngeom=ngeom, npairs=int(npairs),
       nslots=int(nslots), nr=nr, batch=batch,
@@ -193,18 +222,20 @@ def check_capacity(estimate, limits=None) -> CapacityEstimate:
   if estimate.batch > limits.max_batch:
     raise CapacityOverflow(
         f"batch size ({estimate.batch}) exceeds capacity {limits.max_batch}")
-  if estimate.nv > limits.max_nv:
+  max_nv = min(int(limits.max_nv), NATIVE_MAX_NV)
+  if estimate.nv > max_nv:
     raise CapacityOverflow(
-        f"coupled constraint stage bounds nv to {limits.max_nv}; found {estimate.nv}")
+        f"coupled constraint stage bounds nv to {max_nv}; found {estimate.nv}")
   if estimate.npairs > limits.max_pairs:
     raise CapacityOverflow(
         f"candidate contact pairs ({estimate.npairs}) exceeds capacity {limits.max_pairs}")
   if estimate.nslots > limits.max_slots:
     raise CapacityOverflow(
         f"total candidate contact slots ({estimate.nslots}) exceeds capacity {limits.max_slots}")
-  if estimate.nr > limits.max_rows:
+  max_rows = min(int(limits.max_rows), NATIVE_MAX_ROWS)
+  if estimate.nr > max_rows:
     raise CapacityOverflow(
-        f"total candidate constraint rows ({estimate.nr}) exceeds capacity {limits.max_rows}")
+        f"total candidate constraint rows ({estimate.nr}) exceeds capacity {max_rows}")
   if estimate.memory_bytes > limits.memory_budget_bytes:
     raise CapacityOverflow(
         f"estimated device memory ({estimate.memory_bytes} bytes) exceeds budget "
