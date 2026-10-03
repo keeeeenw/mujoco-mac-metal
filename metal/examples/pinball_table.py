@@ -36,8 +36,9 @@ def _sensor_summary(model, sensordata):
   out["touchA"] = float(sensordata[adr[0]])
   out["touchB"] = float(sensordata[adr[1]])
   out["accelA"] = float(np.linalg.norm(sensordata[adr[2]:adr[2] + 3]))
-  out["range0"] = float(sensordata[adr[4]])
-  out["range1"] = float(sensordata[adr[5]])
+  out["forceA"] = float(np.linalg.norm(sensordata[adr[4]:adr[4] + 3]))
+  out["range0"] = float(sensordata[adr[6]])
+  out["range1"] = float(sensordata[adr[7]])
   return out, None
 
 

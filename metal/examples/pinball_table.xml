@@ -42,6 +42,8 @@
     <touch site="padB"/>
     <accelerometer site="imuA"/>
     <accelerometer site="imuB"/>
+    <force site="gaugeA"/>
+    <torque site="gaugeA"/>
     <rangefinder site="eye0"/>
     <rangefinder site="eye1"/>
     <rangefinder site="eye2" data="dist normal"/>
