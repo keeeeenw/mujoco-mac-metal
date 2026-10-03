@@ -36,7 +36,8 @@ _SUPPORTED = {
     int(mujoco.mjtSensor.mjSENS_FRAMEANGVEL),
     int(mujoco.mjtSensor.mjSENS_GYRO),
     int(mujoco.mjtSensor.mjSENS_VELOCIMETER),
-    # Milestone 016 families (CAMPROJECTION/TACTILE/PLUGIN/USER stay rejected).
+    # Milestone 016 families (TACTILE/PLUGIN/USER stay deferred to 019;
+    # CAMPROJECTION admitted in R07a).
     int(mujoco.mjtSensor.mjSENS_TOUCH),
     int(mujoco.mjtSensor.mjSENS_ACCELEROMETER),
     int(mujoco.mjtSensor.mjSENS_FORCE),
