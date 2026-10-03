@@ -68,6 +68,15 @@ def test_plane_candidates_keep_simultaneous_obstacles_and_exact_row_spans():
   assert np.all(descriptor.kind == _KIND_PLANE_VERTEX)
   assert np.all(descriptor.geom[:nvert] == 0)
   assert np.all(descriptor.geom[nvert:] == 1)
+  body = int(model.geom_bodyid[0])
+  midphase = (not (int(model.opt.disableflags)
+                   & int(mujoco.mjtDisableBit.mjDSBL_MIDPHASE))
+              and int(model.body_bvhadr[body]) >= 0
+              and int(model.flex_bvhadr[0]) >= 0)
+  assert descriptor.filter_group_count == (1 if midphase else 2)
+  assert np.unique(descriptor.filter_group[:nvert]).size == 1
+  assert np.unique(descriptor.filter_group[nvert:]).size == 1
+  assert (descriptor.filter_group[0] == descriptor.filter_group[nvert]) == midphase
   np.testing.assert_array_equal(
       descriptor.row_span,
       np.r_[np.full(nvert, 4), np.full(nvert, 6)])
@@ -185,6 +194,56 @@ def test_geom_candidates_include_inactive_tetrahedra_like_pinned_source():
   still_collidable = lower_flex_contacts(model)
   assert np.count_nonzero(still_collidable.kind == _KIND_GEOM_ELEMENT) == int(
       model.flex_elemnum[0])
+
+
+def test_cpu_contact_cap_and_group_route_follow_midphase_selection():
+  xml = """
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <body pos="0 0 .15"><freejoint/>
+        <geom type="sphere" size=".5" contype="0" conaffinity="1"/>
+        <geom type="sphere" pos=".3 0 0" size=".5"
+              contype="0" conaffinity="1"/>
+      </body>
+      <flexcomp name="cloth" type="grid" count="8 8 1" pos="0 0 .1"
+                spacing=".1 .1 .1" mass="1" dim="2">
+        <contact contype="1" conaffinity="0" selfcollide="none"/>
+        <edge stiffness="0" damping="0"/>
+        <elasticity young="100" poisson=".2" thickness=".01"
+                    elastic2d="stretch"/>
+      </flexcomp>
+    </worldbody></mujoco>
+  """
+  records = {}
+  for midphase in (False, True):
+    model = mujoco.MjModel.from_xml_string(xml)
+    if not midphase:
+      model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MIDPHASE)
+    descriptor = lower_flex_contacts(model)
+    body = int(model.geom_bodyid[0])
+    can_use_tree = (int(model.body_bvhadr[body]) >= 0
+                    and int(model.flex_bvhadr[0]) >= 0)
+    expected_groups = 1 if midphase and can_use_tree else 2
+    assert descriptor.filter_group_count == expected_groups
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    identities = [(tuple(int(x) for x in c.geom),
+                   tuple(int(x) for x in c.flex),
+                   tuple(int(x) for x in c.elem)) for c in data.contact]
+    records[midphase] = identities
+    counts = {geom: sum(1 for c in data.contact if int(c.geom[0]) == geom)
+              for geom in (0, 1)}
+    if midphase and can_use_tree:
+      assert data.ncon == 50
+    else:
+      assert counts == {0: 50, 1: 50}
+      assert [int(c.geom[0]) for c in data.contact] == [0] * 50 + [1] * 50
+    repeat = mujoco.MjData(model)
+    mujoco.mj_forward(model, repeat)
+    assert identities == [(tuple(int(x) for x in c.geom),
+                           tuple(int(x) for x in c.flex),
+                           tuple(int(x) for x in c.elem)) for c in repeat.contact]
+  assert len(records[True]) == 50
+  assert len(records[False]) == 100
 
 
 def test_self_collision_requires_matching_contype_and_conaffinity():

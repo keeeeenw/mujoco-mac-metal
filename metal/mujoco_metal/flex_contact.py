@@ -18,6 +18,8 @@ _PLANE = int(mujoco.mjtGeom.mjGEOM_PLANE)
 _ELLIPTIC = int(mujoco.mjtCone.mjCONE_ELLIPTIC)
 _DISABLE_CONTACT = int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
 _DISABLE_CONSTRAINT = int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+_DISABLE_NATIVECCD = int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD)
+_DISABLE_MIDPHASE = int(mujoco.mjtDisableBit.mjDSBL_MIDPHASE)
 _ENABLE_OVERRIDE = int(mujoco.mjtEnableBit.mjENBL_OVERRIDE)
 _SHADER = Path(__file__).parent / "shaders" / "flex_contact.metal"
 
@@ -149,6 +151,8 @@ class FlexContactDescriptor:
   candidate_link_ids: np.ndarray
   max_links_per_candidate: int
   link_capacity: int
+  filter_group: np.ndarray
+  filter_group_count: int
 
   @property
   def slot_count(self):
@@ -362,6 +366,26 @@ def lower_flex_contacts(model):
   candidate_link_ids = np.full((count, max_links), -1, dtype=np.int32)
   for slot, pairs in enumerate(link_sets):
     candidate_link_ids[slot, :len(pairs)] = [link_index[pair] for pair in sorted(pairs)]
+  group_keys = []
+  for row in rows:
+    kind, flex1, _elem1, _vert1, flex2, _elem2, _vert2, geom, *_ = row
+    if kind in (_KIND_PLANE_VERTEX, _KIND_GEOM_ELEMENT):
+      body = int(model.geom_bodyid[geom])
+      use_midphase = (
+          not (int(model.opt.disableflags) & _DISABLE_MIDPHASE)
+          and int(model.body_bvhadr[body]) >= 0
+          and int(model.flex_bvhadr[flex1]) >= 0)
+      owner = body if use_midphase else int(geom)
+      group = (0, int(use_midphase), owner, flex1)
+    elif kind == _KIND_INTERNAL_VERTEX_ELEMENT:
+      group = (1, flex1)
+    elif flex1 == flex2:
+      group = (2, flex1)
+    else:
+      group = (3, flex1, flex2)
+    group_keys.append(group)
+  group_index = {key: index for index, key in enumerate(sorted(set(group_keys)))}
+  filter_group = np.asarray([group_index[key] for key in group_keys], np.int32)
   return FlexContactDescriptor(
       kind=_frozen(kinds, np.int32), flex1=col(1), elem1=col(2), vert1=col(3),
       flex2=col(4), elem2=col(5), vert2=col(6), geom=col(7),
@@ -386,7 +410,9 @@ def lower_flex_contacts(model):
       link_tree_pairs=_frozen(link_pairs, np.int32).reshape(-1, 2),
       candidate_link_ids=_frozen(candidate_link_ids, np.int32),
       max_links_per_candidate=max_links,
-      link_capacity=len(link_pairs))
+      link_capacity=len(link_pairs),
+      filter_group=_frozen(filter_group, np.int32),
+      filter_group_count=len(group_index))
 
 
 class FlexContactProgram:
