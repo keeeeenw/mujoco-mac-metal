@@ -981,6 +981,7 @@ class MetalActuators:
     self._force_kernel = alib.actuator_force
     self._qfrc_kernel = alib.actuator_assemble_qfrc
     self._adv_kernel = alib.advance_activations
+    self._velocity_derivative_kernel = alib.actuator_velocity_derivative
     meta = self._meta
     b = int(batch_size)
     if b <= 0:
@@ -1057,6 +1058,17 @@ class MetalActuators:
                                meta.disableactuator, meta.ntendon],
                               _torch.int32)
     self._qfrc_dims = tensor([meta.nv, meta.nu, b, meta.njnt], _torch.int32)
+    self._derivative_dims = tensor([
+        meta.nv, meta.nu, meta.na, b,
+        int(bool(meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_ACTUATION))),
+        meta.disableactuator], _torch.int32)
+    # Pinned qDeriv retains the compiled D sparsity, even when a tendon
+    # spans independent trees. Dense storage must preserve that approximation.
+    derivative_pattern = np.zeros((meta.nv, meta.nv), dtype=np.int32)
+    for row in range(meta.nv):
+      adr, count = int(model.D_rowadr[row]), int(model.D_rownnz[row])
+      derivative_pattern[row, model.D_colind[adr:adr+count]] = 1
+    self._derivative_pattern = tensor(derivative_pattern.reshape(-1), _torch.int32)
     self._adv_dims = tensor([meta.nu, meta.na, b, meta.disableactuator], _torch.int32)
     self._dt = tensor(np.array([meta.timestep], dtype=np.float32))
     self._dummy = _torch.zeros(1, dtype=_torch.float32, device=self._device)
@@ -1070,6 +1082,7 @@ class MetalActuators:
         "ctrl_used": _torch.zeros(b * nu, dtype=_torch.float32, device=self._device),
         "qfrc": _torch.zeros(b * nv, dtype=_torch.float32, device=self._device),
         "act_next": _torch.zeros(b * na, dtype=_torch.float32, device=self._device),
+        "velocity_derivative": _torch.zeros(b * nv * nv, dtype=_torch.float32, device=self._device),
     }
 
   @property
@@ -1188,6 +1201,33 @@ class MetalActuators:
             "force": w["force"].reshape(b, nu),
             "ctrl": w["ctrl_used"].reshape(b, nu),
             "qfrc": w["qfrc"].reshape(b, max(nv, 1))}
+
+  def run_velocity_derivative(self, ctrl, act, kin):
+    """Pinned analytical actuator block for the latest force-stage inputs.
+
+    Call after ``run_forces`` with its control, activation and kinematics.
+    Force clamps use the computed stage force; gain derivatives use the
+    original control, as in ``mjd_actuator_vel``. Returned storage is borrowed.
+    """
+    meta, b, w = self._meta, self.batch_size, self._ws
+    self._check(ctrl, "ctrl", (b, meta.nu))
+    if meta.na:
+      self._check(act, "act", (b, meta.na))
+    for name, shape in (("length", (b, meta.nu)), ("velocity", (b, meta.nu)),
+                        ("moment", (b, meta.nu, max(meta.nv, 1)))):
+      self._check(kin[name], name, shape)
+    if meta.nv:
+      self._velocity_derivative_kernel(
+          ctrl.reshape(-1), act.reshape(-1) if meta.na else self._dummy,
+          w["act_dot"], kin["length"].reshape(-1), kin["velocity"].reshape(-1),
+          w["force"], kin["moment"].reshape(-1),
+          self._gaintype, self._gainprm, self._biastype, self._biasprm,
+          self._dyntype, self._dynprm, self._actadr, self._actnum, self._actearly,
+          self._actlimited, self._actrange, self._group, self._forcelimited,
+          self._forcerange, self._lengthrange, self._acc0,
+          self._derivative_dims, self._dt, w["velocity_derivative"], self._derivative_pattern,
+          threads=(b*meta.nv*meta.nv,), group_size=(1,))
+    return w["velocity_derivative"][:b*meta.nv*meta.nv].reshape(b, meta.nv, meta.nv)
 
   def advance(self, act, act_dot, velocity):
     """Integrate activations one Euler step with exact slot forms; returns borrowed view."""

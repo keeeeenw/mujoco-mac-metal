@@ -136,7 +136,7 @@ inline float ad7_next_act(int dyntype, int slot_off, int cur_off, int br_off,
       return cur+dot*te*(1.0f-exp(-h/te));
     }
     if (slot_off==br_off) {
-      float fc=biasprm[9*a+3], fs=biasprm[9*a+4], vs=biasprm[9*a+5];
+      float fc=biasprm[10*a+3], fs=biasprm[10*a+4], vs=biasprm[10*a+5];
       float ratio=vel/max(1e-15f,vs);
       float g=fc+(fs-fc)*exp(-ratio*ratio);
       float dd=-dynprm[10*a+5]*abs(vel)/max(1e-15f,g);
@@ -158,10 +158,101 @@ inline void ad7_slot_offsets(device const float* dynprm, device const float* gai
     int a, thread int* cur_off, thread int* br_off, thread int* int_off) {
   int kk=0;
   if (dynprm[10*a+7]>0.0f) kk++;
-  if (gainprm[9*a+5]>0.0f) { *int_off=kk; kk++; } else *int_off=-1;
+  if (gainprm[10*a+5]>0.0f) { *int_off=kk; kk++; } else *int_off=-1;
   if (dynprm[10*a+2]>0.0f) kk++;
   if (dynprm[10*a+5]>0.0f) { *br_off=kk; kk++; } else *br_off=-1;
   if (dynprm[10*a]>0.0f) *cur_off=kk; else *cur_off=-1;
+}
+
+// Pinned engine_derivative.c mjd_muscleGain_vel. This is the engine's
+// analytical integrator derivative, including the saturated curve branches.
+inline float ad_muscle_gain_velocity(float len, float vel,
+    device const float* range, float acc0, device const float* prm) {
+  float force=prm[2]<0.0f?prm[3]/max(1e-15f,acc0):prm[2];
+  float L0=(range[1]-range[0])/max(1e-15f,prm[1]-prm[0]);
+  float L=prm[0]+(len-range[0])/max(1e-15f,L0);
+  float V=vel/max(1e-15f,L0*prm[6]),y=prm[8]-1.0f;
+  float dFV=V<=-1.0f?0.0f:V<=0.0f?2.0f*V+2.0f:
+      V<=y?(-2.0f*V+2.0f*y)/max(1e-15f,y):0.0f;
+  return -force*ad7_muscle_len_gain(L,prm[4],prm[5])*dFV/max(1e-15f,L0*prm[6]);
+}
+
+// Exact pinned mjd_actuator_vel block J' diag(dF/dvelocity) J. Each thread
+// owns a matrix coefficient, avoiding atomics, host evaluation, and nv caps.
+// Inputs belong to the same forward stage as actuator_force/act_dot.
+kernel void actuator_velocity_derivative(
+    device const float* ctrl [[buffer(0)]],
+    device const float* act [[buffer(1)]],
+    device const float* act_dot [[buffer(2)]],
+    device const float* length [[buffer(3)]],
+    device const float* velocity [[buffer(4)]],
+    device const float* force [[buffer(5)]],
+    device const float* moment [[buffer(6)]],
+    device const int* gaintype [[buffer(7)]],
+    device const float* gainprm [[buffer(8)]],
+    device const int* biastype [[buffer(9)]],
+    device const float* biasprm [[buffer(10)]],
+    device const int* dyntype [[buffer(11)]],
+    device const float* dynprm [[buffer(12)]],
+    device const int* actadr [[buffer(13)]],
+    device const int* actnum [[buffer(14)]],
+    device const int* actearly [[buffer(15)]],
+    device const int* actlimited [[buffer(16)]],
+    device const float* actrange [[buffer(17)]],
+    device const int* group [[buffer(18)]],
+    device const int* forcelimited [[buffer(19)]],
+    device const float* forcerange [[buffer(20)]],
+    device const float* lengthrange [[buffer(21)]],
+    device const float* acc0 [[buffer(22)]],
+    constant int* dims [[buffer(23)]],
+    constant float* step_dt [[buffer(24)]],
+    device float* derivative [[buffer(25)]],
+    device const int* pattern [[buffer(26)]],
+    uint tid [[thread_position_in_grid]]) {
+  int nv=dims[0],nu=dims[1],na=dims[2],batch=dims[3];
+  if(tid>=uint(batch*nv*nv))return;
+  int world=int(tid)/(nv*nv),row=(int(tid)/nv)%nv,col=int(tid)%nv;
+  if(!pattern[row*nv+col]){derivative[tid]=0.0f;return;}
+  float result=0.0f;
+  if(!dims[4])for(int i=0;i<nu;i++) {
+    if((dims[5]&(1<<group[i]))!=0)continue;
+    int u=world*max(nu,1)+i,base=world*max(na,1);
+    if(forcelimited[i]&&(force[u]<=forcerange[2*i]||force[u]>=forcerange[2*i+1]))continue;
+    float bias_vel=0.0f,gain_vel=0.0f;
+    if(biastype[i]==1)bias_vel=biasprm[10*i+2];
+    else if(biastype[i]==3&&dynprm[10*i]<=0.0f)
+      bias_vel=-gainprm[10*i+1]*gainprm[10*i+1]/max(1e-15f,gainprm[10*i]);
+    if(gaintype[i]==1)gain_vel=gainprm[10*i+2];
+    else if(gaintype[i]==2)gain_vel=ad_muscle_gain_velocity(
+        length[u],velocity[u],lengthrange+2*i,acc0[i],gainprm+10*i);
+    else if(gaintype[i]==3) {
+      int mode=int(gainprm[10*i+8]);
+      float dVdw=mode==1?-gainprm[10*i+6]:mode==2?-gainprm[10*i+4]:0.0f;
+      float te=dynprm[10*i],R=max(1e-15f,gainprm[10*i]),K=gainprm[10*i+1];
+      if(te>0.0f)bias_vel+=K*(dVdw-K)*(1.0f-exp(-step_dt[0]/te))/R;
+      else bias_vel+=K*dVdw/R;
+      if(dynprm[10*i+6]>0.0f)bias_vel-=dynprm[10*i+6];
+    }
+    if(gain_vel!=0.0f) {
+      float value=ctrl[u];
+      if(dyntype[i]!=0) {
+        int first=actadr[i],last=first+actnum[i]-1;
+        value=act[base+last];
+        if(actearly[i]) {
+          int current=-1,bristle=-1,integral=-1;
+          ad7_slot_offsets(dynprm,gainprm,i,&current,&bristle,&integral);
+          value=ad7_next_act(dyntype[i],last-first,current,bristle,integral,
+              value,act_dot[base+last],velocity[u],dynprm,gainprm,biasprm,i,step_dt[0]);
+          if(actlimited[i]&&dyntype[i]!=5)
+            value=clamp(value,actrange[2*i],actrange[2*i+1]);
+        }
+      }
+      bias_vel+=gain_vel*value;
+    }
+    int m=(world*max(nu,1)+i)*max(nv,1);
+    result+=moment[m+row]*bias_vel*moment[m+col];
+  }
+  derivative[tid]=result;
 }
 
 // Stage 1: clipped control copy + act_dot switch (pinned mj_fwdActuation).
