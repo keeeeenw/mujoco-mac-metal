@@ -90,7 +90,7 @@ class MetalSimulation:
     # This CPU-only contract check must finish before any constructor can
     # initialize MPS or compile a shader.
     profile = validate_stepping_profile(model, profile=profile)
-    is_integrated = profile.name == "integrated_euler_v1"
+    is_integrated = profile.name in ("integrated_euler_v1", "integrated_rk4_v1")
     with_transmissions = "transmission" in profile.name or is_integrated
     motor_model = (
         ScalarMotorModel.from_model(model)
@@ -451,6 +451,8 @@ class MetalSimulation:
       from mujoco_metal.runge_kutta import MetalRungeKutta
 
       self._rk4 = MetalRungeKutta(descriptor, batch_size, profile.timestep)
+      # Descriptors omit actuator counts; the live state owns na.
+      self._rk4._na = na
     else:
       self._rk4 = None
 
@@ -1488,7 +1490,7 @@ class MetalSimulation:
     t = time.detach().cpu().numpy() if hasattr(time, "detach") else _np.asarray(time)
     self._delay.record(self._control, t.reshape(-1), mask=mask)
 
-  def _actuation_force(self, qpos, qvel, poses):
+  def _actuation_force(self, qpos, qvel, poses, act_override=None):
     """General actuator force stage with pinned mj_fwdActuation ordering.
 
     Runs candidate-contact generation first when BODY adhesion transmissions
@@ -1496,6 +1498,7 @@ class MetalSimulation:
     transmission kinematics, gravity-compensation routing, and the fused
     dynamics/force kernel. Stashes per-step act_dot/velocity for the
     activation advance. Returns borrowed MPS qfrc_actuator.
+    ``act_override`` supplies stage activation (RK4); default is live state.
     """
     actuators = self._actuators
     state = self._state
@@ -1520,7 +1523,7 @@ class MetalSimulation:
         np.any(np.asarray(actuators.meta.jnt_actgravcomp))):
       gravcomp = self._passive.gravcomp_device(
           qpos, getattr(state, "_mpos", None), getattr(state, "_mquat", None))
-    act = getattr(state, "_act", None)
+    act = act_override if act_override is not None else getattr(state, "_act", None)
     if actuators.meta.na > 0 and act is None:
       raise ValueError("activation state is missing")
     out = actuators.run_forces(self._delayed_control(state._time), act, kin, gravcomp)
@@ -1649,7 +1652,7 @@ class MetalSimulation:
         lam_raw=lam, lam_nr=lam_nr, lam_stride=lam_s,
         act_force=self._sen_act_force, qfrc_act=self._sen_qfrc_act, out=out)
 
-  def _acceleration(self, qpos, qvel):
+  def _acceleration(self, qpos, qvel, act_override=None):
     mpos = getattr(self._state, "_mpos", None)
     mquat = getattr(self._state, "_mquat", None)
     dynamics = self._smooth.run_device(qpos, qvel, mpos, mquat)
@@ -1703,7 +1706,8 @@ class MetalSimulation:
             self._sen_act_force.shape))
         self._sen_qfrc_act.add_(t_qfrc.reshape(self._sen_qfrc_act.shape))
     if self._actuators is not None:
-      self._rhs.add_(self._actuation_force(qpos, qvel, dynamics["poses"]))
+      self._rhs.add_(self._actuation_force(qpos, qvel, dynamics["poses"],
+                                           act_override=act_override))
     if self._motor is not None:
       m_qfrc = self._motor.run_device(self._delayed_control(self._state._time))
       self._rhs.add_(m_qfrc)
@@ -1793,12 +1797,20 @@ class MetalSimulation:
           fwd_acc, _, fwd_dyn = self._acceleration(state._qpos, state._qvel)
           self._store_step_sensors(state._qpos, state._qvel, fwd_dyn,
                                    qacc=fwd_acc)
-        qpos, qvel, acceleration, time, status = self._rk4.run_device(
+        na_here = int(getattr(state, "_na", 0))
+        rk4_act = (state._act if (self._actuators is not None and na_here > 0)
+                   else None)
+        def _rk4_accel(q, v, a):
+          acc, solve_status, _ = self._acceleration(q, v, act_override=a)
+          adot = self._act_dot.clone() if na_here > 0 else None
+          return acc, adot, solve_status
+        qpos, qvel, acceleration, weighted_dot, time, status = self._rk4.run_device(
             state._qpos,
             state._qvel,
+            rk4_act,
             state._time,
             state._status,
-            lambda q, v: self._acceleration(q, v)[:2],
+            _rk4_accel,
         )
         success = status == 0
         state._qpos = torch.where(success.unsqueeze(1), qpos, state._qpos)
@@ -1806,6 +1818,16 @@ class MetalSimulation:
         state._qacc = torch.where(success[:, None], acceleration, state._qacc)
         state._time = torch.where(success, time, state._time)
         state._status = status.clone()
+        if self._actuators is not None and na_here > 0 and weighted_dot is not None:
+          # Pinned mj_advance applies mj_nextActivation to the RK-weighted
+          # act_dot from the step-start activation; failed worlds keep
+          # theirs via the accepted-step mask (R02).
+          self._act_dot.copy_(torch.where(
+              success.unsqueeze(1), weighted_dot.reshape(self._act_dot.shape),
+              self._act_dot))
+          self._success.copy_(success)
+          self._advance_activations(state)
+          state._act, self._next_act = self._next_act, state._act
         self._record_delay(pre_step_time, success)
         state._generation += 1
         if not bool(torch.all(success)):

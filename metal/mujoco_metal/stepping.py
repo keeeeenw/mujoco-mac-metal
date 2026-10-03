@@ -563,16 +563,13 @@ def validate_stepping_profile(
       "contact_free_fluid_rk4_v1",
       "contact_free_passive_rk4_v1",
       "contact_free_sensor_rk4_v1",
+      "integrated_rk4_v1",
   ):
     if not isinstance(model, mujoco.MjModel):
       raise TypeError("model must be a compiled mujoco.MjModel")
     if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_RK4):
       raise ValueError(f"{profile} requires the RK4 integrator")
-    if int(model.na) > 0:
-      # Pinned RK4 integrates actuator activation state (act_dot) at every
-      # stage; the native RK4 path holds controls with frozen activation.
-      # Reject rather than silently integrate wrong dynamics (015).
-      raise ValueError(f"{profile} excludes actuator activation state; use Euler")
+    # R06/D3: native RK4 integrates activation state at every stage.
     if int(model.nu) > 0 and bool(np.any(np.asarray(model.actuator_history)[:, 0] != 0)):
       # Pinned RK4 reads delayed control at per-stage times (d->time = T[i]);
       # the native RK4 stages share the frozen step-start time. Reject

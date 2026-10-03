@@ -242,18 +242,18 @@ def test_integrator_admission_by_combination():
   m.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICIT
   with pytest.raises(ValueError, match="Euler|mplicit"):
     validate_stepping_profile(m, profile="contact_free_euler_v1")
-  # RK4 with activation state is rejected (stages would freeze act).
+  # RK4 with activation state is integrated at every stage (R06/D3).
   m2 = mujoco.MjModel.from_xml_string(
-      '<mujoco><option integrator="RK4"/><worldbody>'
+      '<mujoco><option integrator="RK4"><flag contact="disable"/></option><worldbody>'
       '<body><joint name="h" type="hinge" axis="0 0 1"/>'
       '<geom type="sphere" size="0.1"/>'
       '</body></worldbody>'
       '<actuator><general joint="h" dyntype="filter" gainprm="5"/></actuator>'
       '</mujoco>')
   assert int(m2.na) > 0
-  with pytest.raises(ValueError, match="activation"):
-    validate_stepping_profile(m2, profile="contact_free_motor_rk4_v1")
-  # implicitfast with polynomial damping needs the external derivative.
+  prof = validate_stepping_profile(m2, profile="integrated_rk4_v1")
+  assert prof is not None
+  # implicitfast with polynomial damping assembles natively (R06/D2).
   m3 = mujoco.MjModel.from_xml_string(
       '<mujoco><option integrator="Euler"><flag contact="disable"/></option>'
       '<worldbody>'
@@ -261,5 +261,5 @@ def test_integrator_admission_by_combination():
       '<geom type="sphere" size="0.1"/></body></worldbody></mujoco>')
   m3.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
   m3.dof_dampingpoly[:] = 0.2
-  with pytest.raises(ValueError, match="[Dd]amping"):
-    validate_stepping_profile(m3, profile="contact_free_implicitfast_v1")
+  prof3 = validate_stepping_profile(m3, profile="contact_free_implicitfast_v1")
+  assert prof3 is not None

@@ -173,8 +173,11 @@ def test_tendon_armature_damping_parity_gpu():
                              rtol=1e-4, atol=1e-4)
 
 
-def test_actuator_delay_history_rejected_cpu():
+def test_actuator_delay_history_admitted_cpu():
+  # R06/D1: delay/history admitted with validated config (live reads when
+  # nsample is 0, ring semantics otherwise); malformed config still raises.
   from mujoco_metal.stepping import validate_stepping_profile
+  from mujoco_metal.stateful_actuation import actuator_delay_config
   m = mujoco.MjModel.from_xml_string(
       "<mujoco><option timestep='0.002' integrator='Euler'/>"
       "<worldbody><body pos='0 0 0.5'>"
@@ -184,8 +187,9 @@ def test_actuator_delay_history_rejected_cpu():
       "<actuator><motor name='m' joint='h' gear='1'/></actuator>"
       "</mujoco>")
   m.actuator_delay[0] = 0.01
-  with pytest.raises(ValueError, match="delay"):
-    validate_stepping_profile(m, 0.002, profile="integrated_euler_v1")
+  validate_stepping_profile(m, 0.002, profile="integrated_euler_v1")
+  ns, ip, dl = actuator_delay_config(m)
+  assert list(ns) == [0] and list(dl) == [0.01]
 
   m2 = mujoco.MjModel.from_xml_string(
       "<mujoco><option timestep='0.002' integrator='Euler'/>"
@@ -196,8 +200,10 @@ def test_actuator_delay_history_rejected_cpu():
       "<actuator><motor name='m' joint='h' gear='1'/></actuator>"
       "</mujoco>")
   m2.actuator_history[0] = 1
-  with pytest.raises(ValueError, match="history"):
-    validate_stepping_profile(m2, 0.002, profile="integrated_euler_v1")
+  # Single-sample history buffer admitted (holds the latest control).
+  validate_stepping_profile(m2, 0.002, profile="integrated_euler_v1")
+  ns2, _, _ = actuator_delay_config(m2)
+  assert list(ns2) == [1]
 
 
 @_needs_gpu()
