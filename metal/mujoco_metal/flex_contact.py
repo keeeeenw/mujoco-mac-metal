@@ -25,7 +25,7 @@ _KIND_GEOM_ELEMENT = 2
 _KIND_INTERNAL_VERTEX_ELEMENT = 3
 _KIND_ELEMENT_PAIR_VERTEX = 4
 _KIND_ELEMENT_PAIR_EDGE = 5
-_KIND_ELEMENT_PAIR_EDGE = 5
+_KIND_ELEMENT_PAIR = 6
 
 
 def _frozen(value, dtype, shape=None):
@@ -80,6 +80,27 @@ def _row_span(condim, cone):
   return 2 * (condim - 1)
 
 
+def _active_elements(model, flex_id, elements):
+  """Return element IDs admitted by pinned ``mj_isElemActive`` semantics."""
+  if int(model.flex_dim[flex_id]) < 3:
+    return range(elements)
+  start = int(model.flex_elemadr[flex_id])
+  active_layers = int(model.flex_activelayers[flex_id])
+  layers = np.asarray(model.flex_elemlayer, dtype=np.int32)
+  return (e for e in range(elements)
+          if int(layers[start + e]) < active_layers)
+
+
+def _shares_body(model, vertices1, vertices2):
+  """Pinned flex narrowphase excludes features attached to one body."""
+  body = np.asarray(model.flex_vertbodyid, dtype=np.int32)
+  bodies1 = {int(body[int(v)]) for v in vertices1}
+  bodies1.discard(-1)
+  if not bodies1:
+    return False
+  return any(int(body[int(v)]) in bodies1 for v in vertices2)
+
+
 @dataclass(frozen=True)
 class FlexContactDescriptor:
   """Immutable candidate feature pairs and their fixed solver row spans."""
@@ -125,9 +146,9 @@ class FlexContactDescriptor:
 def lower_flex_contacts(model):
   """Lower geometry filters, contact mixing, and feature-pair capacity.
 
-  Unlike the former ``nflexvert * 4`` heuristic, every candidate feature has
-  its own contact slot and a row span derived from its mixed ``condim`` and
-  cone. No obstacle can overwrite another obstacle's slot.
+  Element candidates retain the complete flex simplex and assign a fixed row
+  span from mixed ``condim`` and cone. Plane contact retains its pinned
+  vertex-based slot layout. No obstacle can overwrite another obstacle's slot.
   """
   if not isinstance(model, mujoco.MjModel):
     raise TypeError("flex contact lowering requires a compiled mujoco.MjModel")
@@ -144,6 +165,8 @@ def lower_flex_contacts(model):
     ea, en = int(model.flex_elemadr[f]), int(model.flex_elemnum[f])
     eda = int(model.flex_elemdataadr[f])
     nper = int(model.flex_dim[f]) + 1
+    active_elements = tuple(_active_elements(model, f, en))
+    vert_body = np.asarray(model.flex_vertbodyid, dtype=np.int32)
     elems = [flex_elem[eda + e*nper:eda + (e+1)*nper].astype(np.int32) + va
              for e in range(en)]
 
@@ -169,32 +192,27 @@ def lower_flex_contacts(model):
                        nodes, np.full(4, -1, np.int32), condim, span,
                        friction, solref, solimp, margin, gap, -1, -1))
       else:
-        # A feature slot is assigned per element vertex. The element topology
-        # is retained so the narrowphase can extend vertex samples to edge/face
-        # features without changing solver row identities or capacity.
-        for e, vertices in enumerate(elems):
-          for v in vertices:
-            nodes = np.full(4, -1, np.int32)
-            nodes[:nper] = vertices
-            rows.append((_KIND_GEOM_VERTEX, f, e, int(v), -1, -1, -1, g,
-                         nodes, np.full(4, -1, np.int32), condim, span,
-                         friction, solref, solimp, margin, gap, -1, -1))
-          # Retain face/element candidates as well as vertex samples. The
-          # narrowphase uses barycentric coordinates on the actual simplex
-          # face, so contacts through a triangle interior are not lost.
-          faces = ([vertices] if nper == 3 else
-                   [vertices[[j for j in range(4) if j != opposite]]
-                    for opposite in range(4)])
-          for face_index, face_vertices in enumerate(faces):
-            nodes = np.full(4, -1, np.int32)
-            nodes[:3] = face_vertices[:3]
-            rows.append((_KIND_GEOM_ELEMENT, f, e, -1, -1, -1, -1, g,
-                         nodes, np.full(4, -1, np.int32), condim, span,
-                         friction, solref, solimp, margin, gap,
-                         face_index, -1))
+        # The pinned element path sees the complete convex simplex. Its
+        # support map chooses active vertices as the CCD direction changes;
+        # lowering vertex/face samples here would duplicate physical contacts.
+        if (gtype == int(mujoco.mjtGeom.mjGEOM_SDF)
+            and int(model.flex_dim[f]) != 2):
+          continue
+        geom_body = int(model.geom_bodyid[g])
+        for e in active_elements:
+          vertices = elems[e]
+          if geom_body >= 0 and np.any(vert_body[vertices] == geom_body):
+            continue
+          nodes = np.full(4, -1, np.int32)
+          nodes[:nper] = vertices
+          rows.append((_KIND_GEOM_ELEMENT, f, e, -1, -1, -1, -1, g,
+                       nodes, np.full(4, -1, np.int32), condim, span,
+                       friction, solref, solimp, margin, gap, -1, -1))
 
     # Predefined internal contacts are vertex/element feature pairs.
-    if bool(model.flex_internal[f]) and int(model.flex_dim[f]) == 3:
+    if (not bool(model.flex_rigid[f])
+        and (fmask & famask)
+        and bool(model.flex_internal[f])):
       pairadr = int(model.flex_evpairadr[f])
       pairnum = int(model.flex_evpairnum[f])
       evpair = np.asarray(model.flex_evpair, dtype=np.int32).reshape(-1, 2)
@@ -202,7 +220,8 @@ def lower_flex_contacts(model):
           model, ("flex", f), ("flex", f))
       span = _row_span(condim, cone)
       for element, vertex in evpair[pairadr:pairadr + pairnum]:
-        if 0 <= element < len(elems) and va <= vertex < va + vn:
+        if (0 <= element < len(elems) and va <= vertex < va + vn
+            and int(element) in active_elements):
           nodes = np.full(4, -1, np.int32)
           face = [int(v) for v in elems[int(element)] if int(v) != int(vertex)]
           nodes[:3] = face[:3]
@@ -211,41 +230,43 @@ def lower_flex_contacts(model):
                        nodes, np.full(4, -1, np.int32), condim, span,
                        friction, solref, solimp, float(model.flex_margin[f]),
                        float(model.flex_gap[f]), -1, -1))
+      if int(model.flex_dim[f]) == 3:
+        # The pinned tetrahedral internal pass tests each opposite vertex
+        # against the other three vertices of that tetrahedron.
+        for element in active_elements:
+          vertices = elems[element]
+          for opposite, vertex in enumerate(vertices):
+            nodes = np.full(4, -1, np.int32)
+            nodes[:3] = np.delete(vertices, opposite)
+            rows.append((_KIND_INTERNAL_VERTEX_ELEMENT, f, element, -1,
+                         f, element, int(vertex), -1, nodes,
+                         np.full(4, -1, np.int32), 1, 1, friction, solref,
+                         solimp, float(model.flex_margin[f]),
+                         float(model.flex_gap[f]), opposite, -1))
 
-    # Self-collision candidates retain both complete element identities.
+    # Self-collision candidates retain one complete convex pair per element
+    # pair. Narrowphase feature selection belongs to the support algorithm,
+    # never to a cartesian product of point/edge guesses.
     if (not bool(model.flex_rigid[f])
+        and (fmask & famask)
         and int(model.flex_selfcollide[f]) != int(mujoco.mjtFlexSelf.mjFLEXSELF_NONE)):
       condim, solref, solimp, friction = _contact_parameters(
           model, ("flex", f), ("flex", f))
       span = _row_span(condim, cone)
-      for e1 in range(en):
-        for e2 in range(e1 + 1, en):
-          if np.intersect1d(elems[e1], elems[e2]).size:
+      for e1 in active_elements:
+        for e2 in active_elements:
+          if e2 <= e1:
             continue
-          for side, vertices in ((0, elems[e1]), (1, elems[e2])):
-            for v in vertices:
-              nodes1 = np.full(4, -1, np.int32)
-              nodes2 = np.full(4, -1, np.int32)
-              nodes1[:nper], nodes2[:nper] = elems[e1], elems[e2]
-              rows.append((_KIND_ELEMENT_PAIR_VERTEX, f, e1,
-                           int(v) if side == 0 else -1,
-                           f, e2, int(v) if side == 1 else -1, -1,
-                           nodes1, nodes2, condim, span, friction, solref,
-                           solimp, float(model.flex_margin[f]),
-                           float(model.flex_gap[f]), -1, -1))
-          edge_list = ([(0, 1), (1, 2), (2, 0)] if nper == 3 else
-                       [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
-          for ia, ib in edge_list:
-            for ja, jb in edge_list:
-              nodes1 = np.full(4, -1, np.int32)
-              nodes2 = np.full(4, -1, np.int32)
-              nodes1[:2] = elems[e1][[ia, ib]]
-              nodes2[:2] = elems[e2][[ja, jb]]
-              rows.append((_KIND_ELEMENT_PAIR_EDGE, f, e1, ia*nper+ib,
-                           f, e2, ja*nper+jb, -1,
-                           nodes1, nodes2, condim, span, friction, solref,
-                           solimp, float(model.flex_margin[f]),
-                           float(model.flex_gap[f]), ia*nper+ib, ja*nper+jb))
+          if _shares_body(model, elems[e1], elems[e2]):
+            continue
+          nodes1 = np.full(4, -1, np.int32)
+          nodes2 = np.full(4, -1, np.int32)
+          nodes1[:nper], nodes2[:nper] = elems[e1], elems[e2]
+          rows.append((_KIND_ELEMENT_PAIR, f, e1, -1,
+                       f, e2, -1, -1, nodes1, nodes2,
+                       condim, span, friction, solref, solimp,
+                       float(model.flex_margin[f]), float(model.flex_gap[f]),
+                       -1, -1))
 
   # Cross-flex element features. The opposite bitmask test is the same one
   # used by the pinned body:flex broadphase.
@@ -265,38 +286,24 @@ def lower_flex_contacts(model):
       va1, va2 = int(model.flex_vertadr[f1]), int(model.flex_vertadr[f2])
       elems1 = [flex_elem[d1 + e*n1:d1 + (e+1)*n1] + va1 for e in range(e1n)]
       elems2 = [flex_elem[d2 + e*n2:d2 + (e+1)*n2] + va2 for e in range(e2n)]
+      active1 = tuple(_active_elements(model, f1, e1n))
+      active2 = tuple(_active_elements(model, f2, e2n))
       condim, solref, solimp, friction = _contact_parameters(
           model, ("flex", f1), ("flex", f2))
       span = _row_span(condim, cone)
-      for e1, verts1 in enumerate(elems1):
-        for e2, verts2 in enumerate(elems2):
-          for side, vertices in ((0, verts1), (1, verts2)):
-            for v in vertices:
-              nodes1 = np.full(4, -1, np.int32)
-              nodes2 = np.full(4, -1, np.int32)
-              nodes1[:n1], nodes2[:n2] = verts1, verts2
-              rows.append((_KIND_ELEMENT_PAIR_VERTEX, f1, e1,
-                           int(v) if side == 0 else -1,
-                           f2, e2, int(v) if side == 1 else -1, -1,
-                           nodes1, nodes2, condim, span, friction, solref,
-                           solimp, float(model.flex_margin[f1] + model.flex_margin[f2]),
-                           float(model.flex_gap[f1] + model.flex_gap[f2]), -1, -1))
-          edge_list1 = ([(0, 1), (1, 2), (2, 0)] if n1 == 3 else
-                        [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
-          edge_list2 = ([(0, 1), (1, 2), (2, 0)] if n2 == 3 else
-                        [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
-          for ia, ib in edge_list1:
-            for ja, jb in edge_list2:
-              nodes1 = np.full(4, -1, np.int32)
-              nodes2 = np.full(4, -1, np.int32)
-              nodes1[:2] = verts1[[ia, ib]]
-              nodes2[:2] = verts2[[ja, jb]]
-              rows.append((_KIND_ELEMENT_PAIR_EDGE, f1, e1, ia*n1,
-                           f2, e2, ja*n2, -1,
-                           nodes1, nodes2, condim, span, friction, solref,
-                           solimp, float(model.flex_margin[f1] + model.flex_margin[f2]),
-                           float(model.flex_gap[f1] + model.flex_gap[f2]),
-                           ia*n1+ib, ja*n2+jb))
+      for e1 in active1:
+        verts1 = elems1[e1]
+        for e2 in active2:
+          verts2 = elems2[e2]
+          if _shares_body(model, verts1, verts2):
+            continue
+          nodes1 = np.full(4, -1, np.int32)
+          nodes2 = np.full(4, -1, np.int32)
+          nodes1[:n1], nodes2[:n2] = verts1, verts2
+          rows.append((_KIND_ELEMENT_PAIR, f1, e1, -1, f2, e2, -1, -1,
+                       nodes1, nodes2, condim, span, friction, solref, solimp,
+                       float(model.flex_margin[f1] + model.flex_margin[f2]),
+                       float(model.flex_gap[f1] + model.flex_gap[f2]), -1, -1))
 
   count = len(rows)
   kinds = np.asarray([r[0] for r in rows], np.int32)
@@ -371,7 +378,7 @@ def lower_flex_contacts(model):
 
 
 class FlexContactProgram:
-  """State-dependent fixed-slot flex narrowphase on the native Metal path."""
+  """Fixed-slot flex contact workspace with a fail-closed narrowphase gate."""
 
   def __init__(self, model, batch_size=1, device="mps"):
     import torch
@@ -382,6 +389,9 @@ class FlexContactProgram:
     self.device = torch.device(device)
     self._torch = torch
     d = self.descriptor
+    self._narrowphase_admitted = (
+        not d.global_enabled
+        or bool(np.all(d.kind == _KIND_PLANE_VERTEX)))
     def tensor(value, dtype=None):
       return torch.as_tensor(np.array(value, copy=True), dtype=dtype,
                              device=self.device)
@@ -426,11 +436,12 @@ class FlexContactProgram:
         if self.device.type == "mps" and d.slot_count else None)
 
   def run_device(self, flexvert_xpos, geom_pos, geom_quat):
-    """Return one immutable-identity result record per lowered candidate.
+    """Return one immutable-identity result record per admitted candidate.
 
-    The fixed arrays are never compacted in Python. Solver integration uses
-    ``active`` to disable empty feature slots and ``row_start/row_span`` to
-    retain each candidate's independent friction-cone block.
+    Plane/vertex contact has the current source-matched narrowphase. Enabled
+    geometry/element and self/cross-element contacts fail closed until their
+    support/CCD/manifold implementation is complete. The fixed arrays are
+    never compacted in Python.
     """
     torch = self._torch
     d = self.descriptor
@@ -453,6 +464,10 @@ class FlexContactProgram:
               "vert1": self._vert1, "vert2": self._vert2,
               "nodes1": self._nodes1, "nodes2": self._nodes2,
               "feature1": self._feature1, "feature2": self._feature2}
+    if d.global_enabled and not self._narrowphase_admitted:
+      raise NotImplementedError(
+          "flex element/geom and self/cross narrowphase is not admitted until "
+          "the pinned support/CCD/manifold implementation is complete")
     active = torch.empty((b, nslot), dtype=torch.int32, device=self.device)
     dist = torch.empty((b, nslot), dtype=torch.float32, device=self.device)
     pos = torch.empty((b, nslot, 3), dtype=torch.float32, device=self.device)

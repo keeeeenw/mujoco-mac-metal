@@ -5,11 +5,13 @@
 
 import mujoco
 import numpy as np
+import pytest
 
 from mujoco_metal.flex_contact import (
-    _KIND_ELEMENT_PAIR_VERTEX,
+    _KIND_ELEMENT_PAIR,
     _KIND_GEOM_ELEMENT,
     _KIND_PLANE_VERTEX,
+    FlexContactProgram,
     lower_flex_contacts,
 )
 
@@ -32,6 +34,18 @@ def _flex(name, pos, contype, conaffinity):
       <edge stiffness="0" damping="0"/>
       <elasticity young="100" poisson=".2" thickness=".01"
                   elastic2d="stretch"/>
+    </flexcomp>
+  """
+
+
+def _volume_flex(name, selfcollide, contype=1, conaffinity=0):
+  return f"""
+    <flexcomp name="{name}" type="grid" count="2 2 2"
+              pos="0 0 .1" spacing=".1 .1 .1" mass="1" dim="3">
+      <contact contype="{contype}" conaffinity="{conaffinity}"
+               selfcollide="{selfcollide}"/>
+      <edge stiffness="0" damping="0"/>
+      <elasticity young="100" poisson=".2"/>
     </flexcomp>
   """
 
@@ -78,25 +92,21 @@ def test_elliptic_rows_follow_mixed_condim_without_overwriting_features():
       descriptor.row_start, np.arange(nvert, dtype=np.int32) * 4)
 
 
-def test_cross_flex_candidates_retain_both_elements_and_side_vertex_ids():
+def test_cross_flex_candidates_retain_one_complete_simplex_pair():
   first = _flex("left", "0 0 .1", 1, 0)
   second = _flex("right", ".5 0 .1", 0, 1)
   model = _model("", first + second)
   descriptor = lower_flex_contacts(model)
-  pair_mask = ((descriptor.kind == _KIND_ELEMENT_PAIR_VERTEX)
+  pair_mask = ((descriptor.kind == _KIND_ELEMENT_PAIR)
                & (descriptor.flex1 == 0) & (descriptor.flex2 == 1))
   pair_ids = np.flatnonzero(pair_mask)
-  assert pair_ids.size == (2 * int(model.flex_elemnum[0])
-                           * int(model.flex_elemnum[1]) * 3)
+  assert pair_ids.size == (int(model.flex_elemnum[0])
+                           * int(model.flex_elemnum[1]))
   assert np.all(descriptor.elem1[pair_ids] >= 0)
   assert np.all(descriptor.elem2[pair_ids] >= 0)
-  assert np.all((descriptor.vert1[pair_ids] >= 0)
-                ^ (descriptor.vert2[pair_ids] >= 0))
   assert np.all(descriptor.nodes1[pair_ids, :3] >= 0)
   assert np.all(descriptor.nodes2[pair_ids, :3] >= 0)
   second_vertadr = int(model.flex_vertadr[1])
-  assert np.all(descriptor.vert2[pair_ids][descriptor.vert2[pair_ids] >= 0]
-                >= second_vertadr)
   assert np.all(descriptor.nodes2[pair_ids, :3] >= second_vertadr)
 
 
@@ -129,3 +139,38 @@ def test_disabled_global_contacts_have_no_candidate_slots():
   descriptor = lower_flex_contacts(model)
   assert descriptor.slot_count > 0
   assert not descriptor.global_enabled
+
+
+def test_tetrahedron_element_candidates_follow_pinned_active_layers():
+  model = _model(
+      '<geom type="sphere" size=".2" contype="0" conaffinity="1"/>',
+      _volume_flex("volume", "none"))
+  assert int(model.flex_dim[0]) == 3
+  assert int(model.flex_elemnum[0]) > 0
+  descriptor = lower_flex_contacts(model)
+  assert np.count_nonzero(descriptor.kind == _KIND_GEOM_ELEMENT) == int(
+      model.flex_elemnum[0])
+  # This is the same strict less-than layer rule as mj_isElemActive.
+  model.flex_activelayers[0] = 0
+  inactive = lower_flex_contacts(model)
+  assert not np.any(inactive.kind == _KIND_GEOM_ELEMENT)
+
+
+def test_self_collision_requires_matching_contype_and_conaffinity():
+  model = _model(
+      '', _volume_flex("volume", "narrow", contype=1, conaffinity=0))
+  descriptor = lower_flex_contacts(model)
+  assert not np.any(descriptor.kind == _KIND_ELEMENT_PAIR)
+
+
+def test_enabled_nonplane_contacts_fail_closed_until_ccd_is_admitted():
+  torch = pytest.importorskip("torch")
+  model = _model(
+      '<geom type="sphere" size=".2" contype="0" conaffinity="1"/>',
+      _volume_flex("volume", "none"))
+  program = FlexContactProgram(model, device="cpu")
+  with pytest.raises(NotImplementedError, match="support/CCD/manifold"):
+    program.run_device(
+        torch.zeros((1, model.nflexvert, 3)),
+        torch.zeros((1, model.ngeom, 3)),
+        torch.tensor([[[1., 0., 0., 0.]]]))
