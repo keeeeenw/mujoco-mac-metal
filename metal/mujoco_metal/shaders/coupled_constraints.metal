@@ -1371,7 +1371,7 @@ kernel void solve_coupled_constraints(
       if (max_res <= tol) {
         converged = true;
         break;
-      } else if (it + 1 == pgs_cap && pgs_cap < 1024 && max_res <= 1e-3f
+      } else if (maxiter > 2 && it + 1 == pgs_cap && pgs_cap < 1024 && max_res <= 1e-3f
           && max_res < win_start) {
         // Close and improved over the window: grant another window.
         win_start = max_res;
@@ -1483,7 +1483,7 @@ kernel void solve_coupled_constraints(
                     v += W[ri * nr + col] * lam[col];
                 bc[i] = v;
                 for (int j = 0; j < nf; ++j)
-                  Ac[i * 6 + j] = W[ri * nr + start + 1 + j];
+                  Ac[i * nf + j] = W[ri * nr + start + 1 + j];
               }
               thread float qv[6];
               for (int i = 0; i < 6; ++i) qv[i] = 0.0f;
@@ -1575,26 +1575,53 @@ kernel void solve_coupled_constraints(
   // mirror the pinned stage; iteration counts accumulate into diagnostics.
   int noslip_iters = dims[18];
   float noslip_tol = params[3];
+  float mean_inertia = params[4];
+  if (!isfinite(mean_inertia) || mean_inertia <= 1e-6f) mean_inertia = 1.0f;
+  float noslip_scale = 1.0f / (mean_inertia * float(max(1, nv)));
   if (noslip_iters > 0 && total_nr > 0) {
     int ns_done = 0;
     for (int nsit = 0; nsit < noslip_iters; ++nsit) {
       float improvement = 0.0f;
+      // At iteration 0, account for regularizer removal (pinned engine_solver.c:solNoSlip)
+      if (nsit == 0) {
+        for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+          float lorb = lo[row], hib = hi[row];
+          if (lorb < 0.0f && hib == -lorb && hib < INFINITY) {
+            improvement += 0.5f * lam[row] * lam[row] * R[row];
+          }
+        }
+        for (int b = 0; b < contact_block_count; ++b) {
+          int row_start = contact_block_start[b];
+          int block_size = contact_block_size[b];
+          for (int k = 0; k + 1 < block_size; k += 2) {
+            int j0 = row_start + k, j1 = row_start + k + 1;
+            if (enabled[j0]) improvement += 0.5f * lam[j0] * lam[j0] * R[j0];
+            if (enabled[j1]) improvement += 0.5f * lam[j1] * lam[j1] * R[j1];
+          }
+        }
+        for (int b = 0; b < elliptic_count; ++b) {
+          int start = elliptic_start[b];
+          int dim = elliptic_dim[b];
+          for (int i = 1; i < dim; ++i) {
+            int ri = start + i;
+            if (enabled[ri]) improvement += 0.5f * lam[ri] * lam[ri] * R[ri];
+          }
+        }
+      }
+
       // Dry friction rows: symmetric finite bounds identify joint and
       // tendon frictionloss rows (bilateral equalities use infinite
-      // bounds; limits use [0, inf)).
+      // bounds; limits use [0, inf)). Regularizer R is excluded.
       for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
         float lorb = lo[row], hib = hi[row];
         if (!(lorb < 0.0f && hib == -lorb && hib < INFINITY)) continue;
-        float diag = max(1e-15f, W[row * nr + row] + R[row]);
-        float grad = -rhs[row];
-        for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
-        grad += R[row] * lam[row];
+        float diag = max(1e-10f, W[row * nr + row]);
+        float res = -rhs[row];
+        for (int col = 0; col < total_nr; ++col) if (enabled[col]) res += W[row * nr + col] * lam[col];
         float old = lam[row];
-        float v = clamp(lam[row] - grad / diag, lorb, hib);
+        float v = clamp(old - res / diag, lorb, hib);
         float delta = v - old;
-        float change = 0.5f * delta * delta * diag + delta * (grad - 0.0f);
-        // NOTE: pinned costChange uses the pre-update residual; grad
-        // above is exactly that (computed from old lam).
+        float change = 0.5f * delta * delta * diag + delta * res;
         if (change > 1e-10f) {
           v = old;
           change = 0.0f;
@@ -1606,7 +1633,7 @@ kernel void solve_coupled_constraints(
       for (int b = 0; b < contact_block_count; ++b) {
         int row_start = contact_block_start[b];
         int block_size = contact_block_size[b];
-        // Pyramidal edge pairs: exact 2D solve preserving the pair sum.
+        // Pyramidal edge pairs: exact 2D solve preserving the pair sum (R excluded).
         for (int k = 0; k + 1 < block_size; k += 2) {
           int j0 = row_start + k, j1 = row_start + k + 1;
           if (!(enabled[j0] && enabled[j1])) continue;
@@ -1615,15 +1642,15 @@ kernel void solve_coupled_constraints(
             r0 += W[j0 * nr + col] * lam[col];
             r1 += W[j1 * nr + col] * lam[col];
           }
-          r0 += R[j0] * lam[j0];
-          r1 += R[j1] * lam[j1];
           float old0 = lam[j0], old1 = lam[j1];
           float A00 = W[j0 * nr + j0], A11 = W[j1 * nr + j1];
           float A01 = W[j0 * nr + j1];
+          float bc0 = r0 - (A00 * old0 + A01 * old1);
+          float bc1 = r1 - (A01 * old0 + A11 * old1);
           float mid = 0.5f * (old0 + old1);
           float y = 0.5f * (old0 - old1);
           float K1 = A00 + A11 - 2.0f * A01;
-          float K0 = mid * (A00 - A11) + r0 - r1;
+          float K0 = mid * (A00 - A11) + bc0 - bc1;
           float ny = y;
           if (K1 < 1e-15f) {
             ny = y;
@@ -1632,7 +1659,7 @@ kernel void solve_coupled_constraints(
             ny = ny < -mid ? -mid : (ny > mid ? mid : ny);
           }
           float f0 = mid + ny, f1 = mid - ny;
-          // costChange with the pair block (R excluded, matching pinned).
+          // costChange with unregularized residual r0, r1.
           float d0 = f0 - old0, d1 = f1 - old1;
           float change = 0.5f * (d0 * (A00 * d0 + A01 * d1) + d1 * (A01 * d0 + A11 * d1))
               + d0 * r0 + d1 * r1;
@@ -1646,33 +1673,31 @@ kernel void solve_coupled_constraints(
           improvement -= change;
         }
       }
-      // Elliptic friction blocks: QCQP over friction rows given normal.
+      // Elliptic friction blocks: QCQP over friction rows given normal (R excluded).
       for (int b = 0; b < elliptic_count; ++b) {
         int start = elliptic_start[b];
         int dim = elliptic_dim[b];
-        if (!(enabled[start] > 0.5f)) continue;
+        if (!enabled[start]) continue;
         float fn = lam[start];
         if (fn < 1e-15f) {
           for (int k = 1; k < dim; ++k) lam[start + k] = 0.0f;
           continue;
         }
         int nf = dim - 1;
-        thread float Ac[36], bc[6], oldf[6], muf[5];
+        thread float Ac[36], bc[6], oldf[6], muf[5], res_arr[6];
         for (int i = 0; i < 36; ++i) Ac[i] = 0.0f;
-        for (int i = 0; i < 6; ++i) { bc[i] = 0.0f; oldf[i] = 0.0f; }
+        for (int i = 0; i < 6; ++i) { bc[i] = 0.0f; oldf[i] = 0.0f; res_arr[i] = 0.0f; }
         for (int i = 0; i < 5; ++i) muf[i] = elliptic_friction[b * 5 + i];
         for (int i = 0; i < nf; ++i) {
           int ri = start + 1 + i;
           oldf[i] = lam[ri];
           float v = -rhs[ri];
           for (int col = 0; col < total_nr; ++col) if (enabled[col]) v += W[ri * nr + col] * lam[col];
-          v += R[ri] * lam[ri];
-          // Remove own-R (pinned flg_subR) and own-block contribution.
-          v -= R[ri] * lam[ri];
-          for (int j = 0; j < nf; ++j) v -= W[ri * nr + start + 1 + j] * lam[start + 1 + j];
+          res_arr[i] = v;
           bc[i] = v;
           for (int j = 0; j < nf; ++j) {
-            Ac[i * 6 + j] = W[ri * nr + start + 1 + j];
+            Ac[i * nf + j] = W[ri * nr + start + 1 + j];
+            bc[i] -= Ac[i * nf + j] * lam[start + 1 + j];
           }
         }
         thread float qv[6];
@@ -1688,13 +1713,13 @@ kernel void solve_coupled_constraints(
           for (int j = 0; j < nf; ++j) qv[j] *= s;
         }
         for (int i = 0; i < nf; ++i) lam[start + 1 + i] = qv[i];
-        // costChange with the friction block (R excluded, matching pinned).
+        // costChange uses unregularized residual res_arr, matching pinned engine_solver.c.
         float change = 0.0f;
         for (int i = 0; i < nf; ++i) {
           float delta = lam[start + 1 + i] - oldf[i];
           float ad = 0.0f;
-          for (int j = 0; j < nf; ++j) ad += Ac[i * 6 + j] * delta;
-          change += 0.5f * delta * ad + delta * bc[i];
+          for (int j = 0; j < nf; ++j) ad += Ac[i * nf + j] * delta;
+          change += 0.5f * delta * ad + delta * res_arr[i];
         }
         if (change > 1e-10f) {
           for (int i = 0; i < nf; ++i) lam[start + 1 + i] = oldf[i];
@@ -1703,38 +1728,23 @@ kernel void solve_coupled_constraints(
         improvement -= change;
       }
       ns_done++;
+      improvement *= noslip_scale;
       if (improvement < noslip_tol) break;
     }
     out_diagnostics[world * 10 + 1] += float(ns_done);
-    // Re-certify from the final multipliers for the status below
-    // (cone-aware: elliptic member rows use the block certificate).
-    max_res = 0.0f;
-    for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
-      int eblock = -1;
-      for (int b = 0; b < elliptic_count; ++b) {
-        int s0 = elliptic_start[b];
-        if (row >= s0 && row < s0 + elliptic_dim[b]) { eblock = b; break; }
-      }
-      if (eblock >= 0) continue;
-      max_res = max(max_res, cert_row_residual(row, W, R, rhs, ar, lam,
-                                               lo, hi, enabled, nr, total_nr,
-                                               -1, 0, lo));
+    // Note: No-slip solves the unregularized friction subproblem and deliberately
+    // deviates from the regularized QP optimum. Do not overwrite `converged` with
+    // a regularized KKT certificate here (pinned semantics, R04).
+    bool lam_finite = true;
+    for (int r = 0; r < total_nr; ++r) {
+      if (enabled[r] && !isfinite(lam[r])) { lam_finite = false; break; }
     }
-    for (int b = 0; b < elliptic_count; ++b) {
-      int start = elliptic_start[b];
-      int dim = elliptic_dim[b];
-      thread float mu[5];
-      for (int k = 0; k < 5; ++k) mu[k] = elliptic_friction[b * 5 + k];
-      max_res = max(max_res, cert_block_residual(start, dim, mu, W, R, rhs,
-                                                 lam, enabled, nr, total_nr));
-    }
-    converged = (max_res <= tol);
+    if (!lam_finite) converged = false;
   }
 
   // G2: nonfinite residuals fail explicitly (NaN never satisfies `> tol`,
   // so without this guard a nonfinite solve would report success).
-  if (!isfinite(max_res)) out_status[world] = 3;
-  else if (!converged && max_res > tol) out_status[world] = 3;
+  if (!isfinite(max_res) || !converged) out_status[world] = 3;
 
   // 10. Reconstruct forces and acceleration
   for (int row = 0; row < total_nr; ++row) if (enabled[row]) {

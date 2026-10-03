@@ -262,6 +262,7 @@ class CoupledConstraintDescriptor:
   tolerance: float
   noslip_iterations: int
   noslip_tolerance: float
+  mean_inertia: float
   solver_settings: CoupledSolverSettings
   n_eq_rows: int
 
@@ -1011,6 +1012,10 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       tolerance=eff_tol,
       noslip_iterations=noslip_iters,
       noslip_tolerance=noslip_tol if noslip_iters > 0 else 0.0,
+      mean_inertia=(float(getattr(getattr(model, "stat", None), "meaninertia", 1.0))
+                    if math.isfinite(float(getattr(getattr(model, "stat", None), "meaninertia", 1.0)))
+                    and float(getattr(getattr(model, "stat", None), "meaninertia", 1.0)) > 0
+                    else 1.0),
       solver_settings=solver_settings,
       n_eq_rows=n_eq_rows,
       ntendon=int(model.ntendon),
@@ -1317,7 +1322,7 @@ class MetalCoupledConstraints:
             dtype=torch.int32, device=self._device,
         ),
         "solver_params": torch.tensor(
-            [d.timestep, d.impratio, d.tolerance, d.noslip_tolerance],
+            [d.timestep, d.impratio, d.tolerance, d.noslip_tolerance, d.mean_inertia],
             dtype=torch.float32, device=self._device,
         ),
     }

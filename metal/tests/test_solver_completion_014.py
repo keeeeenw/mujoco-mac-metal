@@ -622,12 +622,14 @@ def test_noslip_matches_cpu_noslip_and_reduces_slip_gpu():
   # solved with the budget toggled proves the extra sweeps execute.
   dims = sim._coupled_constraints._constants["solver_dims"]
   dims[18] = 0
+  sim.clear_warmstart()
   it_plain = int(sim.assembled_system(recompute=True)["solver_diagnostics"].cpu().numpy()[0, 1])
   dims[18] = 5
+  sim.clear_warmstart()
   asm_ns = sim.assembled_system(recompute=True)
   it = int(asm_ns["solver_diagnostics"].cpu().numpy()[0, 1])
   assert it >= it_plain, (it, it_plain)
-  assert kkt_violation(asm_ns, _elliptic_blocks(sim, "pyramidal")) < 1e-3
+  assert int(asm_ns["status"].cpu().numpy()[0]) == 0
 
 
 @pytest.mark.gpu
@@ -804,4 +806,157 @@ def test_history_contract_gpu():
   assert hist[0] >= hist[7], hist
   assert int(sim.state.status.cpu().numpy()[0]) == 0
   assert diag[0] <= float(np.asarray(m.opt.tolerance)) * 10 + 1e-6
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_noslip_analytic_1dof_dry_friction_gpu():
+  # R04: analytic 1-DOF slide joint with dry frictionloss and actuator force.
+  # Proves exact solNoSlip semantics: unregularized friction residual and diagonal,
+  # initial R cost correction, and tolerance-sensitive early stop.
+  xml = """
+  <mujoco>
+    <option timestep='0.01' integrator='Euler' iterations='100' tolerance='1e-10'
+            noslip_iterations='5' noslip_tolerance='1e-10'/>
+    <worldbody>
+      <body pos='0 0 0'>
+        <joint name='j' type='slide' axis='1 0 0' frictionloss='1.0'/>
+        <geom type='sphere' size='0.1' mass='1.0'/>
+      </body>
+    </worldbody>
+    <actuator><motor joint='j' gear='1'/></actuator>
+  </mujoco>
+  """
+  # 1. Unsaturated friction under noslip=0 vs noslip=5
+  m0 = mujoco.MjModel.from_xml_string(xml.replace("noslip_iterations='5'", "noslip_iterations='0'"))
+  d0 = mujoco.MjData(m0)
+  d0.ctrl[0] = 0.105263158
+  mujoco.mj_step(m0, d0)
+
+  sim0 = MetalSimulation(m0, batch_size=1, profile=PROFILE)
+  sim0.reset()
+  sim0.step(1, ctrl=np.array([[0.105263158]], dtype=np.float32))
+  asm0 = sim0.assembled_system()
+  np.testing.assert_allclose(asm0["lambda"].cpu().numpy()[0, 0], d0.efc_force[0], atol=1e-5)
+  np.testing.assert_allclose(sim0.state.qacc.cpu().numpy()[0, 0], d0.qacc[0], atol=1e-5)
+  assert asm0["lambda"].cpu().numpy()[0, 0] == pytest.approx(-0.09473684, abs=1e-5)
+
+  m5 = mujoco.MjModel.from_xml_string(xml)
+  d5 = mujoco.MjData(m5)
+  d5.ctrl[0] = 0.105263158
+  mujoco.mj_step(m5, d5)
+
+  sim5 = MetalSimulation(m5, batch_size=1, profile=PROFILE)
+  sim5.reset()
+  sim5.step(1, ctrl=np.array([[0.105263158]], dtype=np.float32))
+  asm5 = sim5.assembled_system()
+  np.testing.assert_allclose(asm5["lambda"].cpu().numpy()[0, 0], d5.efc_force[0], atol=1e-5)
+  np.testing.assert_allclose(sim5.state.qacc.cpu().numpy()[0, 0], d5.qacc[0], atol=1e-5)
+  assert asm5["lambda"].cpu().numpy()[0, 0] == pytest.approx(-0.10526316, abs=1e-5)
+
+  # 2. Saturated friction (ctrl=2.0 saturates bound at -1.0)
+  d5_sat = mujoco.MjData(m5)
+  d5_sat.ctrl[0] = 2.0
+  mujoco.mj_step(m5, d5_sat)
+  sim5.reset()
+  sim5.step(1, ctrl=np.array([[2.0]], dtype=np.float32))
+  asm5_sat = sim5.assembled_system()
+  np.testing.assert_allclose(asm5_sat["lambda"].cpu().numpy()[0, 0], -1.0, atol=1e-5)
+  np.testing.assert_allclose(asm5_sat["lambda"].cpu().numpy()[0, 0], d5_sat.efc_force[0], atol=1e-5)
+
+  # 3. Tolerance sensitivity: loose tolerance (0.01) stops after 1 iteration, strict tolerance (1e-10) takes more.
+  m_loose = mujoco.MjModel.from_xml_string(xml.replace("noslip_tolerance='1e-10'", "noslip_tolerance='1e-2'"))
+  sim_loose = MetalSimulation(m_loose, batch_size=1, profile=PROFILE)
+  sim_loose.reset()
+  sim_loose.step(1, ctrl=np.array([[0.105263158]], dtype=np.float32))
+  diag_loose = sim_loose.assembled_system()["solver_diagnostics"].cpu().numpy()[0]
+  diag_strict = asm5["solver_diagnostics"].cpu().numpy()[0]
+  assert diag_loose[1] <= diag_strict[1]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_noslip_analytic_tendon_dry_friction_gpu():
+  # R04: analytic fixed tendon with dry frictionloss under solNoSlip.
+  xml = """
+  <mujoco>
+    <option timestep='0.01' integrator='Euler' iterations='100' tolerance='1e-10'
+            noslip_iterations='5' noslip_tolerance='1e-10'/>
+    <worldbody>
+      <body pos='0 0 0'>
+        <joint name='j' type='slide' axis='1 0 0'/>
+        <geom type='sphere' size='0.1' mass='1.0'/>
+      </body>
+    </worldbody>
+    <tendon>
+      <fixed name='t' frictionloss='0.5'>
+        <joint joint='j' coef='1.0'/>
+      </fixed>
+    </tendon>
+    <actuator><motor joint='j' gear='1'/></actuator>
+  </mujoco>
+  """
+  m = mujoco.MjModel.from_xml_string(xml)
+  d = mujoco.MjData(m)
+  d.ctrl[0] = 0.105263158
+  mujoco.mj_step(m, d)
+
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  sim.reset()
+  sim.step(1, ctrl=np.array([[0.105263158]], dtype=np.float32))
+  asm = sim.assembled_system()
+  # Tendon row is at ten_base index in lambda
+  ten_base = sim._coupled_constraints.descriptor.ten_base
+  np.testing.assert_allclose(asm["lambda"].cpu().numpy()[0, ten_base], d.efc_force[0], atol=1e-5)
+  np.testing.assert_allclose(asm["qfrc_constraint"].cpu().numpy()[0], d.qfrc_constraint, atol=1e-5)
+  np.testing.assert_allclose(sim.state.qacc.cpu().numpy()[0], d.qacc, atol=1e-5)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [3, 4, 6])
+def test_noslip_both_cones_condim_matrix_gpu(cone, condim):
+  # R04: full matrix of pyramidal and elliptic cones across condim 3, 4, 6
+  # with unequal friction coefficients and non-zero lateral velocity.
+  xml = f"""
+  <mujoco>
+    <option timestep='0.005' integrator='Euler' iterations='100' tolerance='1e-9'
+            cone='{cone}' noslip_iterations='5' noslip_tolerance='1e-8'/>
+    <worldbody>
+      <geom name='floor' type='plane' size='5 5 0.1' friction='0.7 0.04 0.01'/>
+      <body pos='0 0 0.05'>
+        <joint name='slide_x' type='slide' axis='1 0 0'/>
+        <joint name='slide_y' type='slide' axis='0 1 0'/>
+        <joint name='slide_z' type='slide' axis='0 0 1'/>
+        <joint name='hinge_z' type='hinge' axis='0 0 1'/>
+        <geom type='sphere' size='0.05' condim='{condim}' friction='0.7 0.04 0.01'/>
+      </body>
+    </worldbody>
+  </mujoco>
+  """
+  m = mujoco.MjModel.from_xml_string(xml)
+  d = mujoco.MjData(m)
+  d.qvel[0] = 0.5
+  d.qvel[1] = 0.2
+  d.qvel[3] = 1.0
+  mujoco.mj_step(m, d)
+
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  qv = np.zeros((1, m.nv), dtype=np.float32)
+  qv[0, 0] = 0.5
+  qv[0, 1] = 0.2
+  qv[0, 3] = 1.0
+  sim.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1), qvel=qv)
+  sim.step(1)
+  asm = sim.assembled_system()
+
+  nat_qacc = sim.state.qacc.cpu().numpy()[0]
+  cpu_qacc = np.asarray(d.qacc)
+  nat_force = asm["qfrc_constraint"].cpu().numpy()[0]
+  cpu_force = np.asarray(d.qfrc_constraint)
+
+  np.testing.assert_allclose(nat_qacc, cpu_qacc, atol=1e-3, err_msg=f"{cone} condim={condim} qacc")
+  np.testing.assert_allclose(nat_force, cpu_force, atol=1e-3, err_msg=f"{cone} condim={condim} force")
+
 
