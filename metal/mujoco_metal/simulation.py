@@ -1846,9 +1846,20 @@ class MetalSimulation:
       integration_acceleration = acceleration
       next_velocity = position_velocity = None
       if self._implicitfast is not None:
-        implicit = self._implicitfast.run_device(
-            dynamics["mass_matrix"], self._rhs
-        )
+        if bool(getattr(self._implicitfast.descriptor, "auto_derivative", False)):
+          # R06/D2: natively assembled passive/tendon derivatives from the
+          # stage tangents already computed above (None stages read as zero).
+          implicit = self._implicitfast.run_device_auto(
+              dynamics["mass_matrix"], self._rhs,
+              getattr(self, "_damping_tangent", None)
+              if getattr(self, "_passive", None) is not None else None,
+              getattr(self, "_tendon_damping", None)
+              if getattr(self, "_tendons", None) is not None else None,
+          )
+        else:
+          implicit = self._implicitfast.run_device(
+              dynamics["mass_matrix"], self._rhs
+          )
         integration_acceleration = implicit["qacc"]
         solve_status = torch.where(
             solve_status == 0, implicit["status"], solve_status

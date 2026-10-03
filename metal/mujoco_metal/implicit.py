@@ -24,6 +24,33 @@ class ImplicitFastDescriptor:
   timestep: float
   disableflags: int
   dof_damping: np.ndarray
+  auto_derivative: bool = False
+
+
+def implicitfast_auto_servable(model):
+  """Whether native code assembles velocity derivatives (R06/D2).
+
+  True when every smooth-force velocity dependence is natively covered:
+  passive dampers (linear + polynomial, device diagonal) and fixed-tendon
+  damping tangents (device rank updates); no fluid forces (no device
+  Jacobian), no activation state, and only zero-derivative scalar motors.
+  Tendon stiffness/limits are position-only (zero block).
+  """
+  if not isinstance(model, mujoco.MjModel):
+    raise TypeError("implicitfast lowering requires a MuJoCo MjModel")
+  if mujoco.__version__ != "3.10.0":
+    raise RuntimeError("implicitfast lowering requires MuJoCo 3.10.0")
+  if model.opt.density != 0 or model.opt.viscosity != 0 or np.any(model.opt.wind != 0):
+    return False
+  if int(model.na) > 0:
+    return False
+  if int(model.nu) > 0:
+    try:
+      from mujoco_metal.actuation import ScalarMotorModel
+      ScalarMotorModel.from_model(model)
+    except ValueError:
+      return False
+  return True
 
 
 def implicitfast_supports_automatic(model):
@@ -116,21 +143,34 @@ def lower_implicitfast(model, *, external_derivative=False):
     raise ValueError("implicitfast stage excludes MuJoCo plugins and mocap bodies")
   if int(model.na) > 0:
     raise ValueError("implicitfast stage excludes activation state (owned by milestone 015)")
-  if not external_derivative and model.ntendon:
-    raise ValueError("implicitfast tendon derivatives require an external full qDeriv")
-  if not external_derivative and (model.opt.density != 0 or model.opt.viscosity != 0):
-    raise ValueError("implicitfast fluid velocity derivatives are unsupported")
-  if not external_derivative and np.any(np.asarray(model.dof_dampingpoly) != 0):
-    raise ValueError("implicitfast stage currently supports constant DOF damping only")
+  # Nonlinear velocity dependence (tendon damping, polynomial dampers)
+  # is served by native automatic assembly when auto-servable; otherwise
+  # an external full qDeriv (or constant damping) is required. Fluid has
+  # no device Jacobian and always needs the external path.
+  if not external_derivative and (
+      model.ntendon or np.any(np.asarray(model.dof_dampingpoly) != 0)):
+    if not implicitfast_auto_servable(model):
+      raise ValueError(
+          "implicitfast nonlinear velocity derivatives require an external "
+          "full qDeriv (native automatic assembly covers passive/tendon "
+          "terms only, never fluid)")
   if model.nu and not external_derivative:
     from mujoco_metal.actuation import ScalarMotorModel
     ScalarMotorModel.from_model(model)
   if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
     raise ValueError("implicitfast timestep must be finite and positive")
+  # Native automatic assembly engages only where the baseline is inexact
+  # (tendon damping or polynomial dampers present); otherwise the baseline
+  # constant-damping path runs bit-identically to before. The flag records
+  # native availability independently of the external-derivative mode.
+  auto = (implicitfast_auto_servable(model)
+          and (int(model.ntendon) > 0
+               or bool(np.any(np.asarray(model.dof_dampingpoly) != 0))))
   return ImplicitFastDescriptor(
       nv=int(model.nv), timestep=float(model.opt.timestep),
       disableflags=int(model.opt.disableflags),
       dof_damping=_frozen(model.dof_damping, np.float32),
+      auto_derivative=bool(auto),
   )
 
 
@@ -226,6 +266,40 @@ class ImplicitFastProgram:
     ).contiguous()
     self._dims = torch.tensor([self.batch_size, self.descriptor.nv], dtype=torch.int32, device=self._device)
     self._timestep = torch.tensor([self.descriptor.timestep], dtype=torch.float32, device=self._device)
+
+  def run_device_auto(self, mass_matrix, qfrc_smooth, passive_diag, tendon_tangent=None):
+    """Solve with natively assembled velocity derivatives (R06/D2).
+
+    ``passive_diag`` is the device per-dof damping tangent magnitudes
+    ``(b, nv)`` (passive stage ``deriv`` output, already damper-gated) and
+    ``tendon_tangent`` the device ``(b, nv, nv)`` tendon damping tangent
+    (or None without fixed tendons). The assembled derivative is
+    ``-(diag(passive) + tendon)``, matching
+    :func:`implicit_derivative_reference` for auto-servable models; the
+    solve then follows the standard external-derivative path. Only valid
+    when the descriptor carries ``auto_derivative``.
+    """
+    torch, nv, b = self._torch, self.descriptor.nv, self.batch_size
+    if not self.descriptor.auto_derivative:
+      raise ValueError("this program was lowered without automatic derivatives")
+    if passive_diag is None:
+      passive_diag = torch.zeros((b, nv), dtype=torch.float32, device=self._device)
+    for name, tensor, shape in (
+        ("passive_diag", passive_diag, (b, nv)),
+    ):
+      if (not isinstance(tensor, torch.Tensor) or tensor.device.type != "mps"
+              or tensor.dtype != torch.float32 or tuple(tensor.shape) != shape
+              or not tensor.is_contiguous()):
+        raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
+    if tendon_tangent is None:
+      combined = -torch.diag_embed(passive_diag)
+    else:
+      if (not isinstance(tendon_tangent, torch.Tensor) or tendon_tangent.device.type != "mps"
+              or tendon_tangent.dtype != torch.float32
+              or tuple(tendon_tangent.shape) != (b, nv, nv) or not tendon_tangent.is_contiguous()):
+        raise ValueError(f"tendon_tangent must be contiguous float32 MPS with shape ({b}, {nv}, {nv})")
+      combined = -(torch.diag_embed(passive_diag) + tendon_tangent)
+    return self.run_device(mass_matrix, qfrc_smooth, combined)
 
   def run_device(self, mass_matrix, qfrc_smooth, force_velocity_derivative=None):
     """Return borrowed ``effective_mass``, ``qacc`` and per-world status tensors."""

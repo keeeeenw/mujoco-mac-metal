@@ -247,8 +247,7 @@ def test_automatic_derivative_pinned_step_parity_gpu():
 
 
 @_needs_gpu()
-def test_fluid_implicitfast_trajectory_parity_gpu():
-  # R06d end-to-end: native solve with automatic derivatives (passive +
+def test_fluid_implicitfast_trajectory_parity_gpu():  # R06d end-to-end: native solve with automatic derivatives (passive +
   # fluid) plus pinned advance math reproduces CPU implicitfast stepping
   # on a viscous + dense fluid hinge.
   import os
@@ -289,3 +288,93 @@ def test_fluid_implicitfast_trajectory_parity_gpu():
     mujoco.mj_step(m, d2)
   np.testing.assert_allclose(nq[0], np.asarray(d2.qpos), rtol=1e-3, atol=1e-4)
   np.testing.assert_allclose(nv[0], np.asarray(d2.qvel), rtol=1e-3, atol=1e-4)
+
+
+@_needs_gpu()
+def test_program_tendon_auto_derivative_gpu():
+  # R06/D2 program level: run_device_auto with a damped-tendon tangent
+  # matches the oracle fed with the host reference derivative.
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  from mujoco_metal.implicit import (
+      ImplicitFastProgram, implicit_derivative_reference, implicitfast_oracle,
+  )
+  from mujoco_metal.model import load_model
+  from mujoco_metal.passive import PassiveForceModel
+  from mujoco_metal.tendons import FixedTendonModel
+  from mujoco_metal.smooth_metal import MetalSmoothDynamics
+  import torch
+  m = mujoco.MjModel.from_xml_string(
+      "<mujoco><option timestep='0.002' integrator='implicitfast'>"
+      "<flag contact='disable'/>"
+      "</option><worldbody><body pos='0 0 0.5'>"
+      "<joint name='h' type='hinge' axis='0 0 1' damping='0.2'/>"
+      "<geom type='sphere' size='0.1' mass='0.5'/>"
+      "</body></worldbody>"
+      "<tendon><fixed name='t'><joint joint='h' coef='2'/></fixed></tendon></mujoco>")
+  m.tendon_damping[0] = 0.4
+  desc = load_model(m)
+  qpf = np.array([[0.3]])
+  qvf = np.array([[1.1]])
+  qp = torch.as_tensor(qpf.astype(np.float32), device="mps")
+  qv = torch.as_tensor(qvf.astype(np.float32), device="mps")
+  smooth = MetalSmoothDynamics(desc, batch_size=1)
+  dyn = smooth.run_device(qp, qv, None, None)
+  from mujoco_metal.tendons import MetalFixedTendonDynamics
+  ten = MetalFixedTendonDynamics(m, batch_size=1)
+  tforce, ttangent, tarm = ten.run_device(qp, qv)
+  pf = PassiveForceModel(m).force(qpf, qvf)
+  # Mass matrix plus tendon armature, force incl. tendon + passive.
+  import numpy as _np
+  M = dyn["mass_matrix"].cpu().numpy() + _np.asarray(tarm.cpu().numpy())
+  rhs = (dyn["qfrc_bias"].cpu().numpy() + pf
+         + _np.asarray(tforce.cpu().numpy()))
+  prog = ImplicitFastProgram(m, batch_size=1, external_derivative=True)
+  assert prog.descriptor.auto_derivative is True
+  from mujoco_metal.passive import MetalPassiveForces
+  pas = MetalPassiveForces(m)
+  pout, pderiv = pas.run_device(qp, qv, return_damping=True)
+  got = prog.run_device_auto(
+      torch.as_tensor(M.astype(np.float32), device="mps"),
+      torch.as_tensor(rhs.astype(np.float32), device="mps"),
+      pderiv, ttangent)
+  auto = implicit_derivative_reference(m, qpf, qvf)
+  want = implicitfast_oracle(m, M, rhs, force_velocity_derivative=auto)
+  np.testing.assert_allclose(got["qacc"].cpu().numpy(), want["qacc"],
+                             rtol=1e-4, atol=1e-5)
+  assert float(np.max(np.abs(want["qacc"]))) > 0.5  # non-vacuous
+
+
+@_needs_gpu()
+def test_integrated_implicitfast_auto_trajectory_gpu():
+  # R06/D2 integrated wiring: an implicitfast-profile simulation with
+  # polynomial damping steps with natively assembled derivatives and
+  # matches CPU implicitfast stepping. (Tendon models stay program-level:
+  # the euler-family profiles reject tendons upstream of this path.)
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  from mujoco_metal.simulation import MetalSimulation
+  m = mujoco.MjModel.from_xml_string(
+      "<mujoco><option timestep='0.002' integrator='implicitfast' density='0' viscosity='0'>"
+      "<flag contact='disable'/>"
+      "</option><worldbody><body pos='0 0 0.5'>"
+      "<joint name='h' type='hinge' axis='0 0 1' damping='0.3'/>"
+      "<geom type='sphere' size='0.1' mass='0.5'/>"
+      "</body></worldbody></mujoco>")
+  m.dof_dampingpoly[0] = [0.1, 0.02]
+  sim = MetalSimulation(m, batch_size=1, profile="contact_free_implicitfast_v1")
+  assert sim._implicitfast.descriptor.auto_derivative is True
+  qp = np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1)
+  qv = np.array([[1.7]], dtype=np.float32)
+  sim.reset(qpos=qp, qvel=qv)
+  d = mujoco.MjData(m)
+  d.qpos[:] = qp[0]
+  d.qvel[:] = qv[0]
+  for _ in range(40):
+    sim.step(1)
+    mujoco.mj_step(m, d)
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[0], np.asarray(d.qpos),
+                             rtol=1e-3, atol=1e-4)
+  np.testing.assert_allclose(sim.state.qvel.cpu().numpy()[0], np.asarray(d.qvel),
+                             rtol=1e-3, atol=1e-4)

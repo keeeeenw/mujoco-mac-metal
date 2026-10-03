@@ -100,8 +100,11 @@ def test_freejoint_is_allowed_for_midpoint_profile():
 def test_external_full_derivative_unblocks_other_velocity_force_families():
   model = mujoco.MjModel.from_xml_string(XML)
   model.dof_dampingpoly[0, 0] = .02
-  with pytest.raises(ValueError, match="constant DOF damping"):
-    lower_implicitfast(model)
+  # R06/D2: polynomial damping assembles natively (auto derivative flag);
+  # the external path still works and agrees on the solve.
+  descriptor = lower_implicitfast(model)
+  assert descriptor.nv == model.nv
+  assert descriptor.auto_derivative is True
   descriptor = lower_implicitfast(model, external_derivative=True)
   assert descriptor.nv == model.nv
   data, mass = _state(model)
