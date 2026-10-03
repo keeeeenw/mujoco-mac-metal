@@ -1,28 +1,26 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
 
-"""Native deformable physics (milestone 018) for MuJoCo 3.10 models on Metal.
+"""Pinned MuJoCo 3.10 flex material primitives for the native backend.
 
-Implements the pinned flex inventory:
-- Topologies: 1D (cable/string), 2D (cloth/shell/grid), 3D (tetrahedral/volumetric).
-- Constitutive models:
-  * Edge distance equality constraints (mjtEq.mjEQ_FLEX).
-  * Mass-spring network elastic forces and damping.
-  * Continuum St. Venant-Kirchhoff (StVK) / Neo-Hookean strain energy,
-    internal stress, and nodal restoring forces.
-- Internal strain forces and analytic force derivatives (stiffness and damping tangents) on MPS.
-- Flex-rigid attachments and constraint coupling with the scalable block-row solver.
-- Narrowphase vertex-rigid obstacle collision and self-collision.
-- Full state lifecycle: reset, step, copy, snapshot, restore of contacting deformed states.
+This manager lowers compiled simplex stretch metrics and ordinary triangular
+shell bending records. The signed interpolation modes, interpolated-shell
+bending, full attachment Jacobian derivatives, and general flex contact are
+not implemented here; callers must retain their existing admission guards for
+those modes. Edge equalities, contact assembly and lifecycle are integrated by
+the owning simulation stages.
 """
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import mujoco
 import numpy as np
 import torch
+
+_MATERIAL_SHADER = Path(__file__).parent / "shaders" / "flex_material.metal"
 
 
 def _frozen(values, dtype):
@@ -49,6 +47,7 @@ class FlexDescriptor:
   vert0: np.ndarray           # (nflexvert, 3) float32
   vertbodyid: np.ndarray      # (nflexvert,) int32
   edge: np.ndarray            # (nflexedge, 2) int32
+  edgeflap: np.ndarray        # (nflexedge, 2) int32, local flap vertices
   edgeadr: np.ndarray         # (nflex,) int32
   edgenum: np.ndarray         # (nflex,) int32
   edgeequality: np.ndarray    # (nflex,) int32
@@ -58,7 +57,22 @@ class FlexDescriptor:
   edge_invweight0: np.ndarray # (nflexedge,) float32
   elem: np.ndarray            # (nflexelem_total,) int32
   elemadr: np.ndarray         # (nflex,) int32
+  elemdataadr: np.ndarray     # (nflex,) int32, address into flex_elem
   elemnum: np.ndarray         # (nflex,) int32
+  elemedge: np.ndarray        # (nflexelemedge,) int32, local edge ids per element
+  elemedgeadr: np.ndarray     # (nflex,) int32
+  stiffness: np.ndarray       # (nflexstiffness,) float32, pinned packed matrices
+  stiffnessadr: np.ndarray    # (nflex,) int32
+  interp: np.ndarray          # (nflex,) int32; signed interpolation order
+  damping: np.ndarray         # (nflex,) float32, pinned Rayleigh coefficient
+  bending: np.ndarray         # (nflexbending,) float32, pinned bending data
+  bendingadr: np.ndarray      # (nflex,) int32
+  cellnum: np.ndarray         # (nflex, 3) int32
+  node: np.ndarray            # (nflexnode, 3) float32
+  node0: np.ndarray           # (nflexnode, 3) float32
+  nodebodyid: np.ndarray      # (nflexnode,) int32
+  nodeadr: np.ndarray         # (nflex,) int32
+  nodenum: np.ndarray         # (nflex,) int32
   radius: np.ndarray          # (nflex,) float32
   contype: np.ndarray         # (nflex,) int32
   conaffinity: np.ndarray     # (nflex,) int32
@@ -69,10 +83,10 @@ class FlexDescriptor:
   selfcollide: np.ndarray     # (nflex,) int32
   solref: np.ndarray          # (nflex, 2) float32
   solimp: np.ndarray          # (nflex, 5) float32
-  young: np.ndarray           # (nflex,) float32 (effective Young's modulus)
-  poisson: np.ndarray         # (nflex,) float32 (Poisson's ratio)
-  lame_lambda: np.ndarray     # (nflex,) float32
-  lame_mu: np.ndarray         # (nflex,) float32
+  young: np.ndarray           # (nflex,) float32; raw compiled metric is authoritative
+  poisson: np.ndarray         # (nflex,) float32; raw compiled metric is authoritative
+  lame_lambda: np.ndarray     # (nflex,) float32; raw compiled metric is authoritative
+  lame_mu: np.ndarray         # (nflex,) float32; raw compiled metric is authoritative
 
 
 def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
@@ -94,17 +108,43 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
   vert = _frozen(model.flex_vert, np.float32).reshape(nflexvert, 3)
   vert0 = _frozen(model.flex_vert0, np.float32).reshape(nflexvert, 3)
   vertbodyid = _frozen(model.flex_vertbodyid, np.int32)
-  edge = _frozen(model.flex_edge, np.int32).reshape(nflexedge, 2)
+  edge = np.array(model.flex_edge, dtype=np.int32, order="C", copy=True).reshape(nflexedge, 2)
   edgeadr = _frozen(model.flex_edgeadr, np.int32)
   edgenum = _frozen(model.flex_edgenum, np.int32)
+  vertadr = _frozen(model.flex_vertadr, np.int32)
+  for f in range(nflex):
+    start, count = int(edgeadr[f]), int(edgenum[f])
+    edge[start:start + count] += int(vertadr[f])
+  edge = _frozen(edge, np.int32)
   edgeequality = _frozen(model.flex_edgeequality, np.int32)
+  edgeflap = np.array(model.flex_edgeflap, dtype=np.int32, order="C", copy=True).reshape(nflexedge, 2)
+  for f in range(nflex):
+    start, count = int(edgeadr[f]), int(edgenum[f])
+    mask = edgeflap[start:start + count] >= 0
+    edgeflap[start:start + count][mask] += int(vertadr[f])
+  edgeflap = _frozen(edgeflap, np.int32)
   edgestiffness = _frozen(model.flex_edgestiffness, np.float32)
   edgedamping = _frozen(model.flex_edgedamping, np.float32)
   edge_length0 = _frozen(model.flexedge_length0, np.float32)
   edge_invweight0 = _frozen(model.flexedge_invweight0, np.float32)
   elem = _frozen(model.flex_elem, np.int32)
   elemadr = _frozen(model.flex_elemadr, np.int32)
+  elemdataadr = _frozen(model.flex_elemdataadr, np.int32)
   elemnum = _frozen(model.flex_elemnum, np.int32)
+  elemedge = _frozen(model.flex_elemedge, np.int32)
+  elemedgeadr = _frozen(model.flex_elemedgeadr, np.int32)
+  stiffness = _frozen(model.flex_stiffness, np.float32)
+  stiffnessadr = _frozen(model.flex_stiffnessadr, np.int32)
+  interp = _frozen(model.flex_interp, np.int32)
+  damping = _frozen(model.flex_damping, np.float32)
+  bending = _frozen(model.flex_bending, np.float32)
+  bendingadr = _frozen(model.flex_bendingadr, np.int32)
+  cellnum = _frozen(model.flex_cellnum, np.int32).reshape(nflex, 3)
+  node = _frozen(model.flex_node, np.float32).reshape(-1, 3)
+  node0 = _frozen(model.flex_node0, np.float32).reshape(-1, 3)
+  nodebodyid = _frozen(model.flex_nodebodyid, np.int32)
+  nodeadr = _frozen(model.flex_nodeadr, np.int32)
+  nodenum = _frozen(model.flex_nodenum, np.int32)
   radius = _frozen(model.flex_radius, np.float32)
   contype = _frozen(model.flex_contype, np.int32)
   conaffinity = _frozen(model.flex_conaffinity, np.int32)
@@ -115,31 +155,6 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
   selfcollide = _frozen(model.flex_selfcollide, np.int32)
   solref = _frozen(model.flex_solref, np.float32).reshape(nflex, 2)
   solimp = _frozen(model.flex_solimp, np.float32).reshape(nflex, 5)
-
-  # Derived Lamé parameters from stiffness or elasticity settings
-  young = np.zeros(nflex, dtype=np.float32)
-  poisson = np.full(nflex, 0.3, dtype=np.float32)
-  lame_lambda = np.zeros(nflex, dtype=np.float32)
-  lame_mu = np.zeros(nflex, dtype=np.float32)
-
-  has_stiffness = hasattr(model, "flex_stiffnessadr") and hasattr(model, "flex_stiffness")
-  stiffnessadr = _frozen(model.flex_stiffnessadr, np.int32) if has_stiffness else np.full(nflex, -1, dtype=np.int32)
-
-  for f in range(nflex):
-    sadr = int(stiffnessadr[f]) if f < len(stiffnessadr) else -1
-    if sadr >= 0 and has_stiffness and sadr < len(model.flex_stiffness):
-      k = float(model.flex_stiffness[sadr])
-    else:
-      k = float(edgestiffness[f]) if f < len(edgestiffness) else 0.0
-    if k > 0.0:
-      young[f] = k
-      nu = float(poisson[f])
-      lame_lambda[f] = (k * nu) / ((1.0 + nu) * max(1.0 - 2.0 * nu, 1e-4))
-      lame_mu[f] = k / (2.0 * (1.0 + nu))
-    else:
-      young[f] = 0.0
-      lame_lambda[f] = 0.0
-      lame_mu[f] = 0.0
 
   return FlexDescriptor(
       nflex=nflex,
@@ -156,6 +171,7 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
       vert0=vert0,
       vertbodyid=vertbodyid,
       edge=edge,
+      edgeflap=edgeflap,
       edgeadr=edgeadr,
       edgenum=edgenum,
       edgeequality=edgeequality,
@@ -165,7 +181,22 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
       edge_invweight0=edge_invweight0,
       elem=elem,
       elemadr=elemadr,
+      elemdataadr=elemdataadr,
       elemnum=elemnum,
+      elemedge=elemedge,
+      elemedgeadr=elemedgeadr,
+      stiffness=stiffness,
+      stiffnessadr=stiffnessadr,
+      interp=interp,
+      damping=damping,
+      bending=bending,
+      bendingadr=bendingadr,
+      cellnum=cellnum,
+      node=node,
+      node0=node0,
+      nodebodyid=nodebodyid,
+      nodeadr=nodeadr,
+      nodenum=nodenum,
       radius=radius,
       contype=contype,
       conaffinity=conaffinity,
@@ -176,10 +207,10 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
       selfcollide=selfcollide,
       solref=solref,
       solimp=solimp,
-      young=_frozen(young, np.float32),
-      poisson=_frozen(poisson, np.float32),
-      lame_lambda=_frozen(lame_lambda, np.float32),
-      lame_mu=_frozen(lame_mu, np.float32),
+      young=_frozen(np.zeros(nflex, dtype=np.float32), np.float32),
+      poisson=_frozen(np.zeros(nflex, dtype=np.float32), np.float32),
+      lame_lambda=_frozen(np.zeros(nflex, dtype=np.float32), np.float32),
+      lame_mu=_frozen(np.zeros(nflex, dtype=np.float32), np.float32),
   )
 
 
@@ -198,6 +229,98 @@ class MetalFlex:
     self.batch_size = batch_size
     self._device = torch.device(device)
     d = self.descriptor
+    self._disableflags = int(model.opt.disableflags)
+
+    # MuJoCo 3.10 compiles simplex elasticity into 21 upper-triangle values
+    # per element. Lower that packed matrix and the corresponding element and
+    # edge addresses verbatim; no coefficient is reinterpreted as Young's E.
+    stretch_vertex, stretch_edge, stretch_metric = [], [], []
+    stretch_edge_count, stretch_vertex_count, stretch_damping = [], [], []
+    for f in range(d.nflex):
+      dim = int(d.dim[f])
+      kadr = int(d.stiffnessadr[f])
+      if dim not in (2, 3) or int(d.interp[f]) != 0 or kadr < 0:
+        continue
+      nvert, nedge = dim + 1, (3 if dim == 2 else 6)
+      for t in range(int(d.elemnum[f])):
+        vstart = int(d.elemdataadr[f]) + t * nvert
+        estart = int(d.elemedgeadr[f]) + t * nedge
+        verts = int(model.flex_vertadr[f]) + np.asarray(
+            d.elem[vstart:vstart + nvert], dtype=np.int32)
+        edges = int(d.edgeadr[f]) + np.asarray(
+            d.elemedge[estart:estart + nedge], dtype=np.int32)
+        packed = np.asarray(d.stiffness[kadr + 21*t:kadr + 21*t + 21], dtype=np.float32)
+        if len(packed) != 21:
+          raise ValueError("compiled flex element stiffness is truncated")
+        metric = np.zeros((6, 6), dtype=np.float32)
+        index = 0
+        for i in range(nedge):
+          for j in range(i, nedge):
+            metric[i, j] = metric[j, i] = packed[index]
+            index += 1
+        if not np.all(np.isfinite(metric)):
+          raise ValueError("compiled flex stiffness must be finite and representable")
+        stretch_vertex.append(np.pad(verts, (0, 4 - nvert), constant_values=-1))
+        stretch_edge.append(np.pad(edges, (0, 6 - nedge), constant_values=-1))
+        stretch_metric.append(metric)
+        stretch_edge_count.append(nedge)
+        stretch_vertex_count.append(nvert)
+        stretch_damping.append(float(d.damping[f]))
+    self._stretch_count = len(stretch_vertex)
+
+    def static_tensor(values, shape, dtype):
+      array = np.asarray(values, dtype=np.int32 if dtype == torch.int32 else np.float32)
+      array = array.reshape(shape) if array.size else np.zeros(shape, dtype=array.dtype)
+      return torch.as_tensor(array, dtype=dtype, device=self._device)
+
+    self._stretch_vertex = static_tensor(stretch_vertex, (self._stretch_count, 4), torch.int32)
+    self._stretch_edge = static_tensor(stretch_edge, (self._stretch_count, 6), torch.int32)
+    self._stretch_metric = static_tensor(stretch_metric, (self._stretch_count, 6, 6), torch.float32)
+    self._stretch_edge_count = static_tensor(stretch_edge_count, (self._stretch_count,), torch.int32)
+    self._stretch_vertex_count = static_tensor(stretch_vertex_count, (self._stretch_count,), torch.int32)
+    # Immutable host descriptors are used only to determine static loop bounds.
+    # Never convert a device tensor scalar to Python in a native execution path.
+    self._stretch_edge_count_host = tuple(stretch_edge_count)
+    self._stretch_vertex_count_host = tuple(stretch_vertex_count)
+    self._stretch_damping = static_tensor(stretch_damping, (self._stretch_count,), torch.float32)
+    self._stretch_damping_host = tuple(stretch_damping)
+    self._stretch_edge_pairs = [
+        ([(1, 2), (2, 0), (0, 1)] if n == 3 else
+         [(0, 1), (1, 2), (2, 0), (2, 3), (0, 3), (1, 3)])
+        for n in stretch_edge_count]
+    self._material_dummy_i = torch.zeros(1, dtype=torch.int32, device=self._device)
+    self._material_dummy_f = torch.zeros(1, dtype=torch.float32, device=self._device)
+    self._material_shader = (
+        torch.mps.compile_shader(_MATERIAL_SHADER.read_text())
+        if self._device.type == "mps" and self._stretch_count else None)
+
+    bend_vertex, bend_data, bend_damping = [], [], []
+    for f in range(d.nflex):
+      if int(d.dim[f]) != 2 or int(d.bendingadr[f]) < 0:
+        continue
+      edge_start, edge_num = int(d.edgeadr[f]), int(d.edgenum[f])
+      bend_start = int(d.bendingadr[f])
+      vert_start = int(model.flex_vertadr[f])
+      for e in range(edge_num):
+        flap = d.edgeflap[edge_start + e]
+        if int(flap[1]) < 0:
+          continue
+        pair = d.edge[edge_start + e]
+        start = bend_start + 17 * e
+        coeff = np.asarray(d.bending[start:start + 17], dtype=np.float32)
+        if len(coeff) != 17:
+          raise ValueError("compiled flex bending data is truncated")
+        bend_vertex.append([int(pair[0]), int(pair[1]), int(flap[0]), int(flap[1])])
+        bend_data.append(coeff)
+        bend_damping.append(float(d.damping[f]))
+    self._bend_count = len(bend_vertex)
+    self._bend_vertex = static_tensor(bend_vertex, (self._bend_count, 4), torch.int32)
+    self._bend_data = static_tensor(bend_data, (self._bend_count, 17), torch.float32)
+    self._bend_damping = static_tensor(bend_damping, (self._bend_count,), torch.float32)
+    self._bend_damping_host = tuple(bend_damping)
+    self._bend_shader = (
+        torch.mps.compile_shader(_MATERIAL_SHADER.read_text())
+        if self._device.type == "mps" and self._bend_count else None)
 
     # Upload static descriptors to device MPS tensors
     self._vert_local = torch.tensor(d.vert, dtype=torch.float32, device=self._device)
@@ -247,67 +370,8 @@ class MetalFlex:
       vert_flexid[v_start:v_start + v_num] = f
     self._vert_flexid = torch.tensor(vert_flexid, dtype=torch.int64, device=self._device)
 
-    # Element data for 2D (triangles: 3 verts) and 3D (tetrahedra: 4 verts)
     self._has_2d = bool(np.any(d.dim == 2))
     self._has_3d = bool(np.any(d.dim == 3))
-
-    # Precalculate rest shape inverse matrices for 2D and 3D elements
-    self._tri_elems = []
-    self._tri_inv_Dm = []
-    self._tri_area0 = []
-    self._tet_elems = []
-    self._tet_inv_Dm = []
-    self._tet_vol0 = []
-
-    for f in range(d.nflex):
-      dim = int(d.dim[f])
-      elem_adr = int(d.elemadr[f])
-      elem_num = int(d.elemnum[f])
-      if dim == 2 and elem_num > 0:
-        tri_v = d.elem[elem_adr * 3:(elem_adr + elem_num) * 3].reshape(elem_num, 3)
-        for t in range(elem_num):
-          v0, v1, v2 = tri_v[t]
-          X0, X1, X2 = d.vert0[v0], d.vert0[v1], d.vert0[v2]
-          # Form 2D basis on triangle plane
-          e1 = X1 - X0
-          e2 = X2 - X0
-          norm1 = np.linalg.norm(e1)
-          u1 = e1 / max(norm1, 1e-8)
-          norm_n = np.cross(u1, e2)
-          u2 = np.cross(norm_n, u1)
-          u2 = u2 / max(np.linalg.norm(u2), 1e-8)
-          Dm = np.array([[np.dot(e1, u1), np.dot(e2, u1)],
-                         [np.dot(e1, u2), np.dot(e2, u2)]], dtype=np.float32)
-          det = abs(float(np.linalg.det(Dm)))
-          inv_Dm = np.linalg.inv(Dm) if det > 1e-12 else np.eye(2, dtype=np.float32)
-          self._tri_elems.append([v0, v1, v2])
-          self._tri_inv_Dm.append(inv_Dm)
-          self._tri_area0.append(0.5 * det)
-      elif dim == 3 and elem_num > 0:
-        tet_v = d.elem[elem_adr * 4:(elem_adr + elem_num) * 4].reshape(elem_num, 4)
-        for t in range(elem_num):
-          v0, v1, v2, v3 = tet_v[t]
-          X0, X1, X2, X3 = d.vert0[v0], d.vert0[v1], d.vert0[v2], d.vert0[v3]
-          Dm = np.column_stack([X1 - X0, X2 - X0, X3 - X0]).astype(np.float32)
-          det = abs(float(np.linalg.det(Dm)))
-          inv_Dm = np.linalg.inv(Dm) if det > 1e-12 else np.eye(3, dtype=np.float32)
-          self._tet_elems.append([v0, v1, v2, v3])
-          self._tet_inv_Dm.append(inv_Dm)
-          self._tet_vol0.append(det / 6.0)
-
-    if self._tri_elems:
-      self._tri_elems_t = torch.tensor(self._tri_elems, dtype=torch.int64, device=self._device)
-      self._tri_inv_Dm_t = torch.tensor(np.array(self._tri_inv_Dm), dtype=torch.float32, device=self._device)
-      self._tri_area0_t = torch.tensor(np.array(self._tri_area0), dtype=torch.float32, device=self._device)
-    else:
-      self._tri_elems_t = None
-
-    if self._tet_elems:
-      self._tet_elems_t = torch.tensor(self._tet_elems, dtype=torch.int64, device=self._device)
-      self._tet_inv_Dm_t = torch.tensor(np.array(self._tet_inv_Dm), dtype=torch.float32, device=self._device)
-      self._tet_vol0_t = torch.tensor(np.array(self._tet_vol0), dtype=torch.float32, device=self._device)
-    else:
-      self._tet_elems_t = None
 
     # Tree body parent map for point Jacobians
     self._body_parentid = np.asarray(model.body_parentid, dtype=np.int32)
@@ -326,6 +390,12 @@ class MetalFlex:
     self._flexedge_dir = torch.zeros((b, d.nflexedge, 3), dtype=torch.float32, device=self._device)
     self._flexvert_J = torch.zeros((b, d.nflexvert, 3, max(nv, 1)), dtype=torch.float32, device=self._device)
     self._flexedge_J = torch.zeros((b, d.nflexedge, max(nv, 1)), dtype=torch.float32, device=self._device)
+    self._node_local = torch.tensor(np.array(d.node, copy=True), dtype=torch.float32, device=self._device)
+    self._node0 = torch.tensor(np.array(d.node0, copy=True), dtype=torch.float32, device=self._device)
+    self._nodebodyid = torch.tensor(np.array(d.nodebodyid, copy=True), dtype=torch.int64, device=self._device)
+    self._node_xpos = torch.zeros((b, len(d.nodebodyid), 3), dtype=torch.float32, device=self._device)
+    self._node_xvel = torch.zeros_like(self._node_xpos)
+    self._node_J = torch.zeros((b, len(d.nodebodyid), 3, max(nv, 1)), dtype=torch.float32, device=self._device)
     self._qfrc_passive = torch.zeros((b, max(nv, 1)), dtype=torch.float32, device=self._device)
     self._damping_tangent = torch.zeros((b, max(nv, 1), max(nv, 1)), dtype=torch.float32, device=self._device)
     self._stiffness_tangent = torch.zeros((b, max(nv, 1), max(nv, 1)), dtype=torch.float32, device=self._device)
@@ -380,6 +450,21 @@ class MetalFlex:
     else:
       self._flexvert_xvel.zero_()
 
+    if len(self.descriptor.nodebodyid):
+      nbody_ids = self._nodebodyid
+      nquat = body_quat[:, nbody_ids, :]
+      nlocal = self._node_local.unsqueeze(0).expand(b, -1, -1)
+      nqv, nqw = nquat[..., 1:], nquat[..., :1]
+      nt = 2.0 * torch.cross(nqv, nlocal, dim=-1)
+      nrot = nlocal + nqw * nt + torch.cross(nqv, nt, dim=-1)
+      self._node_xpos.copy_(body_pos[:, nbody_ids, :] + nrot)
+      if cvel is not None and cvel.numel() > 0:
+        ncvel = cvel[:, nbody_ids, :]
+        nvel = ncvel[..., 3:] + torch.cross(ncvel[..., :3], nrot, dim=-1)
+        self._node_xvel.copy_(nvel)
+      else:
+        self._node_xvel.zero_()
+
     # 3. Edge lengths, deformation rates, and unit direction vectors
     e0 = self._edge[:, 0]
     e1 = self._edge[:, 1]
@@ -401,77 +486,11 @@ class MetalFlex:
 
   def _compute_jacobians(self, poses: Dict[str, torch.Tensor]):
     """Vectorized calculation of vertex and edge Jacobians on device MPS."""
-    b = self.batch_size
-    nv = self.descriptor.nv
-    if nv <= 0:
-      return
-
-    self._flexvert_J.zero_()
-    body_pos = poses["body_pos"]
-    body_quat = poses["body_quat"]
-    anchors = poses.get("joint_anchor", None)
-    axes = poses.get("joint_axis", None)
-
-    # Ancestor traversal for each vertex attached to body b
-    # Since nflexvert is discrete, we populate flexvert_J directly
-    xpos = self._flexvert_xpos  # (B, nflexvert, 3)
-
-    for v in range(self.descriptor.nflexvert):
-      body = int(self.descriptor.vertbodyid[v])
-      if body <= 0:
-        continue  # pinned to world: Jacobian is exactly 0
-      curr = body
-      pv = xpos[:, v, :]  # (B, 3)
-      while curr > 0 and curr < self.descriptor.nbody:
-        ja = int(self._body_jntadr[curr])
-        jn = int(self._body_jntnum[curr])
-        for jj in range(jn):
-          j = ja + jj
-          if j < 0 or j >= self.descriptor.njnt:
-            continue
-          da = int(self._jnt_dofadr[j])
-          typ = int(self._jnt_type[j])
-          nd = 6 if typ == 0 else (3 if typ == 1 else 1)
-          if typ == 2:  # mjJNT_SLIDE = 2
-            if axes is not None:
-              axis = axes[:, j, :]
-              self._flexvert_J[:, v, :, da] += axis
-          elif typ == 3:  # mjJNT_HINGE = 3
-            if axes is not None:
-              axis = axes[:, j, :]
-              anc = anchors[:, j, :] if anchors is not None else body_pos[:, curr, :]
-              col = torch.cross(axis, pv - anc, dim=-1)
-              self._flexvert_J[:, v, :, da] += col
-          elif typ == 0:  # Free joint (3 translations + 3 rotations)
-            # Translations: standard unit vectors
-            self._flexvert_J[:, v, 0, da] = 1.0
-            self._flexvert_J[:, v, 1, da + 1] = 1.0
-            self._flexvert_J[:, v, 2, da + 2] = 1.0
-            # Rotations
-            b_quat = body_quat[:, curr, :]
-            b_pos = body_pos[:, curr, :]
-            for rot_i in range(3):
-              unit_ax = torch.zeros((b, 3), device=self._device)
-              unit_ax[:, rot_i] = 1.0
-              qw = b_quat[:, :1]
-              qv = b_quat[:, 1:]
-              t_ax = 2.0 * torch.cross(qv, unit_ax, dim=-1)
-              rot_axis = unit_ax + qw * t_ax + torch.cross(qv, t_ax, dim=-1)
-              col = torch.cross(rot_axis, pv - b_pos, dim=-1)
-              self._flexvert_J[:, v, :, da + 3 + rot_i] = col
-          elif typ == 1:  # Ball joint (3 rotations)
-            b_quat = body_quat[:, curr, :]
-            anc = anchors[:, j, :] if anchors is not None else body_pos[:, curr, :]
-            for rot_i in range(3):
-              unit_ax = torch.zeros((b, 3), device=self._device)
-              unit_ax[:, rot_i] = 1.0
-              qw = b_quat[:, :1]
-              qv = b_quat[:, 1:]
-              t_ax = 2.0 * torch.cross(qv, unit_ax, dim=-1)
-              rot_axis = unit_ax + qw * t_ax + torch.cross(qv, t_ax, dim=-1)
-              col = torch.cross(rot_axis, pv - anc, dim=-1)
-              self._flexvert_J[:, v, :, da + rot_i] = col
-        curr = int(self._body_parentid[curr])
+    self._compute_point_jacobian(
+        self._vertbodyid, self._flexvert_xpos, self._flexvert_J, poses)
+    if len(self.descriptor.nodebodyid):
+      self._compute_point_jacobian(
+          self._nodebodyid, self._node_xpos, self._node_J, poses)
 
     # 5. Assemble edge Jacobians: J_e = u_e^T (J_v1 - J_v0)
     e0 = self._edge[:, 0]
@@ -481,6 +500,50 @@ class MetalFlex:
     dJ = J1 - J0                         # (B, nflexedge, 3, nv)
     u_exp = self._flexedge_dir.unsqueeze(2)  # (B, nflexedge, 1, 3)
     self._flexedge_J.copy_(torch.matmul(u_exp, dJ).squeeze(2))
+
+  def _compute_point_jacobian(self, body_ids, points, output, poses):
+    b, nv = self.batch_size, self.descriptor.nv
+    if nv <= 0:
+      return
+    output.zero_()
+    body_pos = poses["body_pos"]
+    body_quat = poses["body_quat"]
+    anchors = poses.get("joint_anchor")
+    axes = poses.get("joint_axis")
+    for index, body_value in enumerate(self.descriptor.vertbodyid if output is self._flexvert_J else self.descriptor.nodebodyid):
+      body = int(body_value)
+      if body <= 0:
+        continue
+      curr = body
+      point = points[:, index, :]
+      while curr > 0 and curr < self.descriptor.nbody:
+        ja, jn = int(self._body_jntadr[curr]), int(self._body_jntnum[curr])
+        for j in range(ja, ja + jn):
+          if j < 0 or j >= self.descriptor.njnt:
+            continue
+          da, typ = int(self._jnt_dofadr[j]), int(self._jnt_type[j])
+          if typ == 2 and axes is not None:
+            output[:, index, :, da] += axes[:, j, :]
+          elif typ == 3 and axes is not None:
+            anc = anchors[:, j, :] if anchors is not None else body_pos[:, curr, :]
+            output[:, index, :, da] += torch.cross(axes[:, j, :], point - anc, dim=-1)
+          elif typ in (0, 1):
+            b_quat = body_quat[:, curr, :]
+            anc = body_pos[:, curr, :] if typ == 0 else (
+                anchors[:, j, :] if anchors is not None else body_pos[:, curr, :])
+            for rot_i in range(3):
+              unit_ax = torch.zeros((b, 3), device=self._device)
+              unit_ax[:, rot_i] = 1.0
+              qw, qv = b_quat[:, :1], b_quat[:, 1:]
+              t_ax = 2.0 * torch.cross(qv, unit_ax, dim=-1)
+              rot_axis = unit_ax + qw * t_ax + torch.cross(qv, t_ax, dim=-1)
+              output[:, index, :, da + rot_i + (3 if typ == 0 else 0)] = torch.cross(
+                  rot_axis, point - anc, dim=-1)
+            if typ == 0:
+              output[:, index, 0, da] = 1.0
+              output[:, index, 1, da + 1] = 1.0
+              output[:, index, 2, da + 2] = 1.0
+        curr = int(self._body_parentid[curr])
 
   def run_device(
       self,
@@ -538,114 +601,186 @@ class MetalFlex:
     self._damping_tangent.add_(damp_tang)
     self._stiffness_tangent.add_(stiff_tang)
 
-    # 2. 2D Triangular continuum elements (StVK plane-stress)
-    if self._tri_elems_t is not None and self._tri_elems_t.numel() > 0:
-      self._compute_2d_continuum_forces()
-
-    # 3. 3D Tetrahedral continuum elements (StVK volumetric)
-    if self._tet_elems_t is not None and self._tet_elems_t.numel() > 0:
-      self._compute_3d_continuum_forces()
+    # 2. Pinned 2D membrane and 3D tetrahedral material forces.
+    if self._stretch_count:
+      self._compute_pinned_stretch()
+    if self._bend_count:
+      self._compute_pinned_bend()
 
     return self._qfrc_passive, self._damping_tangent, self._stiffness_tangent
 
-  def _compute_2d_continuum_forces(self):
-    """Compute 2D St. Venant-Kirchhoff strain and nodal restoring forces."""
-    b = self.batch_size
-    elems = self._tri_elems_t  # (ntri, 3)
-    inv_Dm = self._tri_inv_Dm_t  # (ntri, 2, 2)
-    area0 = self._tri_area0_t    # (ntri,)
+  def _compute_pinned_stretch(self):
+    """Evaluate MuJoCo 3.10's compiled simplex stiffness representation."""
+    b, nv = self.batch_size, self.descriptor.nv
+    d = self.descriptor
+    if self._device.type == "mps":
+      dims = torch.tensor(
+          [b, nv, self._stretch_count, 4, d.nflexedge, d.nflexvert],
+          dtype=torch.int32, device=self._device)
+      elem_force = torch.empty(
+          (b, self._stretch_count, nv), dtype=torch.float32, device=self._device)
+      self._material_shader.flex_stretch_force(
+          self._flexvert_xpos.reshape(-1), self._flexedge_length.reshape(-1),
+          self._flexedge_velocity.reshape(-1), self._edge_length0,
+          self._flexvert_J.reshape(-1), self._stretch_vertex.reshape(-1),
+          self._stretch_edge.reshape(-1), self._stretch_metric.reshape(-1),
+          self._stretch_damping, self._stretch_edge_count,
+          self._stretch_vertex_count, dims,
+          torch.as_tensor([d.timestep], dtype=torch.float32, device=self._device),
+          elem_force.reshape(-1),
+          threads=(b * self._stretch_count * nv,), group_size=(128,))
+      self._qfrc_passive.add_(elem_force.sum(dim=1))
+    else:
+      # Identical arithmetic used by the CPU test backend. Production MPS
+      # evaluates this element-local loop in flex_material.metal.
+      qforce = torch.zeros((b, self._stretch_count, nv), dtype=torch.float32, device=self._device)
+      for e in range(self._stretch_count):
+        ne = self._stretch_edge_count_host[e]
+        nve = self._stretch_vertex_count_host[e]
+        verts = self._stretch_vertex[e, :nve].long()
+        edge_ids = self._stretch_edge[e, :ne].long()
+        metric = self._stretch_metric[e, :ne, :ne]
+        pos = self._flexvert_xpos[:, verts, :]
+        edgevec = torch.stack(
+            [pos[:, a, :] - pos[:, c, :] for a, c in self._stretch_edge_pairs[e]], dim=1)
+        lengths = self._flexedge_length[:, edge_ids]
+        rates = self._flexedge_velocity[:, edge_ids]
+        rest = self._edge_length0[edge_ids].unsqueeze(0)
+        previous = lengths - rates * d.timestep
+        kd = float(self._stretch_damping[e]) / d.timestep if d.timestep > 0 else 0.0
+        elong = lengths.square() - rest.square() + (lengths.square() - previous.square()) * kd
+        coeff = elong @ metric
+        local = torch.zeros((b, nve, 3), dtype=torch.float32, device=self._device)
+        for j, (a, c) in enumerate(self._stretch_edge_pairs[e]):
+          local[:, a, :] -= coeff[:, j:j+1] * edgevec[:, j, :]
+          local[:, c, :] += coeff[:, j:j+1] * edgevec[:, j, :]
+        jac = self._flexvert_J[:, verts, :, :]
+        qforce[:, e, :] = torch.einsum("bvk,bvkn->bn", local, jac)
+      self._qfrc_passive.add_(qforce.sum(dim=1))
 
-    xpos = self._flexvert_xpos
-    x0 = xpos[:, elems[:, 0], :]  # (B, ntri, 3)
-    x1 = xpos[:, elems[:, 1], :]
-    x2 = xpos[:, elems[:, 2], :]
+    # Exact local element derivatives of the pinned squared-length law. The
+    # formula uses the point Jacobians already lowered for every vertex, so it
+    # stays device resident and includes geometric terms from the moving edge
+    # directions. Flexcomp's per-vertex slide-DOF Jacobians are constant; for
+    # rotational attachments their Jacobian derivative is outside this local
+    # element matrix and is accounted for by the enclosing rigid-body stage.
+    for e in range(self._stretch_count):
+      ne = self._stretch_edge_count_host[e]
+      nve = self._stretch_vertex_count_host[e]
+      verts = self._stretch_vertex[e, :nve].long()
+      edge_ids = self._stretch_edge[e, :ne].long()
+      metric = self._stretch_metric[e, :ne, :ne]
+      pairs = self._stretch_edge_pairs[e]
+      x = self._flexvert_xpos[:, verts, :]
+      vel = self._flexvert_xvel[:, verts, :]
+      jv = self._flexvert_J[:, verts, :, :]
+      diffs = torch.stack([x[:, a] - x[:, c] for a, c in pairs], dim=1)
+      vdiffs = torch.stack([vel[:, a] - vel[:, c] for a, c in pairs], dim=1)
+      jrel = torch.stack([jv[:, a] - jv[:, c] for a, c in pairs], dim=1)
+      lengths = self._flexedge_length[:, edge_ids]
+      rates = self._flexedge_velocity[:, edge_ids]
+      unit = diffs / torch.clamp(lengths.unsqueeze(-1), min=1e-10)
+      je = torch.einsum("bei,bein->ben", unit, jrel)
+      jrate = torch.einsum(
+          "bei,bein->ben",
+          (vdiffs - unit * rates.unsqueeze(-1)) /
+          torch.clamp(lengths.unsqueeze(-1), min=1e-10), jrel)
+      kd = self._stretch_damping_host[e] / d.timestep if d.timestep > 0 else 0.0
+      previous = lengths - rates * d.timestep
+      elong = lengths.square() - self._edge_length0[edge_ids].square().unsqueeze(0)
+      elong = elong + (lengths.square() - previous.square()) * kd
+      coeff = elong @ metric
 
-    # Deformed shape matrix Ds = [x1 - x0, x2 - x0] (B, ntri, 3, 2)
-    Ds = torch.stack([x1 - x0, x2 - x0], dim=-1)
-    # Deformation gradient F = Ds @ inv_Dm (B, ntri, 3, 2)
-    inv_Dm_exp = inv_Dm.unsqueeze(0).expand(b, -1, -1, -1)
-    F = torch.matmul(Ds, inv_Dm_exp)
+      # Derivative of each projected edge gradient, Jrel' * Jrel.
+      dgrad = torch.einsum("bein,beim->benm", jrel, jrel)
+      geom = torch.einsum("be,benm->bnm", coeff, dgrad)
+      if kd:
+        delong = (
+            2.0 * (lengths + kd * rates * d.timestep)[:, :, None] * je
+            + 2.0 * kd * d.timestep *
+            (lengths - rates * d.timestep)[:, :, None] * jrate)
+      else:
+        delong = 2.0 * lengths[:, :, None] * je
+      generalized_edge_gradient = lengths[:, :, None] * je
+      coupled = torch.einsum("ij,bim->bjm", metric, delong)
+      geom = geom + torch.einsum(
+          "ben,bem->bnm", generalized_edge_gradient, coupled)
+      self._stiffness_tangent.add_(-geom)
 
-    # Right Cauchy-Green C = F^T @ F (B, ntri, 2, 2)
-    C = torch.matmul(F.transpose(-1, -2), F)
-    I2 = torch.eye(2, device=self._device).unsqueeze(0).unsqueeze(0)
-    E = 0.5 * (C - I2)  # Green-Lagrange strain
+      damping = self._stretch_damping_host[e]
+      if damping:
+        weight = 2.0 * damping * (lengths - rates * d.timestep)
+        damp_tangent = -torch.einsum(
+            "bjn,ij,bi,bim,bj->bnm", je, metric, weight, je, lengths)
+        self._damping_tangent.add_(damp_tangent)
 
-    # Lamé parameters
-    lam = float(self.descriptor.lame_lambda[0])
-    mu = float(self.descriptor.lame_mu[0])
+  def _compute_pinned_bend(self):
+    """Evaluate the compiled 17-scalar per-edge 2D shell bending record."""
+    b, nv = self.batch_size, self.descriptor.nv
+    d = self.descriptor
+    spring = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
+    damper = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
+    if self._device.type == "mps":
+      dims = torch.tensor(
+          [b, nv, self._bend_count, d.nflexvert],
+          dtype=torch.int32, device=self._device)
+      element_force = torch.empty(
+          (b, self._bend_count, nv), dtype=torch.float32, device=self._device)
+      # Keep pinned spring/damper enable bits in the pre-lowered coefficients.
+      values = self._bend_data.clone()
+      if not spring:
+        values[:, :16] = 0
+        values[:, 16] = 0
+      damping = self._bend_damping if damper else self._material_dummy_f.expand_as(self._bend_damping)
+      self._bend_shader.flex_bend_force(
+          self._flexvert_xpos.reshape(-1), self._flexvert_xvel.reshape(-1),
+          self._flexvert_J.reshape(-1), self._bend_vertex.reshape(-1),
+          values.reshape(-1), damping, dims, element_force.reshape(-1),
+          threads=(b * self._bend_count * nv,), group_size=(128,))
+      self._qfrc_passive.add_(element_force.sum(dim=1))
 
-    tr_E = E[..., 0, 0] + E[..., 1, 1]  # (B, ntri)
-    S = lam * tr_E.unsqueeze(-1).unsqueeze(-1) * I2 + 2.0 * mu * E  # 2nd PK stress (B, ntri, 2, 2)
-    P = torch.matmul(F, S)  # 1st PK stress (B, ntri, 3, 2)
+    # The matrix contribution has a constant-Jacobian projected derivative.
+    # The curved-rest correction and derivatives of attachment Jacobians are
+    # not included, so this is not the complete configuration tangent for
+    # general articulated/off-center attachments.
+    if nv:
+      for e in range(self._bend_count):
+        if not spring and not damper:
+          continue
+        verts = self._bend_vertex[e].long()
+        jac = self._flexvert_J[:, verts, :, :]
+        matrix = self._bend_data[e, :16].reshape(4, 4)
+        projected = torch.einsum("bikn,ij,bjkm->bnm", jac, matrix, jac)
+        if spring:
+          self._stiffness_tangent.sub_(projected)
+        damping = self._bend_damping_host[e]
+        if damper and damping != 0.0:
+          self._damping_tangent.add_(-damping * projected)
 
-    # Nodal forces: [f1, f2] = -A0 * P @ inv_Dm^T
-    H = -area0.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) * torch.matmul(P, inv_Dm_exp.transpose(-1, -2))
-    f1 = H[..., 0]  # (B, ntri, 3)
-    f2 = H[..., 1]  # (B, ntri, 3)
-    f0 = -(f1 + f2)
-
-    # Project nodal forces to generalized forces via vertex Jacobians
-    J0 = self._flexvert_J[:, elems[:, 0], :, :]  # (B, ntri, 3, nv)
-    J1 = self._flexvert_J[:, elems[:, 1], :, :]
-    J2 = self._flexvert_J[:, elems[:, 2], :, :]
-
-    qfrc_t = (
-        torch.einsum("btk,btkn->bn", f0, J0)
-        + torch.einsum("btk,btkn->bn", f1, J1)
-        + torch.einsum("btk,btkn->bn", f2, J2)
-    )
-    self._qfrc_passive.add_(qfrc_t)
-
-  def _compute_3d_continuum_forces(self):
-    """Compute 3D St. Venant-Kirchhoff volumetric strain and nodal forces."""
-    b = self.batch_size
-    elems = self._tet_elems_t    # (ntet, 4)
-    inv_Dm = self._tet_inv_Dm_t  # (ntet, 3, 3)
-    vol0 = self._tet_vol0_t      # (ntet,)
-
-    xpos = self._flexvert_xpos
-    x0 = xpos[:, elems[:, 0], :]
-    x1 = xpos[:, elems[:, 1], :]
-    x2 = xpos[:, elems[:, 2], :]
-    x3 = xpos[:, elems[:, 3], :]
-
-    # Deformed shape matrix Ds = [x1-x0, x2-x0, x3-x0] (B, ntet, 3, 3)
-    Ds = torch.stack([x1 - x0, x2 - x0, x3 - x0], dim=-1)
-    inv_Dm_exp = inv_Dm.unsqueeze(0).expand(b, -1, -1, -1)
-    F = torch.matmul(Ds, inv_Dm_exp)
-
-    # Right Cauchy-Green C = F^T @ F (B, ntet, 3, 3)
-    C = torch.matmul(F.transpose(-1, -2), F)
-    I3 = torch.eye(3, device=self._device).unsqueeze(0).unsqueeze(0)
-    E = 0.5 * (C - I3)
-
-    lam = float(self.descriptor.lame_lambda[0])
-    mu = float(self.descriptor.lame_mu[0])
-
-    tr_E = E[..., 0, 0] + E[..., 1, 1] + E[..., 2, 2]
-    S = lam * tr_E.unsqueeze(-1).unsqueeze(-1) * I3 + 2.0 * mu * E
-    P = torch.matmul(F, S)
-
-    # Nodal forces [f1, f2, f3] = -V0 * P @ inv_Dm^T
-    H = -vol0.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) * torch.matmul(P, inv_Dm_exp.transpose(-1, -2))
-    f1 = H[..., 0]
-    f2 = H[..., 1]
-    f3 = H[..., 2]
-    f0 = -(f1 + f2 + f3)
-
-    J0 = self._flexvert_J[:, elems[:, 0], :, :]
-    J1 = self._flexvert_J[:, elems[:, 1], :, :]
-    J2 = self._flexvert_J[:, elems[:, 2], :, :]
-    J3 = self._flexvert_J[:, elems[:, 3], :, :]
-
-    qfrc_tet = (
-        torch.einsum("btk,btkn->bn", f0, J0)
-        + torch.einsum("btk,btkn->bn", f1, J1)
-        + torch.einsum("btk,btkn->bn", f2, J2)
-        + torch.einsum("btk,btkn->bn", f3, J3)
-    )
-    self._qfrc_passive.add_(qfrc_tet)
+    if self._device.type != "mps":
+      for e in range(self._bend_count):
+        verts = self._bend_vertex[e].long()
+        x = self._flexvert_xpos[:, verts, :]
+        v = self._flexvert_xvel[:, verts, :]
+        ed0 = x[:, 1] - x[:, 0]
+        ed1 = x[:, 2] - x[:, 0]
+        ed2 = x[:, 3] - x[:, 0]
+        ref = torch.stack([
+            -torch.cross(ed1, ed2, dim=-1) - torch.cross(ed2, ed0, dim=-1) - torch.cross(ed0, ed1, dim=-1),
+            torch.cross(ed1, ed2, dim=-1),
+            torch.cross(ed2, ed0, dim=-1),
+            torch.cross(ed0, ed1, dim=-1),
+        ], dim=1)
+        matrix = self._bend_data[e, :16].reshape(4, 4)
+        total = torch.zeros_like(x)
+        if spring:
+          total = total + torch.einsum("ij,bjk->bik", matrix, x)
+          total = total + self._bend_data[e, 16] * ref
+        if damper:
+          total = total + self._bend_damping_host[e] * torch.einsum(
+              "ij,bjk->bik", matrix, v)
+        jac = self._flexvert_J[:, verts, :, :]
+        self._qfrc_passive.add_(-torch.einsum("bik,bikn->bn", total, jac))
 
   def run_equalities(
       self,
