@@ -202,6 +202,7 @@ class CoupledConstraintDescriptor:
   geom_bodyid: np.ndarray
   geom_size: np.ndarray
   geom_type: np.ndarray
+  geom_rbound: np.ndarray
   body_parentid: np.ndarray
   body_jntadr: np.ndarray
   body_jntnum: np.ndarray
@@ -772,6 +773,7 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       geom_bodyid=_frozen(model.geom_bodyid, np.int32),
       geom_size=_frozen(geom_size_mat, np.float32),
       geom_type=_frozen(model.geom_type, np.int32),
+      geom_rbound=_frozen(np.asarray(model.geom_rbound, dtype=np.float32).reshape(model.ngeom), np.float32),
       body_parentid=_frozen(model.body_parentid, np.int32),
       body_jntadr=_frozen(model.body_jntadr, np.int32),
       body_jntnum=_frozen(model.body_jntnum, np.int32),
@@ -948,6 +950,7 @@ class MetalCoupledConstraints:
         "eq_rowadr": self._tensor(d.eq_rowadr if d.neq else np.zeros(1, dtype=np.int32)),
         "geom_size": self._tensor(d.geom_size.reshape(-1) if d.ngeom else np.zeros(3, dtype=np.float32)),
         "geom_type": self._tensor(d.geom_type if d.ngeom else np.zeros(1, dtype=np.int32)),
+        "geom_rbound": self._tensor(d.geom_rbound if d.ngeom else np.zeros(1, dtype=np.float32)),
         "geom_bodyid": self._tensor(d.geom_bodyid if d.ngeom else np.zeros(1, dtype=np.int32)),
         "body_parentid": self._tensor(d.body_parentid),
         "body_jntadr": self._tensor(d.body_jntadr),
@@ -996,7 +999,8 @@ class MetalCoupledConstraints:
         "ten_moment_map": self._tensor(d.ten_moment_map.reshape(-1)),
         "c_dims": torch.tensor(
 
-            [d.nv, d.npairs, d.ncontacts_max, self.batch_size, d.nbody, d.njnt, d.ngeom, d.cone_type],
+            [d.nv, d.npairs, d.ncontacts_max, self.batch_size, d.nbody, d.njnt, d.ngeom, d.cone_type,
+             1 if (int(d.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)) else 0],
             dtype=torch.int32, device=self._device,
         ),
         "body_dims": torch.tensor(
@@ -1081,7 +1085,7 @@ class MetalCoupledConstraints:
           self._constants["pair_condim"], self._constants["pair_friction"],
           self._constants["pair_solreffriction"], self._constants["pair_contact_offset"],
           w["contact_row_data"], w["contact_frame"], w["contact_jacobian"],
-          self._constants["c_dims"],
+          self._constants["c_dims"], self._constants["geom_rbound"],
           threads=(b * d.npairs,), group_size=(1,),
       )
 

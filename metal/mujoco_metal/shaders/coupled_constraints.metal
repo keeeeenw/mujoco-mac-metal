@@ -203,6 +203,7 @@ kernel void contact_normal(
     device float* frame [[buffer(25)]],
     device float* jacobian [[buffer(26)]],
     constant int* dims [[buffer(27)]],
+    device const float* geom_rbound [[buffer(28)]],
     uint tid [[thread_position_in_grid]]) {
   int nv = dims[0];
   int npairs = dims[1];
@@ -222,6 +223,9 @@ kernel void contact_normal(
   int tb = geom_type[b];
   float3 sza = float3(geom_size[a * 3], geom_size[a * 3 + 1], geom_size[a * 3 + 2]);
   float3 szb = float3(geom_size[b * 3], geom_size[b * 3 + 1], geom_size[b * 3 + 2]);
+  float rba = geom_rbound[a];
+  float rbb = geom_rbound[b];
+  int disable_multiccd = dims[8];
 
   int go = world * ngeom;
   float3 pa = float3(geom_pos[(go + a) * 3], geom_pos[(go + a) * 3 + 1], geom_pos[(go + a) * 3 + 2]);
@@ -246,7 +250,8 @@ kernel void contact_normal(
     con[k].t1 = float3(0.0f);
     con[k].t2 = float3(0.0f);
   }
-  int ncon = collide_pair(ta, pa, qa, sza, tb, pb, qb, szb, m + g, con);
+  int ncon = collide_pair(ta, pa, qa, sza, rba, tb, pb, qb, szb, rbb,
+                            m + g, disable_multiccd, con);
   ncon = min(ncon, max_con);
 
   int ba = geom_bodyid[a];

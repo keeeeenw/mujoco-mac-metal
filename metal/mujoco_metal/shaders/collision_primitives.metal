@@ -1307,13 +1307,15 @@ inline int collide_convex_single(int ta, float3 pa, float4 qa, float3 sza,
                                  float margin, thread ContactGeom* con);
 inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
                                 int tb, float3 pb, float4 qb, float3 szb,
-                                float margin, int maxn, thread ContactGeom* con);
+                                float margin, int maxn,
+                                float rb1, float rb2, int disable_multiccd,
+                                thread ContactGeom* con);
 
 // Unified Pair Dispatcher
 inline int collide_pair(
-    int type1, float3 p1, float4 q1, float3 sz1,
-    int type2, float3 p2, float4 q2, float3 sz2,
-    float margin, thread ContactGeom* con) {
+    int type1, float3 p1, float4 q1, float3 sz1, float rb1,
+    int type2, float3 p2, float4 q2, float3 sz2, float rb2,
+    float margin, int disable_multiccd, thread ContactGeom* con) {
   // Types: 0 = plane, 2 = sphere, 3 = capsule, 4 = ellipsoid, 5 = cylinder, 6 = box
   bool swapped = (type1 > type2);
   int t1 = swapped ? type2 : type1;
@@ -1321,9 +1323,11 @@ inline int collide_pair(
   float3 pos1 = swapped ? p2 : p1;
   float4 quat1 = swapped ? q2 : q1;
   float3 size1 = swapped ? sz2 : sz1;
+  float r1 = swapped ? rb2 : rb1;
   float3 pos2 = swapped ? p1 : p2;
   float4 quat2 = swapped ? q1 : q2;
   float3 size2 = swapped ? sz1 : sz2;
+  float r2 = swapped ? rb1 : rb2;
 
   int n = 0;
   if (t1 == 0 && t2 == 2) {
@@ -1355,7 +1359,7 @@ inline int collide_pair(
     n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con);
   } else if ((t1 == 3 && t2 == 5) || (t1 == 5 && t2 == 5) || (t1 == 5 && t2 == 6)) {
     n = collide_convex_multi(t1, pos1, quat1, size1, t2, pos2, quat2, size2,
-                             margin, 5, con);
+                             margin, 5, r1, r2, disable_multiccd, con);
   }
 
   // If order was swapped, normal points from pos1 to pos2, which is from original geom2 to geom1.

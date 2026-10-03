@@ -1,0 +1,43 @@
+<mujoco>
+  <option timestep="0.002" gravity="0 0 -9.81" iterations="100" tolerance="1e-5"/>
+  <!-- Tilted 10 degrees about Y: pieces travel toward +x. -->
+  <worldbody>
+    <geom name="table" type="plane" size="5 5 0.1" quat="0.99619 0 0.08716 0"
+          friction="0.05" contype="1" conaffinity="6"/>
+    <!-- Lane divider (visual): pieces verifiably never touch it (see
+         lane-clearance checks), so it carries no contact pairs. -->
+    <body name="divider" pos="0.2 0 -0.02" quat="0.99619 0 0.08716 0">
+      <geom name="ridge" type="box" size="1.2 0.015 0.12"
+            contype="8" conaffinity="0"/>
+    </body>
+    <!-- Lane A (y = -0.2): cylindrical roller, axis across the slope, high
+         sliding friction so it rolls without slipping. -->
+    <body name="roller1" pos="-0.3 -0.2 0.108">
+      <freejoint name="roller1_free"/>
+      <geom name="roll1" type="cylinder" size="0.05 0.1" quat="0.7071 0.7071 0 0"
+            friction="0.8" contype="2" conaffinity="17"/>
+    </body>
+    <!-- Lane B (y = +0.2): nonuniform ellipsoids, low sliding friction so
+         they slide independently (no catch-up pinch; see guide). -->
+    <body name="tumbler1" pos="-0.3 0.2 0.108">
+      <freejoint name="tumbler1_free"/>
+      <geom name="tumb1" type="ellipsoid" size="0.06 0.04 0.05" friction="0.08"
+            contype="4" conaffinity="37"/>
+    </body>
+    <body name="tumbler2" pos="-0.6 0.2 0.141">
+      <freejoint name="tumbler2_free"/>
+      <geom name="tumb2" type="ellipsoid" size="0.05 0.05 0.03" friction="0.13"
+            contype="4" conaffinity="37"/>
+    </body>
+    <!-- Catch walls (one per lane, too tall to climb). The roller
+         out-travels the tumblers into the far wall. -->
+    <body name="bin_far" pos="0.92 -0.2 0.0" quat="0.99619 0 0.08716 0">
+      <geom name="bin_far_w" type="box" size="0.02 0.18 0.14" solref="0.006 1"
+            contype="16" conaffinity="2"/>
+    </body>
+    <body name="bin_near" pos="0.37 0.2 0.0" quat="0.99619 0 0.08716 0">
+      <geom name="bin_near_w" type="box" size="0.02 0.18 0.12" solref="0.006 1"
+            contype="32" conaffinity="4"/>
+    </body>
+  </worldbody>
+</mujoco>
