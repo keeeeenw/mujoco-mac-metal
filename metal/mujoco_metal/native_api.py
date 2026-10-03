@@ -237,7 +237,11 @@ def _restore_query_workspaces(saved, bookkeeping_names, bookkeeping, component,
     vars(program).clear()
     vars(program).update(attributes)
     for name, value in storage.items():
-      setattr(program, name, _restore_query_storage(value))
+      # Frozen dataclass maps are owned records, not mutable programs, but
+      # their tensor storage still participates in rollback. Restore their
+      # original field bindings through the same internal mechanism used by
+      # `_restore_query_storage`, without invoking their public frozen setter.
+      object.__setattr__(program, name, _restore_query_storage(value))
   for name in bookkeeping_names:
     if name in bookkeeping:
       setattr(sim, name, _restore_query_storage(bookkeeping[name]))

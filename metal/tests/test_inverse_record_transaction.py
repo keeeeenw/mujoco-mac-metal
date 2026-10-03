@@ -109,6 +109,46 @@ def test_query_restores_legacy_row_producers_and_combined_scratch(fail):
 
 
 @pytest.mark.parametrize('fail', [False, True])
+@pytest.mark.parametrize('capacity', [0, 3])
+def test_query_restores_real_frozen_compaction_map_without_masking_errors(
+    fail, capacity):
+  torch = pytest.importorskip('torch')
+  from mujoco_metal.native_api import _inverse_query_workspaces
+  from mujoco_metal.row_compaction import CompactionMap
+  packed = torch.full((2, capacity), -1, dtype=torch.int32)
+  reverse = torch.full((2, capacity), -1, dtype=torch.int32)
+  count = torch.zeros(2, dtype=torch.int32)
+  overflow = torch.zeros(2, dtype=torch.int32)
+  mapping = CompactionMap(packed, reverse, count, overflow)
+  program = SimpleNamespace(_slot_map=mapping, _workspace={'slot_maps': mapping})
+  sim = SimpleNamespace(_coupled_constraints=program)
+  def query():
+    with _inverse_query_workspaces(sim):
+      packed.fill_(2)
+      reverse.fill_(1)
+      count.fill_(capacity)
+      overflow.fill_(1)
+      program._slot_map = None
+      program._workspace.clear()
+      if fail:
+        raise RuntimeError('original compaction producer failure')
+  if fail:
+    with pytest.raises(RuntimeError, match='original compaction producer failure'):
+      query()
+  else:
+    query()
+  assert program._slot_map is mapping
+  assert program._workspace['slot_maps'] is mapping
+  assert mapping.packed_to_logical is packed
+  assert mapping.logical_to_packed is reverse
+  assert mapping.active_count is count and mapping.overflow is overflow
+  torch.testing.assert_close(packed, torch.full_like(packed, -1), rtol=0, atol=0)
+  torch.testing.assert_close(reverse, torch.full_like(reverse, -1), rtol=0, atol=0)
+  torch.testing.assert_close(count, torch.zeros_like(count), rtol=0, atol=0)
+  torch.testing.assert_close(overflow, torch.zeros_like(overflow), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('fail', [False, True])
 @pytest.mark.parametrize('allocated', [False, True])
 def test_query_restores_energy_values_and_owner_even_if_buffer_is_replaced(
     fail, allocated):
