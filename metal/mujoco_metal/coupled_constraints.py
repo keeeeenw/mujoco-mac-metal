@@ -31,6 +31,7 @@ import numpy as np
 _SHADER = Path(__file__).parent / "shaders" / "coupled_constraints.metal"
 _EQUALITY_SHADER = Path(__file__).parent / "shaders" / "equality_assembly.metal"
 _COLLISION_SHADER = Path(__file__).parent / "shaders" / "collision_primitives.metal"
+_CONVEX_SHADER = Path(__file__).parent / "shaders" / "convex_narrowphase.metal"
 _MINVAL = 1e-15
 _MAX_NV = 32
 _MAX_PAIRS = 16
@@ -72,10 +73,11 @@ _SUPPORTED_GEOM_TYPES = (_PLANE, _SPHERE, _CAPSULE, _BOX, _ELLIPSOID, _CYLINDER)
 def pair_max_contacts(t1: int, t2: int) -> int:
   """Derive upper bound on contact points for a primitive geometry pair.
 
-  Mirrors pinned `mj_maxContact` (3.10.0) under default flags
-  (multiccd + nativeccd enabled): sphere/ellipsoid involvement caps at 1;
-  box-box 8; capsule-capsule 2; capsule-box and plane-cylinder/box 4;
-  remaining cylinder-involved convex pairs 5.
+  Bounds follow the pinned colliders' actual manifold sizes (3.10.0), not
+  the conservative mj_maxContact allocation bounds: sphere/ellipsoid
+  involvement caps at 1; capsule pairs cap at 2 (mjraw_CapsuleBox emits at
+  most best+second); plane-cylinder/box cap at 4; box-box 8; remaining
+  cylinder-involved convex pairs cap at 5 (multiccd native witnesses).
   """
   t_min, t_max = min(t1, t2), max(t1, t2)
   if _SPHERE in (t_min, t_max) or _ELLIPSOID in (t_min, t_max):
@@ -86,10 +88,10 @@ def pair_max_contacts(t1: int, t2: int) -> int:
   if (t_min, t_max) in (
       (_PLANE, _CAPSULE),
       (_CAPSULE, _CAPSULE),
+      (_CAPSULE, _BOX),
   ):
     return 2
   if (t_min, t_max) in (
-      (_CAPSULE, _BOX),
       (_PLANE, _CYLINDER),
       (_PLANE, _BOX),
   ):
@@ -876,7 +878,8 @@ class MetalCoupledConstraints:
     self._torch = torch
     self._device = torch.device("mps")
 
-    shader_source = _COLLISION_SHADER.read_text() + "\n" + _EQUALITY_SHADER.read_text() + "\n" + _SHADER.read_text()
+    shader_source = (_COLLISION_SHADER.read_text() + "\n" + _CONVEX_SHADER.read_text()
+                     + "\n" + _EQUALITY_SHADER.read_text() + "\n" + _SHADER.read_text())
     self._library = torch.mps.compile_shader(shader_source)
     self._contact_kernel = self._library.contact_normal
     try:

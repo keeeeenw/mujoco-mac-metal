@@ -95,10 +95,10 @@ def test_coupled_lowering_cylinder_ellipsoid_admitted():
   assert pair_max_contacts(cc._CAPSULE, cyl) == 5
   assert pair_max_contacts(cyl, cyl) == 5
   assert pair_max_contacts(cyl, cc._BOX) == 5
-  # Pre-existing pairs unchanged.
+  # Pre-existing pairs unchanged (capsule-box emits best+second only).
   assert pair_max_contacts(cc._PLANE, cc._SPHERE) == 1
   assert pair_max_contacts(cc._CAPSULE, cc._CAPSULE) == 2
-  assert pair_max_contacts(cc._CAPSULE, cc._BOX) == 4
+  assert pair_max_contacts(cc._CAPSULE, cc._BOX) == 2
   assert pair_max_contacts(cc._PLANE, cc._BOX) == 4
   assert pair_max_contacts(cc._BOX, cc._BOX) == 8
   xml = COUPLED_XML.replace('type="sphere" size="0.2"', 'type="cylinder" size="0.1 0.2"')
