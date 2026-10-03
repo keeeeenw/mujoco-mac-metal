@@ -40,7 +40,12 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examp
 The `--headless --check` run asserts actual native behavior: native/CPU pose
 parity, ball-stop engagement (strut past 0.28 rad), cable-limit engagement
 (cable length past 0.66 m), cargo contact on a majority of steps, platform
-sway in the tilt run and near-stillness in the level run. Geometry-distance
+sway in the tilt run and near-stillness in the level run. Orientation parity
+is split by physics: platform/cargo quats and the strut-axis tilt are gated
+tightly, while ball-joint twist about the strut long axis is reported only
+(it drifts between float32/float64 with no observable effect on the
+axisymmetric strut/bob hardware). Native stop engagement is asserted on the
+native strut peak itself, not just the CPU reference. Geometry-distance
 checks verify that the strut and bob stay clear of both the platform and cargo
 through the complete native trajectory. A CPU regression repeats this check.
 

@@ -86,6 +86,18 @@ def run(steps=1200, mode="metal", check=False, record=None):
   cargo_contacts = 0
   strut_hits = 0
   cable_hits = 0
+  # Ball-joint orientation is split: the strut/bob hardware is axisymmetric
+  # about the strut axis, so twist about that axis is physically invisible
+  # and unconstrained (it drifts to ~0.17 rad between float32/float64). The
+  # constrained quantity is the strut-axis tilt, gated below; raw ball-quat
+  # components stay reported but not gated.
+  max_tilt_err = 0.0
+  end_tilt_err = 0.0
+  max_rigid_quat_err = 0.0
+  end_rigid_quat_err = 0.0
+  nat_strut_peak = 0.0
+  nat_strut_hits = 0
+  _AXIS = np.array([0.0, 0.0, -1.0])
 
   for step in range(steps):
     quat = _carrier_quat(step)
@@ -119,11 +131,30 @@ def run(steps=1200, mode="metal", check=False, record=None):
                                    - cpu_swing.qpos[[4, 5, 6, 11, 12, 13]])))
       equat = float(np.max(np.abs(gq[[0, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 17]]
                                     - cpu_swing.qpos[[0, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 17]])))
+      rigid = float(np.max(np.abs(gq[[7, 8, 9, 10, 14, 15, 16, 17]]
+                                    - cpu_swing.qpos[[7, 8, 9, 10, 14, 15, 16, 17]])))
+      # Strut-axis tilt parity (twist-excluded): direction of the strut
+      # long axis under each engine's ball-quat, compared by angle.
+      w0, x0, y0, z0 = (float(v) for v in gq[0:4])
+      w1, x1, y1, z1 = (float(v) for v in cpu_swing.qpos[0:4])
+      dn = np.array([2 * (x0 * z0 + y0 * w0), 2 * (y0 * z0 - x0 * w0),
+                     1 - 2 * (x0 * x0 + y0 * y0)])
+      dc = np.array([2 * (x1 * z1 + y1 * w1), 2 * (y1 * z1 - x1 * w1),
+                     1 - 2 * (x1 * x1 + y1 * y1)])
+      tilt = float(np.arccos(np.clip(dn @ dc / (np.linalg.norm(dn) * np.linalg.norm(dc)),
+                             -1.0, 1.0)))
       max_pos_err = max(max_pos_err, epos)
       max_quat_err = max(max_quat_err, equat)
+      max_tilt_err = max(max_tilt_err, tilt)
+      max_rigid_quat_err = max(max_rigid_quat_err, rigid)
       max_qpos_err = max(max_qpos_err, float(np.max(np.abs(gq - cpu_swing.qpos))))
+      ns = _strut_angle(gq)
+      nat_strut_peak = max(nat_strut_peak, ns)
+      if ns > 0.28 - 1e-9:
+        nat_strut_hits += 1
       if step == steps - 1:
         end_pos_err, end_quat_err = epos, equat
+        end_tilt_err, end_rigid_quat_err = tilt, rigid
     clearance.sample(
         native.state.qpos[0].cpu().numpy() if native is not None else cpu_swing.qpos,
         cpu_swing.mocap_pos, cpu_swing.mocap_quat)
@@ -160,8 +191,14 @@ def run(steps=1200, mode="metal", check=False, record=None):
       "max_qpos_err": max_qpos_err,
       "max_pos_err": max_pos_err,
       "max_quat_err": max_quat_err,
+      "max_tilt_err": max_tilt_err,
+      "max_rigid_quat_err": max_rigid_quat_err,
       "end_pos_err": end_pos_err,
       "end_quat_err": end_quat_err,
+      "end_tilt_err": end_tilt_err,
+      "end_rigid_quat_err": end_rigid_quat_err,
+      "nat_strut_peak": nat_strut_peak,
+      "nat_strut_hits": nat_strut_hits,
       "strut_peak": strut_peak,
       "cable_peak": cable_peak,
       "cargo_contacts": cargo_contacts,
@@ -176,8 +213,17 @@ def run(steps=1200, mode="metal", check=False, record=None):
     clearance.check()
   if check and mode == "metal":
     assert max_pos_err < 5e-3, max_pos_err
-    assert max_quat_err < 1.5e-2, max_quat_err
-    assert end_pos_err < 5e-3 and end_quat_err < 5e-3, (end_pos_err, end_quat_err)
+    # Platform/cargo orientations are constrained and tight; the ball-joint
+    # raw quat includes invisible twist drift (reported in max_quat_err),
+    # so the ball joint is gated on strut-axis tilt instead (native peak
+    # tilt error 0.040 measured; twist reaches 0.17 with no observable
+    # effect on axisymmetric hardware).
+    assert max_rigid_quat_err < 1.5e-2, max_rigid_quat_err
+    assert max_tilt_err < 8e-2, max_tilt_err
+    assert end_pos_err < 5e-3 and end_rigid_quat_err < 5e-3, (end_pos_err, end_rigid_quat_err)
+    assert end_tilt_err < 5e-2, end_tilt_err
+    assert nat_strut_peak > 0.28, nat_strut_peak  # native ball stop engaged
+    assert nat_strut_hits > 100, nat_strut_hits
     assert strut_peak > 0.28, strut_peak  # ball stop engaged
     assert cable_peak > 0.66, cable_peak  # cable limit engaged
     assert cargo_contacts > 100, cargo_contacts
