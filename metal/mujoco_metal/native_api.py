@@ -659,7 +659,10 @@ def _validate_spatial_stage(sim, dynamics):
                       ("cdof", (b, nv, 6)), ("cdof_dot", (b, nv, 6))):
     value = dynamics.get(name)
     if (not isinstance(value, torch.Tensor) or tuple(value.shape) != shape
-        or value.device != sim.state._device or value.dtype != torch.float32
+        or value.device.type != sim.state._device.type
+        or (sim.state._device.index is not None
+            and value.device.index != sim.state._device.index)
+        or value.dtype != torch.float32
         or not value.is_contiguous() or not bool(torch.isfinite(value).all())):
       raise ValueError(f"dynamics.{name} has invalid native layout or values")
 

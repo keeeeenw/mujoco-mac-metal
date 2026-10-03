@@ -8,6 +8,41 @@ import numpy as np
 import pytest
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='native opt-in')
+def test_native_query_accepts_default_mps_device_with_indexed_stage_tensors():
+  """Exercise actual batched query math without Simulation construction."""
+  import torch
+  from types import SimpleNamespace
+  from mujoco_metal.native_api import _validate_spatial_stage
+  from mujoco_metal.spatial_queries import DeviceSpatialQueries
+  model = _fixture()
+  worlds = [_stages(model, seed, 'mps') for seed in (17, 31)]
+  dynamics = {name: torch.cat([world[1][name] for world in worlds])
+              for name in ('root_com', 'cvel', 'cdof', 'cdof_dot')}
+  dynamics['poses'] = {
+      name: torch.cat([world[1]['poses'][name] for world in worlds])
+      for name in worlds[0][1]['poses']}
+  sim = SimpleNamespace(_mjmodel=model, batch_size=2,
+                        state=SimpleNamespace(_device=torch.device('mps')))
+  _validate_spatial_stage(sim, dynamics)
+  program = DeviceSpatialQueries(model, 2, 'mps')
+  body = model.nbody - 2
+  point = (dynamics['poses']['body_pos'][:, body]
+           + dynamics['cdof'].new_tensor([[.1, -.2, .05]]))
+  for method, oracle in ((program.jac, mujoco.mj_jac),
+                         (program.jac_dot, mujoco.mj_jacDot)):
+    jp, jr = method(dynamics, point, body)
+    expected_p, expected_r = [], []
+    host_points = point.cpu().numpy()
+    for world, (data, *_unused) in enumerate(worlds):
+      p, r = np.empty((3, model.nv)), np.empty((3, model.nv))
+      oracle(model, data, p, r, host_points[world].astype(np.float64), body)
+      expected_p.append(p); expected_r.append(r)
+    np.testing.assert_allclose(jp.cpu().numpy(), expected_p, atol=3e-6, rtol=3e-5)
+    np.testing.assert_allclose(jr.cpu().numpy(), expected_r, atol=3e-6, rtol=3e-5)
+
+
 def _fixture(disable_gravity=False):
   flag = '<flag contact="disable"' + (' gravity="disable"' if disable_gravity else '') + '/>'
   cameras = ''.join(f'<camera name="c{i}" mode="{mode}" pos=".4 -.7 .5"' +

@@ -90,7 +90,10 @@ class DeviceSpatialQueries:
     return int(value)
 
   def _tensor(self, value, shape, name):
-    if (not isinstance(value, torch.Tensor) or value.device != self.device
+    if (not isinstance(value, torch.Tensor)
+        or value.device.type != self.device.type
+        or (self.device.index is not None
+            and value.device.index != self.device.index)
         or value.dtype != torch.float32 or tuple(value.shape) != tuple(shape)):
       raise ValueError(f"{name} must be float32{tuple(shape)} on {self.device}")
     return value
