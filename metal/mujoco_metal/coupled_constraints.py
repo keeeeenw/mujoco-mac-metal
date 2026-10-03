@@ -29,6 +29,7 @@ import mujoco
 import numpy as np
 
 _SHADER = Path(__file__).parent / "shaders" / "coupled_constraints.metal"
+_BROADPHASE_SHADER = Path(__file__).parent / "shaders" / "broadphase.metal"
 _EQUALITY_SHADER = Path(__file__).parent / "shaders" / "equality_assembly.metal"
 _COLLISION_SHADER = Path(__file__).parent / "shaders" / "collision_primitives.metal"
 _CONVEX_SHADER = Path(__file__).parent / "shaders" / "convex_narrowphase.metal"
@@ -1176,6 +1177,8 @@ class MetalCoupledConstraints:
     except AttributeError:
       self._tendon_kernel = None
     self._solve_kernel = self._library.solve_coupled_constraints
+    self._broadphase_lib = torch.mps.compile_shader(_BROADPHASE_SHADER.read_text())
+    self._broadphase_kernel = self._broadphase_lib.broadphase_mask
 
     d = self.descriptor
     joint_limit_params = (
@@ -1323,6 +1326,7 @@ class MetalCoupledConstraints:
         "contact_row_data": empty(b * nc * 6 * 6),
         "contact_frame": empty(b * nc * 12),
         "contact_jacobian": empty(b * nc * 6 * nv),
+        "pair_mask": torch.zeros(max(b * max(d.npairs, 1), 1), dtype=torch.float32, device=self._device),
         "workspace_J": empty(b * nr * nv),
         "workspace_debug": empty(b * (nr * nr + 7 * nr)),
         "out_force": empty(b * nv),
@@ -1435,6 +1439,17 @@ class MetalCoupledConstraints:
       w["contact_row_data"].zero_()
       w["contact_frame"].zero_()
       w["contact_jacobian"].zero_()
+      w["pair_mask"].zero_()
+      self._broadphase_kernel(
+          poses["geom_pos"].reshape(-1),
+          self._constants["geom_rbound"],
+          self._constants["pair_geoms"],
+          self._constants["pair_margin_gap"],
+          self._constants["geom_type"],
+          w["pair_mask"],
+          self._constants["c_dims"],
+          threads=(b * d.npairs,), group_size=(1,),
+      )
       self._contact_kernel(
           poses["geom_pos"], poses["geom_quat"],
           self._constants["geom_size"], self._constants["geom_type"],
@@ -1452,6 +1467,25 @@ class MetalCoupledConstraints:
           self._constants["mesh_hull"], self._constants["mesh_hull_info"],
           threads=(b * d.npairs,), group_size=(1,),
       )
+
+  def broadphase_counts(self):
+    """Diagnostics-only readback: per-env (mask_active, slot_active) counts.
+
+    `mask_active` counts broadphase sphere-overlap pairs; `slot_active`
+    counts narrowphase slots with solver rows. Every slot-active pair must
+    be mask-active (conservative superset). Host readback happens here only,
+    never inside the step loop.
+    """
+    w, d = self._workspace, self.descriptor
+    b, npairs, nc = self.batch_size, d.npairs, d.ncontacts_max
+    mask = w["pair_mask"][: b * max(npairs, 1)].detach().cpu().numpy().reshape(b, max(npairs, 1))
+    rows = w["contact_row_data"][: b * max(nc, 1) * 36].detach().cpu().numpy().reshape(b, max(nc, 1), 6, 6)
+    out = []
+    for env in range(b):
+      m = int(np.sum(mask[env, :npairs] > 0.5)) if npairs else 0
+      s = int(np.sum(rows[env, :nc, 0, 0] > 0.5)) if nc else 0
+      out.append((m, s))
+    return out
 
   def contact_buffers(self):
     """Return borrowed candidate-contact workspace views for BODY adhesion."""
