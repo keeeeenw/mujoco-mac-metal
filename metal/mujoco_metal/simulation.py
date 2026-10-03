@@ -89,9 +89,12 @@ class MetalSimulation:
       raise ValueError("batch_size must be positive")
     batch_size = int(batch_size)
     self.limits = limits
+    if self.limits is None and getattr(profile, "name", profile) == "integrated_scalable_v1":
+      from mujoco_metal.capacity import CapacityLimits
+      self.limits = CapacityLimits(max_nv=64, max_pairs=64, max_slots=64, max_rows=256)
     # This CPU-only contract check must finish before any constructor can
     # initialize MPS or compile a shader.
-    profile = validate_stepping_profile(model, profile=profile, limits=limits)
+    profile = validate_stepping_profile(model, profile=profile, limits=self.limits)
     is_integrated = profile.name in ("integrated_euler_v1", "integrated_rk4_v1", "integrated_implicit_v1", "integrated_scalable_v1")
     with_transmissions = "transmission" in profile.name or is_integrated
     motor_model = (
@@ -189,6 +192,10 @@ class MetalSimulation:
     self._joint_constraints = None
     self._contact = None
     self._coupled_constraints = None
+    self._flex = None
+    if hasattr(model, "nflex") and model.nflex > 0:
+      from mujoco_metal.flex import MetalFlex
+      self._flex = MetalFlex(model, batch_size=batch_size, device=self._state._device)
     self._accepted_step = None
     self._coupled_solve_dispatches = 0
 
@@ -758,6 +765,8 @@ class MetalSimulation:
         "tree_asleep": self._islands.tree_asleep.copy(),
         "_stationary_steps": self._islands._stationary_steps.copy(),
     } if getattr(self, "_islands", None) is not None else None)
+    snap["flex"] = (self._flex.get_state()
+                    if getattr(self, "_flex", None) is not None else None)
     return snap
 
   def restore(self, snapshot, env_ids=None):
@@ -903,6 +912,12 @@ class MetalSimulation:
         for row in np.asarray(ids).tolist():
           self._islands.tree_asleep[row] = snapshot["islands"]["tree_asleep"][row]
           self._islands._stationary_steps[row] = snapshot["islands"]["_stationary_steps"][row]
+    if getattr(self, "_flex", None) is not None:
+      if "flex" in snapshot and snapshot["flex"] is not None:
+        self._flex.set_state(snapshot["flex"])
+      else:
+        body_pos, body_quat, _, _ = self._smooth.forward_kinematics(self._state.qpos)
+        self._flex.update_kinematics({"body_pos": body_pos, "body_quat": body_quat})
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -937,6 +952,9 @@ class MetalSimulation:
           self._sensordata[ids.tolist()] = 0.0
     if getattr(self, "_islands", None) is not None:
       self._islands.wake_all(env_ids=env_ids)
+    if getattr(self, "_flex", None) is not None:
+      body_pos, body_quat, _, _ = self._smooth.forward_kinematics(self._state.qpos)
+      self._flex.update_kinematics({"body_pos": body_pos, "body_quat": body_quat})
     self._assembled_system_valid = False
     self._accepted_step = None
     if hasattr(self, "_last_coupled"):
@@ -1026,6 +1044,9 @@ class MetalSimulation:
           self._sensordata[ids.tolist()] = 0.0
     if getattr(self, "_islands", None) is not None:
       self._islands.wake_all(env_ids=env_ids)
+    if getattr(self, "_flex", None) is not None:
+      body_pos, body_quat, _, _ = self._smooth.forward_kinematics(self._state.qpos)
+      self._flex.update_kinematics({"body_pos": body_pos, "body_quat": body_quat})
     self._assembled_system_valid = False
     self._accepted_step = None
     if hasattr(self, "_last_coupled"):
@@ -1339,6 +1360,11 @@ class MetalSimulation:
           mocap_pos=mpos, mocap_quat=mquat,
       )
       rhs.add_(passive)
+    if self._flex is not None:
+      flex_qfrc, _, _ = self._flex.run_device(
+          qpos, qvel, dynamics["poses"], dynamics.get("cvel", None)
+      )
+      rhs.add_(flex_qfrc)
     if self._fluid is not None:
       rhs.add_(self._fluid.run_device(qpos, qvel, dynamics))
     if self._tendons is not None:
@@ -1372,6 +1398,7 @@ class MetalSimulation:
         dynamics["poses"], dynamics["mass_matrix"], rhs, qpos, qvel,
         eq_active=eq_active, cvel=dynamics.get("cvel", None),
         tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
+        flex=self._flex,
     )
     coupled["mass_matrix"] = dynamics["mass_matrix"]
     self._last_coupled = coupled
@@ -1724,6 +1751,16 @@ class MetalSimulation:
           mocap_pos=mpos, mocap_quat=mquat,
       )
       self._rhs.add_(passive)
+    if self._flex is not None:
+      flex_qfrc, flex_damp, flex_stiff = self._flex.run_device(
+          qpos, qvel, dynamics["poses"], dynamics.get("cvel", None)
+      )
+      self._rhs.add_(flex_qfrc)
+      if getattr(self, "_damping_tangent", None) is not None and flex_damp is not None:
+        if flex_damp.ndim == 3 and self._damping_tangent.ndim == 2:
+          self._damping_tangent.add_(-self._state._torch.diagonal(flex_damp, dim1=1, dim2=2))
+        else:
+          self._damping_tangent.add_(flex_damp)
     if self._fluid is not None:
       self._rhs.add_(self._fluid.run_device(qpos, qvel, dynamics))
     if self._tendons is not None:
@@ -1778,6 +1815,7 @@ class MetalSimulation:
           dynamics["poses"], dynamics["mass_matrix"], self._rhs, qpos, qvel,
           eq_active=eq_active, cvel=dynamics.get("cvel", None),
           tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
+          flex=self._flex,
       )
       coupled["mass_matrix"] = dynamics["mass_matrix"]
       self._last_coupled = coupled
@@ -1883,6 +1921,9 @@ class MetalSimulation:
           self._islands.update_sleep(state._qvel, ctrl=self._control, xfrc_applied=self._body_wrench)
           self._islands.apply_sleep_to_state(state._qvel, state._qacc)
         state._generation += 1
+        if getattr(self, "_flex", None) is not None:
+          fk_dyn = self._smooth.run_device(state._qpos, state._qvel, getattr(state, "_mpos", None), getattr(state, "_mquat", None))
+          self._flex.update_kinematics(fk_dyn["poses"], fk_dyn.get("cvel", None))
         if not bool(torch.all(success)):
           if self._sensordata is not None:
             rollback_sens = pre_sens if pre_sens is not None else torch.zeros_like(self._sensordata)
@@ -2064,6 +2105,9 @@ class MetalSimulation:
         self._islands.update_sleep(state._qvel, ctrl=self._control, xfrc_applied=self._body_wrench)
         self._islands.apply_sleep_to_state(state._qvel, state._qacc)
       state._generation += 1
+      if getattr(self, "_flex", None) is not None:
+        fk_dyn = self._smooth.run_device(state._qpos, state._qvel, getattr(state, "_mpos", None), getattr(state, "_mquat", None))
+        self._flex.update_kinematics(fk_dyn["poses"], fk_dyn.get("cvel", None))
 
       # Failure atomicity (R02): rollback sensor samples and warmstarts for failed worlds
       if not bool(torch.all(self._success)):
@@ -2163,3 +2207,23 @@ class MetalSimulation:
         state._act,
         out=self._next_act,
     )
+
+  @property
+  def flex(self):
+    """Underlying MetalFlex instance if model contains flex elements, else None."""
+    return self._flex
+
+  @property
+  def flexvert_xpos(self):
+    """World positions of flex vertices (B, nflexvert, 3) or None."""
+    return self._flex.flexvert_xpos if self._flex is not None else None
+
+  @property
+  def flexedge_length(self):
+    """Current lengths of flex edges (B, nflexedge) or None."""
+    return self._flex.flexedge_length if self._flex is not None else None
+
+  @property
+  def flexedge_velocity(self):
+    """Current deformation rates of flex edges (B, nflexedge) or None."""
+    return self._flex.flexedge_velocity if self._flex is not None else None

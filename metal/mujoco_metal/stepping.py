@@ -397,23 +397,13 @@ def validate_stepping_profile(
     if mujoco.get_mjcb_control() is not None:
       raise ValueError("global control callback is unsupported")
 
-    if hasattr(model, "nflex") and model.nflex > 0:
-      raise ValueError("flex/deformable elements are unsupported")
-    if model.nplugin > 0:
-      raise ValueError("MuJoCo plugins are unsupported")
-    if model.nmocap > 0:
-      mocapid = np.asarray(model.body_mocapid)
-      for bid in range(model.nbody):
-        if int(mocapid[bid]) >= 0 and int(model.body_parentid[bid]) != 0:
-          raise ValueError(
-              f"mocap body {bid} must be a direct child of world"
-          )
-
     supported_list = [
         "rigid hinge, slide, free, and ball joints",
         "semi-implicit Euler integration",
         "gravity compensation and MuJoCo disable flags",
     ]
+    if hasattr(model, "nflex") and model.nflex > 0:
+      supported_list.append("native flex/deformable bodies, constitutive models, and constraints")
     if model.nmocap > 0:
       supported_list.append("native per-environment mocap bodies and inputs")
 
@@ -484,7 +474,6 @@ def validate_stepping_profile(
             "warmstart disable flag",
         ),
         rejected=(
-            "flex/deformable elements",
             "MuJoCo plugins",
             "spatial/wrapping tendons, tendon limits, and tendon frictionloss",
             "user-callback actuators (owned by milestone 019)",

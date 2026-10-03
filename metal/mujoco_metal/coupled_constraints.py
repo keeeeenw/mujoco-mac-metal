@@ -60,6 +60,9 @@ _EQ_CONNECT = int(mujoco.mjtEq.mjEQ_CONNECT)
 _EQ_WELD = int(mujoco.mjtEq.mjEQ_WELD)
 _EQ_JOINT = int(mujoco.mjtEq.mjEQ_JOINT)
 _EQ_TENDON = int(mujoco.mjtEq.mjEQ_TENDON)
+_EQ_FLEX = int(mujoco.mjtEq.mjEQ_FLEX)
+_EQ_FLEXVERT = int(mujoco.mjtEq.mjEQ_FLEXVERT)
+_EQ_FLEXSTRAIN = int(mujoco.mjtEq.mjEQ_FLEXSTRAIN)
 _OBJ_BODY = int(mujoco.mjtObj.mjOBJ_BODY)
 _OBJ_SITE = int(mujoco.mjtObj.mjOBJ_SITE)
 
@@ -70,7 +73,7 @@ _EQ_ROWS = {
     _EQ_WELD: 6,
 }
 
-_SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_TENDON, _EQ_CONNECT, _EQ_WELD)
+_SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_TENDON, _EQ_CONNECT, _EQ_WELD, _EQ_FLEX, _EQ_FLEXVERT, _EQ_FLEXSTRAIN)
 
 _SUPPORTED_GEOM_TYPES = (_PLANE, _HFIELD, _SPHERE, _CAPSULE, _BOX,
                            _ELLIPSOID, _CYLINDER, _MESH, _SDF)
@@ -448,11 +451,25 @@ def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor
   for eid in range(model.neq):
     et = int(eq_types_arr[eid])
     ot = int(eq_objtype_arr[eid])
-    span = int(_EQ_ROWS[et])
+    if et == _EQ_FLEX:
+      fid = int(model.eq_obj1id[eid])
+      span = int(model.flex_edgenum[fid]) if model.nflex else 0
+    elif et == _EQ_FLEXVERT:
+      fid = int(model.eq_obj1id[eid])
+      span = int(model.flex_vertnum[fid]) * 3 if model.nflex else 0
+    elif et == _EQ_FLEXSTRAIN:
+      fid = int(model.eq_obj1id[eid])
+      span = int(model.flex_elemnum[fid]) if model.nflex else 0
+    else:
+      span = int(_EQ_ROWS[et])
     eq_rowadr_list.append(eq_row_cursor)
     eq_rownum_list.append(span)
     eq_row_cursor += span
-    if et == _EQ_JOINT:
+    if et in (_EQ_FLEX, _EQ_FLEXVERT, _EQ_FLEXSTRAIN):
+      fid = int(model.eq_obj1id[eid])
+      if not 0 <= fid < int(model.nflex):
+        raise ValueError(f"equality {eid}: flex object id out of range")
+    elif et == _EQ_JOINT:
       j1, j2 = int(model.eq_obj1id[eid]), int(model.eq_obj2id[eid])
       if not 0 <= j1 < model.njnt or int(model.jnt_type[j1]) not in scalar_types:
         raise ValueError(f"equality {eid}: object 1 must be a scalar hinge/slide joint")
@@ -1590,7 +1607,7 @@ class MetalCoupledConstraints:
     }
 
   def run_device(self, poses, mass, qfrc_smooth, qpos, qvel, eq_active=None, cvel=None,
-                 tendon_J_spatial=None, tendon_length_spatial=None):
+                 tendon_J_spatial=None, tendon_length_spatial=None, flex=None):
     """Solve coupled contacts, limits, dry friction, and equalities on MPS.
 
     `poses` is the dict of FK outputs from `MetalKinematics`.
@@ -1711,6 +1728,29 @@ class MetalCoupledConstraints:
           w["workspace_J"], w["workspace_debug"],
           threads=(b,), group_size=(1,),
       )
+
+    # 1c. Flex equality constraint rows (milestone 018: flex distance equalities).
+    if d.neq > 0 and bool(np.any(np.asarray(d.eq_type) == _EQ_FLEX)) and flex is not None:
+      f_pos, f_aref, f_R, f_J = flex.run_equalities(poses, cvel=cvel, eq_active=eq_active_tensor)
+      nr_val = int(d.nr)
+      for eid in range(d.neq):
+        if int(d.eq_type[eid]) == _EQ_FLEX:
+          fid = int(d.eq_obj[eid, 0])
+          edge_start = int(flex.descriptor.edgeadr[fid]) if fid < flex.descriptor.nflex else 0
+          row_start = int(d.eq_rowadr[eid])
+          row_span = int(d.eq_rownum[eid])
+          J_w = w["workspace_J"].view(b, nr_val, max(nv, 1))
+          dbg_w = w["workspace_debug"].view(b, -1)
+          for k in range(row_span):
+            r = row_start + k
+            e = edge_start + k
+            if r < nr_val and e < flex.descriptor.nflexedge:
+              J_w[:, r, :nv] = f_J[:, e, :nv]
+              dbg_w[:, nr_val * nr_val + r] = f_R[:, e]
+              dbg_w[:, nr_val * nr_val + nr_val + r] = f_aref[:, e]
+              dbg_w[:, nr_val * nr_val + 4 * nr_val + r] = -float("inf")
+              dbg_w[:, nr_val * nr_val + 5 * nr_val + r] = float("inf")
+              dbg_w[:, nr_val * nr_val + 6 * nr_val + r] = 1.0
 
     # 2. Coupled constraint solver kernel
     solve_fn = self._solve_kernel if self.descriptor.dense_path else self._solve_block_kernel
