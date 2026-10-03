@@ -402,12 +402,18 @@ kernel void evaluate_state_sensors(
       slin[p]+=slin[uint(k)];
     }
     float smass[64];
-    for (uint k=0;k<nbody;++k) smass[k]=massub[k*5+0];
-    for (int k=int(nbody)-1;k>0;--k) smass[uint(body_tree[uint(k)*2+0])]+=smass[uint(k)];
-    for (uint k=0;k<nbody;++k) scom[k]=xipos[k];
+    float3 smom[64];
+    for (uint k=0;k<nbody;++k) {
+      smass[k]=massub[k*5+0];
+      smom[k]=massub[k*5+0]*xipos[k];
+    }
     for (int k=int(nbody)-1;k>0;--k) {
       uint p=uint(body_tree[uint(k)*2+0]);
-      scom[p]=(scom[p]*(smass[p]-smass[uint(k)])+scom[uint(k)]*smass[uint(k)])/max(smass[p],1e-30f);
+      smass[p]+=smass[uint(k)];
+      smom[p]+=smom[uint(k)];
+    }
+    for (uint k=0;k<nbody;++k) {
+      scom[k]=smass[k]>1e-15f ? smom[k]/smass[k] : xipos[k];
     }
     float3 slv[64];
     for (uint k=0;k<nbody;++k) {

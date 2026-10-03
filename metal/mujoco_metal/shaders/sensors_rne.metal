@@ -101,21 +101,23 @@ kernel void assemble_cfrc_ext(
     cfrc_ext[b6+b*6+0]=0.0f; cfrc_ext[b6+b*6+1]=0.0f; cfrc_ext[b6+b*6+2]=0.0f;
     cfrc_ext[b6+b*6+3]=0.0f; cfrc_ext[b6+b*6+4]=0.0f; cfrc_ext[b6+b*6+5]=0.0f;
   }
-  // Subtree com (mass-weighted xipos backward pass).
+  // Subtree com (pinned mj_comPos: mass-weighted moments accumulated
+  // backward, normalized by subtree mass; xipos fallback below MINVAL).
   float3 scom[64];
   float smass[64];
+  float3 smom[64];
   for (uint b=0;b<nbody;++b) {
     scom[b]=r3(inertial_pos,b3+b*3);
     smass[b]=mass[b];
+    smom[b]=mass[b]*r3(inertial_pos,b3+b*3);
   }
   for (int k=int(nbody)-1;k>0;--k) {
     uint kk=uint(k), p=uint(body_tree[kk*2+0]);
     smass[p]+=smass[kk];
+    smom[p]+=smom[kk];
   }
-  for (uint b=0;b<nbody;++b) scom[b]=r3(inertial_pos,b3+b*3);
-  for (int k=int(nbody)-1;k>0;--k) {
-    uint kk=uint(k), p=uint(body_tree[kk*2+0]);
-    scom[p]=(scom[p]*(smass[p]-smass[kk])+scom[kk]*smass[kk])/max(smass[p],1e-30f);
+  for (uint b=0;b<nbody;++b) {
+    scom[b]=smass[b]>1e-15f ? smom[b]/smass[b] : r3(inertial_pos,b3+b*3);
   }
   // xfrc_applied: torque:force rearranged, mapped to com.
   if (has_xfrc!=0) {
@@ -287,21 +289,22 @@ kernel void rne_post(
   uint njnt=uint(dims[3]);
   if (world>=batch || nbody>64 || nv>64) return;
   uint vb=world*nv, b3=world*nbody*3, b6=world*nbody*6;
-  // Subtree com.
+  // Subtree com (pinned mj_comPos: moment accumulation + MINVAL fallback).
   float3 scom[64];
   float smass[64];
+  float3 smom[64];
   for (uint b=0;b<nbody;++b) {
     scom[b]=r3(inertial_pos,b3+b*3);
     smass[b]=mass[b];
+    smom[b]=mass[b]*r3(inertial_pos,b3+b*3);
   }
   for (int k=int(nbody)-1;k>0;--k) {
     uint kk=uint(k), p=uint(body_tree[kk*2+0]);
     smass[p]+=smass[kk];
+    smom[p]+=smom[kk];
   }
-  for (uint b=0;b<nbody;++b) scom[b]=r3(inertial_pos,b3+b*3);
-  for (int k=int(nbody)-1;k>0;--k) {
-    uint kk=uint(k), p=uint(body_tree[kk*2+0]);
-    scom[p]=(scom[p]*(smass[p]-smass[kk])+scom[kk]*smass[kk])/max(smass[p],1e-30f);
+  for (uint b=0;b<nbody;++b) {
+    scom[b]=smass[b]>1e-15f ? smom[b]/smass[b] : r3(inertial_pos,b3+b*3);
   }
   // Root-com-per-body for downstream kernels.
   for (uint b=0;b<nbody;++b) {
