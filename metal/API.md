@@ -124,8 +124,35 @@ The default integrated Euler pipeline enforces hardware-tailored capacity bounds
 
 ### Native stages and state APIs
 - Native split-stage APIs: `mj_fwdPosition`, `mj_fwdVelocity`, `mj_fwdActuation`, `mj_fwdAcceleration` (unconstrained forward acceleration $M \hat{a} = \tau_{\text{smooth}}$), and `mj_fwdConstraint` (coupled contact/limit/equality solve).
-- Inverse dynamics: `mj_inverse` subtracts constraint forces ($qfrc\_constraint$), passive forces, and actuation forces matching pinned MuJoCo semantics.
+- Inverse dynamics: `mj_inverse` computes $M qacc + qfrc\_bias - qfrc\_passive - qfrc\_constraint$. The result is the generalized force required to produce the supplied acceleration; current actuator force is not subtracted. Explicit inverse queries preserve borrowed forward-stage storage and cache records, including on failure, using device snapshots. This incurs allocation overhead at the query boundary.
 - Native state selectors: `mj_getState` and `mj_setState` conform to pinned `mjtState` bitmasks (TIME=1, QPOS=2, QVEL=4, ACT=8, HISTORY=16, WARMSTART=32, CTRL=64, QFRC_APPLIED=128, XFRC_APPLIED=256, EQ_ACTIVE=512, MOCAP_POS=1024, MOCAP_QUAT=2048, USERDATA=4096, PLUGIN=8192; groups PHYSICS=30, USER=8128, FULLPHYSICS=8223, INTEGRATION=16383) with atomic validation and per-world selection.
+
+### Spatial queries in development source
+
+The following device query implementations are available from
+`mujoco_metal.native_api` in development source. Pinned CPU comparisons cover
+free/ball/hinge/slide chains, welded/static bodies, world/local frames and all
+five camera modes. **Native GPU qualification is pending**; this is not an
+additional claim for the published 0.4.0 wheel.
+
+- `mj_jac`, `mj_jacDot`, `mj_jacBody`, `mj_jacBodyCom`, `mj_jacGeom`,
+  `mj_jacSite`: return owned translation/rotation Jacobians, each `[batch,3,nv]`,
+  in world axes. Body origin and inertial COM are distinct. `mj_jacSubtreeCom`
+  returns the mass-weighted subtree COM translation Jacobian.
+- `mj_objectVelocity`, `mj_objectAcceleration`: return owned `[batch,6]` values
+  in angular-then-linear order, centered on a body inertial/regular frame,
+  geom, site or camera. `flg_local=0` uses world axes; `1` uses object axes.
+  Acceleration uses current velocity and supplied/owned `qacc`, the pinned RNE
+  gravity convention and rotating-frame correction; it does not solve forward
+  constraints. Supply matching `qvel`/`qacc` when querying an explicit stage.
+- `mj_applyFT(sim, force, torque, point, body)`: returns the generalized wrench
+  contribution `[batch,nv]`; it does not mutate held applied forces. Force and
+  torque are world vectors `[batch,3]`, and either may be `None` for zero.
+
+Queries evaluate current smooth state by default. An optional `dynamics=` stage
+avoids that evaluation; its borrowed inputs must still describe the requested
+state. Host arrays are staged at the explicit input boundary. Math remains on
+the simulation device, and temporary forward storage is restored after queries.
 
 ### Equality activation, reset, snapshots and failure
 

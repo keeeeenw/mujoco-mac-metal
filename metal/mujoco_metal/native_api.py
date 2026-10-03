@@ -559,6 +559,88 @@ def mj_fwdConstraint(sim, qpos=None, qvel=None, poses=None, dynamics=None):
   return acc, status, dyn
 
 
+def _spatial_query(sim, operation, dynamics=None):
+  """Query current smooth state while preserving borrowed forward records."""
+  from mujoco_metal.spatial_queries import DeviceSpatialQueries
+  program = getattr(sim, "_spatial_queries", None)
+  if (program is None or program.model is not sim.model
+      or program.batch_size != sim.batch_size or program.device != sim.state._device):
+    program = DeviceSpatialQueries(sim.model, sim.batch_size, sim.state._device)
+    sim._spatial_queries = program
+  with _inverse_query_workspaces(sim):
+    stage = dynamics if dynamics is not None else sim._smooth.run_device(
+        sim.state._qpos, sim.state._qvel,
+        getattr(sim.state, "_mpos", None), getattr(sim.state, "_mquat", None))
+    return operation(program, stage)
+
+def mj_jac(sim, point, body, *, dynamics=None):
+  """Owned world point translation/rotation Jacobians [batch,3,nv]."""
+  point = _stage_tensor(sim, point, (sim.batch_size, 3), "point")
+  return _spatial_query(sim, lambda program, stage: program.jac(stage, point, body), dynamics)
+
+def mj_jacDot(sim, point, body, *, dynamics=None):
+  """Owned world time derivatives of the point/rotation Jacobians."""
+  point = _stage_tensor(sim, point, (sim.batch_size, 3), "point")
+  return _spatial_query(sim, lambda program, stage: program.jac_dot(stage, point, body), dynamics)
+
+def _object_jac(sim, objtype, objid, dynamics):
+  def query(program, stage):
+    body, point, _rotation = program.object_frame(stage, objtype, objid)
+    return program.jac(stage, point, body)
+  return _spatial_query(sim, query, dynamics)
+
+def mj_jacBody(sim, body, *, dynamics=None):
+  """World Jacobians at the regular body origin (not its inertial COM)."""
+  return _object_jac(sim, mujoco.mjtObj.mjOBJ_XBODY, body, dynamics)
+
+def mj_jacBodyCom(sim, body, *, dynamics=None):
+  return _object_jac(sim, mujoco.mjtObj.mjOBJ_BODY, body, dynamics)
+
+def mj_jacGeom(sim, geom, *, dynamics=None):
+  return _object_jac(sim, mujoco.mjtObj.mjOBJ_GEOM, geom, dynamics)
+
+def mj_jacSite(sim, site, *, dynamics=None):
+  return _object_jac(sim, mujoco.mjtObj.mjOBJ_SITE, site, dynamics)
+
+def mj_jacSubtreeCom(sim, body, *, dynamics=None):
+  return _spatial_query(sim, lambda program, stage: program.jac_subtree_com(stage, body), dynamics)
+
+def _local_flag(value):
+  if not isinstance(value, (bool, int, np.integer)) or int(value) not in (0, 1):
+    raise ValueError("flg_local must be 0 or 1")
+  return bool(value)
+
+def mj_objectVelocity(sim, objtype, objid, flg_local=0, *, dynamics=None):
+  """Owned [batch,6] rot:lin object-centered velocity, world/local axes."""
+  local = _local_flag(flg_local)
+  return _spatial_query(sim, lambda program, stage:
+      program.object_velocity(stage, objtype, objid, local), dynamics)
+
+def mj_objectAcceleration(sim, objtype, objid, flg_local=0, *, dynamics=None, qvel=None, qacc=None):
+  """Pinned object acceleration from current qvel and supplied/owned qacc.
+
+  Includes RNE's gravity convention and rotating-frame Coriolis correction.
+  This evaluates a query; it does not perform a forward constraint solve.
+  """
+  local = _local_flag(flg_local)
+  qa = (_stage_tensor(sim, qacc, (sim.batch_size, sim.model.nv), "qacc")
+        if qacc is not None else sim.state._qacc)
+  qv = (_stage_tensor(sim, qvel, (sim.batch_size, sim.model.nv), "qvel")
+        if qvel is not None else sim.state._qvel)
+  return _spatial_query(sim, lambda program, stage: program.object_acceleration(
+      stage, qv, qa, objtype, objid, local), dynamics)
+
+def mj_applyFT(sim, force, torque, point, body, *, dynamics=None):
+  """Owned generalized wrench contribution, without mutating held inputs."""
+  def tensor(value, name):
+    if value is None:
+      return torch.zeros((sim.batch_size, 3), dtype=torch.float32, device=sim.state._device)
+    return _stage_tensor(sim, value, (sim.batch_size, 3), name)
+  force, torque = tensor(force, "force"), tensor(torque, "torque")
+  point = _stage_tensor(sim, point, (sim.batch_size, 3), "point")
+  return _spatial_query(sim, lambda program, stage:
+      program.apply_ft(stage, force, torque, point, body), dynamics)
+
 # -------------------------------------------------------------------------
 # Native State Selector APIs (mj_getState / mj_setState)
 # -------------------------------------------------------------------------
