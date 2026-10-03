@@ -60,18 +60,28 @@ def test_native_implicit_large_dense_solve_parity_and_reuse(integrator,program):
     adr,count = int(model.D_rowadr[row]),int(model.D_rownnz[row])
     pattern[row,model.D_colind[adr:adr+count]] = 1
   derivative *= pattern
+  full_effective = mass-model.opt.timestep*derivative
+  input_derivative = derivative.copy()
   if integrator == "implicitfast":
     derivative = np.tril(derivative)+np.tril(derivative,-1).transpose(0,2,1)
   effective = mass-model.opt.timestep*derivative
   pointer = None
   tensor = lambda x: torch.tensor(x,dtype=torch.float32,device="mps")
-  m,d = tensor(mass),tensor(derivative)
+  m,d = tensor(mass),tensor(input_derivative)
+  full_pointer = None
   for replay in range(2):
     force = rng.normal(size=(2,72))
     result = native.run_device(m,tensor(force),d)
     np.testing.assert_array_equal(result["status"].cpu().numpy(),0)
     np.testing.assert_allclose(result["effective_mass"].cpu().numpy(),effective,
                                atol=2e-7,rtol=2e-6)
+    np.testing.assert_allclose(result["full_effective_mass"].cpu().numpy(),
+                               full_effective,atol=2e-7,rtol=2e-6)
+    if integrator == "implicitfast":
+      assert np.max(np.abs(full_effective-effective)) > 1e-5
+    if full_pointer is not None:
+      assert result["full_effective_mass"].data_ptr() == full_pointer
+    full_pointer = result["full_effective_mass"].data_ptr()
     expected = np.stack([np.linalg.solve(effective[b],force[b]) for b in range(2)])
     np.testing.assert_allclose(result["qacc"].cpu().numpy(),expected,atol=2e-6,rtol=1e-5)
     if pointer is not None:

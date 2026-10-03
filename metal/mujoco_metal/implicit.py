@@ -273,6 +273,12 @@ class ImplicitFastProgram:
     self._mass = self._mass_storage[:self.batch_size*self.descriptor.nv*self.descriptor.nv].reshape(
         self.batch_size, self.descriptor.nv, self.descriptor.nv
     )
+    # Flex CG uses the full compiled D operator even when the ordinary
+    # implicitfast solve factors the mirrored lower-triangle preconditioner.
+    self._full_mass_storage = torch.empty_like(self._mass_storage)
+    self._full_mass = self._full_mass_storage[
+        :self.batch_size*self.descriptor.nv*self.descriptor.nv].reshape(
+            self.batch_size, self.descriptor.nv, self.descriptor.nv)
     self._baseline = torch.as_tensor(
         np.array(_baseline_derivative(self.descriptor), copy=True),
         dtype=torch.float32, device=self._device,
@@ -348,9 +354,12 @@ class ImplicitFastProgram:
       mass_buffer = derivative_buffer = self._empty_input
     else:
       mass_buffer, derivative_buffer = mass_matrix.reshape(-1), derivative.reshape(-1)
-    self._assemble(mass_buffer, derivative_buffer, self._mass_storage, self._dims, self._timestep, threads=(b*max(nv*nv, 1),), group_size=(1,))
+    self._assemble(mass_buffer, derivative_buffer, self._mass_storage, self._dims,
+                   self._timestep, self._full_mass_storage,
+                   threads=(b*max(nv*nv, 1),), group_size=(1,))
     acceleration, status = self._solver.run_device(self._mass, qfrc_smooth)
-    return {"effective_mass": self._mass, "qacc": acceleration, "status": status}
+    return {"effective_mass": self._mass, "full_effective_mass": self._full_mass,
+            "qacc": acceleration, "status": status}
 
 
 @dataclass(frozen=True)
@@ -501,4 +510,5 @@ class ImplicitProgram:
       mass_buffer, derivative_buffer = mass_matrix.reshape(-1), derivative.reshape(-1)
     self._assemble(mass_buffer, derivative_buffer, self._mass_storage, self._dims, self._timestep, threads=(b*max(nv*nv, 1),), group_size=(1,))
     acceleration, status = self._solver.run_device(self._mass, qfrc_smooth)
-    return {"effective_mass": self._mass, "qacc": acceleration, "status": status}
+    return {"effective_mass": self._mass, "full_effective_mass": self._mass,
+            "qacc": acceleration, "status": status}
