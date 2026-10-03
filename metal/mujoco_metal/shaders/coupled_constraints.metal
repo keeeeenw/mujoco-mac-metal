@@ -198,26 +198,39 @@ kernel void contact_normal(
     device const int* pair_condim [[buffer(20)]],
     device const float* pair_friction [[buffer(21)]],
     device const float* pair_solreffriction [[buffer(22)]],
-    device const int* pair_contact_offset [[buffer(23)]],
+    device const int* pair_contact_offsets_dims [[buffer(23)]],
     device float* row_data [[buffer(24)]],
     device float* frame [[buffer(25)]],
     device float* jacobian [[buffer(26)]],
-    constant int* dims [[buffer(27)]],
+    device const int* logical_pair_to_packed [[buffer(27)]],
     device const float* geom_rbound [[buffer(28)]],
     device const float* mesh_hull [[buffer(29)]],
     device const int* mesh_hull_info [[buffer(30)]],
     uint tid [[thread_position_in_grid]]) {
-  int nv = dims[0];
-  int npairs = dims[1];
-  int ncontacts_max = dims[2];
-  int batch = dims[3];
-  int nbody = dims[4];
-  int njnt = dims[5];
-  int ngeom = dims[6];
+  int npairs = pair_contact_offsets_dims[1];
+  int dims_base = npairs + 1;
+  int nv = pair_contact_offsets_dims[dims_base + 0];
+  int ncontacts_max = pair_contact_offsets_dims[dims_base + 2];
+  int batch = pair_contact_offsets_dims[dims_base + 3];
+  int nbody = pair_contact_offsets_dims[dims_base + 4];
+  int njnt = pair_contact_offsets_dims[dims_base + 5];
+  int ngeom = pair_contact_offsets_dims[dims_base + 6];
 
   int world = int(tid) / max(npairs, 1);
   int pair_idx = int(tid) % max(npairs, 1);
   if (uint(world) >= uint(batch) || pair_idx >= npairs) return;
+  if (pair_contact_offsets_dims[dims_base + 9] != 0
+      && logical_pair_to_packed[world * npairs + pair_idx] < 0) {
+    int offset = pair_contact_offsets_dims[pair_idx];
+    int max_con = pair_contact_offsets_dims[pair_idx + 1] - offset;
+    for (int k = 0; k < max_con; ++k) {
+      int slot = offset + k;
+      if (slot >= ncontacts_max) break;
+      int fb = (world * ncontacts_max + slot) * 12;
+      frame[fb] = 1234.0f;
+    }
+    return;
+  }
 
   int a = pair_geoms[pair_idx * 2 + 0];
   int b = pair_geoms[pair_idx * 2 + 1];
@@ -227,7 +240,7 @@ kernel void contact_normal(
   float3 szb = float3(geom_size[b * 3], geom_size[b * 3 + 1], geom_size[b * 3 + 2]);
   float rba = geom_rbound[a];
   float rbb = geom_rbound[b];
-  int disable_multiccd = dims[8];
+  int disable_multiccd = pair_contact_offsets_dims[dims_base + 8];
 
   int go = world * ngeom;
   float3 pa = float3(geom_pos[(go + a) * 3], geom_pos[(go + a) * 3 + 1], geom_pos[(go + a) * 3 + 2]);
@@ -238,30 +251,10 @@ kernel void contact_normal(
   float m = pair_margin_gap[pair_idx * 2 + 0];
   float g = pair_margin_gap[pair_idx * 2 + 1];
   int dim = pair_condim[pair_idx];
-  float cone = float(dims[7]);
+  float cone = float(pair_contact_offsets_dims[dims_base + 7]);
 
-  int offset = pair_contact_offset[pair_idx];
-  int max_con = pair_contact_offset[pair_idx + 1] - offset;
-
-  // R08/F1 broadphase-fed pruning: the conservative sphere test mirrors
-  // broadphase_mask exactly (planes always overlap; otherwise skip when
-  // center distance exceeds rbound sum + margin + gap + 1e-6). Skipped
-  // pairs stamp a finite sentinel into their slots (active flag stays 0)
-  // so tests can prove the skip path executed instead of a silent zero.
-  // dims[9] toggles pruning for on/off physics-equivalence qualification.
-  if (dims[9] != 0 && ta != 0 && tb != 0) {
-    float3 delta_pb = pb - pa;
-    float prune_R = rba + rbb + m + g;
-    if (length(delta_pb) > prune_R + 1e-6f) {
-      for (int k = 0; k < max_con; ++k) {
-        int slot = offset + k;
-        if (slot >= ncontacts_max) break;
-        int fb = (world * ncontacts_max + slot) * 12;
-        frame[fb + 0] = 1234.0f;
-      }
-      return;
-    }
-  }
+  int offset = pair_contact_offsets_dims[pair_idx];
+  int max_con = pair_contact_offsets_dims[pair_idx + 1] - offset;
 
   // Run collision algorithm
   ContactGeom con[16];
@@ -726,7 +719,7 @@ kernel void solve_coupled_constraints(
     device int* out_status [[buffer(25)]],
     device float* out_diagnostics [[buffer(26)]],
     device float* out_contact_force [[buffer(27)]],
-    device float* out_joint_force [[buffer(28)]],
+    device const int* packed_slot_to_logical [[buffer(28)]],
     device float* workspace_J [[buffer(29)]],
     device float* workspace_debug [[buffer(30)]],
     uint world [[thread_position_in_grid]]) {
@@ -841,6 +834,13 @@ kernel void solve_coupled_constraints(
     if (ten_rows > nr) ten_rows = nr;
     base_contact += ten_rows;
   }
+  device float* out_joint_force = out_contact_force
+      + max(batch * ncontacts_max * 11, 1)
+      + world * max(base_contact, 1);
+  int nactive_slots = 0;
+  while (nactive_slots < ncontacts_max
+         && packed_slot_to_logical[world * ncontacts_max + nactive_slots] >= 0)
+    ++nactive_slots;
 
   // 1. Joint constraints (if constraint disable flag not set: bit 0 mjDSBL_CONSTRAINT)
   if ((flags & 1) == 0) {
@@ -935,7 +935,9 @@ kernel void solve_coupled_constraints(
   for (int i = 0; i < 96; ++i) elliptic_member[i] = false;
 
   if ((flags & 1) == 0 && (flags & 16) == 0) {
-    for (int s = 0; s < ncontacts_max; ++s) {
+    for (int packed_s = 0; packed_s < nactive_slots; ++packed_s) {
+      int s = packed_slot_to_logical[world * ncontacts_max + packed_s];
+      if (s < 0 || s >= ncontacts_max) continue;
       int cdim = contact_condim[s * 3 + 0];
       int row_offset = contact_condim[s * 3 + 1];
       int row_start = base_contact + row_offset;
@@ -1145,6 +1147,27 @@ kernel void solve_coupled_constraints(
   int hsamp = 0;
   int hstep = max(1, maxiter / 7);
   for (int k = 0; k < 8; ++k) hist[k] = 0.0f;
+  // Report the residual of the retained warm start even when iterations is
+  // zero.  Exhausting a finite configured budget is diagnostic information,
+  // not a numerical world failure in pinned MuJoCo semantics.
+  for (int row = 0; row < total_nr; ++row) if (enabled[row] && !elliptic_member[row]) {
+    float grad = -rhs[row];
+    for (int col = 0; col < total_nr; ++col) if (enabled[col])
+      grad += W[row * nr + col] * lam[col];
+    grad += R[row] * lam[row];
+    float diag = max(1e-15f, W[row * nr + row] + R[row]);
+    float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
+    float scale = abs(ar[row]) + abs(R[row] * lam[row]);
+    for (int col = 0; col < total_nr; ++col) if (enabled[col])
+      scale += abs(W[row * nr + col] * lam[col]);
+    max_res = max(max_res, abs(proj - lam[row]) * diag / max(1.0f, scale));
+  }
+  for (int b = 0; b < elliptic_count; ++b) {
+    thread float mu[5];
+    for (int k = 0; k < 5; ++k) mu[k] = elliptic_friction[b * 5 + k];
+    max_res = max(max_res, cert_block_residual(elliptic_start[b], elliptic_dim[b],
+        mu, W, R, rhs, lam, enabled, nr, total_nr));
+  }
   if (elliptic_count > 0) {
     // Elliptic contacts are cone blocks in scaled coordinates. Solve the full
     // coupled quadratic with projected FISTA so interactions between multiple
@@ -1391,11 +1414,6 @@ kernel void solve_coupled_constraints(
       if (max_res <= tol) {
         converged = true;
         break;
-      } else if (maxiter > 2 && it + 1 == pgs_cap && pgs_cap < 1024 && max_res <= 1e-3f
-          && max_res < win_start) {
-        // Close and improved over the window: grant another window.
-        win_start = max_res;
-        pgs_cap = min(1024, pgs_cap * 2);
       }
     }
   }
@@ -1406,189 +1424,7 @@ kernel void solve_coupled_constraints(
   hist[7] = max_res;
   for (int k = 0; k < 8; ++k) out_diagnostics[world * 10 + 2 + k] = hist[k];
 
-  // 9. Contact Block Refinement (exact per-block solves tighten the PGS
-  // solution). Runs when the sweep did not certify, or when it certified
-  // only loosely (res > 1e-7): loose PGS solutions drift on rolling
-  // friction while exact block solves match the CPU oracle. Already-tight
-  // solutions skip it, bit-identical to before. Elliptic blocks join via
-  // alternating normal/QCQP exact block rounds (R04 pinch repair).
-  // G2: refinement changes retained multipliers, so the pre-refinement
-  // certificate must not survive it. Snapshot the certified candidate;
-  // after refinement, re-certify from the FINAL multipliers: revert to the
-  // snapshot if refinement lost certification, fail on nonfinite residuals.
-  // Tiny budgets (maxiter <= 2) skip refinement: the 256-round exact phase
-  // would dominate the reported iteration count and misreport exhaustion.
-  if (maxiter > 2 && (!converged || max_res > 1e-7f) && (contact_block_count > 0 || elliptic_count > 0)) {
-    thread float snap_lam[96];
-    for (int r = 0; r < 96; ++r) snap_lam[r] = lam[r];
-    float snap_res = max_res;
-    bool snap_certified = converged;
-    converged = false;
-    for (int ref = 0; ref < 256; ++ref) {
-      for (int b = 0; b < contact_block_count; ++b) {
-        int row_start = contact_block_start[b];
-        int block_size = contact_block_size[b];
-        // Preserve the original four-edge pyramid refinement budget. The
-        // expanded condim-4/6 blocks need the larger bound qualified below.
-        if (block_size <= 4 && ref >= 64) continue;
-        int local_rows[10];
-        int nlocal = 0;
-        for (int k = 0; k < block_size; ++k) {
-          int row = row_start + k;
-          if (enabled[row]) local_rows[nlocal++] = row;
-        }
-        if (nlocal == 0) continue;
-        thread float local_A[100], local_b[10], local_sol[10];
-        for (int i = 0; i < 100; ++i) local_A[i] = 0.0f;
-        for (int i = 0; i < 10; ++i) { local_b[i] = 0.0f; local_sol[i] = 0.0f; }
-        for (int i = 0; i < nlocal; ++i) {
-          int row = local_rows[i];
-          float v = -rhs[row];
-          for (int col = 0; col < total_nr; ++col) if (enabled[col] && (col < row_start || col >= row_start + block_size)) {
-            v += W[row * nr + col] * lam[col];
-          }
-          local_b[i] = v;
-          local_sol[i] = lam[row];
-          for (int j = 0; j < nlocal; ++j) {
-            int other = local_rows[j];
-            local_A[i * 10 + j] = W[row * nr + other] + (i == j ? R[row] : 0.0f);
-          }
-        }
-        float b_err;
-        if (nlocal <= 4) {
-          thread float small_A[16], small_b[4], small_sol[4];
-          for (int i = 0; i < 16; ++i) small_A[i] = 0.0f;
-          for (int i = 0; i < 4; ++i) { small_b[i] = 0.0f; small_sol[i] = 0.0f; }
-          for (int i = 0; i < nlocal; ++i) {
-            small_b[i] = local_b[i];
-            for (int j = 0; j < nlocal; ++j) small_A[i * 4 + j] = local_A[i * 10 + j];
-          }
-          b_err = solve_contact_block(small_A, small_b, nlocal, small_sol);
-          for (int i = 0; i < nlocal; ++i) local_sol[i] = small_sol[i];
-        } else {
-          b_err = solve_contact_block_iterative(local_A, local_b, nlocal, local_sol);
-        }
-        if (b_err < 1e-5f) {
-          for (int i = 0; i < nlocal; ++i) lam[local_rows[i]] = max(0.0f, local_sol[i]);
-        }
-      }
-      // Elliptic blocks: alternating exact normal 1D Newton and QCQP
-      // friction solves (4 rounds), with per-block revert when the block
-      // cone residual does not improve.
-      for (int b = 0; b < elliptic_count; ++b) {
-        int start = elliptic_start[b];
-        int dim = elliptic_dim[b];
-        thread float mu[5];
-        for (int k = 0; k < 5; ++k) mu[k] = elliptic_friction[b * 5 + k];
-        float before = cert_block_residual(start, dim, mu, W, R, rhs, lam,
-                                           enabled, nr, total_nr);
-        thread float keep[6];
-        for (int k = 0; k < 6; ++k) keep[k] = 0.0f;
-        for (int k = 0; k < dim; ++k) keep[k] = lam[start + k];
-        for (int round = 0; round < 4; ++round) {
-          // Friction QCQP given the current normal.
-          {
-            int nf = dim - 1;
-            thread float Ac[36], bc[6], oldf[6];
-            for (int i = 0; i < 36; ++i) Ac[i] = 0.0f;
-            for (int i = 0; i < 6; ++i) { bc[i] = 0.0f; oldf[i] = 0.0f; }
-            float fn = lam[start];
-            if (fn < 1e-15f) {
-              for (int k = 1; k < dim; ++k) lam[start + k] = 0.0f;
-            } else {
-              for (int i = 0; i < nf; ++i) {
-                int ri = start + 1 + i;
-                oldf[i] = lam[ri];
-                float v = -rhs[ri];
-                for (int col = 0; col < total_nr; ++col)
-                  if (enabled[col] && (col < start + 1 || col >= start + dim))
-                    v += W[ri * nr + col] * lam[col];
-                bc[i] = v;
-                for (int j = 0; j < nf; ++j)
-                  Ac[i * nf + j] = W[ri * nr + start + 1 + j] + (i == j ? R[ri] : 0.0f);
-              }
-              thread float qv[6];
-              for (int i = 0; i < 6; ++i) qv[i] = 0.0f;
-              int act = 0;
-              if (nf == 2) act = nsl_qcqp2(qv, Ac, bc, mu, fn);
-              else if (nf == 3) act = nsl_qcqp3(qv, Ac, bc, mu, fn);
-              else act = nsl_qcqpn(qv, Ac, bc, mu, fn, nf);
-              if (act) {
-                float s = 0.0f;
-                for (int j = 0; j < nf; ++j) s += qv[j] * qv[j] / max(mu[j] * mu[j], 1e-30f);
-                s = sqrt(fn * fn / max(1e-15f, s));
-                for (int j = 0; j < nf; ++j) qv[j] *= s;
-              }
-              for (int i = 0; i < nf; ++i) lam[start + 1 + i] = qv[i];
-            }
-          }
-          // Normal 1D Newton given friction.
-          {
-            float grad = -rhs[start];
-            for (int col = 0; col < total_nr; ++col)
-              if (enabled[col]) grad += W[start * nr + col] * lam[col];
-            grad += R[start] * lam[start];
-            float diag = max(1e-15f, W[start * nr + start] + R[start]);
-            lam[start] = max(0.0f, lam[start] - grad / diag);
-          }
-        }
-        float after = cert_block_residual(start, dim, mu, W, R, rhs, lam,
-                                          enabled, nr, total_nr);
-        if (!(after <= before) || !isfinite(after)) {
-          for (int k = 0; k < dim; ++k) lam[start + k] = keep[k];
-        }
-      }
-      max_res = 0.0f;
-      for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
-        if (elliptic_member[row]) continue;
-        float grad = -rhs[row];
-        for (int col = 0; col < total_nr; ++col) if (enabled[col]) grad += W[row * nr + col] * lam[col];
-        grad += R[row] * lam[row];
-        float diag = max(1e-15f, W[row * nr + row] + R[row]);
-        float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
-        float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
-        for (int col = 0; col < total_nr; ++col) if (enabled[col]) row_scale += abs(W[row * nr + col] * lam[col]);
-        row_scale = max(1.0f, row_scale);
-        max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
-      }
-      for (int b = 0; b < elliptic_count; ++b) {
-        int start = elliptic_start[b];
-        int dim = elliptic_dim[b];
-        thread float mu[5];
-        for (int k = 0; k < 5; ++k) mu[k] = elliptic_friction[b * 5 + k];
-        max_res = max(max_res, cert_block_residual(start, dim, mu, W, R, rhs,
-                                                   lam, enabled, nr, total_nr));
-      }
-      out_diagnostics[world * 10] = max_res;
-      out_diagnostics[world * 10 + 1] = float(int(out_diagnostics[world * 10 + 1]) + 1);
-      if (max_res <= tol) { converged = true; break; }
-    }
-    // G2: certify the FINAL retained multipliers from scratch. Refinement
-    // may have replaced a certified candidate with an uncertified (or
-    // nonfinite) one while other coupled rows stayed fixed: revert to the
-    // snapshot when it was certified, otherwise fail loudly. The status
-    // below therefore always describes the retained solution.
-    if (!isfinite(max_res)) {
-      if (snap_certified) {
-        for (int r = 0; r < 96; ++r) lam[r] = snap_lam[r];
-        max_res = snap_res;
-        converged = true;
-      } else {
-        converged = false;
-      }
-    } else if (max_res > tol) {
-      if (snap_certified) {
-        for (int r = 0; r < 96; ++r) lam[r] = snap_lam[r];
-        max_res = snap_res;
-        converged = true;
-      } else {
-        converged = false;
-      }
-    } else {
-      converged = true;
-    }
-    out_diagnostics[world * 10] = max_res;
-  }
+  // The configured outer solver budget is authoritative; no hidden refinement.
 
   // 9b. No-slip post-pass (pinned solNoSlip): exact friction subproblem
   // solves over dry-friction rows and contact friction blocks. Gated on
@@ -1748,7 +1584,10 @@ kernel void solve_coupled_constraints(
 
   // G2: nonfinite residuals fail explicitly (NaN never satisfies `> tol`,
   // so without this guard a nonfinite solve would report success).
-  if (!isfinite(max_res) || !converged) out_status[world] = 3;
+  bool finite_solution = isfinite(max_res);
+  for (int r = 0; r < total_nr; ++r)
+    if (enabled[r] && !isfinite(lam[r])) finite_solution = false;
+  if (!finite_solution) out_status[world] = 3;
 
   // 10. Reconstruct forces and acceleration
   for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
@@ -2033,7 +1872,7 @@ kernel void solve_coupled_constraints_block(
     device int* out_status [[buffer(25)]],
     device float* out_diagnostics [[buffer(26)]],
     device float* out_contact_force [[buffer(27)]],
-    device float* out_joint_force [[buffer(28)]],
+    device const int* packed_slot_to_logical [[buffer(28)]],
     device float* workspace_J [[buffer(29)]],
     device float* workspace_debug [[buffer(30)]],
     uint world [[thread_position_in_grid]]) {
@@ -2118,6 +1957,13 @@ kernel void solve_coupled_constraints_block(
     if (ten_rows > nr) ten_rows = nr;
     base_contact += ten_rows;
   }
+  device float* out_joint_force = out_contact_force
+      + max(batch * ncontacts_max * 11, 1)
+      + world * max(base_contact, 1);
+  int nactive_slots = 0;
+  while (nactive_slots < ncontacts_max
+         && packed_slot_to_logical[world * ncontacts_max + nactive_slots] >= 0)
+    ++nactive_slots;
 
   // 1. Joint constraints
   if ((flags & 1) == 0) {
@@ -2219,7 +2065,9 @@ kernel void solve_coupled_constraints_block(
   for (int i = 0; i < 256; ++i) elliptic_member[i] = false;
 
   if ((flags & 1) == 0 && (flags & 16) == 0) {
-    for (int s = 0; s < ncontacts_max; ++s) {
+    for (int packed_s = 0; packed_s < nactive_slots; ++packed_s) {
+      int s = packed_slot_to_logical[world * ncontacts_max + packed_s];
+      if (s < 0 || s >= ncontacts_max) continue;
       int cdim = contact_condim[s * 3 + 0];
       int row_offset = contact_condim[s * 3 + 1];
       int row_start = base_contact + row_offset;
@@ -2428,6 +2276,40 @@ kernel void solve_coupled_constraints_block(
   int hsamp = 0;
   int hstep = max(1, maxiter / 7);
   for (int k = 0; k < 8; ++k) hist[k] = 0.0f;
+  // The zero-budget result is the validated retained warm start.  Record its
+  // projected residual instead of converting non-convergence into failure.
+  for (int row = 0; row < nr; ++row) if (enabled[row] && !elliptic_member[row]) {
+    float grad = -rhs[row];
+    for (int col = 0; col < nr; ++col) if (enabled[col])
+      grad += W[row * nr + col] * lam[col];
+    grad += R[row] * lam[row];
+    float diag = max(1e-15f, W[row * nr + row] + R[row]);
+    float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
+    float scale = abs(ar[row]) + abs(R[row] * lam[row]);
+    for (int col = 0; col < nr; ++col) if (enabled[col])
+      scale += abs(W[row * nr + col] * lam[col]);
+    max_res = max(max_res, abs(proj - lam[row]) * diag / max(1.0f, scale));
+  }
+  for (int b = 0; b < elliptic_count; ++b) {
+    int start = elliptic_start[b], dim = elliptic_dim[b];
+    thread float A[36], g[6], force[6], mu[5];
+    for (int i = 0; i < 36; ++i) A[i] = 0.0f;
+    for (int i = 0; i < 6; ++i) { g[i] = 0.0f; force[i] = 0.0f; }
+    for (int k = 0; k < 5; ++k) mu[k] = elliptic_friction[b * 5 + k];
+    for (int i = 0; i < dim; ++i) {
+      int ri = start + i;
+      force[i] = lam[ri];
+      g[i] = -rhs[ri];
+      for (int col = 0; col < nr; ++col)
+        if (enabled[col] && (col < start || col >= start + dim))
+          g[i] += W[ri * nr + col] * lam[col];
+      for (int j = 0; j < dim; ++j) {
+        int rj = start + j;
+        A[i * 6 + j] = W[ri * nr + rj] + (i == j ? R[ri] : 0.0f);
+      }
+    }
+    max_res = max(max_res, elliptic_projected_residual(A, g, mu, dim, force));
+  }
 
   if (elliptic_count > 0) {
     thread float dscale[256], z[256], extrapolated[256], candidate[256], gradient_z[256];
@@ -2641,57 +2523,9 @@ kernel void solve_coupled_constraints_block(
       if (max_res <= tol) { converged = true; break; }
     }
 
-    // Refinement sweeps
-    int ref_sweeps = dims[11];
-    if (ref_sweeps <= 0) ref_sweeps = 64;
-    for (int ref = 0; ref < ref_sweeps; ++ref) {
-      for (int b = 0; b < contact_block_count; ++b) {
-        int row_start = contact_block_start[b];
-        int block_size = contact_block_size[b];
-        if (block_size <= 4 && ref >= 64) continue;
-        int local_rows[10];
-        int nlocal = 0;
-        for (int k = 0; k < block_size; ++k) {
-          int row = row_start + k;
-          if (enabled[row]) local_rows[nlocal++] = row;
-        }
-        if (nlocal == 0) continue;
-        thread float local_A[100], local_b[10], local_sol[10];
-        for (int i = 0; i < 100; ++i) local_A[i] = 0.0f;
-        for (int i = 0; i < 10; ++i) { local_b[i] = 0.0f; local_sol[i] = 0.0f; }
-        for (int i = 0; i < nlocal; ++i) {
-          int row = local_rows[i];
-          float v = -rhs[row];
-          for (int col = 0; col < nr; ++col) if (enabled[col] && (col < row_start || col >= row_start + block_size)) {
-            v += W[row * nr + col] * lam[col];
-          }
-          local_b[i] = v;
-          local_sol[i] = lam[row];
-          for (int j = 0; j < nlocal; ++j) {
-            int other = local_rows[j];
-            local_A[i * 10 + j] = W[row * nr + other] + (i == j ? R[row] : 0.0f);
-          }
-        }
-        float b_err;
-        if (nlocal <= 4) {
-          thread float small_A[16], small_b[4], small_sol[4];
-          for (int i = 0; i < 16; ++i) small_A[i] = 0.0f;
-          for (int i = 0; i < 4; ++i) { small_b[i] = 0.0f; small_sol[i] = 0.0f; }
-          for (int i = 0; i < nlocal; ++i) {
-            small_b[i] = local_b[i];
-            for (int j = 0; j < nlocal; ++j) small_A[i * 4 + j] = local_A[i * 10 + j];
-          }
-          b_err = solve_contact_block(small_A, small_b, nlocal, small_sol);
-          for (int i = 0; i < nlocal; ++i) local_sol[i] = small_sol[i];
-        } else {
-          b_err = solve_contact_block_iterative(local_A, local_b, nlocal, local_sol);
-        }
-        if (b_err < 1e-5f) {
-          for (int i = 0; i < nlocal; ++i) lam[local_rows[i]] = max(0.0f, local_sol[i]);
-        }
-      }
-    }
   }
+
+  out_diagnostics[world * 10] = max_res;
 
   // 9b. No-slip post-pass
   int noslip_iters = dims[18];
@@ -2770,7 +2604,10 @@ kernel void solve_coupled_constraints_block(
     out_diagnostics[world * 10 + 1] += float(ns_done);
   }
 
-  if (!isfinite(max_res) || !converged) out_status[world] = 3;
+  bool finite_solution = isfinite(max_res);
+  for (int r = 0; r < nr; ++r)
+    if (enabled[r] && !isfinite(lam[r])) finite_solution = false;
+  if (!finite_solution) out_status[world] = 3;
 
   // 10. Reconstruct forces and acceleration
   thread float f_tot[64];

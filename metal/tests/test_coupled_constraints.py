@@ -157,15 +157,31 @@ def test_coupled_lowering_admits_noslip_with_validated_budget():
 
 
 def test_coupled_lowering_maps_solver_selection():
-  # PGS/Newton/CG selections all lower (mapped to the native projected
-  # solver, REQ-SOL-001/002); the selection name does not change native
-  # execution, verified by parity tests in test_solver_completion_014.
+  # Keep the configured solver selector in the frozen native descriptor so
+  # execution can dispatch to its own PGS, CG, or Newton algorithm.
   for solver in ("PGS", "Newton", "CG"):
     xml = f'''<mujoco><option solver="{solver}"/>
       <worldbody><geom type="plane" size="1 1 .1"/>
         <body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1"/>
         </body></worldbody></mujoco>'''
     model = mujoco.MjModel.from_xml_string(xml)
+    descriptor = lower_coupled_constraints(model)
+    assert descriptor.solver_type == int(model.opt.solver)
+    assert descriptor.line_search_iterations == int(model.opt.ls_iterations)
+    assert descriptor.line_search_tolerance == pytest.approx(model.opt.ls_tolerance)
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("ls_iterations", 0, "ls_iterations"),
+    ("ls_iterations", 2049, "ls_iterations"),
+    ("ls_tolerance", 0.0, "ls_tolerance"),
+    ("ls_tolerance", np.nan, "ls_tolerance"),
+])
+def test_coupled_lowering_validates_primal_line_search_options(field, value, message):
+  model = mujoco.MjModel.from_xml_string(
+      '<mujoco><worldbody><geom type="plane" size="1 1 .1"/></worldbody></mujoco>')
+  setattr(model.opt, field, value)
+  with pytest.raises(ValueError, match=message):
     lower_coupled_constraints(model)
 
 
@@ -647,10 +663,10 @@ def test_native_elliptic_multicontact_iteration_exhaustion_is_reported():
       poses, dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos_mps, qvel_mps
   )
   diagnostic = result["solver_diagnostics"][0].cpu().numpy()
-  assert int(result["status"][0]) == 3, diagnostic
-  # One main sweep plus exact block-refinement rounds (R04: refinement also
-  # covers elliptic blocks, matching pyramidal exhaustion behavior).
-  assert diagnostic[1] >= 1, diagnostic
+  # One configured sweep is retained even though this contact iterate is not
+  # yet certified by the independent residual.
+  assert int(result["status"][0]) == 0, diagnostic
+  assert diagnostic[1] == 1, diagnostic
   assert diagnostic[0] > 1e-6, diagnostic
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
@@ -1030,13 +1046,12 @@ def test_coupled_solver_settings_range_contracts():
   assert settings.effective_iterations == 1000
   assert settings.requested_tolerance == 1e-6
   assert settings.effective_tolerance == 1e-6
-  assert settings.max_refinement_sweeps == 256
+  assert settings.max_refinement_sweeps == 0
   assert settings.metric == "max_normalized_projected_gradient"
-  # G3: adaptive budget contract is explicit and separate from the request.
-  assert settings.adaptive_max_iterations == 1024
+  # The runtime follows the pinned configured budget exactly.
+  assert settings.adaptive_max_iterations == 0
 
-  # Iterations contract: [1, 2048]
-  # Value 100 is NOT silently overridden to 1024
+  # Iterations contract: [0, 2048], with no hidden extension.
   m100 = mujoco.MjModel.from_xml_string(COUPLED_XML)
   m100.opt.iterations = 100
   d100 = lower_coupled_constraints(m100)
@@ -1048,18 +1063,21 @@ def test_coupled_solver_settings_range_contracts():
   m2048.opt.iterations = 2048
   d2048 = lower_coupled_constraints(m2048)
   assert d2048.solver_settings.effective_iterations == 2048
-  # PGS work bound is max(effective, adaptive): the adaptive ceiling never
-  # reduces a larger requested budget, and refinement has its own allowance.
   s2048 = d2048.solver_settings
-  assert max(s2048.effective_iterations, s2048.adaptive_max_iterations) == 2048
   s100 = d100.solver_settings
-  assert max(s100.effective_iterations, s100.adaptive_max_iterations) == 1024
+  assert s100.effective_iterations == 100
+  assert s2048.effective_iterations == 2048
+  assert s100.adaptive_max_iterations == s2048.adaptive_max_iterations == 0
+  assert s100.max_refinement_sweeps == s2048.max_refinement_sweeps == 0
 
-  # <= 0 or > 2048 rejected
-  for bad_iter in [0, -1, 2049]:
+  # Zero is a valid budget; negative values and values above the native cap fail.
+  mzero = mujoco.MjModel.from_xml_string(COUPLED_XML)
+  mzero.opt.iterations = 0
+  assert lower_coupled_constraints(mzero).solver_settings.effective_iterations == 0
+  for bad_iter in [-1, 2049]:
     mbad = mujoco.MjModel.from_xml_string(COUPLED_XML)
     mbad.opt.iterations = bad_iter
-    with pytest.raises(ValueError, match="bounds iterations to \\[1, 2048\\]"):
+    with pytest.raises(ValueError, match="bounds iterations to \\[0, 2048\\]"):
       lower_coupled_constraints(mbad)
 
   # Tolerance contract: finite and positive, floored at float32 floor 1e-6
@@ -1082,7 +1100,7 @@ def test_coupled_solver_settings_range_contracts():
       lower_coupled_constraints(mtol_bad)
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_solver_status_matches_final_residual_mixed_gpu():
+def test_solver_residual_remains_diagnostic_for_finite_iterate_mixed_gpu():
   # G2: contact + connect-equality + tendon-limit rows in one coupled solve.
   # Every step asserts the status/diostics contract (status 0 iff final
   # residual within tol), an independent CPU recomputation of the equality
@@ -1130,10 +1148,10 @@ def test_solver_status_matches_final_residual_mixed_gpu():
       dg = asm["solver_diagnostics"][0].cpu().numpy()
       res, iters = float(dg[0]), float(dg[1])
       assert np.isfinite(res), (tag, res)
-      # G2 invariant: status describes the FINAL residual.
-      assert (st == 0) == (res <= tol), (tag, st, res, tol)
-      # G3 invariant: actual work stays within the adaptive cap.
-      assert iters <= 1024, (tag, iters)
+      # Finite low-budget iterates are retained even when uncertified. The
+      # residual remains visible separately from numerical world status.
+      assert st == 0, (tag, st, res, tol)
+      assert iters <= int(m.opt.iterations), (tag, iters, m.opt.iterations)
       contact_now = cpu.ncon > 0
       if contact_now:
         saw_contact = True
@@ -1141,7 +1159,7 @@ def test_solver_status_matches_final_residual_mixed_gpu():
         L = float(np.asarray(cpu.ten_length)[0])
         if (L < 0.5 or L > 0.85) and contact_now:
           saw_simultaneous = True  # limit + contact rows co-active
-      if st == 0 and neq_rows > 0:
+      if res <= tol and neq_rows > 0:
         # Independent CPU recomputation of the unbounded equality block:
         # residual |grad|/scale over rows [0, neq_rows). The kernel certifies
         # in float32; the float64 recomputation from float32 inputs can differ
@@ -1172,10 +1190,8 @@ def test_solver_status_matches_final_residual_mixed_gpu():
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_low_budget_pyramidal_reports_honestly():
   # G3: with iterations=1 the pyramidal path may still certify via exact
-  # block refinement; either way the reported status must agree with the
-  # final residual, the residual must be finite, and actual work >= 1.
-  # (Status 3 under true exhaustion is covered by the elliptic test and
-  # the sticky-failure test below.)
+  # configured sweep is honored exactly; finite exhaustion remains a usable
+  # iterate and the residual reports its lack of convergence independently.
   import torch
 
   xml = '''<mujoco><option timestep=".002" gravity="0 0 -9.81"
@@ -1199,14 +1215,16 @@ def test_low_budget_pyramidal_reports_honestly():
   diagnostic = result["solver_diagnostics"][0].cpu().numpy()
   res, iters = float(diagnostic[0]), float(diagnostic[1])
   assert np.isfinite(res)
-  assert iters >= 1, diagnostic
-  assert (int(result["status"][0]) == 0) == (res <= tol), diagnostic
+  assert iters == 1, diagnostic
+  assert res > tol, diagnostic
+  assert int(result["status"][0]) == 0, diagnostic
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_solver_failure_is_sticky_until_reset_gpu():
-  # G2/G3: a failed world keeps status 3 across steps until reset clears it.
+def test_low_budget_solver_iterate_is_not_frozen_gpu():
+  # A finite contact solve with one configured iteration is not a failed
+  # world. It continues to advance its valid, if approximate, iterate.
   from mujoco_metal import MetalSimulation
   xml = '''<mujoco><option timestep=".002" gravity="0 0 -9.81"
       iterations="1" tolerance="1e-8"/>
@@ -1217,15 +1235,11 @@ def test_solver_failure_is_sticky_until_reset_gpu():
   m = mujoco.MjModel.from_xml_string(xml)
   sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
   sim.reset()
-  failed_at = None
-  for step in range(150):
-    sim.step(1)
-    if int(sim.state.status.cpu().numpy()[0]) == 3 and failed_at is None:
-      failed_at = step
-  assert failed_at is not None, "expected a solver failure before step 150"
-  # Sticky: further stepping preserves the failure.
+  q0 = sim.state.qpos.cpu().numpy().copy()
   sim.step(5)
-  assert int(sim.state.status.cpu().numpy()[0]) == 3
-  # Reset clears it.
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  assert np.isfinite(sim.state.qpos.cpu().numpy()).all()
+  assert np.isfinite(sim.state.qvel.cpu().numpy()).all()
+  assert not np.array_equal(sim.state.qpos.cpu().numpy(), q0)
   sim.reset()
   assert int(sim.state.status.cpu().numpy()[0]) == 0

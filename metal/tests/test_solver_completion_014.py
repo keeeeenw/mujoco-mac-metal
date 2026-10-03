@@ -528,8 +528,7 @@ def test_opposing_pinch_cold_vs_warm_gpu():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_requested_effective_iterations_reported_gpu():
-  # Requested vs effective budgets are explicit: settings carry both, and
-  # actual diagnostics never exceed the adaptive cap.
+  # The native solver honors the configured budget without extension.
   m = _press_model(iterations=100)
   sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
   qp = np.asarray(m.qpos0, dtype=np.float32)
@@ -537,11 +536,11 @@ def test_requested_effective_iterations_reported_gpu():
   settings = sim._coupled_constraints.solver_settings
   assert settings.requested_iterations == 100
   assert settings.effective_iterations == 100
-  assert settings.adaptive_max_iterations == 1024
+  assert settings.adaptive_max_iterations == 0
   for _ in range(10):
     sim.step(1)
   it = int(sim.assembled_system()["solver_diagnostics"].cpu().numpy()[0, 1])
-  assert it <= settings.adaptive_max_iterations, it
+  assert it <= settings.effective_iterations, it
 
 
 @pytest.mark.gpu
@@ -550,9 +549,8 @@ def test_teleport_rejects_stale_seed_gpu():
   # Stale/foreign seeds cannot survive the warmstart cost gate: solving
   # from a garbage seed matches a cold solve bit-exactly (same system,
   # same budget), and a teleported trajectory matches a cold twin.
-  # NOTE: iterations=1 never converges on contact scenes (status 3 freezes
-  # worlds, so no seeds can develop); the gate is tested directly with a
-  # foreign seed, and the trajectory with a converged budget.
+  # A low budget is still a valid finite solver iterate; it does not freeze
+  # the world or prevent warm starts from being developed.
   m = _press_model(iterations=1)
   sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
   qp = np.asarray(m.qpos0, dtype=np.float32)
@@ -761,9 +759,7 @@ def test_noslip_stage_subsumption_gpu():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_iteration_contract_extension_gpu():
-  # The explicit G3 contract: certification may use adaptive extension
-  # past the requested budget (bounded by 1024) while improving; the
-  # diagnostics report actual counts separately from configured budgets.
+  # Diagnostics never include hidden adaptive or refinement work.
   m = _press_model(iterations=100)
   sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
   qp = np.asarray(m.qpos0, dtype=np.float32)
@@ -772,10 +768,10 @@ def test_iteration_contract_extension_gpu():
     sim.step(1)
   asm = sim.assembled_system()
   it = int(asm["solver_diagnostics"].cpu().numpy()[0, 1])
-  assert it <= 1024, it
+  assert it <= 100, it
   assert int(sim.state.status.cpu().numpy()[0]) == 0
   assert sim._coupled_constraints.solver_settings.requested_iterations == 100
-  assert sim._coupled_constraints.solver_settings.adaptive_max_iterations == 1024
+  assert sim._coupled_constraints.solver_settings.adaptive_max_iterations == 0
   # Contact-free problems certify within a single sweep.
   m2 = mujoco.MjModel.from_xml_string(
       '<mujoco><option timestep="0.002" integrator="Euler" iterations="100" '
@@ -1244,5 +1240,4 @@ def test_noslip_regularizer_removal_iteration_0_parity_gpu(cone, condim, ns_iter
   assert np.any(np.abs(cpu_force) > 0.1), "Test must engage active forces"
   np.testing.assert_allclose(nat_qacc, cpu_qacc, atol=2e-3, err_msg=f"{cone} condim={condim} iters={ns_iters} qacc")
   np.testing.assert_allclose(nat_force, cpu_force, atol=2e-3, err_msg=f"{cone} condim={condim} iters={ns_iters} force")
-
 

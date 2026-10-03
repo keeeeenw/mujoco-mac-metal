@@ -40,9 +40,10 @@ _MAX_PAIRS = 16
 _MAX_CONTACTS = 24
 _MAX_ROWS = 96
 _MAX_ITERATIONS = 2048
+_MAX_LINE_SEARCH_ITERATIONS = 2048
 _TOLERANCE = 1e-6
 # G3: hard cap for adaptive PGS extension; must match the kernel constant.
-_ADAPTIVE_MAX_ITERATIONS = 1024
+_ADAPTIVE_MAX_ITERATIONS = 0
 
 _PLANE = int(mujoco.mjtGeom.mjGEOM_PLANE)
 _HFIELD = int(mujoco.mjtGeom.mjGEOM_HFIELD)
@@ -222,22 +223,20 @@ def _frozen(value, dtype=np.float32):
 
 @dataclass(frozen=True)
 class CoupledSolverSettings:
-  """Explicit configuration for the native coupled Delassus constraint solver.
+  """Explicit configuration for the native coupled constraint solver.
 
-  `requested_iterations` is the model's outer PGS budget. When a budgeted
-  window ends close to certification (residual <= 1e-3) and improved over
-  the window start, the solver adaptively extends up to
-  `adaptive_max_iterations` (G3 contract); `solver_diagnostics[1]` reports
-  the actual iteration count, separately from the configured budgets.
-  `max_refinement_sweeps` bounds the exact per-block contact refinement
-  (64 rounds for blocks of <= 4 rows).
+  The configured MuJoCo outer iteration count is honored exactly, including
+  zero.  A finite iterate is returned even when it does not meet tolerance;
+  `solver_diagnostics[0]` reports its projected residual and
+  `solver_diagnostics[1]` reports solver iterations.  No hidden extension or
+  refinement sweeps are added.
   """
   requested_iterations: int
   effective_iterations: int
   requested_tolerance: float
   effective_tolerance: float
-  adaptive_max_iterations: int = 1024
-  max_refinement_sweeps: int = 256
+  adaptive_max_iterations: int = 0
+  max_refinement_sweeps: int = 0
   metric: str = "max_normalized_projected_gradient"
 
 
@@ -265,6 +264,9 @@ class CoupledConstraintDescriptor:
   tolerance: float
   noslip_iterations: int
   noslip_tolerance: float
+  solver_type: int
+  line_search_iterations: int
+  line_search_tolerance: float
   mean_inertia: float
   solver_settings: CoupledSolverSettings
   n_eq_rows: int
@@ -418,11 +420,11 @@ def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor
   noslip_tol = float(model.opt.noslip_tolerance)
   if noslip_iters > 0 and (not math.isfinite(noslip_tol) or noslip_tol <= 0):
     raise ValueError("model.opt.noslip_tolerance must be finite and positive with nonzero noslip_iterations")
-  if int(model.opt.solver) == int(mujoco.mjtSolver.mjSOL_CG):
-    # Mapped like Newton (REQ-SOL-002): the native projected solver handles
-    # the same coupled problem for every convex/cone combination; the
-    # selection name is honored as a mapping, verified by parity tests.
-    pass
+  solver_type = int(model.opt.solver)
+  if solver_type not in (int(mujoco.mjtSolver.mjSOL_PGS),
+                         int(mujoco.mjtSolver.mjSOL_CG),
+                         int(mujoco.mjtSolver.mjSOL_NEWTON)):
+    raise ValueError(f"unknown constraint solver type {solver_type}")
 
   # 1. Equality and joint constraint validation (joint/connect/weld, mixed order)
   scalar_types = (_HINGE, _SLIDE)
@@ -994,14 +996,23 @@ def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor
           model.geom_aabb[g], dtype=np.float32)
 
   iter_req = int(model.opt.iterations)
-  if iter_req <= 0 or iter_req > _MAX_ITERATIONS:
+  if iter_req < 0 or iter_req > _MAX_ITERATIONS:
     raise ValueError(
-        f"integrated_euler_v1 bounds iterations to [1, {_MAX_ITERATIONS}]; found {iter_req}"
+        f"integrated_euler_v1 bounds iterations to [0, {_MAX_ITERATIONS}]; found {iter_req}"
     )
 
   tol_req = float(model.opt.tolerance)
   if not math.isfinite(tol_req) or tol_req <= 0:
     raise ValueError("model.opt.tolerance must be finite and positive")
+
+  ls_iterations = int(model.opt.ls_iterations)
+  if ls_iterations < 1 or ls_iterations > _MAX_LINE_SEARCH_ITERATIONS:
+    raise ValueError(
+        "model.opt.ls_iterations must be in "
+        f"[1, {_MAX_LINE_SEARCH_ITERATIONS}]; found {ls_iterations}")
+  ls_tolerance = float(model.opt.ls_tolerance)
+  if not math.isfinite(ls_tolerance) or ls_tolerance <= 0:
+    raise ValueError("model.opt.ls_tolerance must be finite and positive")
 
   eff_tol = max(tol_req, _TOLERANCE)
 
@@ -1011,7 +1022,7 @@ def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor
       requested_tolerance=tol_req,
       effective_tolerance=eff_tol,
       adaptive_max_iterations=_ADAPTIVE_MAX_ITERATIONS,
-      max_refinement_sweeps=256,
+      max_refinement_sweeps=0,
       metric="max_normalized_projected_gradient",
   )
 
@@ -1039,6 +1050,9 @@ def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor
       tolerance=eff_tol,
       noslip_iterations=noslip_iters,
       noslip_tolerance=noslip_tol if noslip_iters > 0 else 0.0,
+      solver_type=solver_type,
+      line_search_iterations=ls_iterations,
+      line_search_tolerance=ls_tolerance,
       mean_inertia=(float(getattr(getattr(model, "stat", None), "meaninertia", 1.0))
                     if math.isfinite(float(getattr(getattr(model, "stat", None), "meaninertia", 1.0)))
                     and float(getattr(getattr(model, "stat", None), "meaninertia", 1.0)) > 0
@@ -1236,6 +1250,8 @@ class MetalCoupledConstraints:
       self._solve_block_kernel = self._solve_kernel
     self._broadphase_lib = torch.mps.compile_shader(_BROADPHASE_SHADER.read_text())
     self._broadphase_kernel = self._broadphase_lib.broadphase_mask
+    from mujoco_metal.row_compaction import CompactionWorkspace
+    self._CompactionWorkspace = CompactionWorkspace
 
     d = self.descriptor
     joint_limit_params = (
@@ -1358,14 +1374,23 @@ class MetalCoupledConstraints:
         "solver_dims": torch.tensor(
             # Appended tail carries the no-slip budget (R04); earlier
             # indices are frozen for every consumer of this layout.
-            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows, d.ntendon, d.ten_base, d.ten_friction_rows + d.ten_limit_rows, d.noslip_iterations],
+            [d.nq, d.nv, d.njnt, d.neq, d.ncontacts_max, self.batch_size, d.disableflags, 1 if d.refsafe else 0, d.iterations, d.nr, d.cone_type, d.nbody, d.njnt, d.nsite, d.n_eq_rows, d.ntendon, d.ten_base, d.ten_friction_rows + d.ten_limit_rows, d.noslip_iterations, d.solver_type, d.line_search_iterations],
             dtype=torch.int32, device=self._device,
         ),
         "solver_params": torch.tensor(
-            [d.timestep, d.impratio, d.tolerance, d.noslip_tolerance, d.mean_inertia],
+            [d.timestep, d.impratio, d.tolerance, d.noslip_tolerance, d.mean_inertia, d.line_search_tolerance],
             dtype=torch.float32, device=self._device,
-        ),
+      ),
     }
+    # Pair offsets and candidate dimensions are read together by contact
+    # narrowphase. Store them in one device buffer to leave the native kernel
+    # ABI within Metal's 31-buffer limit after adding the logical compaction map.
+    pair_offsets_size = int(d.npairs) + 1
+    self._constants["pair_contact_offsets_dims"] = torch.cat((
+        self._constants["pair_contact_offset"], self._constants["c_dims"]))
+    packed_dims = self._constants["pair_contact_offsets_dims"]
+    self._constants["pair_contact_offset"] = packed_dims[:pair_offsets_size]
+    self._constants["c_dims"] = packed_dims[pair_offsets_size:]
     self._workspace = None
     self.prepare_workspace(self.batch_size)
 
@@ -1392,6 +1417,10 @@ class MetalCoupledConstraints:
     def empty(size):
       return torch.zeros(max(size, 1), dtype=torch.float32, device=self._device)
 
+    contact_force_size = b * nc * 11
+    contact_force_storage = max(contact_force_size, 1)
+    joint_force_size = b * max(d.nr_joint, 1)
+    force_outputs = empty(contact_force_storage + joint_force_size)
     self._workspace = {
         "contact_row_data": empty(b * nc * 6 * 6),
         "contact_frame": empty(b * nc * 12),
@@ -1403,9 +1432,20 @@ class MetalCoupledConstraints:
         "out_acc": empty(b * nv),
         "out_status": torch.zeros(b, dtype=torch.int32, device=self._device),
         "out_diagnostics": empty(b * 10),
-        "out_contact_force": empty(b * nc * 11),
-        "out_joint_force": empty(b * max(d.nr_joint, 1)),
+        "force_outputs": force_outputs,
+        "out_contact_force": force_outputs[:contact_force_storage],
+        "out_joint_force": force_outputs[
+            contact_force_storage:contact_force_storage + joint_force_size],
     }
+    # Stable active pair/slot maps are fixed-shape device workspaces. Logical
+    # pair and slot identities remain the public order used by contacts,
+    # retained row multipliers, tactile sensors and force queries.
+    self._pair_compaction = (self._CompactionWorkspace(
+        b, d.npairs, d.npairs, device=self._device) if d.npairs else None)
+    self._slot_compaction = (self._CompactionWorkspace(
+        b, nc, nc, device=self._device) if nc else None)
+    self._empty_compaction_map = torch.full((1,), -1, dtype=torch.int32,
+                                            device=self._device)
     if d.neq > 0:
       init_eq = np.broadcast_to(d.eq_active0.astype(np.int32), (b, d.neq)).copy()
     else:
@@ -1520,6 +1560,9 @@ class MetalCoupledConstraints:
           self._constants["c_dims"],
           threads=(b * d.npairs,), group_size=(1,),
       )
+      pair_maps = self._pair_compaction.run(
+          w["pair_mask"][:b * d.npairs].reshape(b, d.npairs))
+      w["pair_maps"] = pair_maps
       self._contact_kernel(
           poses["geom_pos"], poses["geom_quat"],
           self._constants["geom_size"], self._constants["geom_type"],
@@ -1531,12 +1574,16 @@ class MetalCoupledConstraints:
           self._constants["pair_geoms"], self._constants["pair_margin_gap"],
           self._constants["pair_solref"], self._constants["pair_solimp"],
           self._constants["pair_condim"], self._constants["pair_friction"],
-          self._constants["pair_solreffriction"], self._constants["pair_contact_offset"],
+          self._constants["pair_solreffriction"], self._constants["pair_contact_offsets_dims"],
           w["contact_row_data"], w["contact_frame"], w["contact_jacobian"],
-          self._constants["c_dims"], self._constants["geom_rbound"],
+          pair_maps.logical_to_packed.reshape(-1),
+          self._constants["geom_rbound"],
           self._constants["mesh_hull"], self._constants["mesh_hull_info"],
           threads=(b * d.npairs,), group_size=(1,),
       )
+      slot_flags = w["contact_row_data"][:b * nc * 36].reshape(b, nc, 36)[:, :, 0]
+      slot_maps = self._slot_compaction.run(slot_flags)
+      w["slot_maps"] = slot_maps
 
   def set_broadphase_pruning(self, enabled):
     """Toggle narrowphase broadphase-fed pruning (R08/F1 test hook).
@@ -1909,6 +1956,11 @@ class MetalCoupledConstraints:
 
     # 2. Coupled constraint solver kernel
     solve_fn = self._solve_kernel if self.descriptor.dense_path else self._solve_block_kernel
+    slot_maps = w.get("slot_maps")
+    if slot_maps is None:
+      packed_slots = self._empty_compaction_map
+    else:
+      packed_slots = slot_maps.packed_to_logical.reshape(-1)
     solve_fn(
         mass.reshape(-1), qfrc_smooth.reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
         eq_active_tensor.reshape(-1),
@@ -1924,7 +1976,7 @@ class MetalCoupledConstraints:
         self._constants["contact_friction"], self._constants["contact_condim"],
         self._constants["solver_dims"], self._constants["solver_params"],
         w["out_force"], w["out_acc"], w["out_status"], w["out_diagnostics"],
-        w["out_contact_force"], w["out_joint_force"], w["workspace_J"],
+        w["out_contact_force"], packed_slots, w["workspace_J"],
         w["workspace_debug"],
         threads=(b,), group_size=(1,),
     )

@@ -123,6 +123,23 @@ def test_inverse_contact_friction_cone_matches_pinned_force_gradient(cone, condi
                         profile="integrated_euler_v1")
   result = _host(mj_inverse(sim, qacc=data.qacc[None].astype(np.float32)))[0]
   np.testing.assert_allclose(result, data.qfrc_inverse, atol=3e-2, rtol=3e-4)
+  cc = sim._coupled_constraints
+  mask = _host(cc._workspace["pair_mask"][:cc.batch_size * cc.descriptor.npairs])
+  pair_map = cc._workspace["pair_maps"]
+  slot_map = cc._workspace["slot_maps"]
+  packed_pairs = _host(pair_map.packed_to_logical)[0]
+  packed_slots = _host(slot_map.packed_to_logical)[0]
+  pair_count = int(_host(pair_map.active_count)[0])
+  slot_count = int(_host(slot_map.active_count)[0])
+  np.testing.assert_array_equal(packed_pairs[:pair_count],
+                                np.flatnonzero(mask.reshape(1, -1)[0]))
+  slot_flags = _host(cc._workspace["contact_row_data"][:
+      cc.batch_size * cc.descriptor.ncontacts_max * 36]).reshape(
+          cc.batch_size, cc.descriptor.ncontacts_max, 36)[:, :, 0]
+  np.testing.assert_array_equal(packed_slots[:slot_count],
+                                np.flatnonzero(slot_flags[0]))
+  assert np.all(np.diff(packed_pairs[:pair_count]) >= 0)
+  assert np.all(np.diff(packed_slots[:slot_count]) >= 0)
 
 
 @pytest.mark.parametrize("qpos,qvel,qacc", [
@@ -174,3 +191,29 @@ def test_inverse_uses_supplied_mocap_pose_without_mutating_owned_state():
   np.testing.assert_allclose(result, data.qfrc_inverse, atol=2e-4, rtol=2e-4)
   np.testing.assert_array_equal(_host(sim.state.qpos), before_qpos)
   np.testing.assert_array_equal(_host(sim.state.mocap_pos), before_mocap)
+
+
+@pytest.mark.parametrize("iterations", [0, 1])
+def test_pinned_low_iteration_budget_advances_finite_contact_iterate(iterations):
+  model = mujoco.MjModel.from_xml_string(f"""<mujoco>
+    <option timestep="0.002" gravity="0 0 -9.81" solver="PGS"
+      iterations="{iterations}" tolerance="1e-12"/>
+    <worldbody><geom type="plane" size="2 2 .1"/>
+      <body pos="0 0 .09"><freejoint/>
+        <geom type="sphere" size=".1" mass="1"/>
+      </body></worldbody>
+  </mujoco>""")
+  native = MetalSimulation(model, profile="integrated_euler_v1")
+  native.step(1)
+  assert int(_host(native.state.status)[0]) == 0
+  assert np.isfinite(_host(native.state.qpos)).all()
+  assert np.isfinite(_host(native.state.qvel)).all()
+  assert native._coupled_constraints._workspace["out_diagnostics"][1].item() <= iterations
+
+  # MuJoCo advances the finite iterate even when it has not converged within
+  # the configured outer budget. Compare the complete one-step state rather
+  # than a convergence/status proxy.
+  cpu = mujoco.MjData(model)
+  mujoco.mj_step(model, cpu)
+  np.testing.assert_allclose(_host(native.state.qpos)[0], cpu.qpos, atol=3e-3, rtol=3e-3)
+  np.testing.assert_allclose(_host(native.state.qvel)[0], cpu.qvel, atol=3e-2, rtol=3e-2)
