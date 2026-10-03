@@ -49,9 +49,9 @@ def test_estimate_is_deterministic_and_counts_memory():
 
 
 def test_default_limits_preserve_historical_ceilings():
-  assert (BASE_NVIDIA_NV, BASE_MAX_PAIRS, BASE_MAX_SLOTS, BASE_MAX_ROWS) == (32, 16, 24, 96)
+  assert (BASE_NVIDIA_NV, BASE_MAX_PAIRS, BASE_MAX_SLOTS, BASE_MAX_ROWS) == (32, 32, 48, 96)
   lim = CapacityLimits()
-  assert (lim.max_nv, lim.max_pairs, lim.max_slots, lim.max_rows) == (32, 16, 24, 96)
+  assert (lim.max_nv, lim.max_pairs, lim.max_slots, lim.max_rows) == (32, 32, 48, 96)
 
 
 def test_overflow_messages_preserve_historical_text():
@@ -59,10 +59,10 @@ def test_overflow_messages_preserve_historical_text():
   model = _model()
   with pytest.raises(ValueError, match="bounds nv to 32"):
     check_capacity(dataclasses.replace(estimate_capacity(model, 1, 0, 0, 0), nv=33))
-  with pytest.raises(ValueError, match=r"candidate contact pairs \(17\) exceeds capacity 16"):
-    check_capacity(estimate_capacity(model, 1, 17, 0, 0))
-  with pytest.raises(ValueError, match=r"total candidate contact slots \(25\) exceeds capacity 24"):
-    check_capacity(estimate_capacity(model, 1, 0, 25, 0))
+  with pytest.raises(ValueError, match=r"candidate contact pairs \(33\) exceeds capacity 32"):
+    check_capacity(estimate_capacity(model, 1, 33, 0, 0))
+  with pytest.raises(ValueError, match=r"total candidate contact slots \(49\) exceeds capacity 48"):
+    check_capacity(estimate_capacity(model, 1, 0, 49, 0))
   with pytest.raises(ValueError, match=r"total candidate constraint rows \(97\) exceeds capacity 96"):
     check_capacity(estimate_capacity(model, 1, 0, 0, 97))
 

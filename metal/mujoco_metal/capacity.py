@@ -26,12 +26,14 @@ from dataclasses import dataclass
 import mujoco
 import numpy as np
 
-# Baseline ceilings carried over from milestones 004-016. Raising any of
-# these requires the matching scalable path (broadphase/compaction/block
-# solver/tiled kernels), never a bare constant bump.
+# Baseline ceilings carried over from milestones 004-016. Pair/slot
+# ceilings were raised by the F1 scalable path (broadphase-fed pruning:
+# inactive pairs skip narrowphase work, so cost follows active slots and
+# rows, both still hard-capped below) — never a bare constant bump. nv/row
+# ceilings still need tiled layouts and the block solver (follow-up).
 BASE_NVIDIA_NV = 32
-BASE_MAX_PAIRS = 16
-BASE_MAX_SLOTS = 24
+BASE_MAX_PAIRS = 32
+BASE_MAX_SLOTS = 48
 BASE_MAX_ROWS = 96
 # Dense solver threshold: at or below this row count the native solver runs
 # the exact small-model dense path (unchanged math). Above it the block

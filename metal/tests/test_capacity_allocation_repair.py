@@ -131,3 +131,35 @@ def test_active_counts_distinguished_from_allocated_gpu():
   assert 0 < slot_active <= mask_active <= d.npairs
   assert mask_active < d.npairs  # far pair pruned from work, slots remain
   assert slot_active <= d.ncontacts_max
+
+
+def _plinko_model(n_friction=16, n_free=9):
+  pegs = []
+  for i in range(n_friction + n_free):
+    x = -0.6 + 0.15 * (i % 7)
+    z = 0.9 - 0.12 * (i // 7)
+    cd = 3 if i < n_friction else 1
+    pegs.append(f'<geom name="peg{i}" type="box" size="0.02 0.02 0.02" '
+                f'pos="{x} 0 {z}" condim="{cd}"/>')
+  return mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.002" cone="pyramidal"/>'
+      '<worldbody><geom name="floor" type="plane" size="5 5 0.1"/>'
+      + "".join(pegs) +
+      '<body pos="0 0 1.3"><freejoint/>'
+      '<geom name="ball" type="sphere" size="0.05" condim="1"/></body>'
+      '</worldbody></mujoco>')
+
+
+def test_raised_ceilings_admit_beyond_old_caps_cpu():
+  # R08/F2: 25 pairs / 25 slots exceed the old 16/24 ceilings with rows in
+  # budget; beyond the new ceilings still overflows before allocating.
+  from mujoco_metal.coupled_constraints import lower_coupled_constraints
+  m = _plinko_model()
+  desc = lower_coupled_constraints(m)
+  assert desc.npairs == 25, desc.npairs
+  assert desc.ncontacts_max == 25, desc.ncontacts_max
+  assert desc.nr <= 96, desc.nr
+  assert desc.npairs > 16 and desc.ncontacts_max > 24
+  m2 = _plinko_model(n_friction=24, n_free=12)
+  with pytest.raises(ValueError, match="exceeds capacity"):
+    lower_coupled_constraints(m2)
