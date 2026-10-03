@@ -394,6 +394,28 @@ class DeviceState:
       self._act = torch.as_tensor(init_act, dtype=torch.float32, device=self._device).clone()
     else:
       self._act = None
+    # Remaining mjtState arrays are owned per environment as well, even when
+    # a profile has no stage that consumes them.
+    self._nhistory = int(getattr(model, "nhistory", 0)) if isinstance(model, mujoco.MjModel) else 0
+    self._nuserdata = int(getattr(model, "nuserdata", 0)) if isinstance(model, mujoco.MjModel) else 0
+    self._npluginstate = int(getattr(model, "npluginstate", 0)) if isinstance(model, mujoco.MjModel) else 0
+    if isinstance(model, mujoco.MjModel):
+      reset_data = mujoco.MjData(model)
+      mujoco.mj_resetData(model, reset_data)
+      history0 = np.asarray(reset_data.history, dtype=np.float32).copy()
+      userdata0 = np.asarray(reset_data.userdata, dtype=np.float32).copy()
+      plugin0 = np.asarray(reset_data.plugin_state, dtype=np.float32).copy()
+    else:
+      history0 = np.zeros(self._nhistory, dtype=np.float32)
+      userdata0 = np.zeros(self._nuserdata, dtype=np.float32)
+      plugin0 = np.zeros(self._npluginstate, dtype=np.float32)
+    self._history0 = np.frombuffer(history0.tobytes(), dtype=np.float32).reshape(history0.shape)
+    self._userdata0 = np.frombuffer(userdata0.tobytes(), dtype=np.float32).reshape(userdata0.shape)
+    self._plugin_state0 = np.frombuffer(plugin0.tobytes(), dtype=np.float32).reshape(plugin0.shape)
+    self._history = torch.as_tensor(np.broadcast_to(self._history0, (self.batch_size, self._nhistory)).copy(), dtype=torch.float32, device=self._device)
+    self._qacc_warmstart = torch.zeros((self.batch_size, descriptor.nv), dtype=torch.float32, device=self._device)
+    self._userdata = torch.as_tensor(np.broadcast_to(self._userdata0, (self.batch_size, self._nuserdata)).copy(), dtype=torch.float32, device=self._device)
+    self._plugin_state = torch.as_tensor(np.broadcast_to(self._plugin_state0, (self.batch_size, self._npluginstate)).copy(), dtype=torch.float32, device=self._device)
     self._generation = 0
 
   @property
@@ -729,9 +751,12 @@ class DeviceState:
     for index in (src_i, dst_i):
       if not 0 <= index < self.batch_size:
         raise ValueError("environment index out of range")
-    for tensor_name in ("_qpos", "_qvel", "_qacc", "_time", "_status"):
-      tensor = getattr(self, tensor_name).clone()
-      tensor[dst_i] = getattr(self, tensor_name)[src_i]
+    for tensor_name in ("_qpos", "_qvel", "_qacc", "_time", "_status", "_history", "_qacc_warmstart", "_userdata", "_plugin_state"):
+      current = getattr(self, tensor_name)
+      if current.numel() == 0:
+        continue
+      tensor = current.clone()
+      tensor[dst_i] = current[src_i]
       setattr(self, tensor_name, tensor)
     if self._eq_active is not None:
       tensor = self._eq_active.clone()
@@ -883,6 +908,18 @@ class DeviceState:
           0, index,
           self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device))
       self._act = next_act
+    for tensor_name, default in (("_history", self._history0),
+                                 ("_qacc_warmstart", None),
+                                 ("_userdata", self._userdata0),
+                                 ("_plugin_state", self._plugin_state0)):
+      tensor = getattr(self, tensor_name).clone()
+      if tensor.numel():
+        if default is None:
+          tensor.index_fill_(0, index, 0)
+        else:
+          init = np.broadcast_to(default, (count, *default.shape)).copy()
+          tensor.index_copy_(0, index, self._torch.as_tensor(init, dtype=self._torch.float32, device=self._device))
+      setattr(self, tensor_name, tensor)
     self._generation += 1
     if hasattr(self, "_on_reset") and callable(self._on_reset):
       self._on_reset(env_ids=ids)

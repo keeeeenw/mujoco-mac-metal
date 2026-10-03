@@ -92,7 +92,8 @@ def mju_cholSolve(L: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
 # Native Inverse Dynamics (runs on device)
 # -------------------------------------------------------------------------
 
-def mj_inverse(sim, qpos=None, qvel=None, qacc=None) -> torch.Tensor:
+def mj_inverse(sim, qpos=None, qvel=None, qacc=None,
+               mocap_pos=None, mocap_quat=None) -> torch.Tensor:
   """NATIVE GPU inverse dynamics: compute qfrc_inverse on MPS.
   
   qfrc_inverse = M(qpos) * qacc + qfrc_bias(qpos, qvel) - qfrc_passive(qpos, qvel)
@@ -102,14 +103,37 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None) -> torch.Tensor:
   if torch is None:
     raise RuntimeError("PyTorch with MPS is required")
   state = sim.state
-  qp = qpos if qpos is not None else state.qpos
-  qv = qvel if qvel is not None else state.qvel
-  qa = qacc if qacc is not None else state.qacc
+  saved_spatial_kin = getattr(sim, "_spatial_kin", None)
+  saved_spatial_key = getattr(sim, "_spatial_cache_key", None)
+  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
+  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel") if qvel is not None else state._qvel
+  qa = _stage_tensor(sim, qacc, (sim.batch_size, sim._mjmodel.nv), "qacc") if qacc is not None else state._qacc
 
   # 1. Run kinematics & smooth dynamics to obtain mass matrix and Coriolis bias
-  dynamics = sim._smooth.run_device(qp, qv)
+  mpos = _stage_tensor(sim, mocap_pos, (sim.batch_size, state._nmocap, 3), "mocap_pos") if mocap_pos is not None else getattr(state, "_mpos", None)
+  mquat = _stage_tensor(sim, mocap_quat, (sim.batch_size, state._nmocap, 4), "mocap_quat") if mocap_quat is not None else getattr(state, "_mquat", None)
+  if mquat is not None and not bool((torch.abs(torch.linalg.vector_norm(mquat, dim=-1) - 1) <= 1e-5).all()):
+    raise ValueError("mocap_quat values must be unit quaternions")
+  dynamics = sim._smooth.run_device(qp, qv, mpos, mquat)
   M = dynamics["mass_matrix"]       # [batch, nv, nv]
   bias = dynamics["qfrc_bias"]      # [batch, nv]
+  tendon_force = None
+  if getattr(sim, "_tendons", None) is not None:
+    tendon_force, _, tendon_armature = sim._tendons.run_device(qp, qv)
+    M = M + tendon_armature
+  spatial_J = spatial_length = None
+  if getattr(sim, "_spatial_tendons", None) is not None:
+    kin = sim._spatial_jacobian(qv, dynamics["poses"])
+    spatial_J = kin
+    skin = sim._spatial_kin
+    sf, _, sa = sim._spatial_tendons.run_forces(skin)
+    M = M + sa.reshape(M.shape)
+    tendon_force = sf.reshape((sim.batch_size, sim._mjmodel.nv)) if tendon_force is None else tendon_force + sf.reshape((sim.batch_size, sim._mjmodel.nv))
+    sbias, _ = sim._spatial_tendons.run_armature_bias(
+        skin, qv, dynamics["poses"], dynamics.get("cvel"),
+        dynamics.get("root_com"), dynamics.get("cdof"),
+        dynamics.get("cdof_dot"))
+    bias = bias + sbias.reshape(bias.shape)
 
   # 2. Compute M * qacc on MPS
   M_qacc = torch.bmm(M, qa.unsqueeze(-1)).squeeze(-1)
@@ -119,8 +143,6 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None) -> torch.Tensor:
 
   # 4. Subtract passive forces (damping, spring) if active
   if sim._passive is not None:
-    mpos = getattr(state, "_mpos", None)
-    mquat = getattr(state, "_mquat", None)
     passive = sim._passive.run_device(qp, qv, mocap_pos=mpos, mocap_quat=mquat)
     qfrc_inv = qfrc_inv - passive
 
@@ -129,9 +151,8 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None) -> torch.Tensor:
     qfrc_inv = qfrc_inv - sim._fluid.run_device(qp, qv, dynamics)
 
   # 6. Subtract tendon forces if active
-  if getattr(sim, "_tendons", None) is not None:
-    t_force, _, _ = sim._tendons.run_device(qp, qv)
-    qfrc_inv = qfrc_inv - t_force
+  if tendon_force is not None:
+    qfrc_inv = qfrc_inv - tendon_force
 
   # 7. Subtract flex passive forces if active
   if getattr(sim, "_flex", None) is not None:
@@ -143,6 +164,9 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None) -> torch.Tensor:
   # 8. Subtract constraint forces (mj_invConstraint)
   if getattr(sim, "_coupled_constraints", None) is not None:
     cc = sim._coupled_constraints
+    saved_workspace = {k: v.clone() for k, v in cc._workspace.items()}
+    saved_last = getattr(sim, "_last_coupled", None)
+    saved_last_generation = getattr(sim, "_last_coupled_generation", None)
     _ten_J, _ten_L = sim._spatial_for_coupled(qv, dynamics["poses"]) if hasattr(sim, "_spatial_for_coupled") else (None, None)
     eq_act = getattr(state, "_eq_active", None)
     cc.run_device(
@@ -161,10 +185,30 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None) -> torch.Tensor:
       R = dbg[:, nr * nr : nr * nr + nr]
       aref = dbg[:, nr * nr + nr : nr * nr + 2 * nr]
       jar = torch.bmm(J, qa.unsqueeze(-1)).squeeze(-1) - aref
-      force = torch.where((R > 0) & (jar < 0), -jar / torch.clamp(R, min=1e-12), torch.zeros_like(jar))
+      # MuJoCo's inverse constraint force is the gradient of the row cost.
+      # Bilateral rows are quadratic for either sign. Remaining scalar rows
+      # are bounded/unilateral; their bounds are assembled with the row.
+      raw_force = -jar / torch.clamp(R, min=1e-12)
+      n_eq = int(cc.descriptor.n_eq_rows)
+      lo = w["workspace_debug"].view(b, -1)[:, nr * nr + 4 * nr:nr * nr + 5 * nr]
+      hi = w["workspace_debug"].view(b, -1)[:, nr * nr + 5 * nr:nr * nr + 6 * nr]
+      bounded = torch.minimum(torch.maximum(raw_force, lo), hi)
+      if n_eq:
+        bounded[:, :n_eq] = raw_force[:, :n_eq]
+      force = torch.where(R > 0, bounded, torch.zeros_like(raw_force))
       qfrc_constraint = torch.bmm(J.transpose(1, 2), force.unsqueeze(-1)).squeeze(-1)
       qfrc_inv = qfrc_inv - qfrc_constraint
+    for key, saved in saved_workspace.items():
+      cc._workspace[key].copy_(saved)
+    sim._last_coupled = saved_last
+    sim._last_coupled_generation = saved_last_generation
+    if hasattr(sim, "_spatial_kin"):
+      sim._spatial_kin = saved_spatial_kin
+      sim._spatial_cache_key = saved_spatial_key
 
+  if hasattr(sim, "_spatial_kin"):
+    sim._spatial_kin = saved_spatial_kin
+    sim._spatial_cache_key = saved_spatial_key
   return qfrc_inv
 
 
@@ -172,10 +216,79 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None) -> torch.Tensor:
 # Native Split-Stage APIs (runs on device)
 # -------------------------------------------------------------------------
 
+def _stage_tensor(sim, value, shape, name):
+  """Validate and stage one explicit native stage input without mutation."""
+  if value is None:
+    return None
+  if isinstance(value, torch.Tensor):
+    if (value.device.type != sim.state._device.type or
+        (sim.state._device.index is not None and value.device.index != sim.state._device.index)):
+      raise ValueError(f"{name} tensor must be on {sim.state._device}")
+    if value.dtype not in (torch.float32, torch.float64):
+      raise TypeError(f"{name} tensor must be floating point")
+    out = value.to(dtype=torch.float32)
+    if tuple(out.shape) != tuple(shape) or not bool(torch.isfinite(out).all()):
+      raise ValueError(f"{name} must be finite with shape {tuple(shape)}")
+    return out
+  arr = np.asarray(value)
+  if arr.dtype.kind not in "fiu" or arr.shape != tuple(shape):
+    raise ValueError(f"{name} must be numeric with shape {tuple(shape)}")
+  with np.errstate(over="ignore", invalid="ignore"):
+    arr = np.asarray(arr, dtype=np.float32)
+  if not np.all(np.isfinite(arr)):
+    raise ValueError(f"{name} must be finite and float32-representable")
+  return torch.as_tensor(arr, dtype=torch.float32, device=sim.state._device)
+
+
+def _stage_dynamics(sim, dynamics):
+  if dynamics is None:
+    return None
+  if not isinstance(dynamics, dict):
+    raise TypeError("dynamics must be a dynamics dictionary from mj_fwdVelocity")
+  b, nv = sim.batch_size, int(sim._mjmodel.nv)
+  mass = dynamics.get("mass_matrix")
+  bias = dynamics.get("qfrc_bias")
+  if not isinstance(mass, torch.Tensor) or tuple(mass.shape) != (b, nv, nv):
+    raise ValueError("dynamics.mass_matrix has invalid shape")
+  if not isinstance(bias, torch.Tensor) or tuple(bias.shape) != (b, nv):
+    raise ValueError("dynamics.qfrc_bias has invalid shape")
+  def _same_device(value):
+    return (value.device.type == sim.state._device.type and
+            (sim.state._device.index is None or value.device.index == sim.state._device.index))
+  if not _same_device(mass) or not _same_device(bias):
+    raise ValueError("dynamics tensors must remain on the simulation device")
+  if (mass.dtype != torch.float32 or bias.dtype != torch.float32 or
+      not mass.is_contiguous() or not bias.is_contiguous()):
+    raise ValueError("dynamics tensors must be contiguous float32")
+  if not bool(torch.isfinite(mass).all() and torch.isfinite(bias).all()):
+    raise ValueError("dynamics contains nonfinite values")
+  if "poses" not in dynamics or not isinstance(dynamics["poses"], dict):
+    raise ValueError("dynamics is missing the position-stage poses")
+  from mujoco_metal.smooth_metal import validate_pose_dict
+  validate_pose_dict(sim._mjmodel, dynamics["poses"], b,
+                     sim.state._device, torch)
+  # The remaining smooth buffers are consumed by inverse/constraint stages;
+  # require their exact native layouts now instead of failing in a shader.
+  expected = {
+      "cvel": (b, int(sim._mjmodel.nbody), 6),
+      "root_com": (b, int(sim._mjmodel.nbody), 3),
+      "cdof": (b, nv, 6),
+      "cdof_dot": (b, nv, 6),
+  }
+  for name, shape in expected.items():
+    value = dynamics.get(name)
+    if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape:
+      raise ValueError(f"dynamics.{name} has invalid shape")
+    if not _same_device(value) or value.dtype != torch.float32 or not value.is_contiguous():
+      raise ValueError(f"dynamics.{name} must be contiguous float32 on the simulation device")
+    if not bool(torch.isfinite(value).all()):
+      raise ValueError(f"dynamics.{name} contains nonfinite values")
+  return dynamics
+
 def mj_fwdPosition(sim, qpos=None):
   """NATIVE GPU position stage: kinematics, site/geom poses, spatial tendons."""
   state = sim.state
-  qp = qpos if qpos is not None else state.qpos
+  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
   mpos = getattr(state, "_mpos", None)
   mquat = getattr(state, "_mquat", None)
   dynamics = sim._smooth.run_device(qp, state.qvel, mpos, mquat)
@@ -185,47 +298,75 @@ def mj_fwdPosition(sim, qpos=None):
   return poses
 
 
-def mj_fwdVelocity(sim, qpos=None, qvel=None, poses=None):
+def mj_fwdVelocity(sim, qpos=None, qvel=None, poses=None, dynamics=None):
   """NATIVE GPU velocity stage: smooth Coriolis/centrifugal bias and mass matrix."""
   state = sim.state
-  qp = qpos if qpos is not None else state.qpos
-  qv = qvel if qvel is not None else state.qvel
-  dynamics = sim._smooth.run_device(qp, qv)
-  return dynamics
+  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
+  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel") if qvel is not None else state._qvel
+  supplied = _stage_dynamics(sim, dynamics)
+  if supplied is not None:
+    result = dict(supplied)
+  else:
+    result = sim._smooth.run_device(qp, qv,
+                                    state._mpos if poses is None else None,
+                                    state._mquat if poses is None else None,
+                                    poses=poses)
+  if poses is not None:
+    # run_device validated complete pose shape/device/dtype; when supplied
+    # dynamics were supplied too, preserve exact position-stage identity.
+    result["poses"] = poses
+  return result
 
 
 def mj_fwdActuation(sim, qpos=None, qvel=None, poses=None, ctrl=None):
   """NATIVE GPU actuation stage: actuator kinematics, transmission, and forces."""
   state = sim.state
-  qp = qpos if qpos is not None else state.qpos
-  qv = qvel if qvel is not None else state.qvel
+  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
+  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel") if qvel is not None else state._qvel
   p = poses if poses is not None else mj_fwdPosition(sim, qp)
   if ctrl is not None:
-    sim._prepare_control(ctrl)
-  if sim._actuators is not None:
-    return sim._actuation_force(qp, qv, p)
-  return sim._state._torch.zeros((sim.batch_size, sim._mjmodel.nv),
-                                 dtype=sim._state._torch.float32,
-                                 device=sim._state._device)
+    checked = _stage_tensor(sim, ctrl, (sim.batch_size, sim._mjmodel.nu), "ctrl")
+    saved_control = sim._control.clone()
+    sim._control.copy_(checked)
+  else:
+    saved_control = None
+  try:
+    result = sim._state._torch.zeros((sim.batch_size, sim._mjmodel.nv),
+        dtype=sim._state._torch.float32, device=sim._state._device)
+    held_ctrl = sim._delayed_control(state._time)
+    if sim._transmissions is not None:
+      result = result + sim._transmissions.run_device(qp, qv, held_ctrl)
+    if sim._actuators is not None:
+      result = result + sim._actuation_force(qp, qv, p)
+    if sim._motor is not None:
+      result = result + sim._motor.run_device(held_ctrl)
+    return result
+  finally:
+    if saved_control is not None:
+      sim._control.copy_(saved_control)
 
 
 def mj_fwdAcceleration(sim, qpos=None, qvel=None, poses=None, dynamics=None, qfrc_applied=None):
   """NATIVE GPU acceleration stage: unconstrained acceleration M a = sum(forces)."""
   state = sim.state
-  qp = qpos if qpos is not None else state.qpos
-  qv = qvel if qvel is not None else state.qvel
-  if qfrc_applied is not None:
-    sim._prepare_force(qfrc_applied)
-  acc, status, _ = sim._acceleration(qp, qv, constrained=False)
+  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
+  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel") if qvel is not None else state._qvel
+  dyn = _stage_dynamics(sim, dynamics)
+  force = _stage_tensor(sim, qfrc_applied, (sim.batch_size, sim._mjmodel.nv), "qfrc_applied")
+  acc, status, _ = sim._acceleration(qp, qv, constrained=False,
+      dynamics_override=dyn, poses_override=poses,
+      applied_force_override=force)
   return acc, status
 
 
 def mj_fwdConstraint(sim, qpos=None, qvel=None, poses=None, dynamics=None):
   """NATIVE GPU constraint stage: solve contacts, limits, equalities."""
   state = sim.state
-  qp = qpos if qpos is not None else state.qpos
-  qv = qvel if qvel is not None else state.qvel
-  acc, status, dyn = sim._acceleration(qp, qv)
+  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
+  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel") if qvel is not None else state._qvel
+  dyn = _stage_dynamics(sim, dynamics)
+  acc, status, dyn = sim._acceleration(qp, qv, dynamics_override=dyn,
+                                      poses_override=poses)
   return acc, status, dyn
 
 
@@ -234,232 +375,225 @@ def mj_fwdConstraint(sim, qpos=None, qvel=None, poses=None, dynamics=None):
 # -------------------------------------------------------------------------
 
 class StateSpec:
-  """Bitmask specification matching mjtState for state selection."""
-  TIME = 1
-  QPOS = 2
-  QVEL = 4
-  ACT = 8
-  HISTORY = 16
-  WARMSTART = 32
-  CTRL = 64
-  QFRC_APPLIED = 128
-  XFRC_APPLIED = 256
-  EQ_ACTIVE = 512
-  MOCAP_POS = 1024
-  MOCAP_QUAT = 2048
-  USERDATA = 4096
-  PLUGIN = 8192
-  PHYSICS = 30
-  USER = 8128
-  FULLPHYSICS = 8223
-  INTEGRATION = 16383
-  ALL = 16383
+  """Pinned MuJoCo 3.10 mjtState bitmasks."""
+  TIME, QPOS, QVEL, ACT = 1, 2, 4, 8
+  HISTORY, WARMSTART, CTRL = 16, 32, 64
+  QFRC_APPLIED, XFRC_APPLIED, EQ_ACTIVE = 128, 256, 512
+  MOCAP_POS, MOCAP_QUAT, USERDATA, PLUGIN = 1024, 2048, 4096, 8192
+  PHYSICS = QPOS | QVEL | ACT | HISTORY
+  USER = CTRL | QFRC_APPLIED | XFRC_APPLIED | EQ_ACTIVE | MOCAP_POS | MOCAP_QUAT | USERDATA
+  FULLPHYSICS = TIME | PHYSICS | PLUGIN
+  INTEGRATION = TIME | PHYSICS | WARMSTART | CTRL | QFRC_APPLIED | XFRC_APPLIED | EQ_ACTIVE | MOCAP_POS | MOCAP_QUAT | USERDATA | PLUGIN
+  ALL = INTEGRATION
 
 
-def mj_getState(sim, spec: int = StateSpec.ALL, env_ids=None) -> dict[str, torch.Tensor | np.ndarray]:
-  """NATIVE GPU state extractor: return dictionary of requested state tensors."""
-  res = {}
-  state = sim.state
-  ids = env_ids
-  if spec & StateSpec.TIME:
-    t = state.time
-    res["time"] = t if ids is None else t[ids]
-  if spec & StateSpec.QPOS:
-    qp = state.qpos
-    res["qpos"] = qp if ids is None else qp[ids]
-  if spec & StateSpec.QVEL:
-    qv = state.qvel
-    res["qvel"] = qv if ids is None else qv[ids]
-  if spec & StateSpec.ACT:
-    act = state.act
-    if act is not None:
-      res["act"] = act if ids is None else act[ids]
-  if spec & StateSpec.CTRL:
-    ctrl = sim._control
-    if ctrl is not None:
-      res["ctrl"] = ctrl if ids is None else ctrl[ids]
-  if spec & StateSpec.WARMSTART:
-    cc = getattr(sim, "_coupled_constraints", None)
-    if cc is not None and cc.descriptor.nr > 0:
-      w = cc.get_warmstart()
-      res["warmstart"] = w if ids is None else w[ids]
-  if spec & StateSpec.EQ_ACTIVE:
-    eq = state.eq_active
-    if eq is not None:
-      res["eq_active"] = eq if ids is None else eq[ids]
-  if spec & StateSpec.MOCAP_POS:
-    mp = state.mocap_pos
-    if mp is not None:
-      res["mocap_pos"] = mp if ids is None else mp[ids]
-  if spec & StateSpec.MOCAP_QUAT:
-    mq = state.mocap_quat
-    if mq is not None:
-      res["mocap_quat"] = mq if ids is None else mq[ids]
-  return res
+_STATE_FIELDS = {
+    StateSpec.TIME: ("time", "_time", (1,)),
+    StateSpec.QPOS: ("qpos", "_qpos", None),
+    StateSpec.QVEL: ("qvel", "_qvel", None),
+    StateSpec.ACT: ("act", "_act", None),
+    StateSpec.HISTORY: ("history", "_history", None),
+    StateSpec.WARMSTART: ("warmstart", "_qacc_warmstart", None),
+    StateSpec.CTRL: ("ctrl", "_control", None),
+    StateSpec.QFRC_APPLIED: ("qfrc_applied", "_applied_force", None),
+    StateSpec.XFRC_APPLIED: ("xfrc_applied", "_body_wrench", None),
+    StateSpec.EQ_ACTIVE: ("eq_active", "_eq_active", None),
+    StateSpec.MOCAP_POS: ("mocap_pos", "_mpos", None),
+    StateSpec.MOCAP_QUAT: ("mocap_quat", "_mquat", None),
+    StateSpec.USERDATA: ("userdata", "_userdata", None),
+    StateSpec.PLUGIN: ("plugin_state", "_plugin_state", None),
+}
+
+
+def _selected_ids(sim, env_ids):
+  b = int(sim.batch_size)
+  if env_ids is None:
+    return None, b
+  raw = np.asarray(env_ids)
+  if raw.ndim != 1 or raw.dtype.kind not in "iu":
+    raise TypeError("env_ids must be a one-dimensional integer selection")
+  ids = raw.astype(np.int64, copy=True)
+  if np.any(ids < 0) or np.any(ids >= b):
+    raise IndexError(f"env_ids must be in [0, {b})")
+  if len(np.unique(ids)) != len(ids):
+    raise ValueError("env_ids must not contain duplicates")
+  return ids, len(ids)
+
+
+def _validate_history(model, history):
+  """Check the pinned [user,cursor,times,values] history record structure."""
+  torch = __import__("torch")
+  buffers = []
+  for nvalues, dim, adr in (
+      (np.asarray(model.actuator_history).reshape(-1, 2)[:, 0],
+       np.ones(int(model.nu), dtype=np.int32),
+       np.asarray(model.actuator_historyadr).reshape(-1)),
+      (np.asarray(model.sensor_history).reshape(-1, 2)[:, 0],
+       np.asarray(model.sensor_dim).reshape(-1),
+       np.asarray(model.sensor_historyadr).reshape(-1)),
+  ):
+    for i, count in enumerate(np.asarray(nvalues).reshape(-1).tolist()):
+      n = int(count)
+      if n > 0:
+        buffers.append((int(adr[i]), n))
+  for start, n in buffers:
+    cursor = history[:, start + 1]
+    if not bool(((cursor >= 0) & (cursor < n) & (cursor == torch.round(cursor))).all()):
+      raise ValueError("history cursor is outside the model buffer")
+    logical = torch.arange(n, device=history.device, dtype=torch.float32)[None, :]
+    idx = torch.remainder(cursor.to(torch.long)[:, None] + 1 + logical.to(torch.long), n)
+    stamps = history[:, start + 2:start + 2 + n].gather(1, idx)
+    if n > 1 and not bool((stamps[:, 1:] > stamps[:, :-1]).all()):
+      raise ValueError("history timestamps must increase in logical order")
+
+
+def _tensor_state(sim, field):
+  _, attr, _ = field
+  value = getattr(sim.state, attr, None) if attr.startswith("_") and attr not in (
+      "_control", "_applied_force", "_body_wrench") else getattr(sim, attr, None)
+  if value is None:
+    # Zero-dimensional mjtState components still have an explicit empty view.
+    tails = {"_act": (int(getattr(sim._mjmodel, "na", 0)),), "_history": (sim.state._nhistory,),
+             "_control": (int(getattr(sim._mjmodel, "nu", 0)),),
+             "_applied_force": (int(getattr(sim._mjmodel, "nv", 0)),),
+             "_body_wrench": (int(getattr(sim._mjmodel, "nbody", 0)), 6),
+             "_eq_active": (int(getattr(sim._mjmodel, "neq", 0)),),
+             "_mpos": (sim.state._nmocap, 3), "_mquat": (sim.state._nmocap, 4),
+             "_userdata": (sim.state._nuserdata,), "_plugin_state": (sim.state._npluginstate,)}
+    return sim.state._torch.empty((sim.batch_size, *tails.get(attr, (0,))),
+                                  dtype=sim.state._torch.float32, device=sim.state._device)
+  return value
+
+
+def mj_getState(sim, spec: int = StateSpec.ALL, env_ids=None):
+  """Return copies of the selected pinned state groups, preserving device residency."""
+  if isinstance(spec, bool) or not isinstance(spec, (int, np.integer)) or int(spec) < 0 or int(spec) & ~StateSpec.ALL:
+    raise ValueError("spec contains bits outside pinned mjtState")
+  ids, _ = _selected_ids(sim, env_ids)
+  out = {}
+  for bit, (name, _, _) in _STATE_FIELDS.items():
+    if int(spec) & bit:
+      value = _tensor_state(sim, _STATE_FIELDS[bit])
+      out[name] = value.clone() if ids is None else value[torch.as_tensor(ids, device=value.device)].clone()
+  return out
 
 
 def mj_setState(sim, values: dict[str, Any], env_ids=None):
-  """NATIVE GPU state setter: atomically apply provided state arrays."""
+  """Validate all fields, then atomically write selected simulation state rows."""
   if not isinstance(values, dict):
     raise TypeError(f"values must be a dict, got {type(values)}")
-
-  recognized_keys = {
-      "time", "qpos", "qvel", "act", "qacc", "ctrl", "warmstart",
-      "eq_active", "xfrc_applied", "qfrc_applied", "mocap_pos", "mocap_quat"
-  }
-  for k in values:
-    if k not in recognized_keys:
-      raise ValueError(f"Unknown state key: {k}")
-
-  model = getattr(sim, "model", None) or getattr(sim, "_mjmodel", None) or sim.state._model
-  batch = sim.batch_size
-  device = getattr(sim, "device", None) or getattr(sim.state, "device", "mps")
-
-  if env_ids is None:
-    target_idx = None
-    target_count = batch
-  else:
-    target_idx = [int(i) for i in env_ids]
-    target_count = len(target_idx)
-    for idx in target_idx:
-      if idx < 0 or idx >= batch:
-        raise IndexError(f"env_id {idx} out of range [0, {batch})")
-
-  to_apply = {}
-
-  for k, val in values.items():
-    if val is None:
+  aliases = {"qacc_warmstart": "warmstart", "plugin": "plugin_state"}
+  normalized = {}
+  for key, value in values.items():
+    name = aliases.get(key, key)
+    if name in normalized:
+      raise ValueError(f"duplicate state field alias for {name}")
+    normalized[name] = value
+  values = normalized
+  accepted = {field[0] for field in _STATE_FIELDS.values()} | {"qacc"}
+  if set(values) - accepted:
+    raise ValueError(f"unknown state keys: {sorted(set(values) - accepted)}")
+  ids, count = _selected_ids(sim, env_ids)
+  state, model = sim.state, sim._mjmodel
+  device = state._device
+  staged = {}
+  for name, value in values.items():
+    if value is None:
       continue
-    if isinstance(val, np.ndarray):
-      t = torch.from_numpy(val).to(device=device)
-    elif isinstance(val, torch.Tensor):
-      t = val.to(device=device)
+    attr = "_qacc" if name == "qacc" else next(a for n, a, _ in _STATE_FIELDS.values() if n == name)
+    live = getattr(state, attr, None) if attr.startswith("_") and attr not in ("_control", "_applied_force", "_body_wrench") else getattr(sim, attr, None)
+    if live is None:
+      dims = {"act": int(model.na), "eq_active": int(model.neq),
+              "mocap_pos": (int(model.nmocap), 3),
+              "mocap_quat": (int(model.nmocap), 4),
+              "history": state._nhistory, "userdata": state._nuserdata,
+              "plugin_state": state._npluginstate}
+      dim = dims.get(name, 0)
+      if isinstance(dim, tuple):
+        tail = dim
+      else:
+        tail = (dim,)
+      live = torch.empty((sim.batch_size, *tail), dtype=torch.float32, device=device)
+    shape = tuple(live.shape)
+    if len(shape) == 1:
+      shape = (sim.batch_size,)
+    target_shape = shape[1:]
+    if isinstance(value, torch.Tensor):
+      if (value.device.type != device.type or
+          (device.index is not None and value.device.index != device.index)):
+        raise ValueError(f"{name} tensor must be on {device}")
+      raw = value
+      if raw.dtype not in (torch.float32, torch.float64, torch.int32, torch.int64, torch.bool):
+        raise TypeError(f"{name} tensor must have a real numeric dtype")
+      raw = raw.to(dtype=torch.float32)
+      if not bool(torch.isfinite(raw).all()):
+        raise ValueError(f"{name} must be finite")
+      t = raw
     else:
-      t = torch.as_tensor(val, device=device)
-
-    if k == "time":
-      if t.numel() == 1:
-        t = t.view(1).expand(target_count).to(torch.float32)
-      elif t.shape == (target_count,) or t.shape == (target_count, 1):
-        t = t.view(target_count).to(torch.float32)
-      elif env_ids is not None and (t.shape == (batch,) or t.shape == (batch, 1)):
-        t = t.view(batch)[target_idx].to(torch.float32)
-      else:
-        raise ValueError(f"time shape mismatch: got {t.shape}")
-      to_apply["time"] = t
-
-    elif k == "qacc":
-      if t.shape == (target_count, model.nv):
-        t = t.to(torch.float32)
-      elif env_ids is not None and t.shape == (batch, model.nv):
-        t = t[target_idx].to(torch.float32)
-      elif t.numel() == 1 and model.nv == 1:
-        t = t.view(1, 1).expand(target_count, 1).to(torch.float32)
-      else:
-        raise ValueError(f"qacc shape mismatch: expected (_, {model.nv}), got {t.shape}")
-      to_apply["qacc"] = t
-
-    elif k == "qpos":
-      if t.shape == (target_count, model.nq):
-        t = t.to(torch.float32)
-      elif env_ids is not None and t.shape == (batch, model.nq):
-        t = t[target_idx].to(torch.float32)
-      else:
-        raise ValueError(f"qpos shape mismatch: expected (_, {model.nq}), got {t.shape}")
-      to_apply["qpos"] = t
-
-    elif k == "qvel":
-      if t.shape == (target_count, model.nv):
-        t = t.to(torch.float32)
-      elif env_ids is not None and t.shape == (batch, model.nv):
-        t = t[target_idx].to(torch.float32)
-      else:
-        raise ValueError(f"qvel shape mismatch: expected (_, {model.nv}), got {t.shape}")
-      to_apply["qvel"] = t
-
-    elif k == "act":
-      if model.na == 0:
-        continue
-      if t.shape == (target_count, model.na):
-        t = t.to(torch.float32)
-      elif env_ids is not None and t.shape == (batch, model.na):
-        t = t[target_idx].to(torch.float32)
-      else:
-        raise ValueError(f"act shape mismatch: expected (_, {model.na}), got {t.shape}")
-      to_apply["act"] = t
-
-    elif k == "ctrl":
-      if model.nu == 0:
-        continue
-      if t.shape == (target_count, model.nu):
-        t = t.to(torch.float32)
-      elif env_ids is not None and t.shape == (batch, model.nu):
-        t = t[target_idx].to(torch.float32)
-      else:
-        raise ValueError(f"ctrl shape mismatch: expected (_, {model.nu}), got {t.shape}")
-      to_apply["ctrl"] = t
-
-    elif k == "warmstart":
-      cc = getattr(sim, "_coupled_constraints", None)
-      if cc is not None and cc.descriptor.nr > 0:
-        nr = cc.descriptor.nr
-        if t.shape == (target_count, nr):
-          t = t.to(torch.float32)
-        elif env_ids is not None and t.shape == (batch, nr):
-          t = t[target_idx].to(torch.float32)
+      arr = np.asarray(value)
+      if arr.dtype.kind not in ("fiu" if name != "eq_active" else "fiub"):
+        raise TypeError(f"{name} must be a real numeric array")
+      with np.errstate(over="ignore", invalid="ignore"):
+        arr = np.asarray(arr, dtype=np.float32, order="C")
+      if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must be finite and float32-representable")
+      t = torch.as_tensor(arr, dtype=torch.float32, device=device)
+    # Scalar time has a useful broadcast; all other groups retain MuJoCo shape.
+    if name == "time" and t.numel() == 1:
+      t = t.reshape(1).expand(count)
+    elif tuple(t.shape) == (sim.batch_size, *target_shape) and ids is not None:
+      t = t[torch.as_tensor(ids, device=device)]
+    elif tuple(t.shape) == target_shape and name != "time" and count == 1:
+      t = t.unsqueeze(0)
+    elif tuple(t.shape) != (count, *target_shape):
+      raise ValueError(f"{name} shape mismatch: expected {(count, *target_shape)} or full batch, got {tuple(t.shape)}")
+    if t.dtype != torch.float32:
+      t = t.to(torch.float32)
+    if not bool(torch.isfinite(t).all()):
+      raise ValueError(f"{name} must be finite and float32-representable")
+    if name == "eq_active":
+      if not bool(((t == 0) | (t == 1)).all()):
+        raise ValueError("eq_active values must be 0 or 1")
+      t = t.to(torch.int32)
+    if name == "qpos":
+      q = t.reshape(count, int(model.nq))
+      for jid in range(int(model.njnt)):
+        jt = int(model.jnt_type[jid])
+        adr = int(model.jnt_qposadr[jid])
+        if jt == int(mujoco.mjtJoint.mjJNT_FREE):
+          quat = q[:, adr + 3:adr + 7]
+        elif jt == int(mujoco.mjtJoint.mjJNT_BALL):
+          quat = q[:, adr:adr + 4]
         else:
-          raise ValueError(f"warmstart shape mismatch: expected (_, {nr}), got {t.shape}")
-        to_apply["warmstart"] = t
+          continue
+        if not bool((torch.abs(torch.linalg.vector_norm(quat, dim=-1) - 1) <= 1e-5).all()):
+          raise ValueError("qpos contains a non-unit joint quaternion")
+    if name == "mocap_quat":
+      q = t.reshape(count, -1, 4)
+      if not bool((torch.abs(torch.linalg.vector_norm(q, dim=-1) - 1) <= 1e-5).all()):
+        raise ValueError("mocap_quat values must be unit quaternions")
+    if name == "history":
+      _validate_history(model, t)
+    staged[name] = (attr, t)
 
-    elif k == "eq_active":
-      if model.neq > 0:
-        if t.shape == (target_count, model.neq):
-          t = t.to(torch.int32)
-        elif env_ids is not None and t.shape == (batch, model.neq):
-          t = t[target_idx].to(torch.int32)
-        else:
-          raise ValueError(f"eq_active shape mismatch: expected (_, {model.neq}), got {t.shape}")
-        to_apply["eq_active"] = t
-
-  state = sim.state
-  if target_idx is None:
-    if "time" in to_apply:
-      state._time.copy_(to_apply["time"].view(state._time.shape))
-    if "qacc" in to_apply:
-      state._qacc.copy_(to_apply["qacc"])
-    if "qpos" in to_apply:
-      state._qpos.copy_(to_apply["qpos"])
-      if hasattr(sim, "flex") and sim.flex is not None:
-        dyn = sim._smooth.run_device(state._qpos, state._qvel)
-        sim.flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
-    if "qvel" in to_apply:
-      state._qvel.copy_(to_apply["qvel"])
-    if "act" in to_apply and state._act is not None:
-      state._act.copy_(to_apply["act"])
-    if "ctrl" in to_apply and sim._control is not None:
-      sim._control.copy_(to_apply["ctrl"])
-    if "warmstart" in to_apply:
-      sim._coupled_constraints.set_warmstart(to_apply["warmstart"], env_ids=None)
-    if "eq_active" in to_apply and state._eq_active is not None:
-      state._eq_active.copy_(to_apply["eq_active"])
-  else:
-    idx_tensor = torch.tensor(target_idx, device=device, dtype=torch.long)
-    if "time" in to_apply:
-      state._time[idx_tensor] = to_apply["time"].view(-1)
-    if "qacc" in to_apply:
-      state._qacc[idx_tensor] = to_apply["qacc"]
-    if "qpos" in to_apply:
-      state._qpos[idx_tensor] = to_apply["qpos"]
-      if hasattr(sim, "flex") and sim.flex is not None:
-        dyn = sim._smooth.run_device(state._qpos, state._qvel)
-        sim.flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
-    if "qvel" in to_apply:
-      state._qvel[idx_tensor] = to_apply["qvel"]
-    if "act" in to_apply and state._act is not None:
-      state._act[idx_tensor] = to_apply["act"]
-    if "ctrl" in to_apply and sim._control is not None:
-      sim._control[idx_tensor] = to_apply["ctrl"]
-    if "warmstart" in to_apply:
-      sim._coupled_constraints.set_warmstart(to_apply["warmstart"], env_ids=target_idx)
-    if "eq_active" in to_apply and state._eq_active is not None:
-      state._eq_active[idx_tensor] = to_apply["eq_active"]
+  # Stage delegated warmstart inputs before any writes; this is the most
+  # failure-prone external operation in the old implementation.
+  ids_t = None if ids is None else torch.as_tensor(ids, dtype=torch.long, device=device)
+  with torch.no_grad():
+    for name, (attr, value) in staged.items():
+      live = state._qacc if attr == "_qacc" else (getattr(state, attr) if attr not in ("_control", "_applied_force", "_body_wrench") else getattr(sim, attr))
+      if value.numel() == 0:
+        continue
+      if live.ndim == 1 and attr != "_time":
+        live = live.reshape(sim.batch_size, -1)
+      target = live if ids_t is None else live.index_select(0, ids_t).clone()
+      v = value.reshape(target.shape)
+      target.copy_(v)
+      if ids_t is None:
+        live.copy_(target)
+      else:
+        live.index_copy_(0, ids_t, target)
+  if staged:
+    if "history" in staged:
+      sim._sync_delay_from_history(None if ids_t is None else ids_t)
+    sim._invalidate_after_state_write(staged)

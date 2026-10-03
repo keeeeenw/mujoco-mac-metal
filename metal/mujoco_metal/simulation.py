@@ -15,6 +15,7 @@
 """All-device orchestration for explicitly validated native physics profiles."""
 
 import numbers
+import copy
 
 import numpy as np
 
@@ -46,6 +47,60 @@ def _clone_system_dict(d):
     else:
       cloned[k] = v
   return cloned
+
+
+def _plugin_state_key(plugin):
+  return (plugin.plugin_type.value, plugin.name)
+
+
+def _copy_plugin_row(value, src, dst, batch):
+  """Copy a plugin snapshot row when its public snapshot is batched data."""
+  if isinstance(value, dict):
+    return {k: _copy_plugin_row(v, src, dst, batch) for k, v in value.items()}
+  if isinstance(value, tuple):
+    return tuple(_copy_plugin_row(v, src, dst, batch) for v in value)
+  if isinstance(value, list):
+    return [_copy_plugin_row(v, src, dst, batch) for v in value]
+  if isinstance(value, np.ndarray) and value.ndim and value.shape[0] == batch:
+    out = value.copy()
+    out[dst] = value[src]
+    return out
+  try:
+    import torch
+    if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == batch:
+      out = value.clone()
+      out[dst] = value[src]
+      return out
+  except ImportError:
+    pass
+  return value
+
+
+def _preflight_plugin_restores(plugin_map, payloads, env_ids=None):
+  """Exercise restore validation before a surrounding state transaction commits.
+
+  Plugin ABIs historically lacked a pure validation method. A restore probe
+  gives rejecting implementations a chance to fail before simulation tensors
+  are changed, and rolls every touched instance back to its captured payload.
+  """
+  active = {key: plugin for key, plugin in plugin_map.items()
+            if payloads[key] is not None}
+  old = {key: copy.deepcopy(plugin.snapshot())
+         for key, plugin in active.items()}
+  touched = []
+  try:
+    for key, plugin in active.items():
+      touched.append(key)
+      plugin.restore(copy.deepcopy(payloads[key]), env_ids=env_ids)
+  except Exception:
+    for key in reversed(touched):
+      try:
+        active[key].restore(copy.deepcopy(old[key]), env_ids=env_ids)
+      except Exception:
+        pass
+    raise
+  for key in reversed(touched):
+    active[key].restore(copy.deepcopy(old[key]), env_ids=env_ids)
 
 
 class MetalSimulation:
@@ -320,45 +375,15 @@ class MetalSimulation:
         dtype=torch.float32,
         device=self._state._device,
     )
-    self._applied_force = (
-        torch.zeros_like(self._rhs)
-        if (
-            is_integrated
-            or profile.name.replace("rk4", "euler")
-            in (
-                "contact_free_forces_euler_v1",
-                "contact_free_motor_euler_v1",
-                "contact_free_transmission_euler_v1",
-                "joint_constraints_euler_v1",
-                "contact_free_fluid_euler_v1",
-                "contact_free_implicitfast_v1",
-                "contact_free_implicit_v1",
-                "contact_free_passive_euler_v1",
-                "contact_free_sensor_euler_v1",
-                "normal_contact_euler_v1",
-                "friction_contact_euler_v1",
-            )
-        )
-        else None
-    )
-    self._body_wrench = (
-        torch.zeros(
-            (batch_size, int(model.nbody), 6),
-            dtype=torch.float32,
-            device=self._state._device,
-        )
-        if self._passive is not None
-        else None
-    )
-    self._control = (
-        torch.zeros(
-            (batch_size, model.nu),
-            dtype=torch.float32,
-            device=self._state._device,
-        )
-        if motor_model is not None or with_transmissions
-        else None
-    )
+    # mjtState selectors own these inputs independently of whether an
+    # integrated profile has a corresponding force-producing model stage.
+    self._applied_force = torch.zeros_like(self._rhs)
+    self._body_wrench = torch.zeros(
+        (batch_size, int(model.nbody), 6), dtype=torch.float32,
+        device=self._state._device)
+    self._control = torch.zeros(
+        (batch_size, model.nu), dtype=torch.float32,
+        device=self._state._device)
     self._damping = torch.tensor(
         descriptor.dof_damping
         if profile.passive_damping_enabled
@@ -554,14 +579,18 @@ class MetalSimulation:
       _ns, _ip, _dl = _delay_cfg(model)
       if bool(np.any(_ns > 0)):
         self._delay = _DelayLine(_ns, _ip, _dl, batch_size=batch_size)
+    if self._delay is not None:
+      self._sync_delay_from_history()
 
     from mujoco_metal.islands import IslandManager
     self._islands = IslandManager(model, batch_size=batch_size, device=self._state._device)
 
     from mujoco_metal.extensions import default_registry, PluginType
-    self._force_plugins = [p for (name, typ), p in default_registry._plugins.items() if typ in (PluginType.FORCE, PluginType.ACTUATOR)]
-    for p in self._force_plugins:
-      p.init(model, batch_size=batch_size, device=self._state._device)
+    self._native_plugins = default_registry.instantiate(
+        model, batch_size=batch_size, device=self._state._device)
+    self._force_plugins = tuple(
+        p for p in self._native_plugins
+        if p.plugin_type in (PluginType.FORCE, PluginType.ACTUATOR))
 
   @property
   def islands(self):
@@ -582,6 +611,30 @@ class MetalSimulation:
   def device(self):
     """The device backing simulation state."""
     return self._state.device
+
+  def _invalidate_after_state_write(self, fields):
+    """Advance state identity and invalidate records derived from a state transaction."""
+    state = self._state
+    state._generation += 1
+    self._assembled_system_valid = False
+    self._accepted_step = None
+    self._last_coupled = None
+    self._last_coupled_generation = None
+    self._spatial_cache_key = None
+    self._spatial_kin = None
+    if self._flex is not None and ("qpos" in fields or "qvel" in fields or
+                                    "mocap_pos" in fields or "mocap_quat" in fields):
+      dyn = self._smooth.run_device(
+          state._qpos, state._qvel, state._mpos, state._mquat)
+      self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
+    if self._spatial_tendons is not None and ("qpos" in fields or "qvel" in fields or
+                                               "mocap_pos" in fields or "mocap_quat" in fields):
+      dyn = self._smooth.run_device(
+          state._qpos, state._qvel, state._mpos, state._mquat)
+      self._spatial_kin = self._spatial_tendons.run_kinematics(
+          state._qvel, dyn["poses"])
+      self._spatial_cache_key = (state.generation, id(state._qvel),
+                                 id(dyn["poses"].get("body_pos")))
 
   @property
   def execution_plan(self):
@@ -701,7 +754,6 @@ class MetalSimulation:
 
   def copy_environment(self, src, dst):
     """Copy all state rows (qpos/qvel/qacc/time/status/eq/mocap) src -> dst."""
-    gen = self._state.copy_environment(src, dst)
     for name, value in (("src", src), ("dst", dst)):
       raw = np.asarray(value)
       if raw.shape != () or raw.dtype.kind not in "iu":
@@ -710,6 +762,16 @@ class MetalSimulation:
     for index in (src_i, dst_i):
       if not 0 <= index < self.batch_size:
         raise ValueError("environment index out of range")
+    plugin_map = {_plugin_state_key(p): p for p in getattr(self, "_native_plugins", ())}
+    plugin_targets = {}
+    for key, plugin in plugin_map.items():
+      payload = plugin.snapshot()
+      plugin_targets[key] = _copy_plugin_row(payload, src_i, dst_i, self.batch_size)
+    active_plugins = {key: plugin_map[key] for key, value in plugin_targets.items()
+                      if value is not None}
+    active_targets = {key: plugin_targets[key] for key in active_plugins}
+    _preflight_plugin_restores(active_plugins, active_targets, env_ids=[dst_i])
+    gen = self._state.copy_environment(src, dst)
     # Full simulation state follows the device rows: retained warmstarts,
     # stored sensor samples and held per-call inputs. Caches invalidate.
     cc = getattr(self, "_coupled_constraints", None)
@@ -724,6 +786,11 @@ class MetalSimulation:
       tensor = getattr(self, held, None)
       if tensor is not None:
         tensor[dst_i] = tensor[src_i].clone()
+    if getattr(self, "_delay", None) is not None:
+      self._delay.copy_row(src_i, dst_i)
+      self._sync_history_from_delay(env_ids=[dst_i])
+    for key, plugin in active_plugins.items():
+      plugin.restore(plugin_targets[key], env_ids=[dst_i])
     if getattr(self, "_delay", None) is not None:
       self._delay.copy_row(src_i, dst_i)
     if getattr(self, "_islands", None) is not None:
@@ -758,6 +825,13 @@ class MetalSimulation:
         "nv": int(self._mjmodel.nv),
         "nbody": int(self._mjmodel.nbody),
         "device": self._state.snapshot(),
+        "native_state": {
+            name: getattr(self._state, attr).detach().cpu().numpy().copy()
+            for name, attr in (("history", "_history"),
+                               ("qacc_warmstart", "_qacc_warmstart"),
+                               ("userdata", "_userdata"),
+                               ("plugin_state", "_plugin_state"))
+        },
     }
     cc = getattr(self, "_coupled_constraints", None)
     if cc is not None and int(cc.descriptor.nr) > 0:
@@ -782,9 +856,8 @@ class MetalSimulation:
     } if getattr(self, "_islands", None) is not None else None)
     snap["flex"] = (self._flex.get_state()
                     if getattr(self, "_flex", None) is not None else None)
-    snap["plugins"] = {
-        p.name: p.snapshot() for p in getattr(self, "_force_plugins", [])
-    }
+    snap["plugins"] = {_plugin_state_key(p): p.snapshot()
+                       for p in getattr(self, "_native_plugins", ())}
     return snap
 
   def restore(self, snapshot, env_ids=None):
@@ -829,6 +902,18 @@ class MetalSimulation:
             or int(snapshot.get("nv", -1)) != int(self._mjmodel.nv)
             or int(snapshot.get("nbody", -1)) != int(self._mjmodel.nbody)):
       raise ValueError("snapshot model dimensions do not match")
+    plugins = snapshot.get("plugins")
+    plugin_map = {_plugin_state_key(p): p for p in getattr(self, "_native_plugins", ())}
+    if not isinstance(plugins, dict) or set(plugins) != set(plugin_map):
+      raise ValueError("snapshot plugin roles/names do not match this simulation")
+    for key, plugin in plugin_map.items():
+      validator = getattr(plugin, "validate_snapshot", None)
+      if callable(validator):
+        validator(plugins[key], env_ids=ids)
+    # Some third-party restore implementations validate while writing. Probe
+    # their payloads and restore their prior state before committing any
+    # simulation-owned tensor, so a late rejecting plugin is transactional.
+    _preflight_plugin_restores(plugin_map, plugins, env_ids=ids)
     held = snapshot.get("held", {})
     held_checked = {}
     for name, tensor in (("control", self._control),
@@ -850,6 +935,24 @@ class MetalSimulation:
       if not _np.all(_np.isfinite(arr32)):
         raise ValueError(f"snapshot held {name} values overflow float32")
       held_checked[name] = arr32.copy()
+    native_state = snapshot.get("native_state")
+    native_checked = {}
+    if not isinstance(native_state, dict) or set(native_state) != {
+        "history", "qacc_warmstart", "userdata", "plugin_state"}:
+      raise ValueError("snapshot native state groups are missing or unknown")
+    for name, attr in (("history", "_history"),
+                       ("qacc_warmstart", "_qacc_warmstart"),
+                       ("userdata", "_userdata"),
+                       ("plugin_state", "_plugin_state")):
+      tensor = getattr(self._state, attr)
+      arr = _np.asarray(native_state[name], dtype=_np.float64)
+      if arr.shape != tuple(tensor.shape) or not _np.all(_np.isfinite(arr)):
+        raise ValueError(f"snapshot {name} has an invalid shape or nonfinite values")
+      with _np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        arr32 = _np.asarray(arr, dtype=_np.float32)
+      if not _np.all(_np.isfinite(arr32)):
+        raise ValueError(f"snapshot {name} values overflow float32")
+      native_checked[name] = arr32.copy()
     sens = snapshot.get("sensordata")
     sens_checked = None
     if sens is not None:
@@ -878,6 +981,17 @@ class MetalSimulation:
     # Commit boundary: DeviceState validates its fields atomically before mutating.
     self._state.restore(snapshot["device"], env_ids=ids)
     torch = self._state._torch
+    for name, attr in (("history", "_history"),
+                       ("qacc_warmstart", "_qacc_warmstart"),
+                       ("userdata", "_userdata"),
+                       ("plugin_state", "_plugin_state")):
+      tensor = getattr(self._state, attr)
+      val = torch.as_tensor(native_checked[name], dtype=torch.float32,
+                            device=self._state._device)
+      if ids is None:
+        tensor.copy_(val)
+      else:
+        tensor[ids] = val[ids]
     if nr > 0 and warm32 is not None:
       if ids is None:
         cc.set_warmstart(warm32)
@@ -922,6 +1036,7 @@ class MetalSimulation:
           cur["values"].reshape(self.batch_size, nu, nmax)[row] = \
               delay_checked["values"].reshape(self.batch_size, nu, nmax)[row].copy()
         self._delay.restore(cur)
+      self._sync_delay_from_history(env_ids=ids)
     if getattr(self, "_islands", None) is not None and "islands" in snapshot and snapshot["islands"] is not None:
       if ids is None:
         self._islands.tree_asleep[:] = snapshot["islands"]["tree_asleep"]
@@ -936,10 +1051,8 @@ class MetalSimulation:
       else:
         dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
         self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
-    if "plugins" in snapshot and snapshot["plugins"] is not None:
-      for p in getattr(self, "_force_plugins", []):
-        if p.name in snapshot["plugins"]:
-          p.restore(snapshot["plugins"][p.name], env_ids=env_ids)
+    for key, plugin in plugin_map.items():
+      plugin.restore(plugins[key], env_ids=env_ids)
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -964,6 +1077,7 @@ class MetalSimulation:
       self._coupled_constraints.clear_warmstart(env_ids=env_ids)
     if getattr(self, "_delay", None) is not None:
       self._delay.reset(env_ids=env_ids)
+      self._sync_delay_from_history(env_ids=env_ids)
     if getattr(self, "_sensordata", None) is not None:
       # Stored step samples are state: reset zeroes selected worlds.
       if env_ids is None:
@@ -977,7 +1091,7 @@ class MetalSimulation:
     if getattr(self, "_flex", None) is not None:
       dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
       self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
-    for p in getattr(self, "_force_plugins", []):
+    for p in getattr(self, "_native_plugins", ()):
       p.reset(env_ids=env_ids)
     self._assembled_system_valid = False
     self._accepted_step = None
@@ -1450,8 +1564,8 @@ class MetalSimulation:
     torch = self._state._torch
     shape = (self._state.batch_size, self._state._model.nv)
     if qfrc_applied is None:
-      if self._applied_force is not None:
-        self._applied_force.zero_()
+      # Like mj_step, omitted inputs preserve the simulation's held applied
+      # force. Pass an explicit zero array to clear it.
       return
     if self._applied_force is None:
       raise ValueError("qfrc_applied requires contact_free_forces_euler_v1")
@@ -1483,7 +1597,7 @@ class MetalSimulation:
         raise ValueError("xfrc_applied requires a passive or sensor profile")
       return
     if xfrc_applied is None:
-      self._body_wrench.zero_()
+      # Preserve values installed through mj_setState or a prior step call.
       return
     torch = self._state._torch
     shape = tuple(self._body_wrench.shape)
@@ -1516,7 +1630,7 @@ class MetalSimulation:
     torch = self._state._torch
     shape = tuple(self._control.shape)
     if ctrl is None:
-      self._control.zero_()
+      # Control is persistent MuJoCo state; None means leave it unchanged.
       return
     if isinstance(ctrl, torch.Tensor):
       if ctrl.dtype != torch.float32:
@@ -1574,6 +1688,52 @@ class MetalSimulation:
       return self._control
     return self._delay.read(self._control, time)
 
+  def _sync_delay_from_history(self, env_ids=None):
+    """Mirror MuJoCo's canonical actuator history records into the device reader."""
+    if self._delay is None:
+      return
+    torch = self._state._torch
+    ids = (torch.arange(self.batch_size, device=self._state._device)
+           if env_ids is None else torch.as_tensor(env_ids, dtype=torch.long,
+                                                   device=self._state._device))
+    history = self._state._history.index_select(0, ids)
+    cursor = self._delay._cursor.view(self.batch_size, self._mjmodel.nu)
+    times = self._delay._times.view(self.batch_size, self._mjmodel.nu, self._delay.nmax)
+    values = self._delay._values.view(self.batch_size, self._mjmodel.nu, self._delay.nmax)
+    act_n = np.asarray(self._mjmodel.actuator_history).reshape(self._mjmodel.nu, 2)[:, 0]
+    adr = np.asarray(self._mjmodel.actuator_historyadr).reshape(self._mjmodel.nu)
+    for aid, n in enumerate(act_n.tolist()):
+      n = int(n)
+      if n <= 0:
+        continue
+      start = int(adr[aid])
+      cursor[ids, aid] = history[:, start + 1].to(torch.int32)
+      times[ids, aid, :n] = history[:, start + 2:start + 2 + n]
+      values[ids, aid, :n] = history[:, start + 2 + n:start + 2 + 2 * n]
+
+  def _sync_history_from_delay(self, env_ids=None):
+    """Publish accepted actuator delay-ring updates into canonical mjtState history."""
+    if self._delay is None:
+      return
+    torch = self._state._torch
+    ids = (torch.arange(self.batch_size, device=self._state._device)
+           if env_ids is None else torch.as_tensor(env_ids, dtype=torch.long,
+                                                   device=self._state._device))
+    cursor = self._delay._cursor.view(self.batch_size, self._mjmodel.nu)
+    times = self._delay._times.view(self.batch_size, self._mjmodel.nu, self._delay.nmax)
+    values = self._delay._values.view(self.batch_size, self._mjmodel.nu, self._delay.nmax)
+    hist = self._state._history
+    act_n = np.asarray(self._mjmodel.actuator_history).reshape(self._mjmodel.nu, 2)[:, 0]
+    adr = np.asarray(self._mjmodel.actuator_historyadr).reshape(self._mjmodel.nu)
+    for aid, n in enumerate(act_n.tolist()):
+      n = int(n)
+      if n <= 0:
+        continue
+      start = int(adr[aid])
+      hist[ids, start + 1] = cursor[ids, aid].to(torch.float32)
+      hist[ids, start + 2:start + 2 + n] = times[ids, aid, :n]
+      hist[ids, start + 2 + n:start + 2 + 2 * n] = values[ids, aid, :n]
+
   def _record_delay(self, time, success):
     """Record held control into delay rings for successful worlds."""
     if self._delay is None or self._control is None:
@@ -1586,6 +1746,7 @@ class MetalSimulation:
           (1, int(self._mjmodel.nu)), dtype=_np.int32))
     t = time.detach().cpu().numpy() if hasattr(time, "detach") else _np.asarray(time)
     self._delay.record(self._control, t.reshape(-1), mask=mask)
+    self._sync_history_from_delay()
 
   def _actuation_force(self, qpos, qvel, poses, act_override=None, time_override=None):
     """General actuator force stage with pinned mj_fwdActuation ordering.
@@ -1751,24 +1912,34 @@ class MetalSimulation:
         lam_raw=lam, lam_nr=lam_nr, lam_stride=lam_s,
         act_force=self._sen_act_force, qfrc_act=self._sen_qfrc_act, out=out)
 
-  def _acceleration(self, qpos, qvel, act_override=None, time_override=None, constrained=True):
+  def _acceleration(self, qpos, qvel, act_override=None, time_override=None, constrained=True,
+                   dynamics_override=None, poses_override=None,
+                   applied_force_override=None):
+    torch = self._state._torch
     mpos = getattr(self._state, "_mpos", None)
     mquat = getattr(self._state, "_mquat", None)
-    dynamics = self._smooth.run_device(qpos, qvel, mpos, mquat)
+    dynamics = (self._smooth.run_device(qpos, qvel, mpos, mquat)
+                if dynamics_override is None else dict(dynamics_override))
+    if dynamics_override is not None:
+      dynamics["mass_matrix"] = dynamics["mass_matrix"].clone()
+    if poses_override is not None:
+      dynamics["poses"] = poses_override
     eval_time = time_override if time_override is not None else self._state._time
     if self._sensors is not None and self._has_acc_sensors:
       self._lazy_sensor_scratch()
       self._sen_act_force.zero_()
       self._sen_qfrc_act.zero_()
     self._state._torch.neg(dynamics["qfrc_bias"], out=self._rhs)
-    if self._applied_force is not None:
+    applied_force = (self._applied_force if applied_force_override is None
+                     else applied_force_override)
+    if applied_force is not None:
       if (
           self._passive is None
           and self.profile.passive_damping_enabled
           and self._rhs.numel()
       ):
         self._rhs.addcmul_(qvel, self._damping.unsqueeze(0), value=-1.0)
-      self._rhs.add_(self._applied_force)
+      self._rhs.add_(applied_force)
     if self._passive is not None:
       passive, self._damping_tangent = self._passive.run_device(
           qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True,
@@ -1828,10 +1999,25 @@ class MetalSimulation:
             self._sen_act_force.shape) if self._motor._last_force is not None
             else 0.0)
         self._sen_qfrc_act.add_(m_qfrc.reshape(self._sen_qfrc_act.shape))
-    for p in getattr(self, "_force_plugins", []):
-      p_force = p.run_device(self._state, qpos=qpos, qvel=qvel, dynamics=dynamics)
-      if p_force is not None:
-        self._rhs.add_(p_force.reshape(self._rhs.shape))
+    force_plugins = tuple(getattr(self, "_force_plugins", ()))
+    before_plugins = {p: copy.deepcopy(p.snapshot()) for p in force_plugins}
+    try:
+      for p in force_plugins:
+        p_force = p.run_device(self._state, qpos=qpos, qvel=qvel, dynamics=dynamics)
+        if p_force is not None:
+          if (not isinstance(p_force, torch.Tensor)
+              or p_force.device.type != self._state._device.type
+              or (self._state._device.index is not None and p_force.device.index != self._state._device.index)
+              or p_force.dtype != torch.float32
+              or tuple(p_force.shape) != tuple(self._rhs.shape)
+              or not bool(torch.isfinite(p_force).all())):
+            raise ValueError(f"plugin {_plugin_state_key(p)!r} returned an invalid force tensor")
+          self._rhs.add_(p_force)
+    except Exception:
+      for plugin, payload in before_plugins.items():
+        if payload is not None:
+          plugin.restore(payload)
+      raise
     acceleration, status = self._solver.run_device(
         dynamics["mass_matrix"], self._rhs
     )
@@ -1877,10 +2063,12 @@ class MetalSimulation:
   def step(self, steps=1, *, qfrc_applied=None, ctrl=None, xfrc_applied=None):
     """Advance all worlds by a positive number of native profile steps.
 
-    ``qfrc_applied`` and ``ctrl`` are optional per-call host arrays or
+    ``qfrc_applied``, ``ctrl`` and ``xfrc_applied`` are optional host arrays or
     contiguous float32 MPS tensors with shapes ``[batch_size, nv]`` and
-    ``[batch_size, nu]``. Each supplied input is held constant for all steps in
-    this call; omitting one supplies zeros. Controls require a profile supporting the model
+    the corresponding MuJoCo dimensions. Each supplied input is held constant
+    for all steps in this call and remains installed as simulation state;
+    omitting one preserves its current value. Pass explicit zeros to clear it.
+    Controls require a profile supporting the model
     actuator family. Host arrays are validated and copied before device stepping;
     MPS tensors stay on device and nonfinite rows fail independently.
 
@@ -2207,16 +2395,37 @@ class MetalSimulation:
     if self._has_contact_sensors or self._has_ray_sensors or self._has_geomdist_sensors:
       merged = self._run_spatial_into(poses, merged)
     if getattr(self, "_has_user_plugin_sensors", False):
-      from mujoco_metal.extensions import default_registry, PluginType
       import mujoco as _mj
+      sensor_plugins = [p for p in self._native_plugins
+                        if p.plugin_type.value == "sensor"]
+      sensor_plugin_states = {p: copy.deepcopy(p.snapshot()) for p in sensor_plugins}
       for i, typ in enumerate(self._sensors.descriptor.sensor_type):
         if typ in (int(_mj.mjtSensor.mjSENS_USER), int(_mj.mjtSensor.mjSENS_PLUGIN)):
           adr = int(self._sensors.descriptor.sensor_adr[i])
           dim = int(self._sensors.descriptor.sensor_dim[i])
           sname = _mj.mj_id2name(self._mjmodel, int(_mj.mjtObj.mjOBJ_SENSOR), i) or "default"
-          plugin = default_registry.get(sname, PluginType.SENSOR) or default_registry.get("default", PluginType.SENSOR)
+          plugin = next((p for p in sensor_plugins if p.name == sname), None)
+          if plugin is None:
+            plugin = next((p for p in sensor_plugins if p.name == "default"), None)
           if plugin is not None:
-            plugin.run_device(self._state, sensordata=merged, sensor_adr=adr, sensor_dim=dim)
+            try:
+              output = plugin.run_device(self._state, sensordata=merged,
+                                         sensor_adr=adr, sensor_dim=dim)
+              if output is not None and (
+                  not isinstance(output, torch.Tensor)
+                  or output.device.type != self._state._device.type
+                  or (self._state._device.index is not None and output.device.index != self._state._device.index)
+                  or output.dtype != torch.float32
+                  or tuple(output.shape) != (self.batch_size, dim)
+                  or not bool(torch.isfinite(output).all())):
+                raise ValueError(f"sensor plugin {_plugin_state_key(plugin)!r} returned an invalid tensor")
+              if output is not None:
+                merged[:, adr:adr + dim] = output
+            except Exception:
+              for touched, payload in sensor_plugin_states.items():
+                if payload is not None:
+                  touched.restore(payload)
+              raise
     self._sensordata.copy_(merged)
 
   def _advance_activations(self, state):
