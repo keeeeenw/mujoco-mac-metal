@@ -950,7 +950,7 @@ class DeviceState:
         act=self._act.detach().cpu().numpy(),
     )
 
-  def restore(self, snapshot):
+  def restore(self, snapshot, env_ids=None):
     """Restore a matching checkpoint only after validating every field."""
     if not isinstance(snapshot, StateSnapshot):
       raise TypeError("snapshot must be a StateSnapshot")
@@ -965,6 +965,9 @@ class DeviceState:
         or snapshot.batch_size != self.batch_size
     ):
       raise ValueError("snapshot model, profile, timestep, or dimensions do not match")
+    ids = self._env_ids(env_ids) if env_ids is not None else None
+    if ids is not None and ids.size == 0:
+      raise ValueError("env_ids must select at least one world")
     # Equality compatibility: never silently lose activity.
     if self._neq == 0:
       if snapshot.schema_version >= 2 and snapshot.neq != 0:
@@ -1047,14 +1050,29 @@ class DeviceState:
             device=self._device,
         ),
     )
-    self._qpos, self._qvel, self._qacc, self._time, self._status = tensors
-    if self._neq > 0:
-      self._eq_active = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)
-    if self._nmocap > 0:
-      self._mpos = self._torch.as_tensor(mocap_checked[0], dtype=self._torch.float32, device=self._device)
-      self._mquat = self._torch.as_tensor(mocap_checked[1], dtype=self._torch.float32, device=self._device)
-    if self._na > 0:
-      self._act = self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device)
+    if ids is None:
+      self._qpos, self._qvel, self._qacc, self._time, self._status = tensors
+      if self._neq > 0:
+        self._eq_active = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)
+      if self._nmocap > 0:
+        self._mpos = self._torch.as_tensor(mocap_checked[0], dtype=self._torch.float32, device=self._device)
+        self._mquat = self._torch.as_tensor(mocap_checked[1], dtype=self._torch.float32, device=self._device)
+      if self._na > 0:
+        self._act = self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device)
+    else:
+      index = self._torch.as_tensor(ids, dtype=self._torch.int64, device=self._device)
+      self._qpos[index] = tensors[0][index]
+      self._qvel[index] = tensors[1][index]
+      self._qacc[index] = tensors[2][index]
+      self._time[index] = tensors[3][index]
+      self._status[index] = tensors[4][index]
+      if self._neq > 0:
+        self._eq_active[index] = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)[index]
+      if self._nmocap > 0:
+        self._mpos[index] = self._torch.as_tensor(mocap_checked[0], dtype=self._torch.float32, device=self._device)[index]
+        self._mquat[index] = self._torch.as_tensor(mocap_checked[1], dtype=self._torch.float32, device=self._device)[index]
+      if self._na > 0:
+        self._act[index] = self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device)[index]
     self._generation += 1
     return self._generation
 

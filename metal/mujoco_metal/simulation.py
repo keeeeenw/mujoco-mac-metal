@@ -32,6 +32,22 @@ from mujoco_metal.smooth_solve import MetalDenseSolve
 from mujoco_metal.stepping import validate_stepping_profile
 
 
+def _clone_system_dict(d):
+  """Clone system tensor dictionary for immutable accepted-step retention."""
+  if d is None:
+    return None
+  import torch
+  cloned = {}
+  for k, v in d.items():
+    if isinstance(v, torch.Tensor):
+      cloned[k] = v.detach().clone()
+    elif isinstance(v, dict):
+      cloned[k] = _clone_system_dict(v)
+    else:
+      cloned[k] = v
+  return cloned
+
+
 class MetalSimulation:
   """Batched native MPS stepping for bounded, explicitly selected profiles.
 
@@ -170,6 +186,8 @@ class MetalSimulation:
     self._joint_constraints = None
     self._contact = None
     self._coupled_constraints = None
+    self._accepted_step = None
+    self._coupled_solve_dispatches = 0
 
     if is_integrated:
       import mujoco as _mj_init
@@ -640,8 +658,7 @@ class MetalSimulation:
             or snapshot.get("batch_size") != self.batch_size):
       raise ValueError("snapshot model, profile, or batch size do not match")
     ids = self._state._env_ids(env_ids) if env_ids is not None else None
-    rows = (np.arange(self.batch_size, dtype=_np.int64) if ids is None else _np.asarray(ids, dtype=_np.int64))
-    if rows.size == 0:
+    if ids is not None and ids.size == 0:
       raise ValueError("env_ids must select at least one world")
     nr = int(snapshot.get("nr", 0))
     cc = getattr(self, "_coupled_constraints", None)
@@ -649,10 +666,15 @@ class MetalSimulation:
     if nr != cc_nr:
       raise ValueError("snapshot constraint-row dimensions do not match")
     warm = snapshot.get("warmstart")
+    warm32 = None
     if nr > 0:
       warm = _np.asarray(warm, dtype=_np.float64)
       if warm.shape != (self.batch_size, nr) or not _np.all(_np.isfinite(warm)):
         raise ValueError("snapshot warmstart has an invalid shape or nonfinite values")
+      with _np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        warm32 = _np.asarray(warm, dtype=_np.float32)
+      if not _np.all(_np.isfinite(warm32)):
+        raise ValueError("snapshot warmstart values overflow float32")
     elif warm is not None:
       raise ValueError("snapshot warmstart must be None without constraint rows")
     if int(snapshot.get("nsensordata", -1)) != int(self._mjmodel.nsensordata):
@@ -677,41 +699,60 @@ class MetalSimulation:
       arr = _np.asarray(value, dtype=_np.float64)
       if arr.shape != tuple(tensor.shape) or not _np.all(_np.isfinite(arr)):
         raise ValueError(f"snapshot held {name} has an invalid shape or nonfinite values")
-      held_checked[name] = arr.astype(_np.float32, copy=True)
+      with _np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        arr32 = _np.asarray(arr, dtype=_np.float32)
+      if not _np.all(_np.isfinite(arr32)):
+        raise ValueError(f"snapshot held {name} values overflow float32")
+      held_checked[name] = arr32.copy()
     sens = snapshot.get("sensordata")
-    if sens is None:
-      if getattr(self, "_sensordata", None) is not None:
-        raise ValueError("snapshot sensor sample does not match this simulation")
-      sens_checked = None
-    else:
-      if getattr(self, "_sensordata", None) is None:
-        raise ValueError("snapshot sensor sample does not match this simulation")
-      sens_checked = _np.asarray(sens, dtype=_np.float64)
-      if sens_checked.shape != (self.batch_size, int(self._mjmodel.nsensordata)) or not _np.all(_np.isfinite(sens_checked)):
+    sens_checked = None
+    if sens is not None:
+      sens_arr = _np.asarray(sens, dtype=_np.float64)
+      if sens_arr.shape != (self.batch_size, int(self._mjmodel.nsensordata)) or not _np.all(_np.isfinite(sens_arr)):
         raise ValueError("snapshot sensor sample has an invalid shape or nonfinite values")
-      sens_checked = sens_checked.astype(_np.float32, copy=True)
-    # Device restore validates its own fields atomically before mutating.
-    # Only full-simulation restore is supported: selected worlds are served
-    # by copy_environment (row copy) and reset(env_ids) (cold selected
-    # reset). A partial warmstart/held/sensor restore would leave mixed
-    # seeds, so env_ids is refused loudly instead of half-applied.
-    if env_ids is not None:
-      raise ValueError("selected-world restore is not supported; use copy_environment")
-    self._state.restore(snapshot["device"])
+      with _np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        sens32 = _np.asarray(sens_arr, dtype=_np.float32)
+      if not _np.all(_np.isfinite(sens32)):
+        raise ValueError("snapshot sensor sample values overflow float32")
+      sens_checked = sens32.copy()
+
+    # Commit boundary: DeviceState validates its fields atomically before mutating.
+    self._state.restore(snapshot["device"], env_ids=ids)
     torch = self._state._torch
-    if nr > 0:
-      cc.set_warmstart(warm)
+    if nr > 0 and warm32 is not None:
+      if ids is None:
+        cc.set_warmstart(warm32)
+      else:
+        cc.set_warmstart(warm32[ids], env_ids=ids)
     for name, tensor in (("control", self._control),
                          ("wrench", self._body_wrench),
                          ("force", self._applied_force)):
       if tensor is not None:
-        tensor.copy_(torch.as_tensor(held_checked[name], dtype=torch.float32, device=self._state._device))
+        val_t = torch.as_tensor(held_checked[name], dtype=torch.float32, device=self._state._device)
+        if ids is None:
+          tensor.copy_(val_t)
+        else:
+          tensor[ids] = val_t[ids]
     if sens_checked is not None:
-      self._sensordata.copy_(torch.as_tensor(sens_checked, dtype=torch.float32, device=self._state._device))
+      if self._sensordata is None:
+        self._sensordata = torch.zeros(
+            (self.batch_size, int(self._mjmodel.nsensordata)),
+            dtype=torch.float32, device=self._state._device)
+      val_s = torch.as_tensor(sens_checked, dtype=torch.float32, device=self._state._device)
+      if ids is None:
+        self._sensordata.copy_(val_s)
+      else:
+        self._sensordata[ids] = val_s[ids]
+    else:
+      if ids is None:
+        self._sensordata = None
+      elif self._sensordata is not None:
+        self._sensordata[ids] = 0.0
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
       self._last_coupled_generation = None
+    self._accepted_step = None
     return self._state.generation
 
   def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
@@ -1007,6 +1048,9 @@ class MetalSimulation:
       lam_saved = cc.get_warmstart() if cc is not None else None
       last_coupled = getattr(self, "_last_coupled", None)
       last_gen = getattr(self, "_last_coupled_generation", None)
+      accepted_step = getattr(self, "_accepted_step", None)
+      ws_saved = {k: v.clone() for k, v in cc._workspace.items()} if cc is not None else None
+      rhs_saved = self._rhs.clone() if getattr(self, "_rhs", None) is not None else None
       try:
         acceleration, _, acc_dyn = self._acceleration(state._qpos, state._qvel)
         acc_poses = dict(acc_dyn["poses"], cvel=acc_dyn["cvel"],
@@ -1014,6 +1058,11 @@ class MetalSimulation:
         out = self._run_acc_into(state._qpos, state._qvel, acceleration,
                                  acc_poses, acc_dyn, out)
       finally:
+        if ws_saved is not None:
+          for k, v in ws_saved.items():
+            cc._workspace[k].copy_(v)
+        if rhs_saved is not None:
+          self._rhs.copy_(rhs_saved)
         if cc is not None and lam_saved is not None:
           import numpy as _np
           if bool(_np.all(_np.isfinite(lam_saved))):
@@ -1024,6 +1073,7 @@ class MetalSimulation:
           self._last_coupled = last_coupled
         if hasattr(self, "_last_coupled_generation"):
           self._last_coupled_generation = last_gen
+        self._accepted_step = accepted_step
     if self._has_contact_sensors or self._has_ray_sensors or self._has_geomdist_sensors:
       out = self._run_spatial_into(poses, out)
     return out.clone()
@@ -1085,12 +1135,17 @@ class MetalSimulation:
     if qfrc_applied is not None:
       self._prepare_force(qfrc_applied)
       recompute = True
-    if (
-        not recompute
-        and getattr(self, "_last_coupled", None) is not None
-        and getattr(self, "_last_coupled_generation", None) == self._state.generation
-    ):
-      return self._last_coupled
+    if not recompute:
+      if (
+          getattr(self, "_accepted_step", None) is not None
+          and self._accepted_step["generation"] == self._state.generation
+      ):
+        return self._accepted_step["system"]
+      if (
+          getattr(self, "_last_coupled", None) is not None
+          and getattr(self, "_last_coupled_generation", None) == self._state.generation
+      ):
+        return self._last_coupled
     state = self._state
     qpos, qvel = state._qpos, state._qvel
     mpos = getattr(state, "_mpos", None)
@@ -1133,6 +1188,7 @@ class MetalSimulation:
       rhs.add_(self._motor.run_device(self._control))
     eq_active = getattr(state, "_eq_active", None)
     _ten_J, _ten_L = self._spatial_for_coupled(qvel, dynamics["poses"])
+    self._coupled_solve_dispatches += 1
     coupled = self._coupled_constraints.run_device(
         dynamics["poses"], dynamics["mass_matrix"], rhs, qpos, qvel,
         eq_active=eq_active, cvel=dynamics.get("cvel", None),
@@ -1142,6 +1198,11 @@ class MetalSimulation:
     self._last_coupled = coupled
     self._last_coupled_generation = self._state.generation
     return coupled
+
+  @property
+  def accepted_step(self):
+    """The explicit accepted-step record from the most recent trajectory advancement."""
+    return getattr(self, "_accepted_step", None)
 
   def _prepare_force(self, qfrc_applied):
     torch = self._state._torch
@@ -1487,6 +1548,7 @@ class MetalSimulation:
         dynamics["mass_matrix"], self._rhs
     )
     if self._coupled_constraints is not None:
+      self._coupled_solve_dispatches += 1
       eq_active = getattr(self._state, "_eq_active", None)
       _ten_J, _ten_L = self._spatial_for_coupled(qvel, dynamics["poses"])
       coupled = self._coupled_constraints.run_device(
@@ -1545,7 +1607,12 @@ class MetalSimulation:
     self._prepare_force(qfrc_applied)
     torch = self._state._torch
     state = self._state
+    cc = getattr(self, "_coupled_constraints", None)
     for _ in range(int(steps)):
+      pre_step_gen = state.generation
+      pre_step_time = state.time.cpu().numpy().copy()
+      pre_warm = cc.get_warmstart().copy() if cc is not None and int(cc.descriptor.nr) > 0 else None
+      pre_sens = self._sensordata.clone() if self._sensordata is not None else None
       if self._rk4 is not None:
         if self._sensors is not None:
           # Pinned RK4 evaluates the outer forward (with sensors) at the
@@ -1567,6 +1634,25 @@ class MetalSimulation:
         state._time = time.clone()
         state._status = status.clone()
         state._generation += 1
+        if not bool(torch.all(success)):
+          if self._sensordata is not None:
+            if pre_sens is not None:
+              self._sensordata.copy_(torch.where(success.unsqueeze(1), self._sensordata, pre_sens))
+            else:
+              self._sensordata.mul_(success.unsqueeze(1).float())
+          if pre_warm is not None and cc is not None:
+            failed_ids = torch.nonzero(~success).squeeze(1).cpu().numpy()
+            if failed_ids.size > 0:
+              cc.set_warmstart(pre_warm[failed_ids], env_ids=failed_ids)
+        if getattr(self, "_last_coupled", None) is not None:
+          self._accepted_step = {
+              "system": _clone_system_dict(self._last_coupled),
+              "generation": state.generation,
+              "input_generation": pre_step_gen,
+              "input_time": pre_step_time,
+              "status": state._status.clone(),
+              "acceleration": state._qacc.clone(),
+          }
         continue
       acceleration, solve_status, dynamics = self._acceleration(
           state._qpos, state._qvel
@@ -1657,6 +1743,29 @@ class MetalSimulation:
       if self._actuators is not None and getattr(state, "_na", 0) > 0:
         state._act, self._next_act = self._next_act, state._act
       state._generation += 1
+
+      # Failure atomicity (R02): rollback sensor samples and warmstarts for failed worlds
+      if not bool(torch.all(self._success)):
+        if self._sensordata is not None:
+          if pre_sens is not None:
+            self._sensordata.copy_(torch.where(self._success.unsqueeze(1), self._sensordata, pre_sens))
+          else:
+            self._sensordata.mul_(self._success.unsqueeze(1).float())
+        if pre_warm is not None and cc is not None:
+          failed_ids = torch.nonzero(~self._success).squeeze(1).cpu().numpy()
+          if failed_ids.size > 0:
+            cc.set_warmstart(pre_warm[failed_ids], env_ids=failed_ids)
+
+      # Accepted step record (R03/R04): exact immutable snapshot of the solved system
+      if getattr(self, "_last_coupled", None) is not None:
+        self._accepted_step = {
+            "system": _clone_system_dict(self._last_coupled),
+            "generation": state.generation,
+            "input_generation": pre_step_gen,
+            "input_time": pre_step_time,
+            "status": state._status.clone(),
+            "acceleration": state._qacc.clone(),
+        }
     return state._status
 
   def step_sensordata(self):
