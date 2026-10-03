@@ -523,8 +523,9 @@ kernel void solve_coupled_constraints(
   int mb = world * nv * nv;  int qb = world * nv;
   int pb = world * nq;
   out_status[world] = 0;
-  out_diagnostics[world * 2] = 0.0f;
-  out_diagnostics[world * 2 + 1] = 0.0f;
+  out_diagnostics[world * 10] = 0.0f;
+  out_diagnostics[world * 10 + 1] = 0.0f;
+  for (int k = 0; k < 8; ++k) out_diagnostics[world * 10 + 2 + k] = 0.0f;
   for (int i = 0; i < nv; ++i) { out_force[qb + i] = 0.0f; out_acc[qb + i] = 0.0f; }
   if (workspace_debug && nr > 0) {
     device float* dbg = workspace_debug + world * (nr * nr + 7 * nr);
@@ -535,7 +536,10 @@ kernel void solve_coupled_constraints(
       dbg[nr * nr + r] = 0.0f;
       dbg[nr * nr + nr + r] = 0.0f;
     }
-    for (int i = 0; i < 2 * nr; ++i) dbg[nr * nr + 2 * nr + i] = 0.0f;
+    // Zero the residual vector region only; the retained-multiplier region
+    // [3*nr, 4*nr) persists across steps for warm starts (cleared by reset,
+    // restore-clear and clear_warmstart on the host).
+    for (int i = 0; i < nr; ++i) dbg[nr * nr + 2 * nr + i] = 0.0f;
   }
   if (nv == 0) return;
   if (nv > 32 || nr > 96) { out_status[world] = 2; return; }
@@ -555,8 +559,16 @@ kernel void solve_coupled_constraints(
   thread bool enabled[96];
   thread float y[32], x[32];
   for (int i = 0; i < nr * nr; ++i) W[i] = 0.0f;
+  // Warm start: seed multipliers from the retained solution unless the
+  // WARMSTART disable bit (512) is set. Bad/foreign warm vectors are
+  // rejected by the cost check after Delassus assembly below.
+  bool warm_ok = (nr > 0) && ((flags & 512) == 0);
   for (int i = 0; i < nr; ++i) {
     R[i] = 0.0f; ar[i] = 0.0f; lo[i] = 0.0f; hi[i] = 0.0f; lam[i] = 0.0f; enabled[i] = false;
+  }
+  if (warm_ok && workspace_debug) {
+    device float* dbg0 = workspace_debug + world * (nr * nr + 7 * nr);
+    for (int i = 0; i < nr; ++i) lam[i] = dbg0[nr * nr + 3 * nr + i];
   }
   // Equality rows [0, n_eq_rows) are preassembled on Metal by equality_assembly
   // (joint/connect/weld with version-pinned residuals, Jacobians, Jdot, impedance).
@@ -874,10 +886,36 @@ kernel void solve_coupled_constraints(
     }
   }
 
+  // 7b. Warmstart cost check (pinned PGS rule): start from the retained
+  // multipliers only when they improve on zero for the CURRENT Delassus
+  // system; otherwise (released contacts, new manifolds, foreign vectors)
+  // fall back to a cold start. Disabled rows never contribute.
+  // Pinned: efc_b = J*qacc_smooth - aref = -rhs, cost = f.b + 0.5 f.A.f.
+  if (warm_ok && total_nr > 0) {
+    float wcost = 0.0f;
+    for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+      wcost -= lam[row] * rhs[row];
+      for (int col = 0; col < total_nr; ++col) if (enabled[col]) {
+        float a = W[row * nr + col] + (row == col ? R[row] : 0.0f);
+        wcost += 0.5f * lam[row] * a * lam[col];
+      }
+    }
+    if (wcost > 0.0f || !isfinite(wcost)) {
+      for (int row = 0; row < total_nr; ++row) lam[row] = 0.0f;
+    }
+  }
+
   // 8. Projected Gauss-Seidel on coupled W + diag(R)
   float tol = params[2];
   bool converged = false;
   float max_res = 0.0f;
+  // Convergence history: 7 coarse main-sweep samples + final main-sweep
+  // residual (refinement afterwards is a separate exact phase; the retained
+  // diagnostics[0] is post-refinement). Unfilled slots repeat the final.
+  thread float hist[8];
+  int hsamp = 0;
+  int hstep = max(1, maxiter / 7);
+  for (int k = 0; k < 8; ++k) hist[k] = 0.0f;
   if (elliptic_count > 0) {
     // Elliptic contacts are cone blocks in scaled coordinates. Solve the full
     // coupled quadratic with projected FISTA so interactions between multiple
@@ -1064,8 +1102,11 @@ kernel void solve_coupled_constraints(
         row_scale = max(1.0f, row_scale);
         max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
       }
-      out_diagnostics[world * 2] = max_res;
-      out_diagnostics[world * 2 + 1] = float(it + 1);
+      out_diagnostics[world * 10] = max_res;
+      out_diagnostics[world * 10 + 1] = float(it + 1);
+      if (hsamp < 7 && ((it + 1) % hstep == 0 || it + 1 == maxiter)) {
+        hist[hsamp++] = max_res;
+      }
       if (max_res <= tol) { converged = true; break; }
     }
   } else {
@@ -1077,16 +1118,23 @@ kernel void solve_coupled_constraints(
     // Loose-but-certified solutions are tightened by block refinement in
     // section 9; already-tight ones skip it bit-identically.
     int pgs_cap = maxiter;
-    // G3: seed the progress comparison from a real initial residual
-    // (lam starts at zero), not from +inf, so the first extension must
-    // prove improvement over the actual starting point.
+    // G3: seed the progress comparison from the actual starting residual
+    // (lam holds the retained warm vector, or zero when cold), not
+    // from +inf, so the first extension must prove improvement over the
+    // actual starting point.
     float win_start = 0.0f;
     for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
       float grad = -rhs[row];
+      for (int col = 0; col < total_nr; ++col) if (enabled[col])
+        grad += W[row * nr + col] * lam[col];
+      grad += R[row] * lam[row];
       float diag = max(1e-15f, W[row * nr + row] + R[row]);
-      float proj = clamp(-grad / diag, lo[row], hi[row]);
-      float row_scale = max(1.0f, abs(ar[row]));
-      win_start = max(win_start, abs(proj) * diag / row_scale);
+      float proj = clamp(lam[row] - grad / diag, lo[row], hi[row]);
+      float row_scale = abs(ar[row]) + abs(R[row] * lam[row]);
+      for (int col = 0; col < total_nr; ++col) if (enabled[col])
+        row_scale += abs(W[row * nr + col] * lam[col]);
+      row_scale = max(1.0f, row_scale);
+      win_start = max(win_start, abs(proj - lam[row]) * diag / row_scale);
     }
     for (int it = 0; it < pgs_cap; ++it) {
       for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
@@ -1108,8 +1156,9 @@ kernel void solve_coupled_constraints(
         row_scale = max(1.0f, row_scale);
         max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
       }
-      out_diagnostics[world * 2] = max_res;
-      out_diagnostics[world * 2 + 1] = float(it + 1);
+      out_diagnostics[world * 10] = max_res;
+      out_diagnostics[world * 10 + 1] = float(it + 1);
+      if (hsamp < 7 && (it + 1) % hstep == 0) hist[hsamp++] = max_res;
       if (max_res <= tol) {
         converged = true;
         break;
@@ -1121,6 +1170,12 @@ kernel void solve_coupled_constraints(
       }
     }
   }
+
+  // Complete the convergence history: unfilled sample slots repeat the
+  // final main-sweep residual; slot 7 always holds it.
+  while (hsamp < 7) hist[hsamp++] = max_res;
+  hist[7] = max_res;
+  for (int k = 0; k < 8; ++k) out_diagnostics[world * 10 + 2 + k] = hist[k];
 
   // 9. Contact Block Refinement (exact per-block solves tighten the PGS
   // solution). Runs when the sweep did not certify, or when it certified
@@ -1197,8 +1252,8 @@ kernel void solve_coupled_constraints(
         row_scale = max(1.0f, row_scale);
         max_res = max(max_res, abs(proj - lam[row]) * diag / row_scale);
       }
-      out_diagnostics[world * 2] = max_res;
-      out_diagnostics[world * 2 + 1] = float(int(out_diagnostics[world * 2 + 1]) + 1);
+      out_diagnostics[world * 10] = max_res;
+      out_diagnostics[world * 10 + 1] = float(int(out_diagnostics[world * 10 + 1]) + 1);
       if (max_res <= tol) { converged = true; break; }
     }
     // G2: certify the FINAL retained multipliers from scratch. Refinement
@@ -1225,7 +1280,7 @@ kernel void solve_coupled_constraints(
     } else {
       converged = true;
     }
-    out_diagnostics[world * 2] = max_res;
+    out_diagnostics[world * 10] = max_res;
   }
 
   // G2: nonfinite residuals fail explicitly (NaN never satisfies `> tol`,
@@ -1282,6 +1337,12 @@ kernel void solve_coupled_constraints(
       dbg[nr * nr + nr + a] = a < total_nr ? ar[a] : 0.0f;
       dbg[nr * nr + 2 * nr + a] = a < total_nr ? rhs[a] : 0.0f;
       dbg[nr * nr + 3 * nr + a] = (a < total_nr && enabled[a]) ? lam[a] : 0.0f;
+      // Retain joint/contact row bounds for host-side KKT residual checks.
+      // Equality and tendon-owned rows keep their preassembled bounds.
+      if (a < total_nr && a >= n_eq_rows && dbg[nr * nr + 6 * nr + a] <= 0.5f) {
+        dbg[nr * nr + 4 * nr + a] = lo[a];
+        dbg[nr * nr + 5 * nr + a] = hi[a];
+      }
     }
   }
 }

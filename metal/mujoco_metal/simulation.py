@@ -374,6 +374,46 @@ class MetalSimulation:
       return self._coupled_constraints.solver_settings
     return None
 
+  def get_warmstart(self):
+    """Return a host copy of retained constraint multipliers, shape `(batch, nr)`.
+
+    These seed the next coupled solve (warm start) unless the WARMSTART
+    disable flag is set or the cost check prefers a cold start. Empty
+    `(batch, 0)` when the model has no constraint rows.
+    """
+    if self._coupled_constraints is None:
+      raise ValueError("get_warmstart requires a coupled constraint profile")
+    return self._coupled_constraints.get_warmstart()
+
+  def set_warmstart(self, values, env_ids=None):
+    """Store retained constraint multipliers for selected environments.
+
+    `values` accepts host arrays shaped `(nr,)` (broadcast) or
+    `(len(env_ids), nr)`, finite float32-representable. Validation is
+    atomic: bad input leaves all worlds unchanged. Takes effect on the next
+    solve and invalidates cached assembly; sticky failure status is
+    preserved. The cost check still rejects vectors that lose to cold.
+    """
+    if self._coupled_constraints is None:
+      raise ValueError("set_warmstart requires a coupled constraint profile")
+    self._coupled_constraints.set_warmstart(values, env_ids=env_ids)
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
+    if hasattr(self, "_last_coupled_generation"):
+      self._last_coupled_generation = None
+    return self._state.generation
+
+  def clear_warmstart(self, env_ids=None):
+    """Zero retained multipliers (cold start) for selected environments."""
+    if self._coupled_constraints is None:
+      return self._state.generation
+    self._coupled_constraints.clear_warmstart(env_ids=env_ids)
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
+    if hasattr(self, "_last_coupled_generation"):
+      self._last_coupled_generation = None
+    return self._state.generation
+
   def set_equality_active(self, values, env_ids=None):
     """Set persistent equality activity for selected environments.
 
@@ -445,12 +485,18 @@ class MetalSimulation:
 
   def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
             mocap_pos=None, mocap_quat=None, act=None):
-    """Reset selected worlds, clear held per-call inputs, invalidate cache."""
+    """Reset selected worlds, clear held per-call inputs, invalidate cache.
+
+    Reset is cold: retained warmstart multipliers are cleared alongside
+    state, matching pinned reset semantics.
+    """
     gen = self._state.reset(
         env_ids=env_ids, qpos=qpos, qvel=qvel, eq_active=eq_active,
         mocap_pos=mocap_pos, mocap_quat=mocap_quat, act=act,
     )
     self._clear_held_inputs(env_ids)
+    if getattr(self, "_coupled_constraints", None) is not None:
+      self._coupled_constraints.clear_warmstart(env_ids=env_ids)
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -524,6 +570,9 @@ class MetalSimulation:
     self._state._generation += 1
     # Held controls follow key_ctrl for selected worlds; other held inputs zeroed.
     self._apply_key_ctrl(key_id, env_ids)
+    # Keyframe reset is cold like reset.
+    if getattr(self, "_coupled_constraints", None) is not None:
+      self._coupled_constraints.clear_warmstart(env_ids=env_ids)
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -658,11 +707,11 @@ class MetalSimulation:
       entries.extend([
           {"name": "_eq_active_default", "residency": "MPS device-resident", "lifetime": "persistent preallocated", "shape": f"({b}, {max(d.neq, 1)})", "dtype": str(self._coupled_constraints._eq_active_default.dtype).replace("torch.", "")},
           {"name": "workspace_J", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nr}, {d.nv})", "dtype": "float32"},
-          {"name": "workspace_debug", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nr * d.nr + 4 * d.nr})", "dtype": "float32"},
+          {"name": "workspace_debug", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nr * d.nr + 7 * d.nr})", "dtype": "float32"},
           {"name": "out_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nv})", "dtype": "float32"},
           {"name": "out_acc", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.nv})", "dtype": "float32"},
           {"name": "out_status", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b},)", "dtype": str(self._coupled_constraints._workspace["out_status"].dtype).replace("torch.", "")},
-          {"name": "out_diagnostics", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, 2)", "dtype": "float32"},
+          {"name": "out_diagnostics", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, 10)", "dtype": "float32"},
       ])
       if d.nc > 0:
         entries.extend([

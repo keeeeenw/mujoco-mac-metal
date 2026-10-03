@@ -633,10 +633,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-SOL-002", "CG solver selection",
-        Stage.CONSTRAINTS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "rejected at lowering",
-        "engine/engine_solver.c", "reject CG",
-        "none", "014", (),
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "accepted as mapped to the native projected solver (same as Newton); selection name does not change execution",
+        "mujoco_metal/coupled_constraints.py", "accept CG as mapped",
+        "MetalSimulation(profile='integrated_euler_v1')", "014", ("test_solver_completion_014.py",),
         enums=("mjtSolver.mjSOL_CG",),
     ),
     # Equalities.
@@ -871,10 +871,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-STATE-005", "warmstart state",
-        Stage.CONSTRAINTS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "cold starts only",
-        "engine/engine_solver.c", "ignore warmstart content",
-        "none", "014", (),
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "retained multipliers seed the next solve with cost-gated fallback; get/set/clear API; reset/keyframe clear; WARMSTART disable honored",
+        "mujoco_metal/coupled_constraints.py", "warm lam retention + cost check",
+        "MetalSimulation.get/set/clear_warmstart", "014", ("test_solver_completion_014.py",),
         enums=("mjtState.mjSTATE_WARMSTART",),
     ),
     Requirement(

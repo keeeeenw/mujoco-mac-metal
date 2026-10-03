@@ -302,11 +302,11 @@ def _build_integrated_execution_plan(
     audit.extend([
         {"name": "_eq_active_default", "residency": "MPS device-resident", "lifetime": "persistent preallocated", "shape": f"(batch, {max(model.neq, 1)})", "dtype": "int32"},
         {"name": "workspace_J", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nr}, {model.nv})", "dtype": "float32"},
-        {"name": "workspace_debug", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nr * coupled_desc.nr + 4 * coupled_desc.nr})", "dtype": "float32"},
+        {"name": "workspace_debug", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {coupled_desc.nr * coupled_desc.nr + 7 * coupled_desc.nr})", "dtype": "float32"},
         {"name": "out_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
         {"name": "out_acc", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"(batch, {model.nv})", "dtype": "float32"},
         {"name": "out_status", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch,)", "dtype": "int32"},
-        {"name": "out_diagnostics", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch, 2)", "dtype": "float32"},
+        {"name": "out_diagnostics", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": "(batch, 10)", "dtype": "float32"},
     ])
     if coupled_desc.nc > 0:
       audit.extend([

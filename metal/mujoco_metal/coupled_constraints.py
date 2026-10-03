@@ -396,10 +396,10 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
         "MuJoCo's separate no-slip post-solver is not implemented"
     )
   if int(model.opt.solver) == int(mujoco.mjtSolver.mjSOL_CG):
-    raise ValueError(
-        "the MuJoCo CG solver selection is unsupported by integrated_euler_v1; "
-        "use the default Newton selection or PGS"
-    )
+    # Mapped like Newton (REQ-SOL-002): the native projected solver handles
+    # the same coupled problem for every convex/cone combination; the
+    # selection name is honored as a mapping, verified by parity tests.
+    pass
 
   # 1. Equality and joint constraint validation (joint/connect/weld, mixed order)
   scalar_types = (_HINGE, _SLIDE)
@@ -1327,7 +1327,7 @@ class MetalCoupledConstraints:
         "out_force": empty(b * nv),
         "out_acc": empty(b * nv),
         "out_status": torch.zeros(b, dtype=torch.int32, device=self._device),
-        "out_diagnostics": empty(b * 2),
+        "out_diagnostics": empty(b * 10),
         "out_contact_force": empty(b * nc * 11),
         "out_joint_force": empty(b * max(d.nr_joint, 1)),
     }
@@ -1341,6 +1341,84 @@ class MetalCoupledConstraints:
     self._constants["body_dims"][3] = 0
     self._constants["body_dims"][4] = b
     return self._workspace
+
+  @property
+  def warm_size(self):
+    """Number of retained constraint multipliers per world (nr, maybe 0)."""
+    return int(self.descriptor.nr)
+
+  def _warm_rows(self, env_ids=None):
+    import numpy as _np
+    b, nr = int(self.batch_size), int(self.descriptor.nr)
+    if env_ids is None:
+      return list(range(b))
+    ids = _np.asarray(env_ids).reshape(-1)
+    if ids.size == 0:
+      raise ValueError("env_ids must select at least one world")
+    out = []
+    for v in ids.tolist():
+      if isinstance(v, bool) or int(v) != v or not 0 <= int(v) < b:
+        raise ValueError(f"env id {v!r} out of range for batch {b}")
+      out.append(int(v))
+    if len(set(out)) != len(out):
+      raise ValueError("duplicate env ids are not allowed")
+    return out
+
+  def get_warmstart(self):
+    """Return a host copy of retained multipliers, shape (batch, nr)."""
+    import numpy as _np
+    b, nr = int(self.batch_size), int(self.descriptor.nr)
+    if nr == 0:
+      return _np.zeros((b, 0), dtype=_np.float32)
+    w = self._workspace["workspace_debug"].reshape(b, nr * nr + 7 * nr)
+    return w[:, nr * nr + 3 * nr:nr * nr + 4 * nr].detach().cpu().numpy().copy()
+
+  def set_warmstart(self, values, env_ids=None):
+    """Store retained multipliers for selected worlds (validated, atomic).
+
+    `values` accepts host arrays shaped `(nr,)` (broadcast) or
+    `(len(env_ids), nr)`, finite float32-representable. Bad input leaves all
+    worlds unchanged. Takes effect on the next solve; the cost check still
+    rejects vectors that lose to a cold start.
+    """
+    import numpy as _np
+    torch = self._torch
+    b, nr = int(self.batch_size), int(self.descriptor.nr)
+    ids = self._warm_rows(env_ids)
+    arr = _np.asarray(values, dtype=_np.float64)
+    if nr == 0:
+      if arr.size != 0:
+        raise ValueError("model has no constraint rows")
+      return
+    if arr.shape == (nr,):
+      arr = _np.broadcast_to(arr, (len(ids), nr)).copy()
+    if arr.shape != (len(ids), nr):
+      raise ValueError(
+          f"warmstart must have shape ({nr},) or ({len(ids)}, {nr}); "
+          f"got {arr.shape}")
+    if not _np.all(_np.isfinite(arr)):
+      raise ValueError("warmstart must be finite")
+    with _np.errstate(over="ignore", under="ignore", invalid="ignore"):
+      arr32 = _np.asarray(arr, dtype=_np.float32)
+    if not _np.all(_np.isfinite(arr32)):
+      raise ValueError("warmstart must be float32-representable")
+    w = self._workspace["workspace_debug"].reshape(b, nr * nr + 7 * nr)
+    w[:, nr * nr + 3 * nr:nr * nr + 4 * nr][ids] = torch.as_tensor(
+        arr32, dtype=torch.float32, device=self._device)
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
+
+  def clear_warmstart(self, env_ids=None):
+    """Zero retained multipliers (cold start) for selected worlds."""
+    b, nr = int(self.batch_size), int(self.descriptor.nr)
+    if nr == 0:
+      self._warm_rows(env_ids)
+      return
+    ids = self._warm_rows(env_ids)
+    w = self._workspace["workspace_debug"].reshape(b, nr * nr + 7 * nr)
+    w[:, nr * nr + 3 * nr:nr * nr + 4 * nr][ids] = 0.0
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
 
   def generate_candidates(self, poses, qvel):
     """Run only the contact candidate kernel into persistent workspace buffers.
@@ -1538,13 +1616,16 @@ class MetalCoupledConstraints:
     qacc = w["out_acc"][: b * nv].reshape(b, nv)
     qfrc_constraint = w["out_force"][: b * nv].reshape(b, nv)
     status = w["out_status"]
-    diagnostics = w["out_diagnostics"][: b * 2].reshape(b, 2)
+    diagnostics = w["out_diagnostics"][: b * 10].reshape(b, 10)
+    history = diagnostics[:, 2:]
+    diagnostics = diagnostics[:, :2]
 
     result = {
         "qacc": qacc,
         "qfrc_constraint": qfrc_constraint,
         "status": status,
         "solver_diagnostics": diagnostics,
+        "solver_history": history,
     }
 
     if nr > 0:
@@ -1554,6 +1635,8 @@ class MetalCoupledConstraints:
       ar = w_debug[:, nr * nr + nr : nr * nr + 2 * nr].reshape(b, nr)
       rhs = w_debug[:, nr * nr + 2 * nr : nr * nr + 3 * nr].reshape(b, nr)
       lam = w_debug[:, nr * nr + 3 * nr : nr * nr + 4 * nr].reshape(b, nr)
+      lo = w_debug[:, nr * nr + 4 * nr : nr * nr + 5 * nr].reshape(b, nr)
+      hi = w_debug[:, nr * nr + 5 * nr : nr * nr + 6 * nr].reshape(b, nr)
       J = w["workspace_J"][: b * nr * nv].reshape(b, nr, nv)
       result.update({
           "J": J,
@@ -1563,6 +1646,8 @@ class MetalCoupledConstraints:
           "ar": ar,
           "rhs": rhs,
           "lambda": lam,
+          "lo": lo,
+          "hi": hi,
       })
 
     if nc > 0:
