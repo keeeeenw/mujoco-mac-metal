@@ -43,6 +43,35 @@ _DEVICE_ARRAYS = (
 )
 
 
+def validate_pose_dict(model, poses, batch, device, torch):
+  """Validate the full device pose ABI consumed by native smooth stages."""
+  if not isinstance(poses, dict):
+    raise TypeError("poses must be a position-stage pose dictionary")
+  shapes = {
+      "body_pos": (batch, model.nbody, 3),
+      "body_quat": (batch, model.nbody, 4),
+      "geom_pos": (batch, model.ngeom, 3),
+      "geom_quat": (batch, model.ngeom, 4),
+      "site_pos": (batch, model.nsite, 3),
+      "site_quat": (batch, model.nsite, 4),
+      "inertial_pos": (batch, model.nbody, 3),
+      "inertial_quat": (batch, model.nbody, 4),
+      "joint_anchor": (batch, model.njnt, 3),
+      "joint_axis": (batch, model.njnt, 3),
+  }
+  if set(poses) != set(shapes):
+    raise ValueError("poses must contain the complete position-stage ABI")
+  for name, shape in shapes.items():
+    value = poses[name]
+    if (not isinstance(value, torch.Tensor) or tuple(value.shape) != shape or
+        value.dtype != torch.float32 or not value.is_contiguous() or
+        value.device.type != device.type or
+        (device.index is not None and value.device.index != device.index)):
+      raise ValueError(f"poses.{name} has an invalid shape, dtype, layout, or device")
+    if not bool(torch.isfinite(value).all()):
+      raise ValueError(f"poses.{name} contains nonfinite values")
+
+
 class MetalSmoothDynamics:
   """Batched native MPS smooth inertial dynamics stage.
 
@@ -134,7 +163,7 @@ class MetalSmoothDynamics:
         ),
     }
 
-  def run_device(self, qpos, qvel, mocap_pos=None, mocap_quat=None):
+  def run_device(self, qpos, qvel, mocap_pos=None, mocap_quat=None, poses=None):
     """Compute M(q) and bias from borrowed MPS float32 state tensors.
 
     Inputs are trusted to be finite and have finite nonzero free/ball
@@ -166,9 +195,15 @@ class MetalSmoothDynamics:
           "call prepare_workspace(batch_size) before using this batch size"
       )
 
-    # The kernel only reads qpos/qvel, so flattening is a view. For nv=0 the
-    # unused argument gets valid dummy storage for MSL's non-null ABI.
-    poses = self._fk.run_device(qpos, mocap_pos, mocap_quat)
+    # The split-stage API may pass a position-stage result. Validate that
+    # complete borrowed pose ABI and consume it directly; do not recompute FK
+    # (which can overwrite the caller's position-stage workspace).
+    if poses is None:
+      poses = self._fk.run_device(qpos, mocap_pos, mocap_quat)
+    else:
+      if mocap_pos is not None or mocap_quat is not None:
+        raise ValueError("mocap inputs cannot accompany supplied poses")
+      validate_pose_dict(self.model, poses, batch, self._fk._device, torch)
     w, arrays = self._workspace, self._arrays
     qvel_flat = qvel.reshape(-1) if self.model.nv else w["qvel"]
     args = [
