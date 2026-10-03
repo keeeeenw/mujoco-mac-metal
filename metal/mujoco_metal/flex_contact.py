@@ -17,14 +17,13 @@ import numpy as np
 _PLANE = int(mujoco.mjtGeom.mjGEOM_PLANE)
 _ELLIPTIC = int(mujoco.mjtCone.mjCONE_ELLIPTIC)
 _DISABLE_CONTACT = int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+_DISABLE_CONSTRAINT = int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+_ENABLE_OVERRIDE = int(mujoco.mjtEnableBit.mjENBL_OVERRIDE)
 _SHADER = Path(__file__).parent / "shaders" / "flex_contact.metal"
 
 _KIND_PLANE_VERTEX = 0
-_KIND_GEOM_VERTEX = 1
 _KIND_GEOM_ELEMENT = 2
 _KIND_INTERNAL_VERTEX_ELEMENT = 3
-_KIND_ELEMENT_PAIR_VERTEX = 4
-_KIND_ELEMENT_PAIR_EDGE = 5
 _KIND_ELEMENT_PAIR = 6
 
 
@@ -80,6 +79,13 @@ def _row_span(condim, cone):
   return 2 * (condim - 1)
 
 
+def _assigned_margin(model, source):
+  """Match the pinned ``mj_assignMargin`` override behavior."""
+  if int(model.opt.enableflags) & _ENABLE_OVERRIDE:
+    return float(model.opt.o_margin)
+  return float(source)
+
+
 def _active_elements(model, flex_id, elements):
   """Return element IDs admitted by pinned ``mj_isElemActive`` semantics."""
   if int(model.flex_dim[flex_id]) < 3:
@@ -99,6 +105,12 @@ def _shares_body(model, vertices1, vertices2):
   if not bodies1:
     return False
   return any(int(body[int(v)]) in bodies1 for v in vertices2)
+
+
+def _bitmasks_collide(contype1, conaffinity1, contype2, conaffinity2):
+  """Opposite of pinned ``filterBitmask``: either directed bit matches."""
+  return bool((int(contype1) & int(conaffinity2))
+              or (int(contype2) & int(conaffinity1)))
 
 
 @dataclass(frozen=True)
@@ -171,6 +183,11 @@ def lower_flex_contacts(model):
              for e in range(en)]
 
     for g in range(int(model.ngeom)):
+      body = int(model.geom_bodyid[g])
+      if not _bitmasks_collide(
+          model.body_contype[body], model.body_conaffinity[body],
+          fmask, famask):
+        continue
       if not ((int(model.geom_contype[g]) & famask)
               or (fmask & int(model.geom_conaffinity[g]))):
         continue
@@ -181,7 +198,8 @@ def lower_flex_contacts(model):
           int(mujoco.mjtCone.mjCONE_PYRAMIDAL)):
         raise ValueError("flex friction contacts require a recognized cone")
       span = _row_span(condim, cone)
-      margin = float(model.geom_margin[g]) + float(model.flex_margin[f])
+      margin = _assigned_margin(
+          model, float(model.geom_margin[g]) + float(model.flex_margin[f]))
       gap = float(model.geom_gap[g]) + float(model.flex_gap[f])
       gtype = int(model.geom_type[g])
       if gtype == _PLANE:
@@ -199,7 +217,7 @@ def lower_flex_contacts(model):
             and int(model.flex_dim[f]) != 2):
           continue
         geom_body = int(model.geom_bodyid[g])
-        for e in active_elements:
+        for e in range(en):
           vertices = elems[e]
           if geom_body >= 0 and np.any(vert_body[vertices] == geom_body):
             continue
@@ -220,20 +238,19 @@ def lower_flex_contacts(model):
           model, ("flex", f), ("flex", f))
       span = _row_span(condim, cone)
       for element, vertex in evpair[pairadr:pairadr + pairnum]:
-        if (0 <= element < len(elems) and va <= vertex < va + vn
-            and int(element) in active_elements):
+        if 0 <= element < len(elems) and va <= vertex < va + vn:
           nodes = np.full(4, -1, np.int32)
-          face = [int(v) for v in elems[int(element)] if int(v) != int(vertex)]
-          nodes[:3] = face[:3]
+          # mj_collideElemVert treats the element as a complete capsule,
+          # triangle, or tetrahedron; the point is the separate feature.
+          nodes[:nper] = elems[int(element)]
           rows.append((_KIND_INTERNAL_VERTEX_ELEMENT, f, int(element),
                        -1, f, int(element), int(vertex), -1,
                        nodes, np.full(4, -1, np.int32), condim, span,
-                       friction, solref, solimp, float(model.flex_margin[f]),
-                       float(model.flex_gap[f]), -1, -1))
+                       friction, solref, solimp, 0.0, 0.0, -1, -1))
       if int(model.flex_dim[f]) == 3:
         # The pinned tetrahedral internal pass tests each opposite vertex
         # against the other three vertices of that tetrahedron.
-        for element in active_elements:
+        for element in range(en):
           vertices = elems[element]
           for opposite, vertex in enumerate(vertices):
             nodes = np.full(4, -1, np.int32)
@@ -241,8 +258,7 @@ def lower_flex_contacts(model):
             rows.append((_KIND_INTERNAL_VERTEX_ELEMENT, f, element, -1,
                          f, element, int(vertex), -1, nodes,
                          np.full(4, -1, np.int32), 1, 1, friction, solref,
-                         solimp, float(model.flex_margin[f]),
-                         float(model.flex_gap[f]), opposite, -1))
+                         solimp, 0.0, 0.0, opposite, -1))
 
     # Self-collision candidates retain one complete convex pair per element
     # pair. Narrowphase feature selection belongs to the support algorithm,
@@ -265,17 +281,12 @@ def lower_flex_contacts(model):
           rows.append((_KIND_ELEMENT_PAIR, f, e1, -1,
                        f, e2, -1, -1, nodes1, nodes2,
                        condim, span, friction, solref, solimp,
-                       float(model.flex_margin[f]), float(model.flex_gap[f]),
-                       -1, -1))
+                       0.0, 0.0, -1, -1))
 
   # Cross-flex element features. The opposite bitmask test is the same one
   # used by the pinned body:flex broadphase.
   for f1 in range(int(model.nflex)):
-    if bool(model.flex_rigid[f1]):
-      continue
     for f2 in range(f1 + 1, int(model.nflex)):
-      if bool(model.flex_rigid[f2]):
-        continue
       if not ((int(model.flex_contype[f1]) & int(model.flex_conaffinity[f2]))
               or (int(model.flex_contype[f2]) & int(model.flex_conaffinity[f1]))):
         continue
@@ -286,14 +297,12 @@ def lower_flex_contacts(model):
       va1, va2 = int(model.flex_vertadr[f1]), int(model.flex_vertadr[f2])
       elems1 = [flex_elem[d1 + e*n1:d1 + (e+1)*n1] + va1 for e in range(e1n)]
       elems2 = [flex_elem[d2 + e*n2:d2 + (e+1)*n2] + va2 for e in range(e2n)]
-      active1 = tuple(_active_elements(model, f1, e1n))
-      active2 = tuple(_active_elements(model, f2, e2n))
       condim, solref, solimp, friction = _contact_parameters(
           model, ("flex", f1), ("flex", f2))
       span = _row_span(condim, cone)
-      for e1 in active1:
+      for e1 in range(e1n):
         verts1 = elems1[e1]
-        for e2 in active2:
+        for e2 in range(e2n):
           verts2 = elems2[e2]
           if _shares_body(model, verts1, verts2):
             continue
@@ -302,13 +311,15 @@ def lower_flex_contacts(model):
           nodes1[:n1], nodes2[:n2] = verts1, verts2
           rows.append((_KIND_ELEMENT_PAIR, f1, e1, -1, f2, e2, -1, -1,
                        nodes1, nodes2, condim, span, friction, solref, solimp,
-                       float(model.flex_margin[f1] + model.flex_margin[f2]),
+                       _assigned_margin(
+                           model, float(model.flex_margin[f1]
+                                        + model.flex_margin[f2])),
                        float(model.flex_gap[f1] + model.flex_gap[f2]), -1, -1))
 
   count = len(rows)
   kinds = np.asarray([r[0] for r in rows], np.int32)
   row_span = np.asarray([r[11] for r in rows], np.int32)
-  row_start = np.cumsum(np.r_[0, row_span[:-1]], dtype=np.int32)
+  row_start = np.cumsum(row_span, dtype=np.int32) - row_span
   def col(index, dtype=np.int32):
     return _frozen([r[index] for r in rows], dtype)
   # Wake-link expansion is static and duplicate-free. Every emitted edge is
@@ -370,7 +381,8 @@ def lower_flex_contacts(model):
       margin=_frozen([r[15] for r in rows], np.float32),
       gap=_frozen([r[16] for r in rows], np.float32),
       feature_capacity=count, row_capacity=int(row_span.sum()), nv=int(model.nv),
-      global_enabled=not bool(int(model.opt.disableflags) & _DISABLE_CONTACT),
+      global_enabled=not bool(int(model.opt.disableflags)
+                              & (_DISABLE_CONTACT | _DISABLE_CONSTRAINT)),
       link_tree_pairs=_frozen(link_pairs, np.int32).reshape(-1, 2),
       candidate_link_ids=_frozen(candidate_link_ids, np.int32),
       max_links_per_candidate=max_links,
@@ -531,8 +543,10 @@ class FlexContactProgram:
     active = contact_result.get("active")
     if (not isinstance(active, torch.Tensor)
         or tuple(active.shape) != (self.batch_size, self.descriptor.slot_count)
-        or active.device.type != "mps"):
-      raise ValueError("contact_result active mask must be an MPS [batch, slots] tensor")
+        or active.dtype != torch.bool or active.device.type != "mps"
+        or not active.is_contiguous()):
+      raise ValueError(
+          "contact_result active mask must be contiguous MPS bool [batch, slots]")
     links = self._active_links if out_links is None else out_links
     overflow = (self._active_link_overflow if out_overflow is None
                 else out_overflow)
