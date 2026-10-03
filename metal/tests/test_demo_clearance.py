@@ -15,6 +15,8 @@ def test_gripper_schedule_clears_furniture_and_delivers_both_balls(monkeypatch):
   monkeypatch.syspath_prepend(str(EXAMPLES))
   result = importlib.import_module("muscle_gripper").run(mode="cpu", check=True)
   assert min(result["minimum_geometry_distance"].values()) >= -1e-5
+  assert min(result["conservative_geometry_distance_lower_bound"].values()) >= -6e-4
+  assert max(result["geometry_distance_uncertainty_bound"].values()) <= 5e-4 + 1e-10
   x, z = result["released_ball"]
   assert 0.45 < x < 0.75 and 0.12 < z < 0.15
   x, z = result["block_rel"]

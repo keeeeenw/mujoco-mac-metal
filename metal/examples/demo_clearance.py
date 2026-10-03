@@ -113,29 +113,33 @@ class ClearanceMonitor:
 
   Uses separate CPU MjData objects for geometry queries only; this never
   advances or changes the native simulation. Two pair classes:
-  - clearance pairs must stay separated (min distance >= -allowed);
+  - clearance pairs must stay separated (minimum evaluated distance >= -allowed);
   - contact pairs are intentional mechanical joints or functional grasp
     contacts; their worst penetration is recorded for the report instead
     of failing (compliant contact legitimately penetrates ~mm with the
     demo solref settings).
+
+  Measurement fields are deliberately split. ``minimum`` is the minimum
+  unnudged geometry distance actually evaluated at the requested trajectory
+  poses (with an OBB SAT correction for the known exact-zero box overlap
+  degeneracy). ``reported`` is a conservative lower bound formed from nearby
+  nudged evaluations and analytic slab bounds. ``uncertainty`` is the maximum
+  translation radius used to form the nudge ensemble (0.5 mm); it is not a
+  difference between the raw query and the analytic slab bound. A lower bound
+  is not an actual distance observation and must never be reported as one.
 
   Robustness: MuJoCo box-box GJK collapses to exactly 0.0 on face-to-face
   parallel-overlap configurations (our axis-aligned furniture/gantry hits
   this across mm-scale basins; witness points come back outside both boxes
   while truly separated by ~0.2 m). Penetration queries still return honest
   negatives (verified: exact from +-0.1 mm gaps through -0.05 m on 20 mm
-  overlaps, plus an in-scene -8.4 mm jaw catch during development), so the
-  overlap gate tracks the BASE GJK reading only: real overlap reads
-  negative and fails, and a false-0 can never mask it. Reported minima take
-  max(slab lower bound, ensemble max - bound): the analytic AABB-slab gap
-  PROVES far-field separation with no GJK involvement, while the nudge
-  ensemble (translations breaking the parallel overlap) recovers near-field
-  values; truly touching pairs still report ~0. Exactly coincident volumes
-  (GJK reads 0.0 instead of a negative depth) fall back to analytic
-  box-box SAT (R09): real overlap records a negative depth and fails, while
-  touching/near pairs are unaffected. Demo scenes never place distinct
-  bodies exactly coincident, and the fallback is covered by negative
-  controls in test_demo_fixes.py.
+  overlaps, plus an in-scene -8.4 mm jaw catch during development). Overlap
+  checks use the unnudged reading, with analytic box-box SAT for exact-zero
+  ambiguity, so a nearby pose can neither invent an overlap nor hide one.
+  The lower-bound estimate uses max(ensemble readings) - nudge radius; a
+  positive analytic AABB slab gap can strengthen it. Exactly coincident
+  box volumes use SAT to distinguish overlap from touch. Negative controls
+  exercise these cases in test_demo_fixes.py.
   """
 
   # Reporting ensemble (nudge triplets on mocap xyz when present, else on
@@ -152,6 +156,7 @@ class ClearanceMonitor:
     self.contacts = []
     self.minimum = {}
     self.reported = {}
+    self.uncertainty = {}
     self.max_pen = {}
     for first, second in clearance_pairs:
       ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
@@ -162,6 +167,7 @@ class ClearanceMonitor:
       self.clearance.append((key, *ids))
       self.minimum[key] = 1.0
       self.reported[key] = 1.0
+      self.uncertainty[key] = 0.0
     for first, second in contact_pairs:
       ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
              for name in (first, second)]
@@ -196,7 +202,9 @@ class ClearanceMonitor:
       reads = [float(mujoco.mj_geomDistance(self.model, d, first, second,
                                             1.0, None))
                for d in states]
-      # Gate: base reading only (see class doc).
+      # This is the strict evaluated distance at the requested pose. Nudge
+      # results below are a separate uncertainty calculation, not geometry
+      # observations for the simulated pose.
       base = reads[0]
       # R09 coincidence control: an exactly-zero base reading with
       # intersecting AABBs is ambiguous (touching vs collapsed-GJK overlap),
@@ -208,10 +216,16 @@ class ClearanceMonitor:
           base = -sat
       self.minimum[key] = min(self.minimum[key], base)
       slab = _slab_gap(self.model, states[0], first, second)
-      honest = max(reads) - bound
+      lower_bound = max(reads) - bound
       if slab is not None and slab > 0.0:
-        honest = max(honest, slab)
-      self.reported[key] = min(self.reported[key], honest)
+        lower_bound = max(lower_bound, slab)
+      # A measured nonpositive distance is stronger than an optimistic bound
+      # from a nearby pose. In particular, shallow overlaps must remain
+      # visible even when a nudge separates the pair.
+      if base < 0.0 or (base == 0.0 and not (slab is not None and slab > 0.0)):
+        lower_bound = min(lower_bound, base)
+      self.reported[key] = min(self.reported[key], lower_bound)
+      self.uncertainty[key] = max(self.uncertainty[key], bound)
     for key, first, second in self.contacts:
       # Base reading: penetration depth comes from the EPA path, verified
       # honest from +-0.1 mm through -0.05 m; the GJK false-0 affects

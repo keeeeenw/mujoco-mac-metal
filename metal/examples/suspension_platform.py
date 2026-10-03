@@ -207,7 +207,9 @@ def run(steps=1200, mode="metal", check=False, record=None):
       "swing": swing,
       "level": level,
       "steps": steps,
-      "minimum_geometry_distance": clearance.reported,
+      "minimum_geometry_distance": clearance.minimum,
+      "conservative_geometry_distance_lower_bound": clearance.reported,
+      "geometry_distance_uncertainty_bound": clearance.uncertainty,
   }
   if check:
     clearance.check()

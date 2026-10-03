@@ -236,7 +236,9 @@ def run(steps=1200, mode="metal", check=False, record=None, release_step=RELEASE
       "released_payload_z": released_payload_z, "latched_payload_z": latched_payload_z,
       "release_step": release_step, "steps": steps,
       "support_contact_steps_cpu": support_contacts,
-      "minimum_geometry_distance": clearance.reported,
+      "minimum_geometry_distance": clearance.minimum,
+      "conservative_geometry_distance_lower_bound": clearance.reported,
+      "geometry_distance_uncertainty_bound": clearance.uncertainty,
   }
   if check:
     # Impact contact is compliant; reject gross overlap through the stop.
