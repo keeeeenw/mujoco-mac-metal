@@ -74,17 +74,30 @@ kernel void forward_kinematics(
     device float* joint_anchor [[buffer(27)]],
     device float* joint_axis [[buffer(28)]],
     device const int* body_mocapid [[buffer(29)]],
-    device const float* mocap_pose [[buffer(30)]],
+    device float* auxiliary [[buffer(30)]],
     uint world [[thread_position_in_grid]]) {
   uint nq = dims[0], nbody = dims[1], njnt = dims[2];
   uint ngeom = dims[3], nsite = dims[4], batch = dims[5];
   uint nmocap = dims[6];
+  uint ntree = dims[7];
   if (world >= batch) return;
+  uint mocap_values = nmocap ? batch*nmocap*7 : 1;
+  uint tree_offset = mocap_values;
+  uint awake_offset = tree_offset+nbody;
+  uint valid_offset = awake_offset+batch*max(ntree, 1u);
+  bool cached = auxiliary[valid_offset+world] != 0.0f;
+  uint tree_stride = max(ntree, 1u);
   uint qbase = world*nq;
   uint posebase = world*nbody;
   store3(xpos, posebase*3, float3(0));
   store4(xquat, posebase*4, float4(1, 0, 0, 0));
   for (uint b=1; b<nbody; ++b) {
+    int tree = int(auxiliary[tree_offset+b]);
+    if (cached && tree >= 0 && auxiliary[awake_offset+world*tree_stride+uint(tree)] == 0.0f) {
+      // A sleeping tree keeps its last validated pose. Descendant trees may
+      // still be awake and consume this cached parent transform.
+      continue;
+    }
     uint p = uint(parent[b]);
     float3 pos = load3(xpos, (posebase+p)*3) +
                  qrot(load4(xquat, (posebase+p)*4), load3(body_pos, b*3));
@@ -97,8 +110,8 @@ kernel void forward_kinematics(
       // Layout: all positions [batch, nmocap, 3] then all quaternions.
       uint nm = max(nmocap, 1u);
       uint mbase = world*nm + uint(mid);
-      float3 mpos = load3(mocap_pose, mbase*3);
-      float4 mquat = qnorm(load4(mocap_pose, batch*nm*3 + mbase*4));
+      float3 mpos = load3(auxiliary, mbase*3);
+      float4 mquat = qnorm(load4(auxiliary, batch*nm*3 + mbase*4));
       pos = load3(xpos, (posebase+p)*3) + qrot(load4(xquat, (posebase+p)*4), mpos);
       quat = qnorm(qmul(load4(xquat, (posebase+p)*4), mquat));
     }
@@ -131,6 +144,8 @@ kernel void forward_kinematics(
   }
   for (uint g=0; g<ngeom; ++g) {
     uint b = uint(geom_bodyid[g]);
+    int tree = int(auxiliary[tree_offset+b]);
+    if (cached && tree >= 0 && auxiliary[awake_offset+world*tree_stride+uint(tree)] == 0.0f) continue;
     float4 bq = load4(xquat, (posebase+b)*4);
     store3(geom_xpos, (world*ngeom+g)*3,
            load3(xpos, (posebase+b)*3)+qrot(bq, load3(geom_pos, g*3)));
@@ -139,6 +154,8 @@ kernel void forward_kinematics(
   }
   for (uint s=0; s<nsite; ++s) {
     uint b = uint(site_bodyid[s]);
+    int tree = int(auxiliary[tree_offset+b]);
+    if (cached && tree >= 0 && auxiliary[awake_offset+world*tree_stride+uint(tree)] == 0.0f) continue;
     float4 bq = load4(xquat, (posebase+b)*4);
     store3(site_xpos, (world*nsite+s)*3,
            load3(xpos, (posebase+b)*3)+qrot(bq, load3(site_pos, s*3)));
@@ -146,10 +163,13 @@ kernel void forward_kinematics(
            qmul(bq, load4(site_quat, s*4)));
   }
   for (uint b=0; b<nbody; ++b) {
+    int tree = int(auxiliary[tree_offset+b]);
+    if (cached && tree >= 0 && auxiliary[awake_offset+world*tree_stride+uint(tree)] == 0.0f) continue;
     float4 bq = load4(xquat, (posebase+b)*4);
     store3(inertial_xpos, (posebase+b)*3,
            load3(xpos, (posebase+b)*3)+qrot(bq, load3(body_ipos, b*3)));
     store4(inertial_xquat, (posebase+b)*4,
            qmul(bq, load4(body_iquat, b*4)));
   }
+  auxiliary[valid_offset+world] = 1.0f;
 }

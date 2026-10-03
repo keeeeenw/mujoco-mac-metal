@@ -57,6 +57,43 @@ def test_batched_native_fk_matches_cpu_oracle():
       np.testing.assert_allclose(tensor, reference[key], rtol=2e-5, atol=2e-6)
 
 
+@pytest.mark.skipif(
+    os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
+    reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
+)
+def test_sleeping_fk_reuses_valid_tree_poses_and_invalidates_selected_rows():
+  import torch
+
+  descriptor = load_model("""<mujoco><worldbody>
+    <body pos="0 0 0"><joint type="slide" axis="1 0 0"/>
+      <geom type="sphere" size=".1"/></body>
+    <body pos="2 0 0"><joint type="slide" axis="1 0 0"/>
+      <geom type="sphere" size=".1"/></body>
+  </worldbody></mujoco>""")
+  assert descriptor.body_treeid.tolist() == [-1, 0, 1]
+  fk = MetalKinematics(descriptor, batch_size=2)
+  qpos = torch.zeros((2, descriptor.nq), dtype=torch.float32, device="mps")
+  full = fk.run_device(qpos)
+  np.testing.assert_allclose(full["body_pos"][:, 1, 0].cpu().numpy(), [0, 0])
+  np.testing.assert_allclose(full["body_pos"][:, 2, 0].cpu().numpy(), [2, 2])
+
+  qpos[:, 0] = torch.tensor([0.25, 0.35], device="mps")
+  qpos[:, 1] = torch.tensor([0.5, 0.6], device="mps")
+  awake = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32, device="mps")
+  partial = fk.run_device(qpos, tree_awake=awake)
+  # The asleep tree keeps its validated old body and geom poses, while the
+  # awake independent tree follows the current qpos.
+  np.testing.assert_allclose(partial["body_pos"][:, 1, 0].cpu().numpy(), [0, 0])
+  np.testing.assert_allclose(partial["geom_pos"][:, 1, 0].cpu().numpy(), [2.5, 2.6])
+
+  fk.invalidate_cache([0])
+  qpos[0, 0] = 0.75
+  qpos[0, 1] = 0.8
+  refreshed = fk.run_device(qpos, tree_awake=awake)
+  np.testing.assert_allclose(refreshed["body_pos"][:, 1, 0].cpu().numpy(), [0.75, 0])
+  np.testing.assert_allclose(refreshed["geom_pos"][:, 1, 0].cpu().numpy(), [2.8, 2.6])
+
+
 def test_gpu_fixture_compiles_on_cpu():
   mujoco.MjModel.from_xml_string(_MIXED_XML)
 

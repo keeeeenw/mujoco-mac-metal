@@ -191,6 +191,7 @@ class ModelDescriptor:
   gravity: np.ndarray
   disableflags: int
   body_parentid: np.ndarray
+  body_treeid: np.ndarray
   body_jntadr: np.ndarray
   body_jntnum: np.ndarray
   body_mocapid: np.ndarray
@@ -391,6 +392,7 @@ def _validate_lowered(counts, values):
       "dof_jntid": (nv,),
       "body_jntadr": (nb,),
       "body_jntnum": (nb,),
+      "body_treeid": (nb,),
       "body_mocapid": (nb,),
       "body_pos": (nb, 3),
       "body_quat": (nb, 4),
@@ -605,6 +607,7 @@ def load_model(source):
       "dof_jntid",
       "gravity",
       "body_parentid",
+      "body_treeid",
       "body_jntadr",
       "body_jntnum",
       "body_mocapid",

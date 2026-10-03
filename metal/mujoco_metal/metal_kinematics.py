@@ -69,6 +69,7 @@ def _prepare_host_arrays(model: ModelDescriptor):
       "dof_jntid",
       "gravity",
       "body_parentid",
+      "body_treeid",
       "body_jntadr",
       "body_jntnum",
       "body_mocapid",
@@ -240,10 +241,45 @@ class MetalKinematics:
         max(batch_size * m.nq, 1), dtype=torch.float32, device=self._device
     )
     outputs["dims"] = torch.tensor(
-        [m.nq, m.nbody, m.njnt, m.ngeom, m.nsite, batch_size, m.nmocap],
+        [m.nq, m.nbody, m.njnt, m.ngeom, m.nsite, batch_size, m.nmocap,
+         int(np.max(np.asarray(m.body_treeid), initial=-1)) + 1],
         dtype=torch.int32, device=self._device,
     )
+    ntree = int(np.max(np.asarray(m.body_treeid), initial=-1)) + 1
+    mocap_values = (batch_size * int(m.nmocap) * 7
+                    if int(m.nmocap) else 1)
+    tree_offset = mocap_values
+    awake_offset = tree_offset + int(m.nbody)
+    valid_offset = awake_offset + batch_size * max(ntree, 1)
+    outputs["auxiliary"] = torch.zeros(
+        valid_offset + batch_size, dtype=torch.float32, device=self._device)
+    if int(m.nbody):
+      outputs["auxiliary"][tree_offset:awake_offset].copy_(
+          torch.as_tensor(np.asarray(m.body_treeid, dtype=np.float32).copy(),
+                          dtype=torch.float32, device=self._device))
+    outputs["tree_awake"] = torch.ones(
+        (batch_size, max(ntree, 1)), dtype=torch.int32, device=self._device)
+    outputs["cache_valid"] = outputs["auxiliary"][valid_offset:valid_offset + batch_size]
+    outputs["ntree"] = ntree
     self._workspace = {"batch_size": batch_size, "outputs": outputs}
+
+  def invalidate_cache(self, env_ids=None):
+    """Invalidate cached world poses after externally supplied state changes.
+
+    ``env_ids`` may be a host sequence of batch rows. The operation changes
+    only a device validity flag; it never reads device data back to the host.
+    """
+    if self._workspace is None:
+      return
+    valid = self._workspace["outputs"]["cache_valid"]
+    if env_ids is None:
+      valid.zero_()
+    else:
+      rows = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+      if rows.size and (rows.min() < 0 or rows.max() >= valid.numel()):
+        raise ValueError("env_ids contain a row outside the FK workspace")
+      if rows.size:
+        valid[rows.tolist()] = 0
 
   @staticmethod
   def _check_device_tensor(value, name, shape, torch, device):
@@ -259,7 +295,7 @@ class MetalKinematics:
     if not value.is_contiguous():
       raise ValueError(f"{name} must be contiguous")
 
-  def run_device(self, qpos, mocap_pos=None, mocap_quat=None):
+  def run_device(self, qpos, mocap_pos=None, mocap_quat=None, *, tree_awake=None):
     """Run FK from a contiguous MPS float32 state without host readback.
 
     State values are trusted to be finite; free/ball quaternions must be
@@ -286,7 +322,6 @@ class MetalKinematics:
     if nmocap == 0:
       if mocap_pos is not None or mocap_quat is not None:
         raise ValueError("model has no mocap bodies")
-      mocap_flat = torch.zeros(1, dtype=torch.float32, device=self._device)
     else:
       if mocap_pos is None or mocap_quat is None:
         raise ValueError(
@@ -298,15 +333,41 @@ class MetalKinematics:
       self._check_device_tensor(
           mocap_quat, "mocap_quat", (batch, nmocap, 4), torch, self._device
       )
-      mocap_flat = torch.cat(
-          (mocap_pos.reshape(-1), mocap_quat.reshape(-1)), dim=0
-      )
     workspace = self._workspace
     if workspace is None or workspace["batch_size"] != batch:
       raise ValueError(
           "call prepare_workspace(batch_size) before using this batch size"
       )
     out = workspace["outputs"]
+    auxiliary = out["auxiliary"]
+    mocap_values = batch * nmocap * 7 if nmocap else 1
+    if nmocap:
+      auxiliary[:batch * nmocap * 3].copy_(mocap_pos.reshape(-1))
+      auxiliary[batch * nmocap * 3:mocap_values].copy_(mocap_quat.reshape(-1))
+    else:
+      auxiliary[0] = 0.0
+    ntree = out["ntree"]
+    if tree_awake is None:
+      # The public default remains a complete FK evaluation. Simulation passes
+      # its authoritative device scheduler mask when sleep is enabled.
+      awake = out["tree_awake"]
+      awake.fill_(1)
+    else:
+      # DeviceSleepScheduler owns int32 state, while the FK auxiliary ABI is
+      # float32. Accept its native mask directly and cast during the copy into
+      # the preallocated auxiliary buffer; do not allocate a per-stage cast.
+      if not isinstance(tree_awake, torch.Tensor):
+        raise TypeError("tree_awake must be a torch.Tensor")
+      if tree_awake.device.type != self._device.type:
+        raise ValueError(f"tree_awake must be on {self._device}")
+      if tree_awake.dtype not in (torch.int32, torch.float32):
+        raise ValueError("tree_awake must have dtype torch.int32 or torch.float32")
+      if tuple(tree_awake.shape) != (batch, max(ntree, 1)):
+        raise ValueError(
+            f"tree_awake must have shape {(batch, max(ntree, 1))}")
+      if not tree_awake.is_contiguous():
+        raise ValueError("tree_awake must be contiguous")
+      awake = tree_awake
     # A reshape is a device view. For nq=0, the kernel reads the dummy element;
     # this copy keeps the ABI buffer valid without allocating CPU state.
     if self.model.nq:
@@ -334,7 +395,12 @@ class MetalKinematics:
         out["inertial_quat"],
     ])
     args.extend([out["dims"], out["joint_anchor"], out["joint_axis"]])
-    args.extend([self._arrays["body_mocapid"], mocap_flat])
+    tree_offset = mocap_values
+    awake_offset = tree_offset + int(self.model.nbody)
+    awake_count = batch * max(ntree, 1)
+    auxiliary[awake_offset:awake_offset + awake_count].copy_(
+        awake.reshape(-1))
+    args.extend([self._arrays["body_mocapid"], auxiliary])
     self._kernel(*args, threads=(batch,), group_size=(1,))
     result = {}
     for kind, count in (
