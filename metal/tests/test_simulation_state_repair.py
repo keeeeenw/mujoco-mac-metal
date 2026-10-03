@@ -602,8 +602,8 @@ def test_first_step_failure_nan_inf_sensor_rollback_and_all_failed_omission_gpu(
   # Patch _acceleration to inject failure + NaN/Inf in World 0, healthy World 1
   orig_accel = sim._acceleration
   step_idx = [0]
-  def patched_accel(qpos, qvel):
-    acc, status, dyn = orig_accel(qpos, qvel)
+  def patched_accel(qpos, qvel, act_override=None):
+    acc, status, dyn = orig_accel(qpos, qvel, act_override=act_override)
     if step_idx[0] == 0:
       # World 0 fails with status 1
       status = status.clone()
@@ -637,8 +637,8 @@ def test_first_step_failure_nan_inf_sensor_rollback_and_all_failed_omission_gpu(
   # All-failed step: both worlds fail
   pre_accepted = sim.accepted_step
   pre_gen = sim.state.generation
-  def all_fail_accel(qpos, qvel):
-    acc, status, dyn = orig_accel(qpos, qvel)
+  def all_fail_accel(qpos, qvel, act_override=None):
+    acc, status, dyn = orig_accel(qpos, qvel, act_override=act_override)
     status = torch.ones_like(status)  # all fail
     return acc, status, dyn
   sim._acceleration = all_fail_accel

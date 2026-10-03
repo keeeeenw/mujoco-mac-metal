@@ -151,13 +151,15 @@ def _plinko_model(n_friction=16, n_free=9):
 
 
 def test_raised_ceilings_admit_beyond_old_caps_cpu():
-  # R08/F2: 25 pairs / 25 slots exceed the old 16/24 ceilings with rows in
+  # R08/F2: 26 pairs / 26 slots exceed the old 16/24 ceilings with rows in
   # budget; beyond the new ceilings still overflows before allocating.
+  # (The demo XML sets the floor decorative for 25; here default masks
+  # keep the ball/floor pair.)
   from mujoco_metal.coupled_constraints import lower_coupled_constraints
   m = _plinko_model()
   desc = lower_coupled_constraints(m)
-  assert desc.npairs == 25, desc.npairs
-  assert desc.ncontacts_max == 25, desc.ncontacts_max
+  assert desc.npairs == 26, desc.npairs
+  assert desc.ncontacts_max == 26, desc.ncontacts_max
   assert desc.nr <= 96, desc.nr
   assert desc.npairs > 16 and desc.ncontacts_max > 24
   m2 = _plinko_model(n_friction=24, n_free=12)
