@@ -48,6 +48,7 @@ _CAPSULE = int(mujoco.mjtGeom.mjGEOM_CAPSULE)
 _BOX = int(mujoco.mjtGeom.mjGEOM_BOX)
 _ELLIPSOID = int(mujoco.mjtGeom.mjGEOM_ELLIPSOID)
 _CYLINDER = int(mujoco.mjtGeom.mjGEOM_CYLINDER)
+_MESH = int(mujoco.mjtGeom.mjGEOM_MESH)
 _HINGE = int(mujoco.mjtJoint.mjJNT_HINGE)
 _SLIDE = int(mujoco.mjtJoint.mjJNT_SLIDE)
 _BALL = int(mujoco.mjtJoint.mjJNT_BALL)
@@ -67,7 +68,54 @@ _EQ_ROWS = {
 
 _SUPPORTED_EQ_TYPES = (_EQ_JOINT, _EQ_TENDON, _EQ_CONNECT, _EQ_WELD)
 
-_SUPPORTED_GEOM_TYPES = (_PLANE, _SPHERE, _CAPSULE, _BOX, _ELLIPSOID, _CYLINDER)
+_SUPPORTED_GEOM_TYPES = (_PLANE, _SPHERE, _CAPSULE, _BOX, _ELLIPSOID, _CYLINDER, _MESH)
+
+# Milestone 011 convex-mesh bounds: per-geom hull verts and total hull store.
+# Metal caps kernel buffers at 31, so faces pack into the same float store
+# as the verts (indices-as-float are exact below 2^24): layout per model is
+# [hull verts (3V)] [face normals (3F)] [face indices (3F as float)] with one
+# 5-wide int descriptor per geom (hullOff, hullCnt, nrmOff, idxOff, faceCnt).
+_MESH_MAX_VERTS = 64
+_MESH_MAX_TOTAL = 256
+# Face-snap store: triangle indices + outward unit normals (geom-local).
+_MESH_MAX_FACES = 256
+_MESH_DATA_FLOATS = 3 * (_MESH_MAX_TOTAL + 2 * _MESH_MAX_FACES)
+
+
+def _rbound_with_mesh_hulls(model, extra):
+  import numpy as np
+  rb = np.asarray(model.geom_rbound, dtype=np.float32).reshape(int(model.ngeom)).copy()
+  for g, v in extra.items():
+    if not np.isfinite(rb[g]) or rb[g] < v:
+      rb[g] = np.float32(v)
+  return rb
+
+
+def mesh_hull_is_convex(model, meshid, tol=1e-6):
+  """Face-plane convexity check for a mesh asset (host preprocessing).
+
+  Every face plane must leave all hull vertices on its interior side. This
+  admits exactly the single-convex-piece assets the native vertex-support
+  path implements; concave assets stay rejected at lowering (documented).
+  """
+  import numpy as np
+  vadr = int(model.mesh_vertadr[meshid])
+  vnum = int(model.mesh_vertnum[meshid])
+  fadr = int(model.mesh_faceadr[meshid])
+  fnum = int(model.mesh_facenum[meshid])
+  verts = np.asarray(model.mesh_vert[vadr:vadr + vnum], dtype=np.float64)
+  faces = np.asarray(model.mesh_face[fadr:fadr + fnum])
+  for f in faces:
+    p0, p1, p2 = verts[int(f[0])], verts[int(f[1])], verts[int(f[2])]
+    n = np.cross(p1 - p0, p2 - p0)
+    nl = float(np.linalg.norm(n))
+    if nl < 1e-12:
+      continue
+    n = n / nl
+    if bool(np.all(n @ (verts - p0).T <= tol)):
+      continue
+    return False
+  return True
 
 
 def pair_max_contacts(t1: int, t2: int) -> int:
@@ -84,6 +132,11 @@ def pair_max_contacts(t1: int, t2: int) -> int:
     # Pinned rule: any pair involving a sphere or an ellipsoid yields one
     # contact (sphere/python sphere pairs and all ellipsoid pairs). Checked
     # before the multi-contact rules below, matching mj_maxContact order.
+    return 1
+  if _MESH in (t_min, t_max):
+    # Milestone 011: convex mesh pairs yield one native witness (support
+    # GJK/MPR single). Multi-contact mesh manifolds stay a documented
+    # restriction; the CPU oracle may emit face-manifold points.
     return 1
   if (t_min, t_max) in (
       (_PLANE, _CAPSULE),
@@ -203,6 +256,8 @@ class CoupledConstraintDescriptor:
   geom_size: np.ndarray
   geom_type: np.ndarray
   geom_rbound: np.ndarray
+  mesh_hull: np.ndarray
+  mesh_hull_info: np.ndarray
   body_parentid: np.ndarray
   body_jntadr: np.ndarray
   body_jntnum: np.ndarray
@@ -671,6 +726,71 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
 
   geom_size_mat = np.asarray(model.geom_size, dtype=np.float32).reshape(model.ngeom, 3)
 
+  # Milestone 011: convex-mesh hull store. Mesh geoms referenced by admitted
+  # pairs must be single-convex-piece assets with bounded vertex counts;
+  # hull verts are geom-local (world = geom frame composed with mesh_vert,
+  # calibrated against CPU contacts) and uploaded once per model.
+  mesh_used = sorted({g for pr in pairs for g in (pr[0], pr[1])
+                      if int(geoms[g]) == _MESH})
+  mesh_hull = np.zeros((_MESH_DATA_FLOATS,), dtype=np.float32)
+  mesh_hull_info = np.full((int(model.ngeom) * 5,), -1, dtype=np.int32)
+  mesh_rbound_extra = {}
+  cursor = 0
+  ncursor = 3 * _MESH_MAX_TOTAL
+  icursor = 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES)
+  for g in mesh_used:
+    mid = int(model.geom_dataid[g])
+    if mid < 0:
+      raise ValueError(f"mesh geom {g} has no asset")
+    vnum = int(model.mesh_vertnum[mid])
+    if vnum <= 0 or vnum > _MESH_MAX_VERTS:
+      raise ValueError(
+          f"mesh geom {g} has {vnum} verts; 011 supports 1..{_MESH_MAX_VERTS}")
+    if not mesh_hull_is_convex(model, mid):
+      raise ValueError(
+          f"mesh geom {g} is non-convex; 011 supports single-convex-piece "
+          "mesh assets only (concave collision stays rejected)")
+    if cursor + vnum > _MESH_MAX_TOTAL:
+      raise ValueError("total mesh hull verts exceed 011 capacity "
+                       f"{_MESH_MAX_TOTAL}")
+    vadr = int(model.mesh_vertadr[mid])
+    verts = np.asarray(model.mesh_vert[vadr:vadr + vnum], dtype=np.float32)
+    mesh_hull[3 * cursor:3 * (cursor + vnum)] = verts.reshape(-1)
+    mesh_hull_info[5 * g] = cursor
+    mesh_hull_info[5 * g + 1] = vnum
+    mesh_rbound_extra[g] = float(np.max(np.linalg.norm(verts, axis=1)))
+    cursor += vnum
+    # Face-snap data: outward normals from consistent winding (verified by
+    # the convexity check above: all verts satisfy every face plane).
+    fadr = int(model.mesh_faceadr[mid])
+    fnum = int(model.mesh_facenum[mid])
+    faces = np.asarray(model.mesh_face[fadr:fadr + fnum], dtype=np.int64)
+    if ncursor + 3 * fnum > 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES) or \
+        icursor + 3 * fnum > _MESH_DATA_FLOATS:
+      raise ValueError("total mesh faces exceed 011 capacity "
+                       f"{_MESH_MAX_FACES}")
+    vd = verts.astype(np.float64)
+    interior = vd.mean(axis=0)
+    mesh_hull_info[5 * g + 2] = ncursor // 3
+    mesh_hull_info[5 * g + 3] = icursor // 3
+    mesh_hull_info[5 * g + 4] = fnum
+    for f in faces:
+      i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
+      n = np.cross(vd[i1] - vd[i0], vd[i2] - vd[i0])
+      nl = float(np.linalg.norm(n))
+      if nl < 1e-12:
+        n = np.zeros(3)
+      else:
+        n = n / nl
+        if float(n @ (vd[[i0, i1, i2]].mean(axis=0) - interior)) < 0.0:
+          n = -n
+      mesh_face_nrm = n.astype(np.float32)
+      mesh_hull[ncursor:ncursor + 3] = mesh_face_nrm
+      mesh_hull[icursor:icursor + 3] = np.array(
+          [i0, i1, i2], dtype=np.float32)
+      ncursor += 3
+      icursor += 3
+
   iter_req = int(model.opt.iterations)
   if iter_req <= 0 or iter_req > _MAX_ITERATIONS:
     raise ValueError(
@@ -773,7 +893,9 @@ def lower_coupled_constraints(model) -> CoupledConstraintDescriptor:
       geom_bodyid=_frozen(model.geom_bodyid, np.int32),
       geom_size=_frozen(geom_size_mat, np.float32),
       geom_type=_frozen(model.geom_type, np.int32),
-      geom_rbound=_frozen(np.asarray(model.geom_rbound, dtype=np.float32).reshape(model.ngeom), np.float32),
+      geom_rbound=_frozen(_rbound_with_mesh_hulls(model, mesh_rbound_extra), np.float32),
+      mesh_hull=_frozen(mesh_hull, np.float32),
+      mesh_hull_info=_frozen(mesh_hull_info, np.int32),
       body_parentid=_frozen(model.body_parentid, np.int32),
       body_jntadr=_frozen(model.body_jntadr, np.int32),
       body_jntnum=_frozen(model.body_jntnum, np.int32),
@@ -951,6 +1073,8 @@ class MetalCoupledConstraints:
         "geom_size": self._tensor(d.geom_size.reshape(-1) if d.ngeom else np.zeros(3, dtype=np.float32)),
         "geom_type": self._tensor(d.geom_type if d.ngeom else np.zeros(1, dtype=np.int32)),
         "geom_rbound": self._tensor(d.geom_rbound if d.ngeom else np.zeros(1, dtype=np.float32)),
+        "mesh_hull": self._tensor(d.mesh_hull),
+        "mesh_hull_info": self._tensor(d.mesh_hull_info.astype(np.int32)),
         "geom_bodyid": self._tensor(d.geom_bodyid if d.ngeom else np.zeros(1, dtype=np.int32)),
         "body_parentid": self._tensor(d.body_parentid),
         "body_jntadr": self._tensor(d.body_jntadr),
@@ -1086,6 +1210,7 @@ class MetalCoupledConstraints:
           self._constants["pair_solreffriction"], self._constants["pair_contact_offset"],
           w["contact_row_data"], w["contact_frame"], w["contact_jacobian"],
           self._constants["c_dims"], self._constants["geom_rbound"],
+          self._constants["mesh_hull"], self._constants["mesh_hull_info"],
           threads=(b * d.npairs,), group_size=(1,),
       )
 

@@ -514,10 +514,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-GEO-003", "convex mesh collision",
-        Stage.COLLISION, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "rejected at lowering; visual meshes unaffected",
-        "engine/engine_collision_convex.c", "reject meshes",
-        "none", "011", (),
+        Stage.COLLISION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "011 implements convex-hull vertex-support GJK/MPR singles + face-snap",
+        "mujoco_metal/shaders/convex_narrowphase.metal", "admit convex mesh pairs (<=64 verts) with singles slot counts",
+        "MetalSimulation(profile='integrated_euler_v1')", "011", ("test_mesh_contact_011.py",),
         enums=("mjtGeom.mjGEOM_MESH",),
     ),
     Requirement(
