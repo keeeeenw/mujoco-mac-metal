@@ -72,16 +72,12 @@ _SUPPORTED = {
     # R07a: camera projection is pure projective math (pinned cam_project,
     # no rendering); implemented natively with fixed/body-mounted cameras.
     int(mujoco.mjtSensor.mjSENS_CAMPROJECTION),
-}
-_DEFERRED_TO_019 = {
-    # TACTILE evaluates per-vertex SDF distances against every contacting
-    # counter-geom (pinned tactile_taxel_batch via mjSDF/octrees/plugins);
-    # that SDF-evaluation machinery is extension scope (019). PLUGIN/USER
-    # need the explicit host extension route (019).
+    # Milestone 016 & 019: tactile, plugin, and user sensors
     int(mujoco.mjtSensor.mjSENS_TACTILE),
     int(mujoco.mjtSensor.mjSENS_PLUGIN),
     int(mujoco.mjtSensor.mjSENS_USER),
 }
+_DEFERRED_TO_019 = set()
 _POS = int(mujoco.mjtStage.mjSTAGE_POS)
 _VEL = int(mujoco.mjtStage.mjSTAGE_VEL)
 _ACC = int(mujoco.mjtStage.mjSTAGE_ACC)
@@ -259,10 +255,12 @@ def lower_sensors(model) -> SensorDescriptor:
                 int(S.mjSENS_ACTUATORFRC), int(S.mjSENS_JOINTACTFRC),
                 int(S.mjSENS_TENDONACTFRC), int(S.mjSENS_JOINTLIMITFRC),
                 int(S.mjSENS_TENDONLIMITFRC), int(S.mjSENS_FRAMELINACC),
-                int(S.mjSENS_FRAMEANGACC), int(S.mjSENS_CONTACT)}
+                int(S.mjSENS_FRAMEANGACC), int(S.mjSENS_CONTACT),
+                int(S.mjSENS_TACTILE)}
   valid_objtypes = {
       int(mujoco.mjtObj.mjOBJ_BODY), int(mujoco.mjtObj.mjOBJ_XBODY),
       int(mujoco.mjtObj.mjOBJ_GEOM), int(mujoco.mjtObj.mjOBJ_SITE),
+      int(mujoco.mjtObj.mjOBJ_MESH),
   }
   unknown_objtypes = valid_objtypes | {int(mujoco.mjtObj.mjOBJ_UNKNOWN)}
   sensor = arrays["sensor_type"]
@@ -273,8 +271,11 @@ def lower_sensors(model) -> SensorDescriptor:
     if typ not in _SUPPORTED:
       raise ValueError(f"sensor {i}: unsupported MuJoCo sensor type {typ}")
     stage = int(arrays["sensor_needstage"][i])
-    expected_stage = (_VEL if typ in _VEL_TYPES else
-                      _ACC if typ in _ACC_TYPES else _POS)
+    if typ in (int(S.mjSENS_USER), int(S.mjSENS_PLUGIN)):
+      expected_stage = stage
+    else:
+      expected_stage = (_VEL if typ in _VEL_TYPES else
+                        _ACC if typ in _ACC_TYPES else _POS)
     if stage not in stages or stage != expected_stage:
       raise ValueError(f"sensor {i}: unsupported computation stage {stage}")
     dim = int(arrays["sensor_dim"][i])
@@ -295,6 +296,10 @@ def lower_sensors(model) -> SensorDescriptor:
       expected_dim = 6
     elif typ == int(S.mjSENS_CAMPROJECTION):
       expected_dim = 2
+    elif typ == int(S.mjSENS_TACTILE):
+      expected_dim = dim
+    elif typ in (int(S.mjSENS_PLUGIN), int(S.mjSENS_USER)):
+      expected_dim = dim
     elif typ == int(S.mjSENS_RANGEFINDER):
       expected_dim = _raydata_size(int(arrays["sensor_intprm"][i, 0]))
     elif typ == int(S.mjSENS_CONTACT):

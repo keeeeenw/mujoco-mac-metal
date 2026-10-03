@@ -388,6 +388,7 @@ class MetalSimulation:
     self._has_contact_sensors = False
     self._has_ray_sensors = False
     self._has_geomdist_sensors = False
+    self._has_user_plugin_sensors = False
     if self._sensors is not None:
       ST = mujoco.mjtSensor
       need = np.asarray(self._sensors.descriptor.sensor_needstage)
@@ -395,7 +396,9 @@ class MetalSimulation:
       ACC = int(mujoco.mjtStage.mjSTAGE_ACC)
       self._has_acc_sensors = bool(np.any(need == ACC))
       self._has_contact_sensors = bool(np.any(np.isin(types, [
-          int(ST.mjSENS_CONTACT), int(ST.mjSENS_TOUCH)])))
+          int(ST.mjSENS_CONTACT), int(ST.mjSENS_TOUCH), int(ST.mjSENS_TACTILE)])))
+      self._has_user_plugin_sensors = bool(np.any(np.isin(types, [
+          int(ST.mjSENS_USER), int(ST.mjSENS_PLUGIN)])))
       self._has_ray_sensors = bool(np.any(types == int(ST.mjSENS_RANGEFINDER)))
       self._has_geomdist_sensors = bool(np.any(np.isin(types, [
           int(ST.mjSENS_GEOMDIST), int(ST.mjSENS_GEOMNORMAL),
@@ -2126,6 +2129,17 @@ class MetalSimulation:
       merged = self._run_acc_into(qpos, qvel, qacc, poses, dynamics, merged)
     if self._has_contact_sensors or self._has_ray_sensors or self._has_geomdist_sensors:
       merged = self._run_spatial_into(poses, merged)
+    if getattr(self, "_has_user_plugin_sensors", False):
+      from mujoco_metal.extensions import default_registry, PluginType
+      import mujoco as _mj
+      for i, typ in enumerate(self._sensors.descriptor.sensor_type):
+        if typ in (int(_mj.mjtSensor.mjSENS_USER), int(_mj.mjtSensor.mjSENS_PLUGIN)):
+          adr = int(self._sensors.descriptor.sensor_adr[i])
+          dim = int(self._sensors.descriptor.sensor_dim[i])
+          sname = _mj.mj_id2name(self._mjmodel, int(_mj.mjtObj.mjOBJ_SENSOR), i) or "default"
+          plugin = default_registry.get(sname, PluginType.SENSOR) or default_registry.get("default", PluginType.SENSOR)
+          if plugin is not None:
+            plugin.run_device(self._state, sensordata=merged, sensor_adr=adr, sensor_dim=dim)
     self._sensordata.copy_(merged)
 
   def _advance_activations(self, state):
