@@ -15,6 +15,15 @@ are implemented; `out-of-scope` rows are explicit project exclusions (RL/PPO,
 deployment targets, broad hardware testing, extra MuJoCo versions, Metal
 renderer), not future physics work.
 
+Implementation and qualification are separate. `native_gpu/unqualified` can
+describe an integrated device path with focused passing tests whose full
+composition gate remains open. `gpu_qualified` describes the cited fixtures
+and stated restrictions, not every combination of model features, solvers,
+integrators and runtime flags. Test filenames identify evidence to inspect;
+their presence in this table is not a claim that every test in them passed.
+The pinned inventory is still being reconciled (`INVENTORY_COMPLETE=False`);
+this table is not a declaration of complete MuJoCo compatibility.
+
 <!-- COVERAGE_TABLE_BEGIN -->
 | ID | Capability | Execution | Status | Owner | Limitation | Admission | Tests |
 |---|---|---|---|---|---|---|---|
@@ -58,16 +67,16 @@ renderer), not future physics work.
 | REQ-BIAS-001 | none/affine biases | device | native_gpu/gpu_qualified | baseline | stateless scalar scope | accept none/affine | test_actuation.py |
 | REQ-BIAS-002 | muscle/DC-motor biases (built-in) | device | native_gpu/gpu_qualified | 007 | built-in muscle passive + DC back-EMF/cogging/LuGre | bias switch + post-clamp DC mechanics | test_actuators_007.py |
 | REQ-BIAS-003 | user-callback actuator biases | none | not_implemented/unqualified | 019 | arbitrary callbacks cannot execute as Metal kernels | reject biastype user (019 extension contract) | — |
-| REQ-SENS-001 | current-state kinematic/clock/gyro/velocimeter queries | device | native_gpu/gpu_qualified | baseline | explicit query, not stored mj_step timing; no delay/noise/history | accept the 14 listed types | test_sensors.py |
-| REQ-SENS-002 | remaining sensor families (016) | device | native_gpu/gpu_qualified | 016 | touch/accel/force/torque/magnetometer/range/tendon/actuator/limit/frame-acc/subtree/insidesite/geomdist/contact/energy; cutoff honored; delay/interval/noise/history rejected; SDF rays/geomdist + camprojection/tactile/plugin/user per 019; single contact slot; stored step-stage sample vs explicit query | accept the 31 listed types; reject the 4 deferred types | test_sensors.py, test_sensor_families_016.py, test_sensor_force_016.py, test_sensor_spatial_016.py, test_sensor_remaining_016.py |
+| REQ-SENS-001 | current-state kinematic/clock/gyro/velocimeter queries | device | native_gpu/gpu_qualified | baseline | explicit current-state query; stored forward-stage samples and compiled delay/interval history use separate APIs; pinned noise metadata does not introduce stochastic samples | accept the 14 listed types | test_sensors.py |
+| REQ-SENS-002 | remaining sensor families (016) | device | native_gpu/gpu_qualified | 016 | touch/accel/force/torque/magnetometer/range/tendon/actuator/limit/frame-acc/subtree/insidesite/geomdist/contact/energy; cutoff honored; compiled delay/interval history is separate from current-state queries; SDF and extension combinations require their own qualification | accept listed built-in types subject to profile and query contracts; extension types have separate requirements | test_sensors.py, test_sensor_families_016.py, test_sensor_force_016.py, test_sensor_spatial_016.py, test_sensor_remaining_016.py |
 | REQ-SENS-003 | sensor extensions (016/019) | device | native_gpu/gpu_qualified | 019 | camera-projection, tactile, plugin, and user sensors supported natively | accept sensor extensions | test_sensor_extensions_016.py, test_extensions_019.py |
 | REQ-STATE-001 | time/qpos/qvel/eq_active/mocap state ownership | device | native_gpu/gpu_qualified | 006 | persistent per-env poses/masks, schema-3 snapshots, keyframe reset, copy | accept matching snapshots, reject v1-into-neq and <v3-into-mocap | test_device_state.py, test_equality_activity.py, test_mocap_state.py |
 | REQ-STATE-002 | control/applied-force state ownership | device | native_gpu/gpu_qualified | baseline | per-call held inputs validated before the device loop | accept finite host/device inputs | test_simulation.py |
 | REQ-STATE-003 | mocap position/quaternion inputs | device | native_gpu/gpu_qualified | 006 | jointless world-child mocap bodies; per-env poses, keyframe reset, schema-3 snapshots | accept valid mocap, reject non-world-child | test_mocap_state.py |
 | REQ-STATE-004 | actuator activation state | device | native_gpu/gpu_qualified | 007 | schema-4 act storage, reset/keyframe/restore/copy, exact-slot advance | na rows with actearly/actrange semantics | test_actuators_007.py |
-| REQ-STATE-005 | warmstart state | device | native_gpu/unqualified | 014 | retained multipliers seed the next solve with cost-gated fallback; get/set/clear API; reset/keyframe clear; WARMSTART disable honored | warm lam retention + cost check | test_solver_completion_014.py |
-| REQ-STATE-006 | history state | none | not_implemented/unqualified | 015 | no sensor/actuator history storage | reject history-dependent models | — |
-| REQ-STATE-007 | userdata/plugin state | none | not_implemented/unqualified | 019 | no userdata/plugin state ownership | reject stateful plugins | — |
+| REQ-STATE-005 | pinned acceleration warmstart state | device | native_gpu/unqualified | 014 | canonical qacc_warmstart state is distinct from the legacy retained-multiplier API; scalar primal cost-gated initialization implemented; complete cone/budget/composition qualification pending | finite device state with shape (batch, nv); WARMSTART disable honored by solver | test_solver_completion_014.py, test_native_api_transactions.py |
+| REQ-STATE-006 | history state | device | native_gpu/unqualified | 015 | canonical compiled history storage, interpolation, delay/interval sampling and selected lifecycle implemented; full integrator/sleep/extension composition qualification pending | validate compiled addresses, sizes and interpolation; reject invalid or overlapping layouts | test_history_parity.py, test_native_api_transactions.py |
+| REQ-STATE-007 | userdata/plugin state | device | native_gpu/unqualified | 019 | compiled userdata/plugin-state tensors and selected state lifecycle implemented; native callback-owned state requires explicit device rollback methods; arbitrary upstream plugins are not automatically ported | validate compiled state dimensions; stateful native callbacks require device snapshot, full restore and masked restore | test_native_api_transactions.py |
 | REQ-STATE-008 | getState group selectors | device | native_gpu/gpu_qualified | 019 | mj_getState and mj_setState group API supported on device | native state get/set selectors | test_extensions_019.py |
 | REQ-STATE-009 | state count sentinel | none | not_implemented/unqualified | 005 | mjNSTATE is a count, not selectable state | never admitted | — |
 | REQ-DSBL-001 | honored disable flags | device | native_gpu/gpu_qualified | baseline | constraint/equality/frictionloss/limit/contact/spring/damper/gravity/clampctrl/warmstart/filterparent/actuation/refsafe/sensor/midphase/eulerdamp/autoreset honored per stage | accept listed flags | test_simulation.py |
