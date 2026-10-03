@@ -558,6 +558,11 @@ class MetalSimulation:
     from mujoco_metal.islands import IslandManager
     self._islands = IslandManager(model, batch_size=batch_size, device=self._state._device)
 
+    from mujoco_metal.extensions import default_registry, PluginType
+    self._force_plugins = [p for (name, typ), p in default_registry._plugins.items() if typ in (PluginType.FORCE, PluginType.ACTUATOR)]
+    for p in self._force_plugins:
+      p.init(model, batch_size=batch_size, device=self._state._device)
+
   @property
   def islands(self):
     """Kinematic island discovery and sleep/wake manager (milestone 017)."""
@@ -777,6 +782,9 @@ class MetalSimulation:
     } if getattr(self, "_islands", None) is not None else None)
     snap["flex"] = (self._flex.get_state()
                     if getattr(self, "_flex", None) is not None else None)
+    snap["plugins"] = {
+        p.name: p.snapshot() for p in getattr(self, "_force_plugins", [])
+    }
     return snap
 
   def restore(self, snapshot, env_ids=None):
@@ -928,6 +936,10 @@ class MetalSimulation:
       else:
         dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
         self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
+    if "plugins" in snapshot and snapshot["plugins"] is not None:
+      for p in getattr(self, "_force_plugins", []):
+        if p.name in snapshot["plugins"]:
+          p.restore(snapshot["plugins"][p.name], env_ids=env_ids)
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
@@ -965,6 +977,8 @@ class MetalSimulation:
     if getattr(self, "_flex", None) is not None:
       dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
       self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
+    for p in getattr(self, "_force_plugins", []):
+      p.reset(env_ids=env_ids)
     self._assembled_system_valid = False
     self._accepted_step = None
     if hasattr(self, "_last_coupled"):
@@ -1737,7 +1751,7 @@ class MetalSimulation:
         lam_raw=lam, lam_nr=lam_nr, lam_stride=lam_s,
         act_force=self._sen_act_force, qfrc_act=self._sen_qfrc_act, out=out)
 
-  def _acceleration(self, qpos, qvel, act_override=None, time_override=None):
+  def _acceleration(self, qpos, qvel, act_override=None, time_override=None, constrained=True):
     mpos = getattr(self._state, "_mpos", None)
     mquat = getattr(self._state, "_mquat", None)
     dynamics = self._smooth.run_device(qpos, qvel, mpos, mquat)
@@ -1814,9 +1828,15 @@ class MetalSimulation:
             self._sen_act_force.shape) if self._motor._last_force is not None
             else 0.0)
         self._sen_qfrc_act.add_(m_qfrc.reshape(self._sen_qfrc_act.shape))
+    for p in getattr(self, "_force_plugins", []):
+      p_force = p.run_device(self._state, qpos=qpos, qvel=qvel, dynamics=dynamics)
+      if p_force is not None:
+        self._rhs.add_(p_force.reshape(self._rhs.shape))
     acceleration, status = self._solver.run_device(
         dynamics["mass_matrix"], self._rhs
     )
+    if not constrained:
+      return acceleration, status, dynamics
     if self._coupled_constraints is not None:
       self._coupled_solve_dispatches += 1
       eq_active = getattr(self._state, "_eq_active", None)

@@ -124,6 +124,47 @@ def mj_inverse(sim, qpos=None, qvel=None, qacc=None) -> torch.Tensor:
     passive = sim._passive.run_device(qp, qv, mocap_pos=mpos, mocap_quat=mquat)
     qfrc_inv = qfrc_inv - passive
 
+  # 5. Subtract fluid forces if active
+  if getattr(sim, "_fluid", None) is not None:
+    qfrc_inv = qfrc_inv - sim._fluid.run_device(qp, qv, dynamics)
+
+  # 6. Subtract tendon forces if active
+  if getattr(sim, "_tendons", None) is not None:
+    t_force, _, _ = sim._tendons.run_device(qp, qv)
+    qfrc_inv = qfrc_inv - t_force
+
+  # 7. Subtract flex passive forces if active
+  if getattr(sim, "_flex", None) is not None:
+    flex_qfrc, _, _ = sim._flex.run_device(
+        qp, qv, dynamics["poses"], dynamics.get("cvel", None)
+    )
+    qfrc_inv = qfrc_inv - flex_qfrc
+
+  # 8. Subtract constraint forces (mj_invConstraint)
+  if getattr(sim, "_coupled_constraints", None) is not None:
+    cc = sim._coupled_constraints
+    _ten_J, _ten_L = sim._spatial_for_coupled(qv, dynamics["poses"]) if hasattr(sim, "_spatial_for_coupled") else (None, None)
+    eq_act = getattr(state, "_eq_active", None)
+    cc.run_device(
+        dynamics["poses"], M, -bias, qp, qv,
+        eq_active=eq_act, cvel=dynamics.get("cvel", None),
+        tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
+        flex=getattr(sim, "_flex", None),
+    )
+    w = cc._workspace
+    b = sim.batch_size
+    nr = cc.descriptor.nr
+    nv = sim.model.nv
+    if nr > 0:
+      J = w["workspace_J"].view(b, nr, nv)
+      dbg = w["workspace_debug"].view(b, -1)
+      R = dbg[:, nr * nr : nr * nr + nr]
+      aref = dbg[:, nr * nr + nr : nr * nr + 2 * nr]
+      jar = torch.bmm(J, qa.unsqueeze(-1)).squeeze(-1) - aref
+      force = torch.where((R > 0) & (jar < 0), -jar / torch.clamp(R, min=1e-12), torch.zeros_like(jar))
+      qfrc_constraint = torch.bmm(J.transpose(1, 2), force.unsqueeze(-1)).squeeze(-1)
+      qfrc_inv = qfrc_inv - qfrc_constraint
+
   return qfrc_inv
 
 
@@ -173,10 +214,9 @@ def mj_fwdAcceleration(sim, qpos=None, qvel=None, poses=None, dynamics=None, qfr
   state = sim.state
   qp = qpos if qpos is not None else state.qpos
   qv = qvel if qvel is not None else state.qvel
-  dyn = dynamics if dynamics is not None else mj_fwdVelocity(sim, qp, qv)
   if qfrc_applied is not None:
     sim._prepare_force(qfrc_applied)
-  acc, status, _ = sim._acceleration(qp, qv)
+  acc, status, _ = sim._acceleration(qp, qv, constrained=False)
   return acc, status
 
 

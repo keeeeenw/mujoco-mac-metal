@@ -85,8 +85,9 @@ def run(steps=300, mode="metal", check=False, record=None):
 
     # Track swing excursion (displacement of tip vertex)
     tip_x = abs(float(actual.qpos[-3]))
+    tip_y = float(actual.qpos[-2])
     tip_z = abs(float(actual.qpos[-1]))
-    max_excursion = max(max_excursion, tip_x, tip_z)
+    max_excursion = max(max_excursion, tip_x, abs(tip_y), tip_z)
 
     if native is not None:
       nat_edges = native.flexedge_length[0].cpu().numpy()
