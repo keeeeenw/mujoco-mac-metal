@@ -14,36 +14,28 @@
     <!-- Tray: floor slab, two end walls, one divider making two lanes
          (contains lateral scoot from single-point face contacts). -->
     <body name="tray" pos="0 0 0">
-      <geom name="trayfloor" type="box" size="0.25 0.2 0.02" pos="0 0 0.02" rgba="0.1 0.7 0.2 1" mass="0" contype="1" conaffinity="1" condim="3"/>
-      <geom name="wallL" type="box" size="0.02 0.2 0.1" pos="-0.26 0 0.1" rgba="0.1 0.6 0.2 1" mass="0" contype="1" conaffinity="1" condim="3"/>
-      <geom name="wallR" type="box" size="0.02 0.2 0.1" pos="0.26 0 0.1" rgba="0.1 0.6 0.2 1" mass="0" contype="1" conaffinity="1" condim="3"/>
-      <geom name="divider" type="box" size="0.015 0.2 0.08" pos="0.02 0 0.08" rgba="0.1 0.6 0.2 1" mass="0" contype="1" conaffinity="1" condim="3"/>
+      <geom name="trayfloor" type="box" size="0.25 0.2 0.02" pos="0 0 0.02" rgba="0.1 0.7 0.2 1" mass="0" contype="0" conaffinity="0" condim="3"/>
+      <geom name="wallL" type="box" size="0.02 0.2 0.1" pos="-0.26 0 0.1" rgba="0.1 0.6 0.2 1" mass="0" contype="0" conaffinity="0" condim="3"/>
+      <geom name="wallR" type="box" size="0.02 0.2 0.1" pos="0.26 0 0.1" rgba="0.1 0.6 0.2 1" mass="0" contype="0" conaffinity="0" condim="3"/>
+      <geom name="divider" type="box" size="0.015 0.2 0.08" pos="0.02 0 0.08" rgba="0.1 0.6 0.2 1" mass="0" contype="0" conaffinity="0" condim="3"/>
     </body>
     <body name="pieceA" pos="-0.13 0 0.09">
       <freejoint name="freeA"/>
-      <geom name="tetra_geom" type="mesh" mesh="tetra" rgba="0.9 0.1 0.1 1" mass="0.2" friction="0.6 0.05 0.02" contype="1" conaffinity="1" condim="3"/>
+      <geom name="tetra_geom" type="mesh" mesh="tetra" rgba="0.9 0.1 0.1 1" mass="0.2" friction="0.6 0.05 0.02" contype="0" conaffinity="0" condim="3"/>
     </body>
     <body name="pieceB" pos="0.13 0.05 0.1">
       <freejoint name="freeB"/>
-      <geom name="brick_geom" type="mesh" mesh="brick" rgba="0.2 0.5 0.9 1" mass="0.3" friction="0.6 0.05 0.02" contype="1" conaffinity="1" condim="3"/>
+      <geom name="brick_geom" type="mesh" mesh="brick" rgba="0.2 0.5 0.9 1" mass="0.3" friction="0.6 0.05 0.02" contype="0" conaffinity="0" condim="3"/>
     </body>
     <body name="pieceC" pos="0.13 -0.06 0.12">
       <freejoint name="freeC"/>
-      <geom name="octa_geom" type="mesh" mesh="octa" rgba="0.9 0.7 0.1 1" mass="0.15" friction="0.6 0.05 0.02" contype="1" conaffinity="1" condim="3"/>
+      <geom name="octa_geom" type="mesh" mesh="octa" rgba="0.9 0.7 0.1 1" mass="0.15" friction="0.6 0.05 0.02" contype="0" conaffinity="0" condim="3"/>
     </body>
   </worldbody>
   <contact>
     <pair geom1="tetra_geom" geom2="trayfloor"/>
-    <pair geom1="tetra_geom" geom2="wallL"/>
-    <pair geom1="tetra_geom" geom2="divider"/>
     <pair geom1="brick_geom" geom2="trayfloor"/>
-    <pair geom1="brick_geom" geom2="wallR"/>
-    <pair geom1="brick_geom" geom2="divider"/>
     <pair geom1="octa_geom" geom2="trayfloor"/>
-    <pair geom1="octa_geom" geom2="wallR"/>
-    <pair geom1="octa_geom" geom2="divider"/>
-    <pair geom1="tetra_geom" geom2="brick_geom"/>
-    <pair geom1="tetra_geom" geom2="octa_geom"/>
     <pair geom1="brick_geom" geom2="octa_geom"/>
   </contact>
 </mujoco>
