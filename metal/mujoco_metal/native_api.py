@@ -159,7 +159,8 @@ def _inverse_query_workspaces(sim):
   roots = ("_smooth", "_passive", "_fluid", "_tendons", "_spatial_tendons",
            "_flex", "_coupled_constraints", "_component_solver", "_forward_stages",
            "_solver", "_implicit", "_implicitfast", "_actuators", "_transmissions",
-           "_motor", "_sensors", "_state", "_sleep_schedule")
+           "_motor", "_sensors", "_state", "_sleep_schedule", "_contact",
+           "_joint_constraints")
   seen, saved, memo = set(), [], {}
   stages = getattr(sim, "_forward_stages", None)
   record = getattr(stages, "_record", None)
@@ -192,7 +193,8 @@ def _inverse_query_workspaces(sim):
   scratch_names = ("_component_solve_rhs", "_component_world_status",
                    "_component_tendon_J", "_component_damping_deriv", "_rhs",
                    "_act_dot", "_actuator_velocity_derivative", "_sensordata",
-                   "_raw_sensordata", "_energy", "_sensor_plugin_status")
+                   "_raw_sensordata", "_energy", "_sensor_plugin_status",
+                   "_legacy_canonical_rows", "_legacy_constraint_rhs")
   scratch_names += tuple(name for name in vars(sim)
                          if name.startswith(("_forward_stage_", "_sleep_")) and
                          isinstance(getattr(sim, name), torch.Tensor))

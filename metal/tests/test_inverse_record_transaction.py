@@ -65,6 +65,50 @@ def test_query_never_rehabilitates_a_record_already_stale_on_entry():
 
 
 @pytest.mark.parametrize('fail', [False, True])
+def test_query_restores_legacy_row_producers_and_combined_scratch(fail):
+  torch = pytest.importorskip('torch')
+  from mujoco_metal.native_api import _inverse_query_workspaces
+  contact_rows = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+  joint_rows = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+  detection = {'pos': torch.tensor([[[.1, .2, .3]], [[.4, .5, .6]]])}
+  contact = SimpleNamespace(_workspace={'canonical_rows': contact_rows,
+                                        'detector': detection})
+  joint = SimpleNamespace(_outputs={'canonical_rows': joint_rows})
+  combined = torch.arange(18, dtype=torch.float32).reshape(2, 3, 3)
+  rhs = torch.tensor([[.2, .4], [.6, .8]])
+  sim = SimpleNamespace(_contact=contact, _joint_constraints=joint,
+      _legacy_canonical_rows=combined, _legacy_constraint_rhs=rhs)
+  saved = [value.clone() for value in
+           (contact_rows, joint_rows, detection['pos'], combined, rhs)]
+  def query():
+    with _inverse_query_workspaces(sim):
+      contact_rows.fill_(9)
+      contact._workspace['canonical_rows'] = torch.zeros_like(contact_rows)
+      detection['pos'].add_(7)
+      contact._workspace['detector'] = {'pos': torch.zeros_like(detection['pos'])}
+      joint_rows.mul_(3)
+      joint._outputs.clear()
+      combined.fill_(8)
+      sim._legacy_canonical_rows = None
+      rhs.add_(6)
+      if fail:
+        raise RuntimeError('legacy row query failed')
+  if fail:
+    with pytest.raises(RuntimeError, match='legacy row query failed'):
+      query()
+  else:
+    query()
+  assert contact._workspace['canonical_rows'] is contact_rows
+  assert contact._workspace['detector'] is detection
+  assert joint._outputs['canonical_rows'] is joint_rows
+  assert sim._legacy_canonical_rows is combined
+  assert sim._legacy_constraint_rhs is rhs
+  for actual, expected in zip(
+      (contact_rows, joint_rows, detection['pos'], combined, rhs), saved):
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('fail', [False, True])
 @pytest.mark.parametrize('allocated', [False, True])
 def test_query_restores_energy_values_and_owner_even_if_buffer_is_replaced(
     fail, allocated):
