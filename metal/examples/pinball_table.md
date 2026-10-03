@@ -18,14 +18,26 @@ Verification (600 steps, dt 0.002):
 - Native (`--mode metal`): max qpos error 3.7e-07, max qvel error 7.7e-06,
   max stored-sensor error 1.2e-03; same activity gates.
 - Stored `step_sensordata()` matches `mj_step` timing; `sensor_values()`
-  re-evaluates at the post-step state for the overlay (see REPORT).
+  re-evaluates at the post-step state for the overlay. Both paths are
+  covered by `metal/tests/test_sensor_rne_repair.py` (R01: exact ABI,
+  six-component wrench, branched COM, connect/weld composition).
+
+Media: side-by-side native vs CPU reference (300 steps, dt 0.002):
+
+![Pinball inspection table](assets/pinball_table.gif)
+
+Record it locally (headless):
+```sh
+./run python metal/examples/pinball_table.py --headless --steps 300 --mode metal --record metal/examples/assets/pinball_table.gif
+```
 
 Run:
 ```sh
 ./run --cpu python metal/examples/pinball_table.py --headless --check --steps 600 --mode cpu
 ./run python metal/examples/pinball_table.py --headless --check --steps 600 --mode metal
-./run python metal/examples/pinball_table.py --headless --steps 300 --mode metal --record results/milestone-016/demo-evidence/pinball_table.gif
 ```
+The `--record` path above regenerates the packaged GIF from the same
+600-step scene (first 300 steps shown).
 
 Known gaps: SDF rays/geomdist, camera/
 tactile/plugin/user sensors stay 019-owned. The body FORCE/TORQUE sensors
