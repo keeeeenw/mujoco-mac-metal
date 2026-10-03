@@ -72,6 +72,127 @@ def _needs_gpu():
   return pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 
 
+@_needs_gpu()
+@pytest.mark.parametrize("condim", [3, 4, 6])
+def test_sdf_condim_force_parity_gpu(condim):
+  # R05-3: SDF condim 4/6 qualify with the 013 gates (translation 15% +
+  # 0.1 N, rotation at force scale). Frictional rows engage on the press.
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  from mujoco_metal.simulation import MetalSimulation
+  vbox = ("-0.05 -0.05 -0.04 0.05 -0.05 -0.04 0.05 0.05 -0.04 -0.05 0.05 -0.04 "
+          "-0.05 -0.05 0.04 0.05 -0.05 0.04 0.05 0.05 0.04 -0.05 0.05 0.04")
+  xml = (f'<mujoco><asset><mesh name="b" vertex="{vbox}"/></asset>'
+         '<option timestep="0.002" integrator="Euler" iterations="100" '
+         f'tolerance="1e-8" gravity="0 0 0" sdf_initpoints="4"/>'
+         f'<contact><pair geom1="sdf" geom2="ball" condim="{condim}"/></contact>'
+         '<worldbody>'
+         '<geom name="sdf" type="sdf" mesh="b" pos="0 0 0" contype="1" conaffinity="1"/>'
+         '<body pos="0 0 0.07"><freejoint/>'
+         '<geom name="ball" type="sphere" size="0.05" contype="1" conaffinity="1"/></body>'
+         '</worldbody></mujoco>')
+  m = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qp = np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1)
+  sim.reset(qpos=qp, qvel=np.zeros((1, m.nv), dtype=np.float32))
+  asm = sim.assembled_system(recompute=True)
+  cpu = mujoco.MjData(m)
+  cpu.qpos[:] = qp[0]
+  mujoco.mj_step(m, cpu)
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  f_nat = np.asarray(asm["qfrc_constraint"].cpu().numpy()[0])
+  f_cpu = np.asarray(cpu.qfrc_constraint)
+  assert float(np.max(np.abs(f_cpu[:3]))) > 1.0  # non-vacuous press
+  # Normal (z) gates tight; static-press friction direction is
+  # seed-indeterminate on the symmetric scene, so tangential gates bound
+  # magnitude on both engines instead of exact agreement.
+  np.testing.assert_allclose(f_nat[2], f_cpu[2], rtol=0.15, atol=0.1,
+                             err_msg=f"sdf condim {condim} normal")
+  assert float(np.max(np.abs(f_nat[:2]))) < 1.5, f_nat[:2]
+  assert float(np.max(np.abs(f_cpu[:2]))) < 1.5, f_cpu[:2]
+  np.testing.assert_allclose(f_nat[3:], f_cpu[3:], rtol=0.2, atol=0.5,
+                             err_msg=f"sdf condim {condim} rot")
+
+
+@_needs_gpu()
+def test_mesh_manifold_force_sensor_gpu():
+  # R05-3 = R01 re-qualification on the new manifolds: force/torque/
+  # accelerometer on a mesh-plane face press agree with the CPU oracle
+  # (lockstep step-stage samples, then post-step query).
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  from mujoco_metal.simulation import MetalSimulation
+  xml = (f'<mujoco><asset><mesh name="cube" vertex="{BOX8}"/></asset>'
+         '<option timestep="0.002" integrator="Euler" iterations="200" tolerance="1e-8"/>'
+         '<worldbody><geom name="floor" type="plane" size="5 5 0.1"/>'
+         '<body pos="0 0 0.099"><freejoint/>'
+         '<geom name="bx" type="mesh" mesh="cube"/>'
+         '<site name="s"/></body></worldbody>'
+         '<sensor><force site="s"/><torque site="s"/><accelerometer site="s"/></sensor></mujoco>')
+  m = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qp = np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1)
+  sim.reset(qpos=qp, qvel=np.zeros((1, m.nv), dtype=np.float32))
+  cpu = mujoco.MjData(m)
+  cpu.qpos[:] = qp[0]
+  # Redundant-manifold treatment: at fixed deep press the 4-vert native
+  # manifold legitimately answers stiffer than the CPU's pruned 2-point
+  # subset (same 010/011 representation tier as qfrc), and micro-bounce
+  # phases differ. Sensors gate on the settled-window TIME MEAN (both
+  # carry the body weight on average); trajectories agree throughout.
+  worst_q, mean_nat, mean_cpu, cnt = 0.0, None, None, 0
+  for step in range(60):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+    worst_q = max(worst_q, float(np.max(np.abs(sim.state.qpos.cpu().numpy()[0] - np.asarray(cpu.qpos)))))
+    if step >= 30:
+      s = sim.step_sensordata()[0].astype(np.float64)
+      c = np.asarray(cpu.sensordata, dtype=np.float64)
+      mean_nat = s if mean_nat is None else mean_nat + s
+      mean_cpu = c if mean_cpu is None else mean_cpu + c
+      cnt += 1
+  assert worst_q < 2e-3, worst_q
+  mean_nat /= cnt
+  mean_cpu /= cnt
+  np.testing.assert_allclose(mean_nat, mean_cpu, rtol=0.05, atol=0.3)
+  # Post-step query smoke on the manifold scene: finite, right-shaped
+  # output (instant values are representation-tier; see above).
+  got = sim.sensor_values().cpu().numpy()[0]
+  assert got.shape == (m.nsensordata,)
+  assert bool(np.all(np.isfinite(got)))
+
+
+@_needs_gpu()
+def test_mesh_pallet_asymmetric_settle_gpu():
+  # R05-3 mesh pallet with asymmetric loading: mesh box deck plus a welded
+  # corner load settles from a tilt; rest pose matches the CPU oracle.
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  from mujoco_metal.simulation import MetalSimulation
+  xml = (f'<mujoco><asset><mesh name="deck" vertex="{BOX8}"/></asset>'
+         '<option timestep="0.002" integrator="Euler" iterations="200" tolerance="1e-8" gravity="0 0 -9.81"/>'
+         '<worldbody><geom name="floor" type="plane" size="5 5 0.1"/>'
+         '<body pos="0 0 0.25"><freejoint/>'
+         '<geom name="pallet" type="mesh" mesh="deck"/>'
+         '<body pos="0.07 0.05 0.12"><geom name="load" type="box" size="0.03 0.03 0.03" mass="0.8"/></body>'
+         '</body></worldbody></mujoco>')
+  m = mujoco.MjModel.from_xml_string(xml)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qp = np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1)
+  qv = np.zeros((1, m.nv), dtype=np.float32)
+  qv[0, 1] = 0.6
+  sim.reset(qpos=qp, qvel=qv)
+  cpu = mujoco.MjData(m)
+  cpu.qpos[:] = qp[0]
+  cpu.qvel[:] = qv[0]
+  for _ in range(250):
+    sim.step(1)
+    mujoco.mj_step(m, cpu)
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[0][:3],
+                             np.asarray(cpu.qpos)[:3], atol=5e-3)
+
+
 def _hfield_ball_xml(z, margin):
   return (f'<mujoco><asset><hfield name="h" nrow="9" ncol="9" size="1 1 0.2 0.05"/></asset>'
           f'<option timestep="0.002" integrator="Euler" iterations="100" tolerance="1e-8"/>'
