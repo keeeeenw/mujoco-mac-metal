@@ -17,6 +17,89 @@ inline float4 sp_qunit(float4 q) {
 inline float3 sp_qrot(float4 q, float3 v) {
   return v+2.0f*cross(q.yzw,cross(q.yzw,v)+q.x*v);
 }
+
+// One thread owns one taxel. Opposing geom eligibility and SDF/velocity
+// reductions stay on device; each opposing geom contributes at most once.
+// Mirrors engine_sensor.c tactile_taxel_batch and geomDistance (3.10.0).
+kernel void evaluate_tactile(
+    device const float* geom_pos [[buffer(0)]],
+    device const float* geom_quat [[buffer(1)]],
+    device const float* cvel [[buffer(2)]],
+    device const float* root_com [[buffer(3)]],
+    device const float* contact_frame [[buffer(4)]],
+    device const int* slot_pair [[buffer(5)]],
+    device const int* pair_geoms [[buffer(6)]],
+    device const int* geom_body [[buffer(7)]],
+    device const int* body_weld [[buffer(8)]],
+    device const int* body_tree [[buffer(9)]],
+    device const int* geom_type [[buffer(10)]],
+    device const float* geom_size [[buffer(11)]],
+    device const int* taxels [[buffer(12)]],
+    device const float* frames [[buffer(13)]],
+    device const int* oct_info [[buffer(14)]],
+    device const float* octree [[buffer(15)]],
+    device float* output [[buffer(16)]],
+    device const int* dims [[buffer(17)]],
+    uint thread_id [[thread_position_in_grid]]) {
+  int nt=dims[5];
+  if (nt<=0 || thread_id>=uint(dims[0]*nt)) return;
+  int w=int(thread_id)/nt, t=int(thread_id)%nt;
+  int ng=dims[1], nb=dims[2], ns=dims[3], nc=dims[4];
+  int pad=taxels[6*t], weld=taxels[6*t+1], nvert=taxels[6*t+2];
+  int adr=w*ns+taxels[6*t+3], hasframe=taxels[6*t+4], channels=taxels[6*t+5];
+  float depth=0.0f, v1=0.0f, v2=0.0f;
+  float3 point=sp_r3(geom_pos,3*(w*ng+pad))
+      +sp_qrot(sp_r4(geom_quat,4*(w*ng+pad)),sp_r3(frames,10*t));
+  if (!dims[6]) {
+    for (int g=0;g<ng;g++) {
+      bool opposing=false;
+      for (int c=0;c<nc;c++) {
+        float3 normal=sp_r3(contact_frame,12*(w*nc+c));
+        if (!(dot(normal,normal)>0.5f)) continue;
+        int p=slot_pair[c], a=pair_geoms[2*p], b=pair_geoms[2*p+1];
+        if ((a>=0 && b==g && body_weld[geom_body[a]]==weld)
+            || (b>=0 && a==g && body_weld[geom_body[b]]==weld)) {
+          opposing=true; break;
+        }
+      }
+      if (!opposing) continue;
+      float3 gp=sp_r3(geom_pos,3*(w*ng+g));
+      float3 local=sp_qrot(sp_qconj(sp_r4(geom_quat,4*(w*ng+g))),point-gp);
+      int type=geom_type[g];
+      float dist=0.0f;
+      if (type==0) dist=local.z;
+      else if (type>=2 && type<=6)
+        dist=sdf_analytic_dist(type,sp_r3(geom_size,3*g),local);
+      else if (type==7 || type==8) {
+        int offset=oct_info[2*g], count=oct_info[2*g+1];
+        if (offset<0 || count<=0) continue; // pinned needsdf mesh exclusion
+        dist=sdf_oct_dist(octree,offset,count,local);
+      } else continue; // pinned geomDistance has no heightfield SDF
+      if (!(dist<0.0f)) continue;
+      depth=max(depth,-dist);
+      if (hasframe) {
+        int other=geom_body[g];
+        int sr=body_tree[2*weld+1], gr=body_tree[2*other+1];
+        float3 sv=sp_r3(cvel,6*(w*nb+weld)+3)
+            +cross(sp_r3(cvel,6*(w*nb+weld)),
+                   point-sp_r3(root_com,3*(w*nb+sr)));
+        // The pinned opposite-body velocity is evaluated at its geom origin,
+        // not at the taxel. Tangents use compiled mesh_quat, as pinned.
+        float3 gv=sp_r3(cvel,6*(w*nb+other)+3)
+            +cross(sp_r3(cvel,6*(w*nb+other)),
+                   gp-sp_r3(root_com,3*(w*nb+gr)));
+        float3 rel=sv-gv;
+        v1+=fabs(dot(rel,sp_r3(frames,10*t+3)));
+        v2+=fabs(dot(rel,sp_r3(frames,10*t+6)));
+      }
+    }
+  }
+  float cutoff=frames[10*t+9];
+  if (cutoff>0.0f) { depth=min(depth,cutoff); v1=min(v1,cutoff); v2=min(v2,cutoff); }
+  output[adr]=depth;
+  if (channels>=2) output[adr+nvert]=v1;
+  if (channels>=3) output[adr+2*nvert]=v2;
+}
 // Copyright 2026 The MuJoCo Metal contributors
 // Licensed under the Apache License, Version 2.0.
 //

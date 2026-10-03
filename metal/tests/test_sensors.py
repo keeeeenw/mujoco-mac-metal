@@ -101,11 +101,13 @@ def test_sensor_stage_filter_preserves_prior_other_stage_and_disable_is_noop():
   np.testing.assert_array_equal(unchanged, initial)
 
 
-def test_sensor_lowering_rejects_deferred_types_and_stateful_delay():
+def test_sensor_lowering_accepts_acceleration_and_valid_compiled_delay():
   accel = mujoco.MjModel.from_xml_string("""<mujoco><worldbody><body><joint/><geom type="sphere" size=".1" mass="1"/><site name="s"/></body></worldbody><sensor><accelerometer site="s"/></sensor></mujoco>""")
   lower_sensors(accel)
   delayed = mujoco.MjModel.from_xml_string("""<mujoco><worldbody><body><joint name="j"/><geom type="sphere" size=".1" mass="1"/></body></worldbody><sensor><jointpos joint="j" delay=".01" nsample="2"/></sensor></mujoco>""")
-  with pytest.raises(ValueError, match="delay, interval, noise, and history"):
+  lower_sensors(delayed)
+  delayed.sensor_history[0, 0] = 100
+  with pytest.raises(ValueError, match="recompiling"):
     lower_sensors(delayed)
 
 

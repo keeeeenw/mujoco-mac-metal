@@ -18,7 +18,7 @@ pytestmark = [
 
 
 def test_tactile_sensor_multislot_reduction_gpu():
-  """Tactile sensor accumulates normal forces across multiple active contact slots."""
+  """Tactile sensor reports taxel penetration with a multi-point manifold."""
   from mujoco_metal.simulation import MetalSimulation
   # Floor with multiple spheres contacting a box geom
   xml = """
@@ -50,9 +50,9 @@ def test_tactile_sensor_multislot_reduction_gpu():
 
   sens = sim.step_sensordata()
   assert sens.shape == (1, m.nsensordata)
-  # Tactile sensor output should be finite and positive (carrying normal force)
+  # Tactile depth is geometric; it is not the solved normal contact force.
   assert np.all(np.isfinite(sens))
-  assert np.sum(sens[0]) > 0.0, f"Expected positive tactile force, got {sens[0]}"
+  assert np.sum(sens[0]) > 0.0, f"Expected positive tactile depth, got {sens[0]}"
 
 
 def test_user_sensor_native_plugin_execution_gpu():

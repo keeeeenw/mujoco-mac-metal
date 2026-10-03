@@ -567,20 +567,12 @@ class MetalSimulation:
     self._state._on_validate_restore = _handle_state_validate_restore
     self._state._on_restore = _handle_state_restore
     self._state._on_reset = _handle_state_reset
-    # R06/D1 actuator delay line: ring buffers owned here (model-level
-    # config, per-world rows), threaded through the force path with
-    # pre-step times and recorded after integration (pinned mj_readCtrl /
-    # mj_advance order). None when no actuator configures a history
-    # buffer; nsample==0 actuators always read live control.
-    self._delay = None
-    if int(model.nu) > 0:
-      from mujoco_metal.stateful_actuation import actuator_delay_config as _delay_cfg
-      from mujoco_metal.stateful_actuation import MetalDelayLine as _DelayLine
-      _ns, _ip, _dl = _delay_cfg(model)
-      if bool(np.any(_ns > 0)):
-        self._delay = _DelayLine(_ns, _ip, _dl, batch_size=batch_size)
-    if self._delay is not None:
-      self._sync_delay_from_history()
+    # Canonical compiled history is the sole actuator/sensor ring storage.
+    # Snapshot, partial reset and mjtState.HISTORY therefore share one ABI.
+    from mujoco_metal.history import DeviceHistory
+    self._history_program = DeviceHistory(model, batch_size, self._state._device)
+    self._raw_sensordata = None
+    self._delay = None  # Legacy snapshot key; no duplicate ring is maintained.
 
     from mujoco_metal.islands import IslandManager
     self._islands = IslandManager(model, batch_size=batch_size, device=self._state._device)
@@ -626,7 +618,7 @@ class MetalSimulation:
                                     "mocap_pos" in fields or "mocap_quat" in fields):
       dyn = self._smooth.run_device(
           state._qpos, state._qvel, state._mpos, state._mquat)
-      self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
+      self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
     if self._spatial_tendons is not None and ("qpos" in fields or "qvel" in fields or
                                                "mocap_pos" in fields or "mocap_quat" in fields):
       dyn = self._smooth.run_device(
@@ -1050,7 +1042,7 @@ class MetalSimulation:
         self._flex.set_state(snapshot["flex"], env_ids=env_ids)
       else:
         dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
-        self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
+        self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
     for key, plugin in plugin_map.items():
       plugin.restore(plugins[key], env_ids=env_ids)
     if hasattr(self, "_last_coupled"):
@@ -1090,7 +1082,7 @@ class MetalSimulation:
       self._islands.wake_all(env_ids=env_ids)
     if getattr(self, "_flex", None) is not None:
       dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
-      self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
+      self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
     for p in getattr(self, "_native_plugins", ()):
       p.reset(env_ids=env_ids)
     self._assembled_system_valid = False
@@ -1184,7 +1176,7 @@ class MetalSimulation:
       self._islands.wake_all(env_ids=env_ids)
     if getattr(self, "_flex", None) is not None:
       dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
-      self._flex.update_kinematics(dyn["poses"], dyn.get("cvel"))
+      self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
     self._assembled_system_valid = False
     self._accepted_step = None
     if hasattr(self, "_last_coupled"):
@@ -1413,7 +1405,8 @@ class MetalSimulation:
         self._assembled_system_valid = asm_valid
     elif self._has_ray_sensors or self._has_geomdist_sensors:
       out = self._run_spatial_into(poses, out)
-    return out.clone()
+    return self._history_program.samples(
+        out, state._history, state._time, kind=1).clone()
 
   def _state_sensor_inputs(self, qpos, qvel, poses, dynamics):
     """Borrowed (ten_spa_len, ten_spa_vel, act_dyn_len, act_dyn_vel, kind).
@@ -1500,7 +1493,8 @@ class MetalSimulation:
       rhs.add_(passive)
     if self._flex is not None:
       flex_qfrc, _, _ = self._flex.run_device(
-          qpos, qvel, dynamics["poses"], dynamics.get("cvel", None)
+          qpos, qvel, dict(dynamics["poses"], root_com=dynamics["root_com"]),
+          dynamics.get("cvel", None)
       )
       rhs.add_(flex_qfrc)
     if self._fluid is not None:
@@ -1533,7 +1527,7 @@ class MetalSimulation:
     _ten_J, _ten_L = self._spatial_for_coupled(qvel, dynamics["poses"])
     self._coupled_solve_dispatches += 1
     coupled = self._coupled_constraints.run_device(
-        dynamics["poses"], dynamics["mass_matrix"], rhs, qpos, qvel,
+        dict(dynamics["poses"], root_com=dynamics["root_com"]), dynamics["mass_matrix"], rhs, qpos, qvel,
         eq_active=eq_active, cvel=dynamics.get("cvel", None),
         tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
         flex=self._flex,
@@ -1677,76 +1671,31 @@ class MetalSimulation:
     return kin["jacobian"], kin["length"]
 
   def _delayed_control(self, time):
-    """Held control with per-actuator delay applied (pinned mj_fwdActuation).
-
-    ``time`` is a scalar or per-world stamp vector. Without a delay line
-    this is the live held control (borrowed); with one, each actuator
-    reads its ring at ``time - delay`` (live passthrough where nsample
-    is 0). Read-only: recording happens in :meth:`step` after integration.
-    """
-    if self._delay is None or self._control is None:
-      return self._control
-    return self._delay.read(self._control, time)
+    """Read held controls through the canonical device history, without writes."""
+    if self._control is None:
+      return None
+    return self._history_program.samples(
+        self._control, self._state._history, time, kind=0)
 
   def _sync_delay_from_history(self, env_ids=None):
-    """Mirror MuJoCo's canonical actuator history records into the device reader."""
-    if self._delay is None:
-      return
-    torch = self._state._torch
-    ids = (torch.arange(self.batch_size, device=self._state._device)
-           if env_ids is None else torch.as_tensor(env_ids, dtype=torch.long,
-                                                   device=self._state._device))
-    history = self._state._history.index_select(0, ids)
-    cursor = self._delay._cursor.view(self.batch_size, self._mjmodel.nu)
-    times = self._delay._times.view(self.batch_size, self._mjmodel.nu, self._delay.nmax)
-    values = self._delay._values.view(self.batch_size, self._mjmodel.nu, self._delay.nmax)
-    act_n = np.asarray(self._mjmodel.actuator_history).reshape(self._mjmodel.nu, 2)[:, 0]
-    adr = np.asarray(self._mjmodel.actuator_historyadr).reshape(self._mjmodel.nu)
-    for aid, n in enumerate(act_n.tolist()):
-      n = int(n)
-      if n <= 0:
-        continue
-      start = int(adr[aid])
-      cursor[ids, aid] = history[:, start + 1].to(torch.int32)
-      times[ids, aid, :n] = history[:, start + 2:start + 2 + n]
-      values[ids, aid, :n] = history[:, start + 2 + n:start + 2 + 2 * n]
+    """Compatibility hook: canonical history needs no shadow synchronization."""
 
   def _sync_history_from_delay(self, env_ids=None):
-    """Publish accepted actuator delay-ring updates into canonical mjtState history."""
-    if self._delay is None:
-      return
-    torch = self._state._torch
-    ids = (torch.arange(self.batch_size, device=self._state._device)
-           if env_ids is None else torch.as_tensor(env_ids, dtype=torch.long,
-                                                   device=self._state._device))
-    cursor = self._delay._cursor.view(self.batch_size, self._mjmodel.nu)
-    times = self._delay._times.view(self.batch_size, self._mjmodel.nu, self._delay.nmax)
-    values = self._delay._values.view(self.batch_size, self._mjmodel.nu, self._delay.nmax)
-    hist = self._state._history
-    act_n = np.asarray(self._mjmodel.actuator_history).reshape(self._mjmodel.nu, 2)[:, 0]
-    adr = np.asarray(self._mjmodel.actuator_historyadr).reshape(self._mjmodel.nu)
-    for aid, n in enumerate(act_n.tolist()):
-      n = int(n)
-      if n <= 0:
-        continue
-      start = int(adr[aid])
-      hist[ids, start + 1] = cursor[ids, aid].to(torch.float32)
-      hist[ids, start + 2:start + 2 + n] = times[ids, aid, :n]
-      hist[ids, start + 2 + n:start + 2 + 2 * n] = values[ids, aid, :n]
+    """Compatibility hook: canonical history needs no shadow synchronization."""
 
   def _record_delay(self, time, success):
-    """Record held control into delay rings for successful worlds."""
-    if self._delay is None or self._control is None:
-      return
-    import numpy as _np
-    mask = _np.ones((self.batch_size, int(self._mjmodel.nu)), dtype=_np.int32)
-    if success is not None:
-      ok = _np.asarray(success.detach().cpu().numpy()).reshape(-1)
-      mask = (ok.astype(_np.int32).reshape(-1, 1) * _np.ones(
-          (1, int(self._mjmodel.nu)), dtype=_np.int32))
-    t = time.detach().cpu().numpy() if hasattr(time, "detach") else _np.asarray(time)
-    self._delay.record(self._control, t.reshape(-1), mask=mask)
-    self._sync_history_from_delay()
+    """Record raw forward samples for accepted worlds at pre-step time."""
+    torch = self._state._torch
+    controls = self._control
+    if controls is None:
+      controls = torch.zeros((self.batch_size, self._mjmodel.nu),
+                             device=self._state._device)
+    sensors = self._raw_sensordata
+    if sensors is None:
+      sensors = torch.zeros((self.batch_size, self._mjmodel.nsensordata),
+                            device=self._state._device)
+    self._history_program.record(controls, sensors, self._state._history,
+                                 time, success)
 
   def _actuation_force(self, qpos, qvel, poses, act_override=None, time_override=None):
     """General actuator force stage with pinned mj_fwdActuation ordering.
@@ -1948,7 +1897,8 @@ class MetalSimulation:
       self._rhs.add_(passive)
     if self._flex is not None:
       flex_qfrc, flex_damp, flex_stiff = self._flex.run_device(
-          qpos, qvel, dynamics["poses"], dynamics.get("cvel", None)
+          qpos, qvel, dict(dynamics["poses"], root_com=dynamics["root_com"]),
+          dynamics.get("cvel", None)
       )
       self._rhs.add_(flex_qfrc)
       if getattr(self, "_damping_tangent", None) is not None and flex_damp is not None:
@@ -2028,7 +1978,7 @@ class MetalSimulation:
       eq_active = getattr(self._state, "_eq_active", None)
       _ten_J, _ten_L = self._spatial_for_coupled(qvel, dynamics["poses"])
       coupled = self._coupled_constraints.run_device(
-          dynamics["poses"], dynamics["mass_matrix"], self._rhs, qpos, qvel,
+          dict(dynamics["poses"], root_com=dynamics["root_com"]), dynamics["mass_matrix"], self._rhs, qpos, qvel,
           eq_active=eq_active, cvel=dynamics.get("cvel", None),
           tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
           flex=self._flex,
@@ -2144,7 +2094,7 @@ class MetalSimulation:
         state._generation += 1
         if getattr(self, "_flex", None) is not None:
           fk_dyn = self._smooth.run_device(state._qpos, state._qvel, getattr(state, "_mpos", None), getattr(state, "_mquat", None))
-          self._flex.update_kinematics(fk_dyn["poses"], fk_dyn.get("cvel", None))
+          self._flex.update_kinematics(dict(fk_dyn["poses"], root_com=fk_dyn["root_com"]), fk_dyn.get("cvel", None))
         if not bool(torch.all(success)):
           if self._sensordata is not None:
             rollback_sens = pre_sens if pre_sens is not None else torch.zeros_like(self._sensordata)
@@ -2328,7 +2278,7 @@ class MetalSimulation:
       state._generation += 1
       if getattr(self, "_flex", None) is not None:
         fk_dyn = self._smooth.run_device(state._qpos, state._qvel, getattr(state, "_mpos", None), getattr(state, "_mquat", None))
-        self._flex.update_kinematics(fk_dyn["poses"], fk_dyn.get("cvel", None))
+        self._flex.update_kinematics(dict(fk_dyn["poses"], root_com=fk_dyn["root_com"]), fk_dyn.get("cvel", None))
 
       # Failure atomicity (R02): rollback sensor samples and warmstarts for failed worlds
       if not bool(torch.all(self._success)):
@@ -2426,7 +2376,10 @@ class MetalSimulation:
                 if payload is not None:
                   touched.restore(payload)
               raise
-    self._sensordata.copy_(merged)
+    self._raw_sensordata = merged.contiguous().clone()
+    sampled = self._history_program.samples(
+        merged, self._state._history, self._state._time, kind=1)
+    self._sensordata.copy_(sampled)
 
   def _advance_activations(self, state):
     """Advance activation state with pinned mj_nextActivation semantics.

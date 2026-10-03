@@ -133,21 +133,19 @@ def test_invalid_config_cpu():
 
 
 def _delayed_motor_model(delay=0.004, nsample=8, interp=0):
-  """Programmatic delay configuration (no 3.10.0 XML surface exists)."""
+  """Compile history addresses/storage through the pinned MjSpec surface."""
   import mujoco
-  m = mujoco.MjModel.from_xml_string(
+  spec = mujoco.MjSpec.from_string(
       "<mujoco><option timestep='0.002' integrator='Euler'/>"
       "<worldbody><body pos='0 0 0.5'>"
       "<joint name='h' type='hinge' axis='0 0 1'/>"
       "<geom type='sphere' size='0.1' mass='0.5'/>"
       "</body></worldbody>"
       "<actuator><motor name='m' joint='h' gear='1'/></actuator></mujoco>")
-  m.actuator_delay[0] = delay
-  hist = np.asarray(m.actuator_history)
-  hist[0, 0] = nsample
-  hist[0, 1] = interp
-  m.actuator_history[:] = hist
-  return m
+  motor = spec.actuator("m")
+  motor.delay, motor.nsample, motor.interp = delay, nsample, interp
+  return spec.compile()
+
 
 
 def test_delay_admission_and_config_cpu():
@@ -250,12 +248,17 @@ def test_delayed_step_response_onset_gpu():  # D1 integrated delay: constant con
   for _ in range(6):
     sim.step(1, ctrl=np.array([[1.0]], dtype=np.float32))
     vels.append(float(sim.state.qvel.cpu().numpy()[0, 0]))
-  # Step 0 reads pre-delay stamps (0.0): no force, no motion. The step-0
-  # record then promotes the oldest slot (exact stamp match on the
-  # zero-state ring, exactly like pinned post-reset buffers), so step 1
-  # already reads the t=0.0 sample and motion starts.
-  assert vels[0] == 0.0, vels
-  assert all(v > 0.05 for v in vels[1:]), vels
+  data = mujoco.MjData(m)
+  expected = []
+  for step in range(6):
+    data.time = float(np.float32(step*.002))
+    data.ctrl[0] = 1
+    mujoco.mj_step(m, data)
+    expected.append(data.qvel[0])
+  np.testing.assert_allclose(vels, expected, atol=2e-5, rtol=2e-5)
+  assert vels[0] == 0
+  assert expected[-1] > 0.05
+
 
 
 @_needs_gpu()
@@ -272,14 +275,12 @@ def test_delay_lifecycle_and_failure_gpu():
   for _ in range(6):
     sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
   snap = sim.snapshot()
-  assert snap["delay"] is not None
-  ref = {k: np.asarray(v).copy() for k, v in snap["delay"].items()}
+  assert snap["delay"] is None  # No duplicate history representation.
+  ref = snap["native_state"]["history"].copy()
   for _ in range(4):
     sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
   sim.restore(snap)
-  got = sim._delay.snapshot()
-  for k in ref:
-    np.testing.assert_array_equal(got[k], ref[k])
+  np.testing.assert_array_equal(sim.state._history.cpu().numpy(), ref)
   # Replay continues identically after restore.
   for _ in range(4):
     sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
@@ -290,27 +291,28 @@ def test_delay_lifecycle_and_failure_gpu():
   np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), q1)
   # Invalid restore leaves everything untouched.
   bad = dict(snap)
-  bad["delay"] = dict(ref)
-  bad["delay"]["values"] = np.full_like(ref["values"], np.nan)
+  bad["native_state"] = dict(snap["native_state"])
+  bad["native_state"]["history"] = np.full_like(ref, np.nan)
   with pytest.raises(ValueError):
     sim.restore(bad)
   np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), q1)
   # Selected-world reset clears only that world's rings.
   sim.reset(env_ids=[1])
-  s1 = sim._delay.snapshot()["values"].reshape(2, 1, -1)
-  assert bool(np.all(s1[1] == 0)) and bool(np.any(s1[0] != 0))
+  s1 = sim.state._history.cpu().numpy()
+  np.testing.assert_array_equal(s1[1], mujoco.MjData(m).history.astype(np.float32))
+  assert np.any(s1[0] != s1[1])
   # Failed world freezes its delay rows; healthy rows advance.
   sim.reset()
   for _ in range(6):
     sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
-  before = sim._delay.snapshot()["values"].copy()
+  before = sim.state._history.cpu().numpy().copy()
   bad_q = sim.state._qpos.cpu().numpy()
   bad_q[1, 0] = np.nan
   sim.state._qpos.copy_(torch.as_tensor(bad_q))
   sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
-  after = sim._delay.snapshot()["values"].reshape(2, 1, -1)
-  np.testing.assert_array_equal(after[1], before.reshape(2, 1, -1)[1])
-  assert not np.array_equal(after[0], before.reshape(2, 1, -1)[0])
+  after = sim.state._history.cpu().numpy()
+  np.testing.assert_array_equal(after[1], before[1])
+  assert not np.array_equal(after[0], before[0])
   # Copy reproduces rows.
   sim2 = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
   sim2.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
@@ -318,7 +320,7 @@ def test_delay_lifecycle_and_failure_gpu():
   for _ in range(6):
     sim2.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
   sim2.copy_environment(0, 1)
-  v = sim2._delay.snapshot()["values"].reshape(2, 1, -1)
+  v = sim2.state._history.cpu().numpy()
   np.testing.assert_array_equal(v[0], v[1])
 
 
@@ -337,10 +339,15 @@ def test_rk4_delayed_step_response_gpu():
   for _ in range(6):
     sim.step(1, ctrl=np.array([[1.0]], dtype=np.float32))
     vels.append(float(sim.state.qvel.cpu().numpy()[0, 0]))
-  # Step 0 reads pre-delay stamps (0.0): no force, velocity stays 0.
-  # Step 1+ reads recorded samples, starts motion.
-  assert vels[0] == 0.0, vels
-  assert all(v > 0.05 for v in vels[1:]), vels
+  data = mujoco.MjData(m)
+  expected = []
+  for step in range(6):
+    data.time = float(np.float32(step*.002))
+    data.ctrl[0] = 1
+    mujoco.mj_step(m, data)
+    expected.append(data.qvel[0])
+  np.testing.assert_allclose(vels, expected, atol=2e-5, rtol=2e-5)
+  assert expected[-1] > .05
   # Verify snapshot / restore atomicity under RK4
   snap = sim.snapshot()
   for _ in range(4):

@@ -20,3 +20,10 @@ Copyright 2021 DeepMind Technologies Limited, Apache License, Version 2.0.
 
 Copyright 2026 The MuJoCo Metal contributors
 This package is licensed under the Apache License, Version 2.0; see LICENSE.
+
+The canonical history operations in shaders/history.metal adapt the circular
+history utilities in MuJoCo 3.10.0 src/engine/engine_util_misc.c and the sensor
+read/advance ordering in engine_sensor.c and engine_forward.c. The tactile
+kernels follow the taxel layout, distance and velocity semantics in
+engine_sensor.c. These upstream files carry the DeepMind copyright and Apache
+License, Version 2.0, identified above.
