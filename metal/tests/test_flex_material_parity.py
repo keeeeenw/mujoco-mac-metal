@@ -90,12 +90,30 @@ def test_compiled_simplex_metric_matches_pinned_cpu(dim):
   qvel[0] = 0.17
   qvel[-1] = -0.11
 
-  data, flex, force, _, _ = _evaluate(model, qpos, qvel)
+  data, flex, force, damping_tangent, stiffness_tangent = _evaluate(model, qpos, qvel)
   assert np.max(np.abs(data.qfrc_passive)) > 1e-5
   np.testing.assert_allclose(force, data.qfrc_passive, rtol=3e-4, atol=4e-5)
   assert flex.descriptor.stiffness.size == model.flex_stiffness.size
   np.testing.assert_array_equal(flex.descriptor.stiffness, model.flex_stiffness.astype(np.float32))
   assert not np.any(flex.descriptor.young)
+  eps = 2e-3
+  for dof in (0, model.nv - 1):
+    qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
+    qpos_hi[dof] += eps
+    qpos_lo[dof] -= eps
+    numerical_q = (_oracle_passive_force(model, qpos_hi, qvel)
+                   - _oracle_passive_force(model, qpos_lo, qvel)) / (2*eps)
+    np.testing.assert_allclose(
+        stiffness_tangent.detach().numpy()[0, :, dof], numerical_q,
+        rtol=3e-2, atol=8e-2)
+    qvel_hi, qvel_lo = qvel.copy(), qvel.copy()
+    qvel_hi[dof] += eps
+    qvel_lo[dof] -= eps
+    numerical_v = (_oracle_passive_force(model, qpos, qvel_hi)
+                   - _oracle_passive_force(model, qpos, qvel_lo)) / (2*eps)
+    np.testing.assert_allclose(
+        damping_tangent[:, dof], numerical_v,
+        rtol=3e-2, atol=8e-2)
 
 
 @pytest.mark.parametrize("dim", [2, 3])
@@ -128,6 +146,24 @@ def test_mps_simplex_kernel_matches_pinned_cpu(dim):
   np.testing.assert_allclose(
       force.detach().cpu().numpy()[0], data.qfrc_passive,
       rtol=8e-4, atol=6e-5)
+  eps = 2e-3
+  for dof in (0, model.nv - 1):
+    qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
+    qpos_hi[dof] += eps
+    qpos_lo[dof] -= eps
+    numerical_q = (_oracle_passive_force(model, qpos_hi, qvel)
+                   - _oracle_passive_force(model, qpos_lo, qvel)) / (2*eps)
+    np.testing.assert_allclose(
+        stiffness_tangent.detach().cpu().numpy()[0, :, dof], numerical_q,
+        rtol=3e-2, atol=8e-2)
+    qvel_hi, qvel_lo = qvel.copy(), qvel.copy()
+    qvel_hi[dof] += eps
+    qvel_lo[dof] -= eps
+    numerical_v = (_oracle_passive_force(model, qpos, qvel_hi)
+                   - _oracle_passive_force(model, qpos, qvel_lo)) / (2*eps)
+    np.testing.assert_allclose(
+        damping_tangent.detach().cpu().numpy()[0, :, dof], numerical_v,
+        rtol=3e-2, atol=8e-2)
 
 
 def test_material_rayleigh_velocity_tangent_matches_finite_difference():
@@ -302,6 +338,39 @@ def test_mps_triangle_shell_bending_force_and_tangent():
   np.testing.assert_allclose(
       damping_tangent.detach().cpu().numpy()[0, :, 3], numerical_v,
       rtol=3e-2, atol=5e-3)
+
+
+def test_articulated_triangle_bend_tangent_matches_pinned_qpos_difference():
+  model = mujoco.MjModel.from_xml_string("""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <body name="arm" pos=".1 -.2 1">
+        <joint name="hinge" type="hinge" axis="0 1 0"/>
+        <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+        <flexcomp name="shell" type="grid" count="2 2 1"
+                  pos=".13 .21 -.07" spacing=".1 .1 .1" mass="1" dim="2">
+          <contact contype="0" conaffinity="0"/>
+          <elasticity young="3000" poisson=".2" damping=".15"
+                      thickness=".02" elastic2d="bend"/>
+        </flexcomp>
+      </body>
+    </worldbody></mujoco>
+  """)
+  qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+  qpos[0] = 0.27
+  qpos[1] += 0.035
+  qvel = np.linspace(-0.1, 0.1, model.nv)
+  data, flex, force, _, tangent = _evaluate(model, qpos, qvel)
+  assert flex._bend_count > 0
+  np.testing.assert_allclose(force, data.qfrc_passive, rtol=1e-3, atol=8e-5)
+  eps = 2e-3
+  qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
+  qpos_hi[0] += eps
+  qpos_lo[0] -= eps
+  numerical = (_oracle_passive_force(model, qpos_hi, qvel)
+               - _oracle_passive_force(model, qpos_lo, qvel)) / (2*eps)
+  np.testing.assert_allclose(
+      tangent.detach().numpy()[0, :, 0], numerical,
+      rtol=5e-2, atol=5e-3)
 
 
 def test_material_force_uses_articulated_off_center_flex_vertices():

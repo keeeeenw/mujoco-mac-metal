@@ -113,6 +113,9 @@ kernel void flex_bend_force(
     device const float* flex_damping [[buffer(5)]],
     constant int* dims [[buffer(6)]],
     device float* bend_force [[buffer(7)]],
+    device const float* qvel [[buffer(8)]],
+    device const int* vertex_dofadr [[buffer(9)]],
+    device const int* vertex_dofnum [[buffer(10)]],
     uint tid [[thread_position_in_grid]]) {
   int batch = dims[0];
   int nv = dims[1];
@@ -146,17 +149,18 @@ kernel void flex_bend_force(
       float kij = bend_data[17 * e + 4 * i + j];
       for (int d = 0; d < 3; ++d) {
         f[i][d] += kij * vertex_xpos[(env * nvert + v[j]) * 3 + d];
-        h[i][d] += kij * vertex_xvel[(env * nvert + v[j]) * 3 + d];
+        int vadr=vertex_dofadr[4*e+j];
+        if (d<vertex_dofnum[4*e+j]) h[i][d] += kij * qvel[env*nv+vadr+d];
       }
     }
     for (int d = 0; d < 3; ++d) f[i][d] += bend_data[17 * e + 16] * ref[i][d];
   }
   float qf = 0.0f;
   for (int i = 0; i < 4; ++i) {
-    for (int d = 0; d < 3; ++d) {
-      float total = f[i][d] + flex_damping[e] * h[i][d];
-      int ji = ((env * nvert + v[i]) * 3 + d) * nv + dof;
-      qf -= total * vertex_jacobian[ji];
+    int vadr=vertex_dofadr[4*e+i], vnum=vertex_dofnum[4*e+i];
+    if (dof>=vadr && dof<vadr+vnum) {
+      int d=dof-vadr;
+      qf -= f[i][d] + flex_damping[e] * h[i][d];
     }
   }
   bend_force[tid] = qf;

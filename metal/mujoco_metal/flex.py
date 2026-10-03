@@ -301,6 +301,7 @@ class MetalFlex:
                                            np.any(d.interp != 0)) else None)
 
     bend_vertex, bend_data, bend_damping = [], [], []
+    bend_dofadr, bend_dofnum = [], []
     for f in range(d.nflex):
       if int(d.dim[f]) != 2 or int(d.bendingadr[f]) < 0:
         continue
@@ -317,6 +318,9 @@ class MetalFlex:
         if len(coeff) != 17:
           raise ValueError("compiled flex bending data is truncated")
         bend_vertex.append([int(pair[0]), int(pair[1]), int(flap[0]), int(flap[1])])
+        bodies = [int(d.vertbodyid[v]) for v in bend_vertex[-1]]
+        bend_dofadr.append([int(model.body_dofadr[body]) for body in bodies])
+        bend_dofnum.append([int(model.body_dofnum[body]) for body in bodies])
         bend_data.append(coeff)
         bend_damping.append(float(d.damping[f]))
     self._bend_count = len(bend_vertex)
@@ -325,6 +329,10 @@ class MetalFlex:
     self._bend_damping = static_tensor(bend_damping, (self._bend_count,), torch.float32)
     self._bend_damping_host = tuple(bend_damping)
     self._bend_vertex_host = tuple(tuple(map(int, row)) for row in bend_vertex)
+    self._bend_dofadr = static_tensor(bend_dofadr, (self._bend_count, 4), torch.int32)
+    self._bend_dofnum = static_tensor(bend_dofnum, (self._bend_count, 4), torch.int32)
+    self._bend_dofadr_host = tuple(tuple(map(int, row)) for row in bend_dofadr)
+    self._bend_dofnum_host = tuple(tuple(map(int, row)) for row in bend_dofnum)
     self._bend_shader = (
         torch.mps.compile_shader(_MATERIAL_SHADER.read_text())
         if self._device.type == "mps" and self._bend_count else None)
@@ -1695,6 +1703,8 @@ class MetalFlex:
           self._flexvert_xpos.reshape(-1), self._flexvert_xvel.reshape(-1),
           self._flexvert_J.reshape(-1), self._bend_vertex.reshape(-1),
           values.reshape(-1), damping, dims, element_force.reshape(-1),
+          qvel.reshape(-1), self._bend_dofadr.reshape(-1),
+          self._bend_dofnum.reshape(-1),
           threads=(b * self._bend_count * nv,), group_size=(128,))
       self._qfrc_passive.add_(element_force.sum(dim=1))
 
@@ -1702,7 +1712,14 @@ class MetalFlex:
       for e in range(self._bend_count):
         verts = self._bend_vertex[e].long()
         x = self._flexvert_xpos[:, verts, :]
-        v = self._flexvert_xvel[:, verts, :]
+        v_components = []
+        for adr, count in zip(self._bend_dofadr_host[e],
+                              self._bend_dofnum_host[e]):
+          local = torch.zeros((b, 3), dtype=torch.float32, device=self._device)
+          if count:
+            local[:, :count] = qvel[:, adr:adr + count]
+          v_components.append(local)
+        v = torch.stack(v_components, dim=1)
         ed0 = x[:, 1] - x[:, 0]
         ed1 = x[:, 2] - x[:, 0]
         ed2 = x[:, 3] - x[:, 0]
@@ -1720,23 +1737,28 @@ class MetalFlex:
         if damper:
           total = total + self._bend_damping_host[e] * torch.einsum(
               "ij,bjk->bik", matrix, v)
-        jac = self._flexvert_J[:, verts, :, :]
-        self._qfrc_passive.add_(-torch.einsum("bik,bikn->bn", total, jac))
+        for i, (adr, count) in enumerate(zip(
+            self._bend_dofadr_host[e], self._bend_dofnum_host[e])):
+          if count:
+            self._qfrc_passive[:, adr:adr + count].sub_(total[:, i, :count])
     if nv:
-      self._compute_pinned_bend_tangents(qvel, poses, spring, damper)
+      self._compute_pinned_bend_tangents(spring, damper)
 
-  def _compute_pinned_bend_tangents(self, qvel, poses, spring, damper):
-    """Differentiate compiled ordinary-shell bend matrix and curved term."""
+  def _compute_pinned_bend_tangents(self, spring, damper):
+    """Differentiate the pinned direct-body-DOF ordinary bend implementation.
+
+    MuJoCo's ordinary ``mj_flexPassiveBend`` writes its four vertex forces to
+    ``body_dofadr`` directly (rather than projecting them through vertex J).
+    Its damper likewise reads those raw qvel slots.  Preserve that source-level
+    behavior here, including its lack of attachment Hessian terms.
+    """
     b, nv = self.batch_size, self.descriptor.nv
-    d = self.descriptor
     for e in range(self._bend_count):
       if not spring and not damper:
         continue
       verts_np = np.asarray(self._bend_vertex_host[e], dtype=np.int32)
       verts = torch.as_tensor(verts_np, dtype=torch.long, device=self._device)
-      body_ids = d.vertbodyid[verts_np]
       x = self._flexvert_xpos[:, verts, :]
-      vel = self._flexvert_xvel[:, verts, :]
       jac = self._flexvert_J[:, verts, :, :]
       matrix = self._bend_data[e, :16].reshape(4, 4)
       curvature = self._bend_data[e, 16]
@@ -1752,19 +1774,6 @@ class MetalFlex:
           torch.cross(edge2, edge0, dim=-1),
           torch.cross(edge0, edge1, dim=-1),
       ), dim=1)
-      total = torch.zeros_like(x)
-      if spring:
-        total += torch.einsum("ij,bjd->bid", matrix, x) + curvature * ref
-      if damping:
-        total += damping * torch.einsum("ij,bjd->bid", matrix, vel)
-      local_force = -total
-      self._add_attachment_tangent(body_ids, x, jac, local_force, poses)
-
-      projected = torch.einsum("bidv,ij,bjdm->bvm", jac, matrix, jac)
-      if spring:
-        self._stiffness_tangent[:, :nv, :nv].sub_(projected)
-      if damper and damping:
-        self._damping_tangent[:, :nv, :nv].sub_(damping * projected)
 
       e0 = edge0
       e1 = edge1
@@ -1779,17 +1788,28 @@ class MetalFlex:
       dref3 = (torch.cross(de0, e1[:, None, :].expand_as(de0), dim=-1)
                + torch.cross(e0[:, None, :].expand_as(de1), de1, dim=-1))
       dref0 = -(dref1 + dref2 + dref3)
-      dref = torch.stack((dref0, dref1, dref2, dref3), dim=2)
+      dref = torch.stack((dref0, dref1, dref2, dref3), dim=2).permute(
+          0, 2, 3, 1)
+      dtotal = torch.einsum("ij,bjdq->bidq", matrix, jac)
       if spring and curvature != 0.0:
-        self._stiffness_tangent[:, :nv, :nv].add_(
-            -curvature * torch.einsum("bidv,bqid->bvq", jac, dref))
-
+        dtotal = dtotal + curvature * dref
+      if spring:
+        for i, (adr, count) in enumerate(zip(
+            self._bend_dofadr_host[e], self._bend_dofnum_host[e])):
+          if count:
+            self._stiffness_tangent[:, adr:adr + count, :nv].sub_(
+                dtotal[:, i, :count, :])
       if damper and damping:
-        point_vq = self._point_velocity_qpos_jacobian(
-            body_ids, x, jac, qvel, poses)
-        dlocal = damping * torch.einsum("ij,bjdq->bidq", matrix, point_vq)
-        self._stiffness_tangent[:, :nv, :nv].add_(
-            -torch.einsum("bidv,bidq->bvq", jac, dlocal))
+        for i, (adr_i, count_i) in enumerate(zip(
+            self._bend_dofadr_host[e], self._bend_dofnum_host[e])):
+          for j, (adr_j, count_j) in enumerate(zip(
+              self._bend_dofadr_host[e], self._bend_dofnum_host[e])):
+            count = min(count_i, count_j)
+            if count:
+              self._damping_tangent[:, adr_i:adr_i + count,
+                                    adr_j:adr_j + count].diagonal(
+                                        dim1=-2, dim2=-1).sub_(
+                                            damping * matrix[i, j])
 
   def run_equalities(
       self,
