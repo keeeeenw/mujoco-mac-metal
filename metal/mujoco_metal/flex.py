@@ -1015,18 +1015,18 @@ class MetalFlex:
       self._compute_pinned_bend()
     if self._interp_count or self._shell_bend_count:
       if self._interp_count and self._device.type == "mps":
-        self._compute_interpolated_mps(poses)
+        self._compute_interpolated_mps(poses, qvel)
       elif self._interp_count:
-        self._compute_interpolated(poses)
+        self._compute_interpolated(poses, qvel)
       if self._shell_bend_count:
         if self._device.type == "mps":
-          self._compute_interpolated_shell_bend_mps()
+          self._compute_interpolated_shell_bend_mps(qvel, poses)
         else:
-          self._compute_interpolated_shell_bend(poses)
+          self._compute_interpolated_shell_bend(qvel, poses)
 
     return self._qfrc_passive, self._damping_tangent, self._stiffness_tangent
 
-  def _compute_interpolated_mps(self, poses):
+  def _compute_interpolated_mps(self, poses, qvel):
     """Dispatch the compiled Q1/Q2 volume element force kernel on MPS."""
     if not self._interp_count:
       return
@@ -1062,8 +1062,9 @@ class MetalFlex:
         self._add_attachment_tangent(
             ids, self._node_xpos[:, ids, :], self._node_J[:, ids, :, :],
             node_force, poses)
+        self._compute_interpolated_tangent(fe, qvel, poses)
 
-  def _compute_interpolated_shell_bend_mps(self):
+  def _compute_interpolated_shell_bend_mps(self, qvel, poses):
     """Dispatch compiled Crouzeix-Raviart shell-bend forces on MPS."""
     b, nv = self.batch_size, self.descriptor.nv
     elem_force = torch.empty(
@@ -1100,8 +1101,11 @@ class MetalFlex:
           self._add_attachment_tangent(
               ids, self._node_xpos[:, ids, :], self._node_J[:, ids, :, :],
               node_force, poses)
+      if spring:
+        for record in self._shell_bend_records_host:
+          self._compute_shell_bend_material_tangent(record, qvel)
 
-  def _compute_interpolated(self, poses):
+  def _compute_interpolated(self, poses, qvel):
     """Evaluate compiled Q1/Q2 corotational FE matrices (CPU test backend)."""
     spring = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
     damper = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
@@ -1155,9 +1159,151 @@ class MetalFlex:
       if damper:
         generalized += torch.einsum("bnd,bndv->bv", d_world, jac)
       self._qfrc_passive[:, :self.descriptor.nv].add_(generalized)
-      if spring:
-        self._add_attachment_tangent(
-            np.asarray(node_ids, dtype=np.int32), x, jac, f_world, poses)
+      self._add_attachment_tangent(
+          np.asarray(node_ids, dtype=np.int32), x, jac, f_world, poses)
+      self._compute_interpolated_tangent(fe, qvel, poses)
+
+  @staticmethod
+  def _matrix_from_quaternion(quat):
+    """Return rotation matrices for scalar-first unit quaternions."""
+    w, x, y, z = quat.unbind(-1)
+    return torch.stack((
+        1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y),
+        2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x),
+        2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y),
+    ), dim=-1).reshape(quat.shape[:-1] + (3, 3))
+
+  def _polar_frame_tangent(self, F, dF):
+    """Return pinned polar frame and its directional rotation derivatives."""
+    b, _, _, nv = dF.shape
+    quat = self._mat2rot_pinned(F)
+    R = self._matrix_from_quaternion(quat)
+    U = torch.matmul(R.transpose(-1, -2), F)
+    A = torch.einsum("bda,bdjq->bajq", R, dF)
+    rhs = torch.stack((A[:, 2, 1, :] - A[:, 1, 2, :],
+                       A[:, 0, 2, :] - A[:, 2, 0, :],
+                       A[:, 1, 0, :] - A[:, 0, 1, :]), dim=1)
+    trace = torch.diagonal(U, dim1=-2, dim2=-1).sum(-1)
+    sylvester = trace[:, None, None] * torch.eye(
+        3, dtype=F.dtype, device=self._device)[None] - U
+    c00, c01, c02 = sylvester[:, 0, 0], sylvester[:, 0, 1], sylvester[:, 0, 2]
+    c11, c12, c22 = sylvester[:, 1, 1], sylvester[:, 1, 2], sylvester[:, 2, 2]
+    i00 = c11*c22 - c12*c12
+    i01 = c02*c12 - c01*c22
+    i02 = c01*c12 - c02*c11
+    i11 = c00*c22 - c02*c02
+    i12 = c01*c02 - c00*c12
+    i22 = c00*c11 - c01*c01
+    det = c00*i00 + c01*i01 + c02*i02
+    det_sign = torch.where(det < 0, -torch.ones_like(det), torch.ones_like(det))
+    invdet = 1.0 / (det_sign * det.abs().clamp_min(1e-12))
+    rx, ry, rz = rhs[:, 0, :], rhs[:, 1, :], rhs[:, 2, :]
+    omega_vec = torch.stack((
+        (i00[:, None]*rx + i01[:, None]*ry + i02[:, None]*rz)*invdet[:, None],
+        (i01[:, None]*rx + i11[:, None]*ry + i12[:, None]*rz)*invdet[:, None],
+        (i02[:, None]*rx + i12[:, None]*ry + i22[:, None]*rz)*invdet[:, None],
+    ), dim=1)
+    ox, oy, oz = omega_vec.unbind(1)
+    zero = torch.zeros_like(ox)
+    Omega = torch.stack((zero, -oz, oy, oz, zero, -ox, -oy, ox, zero), dim=-1)
+    return quat, R, Omega.reshape(b, nv, 3, 3)
+
+  def _compute_interpolated_tangent(self, fe, qvel, poses):
+    """Add the analytic corotational FE material and Rayleigh tangents.
+
+    The polar-frame derivative uses the Sylvester equation for the skew part
+    of ``R' dF``. All state-dependent arithmetic remains in torch tensors on
+    the active device; the element node list, shape basis, and K matrix are
+    immutable compiled descriptors.
+    """
+    if qvel is None or self.descriptor.nv <= 0:
+      return
+    spring = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
+    damper = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
+    if not spring and not damper:
+      return
+    b, nv = self.batch_size, self.descriptor.nv
+    node_ids = np.asarray(self._interp_nodes_host[fe], dtype=np.int32)
+    npe = self._interp_npe_host[fe]
+    ids = torch.as_tensor(node_ids, dtype=torch.long, device=self._device)
+    x = self._node_xpos[:, ids, :]
+    v = self._node_xvel[:, ids, :]
+    jac = self._node_J[:, ids, :, :]
+    shape_grad = self._interp_grad[fe, :npe]
+    axes = self._interp_axes_host[fe]
+    is_volume = npe == (abs(int(self.descriptor.interp[
+        self._interp_owner_host[fe]])) + 1) ** 3
+    Fparam = torch.einsum("bnd,nk->bdk", x, shape_grad)
+    dFparam = torch.einsum("bndq,nk->bdkq", jac, shape_grad)
+    if is_volume:
+      F = Fparam
+      dF = dFparam
+    else:
+      F = torch.zeros_like(Fparam)
+      F[:, :, axes[0]] = Fparam[:, :, 0]
+      F[:, :, axes[1]] = Fparam[:, :, 1]
+      t0, t1 = Fparam[:, :, 0], Fparam[:, :, 1]
+      F[:, :, axes[2]] = torch.cross(t0, t1, dim=-1)
+      dF = torch.zeros((b, 3, 3, nv), dtype=x.dtype, device=self._device)
+      dF[:, :, axes[0], :] = dFparam[:, :, 0, :]
+      dF[:, :, axes[1], :] = dFparam[:, :, 1, :]
+      dt0, dt1 = dFparam[:, :, 0, :], dFparam[:, :, 1, :]
+      dnormal = (torch.cross(dt0, t1[:, :, None, :].expand_as(dt0), dim=1)
+                 + torch.cross(t0[:, :, None, :].expand_as(dt1), dt1, dim=1))
+      dF[:, :, axes[2], :] = dnormal
+
+    quat, R, Omega = self._polar_frame_tangent(F, dF)
+
+    qc = quat.clone()
+    qc[:, 1:] *= -1
+    x_local = self._quat_rotate(qc, x)
+    v_local = self._quat_rotate(qc, v)
+    x0 = self._node0[ids].unsqueeze(0).expand_as(x)
+    disp = (x_local - x0).reshape(b, 3*npe)
+    vel = v_local.reshape(b, 3*npe)
+    K = self._interp_matrix[fe, :3*npe, :3*npe]
+    local_spring = torch.einsum("ij,bj->bi", K, disp).reshape(b, npe, 3)
+    local_damper = torch.einsum("ij,bj->bi", K, vel).reshape(b, npe, 3)
+    damping = self._interp_damping_host[fe] if damper else 0.0
+    local_force = ((local_spring if spring else torch.zeros_like(local_spring))
+                   + damping * local_damper)
+
+    # Differentiate the corotated displacement, velocity, and world force for
+    # all generalized-coordinate columns together.
+    dx = jac.permute(0, 3, 1, 2)
+    Rt = R.transpose(-1, -2)
+    dx_local = torch.einsum("bji,bqnj->bqni", R, dx)
+    y = x_local  # (B, node, xyz)
+    yq = torch.einsum("bqij,bnj->bqni", Omega, y)
+    ddisp = (dx_local - yq).reshape(b, nv, 3*npe)
+    point_vq = self._point_velocity_qpos_jacobian(
+        self.descriptor.nodebodyid[node_ids], x, jac, qvel, poses)
+    dv = point_vq.permute(0, 3, 1, 2)
+    dv_local = torch.einsum("bji,bqnj->bqni", R, dv)
+    z = v_local
+    zq = torch.einsum("bqij,bnj->bqni", Omega, z)
+    dvel = (dv_local - zq).reshape(b, nv, 3*npe)
+    dlocal = torch.zeros_like(ddisp)
+    if spring:
+      dlocal += torch.einsum("ij,bqj->bqi", K, ddisp)
+    if damper and damping:
+      dlocal += damping * torch.einsum("ij,bqj->bqi", K, dvel)
+    dlocal = dlocal.reshape(b, nv, npe, 3)
+    rotating_force = torch.einsum("bqij,bnj->bqni", Omega, local_force)
+    df_world = torch.einsum(
+        "bij,bqnj->bqni", R, dlocal + rotating_force)
+    self._stiffness_tangent[:, :nv, :nv].add_(
+        torch.einsum("bndv,bqnd->bvq", jac, df_world))
+
+    if damper and damping:
+      # d(J'F)/d qvel = J' R (cK) R' J; dJ is configuration-dependent only.
+      K4 = K.reshape(npe, 3, npe, 3)
+      Krot = torch.einsum("bda,namc,bec->bndme", R, K4, R)
+      Krot = Krot.reshape(b, 3*npe, 3*npe)
+      Jflat = jac.reshape(b, 3*npe, nv)
+      damping_tangent = damping * torch.einsum(
+          "bdn,bde,bem->bnm", Jflat, Krot, Jflat)
+      self._damping_tangent[:, :nv, :nv].add_(damping_tangent)
 
   @staticmethod
   def _shape_phi(s, index, order):
@@ -1212,7 +1358,152 @@ class MetalFlex:
     q[:, 1:] *= -1
     return q
 
-  def _compute_interpolated_shell_bend(self, poses):
+  @staticmethod
+  def _quaternion_derivative(quat, Omega):
+    """Directional quaternion derivative for ``dR = R * Omega``."""
+    omega = torch.stack((Omega[:, :, 2, 1], Omega[:, :, 0, 2],
+                         Omega[:, :, 1, 0]), dim=-1)
+    q = quat[:, None, :].expand(-1, omega.shape[1], -1)
+    qw, qv = q[..., :1], q[..., 1:]
+    dqw = -0.5 * torch.sum(qv * omega, dim=-1, keepdim=True)
+    dqv = 0.5 * (qw * omega + torch.cross(qv, omega, dim=-1))
+    return torch.cat((dqw, dqv), dim=-1)
+
+  def _shell_face_rotation_tangent(self, face_id, x, jac):
+    order = self._shell_face_order_host[face_id]
+    axes = self._shell_face_axes_host[face_id]
+    grad = torch.as_tensor(
+        self._interp_shape_gradient(order, shell=True),
+        dtype=x.dtype, device=self._device)
+    Fparam = torch.einsum("bnd,nk->bdk", x, grad)
+    dFparam = torch.einsum("bndv,nk->bdkv", jac, grad)
+    F = torch.zeros_like(Fparam)
+    F[:, :, axes[0]] = Fparam[:, :, 0]
+    F[:, :, axes[1]] = Fparam[:, :, 1]
+    t0, t1 = Fparam[:, :, 0], Fparam[:, :, 1]
+    F[:, :, axes[2]] = torch.cross(t0, t1, dim=-1)
+    dF = torch.zeros((x.shape[0], 3, 3, self.descriptor.nv),
+                     dtype=x.dtype, device=self._device)
+    dF[:, :, axes[0], :] = dFparam[:, :, 0, :]
+    dF[:, :, axes[1], :] = dFparam[:, :, 1, :]
+    dt0, dt1 = dFparam[:, :, 0, :], dFparam[:, :, 1, :]
+    dnormal = (torch.cross(dt0, t1[:, :, None].expand_as(dt0), dim=1)
+               + torch.cross(t0[:, :, None].expand_as(dt1), dt1, dim=1))
+    dF[:, :, axes[2], :] = dnormal
+    quat, _R, Omega = self._polar_frame_tangent(F, dF)
+    return quat, self._quaternion_derivative(quat, Omega)
+
+  def _compute_shell_bend_material_tangent(self, record, qvel):
+    """Differentiate the CR normal-jump force through normals and corotation."""
+    if qvel is None or self.descriptor.nv <= 0:
+      return
+    face_a, face_b, local, stiffness, dn0, _damping = record
+    if stiffness == 0:
+      return
+    xa, ta0, ta1, na_raw, grada = self._face_normal_frame(face_a, local[:2])
+    xb, tb0, tb1, nb_raw, gradb = self._face_normal_frame(face_b, local[2:])
+    ida = np.asarray(self._shell_face_nodes_host[face_a], dtype=np.int32)
+    idb = np.asarray(self._shell_face_nodes_host[face_b], dtype=np.int32)
+    ja = self._node_J[:, torch.as_tensor(ida, dtype=torch.long, device=self._device), :, :]
+    jb = self._node_J[:, torch.as_tensor(idb, dtype=torch.long, device=self._device), :, :]
+    grada_np, gradb_np = grada, gradb
+    ga0 = torch.as_tensor([g[0] for g in grada_np], dtype=xa.dtype, device=self._device)
+    ga1 = torch.as_tensor([g[1] for g in grada_np], dtype=xa.dtype, device=self._device)
+    gb0 = torch.as_tensor([g[0] for g in gradb_np], dtype=xb.dtype, device=self._device)
+    gb1 = torch.as_tensor([g[1] for g in gradb_np], dtype=xb.dtype, device=self._device)
+
+    def normal_tangent(x, jac, t0, t1, raw, g0, g1):
+      dt0 = torch.einsum("bndv,n->bdv", jac, g0).permute(0, 2, 1)
+      dt1 = torch.einsum("bndv,n->bdv", jac, g1).permute(0, 2, 1)
+      draw = (torch.cross(dt0, t1[:, None, :].expand_as(dt0), dim=-1)
+              + torch.cross(t0[:, None, :].expand_as(dt1), dt1, dim=-1))
+      length = torch.linalg.vector_norm(raw, dim=-1).clamp_min(1e-15)
+      normal = raw / length[:, None]
+      dlength = torch.sum(normal[:, None, :] * draw, dim=-1)
+      dnormal = (draw - normal[:, None, :] * torch.sum(
+          normal[:, None, :] * draw, dim=-1, keepdim=True)) / length[:, None, None]
+      return length, normal, dt0, dt1, dlength, dnormal
+
+    lena, na, dta0, dta1, dlena, dna = normal_tangent(
+        xa, ja, ta0, ta1, na_raw, ga0, ga1)
+    lenb, nb, dtb0, dtb1, dlenb, dnb = normal_tangent(
+        xb, jb, tb0, tb1, nb_raw, gb0, gb1)
+    qa, dqa = self._shell_face_rotation_tangent(face_a, xa, ja)
+    qb, dqb = self._shell_face_rotation_tangent(face_b, xb, jb)
+    qa = qa.clone()
+    qb = qb.clone()
+    qa[:, 1:] *= -1
+    qb[:, 1:] *= -1
+    dqa = dqa.clone()
+    dqb = dqb.clone()
+    dqa[:, :, 1:] *= -1
+    dqb[:, :, 1:] *= -1
+    same = (qa * qb).sum(dim=-1, keepdim=True) >= 0
+    sign = torch.where(same, 1.0, -1.0)
+    qb = qb * sign
+    dqb = dqb * sign[:, None, :]
+    qsum = qa + qb
+    qnorm = torch.linalg.vector_norm(qsum, dim=-1, keepdim=True).clamp_min(1e-15)
+    qavg = qsum / qnorm
+    dqsum = dqa + dqb
+    dqavg = (dqsum - qavg[:, None, :] * torch.sum(
+        qavg[:, None, :] * dqsum, dim=-1, keepdim=True)) / qnorm[:, None, :]
+    qworld = qavg.clone()
+    qworld[:, 1:] *= -1
+    dqworld = dqavg.clone()
+    dqworld[:, :, 1:] *= -1
+    dn0_tensor = torch.as_tensor(dn0, dtype=xa.dtype, device=self._device)
+    dnrot = self._quat_rotate(qworld, dn0_tensor[None, None, :])[:, 0]
+    qv, qw = qworld[:, None, 1:], qworld[:, None, :1]
+    dqv, dqw = dqworld[..., 1:], dqworld[..., :1]
+    inner = torch.cross(qv.expand(-1, self.descriptor.nv, -1),
+                        dn0_tensor[None, None, :].expand_as(dqv), dim=-1)
+    inner += qw * dn0_tensor[None, None, :]
+    dinner = torch.cross(dqv, dn0_tensor[None, None, :].expand_as(dqv), dim=-1)
+    dinner += dqw * dn0_tensor[None, None, :]
+    d_dnrot = 2.0 * (torch.cross(dqv, inner, dim=-1)
+                     + torch.cross(qv.expand_as(dqv), dinner, dim=-1))
+    residual = na - nb - dnrot
+    dresidual = dna - dnb - d_dnrot
+
+    def differentiate_weight(normal, length, dnormal, dlength, residual, dresidual):
+      dot = torch.sum(normal * residual, dim=-1)
+      ddot = (torch.sum(dnormal * residual[:, None, :], dim=-1)
+              + torch.sum(normal[:, None, :] * dresidual, dim=-1))
+      numerator = residual - normal * dot[:, None]
+      dnumerator = (dresidual - dnormal * dot[:, None, None]
+                    - normal[:, None, :] * ddot[:, :, None])
+      weight = numerator / length[:, None]
+      dweight = (dnumerator / length[:, None, None]
+                 - numerator[:, None, :] * dlength[:, :, None]
+                 / length[:, None, None].square())
+      return weight, dweight
+
+    wa, dwa = differentiate_weight(na, lena, dna, dlena, residual, dresidual)
+    wb, dwb = differentiate_weight(nb, lenb, dnb, dlenb, residual, dresidual)
+    fda = []
+    for n, (g0, g1) in enumerate(grada_np):
+      df = stiffness * (
+          g0 * (torch.cross(dwa, ta1[:, None, :], dim=-1)
+                + torch.cross(wa[:, None, :], dta1, dim=-1))
+          - g1 * (torch.cross(dwa, ta0[:, None, :], dim=-1)
+                  + torch.cross(wa[:, None, :], dta0, dim=-1)))
+      fda.append(df)
+    fdb = []
+    for n, (g0, g1) in enumerate(gradb_np):
+      df = -stiffness * (
+          g0 * (torch.cross(dwb, tb1[:, None, :], dim=-1)
+                + torch.cross(wb[:, None, :], dtb1, dim=-1))
+          - g1 * (torch.cross(dwb, tb0[:, None, :], dim=-1)
+                  + torch.cross(wb[:, None, :], dtb0, dim=-1)))
+      fdb.append(df)
+    dfa = torch.stack(fda, dim=2)
+    dfb = torch.stack(fdb, dim=2)
+    self._stiffness_tangent[:, :self.descriptor.nv, :self.descriptor.nv].add_(
+        torch.einsum("bndv,bqnd->bvq", ja, dfa)
+        + torch.einsum("bndv,bqnd->bvq", jb, dfb))
+
+  def _compute_interpolated_shell_bend(self, qvel, poses):
     """Pinned CR normal-jump force for interpolated shell edges."""
     spring = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
     if not spring:
@@ -1257,6 +1548,8 @@ class MetalFlex:
     self._add_attachment_tangent(
         self.descriptor.nodebodyid, self._node_xpos, self._node_J,
         node_force, poses)
+    for record in self._shell_bend_records_host:
+      self._compute_shell_bend_material_tangent(record, qvel)
 
   def _compute_pinned_stretch(self, poses, qvel):
     """Evaluate MuJoCo 3.10's compiled simplex stiffness representation."""

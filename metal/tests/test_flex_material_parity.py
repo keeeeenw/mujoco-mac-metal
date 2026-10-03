@@ -434,6 +434,43 @@ def test_interpolated_q2_volume_uses_compiled_element_matrix():
   np.testing.assert_allclose(force, data.qfrc_passive, rtol=3e-4, atol=1e-5)
 
 
+@pytest.mark.parametrize(("count", "dof"), [("2 2 2", "trilinear"),
+                                              ("3 3 3", "quadratic")])
+def test_interpolated_volume_analytic_tangent_matches_qpos_difference(count, dof):
+  model = mujoco.MjModel.from_xml_string(f"""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      <flexcomp name="volume" type="grid" count="{count}"
+                spacing=".1 .1 .1" mass="1" dim="3" dof="{dof}">
+        <contact contype="0" conaffinity="0" selfcollide="none"/>
+        <elasticity young="1000" poisson=".2" damping=".1"/>
+      </flexcomp>
+    </worldbody></mujoco>
+  """)
+  qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+  qpos[3] += 0.02
+  qvel = np.linspace(-0.03, 0.04, model.nv)
+  _, _, _, damping_tangent, tangent = _evaluate(model, qpos, qvel)
+  eps = 2e-3
+  qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
+  qpos_hi[3] += eps
+  qpos_lo[3] -= eps
+  _, _, force_hi, _, _ = _evaluate(model, qpos_hi, qvel)
+  _, _, force_lo, _, _ = _evaluate(model, qpos_lo, qvel)
+  numerical = (force_hi - force_lo) / (2 * eps)
+  np.testing.assert_allclose(
+      tangent.detach().numpy()[0, :, 3], numerical,
+      rtol=2e-2, atol=4e-3)
+  qvel_hi, qvel_lo = qvel.copy(), qvel.copy()
+  qvel_hi[3] += eps
+  qvel_lo[3] -= eps
+  _, _, force_vhi, _, _ = _evaluate(model, qpos, qvel_hi)
+  _, _, force_vlo, _, _ = _evaluate(model, qpos, qvel_lo)
+  numerical_damping = (force_vhi - force_vlo) / (2 * eps)
+  np.testing.assert_allclose(
+      damping_tangent[:, 3], numerical_damping,
+      rtol=2e-2, atol=4e-3)
+
+
 def test_mps_interpolated_q1_shell_bending_matches_pinned_cpu():
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -491,11 +528,21 @@ def test_interpolated_q1_shell_bending_matches_pinned_cpu():
   qpos[3] += 0.02
   qpos[-1] -= 0.015
   qvel = np.linspace(-0.03, 0.04, model.nv)
-  data, flex, force, _, _ = _evaluate(model, qpos, qvel)
+  data, flex, force, _, tangent = _evaluate(model, qpos, qvel)
   assert flex._shell_bend_count > 0
   assert np.max(np.abs(data.qfrc_passive)) > 1e-5
   # Pinned 3.10 warns and leaves interpolated shell bending damping disabled.
   np.testing.assert_allclose(force, data.qfrc_passive, rtol=2e-4, atol=2e-7)
+  eps = 2e-3
+  qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
+  qpos_hi[3] += eps
+  qpos_lo[3] -= eps
+  _, _, force_hi, _, _ = _evaluate(model, qpos_hi, qvel)
+  _, _, force_lo, _, _ = _evaluate(model, qpos_lo, qvel)
+  numerical = (force_hi - force_lo) / (2 * eps)
+  np.testing.assert_allclose(
+      tangent.detach().numpy()[0, :, 3], numerical,
+      rtol=3e-2, atol=5e-3)
 
 
 def test_mixed_flexes_keep_compiled_material_offsets_and_zero_material():
