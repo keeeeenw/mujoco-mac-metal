@@ -1326,6 +1326,14 @@ inline int collide_hfield(
     int gih, int gio,
     device const float* hull, device const int* hull_info);
 
+// Milestone 013 SDF: Halton-seeded gradient-descent contacts vs analytic
+// geoms and SDF-vs-SDF (pinned mjc_SDF). SDF side second (canonical t2).
+inline int collide_sdf(
+    int t1, float3 p1, float4 q1, float3 sz1,
+    float3 p2, float4 q2,
+    int gi1, int gi2, int maxn, thread ContactGeom* con,
+    device const float* hull, device const int* hull_info);
+
 // Unified Pair Dispatcher
 inline int collide_pair(
     int type1, float3 p1, float4 q1, float3 sz1, float rb1,
@@ -1405,6 +1413,23 @@ inline int collide_pair(
     // Hfield is canonical t1; maxn is this pair's contact-slot budget.
     n = collide_hfield(pos1, quat1, t2, pos2, quat2, size2, r2,
                        margin, maxn, con, gi1, gi2, hull, hull_info);
+  } else if (t1 == 0 && t2 == 8) {
+    // Milestone 013: plane-SDF pairs yield no contacts (pinned driver).
+    n = 0;
+  } else if (t1 == 1 && t2 == 8) {
+    // Milestone 013: heightfield-SDF is unsupported upstream (warns and
+    // returns 0); lowering reserves zero slots for these pairs.
+    n = 0;
+  } else if ((t1 == 2 || t1 == 3 || t1 == 4 || t1 == 5 || t1 == 6) && t2 == 8) {
+    // Milestone 013: SDF vs analytic via Halton/descent (pinned mjc_SDF).
+    // Mesh-SDF is rejected at lowering (BVH+FPS follow-up); maxn carries
+    // the pair's seed budget (== opt.sdf_initpoints here).
+    n = collide_sdf(t1, pos1, quat1, size1, pos2, quat2,
+                    gi1, gi2, maxn, con, hull, hull_info);
+  } else if (t1 == 8 && t2 == 8) {
+    // Milestone 013: SDF-vs-SDF uses the same descent path.
+    n = collide_sdf(t1, pos1, quat1, size1, pos2, quat2,
+                    gi1, gi2, maxn, con, hull, hull_info);
   }
 
   // If order was swapped, normal points from pos1 to pos2, which is from original geom2 to geom1.
