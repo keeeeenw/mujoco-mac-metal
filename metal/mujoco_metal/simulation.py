@@ -1610,8 +1610,12 @@ class MetalSimulation:
     cc = getattr(self, "_coupled_constraints", None)
     for _ in range(int(steps)):
       pre_step_gen = state.generation
-      pre_step_time = state.time.cpu().numpy().copy()
-      pre_warm = cc.get_warmstart().copy() if cc is not None and int(cc.descriptor.nr) > 0 else None
+      pre_step_time = state._time.clone()
+      pre_warm = None
+      if cc is not None and int(cc.descriptor.nr) > 0:
+        nr = int(cc.descriptor.nr)
+        w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, nr * nr + 7 * nr)
+        pre_warm = w_dbg[:, nr * nr + 3 * nr:nr * nr + 4 * nr].clone()
       pre_sens = self._sensordata.clone() if self._sensordata is not None else None
       if self._rk4 is not None:
         if self._sensors is not None:
@@ -1628,10 +1632,10 @@ class MetalSimulation:
             lambda q, v: self._acceleration(q, v)[:2],
         )
         success = status == 0
-        state._qpos = qpos.clone()
-        state._qvel = qvel.clone()
+        state._qpos = torch.where(success.unsqueeze(1), qpos, state._qpos)
+        state._qvel = torch.where(success.unsqueeze(1), qvel, state._qvel)
         state._qacc = torch.where(success[:, None], acceleration, state._qacc)
-        state._time = time.clone()
+        state._time = torch.where(success, time, state._time)
         state._status = status.clone()
         state._generation += 1
         if not bool(torch.all(success)):
@@ -1641,9 +1645,11 @@ class MetalSimulation:
             else:
               self._sensordata.mul_(success.unsqueeze(1).float())
           if pre_warm is not None and cc is not None:
-            failed_ids = torch.nonzero(~success).squeeze(1).cpu().numpy()
-            if failed_ids.size > 0:
-              cc.set_warmstart(pre_warm[failed_ids], env_ids=failed_ids)
+            failed_mask = ~success
+            nr = int(cc.descriptor.nr)
+            w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, nr * nr + 7 * nr)
+            slice_w = w_dbg[:, nr * nr + 3 * nr:nr * nr + 4 * nr]
+            slice_w.copy_(torch.where(failed_mask.unsqueeze(1), pre_warm, slice_w))
         if getattr(self, "_last_coupled", None) is not None:
           self._accepted_step = {
               "system": _clone_system_dict(self._last_coupled),
@@ -1725,9 +1731,24 @@ class MetalSimulation:
           state._qacc,
           out=self._next_qacc,
       )
-      self._next_qpos.copy_(qpos)
-      self._next_qvel.copy_(qvel)
-      self._next_time.copy_(time)
+      torch.where(
+          self._success.unsqueeze(1),
+          qpos,
+          state._qpos,
+          out=self._next_qpos,
+      )
+      torch.where(
+          self._success.unsqueeze(1),
+          qvel,
+          state._qvel,
+          out=self._next_qvel,
+      )
+      torch.where(
+          self._success,
+          time,
+          state._time,
+          out=self._next_time,
+      )
       self._next_status.copy_(status)
       if self._actuators is not None and getattr(state, "_na", 0) > 0:
         self._advance_activations(state)
@@ -1752,9 +1773,11 @@ class MetalSimulation:
           else:
             self._sensordata.mul_(self._success.unsqueeze(1).float())
         if pre_warm is not None and cc is not None:
-          failed_ids = torch.nonzero(~self._success).squeeze(1).cpu().numpy()
-          if failed_ids.size > 0:
-            cc.set_warmstart(pre_warm[failed_ids], env_ids=failed_ids)
+          failed_mask = ~self._success
+          nr = int(cc.descriptor.nr)
+          w_dbg = cc._workspace["workspace_debug"].reshape(self.batch_size, nr * nr + 7 * nr)
+          slice_w = w_dbg[:, nr * nr + 3 * nr:nr * nr + 4 * nr]
+          slice_w.copy_(torch.where(failed_mask.unsqueeze(1), pre_warm, slice_w))
 
       # Accepted step record (R03/R04): exact immutable snapshot of the solved system
       if getattr(self, "_last_coupled", None) is not None:

@@ -71,40 +71,128 @@ def test_disabled_actuation_preserves_activation_gpu():
                              np.asarray(d.qpos), rtol=1e-5, atol=1e-6)
 
 
+def _failure_atomicity_model():
+  return mujoco.MjModel.from_xml_string(
+      "<mujoco><option timestep='0.002' integrator='Euler' iterations='5'/>"
+      "<worldbody>"
+      "<geom name='floor' type='plane' size='5 5 0.1'/>"
+      "<body pos='0 0 0.09'>"
+      "<joint name='j' type='slide' axis='0 0 1'/>"
+      "<geom type='sphere' size='0.1' mass='0.5'/>"
+      "<site name='s'/>"
+      "</body>"
+      "<body pos='0.5 0 0.5'>"
+      "<joint name='h' type='hinge' axis='0 0 1'/>"
+      "<geom type='sphere' size='0.1' mass='0.5'/>"
+      "</body>"
+      "</worldbody>"
+      "<actuator>"
+      "<general name='g' joint='h' dyntype='filter' gainprm='2' biasprm='0 -2 0'/>"
+      "</actuator>"
+      "<sensor>"
+      "<touch site='s'/>"
+      "<jointpos joint='h'/>"
+      "</sensor>"
+      "</mujoco>")
+
+
 @_needs_gpu()
-def test_failed_world_keeps_activation_and_state_gpu():
+@pytest.mark.parametrize("fail_stage", ["force", "constraint", "integration"])
+def test_failed_world_rolls_back_sensors_warmstarts_and_state_gpu(fail_stage):
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
   from mujoco_metal.simulation import MetalSimulation
-  model = _filter_model(disabled=False)
+  model = _failure_atomicity_model()
   assert model.na == 1
   sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
-  sim.reset(qpos=np.array([[0.1], [0.2]], dtype=np.float32),
-            qvel=np.zeros((2, model.nv), dtype=np.float32),
-            act=np.array([[0.3], [0.4]], dtype=np.float32))
-  sim.step(2, ctrl=np.array([[0.5], [0.5]], dtype=np.float32))
-  healthy_act = sim.state._act.cpu().numpy().copy()
-  healthy_qpos = sim.state.qpos.cpu().numpy().copy()
-  # Inject a force-evaluation failure into world 1 only (NaN state).
-  bad = sim.state._qpos.cpu().numpy()
-  bad[1, 0] = np.nan
-  sim.state._qpos.copy_(sim.state._torch.as_tensor(bad))
-  sim.step(1, ctrl=np.array([[0.5], [0.5]], dtype=np.float32))
-  status = sim.state._status.cpu().numpy()
-  assert int(status[1]) != 0
-  after_act = sim.state._act.cpu().numpy()
-  after_qpos = sim.state.qpos.cpu().numpy()
-  # Failed world: activation and observable state exactly preserved.
-  assert after_act[1, 0] == healthy_act[1, 0]
-  assert np.array_equal(after_qpos[1], healthy_qpos[1], equal_nan=True) or \
-      np.all(~np.isfinite(after_qpos[1]))
-  # Healthy world: kept advancing (finite and moved).
-  assert bool(np.all(np.isfinite(after_qpos[0])))
-  assert not np.array_equal(after_qpos[0], healthy_qpos[0])
-  # Recovery: reset the failed world, both advance again.
+  sim.reset(act=np.array([[0.3], [0.4]], dtype=np.float32))
+
+  # Establish nonzero state, activation, warmstart seeds, and sensor samples
+  for _ in range(20):
+    sim.step(1, ctrl=np.array([[1.0], [1.0]], dtype=np.float32))
+
+  w0_warm = sim._coupled_constraints.get_warmstart().copy()
+  w0_sens = sim.step_sensordata().copy()
+  w0_act = sim.state._act.cpu().numpy().copy()
+  w0_qpos = sim.state.qpos.cpu().numpy().copy()
+  w0_qvel = sim.state.qvel.cpu().numpy().copy()
+  w0_qacc = sim.state.qacc.cpu().numpy().copy()
+  w0_time = sim.state.time.cpu().numpy().copy()
+
+  assert np.linalg.norm(w0_warm[1]) > 0
+  assert np.linalg.norm(w0_sens[1]) > 0
+  assert np.linalg.norm(w0_act[1]) > 0
+  assert bool(np.all(np.isfinite(w0_qpos)))
+
+  # Inject failure into world 1 specifically at the selected pipeline stage
+  if fail_stage == "force":
+    orig_solver = sim._solver.run_device
+    def fail_solver(mass, rhs):
+      acc, st = orig_solver(mass, rhs)
+      st = st.clone()
+      st[1] = 3
+      return acc, st
+    sim._solver.run_device = fail_solver
+  elif fail_stage == "constraint":
+    orig_cc = sim._coupled_constraints.run_device
+    def fail_cc(*args, **kwargs):
+      coupled = orig_cc(*args, **kwargs)
+      st = coupled["status"].clone()
+      st[1] = 4
+      coupled["status"] = st
+      return coupled
+    sim._coupled_constraints.run_device = fail_cc
+  elif fail_stage == "integration":
+    orig_int = sim._integrator.run_device
+    def fail_int(*args, **kwargs):
+      qpos, qvel, time, st = orig_int(*args, **kwargs)
+      st = st.clone()
+      st[1] = 5
+      return qpos, qvel, time, st
+    sim._integrator.run_device = fail_int
+
+  sim.step(1, ctrl=np.array([[1.0], [1.0]], dtype=np.float32))
+
+  # 1. World 1 status is non-zero
+  status = sim.state.status.cpu().numpy()
+  assert status[1] != 0
+  assert status[0] == 0
+
+  # 2. Failed world 1: exact preservation of persistent state, sensors, and warmstarts
+  np.testing.assert_array_equal(sim.state.qpos.cpu().numpy()[1], w0_qpos[1])
+  np.testing.assert_array_equal(sim.state.qvel.cpu().numpy()[1], w0_qvel[1])
+  np.testing.assert_array_equal(sim.state.qacc.cpu().numpy()[1], w0_qacc[1])
+  np.testing.assert_array_equal(sim.state.time.cpu().numpy()[1], w0_time[1])
+  np.testing.assert_array_equal(sim.state._act.cpu().numpy()[1], w0_act[1])
+  np.testing.assert_array_equal(sim.step_sensordata()[1], w0_sens[1])
+  np.testing.assert_array_equal(sim._coupled_constraints.get_warmstart()[1], w0_warm[1])
+
+  # 3. Healthy world 0: advanced normally
+  assert sim.state.time.cpu().numpy()[0] > w0_time[0]
+  assert not np.array_equal(sim.state.qpos.cpu().numpy()[0], w0_qpos[0])
+  assert not np.array_equal(sim.step_sensordata()[0], w0_sens[0])
+
+  # 4. Sticky failure status: removing injection still keeps world 1 frozen
+  if fail_stage == "force":
+    sim._solver.run_device = orig_solver
+  elif fail_stage == "constraint":
+    sim._coupled_constraints.run_device = orig_cc
+  elif fail_stage == "integration":
+    sim._integrator.run_device = orig_int
+
+  sim.step(1, ctrl=np.array([[1.0], [1.0]], dtype=np.float32))
+  assert sim.state.status.cpu().numpy()[1] != 0
+  np.testing.assert_array_equal(sim.state.qpos.cpu().numpy()[1], w0_qpos[1])
+  np.testing.assert_array_equal(sim.state.time.cpu().numpy()[1], w0_time[1])
+  np.testing.assert_array_equal(sim.step_sensordata()[1], w0_sens[1])
+  np.testing.assert_array_equal(sim._coupled_constraints.get_warmstart()[1], w0_warm[1])
+
+  # 5. Recovery upon reset of failed world
   sim.reset(env_ids=[1])
-  sim.step(1, ctrl=np.array([[0.5], [0.5]], dtype=np.float32))
-  assert bool(np.all(np.isfinite(sim.state.qpos.cpu().numpy())))
+  assert sim.state.status.cpu().numpy()[1] == 0
+  sim.step(1, ctrl=np.array([[1.0], [1.0]], dtype=np.float32))
+  assert bool(np.all(sim.state.status.cpu().numpy() == 0))
+  assert not np.array_equal(sim.state.qpos.cpu().numpy()[1], w0_qpos[1])
 
 
 def _contact_model(with_acc_sensors=False):
