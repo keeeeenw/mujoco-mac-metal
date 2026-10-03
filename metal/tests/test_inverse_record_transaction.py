@@ -77,7 +77,10 @@ def test_query_restores_legacy_row_producers_and_combined_scratch(fail):
   combined = torch.arange(18, dtype=torch.float32).reshape(2, 3, 3)
   rhs = torch.tensor([[.2, .4], [.6, .8]])
   sim = SimpleNamespace(_contact=contact, _joint_constraints=joint,
-      _legacy_canonical_rows=combined, _legacy_constraint_rhs=rhs)
+      _legacy_canonical_rows=combined, _legacy_constraint_rhs=rhs,
+      _component_solution_vector=torch.tensor([[.1, .3], [.5, .7]]))
+  vector_owner = sim._component_solution_vector
+  vector_before = vector_owner.clone()
   saved = [value.clone() for value in
            (contact_rows, joint_rows, detection['pos'], combined, rhs)]
   def query():
@@ -91,6 +94,8 @@ def test_query_restores_legacy_row_producers_and_combined_scratch(fail):
       combined.fill_(8)
       sim._legacy_canonical_rows = None
       rhs.add_(6)
+      sim._component_solution_vector.fill_(9)
+      sim._component_solution_vector = torch.zeros_like(vector_owner)
       if fail:
         raise RuntimeError('legacy row query failed')
   if fail:
@@ -103,6 +108,8 @@ def test_query_restores_legacy_row_producers_and_combined_scratch(fail):
   assert joint._outputs['canonical_rows'] is joint_rows
   assert sim._legacy_canonical_rows is combined
   assert sim._legacy_constraint_rhs is rhs
+  assert sim._component_solution_vector is vector_owner
+  torch.testing.assert_close(vector_owner, vector_before, rtol=0, atol=0)
   for actual, expected in zip(
       (contact_rows, joint_rows, detection['pos'], combined, rhs), saved):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
