@@ -23,3 +23,5 @@ kernel void assemble_implicit_mass(
   // that authoritative lower triangle so the dense LDL/Cholesky input is SPD.
   effective_mass[tid]=mass[tid]-timestep[0]*force_velocity_derivative[derivative_index];
 }
+
+

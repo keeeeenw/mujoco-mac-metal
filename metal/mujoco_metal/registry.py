@@ -596,10 +596,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-INT-002", "full implicit integrator",
-        Stage.INTEGRATION, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "constant-damping implicitfast shortcut must not cover it",
-        "engine/engine_forward.c", "reject mjINT_IMPLICIT outside guards",
-        "none", "015", (),
+        Stage.INTEGRATION, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
+        Execution.DEVICE, "nonsymmetric LU solve with automatic passive, tendon, fluid and Coriolis derivatives",
+        "mujoco_metal/implicit.py:ImplicitProgram", "admit mjINT_IMPLICIT in contact_free_implicit_v1 and integrated_implicit_v1",
+        "MetalSimulation", "015", ("test_implicit_015.py", "test_implicit_derivative_repair.py"),
         enums=("mjtIntegrator.mjINT_IMPLICIT",),
     ),
     # Jacobian/sparse options.

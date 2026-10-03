@@ -34,7 +34,7 @@ renderer), not future physics work.
 | REQ-CON-002 | nine valid primitive contact pairs | device | native_gpu/gpu_qualified | baseline | plane-plane yields nothing; cylinder/ellipsoid/mesh/hfield/SDF pairs per owning milestones | accept the 9 primitive pairs | test_primitive_collision_qualification.py |
 | REQ-CON-003 | anisotropic sliding/torsional/rolling friction | device | native_gpu/gpu_qualified | baseline | five-coefficient friction expansion with pair mixing | accept finite friction rows | test_coupled_constraints.py |
 | REQ-INT-001 | Euler/RK4/implicitfast bounded profiles | device | native_gpu/gpu_qualified | baseline | per-profile supported combinations only | accept listed profile/integrator pairs | test_integration.py |
-| REQ-INT-002 | full implicit integrator | none | not_implemented/unqualified | 015 | constant-damping implicitfast shortcut must not cover it | reject mjINT_IMPLICIT outside guards | — |
+| REQ-INT-002 | full implicit integrator | device | native_gpu/gpu_qualified | 015 | nonsymmetric LU solve with automatic passive, tendon, fluid and Coriolis derivatives | admit mjINT_IMPLICIT in contact_free_implicit_v1 and integrated_implicit_v1 | test_implicit_015.py, test_implicit_derivative_repair.py |
 | REQ-JAC-001 | dense Jacobians | device | native_gpu/gpu_qualified | baseline | native pipeline is dense | accept dense | test_coupled_constraints.py |
 | REQ-JAC-002 | sparse/auto Jacobians | none | not_implemented/unqualified | 017 | no sparse path; auto must not silently select one | reject sparse | — |
 | REQ-SOL-001 | PGS/Newton selector mapping | device | native_gpu/gpu_qualified | baseline | accepted names run the native projected solver, documented as a mapping | accept PGS/Newton as mapped | test_coupled_constraints.py |

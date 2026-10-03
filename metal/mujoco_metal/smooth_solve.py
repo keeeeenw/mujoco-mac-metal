@@ -135,3 +135,12 @@ class MetalDenseSolve:
           : self.batch_size * self.nv * self.nrhs
       ].reshape(self.batch_size, self.nv, self.nrhs)
     return solution, self._status
+
+
+class MetalGeneralDenseSolve(MetalDenseSolve):
+  """Reusable dense nonsymmetric LU factorization and solve stage on MPS."""
+
+  def __init__(self, nv: int, batch_size: int, nrhs: int = 1):
+    super().__init__(nv, batch_size, nrhs)
+    self._kernel = self._library.dense_general_solve
+

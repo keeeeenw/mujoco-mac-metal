@@ -160,3 +160,114 @@ kernel void dense_spd_solve(
   }
   status[world] = int(failed);
 }
+
+kernel void dense_general_solve(
+    device const float* matrix [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* factor [[buffer(2)]],
+    device float* solution [[buffer(3)]],
+    device int* status [[buffer(4)]],
+    constant int* dims [[buffer(5)]],
+    uint world [[thread_position_in_grid]]) {
+  uint nv = uint(dims[0]);
+  uint batch = uint(dims[1]);
+  uint nrhs = uint(dims[2]);
+  if (world >= batch) return;
+
+  uint mat_base = world * nv * nv;
+  uint rhs_base = world * nv * nrhs;
+  uint failed = 0;
+
+  for (uint i = 0; i < nv * nrhs; ++i) solution[rhs_base + i] = 0.0f;
+
+  for (uint i = 0; i < nv * nv; ++i) {
+    if (!finite_float(matrix[mat_base + i])) { failed = 1; break; }
+  }
+  for (uint i = 0; i < nv * nrhs; ++i) {
+    if (!finite_float(rhs[rhs_base + i])) { failed = 1; break; }
+  }
+  if (failed != 0) {
+    status[world] = 1;
+    return;
+  }
+
+  for (uint i = 0; i < nv * nv; ++i) {
+    factor[mat_base + i] = matrix[mat_base + i];
+  }
+  for (uint i = 0; i < nv * nrhs; ++i) {
+    solution[rhs_base + i] = rhs[rhs_base + i];
+  }
+
+  // LU decomposition with partial row pivoting
+  for (uint k = 0; k < nv; ++k) {
+    uint max_row = k;
+    float max_val = abs(factor[mat_base + k * nv + k]);
+    for (uint i = k + 1; i < nv; ++i) {
+      float val = abs(factor[mat_base + i * nv + k]);
+      if (val > max_val) {
+        max_val = val;
+        max_row = i;
+      }
+    }
+    if (!(max_val > 1e-15f) || !finite_float(max_val)) {
+      failed = 3;
+      break;
+    }
+
+    if (max_row != k) {
+      for (uint j = 0; j < nv; ++j) {
+        float tmp = factor[mat_base + k * nv + j];
+        factor[mat_base + k * nv + j] = factor[mat_base + max_row * nv + j];
+        factor[mat_base + max_row * nv + j] = tmp;
+      }
+      for (uint c = 0; c < nrhs; ++c) {
+        float tmp = solution[rhs_base + k * nrhs + c];
+        solution[rhs_base + k * nrhs + c] = solution[rhs_base + max_row * nrhs + c];
+        solution[rhs_base + max_row * nrhs + c] = tmp;
+      }
+    }
+
+    float pivot = factor[mat_base + k * nv + k];
+    for (uint i = k + 1; i < nv; ++i) {
+      float factor_ik = factor[mat_base + i * nv + k] / pivot;
+      if (!finite_float(factor_ik)) { failed = 4; break; }
+      factor[mat_base + i * nv + k] = factor_ik;
+      for (uint j = k + 1; j < nv; ++j) {
+        factor[mat_base + i * nv + j] -= factor_ik * factor[mat_base + k * nv + j];
+      }
+      for (uint c = 0; c < nrhs; ++c) {
+        solution[rhs_base + i * nrhs + c] -= factor_ik * solution[rhs_base + k * nrhs + c];
+      }
+    }
+    if (failed != 0) break;
+  }
+
+  if (failed == 0) {
+    for (uint c = 0; c < nrhs; ++c) {
+      for (int i = int(nv) - 1; i >= 0; --i) {
+        float sum = solution[rhs_base + uint(i) * nrhs + c];
+        for (uint j = uint(i) + 1; j < nv; ++j) {
+          sum -= factor[mat_base + uint(i) * nv + j] * solution[rhs_base + j * nrhs + c];
+        }
+        float diag = factor[mat_base + uint(i) * nv + uint(i)];
+        if (abs(diag) < 1e-15f || !finite_float(diag)) {
+          failed = 3;
+          break;
+        }
+        float val = sum / diag;
+        if (!finite_float(val)) {
+          failed = 4;
+          break;
+        }
+        solution[rhs_base + uint(i) * nrhs + c] = val;
+      }
+      if (failed != 0) break;
+    }
+  }
+
+  if (failed != 0) {
+    for (uint i = 0; i < nv * nrhs; ++i) solution[rhs_base + i] = 0.0f;
+  }
+  status[world] = int(failed);
+}
+

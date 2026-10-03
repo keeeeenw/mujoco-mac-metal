@@ -90,7 +90,7 @@ class MetalSimulation:
     # This CPU-only contract check must finish before any constructor can
     # initialize MPS or compile a shader.
     profile = validate_stepping_profile(model, profile=profile)
-    is_integrated = profile.name in ("integrated_euler_v1", "integrated_rk4_v1")
+    is_integrated = profile.name in ("integrated_euler_v1", "integrated_rk4_v1", "integrated_implicit_v1")
     with_transmissions = "transmission" in profile.name or is_integrated
     motor_model = (
         ScalarMotorModel.from_model(model)
@@ -102,6 +102,7 @@ class MetalSimulation:
                 "joint_constraints_euler_v1",
                 "contact_free_fluid_euler_v1",
                 "contact_free_implicitfast_v1",
+                "contact_free_implicit_v1",
                 "contact_free_passive_euler_v1",
                 "contact_free_sensor_euler_v1",
                 "normal_contact_euler_v1",
@@ -239,15 +240,22 @@ class MetalSimulation:
           or "joint_constraints" in profile.name
           or "fluid" in profile.name
           or "implicitfast" in profile.name
+          or "implicit" in profile.name
           or "passive" in profile.name
           or "sensor" in profile.name
           or profile.name in ("normal_contact_euler_v1", "friction_contact_euler_v1")
       ):
         from mujoco_metal.passive import MetalPassiveForces
         self._passive = MetalPassiveForces(model)
-      if "fluid" in profile.name:
+      if "fluid" in profile.name or (
+          "implicit" in profile.name
+          and (model.opt.density > 0 or model.opt.viscosity > 0 or np.any(model.opt.wind != 0))
+      ):
         from mujoco_metal.fluid import MetalInertiaBoxFluid
         self._fluid = MetalInertiaBoxFluid(model, batch_size)
+      if model.ntendon and "implicit" in profile.name:
+        from mujoco_metal.tendons import MetalFixedTendonDynamics
+        self._tendons = MetalFixedTendonDynamics(model, batch_size, spatial_ok=True)
       if "sensor" in profile.name:
         from mujoco_metal.sensors import SensorProgram
         self._sensors = SensorProgram(model, batch_size)
@@ -269,6 +277,7 @@ class MetalSimulation:
 
     self._solver = MetalDenseSolve(descriptor.nv, batch_size)
     self._implicitfast = None
+    self._implicit = None
     self._midpoint = None
     if profile.name == "contact_free_implicitfast_v1":
       from mujoco_metal.implicit import ImplicitFastProgram
@@ -279,6 +288,10 @@ class MetalSimulation:
 
       if lower_free_body_midpoints(model).nfree:
         self._midpoint = FreeBodyMidpointProgram(model, batch_size)
+    elif profile.name in ("contact_free_implicit_v1", "integrated_implicit_v1"):
+      from mujoco_metal.implicit import ImplicitProgram
+
+      self._implicit = ImplicitProgram(model, batch_size)
     self._euler_solver = (
         MetalDenseSolve(descriptor.nv, batch_size)
         if (
@@ -310,6 +323,7 @@ class MetalSimulation:
                 "joint_constraints_euler_v1",
                 "contact_free_fluid_euler_v1",
                 "contact_free_implicitfast_v1",
+                "contact_free_implicit_v1",
                 "contact_free_passive_euler_v1",
                 "contact_free_sensor_euler_v1",
                 "normal_contact_euler_v1",
@@ -1490,7 +1504,7 @@ class MetalSimulation:
     t = time.detach().cpu().numpy() if hasattr(time, "detach") else _np.asarray(time)
     self._delay.record(self._control, t.reshape(-1), mask=mask)
 
-  def _actuation_force(self, qpos, qvel, poses, act_override=None):
+  def _actuation_force(self, qpos, qvel, poses, act_override=None, time_override=None):
     """General actuator force stage with pinned mj_fwdActuation ordering.
 
     Runs candidate-contact generation first when BODY adhesion transmissions
@@ -1499,6 +1513,7 @@ class MetalSimulation:
     dynamics/force kernel. Stashes per-step act_dot/velocity for the
     activation advance. Returns borrowed MPS qfrc_actuator.
     ``act_override`` supplies stage activation (RK4); default is live state.
+    ``time_override`` supplies per-stage query time (RK4).
     """
     actuators = self._actuators
     state = self._state
@@ -1526,7 +1541,8 @@ class MetalSimulation:
     act = act_override if act_override is not None else getattr(state, "_act", None)
     if actuators.meta.na > 0 and act is None:
       raise ValueError("activation state is missing")
-    out = actuators.run_forces(self._delayed_control(state._time), act, kin, gravcomp)
+    eval_time = time_override if time_override is not None else state._time
+    out = actuators.run_forces(self._delayed_control(eval_time), act, kin, gravcomp)
     if self._sensors is not None and self._has_acc_sensors:
       self._lazy_sensor_scratch()
       self._sen_act_force.add_(out["force"].reshape(self._sen_act_force.shape))
@@ -1652,10 +1668,11 @@ class MetalSimulation:
         lam_raw=lam, lam_nr=lam_nr, lam_stride=lam_s,
         act_force=self._sen_act_force, qfrc_act=self._sen_qfrc_act, out=out)
 
-  def _acceleration(self, qpos, qvel, act_override=None):
+  def _acceleration(self, qpos, qvel, act_override=None, time_override=None):
     mpos = getattr(self._state, "_mpos", None)
     mquat = getattr(self._state, "_mquat", None)
     dynamics = self._smooth.run_device(qpos, qvel, mpos, mquat)
+    eval_time = time_override if time_override is not None else self._state._time
     if self._sensors is not None and self._has_acc_sensors:
       self._lazy_sensor_scratch()
       self._sen_act_force.zero_()
@@ -1698,7 +1715,7 @@ class MetalSimulation:
       dynamics["mass_matrix"].add_(sarm.reshape(dynamics["mass_matrix"].shape))
     if self._transmissions is not None:
       t_qfrc = self._transmissions.run_device(
-          qpos, qvel, self._delayed_control(self._state._time))
+          qpos, qvel, self._delayed_control(eval_time))
       self._rhs.add_(t_qfrc)
       if self._sensors is not None and self._has_acc_sensors:
         self._lazy_sensor_scratch()
@@ -1707,9 +1724,10 @@ class MetalSimulation:
         self._sen_qfrc_act.add_(t_qfrc.reshape(self._sen_qfrc_act.shape))
     if self._actuators is not None:
       self._rhs.add_(self._actuation_force(qpos, qvel, dynamics["poses"],
-                                           act_override=act_override))
+                                           act_override=act_override,
+                                           time_override=eval_time))
     if self._motor is not None:
-      m_qfrc = self._motor.run_device(self._delayed_control(self._state._time))
+      m_qfrc = self._motor.run_device(self._delayed_control(eval_time))
       self._rhs.add_(m_qfrc)
       if self._sensors is not None and self._has_acc_sensors:
         self._lazy_sensor_scratch()
@@ -1800,8 +1818,8 @@ class MetalSimulation:
         na_here = int(getattr(state, "_na", 0))
         rk4_act = (state._act if (self._actuators is not None and na_here > 0)
                    else None)
-        def _rk4_accel(q, v, a):
-          acc, solve_status, _ = self._acceleration(q, v, act_override=a)
+        def _rk4_accel(q, v, a, t=None):
+          acc, solve_status, _ = self._acceleration(q, v, act_override=a, time_override=t)
           adot = self._act_dot.clone() if na_here > 0 else None
           return acc, adot, solve_status
         qpos, qvel, acceleration, weighted_dot, time, status = self._rk4.run_device(
@@ -1871,15 +1889,50 @@ class MetalSimulation:
         if bool(getattr(self._implicitfast.descriptor, "auto_derivative", False)):
           # R06/D2: natively assembled passive/tendon derivatives from the
           # stage tangents already computed above (None stages read as zero).
+          fluid_jac = None
+          if getattr(self, "_fluid", None) is not None:
+            fluid_jac = self._fluid.run_derivative_device(
+                state._qpos, state._qvel, dynamics, self._smooth
+            )
           implicit = self._implicitfast.run_device_auto(
               dynamics["mass_matrix"], self._rhs,
               getattr(self, "_damping_tangent", None)
               if getattr(self, "_passive", None) is not None else None,
               getattr(self, "_tendon_damping", None)
               if getattr(self, "_tendons", None) is not None else None,
+              fluid_jacobian=fluid_jac,
           )
         else:
           implicit = self._implicitfast.run_device(
+              dynamics["mass_matrix"], self._rhs
+          )
+        integration_acceleration = implicit["qacc"]
+        solve_status = torch.where(
+            solve_status == 0, implicit["status"], solve_status
+        )
+      elif self._implicit is not None:
+        if bool(getattr(self._implicit.descriptor, "auto_derivative", False)):
+          fluid_jac = None
+          if getattr(self, "_fluid", None) is not None:
+            fluid_jac = self._fluid.run_derivative_device(
+                state._qpos, state._qvel, dynamics, self._smooth
+            )
+          bias_deriv = None
+          if hasattr(self._smooth, "bias_derivative_device"):
+            bias_deriv = self._smooth.bias_derivative_device(
+                state._qpos, state._qvel, dynamics
+            )
+          implicit = self._implicit.run_device_auto(
+              dynamics["mass_matrix"], self._rhs,
+              getattr(self, "_damping_tangent", None)
+              if getattr(self, "_passive", None) is not None else None,
+              getattr(self, "_tendon_damping", None)
+              if getattr(self, "_tendons", None) is not None else None,
+              fluid_jacobian=fluid_jac,
+              bias_derivative=bias_deriv,
+          )
+        else:
+          implicit = self._implicit.run_device(
               dynamics["mass_matrix"], self._rhs
           )
         integration_acceleration = implicit["qacc"]

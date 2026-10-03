@@ -482,7 +482,26 @@ def test_integrated_simulation_capacity_boundary_and_overflow_rejection():
     validate_stepping_profile(mujoco.MjModel.from_xml_string(xml_nv33), profile="integrated_euler_v1")
 
   # 2. nc boundary: nc=16 accepted, nc=17 rejected
-  # 8 bodies, each with 2 geoms (16 geoms) colliding against plane
+  # 2. nc boundary: nc=32 accepted, nc=33 rejected
+  # 16 bodies, each with 2 geoms (32 geoms) with condim=1 colliding against plane
+  xml_nc32 = """<mujoco><compiler angle="radian"/><option integrator="Euler"/><worldbody>
+  <geom type="plane" size="5 5 0.1" condim="1"/>"""
+  for i in range(16):
+    xml_nc32 += f"""<body pos="{i} 0 1"><joint type="slide" axis="0 0 1"/>
+    <geom type="sphere" size="0.1" pos="0 0 0" condim="1" conaffinity="0"/>
+    <geom type="sphere" size="0.1" pos="0 0 0.5" condim="1" conaffinity="0"/>
+    </body>"""
+  xml_nc32 += "</worldbody></mujoco>"
+  d32 = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_nc32))
+  assert d32.nc == 32
+
+  xml_nc33 = xml_nc32.replace("</worldbody></mujoco>", """<body pos="20 0 1"><joint type="slide" axis="0 0 1"/>
+  <geom type="sphere" size="0.1" pos="0 0 0" condim="1" conaffinity="0"/>
+  </body></worldbody></mujoco>""")
+  with pytest.raises(ValueError, match="candidate contact pairs \\(33\\) exceeds capacity 32"):
+    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_nc33))
+
+  # 3. nr boundary: nr=96 accepted, nr=97 rejected
   xml_nc16 = """<mujoco><compiler angle="radian"/><option integrator="Euler"/><worldbody>
   <geom type="plane" size="5 5 0.1"/>"""
   for i in range(8):
@@ -491,16 +510,7 @@ def test_integrated_simulation_capacity_boundary_and_overflow_rejection():
     <geom type="sphere" size="0.1" pos="0 0 0.5" conaffinity="0"/>
     </body>"""
   xml_nc16 += "</worldbody></mujoco>"
-  d16 = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_nc16))
-  assert d16.nc == 16
 
-  xml_nc17 = xml_nc16.replace("</worldbody></mujoco>", """<body pos="10 0 1"><joint type="slide" axis="0 0 1"/>
-  <geom type="sphere" size="0.1" pos="0 0 0" conaffinity="0"/>
-  </body></worldbody></mujoco>""")
-  with pytest.raises(ValueError, match="candidate contact pairs \\(17\\) exceeds capacity 16"):
-    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_nc17))
-
-  # 3. nr boundary: nr=96 accepted, nr=97 rejected
   xml_nr96 = xml_nc16.replace("</worldbody></mujoco>", "</worldbody><equality>")
   for i in range(8):
     xml_nr96 = xml_nr96.replace(f'<body pos="{i} 0 1"><joint type="slide"', f'<body pos="{i} 0 1"><joint name="j{i}" type="slide"')

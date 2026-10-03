@@ -499,8 +499,13 @@ def validate_stepping_profile(
     lower_implicitfast(model)
     reference = copy.copy(model)
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
+    base_name = (
+        "contact_free_fluid_euler_v1"
+        if (model.opt.density != 0 or model.opt.viscosity != 0 or np.any(model.opt.wind))
+        else ("contact_free_transmission_euler_v1" if model.ntendon else "contact_free_passive_euler_v1")
+    )
     base = validate_stepping_profile(
-        reference, timestep, "contact_free_passive_euler_v1"
+        reference, timestep, base_name
     )
     return replace(
         base,
@@ -517,6 +522,40 @@ def validate_stepping_profile(
         )
         + ("full implicit integrator, nonconstant velocity derivatives",),
     )
+  if profile in ("contact_free_implicit_v1", "integrated_implicit_v1"):
+    from mujoco_metal.implicit import lower_implicit
+
+    lower_implicit(model)
+    reference = copy.copy(model)
+    reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
+    if profile == "integrated_implicit_v1":
+      base = validate_stepping_profile(
+          reference, timestep, "integrated_euler_v1"
+      )
+    else:
+      base_name = (
+          "contact_free_fluid_euler_v1"
+          if (model.opt.density != 0 or model.opt.viscosity != 0 or np.any(model.opt.wind))
+          else ("contact_free_transmission_euler_v1" if model.ntendon else "contact_free_passive_euler_v1")
+      )
+      base = validate_stepping_profile(
+          reference, timestep, base_name
+      )
+    return replace(
+        base,
+        name=profile,
+        model_fingerprint=_fingerprint(model),
+        descriptor_fingerprint=_fingerprint(load_model(model)),
+        implicit_euler_damping=False,
+        supported=base.supported
+        + (
+            "nonsymmetric implicit velocity solve with automatic force derivatives",
+        ),
+        rejected=tuple(
+            item for item in base.rejected if item != "non-Euler integrators"
+        ),
+    )
+
   if profile in ("normal_contact_euler_v1", "friction_contact_euler_v1"):
     from mujoco_metal.contact import lower_contacts
 
@@ -569,12 +608,7 @@ def validate_stepping_profile(
       raise TypeError("model must be a compiled mujoco.MjModel")
     if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_RK4):
       raise ValueError(f"{profile} requires the RK4 integrator")
-    # R06/D3: native RK4 integrates activation state at every stage.
-    if int(model.nu) > 0 and bool(np.any(np.asarray(model.actuator_history)[:, 0] != 0)):
-      # Pinned RK4 reads delayed control at per-stage times (d->time = T[i]);
-      # the native RK4 stages share the frozen step-start time. Reject
-      # rather than mis-time delayed forces (R06/D1).
-      raise ValueError(f"{profile} excludes actuator delay lines; use Euler")
+    # R06/D3: native RK4 integrates activation state and stage-correct delayed control at every stage.
     reference = copy.copy(model)
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
     result = validate_stepping_profile(

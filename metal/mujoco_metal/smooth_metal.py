@@ -72,6 +72,7 @@ class MetalSmoothDynamics:
     self._kernel = self._library.dense_mass_matrix
     self._bias_library = torch.mps.compile_shader(_BIAS_SHADER.read_text())
     self._bias_kernel = self._bias_library.smooth_bias
+    self._bias_deriv_kernel = self._bias_library.smooth_bias_derivative
     self._arrays = {
         name: torch.from_numpy(host[name]).to(self._fk._device)
         for name in _DEVICE_ARRAYS
@@ -412,3 +413,36 @@ class MetalSmoothDynamics:
         "mass_matrix": computed["mass_matrix"],
         "qfrc_bias": bias[: batch * nv].reshape(batch, nv),
     }
+
+  def bias_derivative_device(self, qpos, qvel, dynamics=None):
+    """Compute batched -d(qfrc_bias)/d(qvel) on MPS."""
+    torch = self._torch
+    batch = qpos.shape[0]
+    nv = self.model.nv
+    if nv == 0:
+      return torch.zeros((batch, 0, 0), dtype=torch.float32, device=self._fk._device)
+    if dynamics is None:
+      dynamics = self.run_device(qpos, qvel)
+    w, arrays = self._workspace, self._arrays
+    qderiv = torch.empty((batch, nv, nv), dtype=torch.float32, device=self._fk._device)
+    cdof = dynamics["cdof"] if "cdof" in dynamics else w["cdof"]
+    local_inertia = dynamics["local_inertia"] if "local_inertia" in dynamics else w["local_inertia"]
+    args = [
+        arrays["body_parentid"],
+        arrays["body_dofadr"],
+        arrays["body_dofnum"],
+        arrays["body_jntadr"],
+        arrays["body_jntnum"],
+        arrays["dof_bodyid"],
+        arrays["jnt_type"],
+        arrays["jnt_dofadr"],
+        arrays["gravity"],
+        cdof.reshape(-1),
+        local_inertia.reshape(-1),
+        w["disableflags"],
+        qvel.reshape(-1),
+        qderiv.reshape(-1),
+        w["bias_dims"],
+    ]
+    self._bias_deriv_kernel(*args, threads=(nv, batch), group_size=(1, 1))
+    return qderiv

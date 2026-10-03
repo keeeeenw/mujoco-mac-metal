@@ -47,5 +47,7 @@ def test_all_demo_models_admit_or_documented():
       f"unexpected admission outcome: new failures "
       f"{sorted(set(failures) - set(_NON_EULER_DEMOS))}, newly passing "
       f"{sorted(set(_NON_EULER_DEMOS) - set(failures))}: {failures}")
+  from mujoco_metal.capacity import BASE_MAX_PAIRS, BASE_MAX_SLOTS
   for name, counts in sorted(admitted.items()):
-    assert counts[0] <= 16 and counts[1] <= 24, (name, counts)
+    assert counts[0] <= BASE_MAX_PAIRS and counts[1] <= BASE_MAX_SLOTS, (name, counts)
+

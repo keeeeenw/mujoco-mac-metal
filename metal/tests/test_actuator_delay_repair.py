@@ -168,15 +168,15 @@ def test_delay_admission_and_config_cpu():
     pass  # bindings may reject the write itself
 
 
-def test_rk4_delay_rejected_cpu():
+def test_rk4_delay_admission_cpu():
   # Pinned RK4 reads delayed control at per-stage times; native RK4 stages
-  # share the frozen step-start time, so the combination is rejected.
+  # evaluate stage-correct delayed control (R06/D1/D3).
   import mujoco
   from mujoco_metal.stepping import validate_stepping_profile
   m = _delayed_motor_model(delay=0.004, nsample=8, interp=0)
   m.opt.integrator = int(mujoco.mjtIntegrator.mjINT_RK4)
-  with pytest.raises(ValueError, match="delay lines"):
-    validate_stepping_profile(m, 0.002, "contact_free_rk4_v1")
+  prof = validate_stepping_profile(m, 0.002, "integrated_rk4_v1")
+  assert prof is not None
 
 
 def _needs_gpu():
@@ -320,3 +320,32 @@ def test_delay_lifecycle_and_failure_gpu():
   sim2.copy_environment(0, 1)
   v = sim2._delay.snapshot()["values"].reshape(2, 1, -1)
   np.testing.assert_array_equal(v[0], v[1])
+
+
+@_needs_gpu()
+def test_rk4_delayed_step_response_gpu():
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  import mujoco
+  from mujoco_metal.simulation import MetalSimulation
+  m = _delayed_motor_model(delay=0.004, nsample=8, interp=0)
+  m.opt.integrator = int(mujoco.mjtIntegrator.mjINT_RK4)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_rk4_v1")
+  sim.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1),
+            qvel=np.zeros((1, m.nv), dtype=np.float32))
+  vels = []
+  for _ in range(6):
+    sim.step(1, ctrl=np.array([[1.0]], dtype=np.float32))
+    vels.append(float(sim.state.qvel.cpu().numpy()[0, 0]))
+  # Step 0 reads pre-delay stamps (0.0): no force, velocity stays 0.
+  # Step 1+ reads recorded samples, starts motion.
+  assert vels[0] == 0.0, vels
+  assert all(v > 0.05 for v in vels[1:]), vels
+  # Verify snapshot / restore atomicity under RK4
+  snap = sim.snapshot()
+  for _ in range(4):
+    sim.step(1, ctrl=np.array([[1.0]], dtype=np.float32))
+  sim.restore(snap)
+  v_restored = float(sim.state.qvel.cpu().numpy()[0, 0])
+  assert v_restored == pytest.approx(vels[-1], abs=1e-6)
+

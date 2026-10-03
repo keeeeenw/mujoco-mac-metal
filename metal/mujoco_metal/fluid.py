@@ -558,3 +558,21 @@ class MetalInertiaBoxFluid:
           self._fluid, self._dims, self._output.reshape(-1),
           threads=(self.batch_size,), group_size=(1,))
     return self._output
+
+  def run_derivative_device(self, qpos, qvel, dynamics, smooth):
+    """Compute d(qfrc_fluid)/d(qvel) on MPS device without host readback."""
+    torch, meta = self._torch, self._meta
+    b, nv = self.batch_size, meta.nv
+    if nv == 0 or (meta.density <= 0 and meta.viscosity <= 0):
+      return torch.zeros((b, nv, nv), dtype=torch.float32, device=self._device)
+    base_force = self.run_device(qpos, qvel, dynamics).clone()
+    deriv = torch.zeros((b, nv, nv), dtype=torch.float32, device=self._device)
+    eps = 1e-3
+    for j in range(nv):
+      v_pert = qvel.clone()
+      v_pert[:, j] += eps
+      dyn_pert = smooth.run_device(qpos, v_pert)
+      f_pert = self.run_device(qpos, v_pert, dyn_pert)
+      deriv[:, :, j] = (f_pert - base_force) / eps
+    return deriv
+

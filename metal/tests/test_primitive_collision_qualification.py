@@ -1477,32 +1477,32 @@ def test_gpu_capacity_pairs_boundary_execution_batch2():
 def test_capacity_overflow_rejection():
   """Admission guards cleanly reject models exceeding pair, contact, or row limits before construction."""
   # 1. 17 pairs exceeds capacity 16
-  xml_p17 = """<mujoco><worldbody><geom name="floor" type="plane" size="5 5 .1"/>"""
-  for i in range(17):
-    xml_p17 += f"""<body pos="{i} 0 1"><geom name="s{i}" type="sphere" size=".1" conaffinity="0"/></body>"""
-  xml_p17 += """</worldbody><contact>"""
-  for i in range(17):
-    xml_p17 += f"""<pair geom1="floor" geom2="s{i}"/>"""
-  xml_p17 += """</contact></mujoco>"""
+  xml_p33 = """<mujoco><worldbody><geom name="floor" type="plane" size="5 5 .1"/>"""
+  for i in range(33):
+    xml_p33 += f"""<body pos="{i} 0 1"><geom name="s{i}" type="sphere" size=".1" conaffinity="0"/></body>"""
+  xml_p33 += """</worldbody><contact>"""
+  for i in range(33):
+    xml_p33 += f"""<pair geom1="floor" geom2="s{i}"/>"""
+  xml_p33 += """</contact></mujoco>"""
 
-  with pytest.raises(ValueError, match="candidate contact pairs \\(17\\) exceeds capacity 16"):
-    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_p17))
+  with pytest.raises(ValueError, match="candidate contact pairs \\(33\\) exceeds capacity 32"):
+    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_p33))
 
-  # 2. 25 contact slots exceeds capacity 24 (3 box-box pairs = 24 slots, plus 1 sphere-sphere pair = 25 slots)
-  xml_c25 = """<mujoco><worldbody>"""
-  for i in range(3):
-    xml_c25 += f"""<body pos="{i*2} 0 0"><geom name="b1_{i}" type="box" size=".1 .1 .1"/></body>
+  # 2. 49 contact slots exceeds capacity 48 (6 box-box pairs = 48 slots, plus 1 sphere-sphere pair = 49 slots)
+  xml_c49 = """<mujoco><worldbody>"""
+  for i in range(6):
+    xml_c49 += f"""<body pos="{i*2} 0 0"><geom name="b1_{i}" type="box" size=".1 .1 .1"/></body>
     <body pos="{i*2} 0 1"><geom name="b2_{i}" type="box" size=".1 .1 .1"/></body>"""
-  xml_c25 += """<body pos="10 0 0"><geom name="s1" type="sphere" size=".1"/></body>
-  <body pos="10 0 1"><geom name="s2" type="sphere" size=".1"/></body>"""
-  xml_c25 += """</worldbody><contact>"""
-  for i in range(3):
-    xml_c25 += f"""<pair geom1="b1_{i}" geom2="b2_{i}"/>"""
-  xml_c25 += """<pair geom1="s1" geom2="s2"/>"""
-  xml_c25 += """</contact></mujoco>"""
+  xml_c49 += """<body pos="20 0 0"><geom name="s1" type="sphere" size=".1"/></body>
+  <body pos="20 0 1"><geom name="s2" type="sphere" size=".1"/></body>"""
+  xml_c49 += """</worldbody><contact>"""
+  for i in range(6):
+    xml_c49 += f"""<pair geom1="b1_{i}" geom2="b2_{i}"/>"""
+  xml_c49 += """<pair geom1="s1" geom2="s2"/>"""
+  xml_c49 += """</contact></mujoco>"""
 
-  with pytest.raises(ValueError, match="total candidate contact slots \\(25\\) exceeds capacity 24"):
-    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_c25))
+  with pytest.raises(ValueError, match="total candidate contact slots \\(49\\) exceeds capacity 48"):
+    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_c49))
 
   # 3. 99 rows exceeds capacity 96 (3 box-box pairs with condim=1 = 24 rows, plus 25 slide joints = 75 rows -> 99 rows)
   xml_r97 = """<mujoco><compiler angle="radian"/><worldbody>"""

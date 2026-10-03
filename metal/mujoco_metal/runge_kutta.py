@@ -42,8 +42,13 @@ class MetalRungeKutta:
       act = act.clone()
     velocities, accelerations, act_dots = [], [], []
     q, v, cur_act = qpos, qvel, act
+    stage_times = (time, time + 0.5 * self.dt, time + 0.5 * self.dt, time + self.dt)
     for stage in range(4):
-      a, adot, solve_status = acceleration(q, v, cur_act)
+      stage_time = stage_times[stage]
+      try:
+        a, adot, solve_status = acceleration(q, v, cur_act, stage_time)
+      except TypeError:
+        a, adot, solve_status = acceleration(q, v, cur_act)
       status = torch.where(status == 0, solve_status, status)
       velocities.append(v.clone())
       accelerations.append(a.clone())
