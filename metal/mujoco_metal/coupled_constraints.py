@@ -1574,12 +1574,20 @@ class MetalCoupledConstraints:
     """Return `(mask_active, slot_active, active_rows)` candidate counts per world."""
     counts = self.broadphase_counts()
     d = self.descriptor
-    out = []
+    w = self._workspace
+    nc = d.ncontacts_max
     cone_type = int(self._mjmodel_ref.opt.cone)
-    rows_per_con = 4 if cone_type == 0 else 3
-    for w in range(self.batch_size):
-      mask_act, slot_act = counts[w]
-      act_rows = min(d.nr, d.nr_joint + slot_act * rows_per_con)
+    rows = w["contact_row_data"][: self.batch_size * max(nc, 1) * 36].detach().cpu().numpy().reshape(self.batch_size, max(nc, 1), 6, 6)
+    out = []
+    for env in range(self.batch_size):
+      mask_act, slot_act = counts[env]
+      act_rows = d.nr_joint
+      for s in range(nc):
+        if rows[env, s, 0, 0] > 0.5:
+          cdim = int(d.contact_condim[s]) if s < len(d.contact_condim) else 3
+          r_con = 1 if cdim == 1 else (2 * (cdim - 1) if cone_type == 0 else cdim)
+          act_rows += r_con
+      act_rows = min(d.nr, act_rows)
       out.append((mask_act, slot_act, act_rows))
     return out
 
