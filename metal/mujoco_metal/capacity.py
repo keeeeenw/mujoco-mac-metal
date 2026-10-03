@@ -131,7 +131,7 @@ def estimate_capacity(model, batch_size, npairs, nslots, nr, *, neq=0, nr_joint=
   return CapacityEstimate(
       nv=nv, nbody=nbody, ngeom=ngeom, npairs=int(npairs),
       nslots=int(nslots), nr=nr, batch=batch,
-      dense_path=nr <= DENSE_ROW_THRESHOLD,
+      dense_path=(nr <= DENSE_ROW_THRESHOLD and nv <= 32),
       memory_bytes=total, memory_breakdown=parts)
 
 

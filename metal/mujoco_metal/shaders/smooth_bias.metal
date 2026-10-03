@@ -213,15 +213,15 @@ kernel void smooth_bias_derivative(
   uint inert = world * nbody * 36;
   float eps = 1e-3f;
 
-  float bias_plus[32];
-  float bias_minus[32];
+  float bias_plus[64];
+  float bias_minus[64];
 
   for (int step = 0; step < 2; ++step) {
     float sign = (step == 0) ? 1.0f : -1.0f;
-    float cvel[32 * 6];
-    float cdof_dot[32 * 6];
-    float cacc[32 * 6];
-    float body_force[32 * 6];
+    float cvel[64 * 6];
+    float cdof_dot[64 * 6];
+    float cacc[64 * 6];
+    float body_force[64 * 6];
 
     for (uint d=0; d<nv; ++d)
       for (uint k=0; k<6; ++k) cdof_dot[d*6+k] = 0.0f;

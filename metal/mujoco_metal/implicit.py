@@ -351,6 +351,8 @@ def lower_implicit(model, *, external_derivative=False):
     raise ValueError("implicit stage requires contact explicitly disabled")
   if model.nv > 32:
     raise ValueError("implicit stage currently bounds nv to 32")
+  if model.nbody > 32:
+    raise ValueError("implicit stage currently bounds nbody to 32")
   if model.neq or np.any(model.jnt_limited) or np.any(model.dof_frictionloss):
     raise ValueError("implicit stage currently excludes joint constraints")
   if model.nflex or model.nflexvert or model.nflexelem:

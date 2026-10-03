@@ -1872,8 +1872,8 @@ kernel void tendon_constraint_rows(
     float L=0.0f;
     for (int q=0;q<nq;++q) L+=ten_length_map[t*max(nq,1)+q]*qpos[qbase+uint(q)];
     L+=ten_length_spatial[tbase+uint(t)];
-    float Jrow[32];
-    for (int d=0;d<32;++d) Jrow[d]=0.0f;
+    float Jrow[64];
+    for (int d=0;d<64;++d) Jrow[d]=0.0f;
     for (int d=0;d<nv;++d)
       Jrow[d]=ten_moment_map[t*max(nv,1)+d]+ten_J_spatial[(tbase+uint(t))*uint(max(nv,1))+uint(d)];
     float vel=0.0f;
@@ -1933,8 +1933,8 @@ kernel void tendon_constraint_rows(
     float L1=0.0f;
     for (int q=0;q<nq;++q) L1+=ten_length_map[t1*max(nq,1)+q]*qpos[qbase+uint(q)];
     L1+=ten_length_spatial[tbase+uint(t1)];
-    float J1[32];
-    for (int d=0;d<32;++d) J1[d]=0.0f;
+    float J1[64];
+    for (int d=0;d<64;++d) J1[d]=0.0f;
     for (int d=0;d<nv;++d)
       J1[d]=ten_moment_map[t1*max(nv,1)+d]+ten_J_spatial[(tbase+uint(t1))*uint(max(nv,1))+uint(d)];
     float pos=L1-ten_length0[t1]-eq_data[e*11];
@@ -1946,8 +1946,8 @@ kernel void tendon_constraint_rows(
       float L2=0.0f;
       for (int q=0;q<nq;++q) L2+=ten_length_map[t2*max(nq,1)+q]*qpos[qbase+uint(q)];
       L2+=ten_length_spatial[tbase+uint(t2)];
-      float J2[32];
-      for (int d=0;d<32;++d) J2[d]=0.0f;
+      float J2[64];
+      for (int d=0;d<64;++d) J2[d]=0.0f;
       for (int d=0;d<nv;++d)
         J2[d]=ten_moment_map[t2*max(nv,1)+d]+ten_J_spatial[(tbase+uint(t2))*uint(max(nv,1))+uint(d)];
       float dif=L2-ten_length0[t2];

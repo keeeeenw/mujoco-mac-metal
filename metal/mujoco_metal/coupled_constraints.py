@@ -1101,7 +1101,7 @@ def lower_coupled_constraints(model, limits=None) -> CoupledConstraintDescriptor
       body_jntadr=_frozen(model.body_jntadr, np.int32),
       body_jntnum=_frozen(model.body_jntnum, np.int32),
       body_invweight0=_frozen(model.body_invweight0.reshape(-1, 2), np.float32),
-      dense_path=bool(_estimate.dense_path),
+      dense_path=bool(_estimate.dense_path and int(model.nv) <= 32),
   )
 
 
