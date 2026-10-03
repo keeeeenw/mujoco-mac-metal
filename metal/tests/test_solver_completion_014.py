@@ -547,14 +547,32 @@ def test_requested_effective_iterations_reported_gpu():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_teleport_rejects_stale_seed_gpu():
-  # Identity transition under a large state jump with a single-iteration
-  # budget: the stale retained seed cannot survive the cost gate, so one
-  # step from the teleported state matches a cold twin bit-exactly. (With
-  # a full budget both would converge alike and prove nothing.)
+  # Stale/foreign seeds cannot survive the warmstart cost gate: solving
+  # from a garbage seed matches a cold solve bit-exactly (same system,
+  # same budget), and a teleported trajectory matches a cold twin.
+  # NOTE: iterations=1 never converges on contact scenes (status 3 freezes
+  # worlds, so no seeds can develop); the gate is tested directly with a
+  # foreign seed, and the trajectory with a converged budget.
   m = _press_model(iterations=1)
   sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
   qp = np.asarray(m.qpos0, dtype=np.float32)
   sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
+  for _ in range(5):
+    sim.step(1)
+  nr = sim._coupled_constraints.descriptor.nr
+  sim.set_warmstart(np.full(nr, 10.0, dtype=np.float32))
+  gated = sim.assembled_system(recompute=True)
+  sim.clear_warmstart()
+  cold = sim.assembled_system(recompute=True)
+  for key in ("qacc", "qfrc_constraint", "lambda"):
+    np.testing.assert_array_equal(
+        np.asarray(gated[key].cpu().numpy()), np.asarray(cold[key].cpu().numpy()))
+  assert int(gated["status"].cpu().numpy()[0]) == int(cold["status"].cpu().numpy()[0])
+  # Teleported trajectory (converged budget) matches a cold twin exactly.
+  m2 = _press_model(iterations=100)
+  sim = MetalSimulation(m2, batch_size=1, profile=PROFILE)
+  qp = np.asarray(m2.qpos0, dtype=np.float32)
+  sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m2.nv), dtype=np.float32))
   for _ in range(30):
     sim.step(1)
   assert bool(np.any(sim._coupled_constraints.get_warmstart() != 0))
@@ -564,7 +582,7 @@ def test_teleport_rejects_stale_seed_gpu():
   qv = sim.state.qvel.cpu().numpy().copy()
   # Teleport WITHOUT reset: retained seed stays stale (reset would clear it).
   sim.state._qpos.copy_(sim.state._torch.as_tensor(tele))
-  cold = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  cold = MetalSimulation(m2, batch_size=1, profile=PROFILE)
   cold.reset(qpos=tele, qvel=qv.copy())
   sim.step(1)
   cold.step(1)
@@ -1028,5 +1046,203 @@ def test_noslip_both_cones_condim_matrix_gpu(cone, condim):
 
   np.testing.assert_allclose(nat_qacc, cpu_qacc, atol=1e-3, err_msg=f"{cone} condim={condim} qacc")
   np.testing.assert_allclose(nat_force, cpu_force, atol=1e-3, err_msg=f"{cone} condim={condim} force")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [3, 4, 6])
+def test_noslip_sticking_unsaturated_parity_gpu(cone, condim):
+  # R04/B4: unsaturated (sticking) friction, where the QCQP solution sits in
+  # the cone interior and is sensitive to the bc/Ac formulation (unlike
+  # saturated sliding, which the boundary pins down). Tiny lateral velocity
+  # and spin that high friction fully cancels.
+  xml = f"""
+  <mujoco>
+    <option timestep='0.002' integrator='Euler' iterations='150' tolerance='1e-9'
+            cone='{cone}' noslip_iterations='5' noslip_tolerance='1e-8'/>
+    <worldbody>
+      <geom name='floor' type='plane' size='5 5 0.1' friction='1.2 0.05 0.02'/>
+      <body pos='0 0 0.045'>
+        <joint name='slide_x' type='slide' axis='1 0 0'/>
+        <joint name='slide_y' type='slide' axis='0 1 0'/>
+        <joint name='slide_z' type='slide' axis='0 0 1'/>
+        <joint name='hinge_z' type='hinge' axis='0 0 1'/>
+        <geom type='sphere' size='0.05' condim='{condim}' friction='1.2 0.05 0.02'/>
+      </body>
+    </worldbody>
+  </mujoco>
+  """
+  m = mujoco.MjModel.from_xml_string(xml)
+  d = mujoco.MjData(m)
+  d.qvel[0] = 0.01
+  d.qvel[1] = -0.008
+  d.qvel[3] = 0.02
+  mujoco.mj_step(m, d)
+  cpu_force = np.asarray(d.qfrc_constraint)
+  cpu_qacc = np.asarray(d.qacc)
+
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  qv = np.zeros((1, m.nv), dtype=np.float32)
+  qv[0, 0] = 0.01
+  qv[0, 1] = -0.008
+  qv[0, 3] = 0.02
+  sim.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1), qvel=qv)
+  sim.step(1)
+  asm = sim.assembled_system()
+  nat_force = asm["qfrc_constraint"].cpu().numpy()[0]
+  nat_qacc = sim.state.qacc.cpu().numpy()[0]
+  assert int(sim.state.status.cpu().numpy()[0]) == 0
+  # Non-vacuous: normal force carries weight, friction unsaturated.
+  fn = None
+  contact_force = None
+  ncon = d.ncon
+  assert ncon > 0
+  f0 = np.zeros(6)
+  mujoco.mj_contactForce(m, d, 0, f0)
+  assert f0[0] > 1.0  # normal load present
+  assert float(np.linalg.norm(f0[1:3])) < 0.99 * f0[0] * 1.2, f0  # strictly inside cone
+  np.testing.assert_allclose(nat_qacc, cpu_qacc, atol=2e-3, err_msg=f"{cone} condim={condim} qacc")
+  np.testing.assert_allclose(nat_force, cpu_force, atol=2e-3, err_msg=f"{cone} condim={condim} force")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+def test_noslip_tolerance_stop_and_parity_gpu(cone):
+  # Tolerance-sensitive stopping: a loose no-slip tolerance stops after
+  # ~1 sweep while a tight one runs the budget; both match the CPU oracle
+  # (same tolerance) on forces. Stage diagnostics expose the sweep count.
+  base = (f'<option timestep="0.002" integrator="Euler" iterations="100" '
+          f'tolerance="1e-9" gravity="0 0 -9.81" cone="{cone}" TOL/>'
+          '<worldbody><geom name="floor" type="plane" size="5 5 0.1" friction="0.8 0.05 0.02"/>'
+          '<body pos="0 0 0.05">'
+          '<joint name="j_slide" type="slide" axis="1 0 0" frictionloss="2.0"/>'
+          '<joint name="j_z" type="slide" axis="0 0 1"/>'
+          '<geom name="ball" type="sphere" size="0.05" condim="3" friction="0.8 0.05 0.02"/>'
+          '</body></worldbody>')
+  counts = {}
+  for tag, tol in (("loose", 'noslip_iterations="5" noslip_tolerance="1e2"'),
+                   ("tight", 'noslip_iterations="5" noslip_tolerance="1e-12"')):
+    m = mujoco.MjModel.from_xml_string(
+        "<mujoco>" + base.replace("TOL", tol) + "</mujoco>")
+    sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+    qp = np.asarray(m.qpos0, dtype=np.float32)
+    qv = np.zeros((1, m.nv), dtype=np.float32)
+    qv[0, 0] = 0.4
+    sim.reset(qpos=qp.reshape(1, -1), qvel=qv)
+    cpu = mujoco.MjData(m)
+    cpu.qpos[:] = qp
+    cpu.qvel[:] = qv[0]
+    for _ in range(30):
+      sim.step(1)
+      mujoco.mj_step(m, cpu)
+    assert int(sim.state.status.cpu().numpy()[0]) == 0
+    dg = sim.assembled_system()["solver_diagnostics"].cpu().numpy()[0]
+    counts[tag] = int(dg[1])
+    gq = sim.state.qpos.cpu().numpy()[0]
+    np.testing.assert_allclose(
+        gq, np.asarray(cpu.qpos), atol=5e-3, err_msg=f"{cone}/{tag} traj")
+  # The loose budget demonstrably stops earlier.
+  assert counts["loose"] <= counts["tight"], counts
+  assert counts["tight"] >= 5, counts  # full budget executed when asked
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_noslip_displacement_negligible_reported_gpu():
+  # Explicit negligibility report (finding 4): on an 18-degree slope the
+  # no-slip stage changes settled displacement only at the 1e-4 level on
+  # BOTH engines (pinned plain-vs-noslip agree identically), so
+  # displacement cannot discriminate the stage here; same-state force
+  # parity (above) is the binding evidence.
+  th = float(np.deg2rad(18))
+  c, s = float(np.cos(th)), float(np.sin(th))
+  slips = {}
+  for engine, ns in (("native", 5), ("cpu-plain", 0), ("cpu-noslip", 5)):
+    xml = (f'<mujoco><option timestep="0.002" integrator="Euler" iterations="100" '
+           f'tolerance="1e-8" gravity="0 0 -9.81" noslip_iterations="{ns}" noslip_tolerance="1e-7"/>'
+           f'<worldbody><geom name="slope" type="plane" size="5 5 0.1" '
+           f'quat="0 {s / 2:.6f} 0 {c / 2:.6f}" friction="0.5 0.05 0.02"/>'
+           '<body pos="0 0 0.3"><freejoint/>'
+           '<geom name="bx" type="box" size="0.06 0.06 0.04" friction="0.5 0.05 0.02"/></body>'
+           '</worldbody></mujoco>')
+    m = mujoco.MjModel.from_xml_string(xml)
+    if engine == "native":
+      sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+      sim.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1),
+                qvel=np.zeros((1, m.nv), dtype=np.float32))
+      for _ in range(300):
+        sim.step(1)
+      slips[engine] = float(np.linalg.norm(sim.state.qpos.cpu().numpy()[0][:2]))
+    else:
+      d = mujoco.MjData(m)
+      d.qpos[:] = np.asarray(m.qpos0)
+      for _ in range(300):
+        mujoco.mj_step(m, d)
+      slips[engine] = float(np.linalg.norm(np.asarray(d.qpos)[:2]))
+  assert abs(slips["cpu-plain"] - slips["cpu-noslip"]) < 2e-4, slips
+  assert abs(slips["native"] - slips["cpu-noslip"]) < 2e-3, slips
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+@pytest.mark.parametrize("condim", [3, 4, 6])
+@pytest.mark.parametrize("ns_iters", [0, 1, 5])
+def test_noslip_regularizer_removal_iteration_0_parity_gpu(cone, condim, ns_iters):
+  """Verify iteration-0 regularizer removal matching pinned engine_solver.c:674-678.
+
+  Combines equality + dry friction + joint limits + contacts with appreciable
+  regularization (impratio/solimp) and active normal & tangential forces.
+  """
+  xml = f"""
+  <mujoco>
+    <option timestep='0.002' integrator='Euler' iterations='150' tolerance='1e-9'
+            impratio='2.0' cone='{cone}' noslip_iterations='{ns_iters}' noslip_tolerance='1e-7'/>
+    <worldbody>
+      <geom name='floor' type='plane' size='5 5 0.1' friction='0.8 0.05 0.02'/>
+      <body pos='0 0 0.05'>
+        <joint name='j_slide' type='slide' axis='1 0 0' limited='true' range='-0.1 0.1' frictionloss='2.0'/>
+        <joint name='j_z' type='slide' axis='0 0 1'/>
+        <joint name='j_roll' type='hinge' axis='1 0 0' frictionloss='1.0'/>
+        <geom type='sphere' size='0.05' condim='{condim}' friction='0.8 0.05 0.02'
+              solimp='0.9 0.95 0.005 0.5 2' solref='0.02 1'/>
+      </body>
+      <body pos='0.3 0 0.05'>
+        <joint name='j_slave' type='slide' axis='1 0 0'/>
+        <geom type='sphere' size='0.05' mass='0.5'/>
+      </body>
+    </worldbody>
+    <equality>
+      <joint joint1='j_slide' joint2='j_slave' polycoef='0 1 0 0 0'/>
+    </equality>
+  </mujoco>
+  """
+  m = mujoco.MjModel.from_xml_string(xml)
+  d = mujoco.MjData(m)
+  d.qpos[0] = 0.05
+  d.qvel[0] = 0.3
+  d.qvel[2] = 0.5
+  mujoco.mj_step(m, d)
+
+  sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
+  qp = np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1)
+  qp[0, 0] = 0.05
+  qv = np.zeros((1, m.nv), dtype=np.float32)
+  qv[0, 0] = 0.3
+  qv[0, 2] = 0.5
+  sim.reset(qpos=qp, qvel=qv)
+  sim.step(1)
+  asm = sim.assembled_system()
+
+  nat_qacc = sim.state.qacc.cpu().numpy()[0]
+  cpu_qacc = np.asarray(d.qacc)
+  nat_force = asm["qfrc_constraint"].cpu().numpy()[0]
+  cpu_force = np.asarray(d.qfrc_constraint)
+
+  assert np.any(np.abs(cpu_force) > 0.1), "Test must engage active forces"
+  np.testing.assert_allclose(nat_qacc, cpu_qacc, atol=2e-3, err_msg=f"{cone} condim={condim} iters={ns_iters} qacc")
+  np.testing.assert_allclose(nat_force, cpu_force, atol=2e-3, err_msg=f"{cone} condim={condim} iters={ns_iters} force")
 
 
