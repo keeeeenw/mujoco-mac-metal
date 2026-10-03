@@ -98,6 +98,42 @@ class NativePlugin:
     """Restore plugin internal state from checkpoint."""
     pass
 
+  def device_snapshot(self):
+    """Return a device-resident copy of live state for step rollback.
+
+    This is distinct from :meth:`snapshot`, which is the explicit host
+    checkpoint boundary used by simulation snapshots. Stateful plugins that
+    participate in stepping must override this method and the matching device
+    restore hooks; copying a solver acceptance mask to the host is forbidden.
+    Stateless plugins may keep the default ``None`` implementation.
+    """
+    return None
+
+  def restore_device(self, snapshot):
+    """Restore a complete device snapshot without host transfers."""
+    if snapshot is not None:
+      raise NotImplementedError(
+          "stateful native plugins must implement restore_device")
+
+  def restore_masked(self, snapshot, accepted_mask):
+    """Restore only failed worlds using a device boolean success mask.
+
+    ``accepted_mask`` has shape ``[batch_size]`` and remains on ``device``.
+    Implementations must preserve their current state where the mask is true
+    and restore ``snapshot`` where it is false, without numerical-status
+    readback. The base implementation accepts only stateless plugins.
+    """
+    if snapshot is None:
+      return
+    if torch is None or not isinstance(accepted_mask, torch.Tensor):
+      raise TypeError("accepted_mask must be a device tensor")
+    if (accepted_mask.dtype != torch.bool
+        or tuple(accepted_mask.shape) != (self.batch_size,)
+        or accepted_mask.device != self.device):
+      raise ValueError("accepted_mask must be bool[batch_size] on the plugin device")
+    raise NotImplementedError(
+        "stateful native plugins must implement device-native restore_masked")
+
 
 @dataclass(frozen=True)
 class PluginRegistration:
