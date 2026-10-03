@@ -116,117 +116,154 @@ inline float3 cx_tri_closest(float3 a, float3 b, float3 c,
   return a + ab * (*v) + ac * (*w);
 }
 
-// GJK distance query. Returns separation (>=0 when disjoint; ~0 on touch).
-// pa/pb are the witness points. ok=false means overlap (use EPA).
+// Closest point to origin on tetrahedron abcd (boundary enumeration with
+// inside test via signed sub-volumes; also yields barycentric weights).
+// Returns the origin itself when enclosed.
+inline float cx_svol(float3 p, float3 q, float3 r, float3 s) {
+  return dot(q - p, cross(r - p, s - p));
+}
+inline float3 cx_tet_closest(float3 a, float3 b, float3 c, float3 d,
+                             thread float* u, thread float* v,
+                             thread float* w, thread float* x) {
+  float V = cx_svol(a, b, c, d);
+  if (fabs(V) > 1e-30f) {
+    float la = cx_svol(float3(0.0f), b, c, d) / V;
+    float lb = cx_svol(a, float3(0.0f), c, d) / V;
+    float lc = cx_svol(a, b, float3(0.0f), d) / V;
+    float ld = cx_svol(a, b, c, float3(0.0f)) / V;
+    if (la >= 0.0f && lb >= 0.0f && lc >= 0.0f && ld >= 0.0f) {
+      *u = la; *v = lb; *w = lc; *x = ld;
+      return float3(0.0f);
+    }
+  }
+  // Outside: nearest of the 4 faces.
+  float bu, bv, bw, best = 1e30f;
+  float3 bp = a;
+  float wu = 0.0f, wv = 0.0f, ww = 0.0f, wx = 0.0f;
+  {
+    float3 p = cx_tri_closest(b, c, d, &bu, &bv, &bw);
+    float l = dot(p, p);
+    if (l < best) { best = l; bp = p; wu = 0.0f; wv = bu; ww = bv; wx = bw; }
+  }
+  {
+    float3 p = cx_tri_closest(a, c, d, &bu, &bv, &bw);
+    float l = dot(p, p);
+    if (l < best) { best = l; bp = p; wu = bu; wv = 0.0f; ww = bv; wx = bw; }
+  }
+  {
+    float3 p = cx_tri_closest(a, b, d, &bu, &bv, &bw);
+    float l = dot(p, p);
+    if (l < best) { best = l; bp = p; wu = bu; wv = bv; ww = 0.0f; wx = bw; }
+  }
+  {
+    float3 p = cx_tri_closest(a, b, c, &bu, &bv, &bw);
+    float l = dot(p, p);
+    if (l < best) { best = l; bp = p; wu = bu; wv = bv; ww = bw; wx = 0.0f; }
+  }
+  *u = wu; *v = wv; *w = ww; *x = wx;
+  return bp;
+}
+
+// GJK distance query with Johnson reduction. Returns separation (>=0 when
+// disjoint). overlap=true with a seed simplex when enclosed (use EPA).
+// wpa/wpb are the witness points on A/B.
 inline float cx_gjk(int ta, float3 pa, float3x3 Ra, float3 sza,
                     int tb, float3 pb, float3x3 Rb, float3 szb,
                     float3 d0, thread float3& wpa, thread float3& wpb,
-                    thread bool& ok) {
+                    thread bool& overlap, thread CxVertex* seed, thread int* nseed) {
   CxVertex S[4];
   int n = 0;
   float3 d = d0;
   if (dot(d, d) < 1e-24f) d = pa - pb;
   if (dot(d, d) < 1e-24f) d = float3(1.0f, 0.0f, 0.0f);
-  S[0] = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, d);
-  n = 1;
-  d = -S[0].m;
-  float prev_dist = 1e30f;
-  ok = true;
+  float wts[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float3 closest = float3(0.0f);
+  float span = 0.0f;
+  overlap = false;
+  *nseed = 0;
   for (int iter = 0; iter < CX_GJK_MAXITER; ++iter) {
-    if (dot(d, d) < 1e-24f) { ok = false; break; }
     CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, d);
-    // No progress past the current closest point: disjoint or touching.
-    float3 closest;
-    if (n == 1) {
-      closest = S[0].m;
-      wpa = S[0].a; wpb = S[0].b;
-    } else if (n == 2) {
-      float u, w;
-      closest = cx_seg_closest(S[0].m, S[1].m, &u, &w);
-      wpa = S[0].a * u + S[1].a * w;
-      wpb = S[0].b * u + S[1].b * w;
+    if (n == 0) {
+      S[0] = v; n = 1;
+      closest = v.m; wts[0] = 1.0f;
+      span = length(v.m);
     } else {
-      float u, w, x;
-      closest = cx_tri_closest(S[0].m, S[1].m, S[2].m, &u, &w, &x);
-      wpa = S[0].a * u + S[1].a * w + S[2].a * x;
-      wpb = S[0].b * u + S[1].b * w + S[2].b * x;
-    }
-    float dist = length(closest);
-    if (dot(v.m, d) < dot(closest, d) + 1e-9f * max(1.0f, dist)) {
-      return dist;  // converged: separating distance
-    }
-    // Grow simplex toward origin.
-    if (n == 1) {
-      S[1] = v; n = 2;
-    } else if (n == 2) {
-      S[2] = v; n = 3;
-      // Check enclosure: origin inside triangle => overlap.
-      float uu, vv, ww;
-      float3 cc = cx_tri_closest(S[0].m, S[1].m, S[2].m, &uu, &vv, &ww);
-      if (length(cc) < 1e-9f) { ok = false; break; }
-    } else {
-      S[0] = S[1]; S[1] = S[2]; S[2] = v;
-      float uu, vv, ww;
-      float3 cc = cx_tri_closest(S[0].m, S[1].m, S[2].m, &uu, &vv, &ww);
-      if (length(cc) < 1e-9f) { ok = false; break; }
-    }
-    // New search direction = -closest.
-    if (n == 1) d = -S[0].m;
-    else if (n == 2) {
-      float u, w;
-      float3 c = cx_seg_closest(S[0].m, S[1].m, &u, &w);
-      d = -c;
-    } else {
-      float u, w, x;
-      float3 c = cx_tri_closest(S[0].m, S[1].m, S[2].m, &u, &w, &x);
-      d = -c;
-      if (dot(d, d) < 1e-24f) { ok = false; break; }
-    }
-    if (fabs(prev_dist - length(d)) < 1e-9f * max(1.0f, prev_dist)) {
-      // Stalled: report current distance.
-      float uu, vv, ww;
-      if (n == 3) {
-        float3 c = cx_tri_closest(S[0].m, S[1].m, S[2].m, &uu, &vv, &ww);
-        wpa = S[0].a * uu + S[1].a * vv + S[2].a * ww;
-        wpb = S[0].b * uu + S[1].b * vv + S[2].b * ww;
-        return length(c);
+      // No progress past the current closest point: disjoint.
+      if (dot(v.m, d) <= dot(closest, d) + 1e-9f * max(1.0f, length(closest))) {
+        break;
       }
-      return length(d);
+      // Duplicate vertex: cannot advance (degenerate curved patch).
+      bool dup = false;
+      for (int k = 0; k < n; ++k) {
+        float3 dd = v.m - S[k].m;
+        if (dot(dd, dd) < 1e-24f) { dup = true; break; }
+      }
+      if (dup || n >= 4) break;
+      for (int k = 0; k < n; ++k) {
+        float3 dd = v.m - S[k].m;
+        span = max(span, length(dd));
+      }
+      S[n] = v; n++;
+      // Johnson reduction to the nonzero-weight feature.
+      float uu = 0.0f, vv = 0.0f, ww = 0.0f, xx = 0.0f;
+      if (n == 2) {
+        closest = cx_seg_closest(S[0].m, S[1].m, &uu, &vv);
+      } else if (n == 3) {
+        closest = cx_tri_closest(S[0].m, S[1].m, S[2].m, &uu, &vv, &ww);
+      } else {
+        closest = cx_tet_closest(S[0].m, S[1].m, S[2].m, S[3].m, &uu, &vv, &ww, &xx);
+      }
+      float nw[4] = {uu, vv, ww, xx};
+      CxVertex T[4];
+      int m = 0;
+      for (int k = 0; k < n; ++k) {
+        if (nw[k] > 1e-12f) { T[m] = S[k]; wts[m] = nw[k]; m++; }
+      }
+      for (int k = 0; k < m; ++k) S[k] = T[k];
+      n = m;
+      if (n == 0) break;
     }
-    prev_dist = length(d);
-  }
-  if (ok) {
-    float uu, vv, ww;
-    if (n == 3) {
-      float3 c = cx_tri_closest(S[0].m, S[1].m, S[2].m, &uu, &vv, &ww);
-      wpa = S[0].a * uu + S[1].a * vv + S[2].a * ww;
-      wpb = S[0].b * uu + S[1].b * vv + S[2].b * ww;
-      return length(c);
-    } else if (n == 2) {
-      float u, w;
-      float3 c = cx_seg_closest(S[0].m, S[1].m, &u, &w);
-      wpa = S[0].a * u + S[1].a * w;
-      wpb = S[0].b * u + S[1].b * w;
-      return length(c);
+    // Enclosure is scale-relative: an exactly-touching simplex in float32
+    // sits ~1e-8 off the origin at shape scale ~0.1; absolute 1e-9 misses
+    // genuine overlap while true separations stay far above this band.
+    if (length(closest) <= 1e-6f * max(span, 1e-9f)) {
+      overlap = true;
+      break;
     }
-    wpa = S[0].a; wpb = S[0].b;
-    return length(S[0].m);
+    d = -closest;
   }
-  return 0.0f;
+  // Witness interpolation + EPA seed.
+  wpa = float3(0.0f); wpb = float3(0.0f);
+  for (int k = 0; k < n; ++k) {
+    wpa += S[k].a * wts[k];
+    wpb += S[k].b * wts[k];
+    seed[k] = S[k];
+  }
+  *nseed = n;
+  if (overlap) return 0.0f;
+  return length(closest);
 }
 
-// EPA penetration query from an overlap state. Returns depth (>0), normal
-// (points A -> B... note: B - A direction), and witness points.
+// EPA penetration query seeded by the GJK terminal simplex (which encloses
+// the origin). Returns depth (>0), normal, and witness points. The normal
+// direction is validated against the CPU oracle (g1 -> g2 on overlap).
 inline float cx_epa(int ta, float3 pa, float3x3 Ra, float3 sza,
                     int tb, float3 pb, float3x3 Rb, float3 szb,
+                    thread CxVertex* seed, int nseed,
                     thread float3& normal, thread float3& wpa, thread float3& wpb) {
-  // Seed tetrahedron: coordinate-axis supports around the centroid delta.
   float3 d0 = pa - pb;
   CxVertex V[8];
   int nv = 0;
   float3 dirs[6] = {float3(1,0,0), float3(-1,0,0), float3(0,1,0),
                     float3(0,-1,0), float3(0,0,1), float3(0,0,-1)};
-  for (int i = 0; i < 6 && nv < 4; ++i) {
+  for (int i = 0; i < nseed && nv < 8; ++i) {
+    bool dup = false;
+    for (int j = 0; j < nv; ++j) {
+      if (dot(V[j].m - seed[i].m, V[j].m - seed[i].m) < 1e-18f) { dup = true; break; }
+    }
+    if (!dup) { V[nv] = seed[i]; nv++; }
+  }
+  for (int i = 0; i < 6 && nv < 8; ++i) {
     CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, dirs[i]);
     bool dup = false;
     for (int j = 0; j < nv; ++j) {
@@ -240,19 +277,59 @@ inline float cx_epa(int ta, float3 pa, float3x3 Ra, float3 sza,
     wpa = pa; wpb = pb;
     return length(d0) > 1e-12f ? 0.0f : 0.0f;
   }
-  // Polytope faces as index triples (outward orientation fixed below).
+  // Select 4 points whose tetrahedron strictly contains the origin
+  // (C(8,4) search; the GJK edge passes through the origin, so a container
+  // exists for genuine overlap). Falls back to the first 4 points.
+  int S_[4] = {0, 1, 2, 3};
+  {
+    bool found = false;
+    for (int i0 = 0; i0 < nv && !found; ++i0)
+    for (int i1 = i0 + 1; i1 < nv && !found; ++i1)
+    for (int i2 = i1 + 1; i2 < nv && !found; ++i2)
+    for (int i3 = i2 + 1; i3 < nv && !found; ++i3) {
+      float3 p0 = V[i0].m, p1 = V[i1].m, p2 = V[i2].m, p3 = V[i3].m;
+      float Vt = cx_svol(p0, p1, p2, p3);
+      if (fabs(Vt) < 1e-24f) continue;
+      float l0 = cx_svol(float3(0.0f), p1, p2, p3) / Vt;
+      float l1 = cx_svol(p0, float3(0.0f), p2, p3) / Vt;
+      float l2 = cx_svol(p0, p1, float3(0.0f), p3) / Vt;
+      float l3 = cx_svol(p0, p1, p2, float3(0.0f)) / Vt;
+      float m = min(min(l0, l1), min(l2, l3));
+      if (m > 1e-6f) {
+        S_[0] = i0; S_[1] = i1; S_[2] = i2; S_[3] = i3;
+        found = true;
+      }
+    }
+  }
+  CxVertex W[8];
+  for (int i = 0; i < nv; ++i) W[i] = V[i];
+  // Move the enclosing tet to the front.
+  {
+    CxVertex T[8];
+    bool used[8];
+    for (int i = 0; i < 8; ++i) used[i] = false;
+    for (int i = 0; i < 4; ++i) { T[i] = W[S_[i]]; used[S_[i]] = true; }
+    int m = 4;
+    for (int i = 0; i < nv; ++i) {
+      if (!used[i] && m < 8) { T[m] = W[i]; m++; }
+    }
+    for (int i = 0; i < m; ++i) V[i] = T[i];
+    nv = m;
+  }
   int F[CX_EPA_MAXFACES * 3];
   int nf = 0;
-  int seed[4][3] = {{0,1,2},{0,3,1},{0,2,3},{1,3,2}};
-  for (int i = 0; i < 4; ++i) {
-    F[nf*3+0] = seed[i][0]; F[nf*3+1] = seed[i][1]; F[nf*3+2] = seed[i][2];
-    // Flip to outward: origin must be on the negative side.
-    float3 a = V[F[nf*3]].m, b = V[F[nf*3+1]].m, c = V[F[nf*3+2]].m;
-    float3 nrm = cross(b - a, c - a);
-    if (dot(nrm, a) > 0.0f) {
-      int t = F[nf*3+1]; F[nf*3+1] = F[nf*3+2]; F[nf*3+2] = t;
+  int topo[4][3] = {{0,1,2},{0,3,1},{0,2,3},{1,3,2}};
+  {
+    float3 cen = (V[0].m + V[1].m + V[2].m + V[3].m) * 0.25f;
+    for (int i = 0; i < 4; ++i) {
+      F[nf*3+0] = topo[i][0]; F[nf*3+1] = topo[i][1]; F[nf*3+2] = topo[i][2];
+      float3 a = V[F[nf*3]].m, b = V[F[nf*3+1]].m, c = V[F[nf*3+2]].m;
+      float3 nrm = cross(b - a, c - a);
+      if (dot(nrm, a - cen) < 0.0f) {
+        int t = F[nf*3+1]; F[nf*3+1] = F[nf*3+2]; F[nf*3+2] = t;
+      }
+      nf++;
     }
-    nf++;
   }
   float best = 0.0f;
   int bi = 0;
@@ -272,7 +349,7 @@ inline float cx_epa(int ta, float3 pa, float3x3 Ra, float3 sza,
     if (bi < 0) break;
     CxVertex v = cx_minkowski(ta, pa, Ra, sza, tb, pb, Rb, szb, bn);
     float adv = dot(v.m, bn) - best;
-    if (adv < 1e-6f * max(1.0f, best) || nv >= 8 - 1) {
+    if (adv < 1e-6f * max(1.0f, best)) {
       // Converged: barycentric witness on best face.
       float u, w, x;
       float3 a = V[F[bi*3]].m, b = V[F[bi*3+1]].m, c = V[F[bi*3+2]].m;
@@ -283,6 +360,7 @@ inline float cx_epa(int ta, float3 pa, float3x3 Ra, float3 sza,
       return best;
     }
     // Expand: remove visible faces, stitch horizon.
+    if (nv >= 8) break;  // vertex budget exhausted
     V[nv] = v;
     int vnew = nv; nv++;
     int kept[CX_EPA_MAXFACES * 3];
@@ -334,10 +412,13 @@ inline float cx_epa(int ta, float3 pa, float3x3 Ra, float3 sza,
     }
     nf = 0;
     for (int i = 0; i < nk && i < CX_EPA_MAXFACES; ++i) {
-      // Orient outward: new vertex must be on positive side.
+      // Orient new faces away from the polytope interior (vertex centroid).
+      float3 cen = float3(0.0f);
+      for (int k = 0; k < nv; ++k) cen += V[k].m;
+      cen = cen / float(max(nv, 1));
       float3 a = V[kept[i*3]].m, b = V[kept[i*3+1]].m, c = V[kept[i*3+2]].m;
       float3 nrm = cross(b - a, c - a);
-      if (dot(nrm, V[vnew].m - a) < 0.0f) {
+      if (dot(nrm, a - cen) < 0.0f) {
         int t = kept[i*3+1]; kept[i*3+1] = kept[i*3+2]; kept[i*3+2] = t;
       }
       F[nf*3] = kept[i*3]; F[nf*3+1] = kept[i*3+1]; F[nf*3+2] = kept[i*3+2];
@@ -370,9 +451,12 @@ inline int cx_single_contact(int ta, float3 pa, float3x3 Ra, float3 sza,
                              float margin, float3 d0,
                              thread ContactGeom* out) {
   float3 wpa, wpb;
-  bool ok = true;
-  float gap = cx_gjk(ta, pa, Ra, sza, tb, pb, Rb, szb, d0, wpa, wpb, ok);
-  if (ok) {
+  CxVertex seed[4];
+  int nseed = 0;
+  bool overlap = false;
+  float gap = cx_gjk(ta, pa, Ra, sza, tb, pb, Rb, szb, d0, wpa, wpb,
+                     overlap, seed, &nseed);
+  if (!overlap) {
     if (gap > margin) return 0;
     float3 delta = wpa - wpb;
     float dsq = dot(delta, delta);
@@ -393,7 +477,10 @@ inline int cx_single_contact(int ta, float3 pa, float3x3 Ra, float3 sza,
     return 1;
   }
   float3 nrm, ea, eb;
-  float depth = cx_epa(ta, pa, Ra, sza, tb, pb, Rb, szb, nrm, ea, eb);
+  float depth = cx_epa(ta, pa, Ra, sza, tb, pb, Rb, szb, seed, nseed,
+                       nrm, ea, eb);
+  // Guard against relative-enclosure false positives at ~1e-8 gaps.
+  if (depth <= 1e-9f) return 0;
   out[0].normal = nrm;
   out[0].dist = -depth;
   out[0].pos = (ea + eb) * 0.5f;
