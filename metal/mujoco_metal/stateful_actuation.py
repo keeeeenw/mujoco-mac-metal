@@ -201,6 +201,170 @@ def lugre_stribeck(velocity, f_c, f_s, v_s):
   return f_c + (f_s - f_c) * np.exp(-ratio * ratio)
 
 
+class ActuatorDelayLine:
+  """Pinned-exact per-actuator control history buffer (R06c).
+
+  Exact host port of ``mju_historyInit/Insert/Read`` with ``dim=1`` plus the
+  ``mj_readCtrl`` selection rule: ``nsample == 0`` reads live control;
+  otherwise the buffer is read at ``time - delay`` with the configured
+  interpolation (0 = zero-order hold, 1 = piecewise linear, else Hermite
+  cubic with Catmull-Rom end slopes). Zero-state (all stamps zero) matches
+  pinned ``mj_resetData`` behavior. State is plain numpy for snapshot
+  ownership; device execution mirrors this logic in ``actuation.metal``.
+  """
+
+  def __init__(self, nsample, interp=0):
+    nsample, interp = int(nsample), int(interp)
+    if nsample < 0 or nsample > (1 << 31) - 1:
+      raise ValueError("delay nsample must be a nonnegative int32 dimension")
+    if interp not in (0, 1, 2):
+      raise ValueError("delay interp must be 0 (hold), 1 (linear) or 2 (cubic)")
+    self.nsample = nsample
+    self.interp = interp
+    self.user = 0.0
+    self.cursor = 0
+    self.times = np.zeros(max(nsample, 1))
+    self.values = np.zeros(max(nsample, 1))
+
+  def _phys(self, logical):
+    return (self.cursor + 1 + int(logical)) % self.nsample
+
+  def _find(self, t):
+    n, times, cursor = self.nsample, self.times, self.cursor
+    t_oldest = times[self._phys(0)]
+    t_newest = times[self._phys(n - 1)]
+    if t <= t_oldest:
+      return 0
+    if t > t_newest:
+      return n
+    lo, hi = 0, n - 1
+    while hi - lo > 1:
+      mid = (lo + hi) // 2
+      if times[self._phys(mid)] < t:
+        lo = mid
+      else:
+        hi = mid
+    return hi
+
+  def reset(self):
+    """Clear to the pinned post-reset zero state."""
+    self.cursor = 0
+    self.times.fill(0.0)
+    self.values.fill(0.0)
+    return self.snapshot()
+
+  def snapshot(self):
+    """Immutable owned copy of the full buffer state."""
+    return {"nsample": self.nsample, "interp": self.interp,
+            "cursor": int(self.cursor),
+            "times": self.times.copy(), "values": self.values.copy()}
+
+  def restore(self, snap):
+    """Validate-then-commit restore; rejects leave state untouched."""
+    if (not isinstance(snap, dict) or snap.get("nsample") != self.nsample
+            or snap.get("interp") != self.interp):
+      raise ValueError("delay snapshot schema/dimensions do not match")
+    times = np.asarray(snap["times"], dtype=np.float64)
+    values = np.asarray(snap["values"], dtype=np.float64)
+    cursor = snap["cursor"]
+    if (times.shape != (self.nsample,) or values.shape != (self.nsample,)
+            or not isinstance(cursor, (int, np.integer))
+            or not 0 <= int(cursor) < self.nsample
+            or not np.all(np.isfinite(times)) or not np.all(np.isfinite(values))):
+      raise ValueError("delay snapshot payload is invalid")
+    self.cursor = int(cursor)
+    self.times = times.copy()
+    self.values = values.copy()
+
+  def insert(self, t, value):
+    """Record a control sample; returns nothing (pinned writes via pointer)."""
+    t, value = float(t), float(value)
+    if not np.isfinite(t) or not np.isfinite(value):
+      raise ValueError("delay insert requires finite time and value")
+    n = self.nsample
+    if n == 0:
+      return
+    i = self._find(t)
+    if i < n and abs(t - self.times[self._phys(i)]) < _MJMINVAL:
+      self.values[self._phys(i)] = value
+      return
+    if i == 0:
+      oldest = self._phys(0)
+      self.times[oldest] = t
+      self.values[oldest] = value
+      return
+    if i == n:
+      self.cursor = (self.cursor + 1) % n
+      self.times[self.cursor] = t
+      self.values[self.cursor] = value
+      return
+    for j in range(i - 1):
+      src, dst = self._phys(j + 1), self._phys(j)
+      self.times[dst] = self.times[src]
+      self.values[dst] = self.values[src]
+    slot = self._phys(i - 1)
+    self.times[slot] = t
+    self.values[slot] = value
+
+  def read(self, t):
+    """Read the buffered value at time ``t`` with configured interpolation."""
+    t = float(t)
+    if not np.isfinite(t):
+      raise ValueError("delay read requires a finite time")
+    n = self.nsample
+    if n == 0:
+      raise ValueError("delay read requires a history buffer")
+    times, values, cursor = self.times, self.values, self.cursor
+    oldest, newest = self._phys(0), self._phys(n - 1)
+    if t <= times[oldest] + _MJMINVAL:
+      return float(values[oldest])
+    if t >= times[newest] - _MJMINVAL:
+      return float(values[newest])
+    i = self._find(t)
+    phys_i = self._phys(i)
+    if abs(t - times[phys_i]) < _MJMINVAL:
+      return float(values[phys_i])
+    phys_lo = self._phys(i - 1)
+    if self.interp == 0:
+      return float(values[phys_lo])
+    dt = times[phys_i] - times[phys_lo]
+    alpha = (t - times[phys_lo]) / dt
+    if self.interp == 1:
+      return float(values[phys_lo] + alpha * (values[phys_i] - values[phys_lo]))
+    alpha2, alpha3 = alpha * alpha, alpha * alpha * alpha
+    h00 = 2 * alpha3 - 3 * alpha2 + 1
+    h10 = alpha3 - 2 * alpha2
+    h01 = -2 * alpha3 + 3 * alpha2
+    h11 = alpha3 - alpha2
+    m_lo = 0.0
+    if i > 1:
+      prev = self._phys(i - 2)
+      m_lo = (values[phys_i] - values[prev]) / (times[phys_i] - times[prev])
+    m_hi = 0.0
+    if i < n - 1:
+      nxt = self._phys(i + 1)
+      m_hi = (values[nxt] - values[phys_lo]) / (times[nxt] - times[phys_lo])
+    return float(h00 * values[phys_lo] + h10 * dt * m_lo
+                 + h01 * values[phys_i] + h11 * dt * m_hi)
+
+
+def delay_reference(nsample, interp, delay, script):
+  """Apply a delay line to a ``[(time, ctrl)]`` script (test/oracle helper).
+
+  Records each script sample then reads at ``time - delay``; ``nsample == 0``
+  reads live control exactly like ``mj_readCtrl``.
+  """
+  line = ActuatorDelayLine(nsample, interp)
+  out = []
+  for t, v in script:
+    if nsample == 0:
+      out.append(float(v))
+      continue
+    line.insert(t, v)
+    out.append(line.read(t - delay))
+  return out
+
+
 class ActuatorModel:
   """Immutable full-family actuator lowering for MuJoCo 3.10.0.
 
@@ -1027,3 +1191,119 @@ def advance_bristle_exact(act_z, act_dot_z, velocity, f_c, f_s, v_s, sigma0, h):
   exp_ah = np.exp(a * h)
   int_h = (exp_ah - 1.0) / a if abs(a) > _MJMINVAL else h
   return exp_ah * act_z + int_h * velocity
+
+
+class MetalDelayLine:
+  """Device control-history ring buffers with pinned read/record semantics.
+
+  Owns ``(batch, nu, nmax)`` time/value rings plus cursors and the
+  per-actuator ``(nsample, interp, delay)`` config. ``record`` inserts the
+  current control at the current time (pinned history-advance stage);
+  ``read`` returns control delayed by each actuator's delay (pinned
+  ``mj_readCtrl``), falling back to live control where ``nsample == 0``.
+  Step-loop wiring and admission stay pending coordination with in-flight
+  simulation state work; construction guards are unchanged.
+  """
+
+  def __init__(self, nsample, interp, delay, batch_size=1):
+    import torch as _torch
+    nsample = np.asarray(nsample, dtype=np.int32).reshape(-1)
+    interp = np.asarray(interp, dtype=np.int32).reshape(-1)
+    delay = np.asarray(delay, dtype=np.float64).reshape(-1)
+    nu = int(nsample.shape[0])
+    if (interp.shape != (nu,) or delay.shape != (nu,)
+            or batch_size <= 0 or nu <= 0):
+      raise ValueError("delay config must have shapes (nu,) with positive batch/nu")
+    if np.any(nsample < 0) or np.any((interp < 0) | (interp > 2)):
+      raise ValueError("delay nsample/interp out of range")
+    if np.any(~np.isfinite(delay)) or np.any(delay < 0):
+      raise ValueError("delay values must be finite and nonnegative")
+    if not _torch.backends.mps.is_available() or not hasattr(_torch.mps, "compile_shader"):
+      raise RuntimeError("delay line requires PyTorch MPS compile_shader")
+    from pathlib import Path as _Path
+    self._torch = _torch
+    self._device = _torch.device("mps")
+    self.batch_size, self.nu = int(batch_size), nu
+    self.nmax = int(max(int(np.max(nsample)), 1))
+    lib = _torch.mps.compile_shader(
+        (_Path(__file__).parent / "shaders" / "actuation.metal").read_text())
+    self._record_kernel = lib.delay_record
+    self._read_kernel = lib.delay_read
+    self._nsample = _torch.as_tensor(nsample.copy(), dtype=_torch.int32, device=self._device)
+    self._interp = _torch.as_tensor(interp.copy(), dtype=_torch.int32, device=self._device)
+    self._delay = _torch.as_tensor(delay.astype(np.float32), dtype=_torch.float32, device=self._device)
+    self._dims = _torch.tensor([self.batch_size, nu, self.nmax], dtype=_torch.int32, device=self._device)
+    self._times = _torch.zeros(self.batch_size * nu * self.nmax, dtype=_torch.float32, device=self._device)
+    self._values = _torch.zeros(self.batch_size * nu * self.nmax, dtype=_torch.float32, device=self._device)
+    self._cursor = _torch.zeros(self.batch_size * nu, dtype=_torch.int32, device=self._device)
+    self._out = _torch.zeros(self.batch_size * nu, dtype=_torch.float32, device=self._device)
+
+  def reset(self):
+    """Clear rings to the pinned post-reset zero state."""
+    self._times.zero_()
+    self._values.zero_()
+    self._cursor.zero_()
+
+  def record(self, ctrl, time):
+    """Insert one control row per world at ``time`` (pinned history advance)."""
+    torch = self._torch
+    ctrl = torch.as_tensor(np.asarray(ctrl, dtype=np.float32),
+                           dtype=torch.float32, device=self._device)
+    if tuple(ctrl.shape) != (self.batch_size, self.nu):
+      raise ValueError(f"ctrl must have shape ({self.batch_size}, {self.nu})")
+    if not np.isfinite(float(time)):
+      raise ValueError("record requires a finite time")
+    now = torch.tensor([float(time)], dtype=torch.float32, device=self._device)
+    self._record_kernel(ctrl.reshape(-1), self._nsample, self._times,
+                        self._values, self._cursor, self._dims, now,
+                        threads=(self.batch_size * self.nu,), group_size=(1,))
+
+  def read(self, ctrl_live, time):
+    """Delayed control per actuator, live passthrough where nsample == 0."""
+    torch = self._torch
+    live = torch.as_tensor(np.asarray(ctrl_live, dtype=np.float32),
+                           dtype=torch.float32, device=self._device)
+    if tuple(live.shape) != (self.batch_size, self.nu):
+      raise ValueError(f"ctrl_live must have shape ({self.batch_size}, {self.nu})")
+    if not np.isfinite(float(time)):
+      raise ValueError("read requires a finite time")
+    # Pinned evaluates time-delay in mjtNum: subtract host-side in float64
+    # so exact-stamp hits survive the float32 cast on both sides.
+    delay = self._delay.detach().cpu().numpy().astype(np.float64)
+    qtime = (np.float64(float(time)) - delay).reshape(1, -1)
+    qtime = np.broadcast_to(qtime, (self.batch_size, self.nu)).astype(np.float32)
+    qtensor = torch.as_tensor(qtime.copy(), dtype=torch.float32, device=self._device)
+    self._read_kernel(self._times, self._values, self._cursor, self._nsample,
+                      self._interp, qtensor, self._out, self._dims,
+                      threads=(self.batch_size * self.nu,), group_size=(1,))
+    return torch.where(self._nsample.reshape(1, -1) > 0,
+                       self._out.reshape(self.batch_size, self.nu), live)
+
+  def snapshot(self):
+    """Immutable host copy of ring state for checkpoint ownership."""
+    return {"cursor": self._cursor.detach().cpu().numpy().copy(),
+            "times": self._times.detach().cpu().numpy().copy(),
+            "values": self._values.detach().cpu().numpy().copy()}
+
+  def restore(self, snap):
+    """Validate-then-commit restore; rejects leave device state untouched."""
+    for key in ("cursor", "times", "values"):
+      if key not in snap:
+        raise ValueError(f"delay snapshot is missing {key!r}")
+    cursor = np.asarray(snap["cursor"], dtype=np.int64)
+    times = np.asarray(snap["times"], dtype=np.float64)
+    values = np.asarray(snap["values"], dtype=np.float64)
+    want = (self.batch_size * self.nu * self.nmax,)
+    if (cursor.shape != (self.batch_size * self.nu,)
+            or times.shape != want or values.shape != want
+            or np.any(cursor < 0)
+            or not np.all(np.isfinite(times)) or not np.all(np.isfinite(values))):
+      raise ValueError("delay snapshot payload is invalid")
+    ns = self._nsample.detach().cpu().numpy()
+    for w in range(self.batch_size * self.nu):
+      if int(cursor[w]) >= max(int(ns[w % self.nu]), 1):
+        raise ValueError("delay snapshot cursor out of range")
+    torch = self._torch
+    self._cursor.copy_(torch.as_tensor(cursor.astype(np.int32), device=self._device))
+    self._times.copy_(torch.as_tensor(times.astype(np.float32), device=self._device))
+    self._values.copy_(torch.as_tensor(values.astype(np.float32), device=self._device))

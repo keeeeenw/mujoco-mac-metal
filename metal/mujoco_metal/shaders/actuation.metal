@@ -587,3 +587,128 @@ kernel void advance_activations(
     }
   }
 }
+
+// ---- Actuator control-history (delay line) ring ops (R06c) ----
+// Pinned source: engine/engine_support.c mju_historyInsert (dim=1) and
+// mju_historyRead plus engine/engine_forward.c mj_readCtrl. One thread per
+// (world, actuator). Layout per actuator: times[nmax], values[nmax],
+// cursor scalar; nsample/interp/delay from meta arrays. nsample==0 is a
+// no-op (record) / live passthrough handled host-side (read).
+// MINVAL matches mjMINVAL (1e-15).
+inline int dl_phys(int cursor, int n, int logical) {
+  return (cursor + 1 + logical) % n;
+}
+// Smallest logical i with times[phys(i)] >= t (linear scan == pinned
+// circular binary search on sorted stamps, including stale zero slots).
+inline int dl_find(device const float* times, int base, int cursor, int n, float t) {
+  float t_oldest = times[base + dl_phys(cursor, n, 0)];
+  float t_newest = times[base + dl_phys(cursor, n, n - 1)];
+  if (t <= t_oldest) return 0;
+  if (t > t_newest) return n;
+  for (int i = 1; i < n; ++i) {
+    if (times[base + dl_phys(cursor, n, i)] >= t) return i;
+  }
+  return n - 1;
+}
+kernel void delay_record(
+    device const float* ctrl [[buffer(0)]],
+    device const int* nsample [[buffer(1)]],
+    device float* times [[buffer(2)]],
+    device float* values [[buffer(3)]],
+    device int* cursor [[buffer(4)]],
+    constant int* dims [[buffer(5)]],
+    constant float* now [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]) {
+  int b = dims[0], nu = dims[1], nmax = dims[2];
+  int world = int(tid) / max(nu, 1), i = int(tid) % max(nu, 1);
+  if (world >= b || i >= nu) return;
+  int n = nsample[i];
+  if (n <= 0) return;
+  float t = now[0];
+  int base = (world * nu + i) * nmax;
+  int cur = cursor[world * nu + i];
+  int idx = dl_find(times + base, 0, cur, n, t);
+  if (idx < n && abs(t - times[base + dl_phys(cur, n, idx)]) < 1e-15f) {
+    values[base + dl_phys(cur, n, idx)] = ctrl[world * nu + i];
+    return;
+  }
+  if (idx == 0) {
+    int s = dl_phys(cur, n, 0);
+    times[base + s] = t;
+    values[base + s] = ctrl[world * nu + i];
+    return;
+  }
+  if (idx == n) {
+    cur = (cur + 1) % n;
+    cursor[world * nu + i] = cur;
+    times[base + cur] = t;
+    values[base + cur] = ctrl[world * nu + i];
+    return;
+  }
+  for (int j = 0; j < idx - 1; ++j) {
+    int src = dl_phys(cur, n, j + 1), dst = dl_phys(cur, n, j);
+    times[base + dst] = times[base + src];
+    values[base + dst] = values[base + src];
+  }
+  int s = dl_phys(cur, n, idx - 1);
+  times[base + s] = t;
+  values[base + s] = ctrl[world * nu + i];
+}
+kernel void delay_read(
+    device const float* times [[buffer(0)]],
+    device const float* values [[buffer(1)]],
+    device const int* cursor [[buffer(2)]],
+    device const int* nsample [[buffer(3)]],
+    device const int* interp [[buffer(4)]],
+    device const float* qtime [[buffer(5)]],
+    device float* out [[buffer(6)]],
+    constant int* dims [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]) {
+  int b = dims[0], nu = dims[1], nmax = dims[2];
+  int world = int(tid) / max(nu, 1), i = int(tid) % max(nu, 1);
+  if (world >= b || i >= nu) return;
+  int n = nsample[i];
+  if (n <= 0) { out[world * nu + i] = 0.0f; return; }
+  // Query times are subtracted host-side in float64 (pinned mj_readCtrl
+  // evaluates time-delay in mjtNum): float32 device subtraction loses
+  // exact-stamp hits that the pinned eps comparison keeps.
+  float t = qtime[world * nu + i];
+  int base = (world * nu + i) * nmax;
+  int cur = cursor[world * nu + i];
+  int oldest = dl_phys(cur, n, 0), newest = dl_phys(cur, n, n - 1);
+  if (t <= times[base + oldest] + 1e-15f) { out[world * nu + i] = values[base + oldest]; return; }
+  if (t >= times[base + newest] - 1e-15f) { out[world * nu + i] = values[base + newest]; return; }
+  int idx = dl_find(times + base, 0, cur, n, t);
+  int hi = dl_phys(cur, n, idx);
+  // Exact-hit tolerance is float32-adapted (1e-7): host query times are
+  // differenced in float64 but stamps and delays quantize to float32,
+  // shifting exact hits by ~1e-10 that pinned mjtNum arithmetic keeps.
+  // Simulation steps (ms) stay far above this snapping radius.
+  if (abs(t - times[base + hi]) < 1e-7f) { out[world * nu + i] = values[base + hi]; return; }
+  int lo = dl_phys(cur, n, idx - 1);
+  int ip = interp[i];
+  if (ip == 0) { out[world * nu + i] = values[base + lo]; return; }
+  float dt = times[base + hi] - times[base + lo];
+  float alpha = (t - times[base + lo]) / dt;
+  if (ip == 1) {
+    out[world * nu + i] = values[base + lo] + alpha * (values[base + hi] - values[base + lo]);
+    return;
+  }
+  float a2 = alpha * alpha, a3 = a2 * alpha;
+  float h00 = 2.0f * a3 - 3.0f * a2 + 1.0f;
+  float h10 = a3 - 2.0f * a2;
+  float h01 = -2.0f * a3 + 3.0f * a2;
+  float h11 = a3 - a2;
+  float m_lo = 0.0f;
+  if (idx > 1) {
+    int p = dl_phys(cur, n, idx - 2);
+    m_lo = (values[base + hi] - values[base + p]) / (times[base + hi] - times[base + p]);
+  }
+  float m_hi = 0.0f;
+  if (idx < n - 1) {
+    int q = dl_phys(cur, n, idx + 1);
+    m_hi = (values[base + q] - values[base + lo]) / (times[base + q] - times[base + lo]);
+  }
+  out[world * nu + i] = h00 * values[base + lo] + h10 * dt * m_lo
+      + h01 * values[base + hi] + h11 * dt * m_hi;
+}
