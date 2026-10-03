@@ -1136,12 +1136,185 @@ inline int collide_box_box(
   return ncon;
 }
 
+// 10. Plane - Cylinder (pinned mjc_PlaneCylinder port; g1 = plane, g2 = cylinder)
+inline int collide_plane_cylinder(
+    float3 p1, float4 q1, float3 sz1,
+    float3 p2, float4 q2, float3 sz2,
+    float margin, thread ContactGeom* con) {
+  float3 normal = rotate_q(q1, float3(0.0f, 0.0f, 1.0f));
+  float3 axis = rotate_q(q2, float3(0.0f, 0.0f, 1.0f));
+  float radius = sz2.x;
+  float half_len = sz2.y;
+
+  // Project, make sure axis points towards plane.
+  float prjaxis = dot(normal, axis);
+  // Sub-float32-noise tilts are rounding, not physics: snap them so the two
+  // rim checks stay symmetric (pinned float64 sees exactly 0.0 here and
+  // reports both rims; an asymmetric 1e-9 would drop one rim).
+  if (fabs(prjaxis) < 1e-7f) prjaxis = 0.0f;
+  if (prjaxis > 0.0f) {
+    axis = -axis;
+    prjaxis = -prjaxis;
+  }
+
+  // Normal distance to cylinder center.
+  float3 to_c = p2 - p1;
+  float dist0 = dot(to_c, normal);
+
+  // Remove component of -normal along axis, compute length.
+  float3 vec = prjaxis * axis - normal;
+  float len_sqr = dot(vec, vec);
+  if (len_sqr >= MJ_MINVAL * MJ_MINVAL) {
+    vec *= radius / sqrt(len_sqr);
+  } else {
+    // Disk parallel to plane: pick x-axis of cylinder, scale by radius.
+    vec = rotate_q(q2, float3(1.0f, 0.0f, 0.0f)) * radius;
+  }
+  float prjvec = dot(vec, normal);
+
+  // Scale axis by half-length.
+  axis *= half_len;
+  prjaxis *= half_len;
+
+  int cnt = 0;
+  // First rim point.
+  if (dist0 + prjaxis + prjvec <= margin) {
+    con[cnt].dist = dist0 + prjaxis + prjvec;
+    con[cnt].pos = p2 + vec + axis - normal * (con[cnt].dist * 0.5f);
+    con[cnt].normal = normal;
+    con[cnt].t1 = float3(0.0f);
+    make_frame(con[cnt].normal, con[cnt].t1, con[cnt].t2);
+    cnt++;
+  } else {
+    return 0;  // nearest point above margin: no contacts
+  }
+  // Second rim point.
+  if (dist0 - prjaxis + prjvec <= margin) {
+    con[cnt].dist = dist0 - prjaxis + prjvec;
+    con[cnt].pos = p2 + vec - axis - normal * (con[cnt].dist * 0.5f);
+    con[cnt].normal = normal;
+    con[cnt].t1 = float3(0.0f);
+    make_frame(con[cnt].normal, con[cnt].t1, con[cnt].t2);
+    cnt++;
+  }
+  // Triangle points on the side closer to plane.
+  float prjvec1 = -prjvec * 0.5f;
+  if (dist0 + prjaxis + prjvec1 <= margin) {
+    float3 vec1 = cross(vec, axis);
+    float vl = length(vec1);
+    if (vl > 1e-12f) vec1 = vec1 / vl;
+    vec1 *= radius * sqrt(3.0f) * 0.5f;
+    con[cnt].dist = dist0 + prjaxis + prjvec1;
+    con[cnt].pos = p2 + vec1 + axis - vec * 0.5f - normal * (con[cnt].dist * 0.5f);
+    con[cnt].normal = normal;
+    con[cnt].t1 = float3(0.0f);
+    make_frame(con[cnt].normal, con[cnt].t1, con[cnt].t2);
+    cnt++;
+    con[cnt].dist = dist0 + prjaxis + prjvec1;
+    con[cnt].pos = p2 - vec1 + axis - vec * 0.5f - normal * (con[cnt].dist * 0.5f);
+    con[cnt].normal = normal;
+    con[cnt].t1 = float3(0.0f);
+    make_frame(con[cnt].normal, con[cnt].t1, con[cnt].t2);
+    cnt++;
+  }
+  return cnt;
+}
+
+// Raw plane-point/sphere contact with an explicit plane normal (for caps).
+inline int raw_plane_normal_sphere(
+    float3 plane_pos, float3 n,
+    float3 p1, float radius,
+    float margin, thread ContactGeom* con) {
+  float cdist = dot(p1 - plane_pos, n);
+  if (cdist > margin + radius) return 0;
+  con[0].dist = cdist - radius;
+  con[0].normal = n;
+  con[0].pos = p1 - n * (radius + con[0].dist * 0.5f);
+  con[0].t1 = float3(0.0f);
+  make_frame(con[0].normal, con[0].t1, con[0].t2);
+  return 1;
+}
+
+// 11. Sphere - Cylinder (pinned mjc_SphereCylinder port; g1 = sphere, g2 = cylinder)
+inline int collide_sphere_cylinder(
+    float3 p1, float4 q1, float3 sz1,
+    float3 p2, float4 q2, float3 sz2,
+    float margin, thread ContactGeom* con) {
+  float radius = sz2.x;
+  float height = sz2.y;  // half-height, matching pinned size convention
+  float3 axis = rotate_q(q2, float3(0.0f, 0.0f, 1.0f));
+
+  // Sphere center relative to cylinder center, split into axial/radial parts.
+  float3 vec = p1 - p2;
+  float x = dot(axis, vec);
+  float3 a_proj = axis * x;
+  float3 p_proj = vec - a_proj;
+  float p_proj_sqr = dot(p_proj, p_proj);
+
+  bool collide_side = fabs(x) < height;
+  bool collide_cap = p_proj_sqr < radius * radius;
+  if (collide_side && collide_cap) {  // deep penetration: keep nearer exit
+    float dist_cap = height - fabs(x);
+    float dist_radius = radius - sqrt(p_proj_sqr);
+    if (dist_cap < dist_radius) {
+      collide_side = false;
+    } else {
+      collide_cap = false;
+    }
+  }
+
+  // Side collision: sphere vs closest axis point (radius = cylinder radius).
+  if (collide_side) {
+    float3 a_point = p2 + a_proj;
+    return collide_sphere_sphere(p1, q1, sz1, a_point, q2,
+                                 float3(radius, 0.0f, 0.0f), margin, con);
+  }
+
+  // Cap collision: plane-sphere against the nearer cap, normal flipped to
+  // point sphere -> cylinder (pinned flips: PLANE < SPHERE < CYLINDER).
+  if (collide_cap) {
+    float3 n_cap;
+    float3 pos_cap;
+    if (x > 0.0f) {
+      n_cap = axis;
+      pos_cap = p2 + axis * height;
+    } else {
+      n_cap = -axis;
+      pos_cap = p2 - axis * height;
+    }
+    int ncon = raw_plane_normal_sphere(pos_cap, n_cap, p1, sz1.x, margin, con);
+    if (ncon) {
+      con[0].normal = -con[0].normal;
+      con[0].t1 = -con[0].t1;
+      con[0].t2 = cross(con[0].normal, con[0].t1);
+    }
+    return ncon;
+  }
+
+  // Corner collision: sphere vs rim corner point (zero-radius point sphere).
+  float3 corner = p_proj * (radius / sqrt(p_proj_sqr)) + axis * (x > 0.0f ? height : -height) + p2;
+  return collide_sphere_sphere(p1, q1, sz1, corner, q2,
+                               float3(0.0f, 0.0f, 0.0f), margin, con);
+}
+
+// Forward declarations for milestone-010 convex pairs (defined in
+// convex_narrowphase.metal, compiled after this file).
+inline int collide_plane_convex(float3 p1, float4 q1,
+                                int t2, float3 p2, float4 q2, float3 sz2,
+                                float margin, thread ContactGeom* con);
+inline int collide_convex_single(int ta, float3 pa, float4 qa, float3 sza,
+                                 int tb, float3 pb, float4 qb, float3 szb,
+                                 float margin, thread ContactGeom* con);
+inline int collide_convex_multi(int ta, float3 pa, float4 qa, float3 sza,
+                                int tb, float3 pb, float4 qb, float3 szb,
+                                float margin, int maxn, thread ContactGeom* con);
+
 // Unified Pair Dispatcher
 inline int collide_pair(
     int type1, float3 p1, float4 q1, float3 sz1,
     int type2, float3 p2, float4 q2, float3 sz2,
     float margin, thread ContactGeom* con) {
-  // Types: 0 = plane, 2 = sphere, 3 = capsule, 6 = box
+  // Types: 0 = plane, 2 = sphere, 3 = capsule, 4 = ellipsoid, 5 = cylinder, 6 = box
   bool swapped = (type1 > type2);
   int t1 = swapped ? type2 : type1;
   int t2 = swapped ? type1 : type2;
@@ -1171,6 +1344,18 @@ inline int collide_pair(
     n = collide_capsule_box(pos1, quat1, size1, pos2, quat2, size2, margin, con);
   } else if (t1 == 6 && t2 == 6) {
     n = collide_box_box(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+  } else if (t1 == 0 && t2 == 5) {
+    n = collide_plane_cylinder(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+  } else if (t1 == 2 && t2 == 5) {
+    n = collide_sphere_cylinder(pos1, quat1, size1, pos2, quat2, size2, margin, con);
+  } else if (t1 == 0 && t2 == 4) {
+    n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, margin, con);
+  } else if ((t1 == 2 && t2 == 4) || (t1 == 3 && t2 == 4) || (t1 == 4 && t2 == 4)
+             || (t1 == 4 && t2 == 5) || (t1 == 4 && t2 == 6)) {
+    n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, margin, con);
+  } else if ((t1 == 3 && t2 == 5) || (t1 == 5 && t2 == 5) || (t1 == 5 && t2 == 6)) {
+    n = collide_convex_multi(t1, pos1, quat1, size1, t2, pos2, quat2, size2,
+                             margin, 5, con);
   }
 
   // If order was swapped, normal points from pos1 to pos2, which is from original geom2 to geom1.
