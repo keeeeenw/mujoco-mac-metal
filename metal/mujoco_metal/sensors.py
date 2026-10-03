@@ -1246,6 +1246,43 @@ class SensorProgram:
         int(mujoco.mjtSensor.mjSENS_GYRO),
         int(mujoco.mjtSensor.mjSENS_VELOCIMETER),
     ])))
+    self._mjmodel = model
+    self._tactile_sensors = []
+    ST = mujoco.mjtSensor
+    for i in range(d.nsensor):
+      if int(d.sensor_type[i]) == int(ST.mjSENS_TACTILE):
+        mesh_id = int(d.sensor_objid[i])
+        geom_id = int(d.sensor_refid[i])
+        parent_body = int(model.geom_bodyid[geom_id]) if geom_id >= 0 else -1
+        parent_weld = int(model.body_weldid[parent_body]) if parent_body >= 0 else -1
+        nvert = int(model.mesh_vertnum[mesh_id]) if mesh_id >= 0 else 0
+        dim = int(d.sensor_dim[i])
+        adr = int(d.sensor_adr[i])
+        nchannel = dim // max(nvert, 1)
+        vert_adr = int(model.mesh_vertadr[mesh_id]) if mesh_id >= 0 else 0
+        verts = np.asarray(model.mesh_vert[vert_adr:vert_adr + nvert], dtype=np.float32) if mesh_id >= 0 else np.zeros((0, 3), dtype=np.float32)
+        has_frame = bool(model.mesh_normalnum[mesh_id] == 3 * nvert) if mesh_id >= 0 else False
+        norm_adr = int(model.mesh_normaladr[mesh_id]) if has_frame else 0
+        tang1 = np.asarray(model.mesh_normal[norm_adr + 3:norm_adr + 3*nvert:9], dtype=np.float32) if has_frame else None
+        tang2 = np.asarray(model.mesh_normal[norm_adr + 6:norm_adr + 3*nvert:9], dtype=np.float32) if has_frame else None
+        mesh_quat = np.asarray(model.mesh_quat[mesh_id], dtype=np.float32) if mesh_id >= 0 else np.array([1, 0, 0, 0], dtype=np.float32)
+
+        self._tactile_sensors.append({
+            "sensor_id": i,
+            "mesh_id": mesh_id,
+            "geom_id": geom_id,
+            "parent_body": parent_body,
+            "parent_weld": parent_weld,
+            "nvert": nvert,
+            "dim": dim,
+            "adr": adr,
+            "nchannel": nchannel,
+            "verts": torch.as_tensor(verts, dtype=torch.float32, device=self._device),
+            "has_frame": has_frame,
+            "mesh_quat": torch.as_tensor(mesh_quat, dtype=torch.float32, device=self._device),
+            "tang1": torch.as_tensor(tang1, dtype=torch.float32, device=self._device) if tang1 is not None else None,
+            "tang2": torch.as_tensor(tang2, dtype=torch.float32, device=self._device) if tang2 is not None else None,
+        })
     self._build_state_constants(model)
 
   def _build_state_constants(self, model):
@@ -1760,7 +1797,7 @@ class SensorProgram:
   def run_contact_device(self, poses, contact, out=None):
     """Evaluate CONTACT sensors into ``out`` (borrowed, merged)."""
     torch, d, b = self._torch, self.descriptor, self.batch_size
-    self._sp_validate_poses(poses, need_geom_quat=False)
+    self._sp_validate_poses(poses, need_geom_quat=bool(getattr(self, "_tactile_sensors", None)))
     nc = 0 if contact is None else int(contact["frame"].shape[1])
     dummy = self._s_dummy
     if contact is None:
@@ -1795,7 +1832,140 @@ class SensorProgram:
         self._s_intprm(),
         dest.reshape(-1), self._stage_mask, cdims,
         threads=(b * max(d.nsensor, 1),), group_size=(1,))
+    if getattr(self, "_tactile_sensors", None):
+      self._evaluate_tactile(poses, contact, dest)
     return dest
+
+  def _evaluate_tactile(self, poses, contact, dest):
+    b = self.batch_size
+    torch = self._torch
+    gpos_all = poses.get("geom_pos")
+    gquat_all = poses.get("geom_quat")
+    cvel = poses.get("cvel", None)
+    scom = poses.get("root_com", None)
+
+    for ts in self._tactile_sensors:
+      geom_id = ts["geom_id"]
+      parent_weld = ts["parent_weld"]
+      nvert = ts["nvert"]
+      dim = ts["dim"]
+      adr = ts["adr"]
+      nchannel = ts["nchannel"]
+      verts = ts["verts"]
+      has_frame = ts["has_frame"]
+      tang1 = ts["tang1"]
+      tang2 = ts["tang2"]
+      mesh_quat = ts["mesh_quat"]
+
+      dest[:, adr:adr + dim].zero_()
+      if nvert == 0:
+        continue
+
+      for w in range(b):
+        opposing_geoms = set()
+        if contact is not None and "row" in contact:
+          nc = contact["row"].shape[1] if contact["row"].ndim > 1 else contact["row"].numel()
+          rows = contact["row"][w].reshape(-1)
+          forces = contact["force"][w].reshape(nc, -1)
+          slot_pair = contact["slot_pair"].reshape(-1)
+          pair_geoms = contact["pair_geoms"].reshape(-1, 2)
+          for c in range(nc):
+            if float(rows[c]) > 0.5:
+              pair = int(slot_pair[c])
+              if pair < pair_geoms.shape[0]:
+                g1, g2 = int(pair_geoms[pair, 0]), int(pair_geoms[pair, 1])
+                b1 = int(self._mjmodel.geom_bodyid[g1]) if g1 >= 0 else -1
+                b2 = int(self._mjmodel.geom_bodyid[g2]) if g2 >= 0 else -1
+                w1 = int(self._mjmodel.body_weldid[b1]) if b1 >= 0 else -1
+                w2 = int(self._mjmodel.body_weldid[b2]) if b2 >= 0 else -1
+                if w1 == parent_weld and g2 >= 0:
+                  opposing_geoms.add(g2)
+                elif w2 == parent_weld and g1 >= 0:
+                  opposing_geoms.add(g1)
+
+        if not opposing_geoms:
+          continue
+
+        gpos = gpos_all[w, geom_id]
+        gquat = gquat_all[w, geom_id]
+        qw = gquat[0]
+        qv = gquat[1:4]
+        t = 2.0 * torch.cross(qv.unsqueeze(0), verts, dim=-1)
+        taxel_world = gpos.unsqueeze(0) + verts + qw * t + torch.cross(qv.unsqueeze(0), t, dim=-1)
+
+        taxel_depth = torch.zeros(nvert, dtype=torch.float32, device=self._device)
+        taxel_tang1 = torch.zeros(nvert, dtype=torch.float32, device=self._device)
+        taxel_tang2 = torch.zeros(nvert, dtype=torch.float32, device=self._device)
+
+        for g in opposing_geoms:
+          og_pos = gpos_all[w, g]
+          og_quat = gquat_all[w, g]
+          og_type = int(self._mjmodel.geom_type[g])
+          og_size = self._mjmodel.geom_size[g]
+
+          og_qw = og_quat[0]
+          og_qv = -og_quat[1:4]
+          rel = taxel_world - og_pos.unsqueeze(0)
+          t_og = 2.0 * torch.cross(og_qv.unsqueeze(0), rel, dim=-1)
+          lpos = rel + og_qw * t_og + torch.cross(og_qv.unsqueeze(0), t_og, dim=-1)
+
+          if og_type == 0:
+            dist = lpos[:, 2]
+          elif og_type == 2:
+            dist = torch.norm(lpos, dim=-1) - float(og_size[0])
+          elif og_type == 6:
+            bx, by, bz = float(og_size[0]), float(og_size[1]), float(og_size[2])
+            dx = torch.abs(lpos[:, 0]) - bx
+            dy = torch.abs(lpos[:, 1]) - by
+            dz = torch.abs(lpos[:, 2]) - bz
+            dmax = torch.maximum(dx, torch.maximum(dy, dz))
+            dist = torch.minimum(dmax, torch.zeros_like(dmax)) + torch.norm(
+                torch.maximum(torch.stack([dx, dy, dz], dim=-1), torch.zeros_like(lpos)), dim=-1)
+          elif og_type == 3:
+            r, hz = float(og_size[0]), float(og_size[1])
+            cz = torch.clamp(lpos[:, 2], -hz, hz)
+            dist = torch.sqrt(lpos[:, 0]**2 + lpos[:, 1]**2 + (lpos[:, 2] - cz)**2) - r
+          elif og_type == 5:
+            r, hz = float(og_size[0]), float(og_size[1])
+            dr = torch.sqrt(lpos[:, 0]**2 + lpos[:, 1]**2) - r
+            dz = torch.abs(lpos[:, 2]) - hz
+            dist = torch.minimum(torch.maximum(dr, dz), torch.zeros_like(dr)) + torch.sqrt(
+                torch.maximum(dr, torch.zeros_like(dr))**2 + torch.maximum(dz, torch.zeros_like(dz))**2)
+          else:
+            continue
+
+          penetrated = dist < 0
+          if bool(torch.any(penetrated)):
+            depth = torch.where(penetrated, -dist, torch.zeros_like(dist))
+            taxel_depth = torch.maximum(taxel_depth, depth)
+
+            if has_frame and cvel is not None and scom is not None and tang1 is not None and tang2 is not None:
+              other_body = int(self._mjmodel.geom_bodyid[g])
+              vel_sensor = cvel[w, parent_weld, 3:6].unsqueeze(0) + torch.cross(
+                  cvel[w, parent_weld, 0:3].unsqueeze(0),
+                  taxel_world - scom[w, int(self._mjmodel.body_rootid[parent_weld])].unsqueeze(0),
+                  dim=-1
+              )
+              vel_other = cvel[w, other_body, 3:6].unsqueeze(0) + torch.cross(
+                  cvel[w, other_body, 0:3].unsqueeze(0),
+                  taxel_world - scom[w, int(self._mjmodel.body_rootid[other_body])].unsqueeze(0),
+                  dim=-1
+              )
+              vel_rel = vel_sensor - vel_other
+              mq_w = mesh_quat[0]
+              mq_v = mesh_quat[1:4]
+              t_mq1 = 2.0 * torch.cross(mq_v.unsqueeze(0), tang1, dim=-1)
+              t1 = tang1 + mq_w * t_mq1 + torch.cross(mq_v.unsqueeze(0), t_mq1, dim=-1)
+              t_mq2 = 2.0 * torch.cross(mq_v.unsqueeze(0), tang2, dim=-1)
+              t2 = tang2 + mq_w * t_mq2 + torch.cross(mq_v.unsqueeze(0), t_mq2, dim=-1)
+              taxel_tang1 += torch.abs(torch.sum(vel_rel * t1, dim=-1))
+              taxel_tang2 += torch.abs(torch.sum(vel_rel * t2, dim=-1))
+
+        dest[w, adr:adr + nvert] = taxel_depth
+        if nchannel >= 2:
+          dest[w, adr + nvert:adr + 2*nvert] = taxel_tang1
+        if nchannel >= 3:
+          dest[w, adr + 2*nvert:adr + 3*nvert] = taxel_tang2
 
   def _s_intprm(self):
     import numpy as _np

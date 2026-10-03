@@ -484,43 +484,10 @@ kernel void evaluate_contact_sensors(
   uint world=index/nsensor, i=index-world*nsensor;
   if (uint(meta[i*10+2])!=ACC) return;
   int styp=meta[i*10+0];
-  if (styp!=42 && styp!=0 && styp!=46) return;
+  if (styp!=42 && styp!=0) return;
   uint dim=uint(meta[i*10+5]), adr=uint(meta[i*10+6]);
   uint base=world*ndata+adr;
   for (uint j=0;j<dim;j++) output[base+j]=0.0f;
-  if (styp==46) {
-    int target_objtype = meta[i*10+3];
-    int target_objid = meta[i*10+4];
-    float total_fn = 0.0f;
-    float3 total_f = float3(0.0f);
-    for (uint c=0; c<nc; ++c) {
-      if (contact_row_data[(world*nc+c)*36] <= 0.5f) continue;
-      if (pair_live[slot_pair[c]] == 0) continue;
-      uint pair = uint(slot_pair[c]);
-      int g1 = pair_geoms[pair*2+0], g2 = pair_geoms[pair*2+1];
-      bool match = (target_objtype == 5 && (g1 == target_objid || g2 == target_objid));
-      if (!match && target_objtype == 10) match = true;
-      if (!match) continue;
-      float fn = contact_force[(world*nc+c)*11];
-      if (fn <= 0.0f) continue;
-      float3 n = sp_r3(contact_frame, (world*nc+c)*12);
-      total_fn += fn;
-      total_f += n * fn;
-    }
-    if (dim == 1) {
-      output[base] = total_fn;
-    } else if (dim == 3) {
-      output[base] = total_f.x;
-      output[base + 1] = total_f.y;
-      output[base + 2] = total_f.z;
-    } else {
-      float per_taxel = total_fn / float(dim);
-      for (uint j = 0; j < dim; ++j) {
-        output[base + j] = per_taxel;
-      }
-    }
-    return;
-  }
   if (styp==0) {
     // TOUCH: sum of normal forces in the site zone (pinned ray test).
     uint s=uint(meta[i*10+4]);
