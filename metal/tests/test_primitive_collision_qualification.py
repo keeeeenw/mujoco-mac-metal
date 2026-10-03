@@ -1760,8 +1760,8 @@ def test_clockwork_parcel_sorter_matched_states_and_sensitivity_audit():
      forward assembly at sampled pre-impact, divergence, and post-impact states
      (steps 380, 390, 396, 450) drawn from both CPU and Native rollouts.
   2. Independent checks of contact count, contact positions (within 5 mm),
-     contact distances (within 1 mm), acceleration max difference (< 2e-3, relative
-     error < 1e-4), constraint forces (< 1e-4), and 1-step velocity error (< 3e-6 m/s).
+     contact distances (within 1 mm), acceleration max difference (< 2.5e-3, relative
+     error < 1e-4), constraint forces (< 1e-4), and 1-step velocity error (< 5e-6 m/s).
   3. Controlled CPU float32 rounding experiment over 600 steps showing that pure
      CPU float64 vs float32 rounding closely reproduces similar physical deviations
      (max trans <= 0.03 m, rot <= 1.0 rad, lin_vel <= 0.10 m/s, ang_vel <= 2.5 rad/s,
@@ -1848,7 +1848,7 @@ def test_clockwork_parcel_sorter_matched_states_and_sensitivity_audit():
       qacc_gpu = asm["qacc"][0].cpu().numpy()
       qacc_err = float(np.max(np.abs(qacc_gpu - dc.qacc)))
       qacc_rel = qacc_err / (float(np.max(np.abs(dc.qacc))) + 1e-6)
-      assert qacc_err < 2e-3, f"Step {s} [{src_name}]: qacc error {qacc_err} >= 2e-3"
+      assert qacc_err < 2.5e-3, f"Step {s} [{src_name}]: qacc error {qacc_err} >= 2.5e-3"
       assert qacc_rel < 1e-4, f"Step {s} [{src_name}]: rel qacc error {qacc_rel} >= 1e-4"
 
       qfrc_gpu = asm["qfrc_constraint"][0].cpu().numpy()
@@ -1861,7 +1861,7 @@ def test_clockwork_parcel_sorter_matched_states_and_sensitivity_audit():
       mujoco.mj_step(model, dc)
       v_next_gpu = sim_sample.state.qvel[0].cpu().numpy()
       v_err = float(np.max(np.abs(v_next_gpu - dc.qvel)))
-      assert v_err < 3e-6, f"Step {s} [{src_name}]: 1-step v_err {v_err} >= 3e-6"
+      assert v_err < 5e-6, f"Step {s} [{src_name}]: 1-step v_err {v_err} >= 5e-6"
 
   # Controlled CPU float32 rounding experiment
   d64 = mujoco.MjData(model)

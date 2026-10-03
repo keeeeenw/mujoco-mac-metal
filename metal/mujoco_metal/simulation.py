@@ -2029,7 +2029,8 @@ class MetalSimulation:
                  root_com=dynamics["root_com"])
     stages = [_mj.mjtStage.mjSTAGE_POS, _mj.mjtStage.mjSTAGE_VEL]
     old = self._sensors.run_device(
-        qpos, qvel, self._state._time, poses, stages=tuple(stages))
+        qpos, qvel, self._state._time, poses, stages=tuple(stages),
+        sensordata=self._sensordata)
     merged = self._run_state_sensors(qpos, qvel, poses, dynamics, out=old)
     if self._has_acc_sensors and qacc is not None:
       # _acceleration just ran at this exact state; its cached actuator

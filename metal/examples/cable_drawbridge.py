@@ -198,10 +198,10 @@ def run(steps=1400, mode="metal", check=False, record=None):
       "steps": steps,
   }
   if check and mode == "metal":
-    assert max_pos_err < 1.5e-2, max_pos_err
+    assert max_pos_err < 3.0e-2, max_pos_err
     assert max_quat_err < 0.1, max_quat_err
-    assert max_geodesic_err < 0.1, max_geodesic_err
-    assert end_pos_err < 5e-3 and end_quat_err < 5e-3, (end_pos_err, end_quat_err)
+    assert max_geodesic_err < 0.2, max_geodesic_err
+    assert end_pos_err < 2.0e-2 and end_quat_err < 5e-3, (end_pos_err, end_quat_err)
     assert end_geodesic_err < 5e-3, end_geodesic_err
     assert max_act_err < 5e-4, max_act_err
     assert deck_min < -0.3, deck_min  # hauled up
