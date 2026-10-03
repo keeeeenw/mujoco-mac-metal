@@ -22,6 +22,8 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Eccentric roller workshop](eccentric_roller.md) | Cylinders and ellipsoids sort themselves rolling and sliding down a tilted railed table into catch bins | Analytic cylinder/ellipsoid collision with convex manifolds |
 | [Latch-and-release cargo bridge](cargo_bridge.md) | Two connected deck sections unlatch a weld brace and land on a solid stop with their payload | Connect/weld equalities with per-environment activation, coupled contact solve |
 | [Assembly puzzle](assembly_puzzle.md) | Procedural convex hulls drop and settle into a walled tray | Convex mesh collision: hull vertex-support GJK/MPR singles with face-snap readout |
+| [Rock-garden axle cart](terrain_rover.md) | A passive two-wheel cart rolls across a rock garden and stops at a berm | Heightfield collision: per-prism terrain witnesses vs spheres |
+| [Latch-and-release cargo bridge](cargo_bridge.md) | Two deck sections joined by a connect constraint unlatch a weld brace and spill a payload into a tray | Connect/weld equalities with per-environment activation, coupled contact solve |
 | [Magnetic crane](magnetic_crane.md) | A mocap hook carries a welded cargo box to a bin and releases it | Per-environment mocap inputs, weld attach/release, keyframe reset |
 | [Muscle-powered gripper](muscle_gripper.md) | Parallel jaws with supporting ledges, bin delivery and pedestal placement | Stateful actuation and contact-rich manipulation |
 | [Cable drawbridge](cable_drawbridge.md) | A routed cable hauls, goes slack and re-tensions a loaded deck | Spatial tendon wrapping, pulley division and spring/damping forces |

@@ -100,15 +100,19 @@ The integrated Euler pipeline enforces explicit hardware-tailored capacity bound
 - Total candidate constraint rows: $nr \le 96$.
 - Equality row spans: joint equality 1 row, connect 3 rows, weld 6 rows per equality (`n_eq_rows` total, deterministic `eq_rowadr`/`eq_rownum` mapping). The activity array keeps one entry per equality, not per row.
 - Contact row counts depend on cone and `condim`: pyramidal condim 1/3/4/6 expands to 1/4/6/10 rows; elliptic condim 1/3/4/6 uses 1/3/4/6 coupled rows. Lowering calculates row offsets and rejects models that exceed the total row cap before GPU execution.
-- Supported geometries: plane, sphere, capsule, box, cylinder, ellipsoid
-  and convex meshes. Cylinder/ellipsoid pairs use analytic ports plus
-  convex GJK+MPR (with multiCCD manifolds where pinned). Meshes collide by
-  convex-hull vertex support (single witness per pair; face-snap readout on
-  shallow contacts); admitted assets are single-convex-piece with at most
-  64 hull vertices (256 total), verified at lowering. Concave assets,
-  heightfields and SDFs stay rejected. Models exceeding bounds, requesting
-  non-Euler integrators, flex, or plugins are rejected cleanly during
-  profile validation before GPU execution.
+- Supported geometries: plane, sphere, capsule, box, cylinder, ellipsoid,
+  convex meshes and heightfields. Cylinder/ellipsoid pairs use analytic
+  ports plus convex GJK+MPR (with multiCCD manifolds where pinned). Meshes
+  collide by convex-hull vertex support (single witness per pair; face-snap
+  readout on shallow contacts); admitted assets are single-convex-piece with
+  at most 64 hull vertices (256 total), verified at lowering. Heightfields
+  collide per overlapped terrain prism (one witness each, same traversal as
+  the pinned engine) against sphere/capsule/box/cylinder/ellipsoid within
+  dim/data caps; mesh-heightfield and heightfield-heightfield pairs stay
+  rejected and margin is qualified at 0 only. Concave assets and SDFs stay
+  rejected. Models exceeding bounds, requesting non-Euler integrators, flex,
+  or plugins are rejected cleanly during profile validation before GPU
+  execution.
 - Supported equality types: joint, connect, weld (body-body, body-world, site-site, including mocap bodies as kinematic anchors; both-mocap equalities reserve rows but assemble zero rows/forces, matching MuJoCo skipping its empty Jacobian). Tendon/flex equalities, ball limits and non-finite `torquescale` are rejected, even when initially inactive.
 - Mocap bodies: jointless direct children of world only (pinned compiler restriction, re-validated at lowering). Prescribed per-environment poses via `sim.set_mocap`.
 
