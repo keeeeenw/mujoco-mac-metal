@@ -288,7 +288,7 @@ kernel void evaluate_state_sensors(
   // spatial families have dedicated kernels.
   bool handled = typ==11||typ==12||typ==13||typ==14||typ==20||typ==21
       ||typ==23||typ==24||typ==6||typ==35||typ==36||typ==37||typ==38
-      ||typ==43||typ==44;
+      ||typ==43||typ==44||typ==8;
   if (!handled) return;
   uint dim=uint(meta[i*10+5]), adr=uint(meta[i*10+6]);
   float value[6] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
@@ -531,6 +531,44 @@ kernel void evaluate_state_sensors(
       }
       value[0]=e;
     }
+  }
+  else if (typ==8) {
+    // Pinned cam_project (R07a, no rendering): site target through the
+    // body-mounted camera frame. Camera constants ride the econst tail at
+    // 10+nq+3*njnt: [ncam] then per camera [bodyid, lpos(3), lquat(4),
+    // res(2), fovy, intrinsic(4), sensorsize(2)].
+    float3 sp=read3(site_pos,(world*nsite+uint(objid))*3);
+    uint cam=uint(meta[i*10+9]);
+    uint cb=uint(10+nq+3*njnt);
+    uint base=cb+1+cam*13;
+    uint cbody=uint(econst[base+0]);
+    if (cbody>=nbody) cbody=0;
+    float3 bpos=read3(body_pos,(world*nbody+cbody)*3);
+    float4 bq=qunit(read4(body_quat,(world*nbody+cbody)*4));
+    float4 lq=qunit(float4(econst[base+4],econst[base+5],econst[base+6],econst[base+7]));
+    float3 campos=bpos+qrot(bq,float3(econst[base+1],econst[base+2],econst[base+3]));
+    float4 wq=qunit(qmul(bq,lq));
+    float x=wq.y, y=wq.z, z=wq.w, w=wq.x;
+    // xmat rows (pinned rotation[i][j] = xmat[j*3+i] = R[i][j]).
+    float3 r0=float3(1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w));
+    float3 r1=float3(2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w));
+    float3 r2=float3(2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y));
+    float3 p=sp-campos;
+    float3 q=float3(dot(r0,p),dot(r1,p),dot(r2,p));
+    float res0=econst[base+8], res1=econst[base+9], fovy=econst[base+10];
+    float ss0=econst[base+15], ss1=econst[base+16];
+    float fx, fy;
+    if (ss0!=0.0f && ss1!=0.0f) {
+      fx=econst[base+11]/ss0*res0;
+      fy=econst[base+12]/ss1*res1;
+    } else {
+      fx=fy=0.5f/tan(fovy*3.14159265f/360.0f)*res1;
+    }
+    float3 px=float3(-fx*q.x,fy*q.y,q.z);
+    float3 img=float3(px.x+res0*0.5f*px.z,px.y+res1*0.5f*px.z,px.z);
+    float denom=img.z;
+    if (abs(denom)<1e-15f) denom=denom<0.0f ? min(denom,-1e-15f) : max(denom,1e-15f);
+    value[0]=img.x/denom; value[1]=img.y/denom;
   }
   float cutoff=as_type<float>(meta[i*10+7]);
   if (cutoff>0 && meta[i*10+1]==0) {

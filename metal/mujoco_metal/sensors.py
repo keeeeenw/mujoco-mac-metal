@@ -68,9 +68,15 @@ _SUPPORTED = {
     int(mujoco.mjtSensor.mjSENS_CONTACT),
     int(mujoco.mjtSensor.mjSENS_E_POTENTIAL),
     int(mujoco.mjtSensor.mjSENS_E_KINETIC),
+    # R07a: camera projection is pure projective math (pinned cam_project,
+    # no rendering); implemented natively with fixed/body-mounted cameras.
+    int(mujoco.mjtSensor.mjSENS_CAMPROJECTION),
 }
 _DEFERRED_TO_019 = {
-    int(mujoco.mjtSensor.mjSENS_CAMPROJECTION),
+    # TACTILE needs contact-to-mesh-vertex force accumulation over the
+    # retained contact manifold (future contact-kernel work); PLUGIN/USER
+    # need the explicit host extension route (019). SDF rays/distances go
+    # through the SDF plugin (pinned mjc_getSDF), likewise 019.
     int(mujoco.mjtSensor.mjSENS_TACTILE),
     int(mujoco.mjtSensor.mjSENS_PLUGIN),
     int(mujoco.mjtSensor.mjSENS_USER),
@@ -128,6 +134,14 @@ class SensorDescriptor:
   body_inertia: np.ndarray
   ntendon: int
   nu: int
+  ncam: int
+  cam_bodyid: np.ndarray
+  cam_pos: np.ndarray
+  cam_quat: np.ndarray
+  cam_resolution: np.ndarray
+  cam_fovy: np.ndarray
+  cam_intrinsic: np.ndarray
+  cam_sensorsize: np.ndarray
   tendon_range: np.ndarray
   tendon_margin: np.ndarray
   tendon_limited: np.ndarray
@@ -171,6 +185,7 @@ def lower_sensors(model) -> SensorDescriptor:
       model.nsensor, model.njnt, model.nbody, model.ngeom, model.nsite
   )
   nt, nu = int(model.ntendon), int(model.nu)
+  ncam = int(model.ncam)
   names = {
       "sensor_type": (np.int32, (ns,)),
       "sensor_datatype": (np.int32, (ns,)),
@@ -215,6 +230,13 @@ def lower_sensors(model) -> SensorDescriptor:
       "tendon_stiffnesspoly": (np.float32, (nt, 2)),
       "gravity": (np.float32, (3,)),
       "magnetic": (np.float32, (3,)),
+      "cam_bodyid": (np.int32, (ncam,)),
+      "cam_pos": (np.float32, (ncam, 3)),
+      "cam_quat": (np.float32, (ncam, 4)),
+      "cam_resolution": (np.int32, (ncam, 2)),
+      "cam_fovy": (np.float32, (ncam,)),
+      "cam_intrinsic": (np.float32, (ncam, 4)),
+      "cam_sensorsize": (np.float32, (ncam, 2)),
   }
   arrays = {name: _vec(model, name, dtype, shape) for name, (dtype, shape) in names.items() if name not in ("gravity", "magnetic")}
   for name, src in (("gravity", model.opt.gravity), ("magnetic", model.opt.magnetic)):
@@ -270,6 +292,8 @@ def lower_sensors(model) -> SensorDescriptor:
       expected_dim = 3
     elif typ == int(S.mjSENS_GEOMFROMTO):
       expected_dim = 6
+    elif typ == int(S.mjSENS_CAMPROJECTION):
+      expected_dim = 2
     elif typ == int(S.mjSENS_RANGEFINDER):
       expected_dim = _raydata_size(int(arrays["sensor_intprm"][i, 0]))
     elif typ == int(S.mjSENS_CONTACT):
@@ -317,6 +341,18 @@ def lower_sensors(model) -> SensorDescriptor:
         raise ValueError(f"sensor {i}: gyro and velocimeter require a site")
       if dim != 3:
         raise ValueError(f"sensor {i}: gyro and velocimeter require dimension 3")
+    if typ == int(S.mjSENS_CAMPROJECTION):
+      # R07a: site target projected through a body-mounted camera (pure
+      # projective math, no rendering). Fixed cameras sit on the world
+      # body; tracked cameras ride their body frame.
+      sid = int(arrays["sensor_objid"][i])
+      if int(arrays["sensor_objtype"][i]) != int(mujoco.mjtObj.mjOBJ_SITE) or not 0 <= sid < nsite:
+        raise ValueError(f"sensor {i}: camprojection requires a site target")
+      cid = int(arrays["sensor_refid"][i])
+      if int(arrays["sensor_reftype"][i]) != int(mujoco.mjtObj.mjOBJ_CAMERA) or not 0 <= cid < ncam:
+        raise ValueError(f"sensor {i}: camprojection requires a camera reference")
+      if dim != 2:
+        raise ValueError(f"sensor {i}: camprojection requires dimension 2")
     if typ in (int(S.mjSENS_TENDONPOS), int(S.mjSENS_TENDONVEL),
                  int(S.mjSENS_TENDONLIMITPOS), int(S.mjSENS_TENDONLIMITVEL),
                  int(S.mjSENS_TENDONLIMITFRC), int(S.mjSENS_TENDONACTFRC)):
@@ -358,10 +394,10 @@ def lower_sensors(model) -> SensorDescriptor:
         raise ValueError(f"sensor {i}: only site rangefinders are supported")
       if not 0 <= int(arrays["sensor_objid"][i]) < nsite:
         raise ValueError(f"sensor {i}: invalid rangefinder site id")
-      if np.any(np.asarray(model.geom_type) == int(mujoco.mjtGeom.mjGEOM_SDF)):
-        raise ValueError(
-            f"sensor {i}: rangefinders in SDF scenes are unsupported in 016"
-            " (pinned SDF ray path is plugin-defined)")
+      # R07a: no SDF-scene rejection. Without a registered SDF plugin both
+      # engines skip SDF geoms in rays (pinned mj_ray reports no-hit);
+      # the native kernel mirrors that skip, verified by parity tests.
+      # With-plugin SDF ray hits stay 019-owned.
     if typ == int(S.mjSENS_CONTACT):
       for key in ("sensor_objtype", "sensor_reftype"):
         t = int(arrays[key][i])
@@ -413,13 +449,14 @@ def lower_sensors(model) -> SensorDescriptor:
       pass
   arrays["ntendon"] = nt
   arrays["nu"] = nu
+  arrays["ncam"] = ncam
   _STATE_TYPES = {int(getattr(mujoco.mjtSensor, n)) for n in (
       "mjSENS_TENDONPOS", "mjSENS_TENDONVEL", "mjSENS_ACTUATORPOS",
       "mjSENS_ACTUATORVEL", "mjSENS_JOINTLIMITPOS", "mjSENS_JOINTLIMITVEL",
       "mjSENS_TENDONLIMITPOS", "mjSENS_TENDONLIMITVEL",
       "mjSENS_SUBTREECOM", "mjSENS_SUBTREELINVEL", "mjSENS_SUBTREEANGMOM",
       "mjSENS_INSIDESITE", "mjSENS_E_POTENTIAL", "mjSENS_E_KINETIC",
-      "mjSENS_MAGNETOMETER")}
+      "mjSENS_MAGNETOMETER", "mjSENS_CAMPROJECTION")}
   if nb > 64 and bool(np.any(np.isin(sensor, list(_STATE_TYPES)))):
     raise ValueError("state-family sensors bound nbody to 64")
   # Stateful timing features change only on selected calls and require history.
@@ -735,6 +772,53 @@ def _unit(q, name):
   return q / norm
 
 
+def _quat_mul(a, b):
+  a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+  return np.array([a[0] * b[0] - np.dot(a[1:], b[1:]),
+                   *(a[0] * b[1:] + b[0] * a[1:] + np.cross(a[1:], b[1:]))])
+
+
+def _cam_project_reference(model, site_pos, body_pos, body_quat, camid):
+  """Exact host port of pinned ``cam_project`` (R07a, no rendering).
+
+  Camera world frame composes the mount-body frame with the compiled
+  local offset, matching ``d->cam_xpos/xmat``; then the pinned
+  translation/rotation/focal/image chain projects the site target.
+  """
+  site_pos = np.asarray(site_pos, dtype=np.float64)
+  b = int(np.asarray(model.cam_bodyid[camid]))
+  bq = _unit(np.asarray(body_quat[b], dtype=np.float64), "body quaternion")
+  bp = np.asarray(body_pos[b], dtype=np.float64)
+  lq = _unit(np.asarray(model.cam_quat[camid], dtype=np.float64), "camera quaternion")
+  wq = _quat_mul(bq, lq)
+  campos = bp + _quat_rot(bq, np.asarray(model.cam_pos[camid], dtype=np.float64))
+  res = np.asarray(model.cam_resolution[camid], dtype=np.float64)
+  fovy = float(np.asarray(model.cam_fovy[camid]))
+  intrinsic = np.asarray(model.cam_intrinsic[camid], dtype=np.float64)
+  sensorsize = np.asarray(model.cam_sensorsize[camid], dtype=np.float64)
+  # Rotation block: rotation[i][j] = xmat[j*3+i] with column-major xmat.
+  x, y, z, w = wq[1], wq[2], wq[3], wq[0]
+  xmat = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                   [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                   [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+  if sensorsize[0] and sensorsize[1]:
+    fx = intrinsic[0] / sensorsize[0] * res[0]
+    fy = intrinsic[1] / sensorsize[1] * res[1]
+  else:
+    fx = fy = 0.5 / np.tan(fovy * np.pi / 360.0) * res[1]
+  # Direct chain evaluation: translation shifts by -campos, rotation
+  # (rotation[i][j] = xmat[j*3+i], i.e. the xmat matrix itself, verified
+  # against CPU sensordata) contracts it, focal scales, image centers.
+  p = site_pos - campos
+  q = xmat @ p
+  px = np.array([-fx * q[0], fy * q[1], q[2]])
+  img = np.array([px[0] + res[0] / 2 * px[2], px[1] + res[1] / 2 * px[2], px[2]])
+  denom = img[2]
+  if abs(denom) < float(mujoco.mjMINVAL):
+    denom = min(denom, -float(mujoco.mjMINVAL)) if denom < 0 else max(denom, float(mujoco.mjMINVAL))
+  return np.array([img[0] / denom, img[1] / denom])
+
+
 def _poly_potential(linear, poly, x):
   return 0.5 * linear * x * x + poly[0] / 3 * x**3 + poly[1] / 4 * x**4
 
@@ -814,6 +898,11 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
         _site_q = _unit(np.asarray(poses["site_quat"])[w, objid], "site quaternion")
         value = _quat_rot(np.array([_site_q[0], *(-_site_q[1:])]),
                           np.asarray(desc.magnetic, dtype=np.float64))
+      elif typ == int(S.mjSENS_CAMPROJECTION):
+        value = _cam_project_reference(
+            model, np.asarray(poses["site_pos"])[w, objid],
+            np.asarray(poses["body_pos"])[w], np.asarray(poses["body_quat"])[w],
+            int(desc.sensor_refid[i]))
       elif typ == int(S.mjSENS_SUBTREECOM):
         value = np.asarray(Need("subtree_com")["subtree_com"][w, objid]).copy()
       elif typ == int(S.mjSENS_SUBTREELINVEL):
@@ -1219,6 +1308,20 @@ class SensorProgram:
                 np.asarray(model.jnt_stiffnesspoly, dtype=np.float64).reshape(nj, 2)[:, 0] if nj else np.zeros(0),
                 np.asarray(model.jnt_stiffnesspoly, dtype=np.float64).reshape(nj, 2)[:, 1] if nj else np.zeros(0)):
       ec += [float(v) for v in arr]
+    # R07a camera block for CAMPROJECTION (econst tail): [ncam] then per
+    # camera [bodyid, lpos(3), lquat(4), res(2), fovy, intrinsic(4),
+    # sensorsize(2)]. Kernel offset = 10 + nq + 3*njnt; zero cameras append
+    # only the count, bit-identical for existing models.
+    ncam = int(model.ncam)
+    ec += [float(ncam)]
+    for c in range(ncam):
+      ec += [float(int(model.cam_bodyid[c]))]
+      ec += [float(v) for v in np.asarray(model.cam_pos[c], dtype=np.float64).reshape(-1)]
+      ec += [float(v) for v in np.asarray(model.cam_quat[c], dtype=np.float64).reshape(-1)]
+      ec += [float(int(model.cam_resolution[c, 0])), float(int(model.cam_resolution[c, 1]))]
+      ec += [float(model.cam_fovy[c])]
+      ec += [float(v) for v in np.asarray(model.cam_intrinsic[c], dtype=np.float64).reshape(-1)]
+      ec += [float(v) for v in np.asarray(model.cam_sensorsize[c], dtype=np.float64).reshape(-1)]
     self._s_econst = torch.as_tensor(np.array(ec, dtype=np.float32), dtype=torch.float32, device=self._device)
     WJ = int(mujoco.mjtWrap.mjWRAP_JOINT)
     ten_lmap = np.zeros((max(nt, 1), max(nq, 1)), dtype=np.float32)

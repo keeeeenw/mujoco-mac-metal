@@ -731,7 +731,8 @@ kernel void evaluate_rays(
       if (mat_rgba[mid*4+3]==0.0f) continue;
     }
     int t=geom_type[g];
-    if (t==8) continue; // SDF rays are plugin-defined (019 gap).
+    if (t==8) continue; // R07a: SDF rays need the SDF plugin (019); without
+    // one pinned mj_ray skips SDF identically (no-hit parity, tested).
     float3 gp=sp_r3(geom_pos,(world*ngeom+g)*3);
     float4 gq=sp_qunit(float4(geom_quat[(world*ngeom+g)*4],geom_quat[(world*ngeom+g)*4+1],geom_quat[(world*ngeom+g)*4+2],geom_quat[(world*ngeom+g)*4+3]));
     float3 c0=sp_qrot(gq,float3(1,0,0)), c1=sp_qrot(gq,float3(0,1,0)), c2=sp_qrot(gq,float3(0,0,1));
