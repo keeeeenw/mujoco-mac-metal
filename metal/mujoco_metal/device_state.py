@@ -868,7 +868,12 @@ class DeviceState:
     return self._generation
 
   def snapshot(self):
-    """Copy all state to an immutable host checkpoint outside the step loop."""
+    """Copy kinematic/equality/mocap/activation rows to a host checkpoint.
+
+    Narrow device-state contract only: retained solver multipliers, held
+    per-call inputs and stored sensor samples are NOT included. Use
+    :meth:`MetalSimulation.snapshot` for full replayable checkpoints (R03).
+    """
     if self._neq == 0 and self._nmocap == 0 and self._na == 0:
       return StateSnapshot(
         model_fingerprint=self._model_fingerprint,

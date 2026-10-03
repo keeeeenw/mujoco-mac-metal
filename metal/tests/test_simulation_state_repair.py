@@ -105,3 +105,179 @@ def test_failed_world_keeps_activation_and_state_gpu():
   sim.reset(env_ids=[1])
   sim.step(1, ctrl=np.array([[0.5], [0.5]], dtype=np.float32))
   assert bool(np.all(np.isfinite(sim.state.qpos.cpu().numpy())))
+
+
+def _contact_model():
+  return mujoco.MjModel.from_xml_string(
+      "<mujoco><option timestep='0.002' integrator='Euler' iterations='1'/>"
+      "<worldbody><geom name='floor' type='plane' size='5 5 0.1'/>"
+      "<body pos='-0.3 0 0.25'><freejoint/><geom type='sphere' size='0.1' mass='0.5'/>"
+      "<site name='s'/></body>"
+      "<body pos='0.3 0 0.4'><freejoint/><geom type='sphere' size='0.1' mass='0.5'/></body>"
+      "</worldbody>"
+      "<sensor><touch site='s'/></sensor></mujoco>")
+
+
+def _full_state(sim):
+  return {
+      "qpos": sim.state.qpos.cpu().numpy().copy(),
+      "qvel": sim.state.qvel.cpu().numpy().copy(),
+      "act": sim.state._act.cpu().numpy().copy() if getattr(sim.state, "_na", 0) else None,
+      "warm": sim._coupled_constraints.get_warmstart().copy()
+      if getattr(sim, "_coupled_constraints", None) is not None else None,
+      "sens": sim.step_sensordata().copy() if getattr(sim, "_sensordata", None) is not None else None,
+  }
+
+
+@_needs_gpu()
+def test_simulation_snapshot_replay_gpu():
+  from mujoco_metal.simulation import MetalSimulation
+  model = _contact_model()
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  sim.reset(qpos=np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
+            qvel=np.zeros((2, model.nv), dtype=np.float32))
+  for _ in range(80):
+    sim.step(1)
+  snap = sim.snapshot()
+  ref = _full_state(sim)
+  for _ in range(30):
+    sim.step(1)
+  assert not np.allclose(sim.state.qpos.cpu().numpy(), ref["qpos"])
+  sim.restore(snap)
+  got = _full_state(sim)
+  for key in ("qpos", "qvel", "sens"):
+    np.testing.assert_array_equal(got[key], ref[key])
+  np.testing.assert_array_equal(got["warm"], ref["warm"])
+  # Replay continues identically (low iteration budget: seeds matter).
+  for _ in range(30):
+    sim.step(1)
+  again = _full_state(sim)
+  sim.restore(snap)
+  for _ in range(30):
+    sim.step(1)
+  twice = _full_state(sim)
+  for key in ("qpos", "qvel", "sens"):
+    np.testing.assert_array_equal(again[key], twice[key])
+  np.testing.assert_array_equal(again["warm"], twice["warm"])
+
+
+@_needs_gpu()
+def test_copy_environment_reproduces_trajectory_gpu():
+  from mujoco_metal.simulation import MetalSimulation
+  model = _contact_model()
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  sim.reset(qpos=np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
+            qvel=np.zeros((2, model.nv), dtype=np.float32))
+  for _ in range(80):
+    sim.step(1)
+  sim.copy_environment(0, 1)
+  for _ in range(10):
+    sim.step(1)
+  q = sim.state.qpos.cpu().numpy()
+  np.testing.assert_array_equal(q[0], q[1])
+  w = sim._coupled_constraints.get_warmstart()
+  np.testing.assert_array_equal(w[0], w[1])
+  s = sim.step_sensordata()
+  np.testing.assert_array_equal(s[0], s[1])
+
+
+@_needs_gpu()
+def test_query_twins_have_identical_next_steps_gpu():
+  from mujoco_metal.simulation import MetalSimulation
+  model = _contact_model()
+  twins = []
+  for _ in range(2):
+    sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+    sim.reset(qpos=np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
+              qvel=np.zeros((2, model.nv), dtype=np.float32))
+    twins.append(sim)
+  for _ in range(60):
+    for sim in twins:
+      sim.step(1)
+  a, b = twins
+  wa_before = a._coupled_constraints.get_warmstart().copy()
+  a.sensor_values()
+  # Query changes nothing persistent: warm seeds and caches identical.
+  np.testing.assert_array_equal(a._coupled_constraints.get_warmstart(), wa_before)
+  for _ in range(5):
+    a.step(1)
+    b.step(1)
+  np.testing.assert_array_equal(a.state.qpos.cpu().numpy(), b.state.qpos.cpu().numpy())
+  np.testing.assert_array_equal(a._coupled_constraints.get_warmstart(),
+                                b._coupled_constraints.get_warmstart())
+
+
+@_needs_gpu()
+def test_invalid_restore_leaves_state_unchanged_gpu():
+  from mujoco_metal.simulation import MetalSimulation
+  model = _contact_model()
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  sim.reset(qpos=np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
+            qvel=np.zeros((2, model.nv), dtype=np.float32))
+  for _ in range(5):
+    sim.step(1)
+  snap = sim.snapshot()
+  ref = _full_state(sim)
+  bad = dict(snap)
+  bad["warmstart"] = np.full_like(snap["warmstart"], np.nan)
+  with pytest.raises(ValueError):
+    sim.restore(bad)
+  with pytest.raises(ValueError):
+    sim.restore("not-a-snapshot")
+  with pytest.raises(ValueError):
+    sim.restore(snap, env_ids=[0])
+  with pytest.raises(ValueError):
+    sim.copy_environment(0, 5)
+  got = _full_state(sim)
+  for key in ("qpos", "qvel", "sens"):
+    np.testing.assert_array_equal(got[key], ref[key])
+  np.testing.assert_array_equal(got["warm"], ref["warm"])
+
+
+@_needs_gpu()
+def test_restore_then_randomize_stays_coherent_gpu():
+  from mujoco_metal.simulation import MetalSimulation
+  rng = np.random.default_rng(7)
+  model = _contact_model()
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  sim.reset(qpos=np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
+            qvel=np.zeros((2, model.nv), dtype=np.float32))
+  for _ in range(5):
+    sim.step(1)
+  snap = sim.snapshot()
+  sim.restore(snap)
+  nq = model.nq
+  assert nq == 14
+  qpos = rng.normal(0, 0.05, size=(2, nq)).astype(np.float32)
+  qpos[:, 0:3] += np.asarray(model.qpos0, dtype=np.float32)[0:3]
+  qpos[:, 3:7] = np.asarray([1, 0, 0, 0], dtype=np.float32)
+  qpos[:, 7:10] += np.asarray(model.qpos0, dtype=np.float32)[7:10]
+  qpos[:, 10:14] = np.asarray([1, 0, 0, 0], dtype=np.float32)
+  sim.reset(qpos=qpos, qvel=np.zeros((2, model.nv), dtype=np.float32))
+  for _ in range(10):
+    sim.step(1)
+  assert bool(np.all(np.isfinite(sim.state.qpos.cpu().numpy())))
+  assert bool(np.all(np.isfinite(sim.step_sensordata())))
+
+
+@_needs_gpu()
+def test_raw_reset_keeps_warmstart_simulator_reset_clears_gpu():
+  from mujoco_metal.simulation import MetalSimulation
+  model = _contact_model()
+  sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  sim.reset(qpos=np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1),
+            qvel=np.zeros((1, model.nv), dtype=np.float32))
+  for _ in range(120):
+    sim.step(1)
+  warm_before = sim._coupled_constraints.get_warmstart().copy()
+  assert bool(np.any(warm_before != 0))
+  # Raw device reset: kinematics replaced, retained solver seed untouched.
+  sim.state.reset()
+  np.testing.assert_array_equal(sim._coupled_constraints.get_warmstart(), warm_before)
+  for _ in range(120):
+    sim.step(1)
+  # Simulator reset: cold start across state, seeds, held inputs, samples.
+  sim.reset()
+  np.testing.assert_array_equal(sim._coupled_constraints.get_warmstart(),
+                                np.zeros_like(warm_before))
+  np.testing.assert_array_equal(sim.step_sensordata(), np.zeros_like(sim.step_sensordata()))

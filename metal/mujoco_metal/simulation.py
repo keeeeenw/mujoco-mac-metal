@@ -556,11 +556,163 @@ class MetalSimulation:
   def copy_environment(self, src, dst):
     """Copy all state rows (qpos/qvel/qacc/time/status/eq/mocap) src -> dst."""
     gen = self._state.copy_environment(src, dst)
+    for name, value in (("src", src), ("dst", dst)):
+      raw = np.asarray(value)
+      if raw.shape != () or raw.dtype.kind not in "iu":
+        raise ValueError("src/dst must be integer environment indices")
+    src_i, dst_i = int(np.asarray(src)), int(np.asarray(dst))
+    for index in (src_i, dst_i):
+      if not 0 <= index < self.batch_size:
+        raise ValueError("environment index out of range")
+    # Full simulation state follows the device rows: retained warmstarts,
+    # stored sensor samples and held per-call inputs. Caches invalidate.
+    cc = getattr(self, "_coupled_constraints", None)
+    if cc is not None and int(cc.descriptor.nr) > 0:
+      w = cc._workspace["workspace_debug"].reshape(
+          self.batch_size, cc.descriptor.nr * cc.descriptor.nr + 7 * cc.descriptor.nr)
+      nr = cc.descriptor.nr
+      w[dst_i, nr * nr + 3 * nr:nr * nr + 4 * nr] = w[src_i, nr * nr + 3 * nr:nr * nr + 4 * nr].clone()
+    if getattr(self, "_sensordata", None) is not None:
+      self._sensordata[dst_i] = self._sensordata[src_i].clone()
+    for held in ("_control", "_body_wrench", "_applied_force"):
+      tensor = getattr(self, held, None)
+      if tensor is not None:
+        tensor[dst_i] = tensor[src_i].clone()
     if hasattr(self, "_last_coupled"):
       self._last_coupled = None
     if hasattr(self, "_last_coupled_generation"):
       self._last_coupled_generation = None
     return gen
+
+  def snapshot(self):
+    """Capture a versioned simulation-level checkpoint (host, immutable).
+
+    Covers everything needed for exact replay: the device state, retained
+    constraint multipliers, held per-call inputs and stored sensor samples.
+    The narrower :meth:`DeviceState.snapshot` owns only kinematic/equality/
+    mocap/activation rows; use this method for full trajectory replay.
+    """
+    import numpy as _np
+    torch = self._state._torch
+    snap = {
+        "schema_version": 1,
+        "model_fingerprint": self._state._model_fingerprint,
+        "profile_fingerprint": self._state._profile_fingerprint,
+        "batch_size": self.batch_size,
+        "nr": 0,
+        "nsensordata": int(self._mjmodel.nsensordata),
+        "nu": int(self._mjmodel.nu),
+        "nv": int(self._mjmodel.nv),
+        "nbody": int(self._mjmodel.nbody),
+        "device": self._state.snapshot(),
+    }
+    cc = getattr(self, "_coupled_constraints", None)
+    if cc is not None and int(cc.descriptor.nr) > 0:
+      nr = int(cc.descriptor.nr)
+      snap["nr"] = nr
+      snap["warmstart"] = cc.get_warmstart().astype(_np.float32, copy=True)
+    else:
+      snap["warmstart"] = None
+    held = {}
+    for name, tensor in (("control", self._control),
+                         ("wrench", self._body_wrench),
+                         ("force", self._applied_force)):
+      held[name] = (tensor.detach().cpu().numpy().copy() if tensor is not None else None)
+    snap["held"] = held
+    snap["sensordata"] = (self._sensordata.detach().cpu().numpy().copy()
+                          if getattr(self, "_sensordata", None) is not None else None)
+    return snap
+
+  def restore(self, snapshot, env_ids=None):
+    """Restore a simulation snapshot, fully or for selected worlds.
+
+    Every field is validated before anything is committed: a bad snapshot
+    (or bad env selection) raises with all live state untouched. Warm
+    starts, held inputs and stored sensor samples follow the same rows as
+    the device state. Restoring never clears retained seeds beyond what the
+    snapshot carries; use :meth:`reset` for a cold start.
+    """
+    import numpy as _np
+    if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1:
+      raise ValueError("unsupported simulation snapshot schema")
+    if (snapshot.get("model_fingerprint") != self._state._model_fingerprint
+            or snapshot.get("profile_fingerprint") != self._state._profile_fingerprint
+            or snapshot.get("batch_size") != self.batch_size):
+      raise ValueError("snapshot model, profile, or batch size do not match")
+    ids = self._state._env_ids(env_ids) if env_ids is not None else None
+    rows = (np.arange(self.batch_size, dtype=_np.int64) if ids is None else _np.asarray(ids, dtype=_np.int64))
+    if rows.size == 0:
+      raise ValueError("env_ids must select at least one world")
+    nr = int(snapshot.get("nr", 0))
+    cc = getattr(self, "_coupled_constraints", None)
+    cc_nr = int(cc.descriptor.nr) if cc is not None else 0
+    if nr != cc_nr:
+      raise ValueError("snapshot constraint-row dimensions do not match")
+    warm = snapshot.get("warmstart")
+    if nr > 0:
+      warm = _np.asarray(warm, dtype=_np.float64)
+      if warm.shape != (self.batch_size, nr) or not _np.all(_np.isfinite(warm)):
+        raise ValueError("snapshot warmstart has an invalid shape or nonfinite values")
+    elif warm is not None:
+      raise ValueError("snapshot warmstart must be None without constraint rows")
+    if int(snapshot.get("nsensordata", -1)) != int(self._mjmodel.nsensordata):
+      raise ValueError("snapshot sensor dimensions do not match")
+    if (int(snapshot.get("nu", -1)) != int(self._mjmodel.nu)
+            or int(snapshot.get("nv", -1)) != int(self._mjmodel.nv)
+            or int(snapshot.get("nbody", -1)) != int(self._mjmodel.nbody)):
+      raise ValueError("snapshot model dimensions do not match")
+    held = snapshot.get("held", {})
+    held_checked = {}
+    for name, tensor in (("control", self._control),
+                         ("wrench", self._body_wrench),
+                         ("force", self._applied_force)):
+      value = held.get(name)
+      if tensor is None:
+        if value is not None:
+          raise ValueError(f"snapshot held {name} does not match this simulation")
+        held_checked[name] = None
+        continue
+      if value is None:
+        raise ValueError(f"snapshot held {name} is missing")
+      arr = _np.asarray(value, dtype=_np.float64)
+      if arr.shape != tuple(tensor.shape) or not _np.all(_np.isfinite(arr)):
+        raise ValueError(f"snapshot held {name} has an invalid shape or nonfinite values")
+      held_checked[name] = arr.astype(_np.float32, copy=True)
+    sens = snapshot.get("sensordata")
+    if sens is None:
+      if getattr(self, "_sensordata", None) is not None:
+        raise ValueError("snapshot sensor sample does not match this simulation")
+      sens_checked = None
+    else:
+      if getattr(self, "_sensordata", None) is None:
+        raise ValueError("snapshot sensor sample does not match this simulation")
+      sens_checked = _np.asarray(sens, dtype=_np.float64)
+      if sens_checked.shape != (self.batch_size, int(self._mjmodel.nsensordata)) or not _np.all(_np.isfinite(sens_checked)):
+        raise ValueError("snapshot sensor sample has an invalid shape or nonfinite values")
+      sens_checked = sens_checked.astype(_np.float32, copy=True)
+    # Device restore validates its own fields atomically before mutating.
+    # Only full-simulation restore is supported: selected worlds are served
+    # by copy_environment (row copy) and reset(env_ids) (cold selected
+    # reset). A partial warmstart/held/sensor restore would leave mixed
+    # seeds, so env_ids is refused loudly instead of half-applied.
+    if env_ids is not None:
+      raise ValueError("selected-world restore is not supported; use copy_environment")
+    self._state.restore(snapshot["device"])
+    torch = self._state._torch
+    if nr > 0:
+      cc.set_warmstart(warm)
+    for name, tensor in (("control", self._control),
+                         ("wrench", self._body_wrench),
+                         ("force", self._applied_force)):
+      if tensor is not None:
+        tensor.copy_(torch.as_tensor(held_checked[name], dtype=torch.float32, device=self._state._device))
+    if sens_checked is not None:
+      self._sensordata.copy_(torch.as_tensor(sens_checked, dtype=torch.float32, device=self._state._device))
+    if hasattr(self, "_last_coupled"):
+      self._last_coupled = None
+    if hasattr(self, "_last_coupled_generation"):
+      self._last_coupled_generation = None
+    return self._state.generation
 
   def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
             mocap_pos=None, mocap_quat=None, act=None):
@@ -848,11 +1000,30 @@ class MetalSimulation:
     if self._has_acc_sensors:
       # ACC families need the solved forward state (pinned sensorAcc runs
       # post-constraint); evaluate the full forward, then the ACC kernel.
-      acceleration, _, acc_dyn = self._acceleration(state._qpos, state._qvel)
-      acc_poses = dict(acc_dyn["poses"], cvel=acc_dyn["cvel"],
-                       root_com=acc_dyn["root_com"])
-      out = self._run_acc_into(state._qpos, state._qvel, acceleration,
-                               acc_poses, acc_dyn, out)
+      # Queries must not perturb future trajectory: the forward solve
+      # refreshes retained warmstarts and the coupled cache, so both are
+      # saved and restored around the query (R03 isolation).
+      cc = getattr(self, "_coupled_constraints", None)
+      lam_saved = cc.get_warmstart() if cc is not None else None
+      last_coupled = getattr(self, "_last_coupled", None)
+      last_gen = getattr(self, "_last_coupled_generation", None)
+      try:
+        acceleration, _, acc_dyn = self._acceleration(state._qpos, state._qvel)
+        acc_poses = dict(acc_dyn["poses"], cvel=acc_dyn["cvel"],
+                         root_com=acc_dyn["root_com"])
+        out = self._run_acc_into(state._qpos, state._qvel, acceleration,
+                                 acc_poses, acc_dyn, out)
+      finally:
+        if cc is not None and lam_saved is not None:
+          import numpy as _np
+          if bool(_np.all(_np.isfinite(lam_saved))):
+            cc.set_warmstart(lam_saved)
+          else:
+            cc.clear_warmstart()
+        if hasattr(self, "_last_coupled"):
+          self._last_coupled = last_coupled
+        if hasattr(self, "_last_coupled_generation"):
+          self._last_coupled_generation = last_gen
     if self._has_contact_sensors or self._has_ray_sensors or self._has_geomdist_sensors:
       out = self._run_spatial_into(poses, out)
     return out.clone()
