@@ -1,7 +1,13 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
 
-"""MuJoCo 3.10 inertia-box fluid forces, lowered to generalized force."""
+"""MuJoCo 3.10 fluid forces, lowered to generalized force.
+
+Covers the pinned inertia-box body model and the per-geom ellipsoid model
+(added-mass, Magnus/Kutta lift, blunt/slender/angular viscous terms). Bodies
+with any interacting ellipsoid geom use the geom model; other bodies use the
+inertia-box model, matching pinned `mj_fluid` selection.
+"""
 
 from pathlib import Path
 
@@ -25,10 +31,15 @@ def _supported_model(model):
     raise RuntimeError(f"fluid lowering requires MuJoCo 3.10.0; found {mujoco.__version__}")
   if not isinstance(model, mujoco.MjModel):
     raise TypeError("model must be a compiled mujoco.MjModel")
-  if np.any(np.asarray(model.geom_fluid)[:, 0] > 0):
-    raise ValueError("geom-fluid ellipsoid/lift models are unsupported")
-  if np.any(np.asarray(model.geom_fluid) != 0):
-    raise ValueError("nonzero geom-fluid parameters are unsupported")
+  gf = np.asarray(model.geom_fluid, dtype=np.float64).reshape(int(model.ngeom), 12)
+  if not np.all(np.isfinite(gf)):
+    raise ValueError("geom-fluid parameters must be finite")
+  with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+    gf32 = np.asarray(gf, dtype=np.float32)
+  if not np.all(np.isfinite(gf32)):
+    raise ValueError("geom-fluid parameters must be float32-representable")
+  if np.any((gf[:, 0] != 0) & (gf[:, 0] != 1)):
+    raise ValueError("geom interaction scale must be 0 or 1")
   if model.opt.density < 0 or model.opt.viscosity < 0:
     raise ValueError("fluid density and viscosity must be nonnegative")
   constants = np.r_[model.opt.density, model.opt.viscosity, model.opt.wind]
@@ -40,11 +51,81 @@ def _supported_model(model):
   return dims
 
 
-class InertiaBoxFluidModel:
-  """CPU reference for the pinned inertia-box force model.
+def _geom_semiaxes(size, geom_type):
+  # Pinned mju_geomSemiAxes (3.10.0).
+  size = np.asarray(size, dtype=np.float64).reshape(3)
+  if int(geom_type) == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+    return np.array([size[0], size[0], size[0]])
+  if int(geom_type) == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+    return np.array([size[0], size[0], size[1] + size[0]])
+  if int(geom_type) == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+    return np.array([size[0], size[0], size[1]])
+  return np.array([size[0], size[1], size[2]])
 
-  Returns only this stage's generalized force; fluid-inertia terms,
-  ellipsoid geometry interactions, and lift are not part of this model.
+
+def _added_mass_forces(lvel, density, vmass, vinertia):
+  # Pinned mj_addedMassForces (local_accels disabled path).
+  lin = lvel[3:6].astype(np.float64)
+  ang = lvel[0:3].astype(np.float64)
+  vlin = density * np.asarray(vmass, dtype=np.float64) * lin
+  vang = density * np.asarray(vinertia, dtype=np.float64) * ang
+  out = np.zeros(6, dtype=np.float64)
+  out[3:6] += np.cross(vlin, ang)
+  out[0:3] += np.cross(vlin, lin) + np.cross(vang, ang)
+  return out
+
+
+def _viscous_forces(lvel, density, viscosity, size, magnus, kutta,
+                    blunt, slender, ang_drag):
+  # Pinned mj_viscousForces (3.10.0).
+  lin = lvel[3:6].astype(np.float64)
+  ang = lvel[0:3].astype(np.float64)
+  size = np.asarray(size, dtype=np.float64).reshape(3)
+  out = np.zeros(6, dtype=np.float64)
+  volume = 4.0 / 3.0 * np.pi * size[0] * size[1] * size[2]
+  out[3:6] += magnus * density * volume * np.cross(ang, lin)
+  dmax = float(np.max(size))
+  dmin = float(np.min(size))
+  dmid = float(size[0] + size[1] + size[2] - dmax - dmin)
+  amax = np.pi * dmax * dmid
+  denom = ((size[1] * size[2]) ** 4 * lin[0] ** 2
+           + (size[2] * size[0]) ** 4 * lin[1] ** 2
+           + (size[0] * size[1]) ** 4 * lin[2] ** 2)
+  num = ((size[1] * size[2] * lin[0]) ** 2
+         + (size[2] * size[0] * lin[1]) ** 2
+         + (size[0] * size[1] * lin[2]) ** 2)
+  aproj = np.pi * np.sqrt(denom / max(mujoco.mjMINVAL, num)) if num > 0 else 0.0
+  norm = np.array([(size[1] * size[2]) ** 2 * lin[0],
+                   (size[2] * size[0]) ** 2 * lin[1],
+                   (size[0] * size[1]) ** 2 * lin[2]])
+  cos_alpha = (num / max(mujoco.mjMINVAL, float(np.linalg.norm(lin)) * denom)
+               if denom > 0 and float(np.linalg.norm(lin)) > 0 else 0.0)
+  circ = np.cross(norm, lin) * kutta * density * cos_alpha * aproj
+  out[3:6] += np.cross(circ, lin)
+  eq_d = 2.0 / 3.0 * float(size[0] + size[1] + size[2])
+  lin_coef = 3.0 * np.pi * eq_d
+  torq_coef = np.pi * eq_d ** 3
+  def max_moment(s, d):
+    d0, d1, d2 = s[d], s[(d + 1) % 3], s[(d + 2) % 3]
+    return 8.0 / 15.0 * np.pi * d0 * max(d1, d2) ** 4
+  ii = np.array([max_moment(size, 0), max_moment(size, 1), max_moment(size, 2)])
+  imax = 8.0 / 15.0 * np.pi * dmid * dmax ** 4
+  mom = ang * (ang_drag * ii + slender * (imax - ii))
+  drag_lin = viscosity * lin_coef + density * float(np.linalg.norm(lin)) * (
+      aproj * blunt + slender * (amax - aproj))
+  drag_ang = viscosity * torq_coef + density * float(np.linalg.norm(mom))
+  out[0:3] -= drag_ang * ang
+  out[3:6] -= drag_lin * lin
+  return out
+
+
+class InertiaBoxFluidModel:
+  """CPU reference for the pinned fluid force models.
+
+  Bodies with any interacting ellipsoid geom (`geom_fluid[..., 0] == 1`) use
+  the per-geom ellipsoid model (added-mass + Magnus/Kutta lift + viscous
+  blunt/slender/angular terms); other bodies use the inertia-box model,
+  matching pinned `mj_fluid` selection.
   """
 
   def __init__(self, model):
@@ -56,6 +137,12 @@ class InertiaBoxFluidModel:
     self.density = float(model.opt.density)
     self.viscosity = float(model.opt.viscosity)
     self.disableflags = int(model.opt.disableflags)
+    self.ngeom = int(model.ngeom)
+    self.geom_bodyid = np.asarray(model.geom_bodyid, dtype=np.int32).copy()
+    self.geom_type = np.asarray(model.geom_type, dtype=np.int32).copy()
+    self.geom_size = _frozen(np.asarray(model.geom_size).reshape(-1, 3))
+    self.geom_fluid = _frozen(
+        np.asarray(model.geom_fluid, dtype=np.float32).reshape(-1, 12))
 
   def run(self, qpos, qvel):
     qpos, qvel = np.asarray(qpos, dtype=np.float64), np.asarray(qvel, dtype=np.float64)
@@ -76,9 +163,44 @@ class InertiaBoxFluidModel:
       data.qpos[:] = qpos[row]
       data.qvel[:] = qvel[row]
       mujoco.mj_forward(self.model, data)
+      gf = np.asarray(self.model.geom_fluid, dtype=np.float64).reshape(-1, 12)
       for body in range(1, self.nbody):
         mass = float(self.mass[body])
         if mass < mujoco.mjMINVAL:
+          continue
+        # Pinned selection: any interacting ellipsoid geom disables the
+        # inertia-box model for the parent body.
+        adr = int(self.model.body_geomadr[body])
+        num = int(self.model.body_geomnum[body])
+        use_ellipsoid = bool(np.any(gf[adr:adr + num, 0] > 0)) if num else False
+        if use_ellipsoid:
+          for j in range(num):
+            gid = adr + j
+            if float(gf[gid, 0]) == 0.0:
+              continue
+            size = _geom_semiaxes(np.asarray(self.model.geom_size[gid]),
+                                  int(np.asarray(self.model.geom_type)[gid]))
+            lvel = np.zeros(6, dtype=np.float64)
+            mujoco.mj_objectVelocity(self.model, data, mujoco.mjtObj.mjOBJ_GEOM,
+                                     gid, lvel, 1)
+            wind = np.r_[np.zeros(3), self.wind.astype(np.float64)]
+            lw = np.zeros(6, dtype=np.float64)
+            root = int(self.model.body_rootid[body])
+            mujoco.mju_transformSpatial(
+                lw, wind, 0, np.asarray(data.geom_xpos[gid]),
+                np.asarray(data.subtree_com[root]),
+                np.asarray(data.geom_xmat[gid]).reshape(-1))
+            lvel[3:] -= lw[3:]
+            lfrc = _added_mass_forces(
+                lvel, self.density, gf[gid, 6:9], gf[gid, 9:12])
+            lfrc += _viscous_forces(
+                lvel, self.density, self.viscosity, size, gf[gid, 5],
+                gf[gid, 4], gf[gid, 1], gf[gid, 2], gf[gid, 3])
+            lfrc *= float(gf[gid, 0])
+            rot = np.asarray(data.geom_xmat[gid]).reshape(3, 3)
+            mujoco.mj_applyFT(
+                self.model, data, rot @ lfrc[3:], rot @ lfrc[:3],
+                np.asarray(data.geom_xpos[gid]), body, result[row])
           continue
         inertia = self.inertia[body].astype(np.float64)
         box = np.sqrt(np.maximum(mujoco.mjMINVAL,
@@ -123,8 +245,11 @@ class MetalInertiaBoxFluid:
       raise ValueError("batch_size must be a positive int32 integer")
     if max(batch_size * self._meta.nbody * 36,
            batch_size * self._meta.njnt * 3,
-           batch_size * self._meta.nv) > _UINT32_MAX:
+           batch_size * self._meta.nv,
+           batch_size * max(self._meta.ngeom, 1) * 12) > _UINT32_MAX:
       raise ValueError("fluid workspace exceeds uint32 indexing")
+    if self._meta.ngeom > _INT32_MAX:
+      raise ValueError("fluid geom count exceeds int32")
     self.batch_size = batch_size
     import torch
     self._torch = torch
@@ -145,11 +270,24 @@ class MetalInertiaBoxFluid:
     spring = int(mujoco.mjtDisableBit.mjDSBL_SPRING)
     damper = int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
     disabled = bool(meta.disableflags & spring and meta.disableflags & damper)
-    self._dims = tensor([meta.nv, meta.nbody, meta.njnt, batch_size, int(disabled)], torch.int32)
+    self._dims = tensor([meta.nv, meta.nbody, meta.njnt, batch_size, int(disabled), meta.ngeom], torch.int32)
+    # Bodies with an interacting ellipsoid geom skip inertia-box (pinned).
+    skip = np.zeros(int(model.nbody), dtype=np.int32)
+    gf0 = np.asarray(meta.geom_fluid).reshape(-1, 12)[:, 0]
+    for b in range(int(model.nbody)):
+      adr, num = int(model.body_geomadr[b]), int(model.body_geomnum[b])
+      if num and bool(np.any(gf0[adr:adr + num] > 0)):
+        skip[b] = 1
+    self._body_skip = tensor(skip, torch.int32)
+    self._geom_bodyid = tensor(meta.geom_bodyid, torch.int32)
+    self._geom_type = tensor(meta.geom_type, torch.int32)
+    self._geom_size = tensor(np.asarray(meta.geom_size).reshape(-1))
+    self._geom_fluid = tensor(np.asarray(meta.geom_fluid).reshape(-1))
     self._output = torch.empty((batch_size, meta.nv), dtype=torch.float32, device=self._device)
     self._dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
     self._library = torch.mps.compile_shader(_SHADER.read_text())
     self._kernel = self._library.inertia_box_fluid
+    self._geom_kernel = self._library.ellipsoid_geom_fluid
 
   def run_device(self, qpos, qvel, dynamics=None):
     torch, meta = self._torch, self._meta
@@ -162,7 +300,7 @@ class MetalInertiaBoxFluid:
     if not isinstance(dynamics, dict) or not required.issubset(dynamics):
       raise ValueError("dynamics must contain native poses, cvel, and root_com")
     poses = dynamics["poses"]
-    for name, value, shape in (
+    names_shapes = [
         ("poses.body_quat", poses["body_quat"], (self.batch_size, meta.nbody, 4)),
         ("poses.inertial_pos", poses["inertial_pos"], (self.batch_size, meta.nbody, 3)),
         ("poses.inertial_quat", poses["inertial_quat"], (self.batch_size, meta.nbody, 4)),
@@ -170,7 +308,13 @@ class MetalInertiaBoxFluid:
         ("poses.joint_axis", poses["joint_axis"], (self.batch_size, meta.njnt, 3)),
         ("cvel", dynamics["cvel"], (self.batch_size, meta.nbody, 6)),
         ("root_com", dynamics["root_com"], (self.batch_size, meta.nbody, 3)),
-    ):
+    ]
+    if meta.ngeom:
+      names_shapes.extend([
+          ("poses.geom_pos", poses["geom_pos"], (self.batch_size, meta.ngeom, 3)),
+          ("poses.geom_quat", poses["geom_quat"], (self.batch_size, meta.ngeom, 4)),
+      ])
+    for name, value, shape in names_shapes:
       if not isinstance(value, torch.Tensor) or value.device.type != "mps" or value.dtype != torch.float32 or tuple(value.shape) != shape or not value.is_contiguous():
         raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
     nv = meta.nv
@@ -180,6 +324,16 @@ class MetalInertiaBoxFluid:
         poses["inertial_quat"].reshape(-1), dynamics["cvel"].reshape(-1),
         dynamics["root_com"].reshape(-1), poses["joint_anchor"].reshape(-1),
         poses["joint_axis"].reshape(-1), self._fluid, self._dims,
-        self._output.reshape(-1) if nv else self._dummy,
+        self._output.reshape(-1) if nv else self._dummy, self._body_skip,
         threads=(self.batch_size,), group_size=(1,))
+    if nv and meta.ngeom:
+      self._geom_kernel(self._body_parentid, self._body_rootid, self._body_jntadr, self._body_jntnum,
+          self._jnt_type, self._jnt_dofadr,
+          poses["body_quat"].reshape(-1), dynamics["cvel"].reshape(-1),
+          dynamics["root_com"].reshape(-1), poses["joint_anchor"].reshape(-1),
+          poses["joint_axis"].reshape(-1), self._geom_bodyid, self._geom_type,
+          self._geom_size.reshape(-1), self._geom_fluid.reshape(-1),
+          poses["geom_pos"].reshape(-1), poses["geom_quat"].reshape(-1),
+          self._fluid, self._dims, self._output.reshape(-1),
+          threads=(self.batch_size,), group_size=(1,))
     return self._output
