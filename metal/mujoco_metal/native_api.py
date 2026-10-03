@@ -159,7 +159,7 @@ def _inverse_query_workspaces(sim):
   roots = ("_smooth", "_passive", "_fluid", "_tendons", "_spatial_tendons",
            "_flex", "_coupled_constraints", "_component_solver", "_forward_stages",
            "_solver", "_implicit", "_implicitfast", "_actuators", "_transmissions",
-           "_motor", "_sensors")
+           "_motor", "_sensors", "_state", "_sleep_schedule")
   seen, saved, memo = set(), [], {}
   stages = getattr(sim, "_forward_stages", None)
   record = getattr(stages, "_record", None)
@@ -186,43 +186,70 @@ def _inverse_query_workspaces(sim):
     collect(getattr(sim, name, None))
   bookkeeping_names = ("_spatial_kin", "_spatial_cache_key", "_forward_position_epoch",
       "_accepted_step", "_last_actuation_kin", "_last_coupled",
-      "_last_coupled_generation", "_assembled_system_valid")
+      "_last_coupled_generation", "_assembled_system_valid", "_step1_record")
   bookkeeping = {name: _capture_query_storage(getattr(sim, name), memo)
                  for name in bookkeeping_names if hasattr(sim, name)}
   scratch_names = ("_component_solve_rhs", "_component_world_status",
                    "_component_tendon_J", "_component_damping_deriv", "_rhs",
                    "_act_dot", "_actuator_velocity_derivative", "_sensordata",
-                   "_raw_sensordata", "_energy")
+                   "_raw_sensordata", "_energy", "_sensor_plugin_status")
   scratch_names += tuple(name for name in vars(sim)
-                         if name.startswith("_forward_stage_") and
+                         if name.startswith(("_forward_stage_", "_sleep_")) and
                          isinstance(getattr(sim, name), torch.Tensor))
   component = {name: _capture_query_storage(getattr(sim, name), memo)
                for name in scratch_names
                if hasattr(sim, name)}
+  plugins = tuple(getattr(sim, "_native_plugins", ()))
+  if plugins:
+    for plugin in plugins:
+      if (not callable(getattr(plugin, "device_snapshot", None)) or
+          not callable(getattr(plugin, "restore_device", None))):
+        raise TypeError("native queries require device rollback methods on plugins")
+    plugin_state = [(plugin, plugin.device_snapshot()) for plugin in plugins]
+  else:
+    plugin_state = None
   try:
-    yield
+    try:
+      yield
+    finally:
+      _restore_query_workspaces(saved, bookkeeping_names, bookkeeping, component,
+                                sim, stages, record, coherent_inputs)
   finally:
-    for program, attributes, storage in reversed(saved):
-      # Restore the schema and original storage owners before copying values;
-      # a failed query may have replaced a buffer or published an extra map.
-      vars(program).clear()
-      vars(program).update(attributes)
-      for name, value in storage.items():
-        setattr(program, name, _restore_query_storage(value))
-    for name in bookkeeping_names:
-      if name in bookkeeping:
-        setattr(sim, name, _restore_query_storage(bookkeeping[name]))
-      elif hasattr(sim, name):
-        delattr(sim, name)
-    for name, value in component.items():
-      setattr(sim, name, _restore_query_storage(value))
-    # Restoring tensor values increments Torch mutation counters. Rebind only
-    # inputs that were coherent on entry, after every borrowed buffer has been
-    # restored. Never turn an already-stale record into a valid one.
-    if record is not None and getattr(stages, "_record", None) is record:
-      for name, value in coherent_inputs:
-        if record.input_tensors.get(name) is value:
-          stages.capture_input(record, name, value)
+    if plugin_state is not None:
+      failures = []
+      for plugin, payload in reversed(plugin_state):
+        try:
+          plugin.restore_device(payload)
+        except Exception as error:
+          failures.append(error)
+      if failures:
+        raise RuntimeError("native query plugin device rollback failed") from failures[0]
+
+
+def _restore_query_workspaces(saved, bookkeeping_names, bookkeeping, component,
+                              sim, stages, record, coherent_inputs):
+  """Restore all simulation-owned storage before invoking plugin rollback."""
+  for program, attributes, storage in reversed(saved):
+    # Restore the schema and original storage owners before copying values;
+    # a failed query may have replaced a buffer or published an extra map.
+    vars(program).clear()
+    vars(program).update(attributes)
+    for name, value in storage.items():
+      setattr(program, name, _restore_query_storage(value))
+  for name in bookkeeping_names:
+    if name in bookkeeping:
+      setattr(sim, name, _restore_query_storage(bookkeeping[name]))
+    elif hasattr(sim, name):
+      delattr(sim, name)
+  for name, value in component.items():
+    setattr(sim, name, _restore_query_storage(value))
+  # Restoring tensor values increments Torch mutation counters. Rebind only
+  # inputs that were coherent on entry, after every borrowed buffer has been
+  # restored. Never turn an already-stale record into a valid one.
+  if record is not None and getattr(stages, "_record", None) is record:
+    for name, value in coherent_inputs:
+      if record.input_tensors.get(name) is value:
+        stages.capture_input(record, name, value)
 
 
 
