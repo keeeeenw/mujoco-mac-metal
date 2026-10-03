@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native MPS dense Cholesky solve for batched symmetric positive systems."""
+"""Prepared native MPS dense SPD, signed symmetric and general solves."""
 
 from pathlib import Path
 
@@ -67,6 +67,13 @@ class MetalDenseSolve:
     self.nrhs = nrhs
     self._library = torch.mps.compile_shader(_SHADER.read_text())
     self._kernel = self._library.dense_spd_solve
+    self._awake_kernel = self._library.dense_awake_solve
+    self._awake_work = torch.empty(
+        max(batch_size * nv * nrhs, 1), dtype=torch.float32, device=self._device
+    )
+    self._awake_dims = torch.tensor(
+        [nv, batch_size, nrhs], dtype=torch.int32, device=self._device)
+    self._awake_flags = torch.zeros((2,), dtype=torch.int32, device=self._device)
     self._factor = torch.empty(
         max(batch_size * nv * nv, 1), dtype=torch.float32, device=self._device
     )
@@ -96,7 +103,7 @@ class MetalDenseSolve:
     if not tensor.is_contiguous():
       raise ValueError(f"{name} must be contiguous")
 
-  def run_device(self, mass, rhs):
+  def run_device(self, mass, rhs, *, awake_lists=None, retained=None):
     """Solve ``mass @ solution = rhs`` for all fixed-capacity batch rows.
 
     ``mass`` is ``[B,nv,nv]``. ``rhs`` is ``[B,nv]`` when ``nrhs==1`` and
@@ -110,6 +117,39 @@ class MetalDenseSolve:
         else (self.batch_size, self.nv, self.nrhs)
     )
     self._validate_tensor(rhs, "rhs", rhs_shape)
+
+    if awake_lists is not None:
+      if not isinstance(awake_lists, dict):
+        raise TypeError("awake_lists must be a mapping")
+      ids = awake_lists.get("dof_ids")
+      counts = awake_lists.get("counts")
+      if (not isinstance(ids, self._torch.Tensor)
+          or tuple(ids.shape) != (self.batch_size, max(self.nv, 1))
+          or ids.dtype != self._torch.int32 or ids.device.type != "mps"
+          or not ids.is_contiguous()):
+        raise ValueError("awake_lists.dof_ids must be contiguous MPS int32")
+      if (not isinstance(counts, self._torch.Tensor)
+          or tuple(counts.shape) != (self.batch_size, 3)
+          or counts.dtype != self._torch.int32 or counts.device.type != "mps"
+          or not counts.is_contiguous()):
+        raise ValueError("awake_lists.counts must be contiguous MPS int32 [batch,3]")
+      if retained is not None:
+        if self.nrhs != 1:
+          raise ValueError("retained output is supported only for one RHS")
+        self._validate_tensor(retained, "retained", (self.batch_size, self.nv))
+      flags = self._awake_flags
+      flags[1].fill_(int(retained is not None))
+      self._awake_kernel(
+          mass.reshape(-1) if self.nv else self._empty_input,
+          rhs.reshape(-1) if self.nv else self._empty_input, ids, counts,
+          retained.reshape(-1) if retained is not None and self.nv else self._empty_input,
+          self._factor, self._awake_work, self._solution, self._status,
+          self._awake_dims, flags,
+          threads=(self.batch_size,), group_size=(1,))
+      shape = ((self.batch_size, self.nv) if self.nrhs == 1
+               else (self.batch_size, self.nv, self.nrhs))
+      count = self.batch_size * self.nv * self.nrhs
+      return self._solution[:count].reshape(shape), self._status
 
     mass_buffer = mass.reshape(-1)
     rhs_buffer = rhs.reshape(-1)
@@ -143,6 +183,46 @@ class MetalGeneralDenseSolve(MetalDenseSolve):
   def __init__(self, nv: int, batch_size: int, nrhs: int = 1):
     super().__init__(nv, batch_size, nrhs)
     self._kernel = self._library.dense_general_solve
+    self._awake_flags[0] = 1
+
+
+def symmetric_ldl_workspace_elements(nv, batch_size, nrhs=1):
+  """Validate all signed Euler solve backings before importing Torch."""
+  counts = factored_workspace_elements(nv, batch_size, nrhs)
+  counts.update({"default_dof_ids": int(batch_size) * max(int(nv), 1),
+                 "default_counts": int(batch_size) * 3})
+  if max(counts.values()) > (1 << 32) - 1:
+    raise ValueError("signed solve workspace exceeds shader indexing range")
+  return counts
+
+
+class MetalSymmetricLDLSolve(MetalDenseSolve):
+  """Solve signed Euler matrices with MuJoCo's descending ``L' D L`` order.
+
+  Finite negative pivots are valid; a zero pivot is status 3. This is the
+  Euler effective-matrix path, not the physical SPD mass solver. It uses the
+  same prepared awake principal-system gather/scatter for full and sleeping
+  worlds, supports multiple RHS columns and performs no host numerical solve.
+  """
+
+  def __init__(self, nv: int, batch_size: int, nrhs: int = 1):
+    symmetric_ldl_workspace_elements(nv, batch_size, nrhs)
+    super().__init__(nv, batch_size, nrhs)
+    torch = self._torch
+    self._awake_flags[0] = 2
+    self._default_dof_ids = torch.arange(
+        max(nv, 1), dtype=torch.int32, device=self._device
+    ).expand(batch_size, -1).contiguous()
+    self._default_counts = torch.tensor(
+        [0, 0, nv], dtype=torch.int32, device=self._device
+    ).expand(batch_size, -1).contiguous()
+    self._default_awake = {"dof_ids": self._default_dof_ids,
+                           "counts": self._default_counts}
+
+  def run_device(self, mass, rhs, *, awake_lists=None, retained=None):
+    return super().run_device(
+        mass, rhs, awake_lists=(self._default_awake if awake_lists is None
+                               else awake_lists), retained=retained)
 
 
 def factored_workspace_elements(nv, batch_size, nrhs=1):

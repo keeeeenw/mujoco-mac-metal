@@ -22,9 +22,6 @@ import pytest
 
 from mujoco_metal.smooth_solve import MetalDenseSolve
 
-pytestmark = pytest.mark.gpu
-
-
 def test_constructor_rejects_invalid_capacities_before_device_setup():
   with pytest.raises(ValueError, match="nv"):
     MetalDenseSolve(-1, 1)
@@ -65,6 +62,7 @@ def test_metadata_rejection_does_not_touch_solver_scratch():
   np.testing.assert_array_equal(solver._factor, np.full(18, 7.0))
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(
     os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
     reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
@@ -106,6 +104,7 @@ def test_batched_multiple_rhs_matches_numpy_and_keeps_mass_immutable():
   )
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(
     os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
     reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
@@ -142,6 +141,7 @@ def test_scaled_33_dof_system_and_zero_dof_shapes():
   np.testing.assert_array_equal(empty_status.cpu().numpy(), [0, 0])
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(
     os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
     reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
@@ -178,6 +178,7 @@ def test_bad_world_status_isolated_and_solution_is_zero():
   np.testing.assert_array_equal(mixed.cpu().numpy()[1], [0, 0])
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(
     os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
     reason="requires explicit MUJOCO_METAL_RUN_GPU=1 and idle GPU",
