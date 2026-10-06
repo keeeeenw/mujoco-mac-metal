@@ -256,8 +256,11 @@ def test_hfield_rejections_cpu():
       '<body pos="0 0 0.3"><freejoint/>'
       '<geom name="o" type="mesh" mesh="bbox" contype="1" conaffinity="1"/></body>'
       '</worldbody></mujoco>')
-  with pytest.raises(ValueError, match="mesh-heightfield"):
-    lower_coupled_constraints(m)
+  # Mesh-heightfield now uses the pinned common-CCD terrain pipeline. Its
+  # source manifold capacity is50 and must survive ordinary host lowering.
+  desc = lower_coupled_constraints(m)
+  assert desc.npairs == 1 and desc.ncontacts_max == 50
+  assert desc.pair_max_contacts.tolist() == [50]
   # plane-hfield reserves zero slots (mobile terrain overlapping a plane).
   m = mujoco.MjModel.from_xml_string(
       f'<mujoco>{HF}{OPT}<worldbody>'

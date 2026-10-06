@@ -29,7 +29,10 @@ def test_bridge_lands_on_stop_instead_of_passing_through(monkeypatch):
   monkeypatch.syspath_prepend(str(EXAMPLES))
   result = importlib.import_module("cargo_bridge").run(mode="cpu", check=True)
   assert result["support_contact_steps_cpu"] > 100
-  assert result["minimum_geometry_distance"]["deckB_geom/tray"] >= -0.007
+  assert result["minimum_geometry_distance"]["deckB_geom/tray"] >= -0.001
+  assert result["conservative_geometry_distance_lower_bound"]["deckB_geom/tray"] >= -0.0015
+  assert result["max_actual_deck_tray_overlap_m"] == pytest.approx(
+      max(0.0, -result["minimum_geometry_distance"]["deckB_geom/tray"]))
   assert result["latched_payload_z"] - result["released_payload_z"] > 0.25
 
 
@@ -39,6 +42,9 @@ def test_suspension_strut_clears_cargo_through_complete_rollout(monkeypatch):
   assert min(result["minimum_geometry_distance"].values()) > 0.1
   assert result["cargo_contacts"] > 100
   assert result["strut_hits"] > 0 and result["cable_hits"] > 0
+  assert result["strut_tip_overrun_m"] <= 0.001
+  assert result["cable_limit_overrun_m"] <= 0.001
+  assert result["max_actual_hardware_overlap_m"] == pytest.approx(0.0)
 
 
 def test_clearance_monitor_detects_overlap_without_collision_pair(monkeypatch):

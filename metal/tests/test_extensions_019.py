@@ -117,16 +117,27 @@ def test_native_custom_magnetic_force_plugin_gpu():
 
   # Set velocity
   sim.reset(qvel=np.array([[1.0, 2.0]], dtype=np.float32))
-  qfrc = plugin.run_device(sim.state)
+  record = mj_fwdPosition(sim, return_record=True)
+  dynamics = mj_fwdVelocity(sim, record=record)
+  qfrc = plugin.run_device(sim.state, dynamics=dynamics)
 
   assert isinstance(qfrc, torch.Tensor)
   assert qfrc.device.type == "mps"
   assert tuple(qfrc.shape) == (1, m.nv)
 
-  # For nv=2, B=(0,0,1): v=(1,2,0) -> v x B = (2, -1, 0)
-  # qfrc = 2.0 * [2, -1] = [4.0, -2.0]
+  # The two hinges are angular generalized coordinates. Use independent
+  # Cartesian COM velocities and force projection, not qvel[:3].
+  data = mujoco.MjData(m)
+  data.qvel[:] = [1.0, 2.0]
+  mujoco.mj_forward(m, data)
+  expected = np.zeros(m.nv)
+  for body in range(1, m.nbody):
+    velocity = np.empty(6)
+    mujoco.mj_objectVelocity(m, data, mujoco.mjtObj.mjOBJ_BODY, body, velocity, 0)
+    force = 2.0 * np.cross(velocity[3:], [0, 0, 1])
+    mujoco.mj_applyFT(m, data, force, np.zeros(3), data.xipos[body], body, expected)
   qfrc_np = qfrc.cpu().numpy()[0]
-  assert np.all(np.isfinite(qfrc_np))
+  np.testing.assert_allclose(qfrc_np, expected, rtol=3e-5, atol=3e-6)
 
 
 def test_native_inverse_dynamics_gpu():

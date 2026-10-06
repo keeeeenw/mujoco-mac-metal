@@ -36,6 +36,84 @@ def _equality_model():
   </mujoco>""")
 
 
+@pytest.mark.parametrize("profile,flag", [
+    ("joint_constraints_euler_v1", "mjENBL_FWDINV"),
+    ("joint_constraints_euler_v1", "mjENBL_INVDISCRETE"),
+    ("normal_contact_euler_v1", "mjENBL_FWDINV"),
+    ("normal_contact_euler_v1", "mjENBL_INVDISCRETE"),
+])
+def test_legacy_inverse_uses_rows_from_assembly_without_optimizer(profile, flag):
+  """Opt-in native gate for legacy row capture and both inverse flags."""
+  enable = int(getattr(mujoco.mjtEnableBit, flag))
+  if profile == "joint_constraints_euler_v1":
+    model = mujoco.MjModel.from_xml_string("""<mujoco>
+      <option timestep=".002" integrator="Euler" gravity="0 0 0">
+        <flag contact="disable"/>
+      </option>
+      <worldbody><body><joint name="slider" type="slide" axis="1 0 0"
+          limited="true" range="-.1 .1" margin=".01"/>
+        <geom type="sphere" size=".1" mass="1"/></body></worldbody>
+    </mujoco>""")
+    qpos = np.array([[.12]], np.float32)
+    qvel = np.array([[.35]], np.float32)
+  else:
+    model = mujoco.MjModel.from_xml_string("""<mujoco>
+      <option timestep=".002" integrator="Euler" gravity="0 0 -9.81"/>
+      <worldbody><geom name="ground" type="plane" size="2 2 .1" condim="1"/>
+        <body pos="0 0 .15"><freejoint/>
+          <geom type="sphere" size=".2" mass="1" condim="1"/>
+        </body></worldbody>
+    </mujoco>""")
+    qpos = np.array([[0, 0, .15, 1, 0, 0, 0]], np.float32)
+    qvel = np.array([[0, 0, .2, .1, 0, 0]], np.float32)
+  model.opt.enableflags |= enable
+  data = mujoco.MjData(model)
+  data.qpos[:] = qpos[0]
+  data.qvel[:] = qvel[0]
+  mujoco.mj_forward(model, data)
+  data.qacc[:] = np.linspace(-.3, .4, model.nv)
+  requested_acceleration = data.qacc.copy()
+  mujoco.mj_inverse(model, data)
+  expected = data.qfrc_inverse.copy()
+
+  sim = MetalSimulation(model, qpos=qpos, qvel=qvel, profile=profile)
+  result = _host(mj_inverse(sim, qacc=requested_acceleration[None].astype(np.float32)))
+  np.testing.assert_allclose(result[0], expected, atol=3e-3, rtol=3e-3)
+
+
+def test_legacy_low_iteration_fwdinv_reports_nonzero_pinned_residuals():
+  """The legacy compare path must consume active rows, not return zeros."""
+  model = mujoco.MjModel.from_xml_string("""<mujoco>
+    <option timestep=".002" integrator="Euler" solver="PGS" iterations="1">
+      <flag contact="disable"/>
+    </option><worldbody>
+      <body><joint name="a" type="slide" axis="1 0 0"/>
+        <geom type="sphere" size=".1" mass="1"/></body>
+      <body pos="1 0 0"><joint name="b" type="slide" axis="1 0 0"/>
+        <geom type="sphere" size=".1" mass="1"/></body>
+      <body pos="2 0 0"><joint name="c" type="slide" axis="1 0 0"/>
+        <geom type="sphere" size=".1" mass="1"/></body>
+    </worldbody><equality>
+      <joint joint1="a" joint2="b" polycoef="0 1 0 0 0"/>
+      <joint joint1="b" joint2="c" polycoef="0 1 0 0 0"/>
+    </equality></mujoco>""")
+  model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_FWDINV)
+  qpos = np.array([[.2, 0, 0]], np.float32)
+  qvel = np.array([[.4, -.1, .2]], np.float32)
+  data = mujoco.MjData(model)
+  data.qpos[:] = qpos[0]
+  data.qvel[:] = qvel[0]
+  mujoco.mj_step(model, data)
+  assert np.linalg.norm(data.solver_fwdinv) > 1.0
+
+  sim = MetalSimulation(model, qpos=qpos, qvel=qvel,
+                        profile="joint_constraints_euler_v1")
+  sim.step()
+  actual = _host(sim.solver_fwdinv)[0]
+  np.testing.assert_allclose(actual, data.solver_fwdinv,
+                             atol=3e-3, rtol=3e-3)
+
+
 @pytest.mark.parametrize("offset", [0.02, -0.02])
 def test_inverse_bilateral_equality_retains_both_force_signs(offset):
   model = _equality_model()
@@ -138,18 +216,21 @@ def test_inverse_preserves_structured_contact_workspace_and_next_step(
   saved = {key: (_host(value), value.data_ptr()) for key, value in tensors(workspace)}
   qacc = torch.ones((2, model.nv), dtype=torch.float32, device="mps")
   if fail_gradient:
-    original_bmm = torch.bmm
-    nr = sim._coupled_constraints.descriptor.nr
-
-    def fail_after_constraint_assembly(left, right, *args, **kwargs):
-      if left.shape[-2:] == (nr, model.nv):
-        raise RuntimeError("inverse row-gradient failure")
-      return original_bmm(left, right, *args, **kwargs)
-
+    import mujoco_metal.inverse_constraints as inverse_constraints
+    injected = {"hit": False}
+    def fail_paired_reduction(*_args, **_kwargs):
+      injected["hit"] = True
+      raise RuntimeError("inverse row-gradient failure")
     with monkeypatch.context() as patch:
-      patch.setattr(torch, "bmm", fail_after_constraint_assembly)
+      patch.setattr(inverse_constraints,
+                    "_dense_jacobian_transpose_pair_matvec",
+                    fail_paired_reduction)
+      patch.setattr(inverse_constraints,
+                    "_packed_jacobian_transpose_pair_matvec",
+                    fail_paired_reduction)
       with pytest.raises(RuntimeError, match="inverse row-gradient failure"):
         mj_inverse(sim, qacc=qacc)
+    assert injected["hit"], "inverse query did not reach the paired row reducer"
   else:
     mj_inverse(sim, qacc=qacc)
   assert set(workspace) == original_keys

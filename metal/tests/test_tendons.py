@@ -1,6 +1,8 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
 
+import os
+
 import mujoco
 import numpy as np
 import pytest
@@ -58,6 +60,63 @@ def test_fixed_tendon_force_tangent_and_armature_match_mujoco():
   mujoco.mj_fullM(model, data_with, mass_with)
   mujoco.mj_fullM(arm_model, data_without, mass_without)
   np.testing.assert_allclose(armature, mass_with - mass_without, rtol=2e-8, atol=2e-8)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
+                    reason="opt-in GPU")
+def test_fixed_tendon_can_leave_armature_to_component_projection():
+  import torch
+  from mujoco_metal.tendons import MetalFixedTendonDynamics
+
+  model = mujoco.MjModel.from_xml_string(_xml())
+  qpos_np = np.asarray([[.27, .31]], dtype=np.float32)
+  qvel_np = np.asarray([[.5, -.2]], dtype=np.float32)
+  args = (torch.as_tensor(qpos_np, device="mps"),
+          torch.as_tensor(qvel_np, device="mps"))
+  dense = MetalFixedTendonDynamics(model, batch_size=1)
+  external = MetalFixedTendonDynamics(model, batch_size=1,
+                                      armature_storage="external")
+  dense_values = dense.run_device(*args)
+  external_values = external.run_device(*args)
+  assert external_values[2] is None
+  assert external._armature_matrix.numel() == 1
+  torch.testing.assert_close(external_values[0], dense_values[0],
+                             rtol=0, atol=0)
+  torch.testing.assert_close(external_values[1], dense_values[1],
+                             rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
+                    reason="opt-in GPU")
+def test_fixed_tendon_damping_writes_compiled_coo_directly():
+  import torch
+  from mujoco_metal.tendons import MetalFixedTendonDynamics
+  from mujoco_metal.velocity_derivative import (
+      MetalVelocityDerivativeValues, compile_velocity_derivative_layout)
+
+  model = mujoco.MjModel.from_xml_string(_xml())
+  model.tendon_dampingpoly[0] = [.1, .15]
+  layout = compile_velocity_derivative_layout(model)
+  program = MetalFixedTendonDynamics(
+      model, batch_size=2, armature_storage="external",
+      velocity_derivative_layout=layout)
+  qpos_np = np.asarray([[.27, .31], [-.13, .43]], dtype=np.float32)
+  qvel_np = np.asarray([[.5, -.2], [-.3, .7]], dtype=np.float32)
+  qpos = torch.as_tensor(qpos_np, device="mps")
+  qvel = torch.as_tensor(qvel_np, device="mps")
+  _, dense_tangent, _ = program.run_device(qpos, qvel)
+  values = torch.zeros((2, max(layout.edge_count, 1)),
+                       dtype=torch.float32, device="mps")
+  writer = MetalVelocityDerivativeValues(layout, 2, values)
+  program.run_damping_derivative_coo_device(qvel, writer)
+  torch.mps.synchronize()
+  expected = np.zeros((2, max(layout.edge_count, 1)), dtype=np.float32)
+  expected[:, :layout.edge_count] = -dense_tangent.cpu().numpy()[
+      :, layout.edge_rows, layout.edge_cols]
+  np.testing.assert_allclose(values.cpu().numpy(), expected,
+                             rtol=3e-6, atol=3e-6)
 
 
 def test_disable_bits_and_raw_qpos_reference_are_respected():
@@ -184,4 +243,3 @@ def test_tendon_armature_crba_sparsity_matches_mujoco_fullM():
   tendon_model = FixedTendonModel(m)
   _, _, armature_matrix = tendon_model.run(np.zeros((1, m.nq)), np.zeros((1, m.nv)))
   np.testing.assert_allclose(armature_matrix, delta_M_mujoco, atol=1e-7)
-

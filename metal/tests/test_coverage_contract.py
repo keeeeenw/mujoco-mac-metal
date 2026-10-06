@@ -10,6 +10,7 @@ from mujoco_metal.registry import (
     MILESTONE_IDS,
     REQUIREMENTS,
     Implementation,
+    Qualification,
     _ENUMS,
     classify_model_field,
     coverage_table,
@@ -51,6 +52,12 @@ def test_every_model_field_classified_without_dead_rules():
       if not any(n == rule or n.startswith(rule) for n in names)
   ]
   assert dead == [], dead
+  exact = {"from_binary_path", "from_xml_path", "from_xml_string"}
+  assert exact <= set(names)
+  assert all(classify_model_field(name)[0] == "005" for name in exact)
+  # MjModel.stat is consumed by solver cost scaling; it is not merely display
+  # metadata even though the aggregate MjStatistic also feeds visualization.
+  assert classify_model_field("stat")[0] == "014"
 
 
 def test_docs_match_generated_table():
@@ -96,12 +103,47 @@ def _user_model(kind):
       f'<actuator>{act}</actuator></mujoco>')
 
 
-def test_user_callbacks_rejected_with_019_owner():
-  # R6: USER variants are explicit 019 rows, rejected at admission.
+def test_user_callbacks_have_registered_device_owner():
+  # USER callbacks are device-native only through explicit typed registration;
+  # no-callback source defaults are covered by the independent CPU oracle.
   from mujoco_metal.stateful_actuation import ActuatorModel
   for kind in ("dyn", "gain", "bias"):
-    with pytest.raises(ValueError, match="019"):
-      ActuatorModel(_user_model(kind))
+    meta = ActuatorModel(_user_model(kind))
+    assert meta.needs_general_path
+
+
+def test_user_callback_native_rows_match_the_qualified_matrix():
+  rows = {req.id: req for req in REQUIREMENTS}
+  for req_id, enum_name in (
+      ("REQ-DYN-003", "mjtDyn.mjDYN_USER"),
+      ("REQ-GAIN-003", "mjtGain.mjGAIN_USER"),
+      ("REQ-BIAS-003", "mjtBias.mjBIAS_USER"),
+  ):
+    row = rows[req_id]
+    assert row.implementation == Implementation.NATIVE_GPU
+    assert row.qualification == Qualification.GPU_QUALIFIED
+    assert enum_name in row.enums
+    assert "test_actuator_user_callbacks_019.py" in row.tests
+
+
+def test_not_implemented_rows_are_only_explicit_sentinels_or_release():
+  rows = {req.id: req for req in REQUIREMENTS}
+  not_implemented = {
+      req.id for req in REQUIREMENTS
+      if req.implementation == Implementation.NOT_IMPLEMENTED
+  }
+  sentinel_ids = {
+      "REQ-GEO-007", "REQ-EQ-004", "REQ-TRN-003", "REQ-STATE-009",
+      "REQ-DSBL-003", "REQ-ENBL-005",
+  }
+  assert not_implemented == sentinel_ids | {"REQ-REL-001"}
+  for req_id in sentinel_ids:
+    row = rows[req_id]
+    assert row.enums, req_id
+    assert row.execution.value == "none", req_id
+    assert row.admission in ("never admitted", "reject distance equalities",
+                             "reject undefined"), req_id
+  assert rows["REQ-REL-001"].stage.value == "api"
 
 
 def test_supported_builtin_admitted_with_evidence():
@@ -124,4 +166,5 @@ def test_supported_builtin_admitted_with_evidence():
   assert dyn.tests, "qualified rows must name evidence"
   user = rows["REQ-DYN-003"]
   assert user.milestone == "019"
-  assert user.implementation == Implementation.NOT_IMPLEMENTED
+  assert user.implementation == Implementation.NATIVE_GPU
+  assert "mjtDyn.mjDYN_USER" in user.enums

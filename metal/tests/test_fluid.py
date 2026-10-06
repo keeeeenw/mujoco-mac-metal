@@ -2,12 +2,13 @@
 # Licensed under the Apache License, Version 2.0.
 
 import os
+from types import SimpleNamespace
 
 import mujoco
 import numpy as np
 import pytest
 
-from mujoco_metal.fluid import InertiaBoxFluidModel
+from mujoco_metal.fluid import InertiaBoxFluidModel, fluid_derivative_reference
 from mujoco_metal.fluid import MetalInertiaBoxFluid
 
 
@@ -167,3 +168,116 @@ def test_native_geom_fluid_matches_mujoco():
   assert np.linalg.norm(expected) > 0
   np.testing.assert_allclose(actual.cpu().numpy(), expected,
                              rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
+                    reason="set MUJOCO_METAL_RUN_GPU=1 on an Apple GPU")
+def test_native_fluid_velocity_derivative_accumulates_only_compiled_coo():
+  import torch
+  from mujoco_metal.model import load_model
+  from mujoco_metal.smooth_metal import MetalSmoothDynamics
+  from mujoco_metal.velocity_derivative import (
+      MetalVelocityDerivativeValues, compile_velocity_derivative_layout)
+
+  model = mujoco.MjModel.from_xml_string("""<mujoco>
+    <option gravity="0 0 0" density="1000" viscosity=".3" wind=".2 -.1 .05"/>
+    <worldbody><body pos="0 0 .5"><joint type="hinge" axis="0 0 1"/>
+      <geom type="ellipsoid" size=".1 .07 .05" mass=".5"/>
+    </body></worldbody>
+  </mujoco>""")
+  layout = compile_velocity_derivative_layout(model)
+  assert layout.edge_count == int(model.nD)
+  smooth = MetalSmoothDynamics(load_model(model), batch_size=2)
+  fluid = MetalInertiaBoxFluid(model, batch_size=2)
+  values = torch.zeros((2, max(layout.edge_count, 1)), dtype=torch.float32,
+                       device="mps")
+  writer = MetalVelocityDerivativeValues(layout, 2, values)
+  qpos = torch.tensor([[.1], [.35]], dtype=torch.float32, device="mps")
+  qvel = torch.tensor([[.7], [-.4]], dtype=torch.float32, device="mps")
+  dynamics = smooth.run_device(qpos, qvel)
+  # Both calls borrow the same Smooth buffers. Derivative evaluation must
+  # restore their original VEL contents before the second call begins.
+  saved = {name: value.clone() for name, value in dynamics.items()
+           if isinstance(value, torch.Tensor)}
+  dense = fluid.run_derivative_device(qpos, qvel, dynamics, smooth)
+  for name, value in saved.items():
+    torch.testing.assert_close(dynamics[name], value, rtol=0, atol=0)
+  writer.clear_device()
+  coo = fluid.run_derivative_device(qpos, qvel, dynamics, smooth,
+                                    edge_writer=writer)
+  torch.mps.synchronize()
+  expected = np.zeros((2, max(layout.edge_count, 1)), dtype=np.float32)
+  expected[:, :layout.edge_count] = dense.cpu().numpy()[:, layout.edge_rows,
+                                                         layout.edge_cols]
+  np.testing.assert_allclose(coo.cpu().numpy(), expected,
+                             rtol=2e-5, atol=2e-5)
+  for name, value in saved.items():
+    torch.testing.assert_close(dynamics[name], value, rtol=0, atol=0)
+  oracle = fluid_derivative_reference(
+      model, qpos.cpu().numpy(), qvel.cpu().numpy())
+  assert np.linalg.norm(oracle) > 0
+  np.testing.assert_allclose(dense.cpu().numpy(), oracle,
+                             rtol=2e-3, atol=2e-5)
+
+
+def test_fluid_derivative_uses_velocity_refresh_and_restores_on_error():
+  """The derivative transaction preserves borrowed POS and VEL records."""
+  torch = pytest.importorskip("torch")
+
+  class SmoothStandin:
+    def __init__(self, dynamics):
+      self.dynamics = dynamics
+      self.velocity_calls = []
+
+    def position_context(self, dynamics):
+      assert dynamics is self.dynamics
+      return {"generation": 3}
+
+    def run_velocity_device(self, context, qvel):
+      assert context == {"generation": 3}
+      self.velocity_calls.append(qvel.clone())
+      self.dynamics["cvel"].copy_(qvel)
+      return self.dynamics
+
+  model = SimpleNamespace(nv=2, density=1.0, viscosity=1.0)
+  fluid = object.__new__(MetalInertiaBoxFluid)
+  fluid._torch = torch
+  fluid._meta = model
+  fluid._device = torch.device("cpu")
+  fluid.batch_size = 1
+  fluid._output = torch.empty((1, 2), dtype=torch.float32)
+  fluid._derivative_base = torch.empty((1, 2), dtype=torch.float32)
+  fluid._derivative_velocity = torch.empty_like(fluid._derivative_base)
+  fluid._derivative_column = torch.empty_like(fluid._derivative_base)
+  dynamics = {"cvel": torch.tensor([[2.0, -1.0]])}
+  smooth = SmoothStandin(dynamics)
+  qpos = torch.zeros((1, 0), dtype=torch.float32)
+  qvel = torch.tensor([[0.4, 0.7]], dtype=torch.float32)
+
+  def fluid_force(_qpos, velocity, _dynamics):
+    fluid._output.copy_(velocity * 3.0)
+    return fluid._output
+
+  fluid.run_device = fluid_force
+  derivative = fluid.run_derivative_device(qpos, qvel, dynamics, smooth)
+  torch.testing.assert_close(derivative, torch.eye(2).unsqueeze(0) * 3.0,
+                             rtol=0, atol=2e-4)
+  torch.testing.assert_close(dynamics["cvel"], qvel, rtol=0, atol=0)
+  assert len(smooth.velocity_calls) == 3  # perturbed columns plus restore
+
+  calls = 0
+
+  def fail_on_perturb(_qpos, velocity, _dynamics):
+    nonlocal calls
+    calls += 1
+    if calls == 2:
+      raise RuntimeError("synthetic fluid failure")
+    fluid._output.copy_(velocity * 3.0)
+    return fluid._output
+
+  fluid.run_device = fail_on_perturb
+  dynamics["cvel"].fill_(8.0)
+  with pytest.raises(RuntimeError, match="synthetic fluid failure"):
+    fluid.run_derivative_device(qpos, qvel, dynamics, smooth)
+  torch.testing.assert_close(dynamics["cvel"], qvel, rtol=0, atol=0)

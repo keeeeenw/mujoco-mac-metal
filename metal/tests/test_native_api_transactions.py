@@ -3,6 +3,7 @@
 """Pinned mjtState ownership, transaction, and cache-coherence regressions."""
 
 import os
+from dataclasses import replace
 
 import mujoco
 import numpy as np
@@ -24,6 +25,19 @@ def _model():
     <worldbody><body><joint name="j" type="slide" axis="1 0 0"/>
       <geom type="sphere" size=".1" mass="1" contype="0" conaffinity="0"/>
     </body></worldbody></mujoco>""")
+
+
+def _equality_model(iterations):
+  return mujoco.MjModel.from_xml_string(f"""<mujoco>
+    <option gravity="0 0 0" solver="PGS" iterations="{iterations}"/>
+    <worldbody>
+      <body><joint name="a" type="slide" axis="1 0 0"/>
+        <geom type="sphere" size=".1" mass="1" contype="0" conaffinity="0"/></body>
+      <body pos="1 0 0"><joint name="b" type="slide" axis="1 0 0"/>
+        <geom type="sphere" size=".1" mass="1" contype="0" conaffinity="0"/></body>
+    </worldbody>
+    <equality><joint joint1="a" joint2="b" polycoef="0 1 0 0 0"/></equality>
+  </mujoco>""")
 
 
 def _host(t):
@@ -56,11 +70,46 @@ class StatefulTestPlugin(NativePlugin):
     if self.fail_output:
       return torch.full((self.batch_size, self.model.nv), float("nan"),
                         dtype=torch.float32, device=self.device)
-    return torch.zeros((self.batch_size, self.model.nv), dtype=torch.float32,
-                       device=self.device)
+    output = torch.zeros((self.batch_size, self.model.nv), dtype=torch.float32,
+                         device=self.device)
+    if self.plugin_type == PluginType.FORCE and hasattr(self, "overflow_world"):
+      output[:, 0] = 1.0
+      output[self.overflow_world, 0] = torch.finfo(torch.float32).max
+    return output
 
   def snapshot(self):
     return self.calls.detach().cpu().numpy().copy()
+
+  def device_snapshot(self):
+    return self.calls.clone()
+
+  def device_snapshot_bytes(self):
+    return self.calls.numel() * self.calls.element_size()
+
+  def restore_device(self, snap):
+    if (not hasattr(snap, "device") or snap.device != self.calls.device
+        or snap.dtype != self.calls.dtype or tuple(snap.shape) != tuple(self.calls.shape)):
+      raise ValueError("invalid device plugin snapshot")
+    self.calls.copy_(snap)
+
+  def restore_masked(self, snap, accepted_mask):
+    import torch
+    if (not isinstance(accepted_mask, torch.Tensor)
+        or accepted_mask.device != self.calls.device
+        or accepted_mask.dtype != torch.bool
+        or tuple(accepted_mask.shape) != (self.batch_size,)):
+      raise ValueError("invalid accepted mask")
+    self.calls.copy_(torch.where(accepted_mask, self.calls, snap))
+
+  def reset_masked(self, reset_mask):
+    import torch
+    if (not isinstance(reset_mask, torch.Tensor)
+        or reset_mask.device != self.calls.device
+        or reset_mask.dtype != torch.bool
+        or tuple(reset_mask.shape) != (self.batch_size,)):
+      raise ValueError("invalid reset mask")
+    self.calls.copy_(torch.where(reset_mask, torch.zeros_like(self.calls),
+                                 self.calls))
 
   def restore(self, snap, env_ids=None):
     self.restore_calls += 1
@@ -81,6 +130,27 @@ class StatefulTestPlugin(NativePlugin):
       self.calls[np.asarray(env_ids).tolist()] = 0
     if self.fail_reset:
       raise ValueError("reject test plugin reset")
+
+
+class StatefulPluginWithoutDeviceRollback(NativePlugin):
+  """Invalid callback fixture: host state exists without a mask rollback ABI."""
+
+  def __init__(self):
+    super().__init__("stateful_without_rollback", PluginType.FORCE)
+
+  def run_device(self, state, **kwargs):
+    return None
+
+  def snapshot(self):
+    return np.zeros((self.batch_size,), dtype=np.int32)
+
+
+class StatelessSnapshotPlugin(StatefulPluginWithoutDeviceRollback):
+  def __init__(self):
+    NativePlugin.__init__(self, "stateless_snapshot", PluginType.FORCE)
+
+  def snapshot(self):
+    return None
 
 
 def test_applied_force_selector_is_owned_and_drives_step():
@@ -191,13 +261,18 @@ def test_bool_eq_active_and_duplicate_aliases_are_handled_explicitly():
                       "qacc_warmstart": np.ones((1, model.nv), np.float32)})
 
 
-def test_stateful_force_sensor_plugins_reset_copy_restore_and_late_failure():
+@pytest.mark.gpu
+@pytest.mark.parametrize("autoreset", [True, False])
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_stateful_force_sensor_plugins_reset_copy_restore_and_late_failure(autoreset):
   model = mujoco.MjModel.from_xml_string("""<mujoco>
     <option gravity="0 0 0" timestep=".002" solver="PGS" iterations="100"/>
     <worldbody><body><joint type="slide" axis="1 0 0"/>
       <geom type="sphere" size=".1" mass="1" contype="0" conaffinity="0"/>
     </body></worldbody>
     <sensor><user name="stateful_sensor" dim="1"/></sensor></mujoco>""")
+  if not autoreset:
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_AUTORESET)
   sensor = StatefulTestPlugin("stateful_sensor", PluginType.SENSOR)
   force = StatefulTestPlugin("stateful_force", PluginType.FORCE)
   late_failure = StatefulTestPlugin("late_failure", PluginType.FORCE,
@@ -212,6 +287,25 @@ def test_stateful_force_sensor_plugins_reset_copy_restore_and_late_failure():
     np.testing.assert_array_equal(sim._native_plugins[0].snapshot(), [1, 1])
     np.testing.assert_array_equal(sim._native_plugins[1].snapshot(), [1, 1])
     snap = sim.snapshot()
+    # Embedded device state is validated before any plugin preflight/restore
+    # callback. A malformed state payload must therefore leave both domains
+    # untouched even when selected-world restore is requested.
+    bad_device = sim.snapshot()
+    malformed_device = replace(bad_device["device"])
+    object.__setattr__(
+        malformed_device, "qpos",
+        np.full_like(malformed_device.qpos, np.nan))
+    bad_device["device"] = malformed_device
+    before_device = _host(sim.state.qpos)
+    before_plugin = [p.snapshot() for p in sim._native_plugins]
+    before_restore_calls = [p.restore_calls for p in sim._native_plugins]
+    with pytest.raises(ValueError, match="finite"):
+      sim.restore(bad_device, env_ids=[1])
+    np.testing.assert_array_equal(_host(sim.state.qpos), before_device)
+    for plugin, before in zip(sim._native_plugins, before_plugin):
+      np.testing.assert_array_equal(plugin.snapshot(), before)
+    assert [p.restore_calls for p in sim._native_plugins] == before_restore_calls
+
     sim.reset(env_ids=[1])
     np.testing.assert_array_equal(sim._native_plugins[0].snapshot(), [1, 0])
     np.testing.assert_array_equal(sim._native_plugins[1].snapshot(), [1, 0])
@@ -254,16 +348,65 @@ def test_stateful_force_sensor_plugins_reset_copy_restore_and_late_failure():
     np.testing.assert_array_equal(_host(sim.state.qpos), before_qpos)
     np.testing.assert_array_equal(runtime_late.snapshot(), before_late)
     before_forces = [p.snapshot() for p in sim._native_plugins[1:]]
+    warning = int(mujoco.mjtWarning.mjWARN_BADQACC)
+    before_warning = _host(sim.state._warning_number)[:, warning]
     sim._native_plugins[-1].fail_output = True
-    with pytest.raises(ValueError, match="invalid force tensor"):
-      sim.step()
-    np.testing.assert_array_equal(_host(sim.state.qpos), before_qpos)
+    status = sim.step().detach().cpu().numpy()
+    assert np.all(status != 0)
+    # This failure is a non-finite current ACC, so pinned AUTORESET restores
+    # the default qpos. Plugin-owned failed rows still roll back to their
+    # pre-step values below; the preceding failed restore was checked against
+    # before_qpos before this independent step.
+    expected_qpos = np.zeros_like(before_qpos) if autoreset else before_qpos
+    np.testing.assert_array_equal(_host(sim.state.qpos), expected_qpos)
+    expected_warning = np.ones_like(before_warning) if autoreset else before_warning + 2
+    np.testing.assert_array_equal(
+        _host(sim.state._warning_number)[:, warning], expected_warning)
     for plugin, before in zip(sim._native_plugins, [before_sensor, *before_forces]):
       np.testing.assert_array_equal(plugin.snapshot(), before)
   finally:
     default_registry.unregister("stateful_sensor", PluginType.SENSOR)
     default_registry.unregister("stateful_force", PluginType.FORCE)
     default_registry.unregister("late_failure", PluginType.FORCE)
+
+
+def test_public_warmstart_is_qacc_and_changes_zero_budget_pgs_solution():
+  """The public warm-start setter controls qacc state consumed by PGS."""
+  high_model = _equality_model(iterations=100)
+  qpos = np.array([[0.02, 0.0]], dtype=np.float32)
+  high = MetalSimulation(high_model, qpos=qpos, profile="integrated_euler_v1")
+  reference = high.assembled_system(recompute=True)
+  seed = _host(reference["qacc"])
+  assert np.isfinite(seed).all() and np.any(np.abs(seed) > 1e-5)
+  oracle = mujoco.MjData(high_model)
+  oracle.qpos[:] = qpos[0]
+  mujoco.mj_forward(high_model, oracle)
+  np.testing.assert_allclose(seed[0], oracle.qacc, rtol=3e-4, atol=3e-3)
+
+  low_model = _equality_model(iterations=0)
+  low = MetalSimulation(low_model, qpos=qpos, profile="integrated_euler_v1")
+  # Assembled workspaces are borrowed; retain the result before another solve.
+  cold = _host(low.assembled_system(recompute=True)["qacc"])
+  cold_oracle = mujoco.MjData(low_model)
+  cold_oracle.qpos[:] = qpos[0]
+  mujoco.mj_forward(low_model, cold_oracle)
+  np.testing.assert_allclose(cold[0], cold_oracle.qacc, rtol=3e-4, atol=3e-3)
+  warm_oracle = mujoco.MjData(low_model)
+  warm_oracle.qpos[:] = qpos[0]
+  warm_oracle.qacc_warmstart[:] = seed[0]
+  mujoco.mj_forward(low_model, warm_oracle)
+  assert not np.allclose(warm_oracle.qacc, cold_oracle.qacc, atol=1e-6)
+  mj_setState(low, {"warmstart": seed})
+  got = mj_getState(low, StateSpec.WARMSTART)["warmstart"]
+  np.testing.assert_array_equal(_host(got), seed)
+  warm = low.assembled_system(recompute=True)
+  assert np.isfinite(_host(warm["qacc"])).all()
+  np.testing.assert_allclose(_host(warm["qacc"])[0], warm_oracle.qacc,
+                             rtol=3e-4, atol=3e-3)
+  assert not np.allclose(_host(warm["qacc"]), cold,
+                         rtol=1e-5, atol=1e-6)
+  assert low.get_warmstart().shape == (1, low_model.nv)
+  assert low.get_constraint_multipliers().shape == (1, low._coupled_constraints.descriptor.nr)
 
 
 def test_reset_and_copy_rollback_when_late_plugin_lifecycle_callback_rejects():
@@ -332,3 +475,78 @@ def test_keyframe_reset_resets_only_selected_plugin_rows():
     np.testing.assert_allclose(_host(sim.state.qpos), [[0], [.25]])
   finally:
     default_registry.unregister("keyframe_plugin", PluginType.FORCE)
+
+
+def test_failed_world_rolls_back_only_that_force_plugin_state():
+  model = mujoco.MjModel.from_xml_string("""<mujoco>
+    <option gravity="0 0 0" timestep=".002" solver="PGS" iterations="100"/>
+    <worldbody><body><joint name="j" type="slide" axis="1 0 0"/>
+      <geom type="sphere" size=".1" mass="1e-10" contype="0" conaffinity="0"/>
+    </body></worldbody></mujoco>""")
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+  plugin = StatefulTestPlugin("row_failure", PluginType.FORCE)
+  plugin.overflow_world = 0
+  default_registry.register(plugin)
+  try:
+    sim = MetalSimulation(model, batch_size=2,
+                          profile="contact_free_forces_euler_v1")
+    runtime = sim._native_plugins[0]
+    status = sim.step().detach().cpu().numpy()
+    np.testing.assert_array_equal(status != 0, [True, False])
+    np.testing.assert_array_equal(runtime.snapshot(), [0, 1])
+    np.testing.assert_array_equal(_host(sim.state.qpos)[0], [0])
+    assert _host(sim.state.qpos)[1, 0] > 0
+  finally:
+    default_registry.unregister("row_failure", PluginType.FORCE)
+
+
+def test_stateful_plugin_without_native_mask_rollback_is_rejected():
+  plugin = StatefulPluginWithoutDeviceRollback()
+  default_registry.register(plugin)
+  try:
+    model = _model()
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    with pytest.raises(TypeError, match="device-native rollback methods"):
+      MetalSimulation(model, profile="contact_free_forces_euler_v1")
+  finally:
+    default_registry.unregister(plugin.name, PluginType.FORCE)
+
+
+def test_stateless_plugin_with_empty_snapshot_remains_supported():
+  plugin = StatelessSnapshotPlugin()
+  default_registry.register(plugin)
+  try:
+    model = _model()
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    sim = MetalSimulation(model, profile="contact_free_forces_euler_v1")
+    assert sim._native_plugins[0].snapshot() is None
+  finally:
+    default_registry.unregister(plugin.name, PluginType.FORCE)
+
+
+def test_sensor_plugin_tick_mask_gates_mutated_output_and_per_world_state():
+  spec = mujoco.MjSpec.from_string("""<mujoco>
+    <option gravity="0 0 0" timestep=".002"/>
+    <worldbody><body><joint name="j" type="slide" axis="1 0 0"/>
+      <geom type="sphere" size=".1" mass="1" contype="0" conaffinity="0"/>
+    </body></worldbody><sensor><user name="tick_sensor" dim="1"/></sensor>
+    </mujoco>""")
+  sensor = spec.sensor("tick_sensor")
+  sensor.nsample = 8
+  sensor.interval = [0.004, 0.0]
+  model = spec.compile()
+  plugin = StatefulTestPlugin("tick_sensor", PluginType.SENSOR)
+  default_registry.register(plugin)
+  try:
+    sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+    runtime = sim._native_plugins[0]
+    mj_setState(sim, {"time": np.array([0.0, 0.002], dtype=np.float32)})
+    expected = sim._history_program.sensor_compute_mask(
+        sim.state._history, sim.state._time)[:, :1].any(dim=1)
+    sim.step()
+    np.testing.assert_array_equal(runtime.calls.detach().cpu().numpy(),
+                                  expected.to(dtype=runtime.calls.dtype).cpu().numpy())
+    output = sim.step_sensordata()
+    np.testing.assert_array_equal(output[:, 0] != 0, expected.cpu().numpy())
+  finally:
+    default_registry.unregister("tick_sensor", PluginType.SENSOR)

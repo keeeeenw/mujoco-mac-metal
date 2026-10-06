@@ -4,6 +4,8 @@
 
 import builtins
 import json
+import hashlib
+from pathlib import Path
 
 from mujoco_metal import __main__ as cli
 
@@ -76,3 +78,30 @@ def test_preflight_command_is_preserved(capsys):
       "narrowly GPU-qualified"
       in result["stages"]["contact_free_motor_euler_v1"]
   )
+
+
+def test_preflight_inventories_actual_installed_shaders_and_requirements(monkeypatch):
+  from mujoco_metal.registry import REQUIREMENTS
+  real_import = builtins.__import__
+
+  def reject_torch_import(name, *args, **kwargs):
+    if name == "torch" or name.startswith("torch."):
+      raise AssertionError("shader and requirement inventory must remain host-only")
+    return real_import(name, *args, **kwargs)
+
+  monkeypatch.setattr(builtins, "__import__", reject_torch_import)
+  result = cli.preflight(include_inventory=True)
+  package = Path(cli.__file__).resolve().parent
+  shaders = sorted((package / "shaders").glob("*.metal"))
+  assert set(result["shaders"]) == {path.stem for path in shaders}
+  assert len(shaders) > 20  # Include newer runtime operators, not only the old list.
+  for path in shaders:
+    actual = result["shaders"][path.stem]
+    assert Path(actual["path"]).resolve() == path.resolve()
+    assert actual["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+  assert [row["id"] for row in result["requirements"]] == [
+      requirement.id for requirement in REQUIREMENTS]
+  assert sum(result["requirement_counts"].values()) == len(REQUIREMENTS)
+  assert result["diagnostic_execution"] == "host_inventory_only"
+  assert result["gpu_qualified"] is False
+  assert "not a physics completion percentage" in result["requirement_counts_scope"]

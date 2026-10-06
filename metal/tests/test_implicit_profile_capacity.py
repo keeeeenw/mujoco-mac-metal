@@ -21,7 +21,8 @@ def test_integrated_implicit_preserves_explicit_capacity():
     </worldbody></mujoco>''')
   profile_name = f"integrated_{integrator}_v1"
   with pytest.raises(CapacityOverflow):
-    validate_stepping_profile(model, profile=profile_name)
+    validate_stepping_profile(
+        model, profile=profile_name, limits=CapacityLimits(max_rows=96))
   limits = CapacityLimits(max_rows=128)
   descriptor = lower_coupled_constraints(model, limits=limits)
   assert 96 < descriptor.nr <= limits.max_rows

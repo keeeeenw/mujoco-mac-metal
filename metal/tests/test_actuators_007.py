@@ -51,12 +51,18 @@ def test_admission_accepts_full_families_cpu():
 
 
 def test_admission_rejects_with_owners_cpu():
-  with pytest.raises(ValueError, match="019"):
-    ActuatorModel(_model(actuator='<general joint="j" dyntype="user"/>'))
-  with pytest.raises(ValueError, match="019"):
-    ActuatorModel(_model(actuator='<general joint="j" gaintype="user"/>'))
-  with pytest.raises(ValueError, match="019"):
-    ActuatorModel(_model(actuator='<general joint="j" biastype="user"/>'))
+  # MuJoCo's no-callback USER defaults are a supported source behavior;
+  # registered device callbacks are separately validated by milestone 019.
+  user_dyn = ActuatorModel(_model(
+      actuator='<general joint="j" dyntype="user" actdim="2"/>'))
+  assert user_dyn.na == 2
+  assert user_dyn.needs_general_path
+  user_gain = ActuatorModel(_model(
+      actuator='<general joint="j" gaintype="user"/>'))
+  assert user_gain.has_user_gain
+  user_bias = ActuatorModel(_model(
+      actuator='<general joint="j" biastype="user"/>'))
+  assert user_bias.has_user_bias
   m = _model(actuator='<general joint="j"/>')
   m.actuator_delay[0] = 0.01
   # R06/D1: delay admitted with validated config (empty history here means
@@ -321,7 +327,7 @@ def test_act_lifecycle_native_gpu():
   sim = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
   assert sim.state.na == 1
   snap = sim.state.snapshot()
-  assert snap.schema_version == 4 and snap.nact == 1
+  assert snap.schema_version == 6 and snap.nact == 1
   sim.step(5, ctrl=np.ones((2, 1), dtype=np.float32))
   assert float(sim.state.act.cpu().numpy()[0, 0]) > 0.05
   sim.state.restore(snap)

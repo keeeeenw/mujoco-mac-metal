@@ -15,6 +15,7 @@
 """CPU lifecycle tests for owned device state and immutable checkpoints."""
 
 import os
+from dataclasses import replace
 
 import mujoco
 import numpy as np
@@ -86,6 +87,44 @@ def test_selected_reset_clears_only_requested_rows_and_commits_generation():
   assert state.reset([]) == 1
 
 
+def test_masked_reset_cpu_adapter_is_row_scoped_and_empty_mask_is_noop():
+  import torch
+
+  state = _state(_model(), batch_size=2)
+  state._qpos.copy_(torch.tensor([[0.2], [-0.3]], dtype=torch.float32))
+  state._qvel.copy_(torch.tensor([[1.0], [2.0]], dtype=torch.float32))
+  state._qacc.copy_(torch.tensor([[3.0], [4.0]], dtype=torch.float32))
+  state._time.copy_(torch.tensor([0.1, 0.2], dtype=torch.float32))
+  state._row_reset_epoch.copy_(torch.tensor([4, 9], dtype=torch.int32))
+  generation = state.generation
+  persistent = (state._qpos, state._qvel, state._qacc, state._time,
+                state._status, state._row_reset_epoch)
+  before = tuple(value.clone() for value in persistent)
+
+  state.reset_mask(torch.tensor([False, False], dtype=torch.bool))
+  assert state.generation == generation
+  assert all(left is right for left, right in zip(
+      persistent, (state._qpos, state._qvel, state._qacc, state._time,
+                   state._status, state._row_reset_epoch)))
+  assert all(torch.equal(expected, actual)
+             for expected, actual in zip(before, persistent))
+
+  state.reset_mask(torch.tensor([True, False], dtype=torch.bool))
+  assert state.generation == generation
+  assert state._row_reset_epoch.tolist() == [5, 9]
+  np.testing.assert_array_equal(
+      state._qpos[:, 0].numpy(), np.asarray([0.0, -0.3], dtype=np.float32))
+  np.testing.assert_array_equal(
+      state._qvel[:, 0].numpy(), np.asarray([0.0, 2.0], dtype=np.float32))
+  np.testing.assert_array_equal(
+      state._qacc[:, 0].numpy(), np.asarray([0.0, 4.0], dtype=np.float32))
+  np.testing.assert_array_equal(
+      state._time.numpy(), np.asarray([0.0, 0.2], dtype=np.float32))
+  assert all(left is right for left, right in zip(
+      persistent, (state._qpos, state._qvel, state._qacc, state._time,
+                   state._status, state._row_reset_epoch)))
+
+
 @pytest.mark.parametrize(
     "env_ids, qpos, qvel",
     [
@@ -103,6 +142,24 @@ def test_invalid_reset_is_atomic(env_ids, qpos, qvel):
   before = state.snapshot()
   with pytest.raises(ValueError):
     state.reset(env_ids, qpos=qpos, qvel=qvel)
+  after = state.snapshot()
+  assert state.generation == 0
+  for name in ("qpos", "qvel", "qacc", "time", "status"):
+    np.testing.assert_array_equal(getattr(after, name), getattr(before, name))
+
+
+def test_validate_snapshot_preflights_without_mutating_live_state():
+  state = _state(batch_size=2,
+      qpos=np.array([[.2], [.4]], dtype=np.float32),
+      qvel=np.array([[.7], [.9]], dtype=np.float32))
+  before = state.snapshot()
+
+  assert state.validate_snapshot(before)
+  bad = replace(before)
+  object.__setattr__(bad, "qpos", np.array([[.2], [np.nan]], dtype=np.float64))
+  with pytest.raises(ValueError, match="finite"):
+    state.validate_snapshot(bad, env_ids=[1])
+
   after = state.snapshot()
   assert state.generation == 0
   for name in ("qpos", "qvel", "qacc", "time", "status"):
@@ -229,6 +286,110 @@ def test_rejects_bad_snapshots_and_accepts_static_empty_world():
         time=np.zeros(2),
         status=np.zeros(2, dtype=np.int32),
     )
+
+
+def test_warning_statistics_reset_copy_snapshot_and_legacy_restore():
+  torch = pytest.importorskip("torch")
+  model = mujoco.MjModel.from_xml_string(
+      "<mujoco><option><flag contact='disable'/></option><worldbody>"
+      "<body><joint name='j'/><geom type='sphere' size='.1'/></body>"
+      "</worldbody></mujoco>"
+  )
+  state = _state(model, batch_size=2)
+  assert state.snapshot().schema_version == 6
+  badqpos = int(mujoco.mjtWarning.mjWARN_BADQPOS)
+  badqvel = int(mujoco.mjtWarning.mjWARN_BADQVEL)
+  state._warning_number[0, badqpos] = 3
+  state._warning_lastinfo[0, badqpos] = 7
+  state._warning_number[1, badqvel] = 9
+  state._warning_lastinfo[1, badqvel] = 2
+  state._row_reset_epoch.copy_(torch.tensor([3, 8], dtype=torch.int32))
+  snap = state.snapshot()
+  np.testing.assert_array_equal(snap.row_reset_epoch, [3, 8])
+  np.testing.assert_array_equal(snap.warning_number[0, badqpos], 3)
+  np.testing.assert_array_equal(snap.warning_lastinfo[0, badqpos], 7)
+
+  state.reset(env_ids=[0])
+  assert int(state._row_reset_epoch[0]) == 4
+  assert int(state._warning_number[0, badqpos]) == 0
+  assert int(state._warning_number[1, badqvel]) == 9
+  state.copy_environment(1, 0)
+  assert int(state._row_reset_epoch[0]) == 8
+  assert int(state._warning_number[0, badqvel]) == 9
+  assert int(state._warning_lastinfo[0, badqvel]) == 2
+
+  state._warning_number.zero_()
+  state._warning_lastinfo.fill_(11)
+  state.restore(snap)
+  np.testing.assert_array_equal(state._row_reset_epoch.numpy(), [3, 8])
+  assert int(state._warning_number[0, badqpos]) == 3
+  assert int(state._warning_lastinfo[0, badqpos]) == 7
+  legacy = replace(snap, schema_version=5)
+  state.restore(legacy)
+  np.testing.assert_array_equal(state._row_reset_epoch.numpy(), [0, 0])
+  assert int(state._warning_number[1, badqvel]) == 9
+
+  # Legacy schemas remain readable and explicitly start with empty warning
+  # history because they did not serialize the MuJoCo warning statistics.
+  legacy = StateSnapshot(
+      model_fingerprint=snap.model_fingerprint,
+      profile_fingerprint=snap.profile_fingerprint,
+      timestep=snap.timestep,
+      nq=snap.nq,
+      nv=snap.nv,
+      batch_size=snap.batch_size,
+      qpos=snap.qpos,
+      qvel=snap.qvel,
+      qacc=snap.qacc,
+      time=snap.time,
+      status=snap.status,
+      schema_version=1,
+  )
+  state.restore(legacy)
+  assert not bool(torch.any(state._warning_number))
+  assert not bool(torch.any(state._warning_lastinfo))
+
+
+def test_device_state_snapshot_is_not_a_full_trajectory_checkpoint():
+  """The narrow state API deliberately omits acceleration warmstart state."""
+  state = _state(batch_size=2)
+  state._qacc_warmstart.fill_(17)
+  snapshot = state.snapshot()
+  assert not hasattr(snapshot, "qacc_warmstart")
+  assert not hasattr(snapshot, "native_state")
+  # Full replay is provided by MetalSimulation.snapshot(), which owns the
+  # native-state payload (including qacc_warmstart), not StateSnapshot.
+
+
+def test_device_masked_reset_resets_selected_rows_without_host_ids():
+  torch = pytest.importorskip("torch")
+  model = mujoco.MjModel.from_xml_string(
+      "<mujoco><option><flag contact='disable'/></option><worldbody>"
+      "<body><joint name='j'/><geom type='sphere' size='.1'/></body>"
+      "</worldbody></mujoco>")
+  state = _state(model, batch_size=2)
+  state._qpos.copy_(torch.tensor([[0.3], [0.7]], dtype=torch.float32))
+  state._qvel.fill_(2)
+  state._qacc.fill_(3)
+  state._time.fill_(4)
+  state._status.fill_(5)
+  state._warning_number.fill_(6)
+  state._warning_lastinfo.fill_(7)
+  state._qacc_warmstart.fill_(8)
+  selected = torch.tensor([True, False], dtype=torch.bool)
+  state.reset_mask(selected)
+  np.testing.assert_allclose(state._qpos.numpy(), [[0.0], [0.7]], atol=0)
+  np.testing.assert_array_equal(state._qvel.numpy(), [[0.0], [2.0]])
+  np.testing.assert_array_equal(state._qacc.numpy(), [[0.0], [3.0]])
+  np.testing.assert_array_equal(state._time.numpy(), [0.0, 4.0])
+  np.testing.assert_array_equal(state._status.numpy(), [0, 5])
+  assert not bool(torch.any(state._warning_number[0]))
+  assert bool(torch.all(state._warning_number[1] == 6))
+  assert bool(torch.all(state._warning_lastinfo[1] == 7))
+  assert bool(torch.all(state._qacc_warmstart[0] == 0))
+  assert bool(torch.all(state._qacc_warmstart[1] == 8))
+  with pytest.raises(ValueError, match=r"bool\[batch_size\]"):
+    state.reset_mask(torch.tensor([1, 0], dtype=torch.int32))
 
 
 @pytest.mark.gpu

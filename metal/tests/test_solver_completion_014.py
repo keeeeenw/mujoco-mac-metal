@@ -2,9 +2,9 @@
 # Licensed under the Apache License, Version 2.0.
 """Milestone 014: solver options, warm starts and completion evidence.
 
-Covers the PGS/Newton/CG selector mapping (all run the native projected
-solver), cold/warm starts with the cost-gated retained multipliers,
-convergence histories, iteration-contract behavior (adaptive extension),
+Covers distinct PGS/Newton/CG native paths, cold/warm starts with the
+cost-gated retained multipliers, convergence histories, configured
+iteration-contract behavior,
 KKT residual evidence on the retained solution, low budgets, converged
 limits, contact transitions, redundant/ill-conditioned systems, no-slip
 behavior (stick/slip + noslip-stage subsumption probe) across both cones.
@@ -40,7 +40,11 @@ def kkt_violation(asm, elliptic_blocks=None):
   projection; rows covered by ``elliptic_blocks`` use the Lorentz
   projection over their contact blocks instead (box-clamping them is not
   a valid cone certificate)."""
-  g = lambda k: np.asarray(asm[k].cpu().numpy(), dtype=np.float64)
+  def g(key):
+    value = asm[key]
+    if hasattr(value, "cpu"):
+      value = value.cpu().numpy()
+    return np.asarray(value, dtype=np.float64)
   W, R, ar, rhs, lam, lo, hi = (g("W"), g("R"), g("ar"), g("rhs"),
                                 g("lambda"), g("lo"), g("hi"))
   b = W.shape[0]
@@ -67,6 +71,30 @@ def kkt_violation(asm, elliptic_blocks=None):
         worst = max(worst, _lorentz_violation(
             W[world], R[world], rhs[world], lam[world], start, dim, friction))
   return worst
+
+
+def _cpu_press_assembly_for_kkt(model, data):
+  """Build the same retained Delassus system from pinned MuJoCo arrays."""
+  nr = int(data.nefc)
+  nv = int(model.nv)
+  if nr == 0:
+    return {key: np.zeros((1, 0), dtype=np.float64)
+            for key in ("W", "R", "ar", "rhs", "lambda", "lo", "hi")}
+  jac = np.asarray(data.efc_J, dtype=np.float64).reshape(nr, nv)
+  mass = np.empty((nv, nv), dtype=np.float64)
+  mujoco.mj_fullM(model, data, mass)
+  W = jac @ np.linalg.solve(mass, jac.T)
+  return {
+      "W": W[None, :, :],
+      "R": np.asarray(data.efc_R, dtype=np.float64)[None, :],
+      "ar": np.asarray(data.efc_aref, dtype=np.float64)[None, :],
+      "rhs": -np.asarray(data.efc_b, dtype=np.float64)[None, :],
+      "lambda": np.asarray(data.efc_force, dtype=np.float64)[None, :],
+      # The press fixture uses pyramidal friction, whose compiled rows have
+      # nonnegative multipliers.  No row is an equality in this oracle.
+      "lo": np.zeros((1, nr), dtype=np.float64),
+      "hi": np.full((1, nr), np.inf, dtype=np.float64),
+  }
 
 
 def _lorentz_violation(W, R, rhs, lam, start, dim, friction):
@@ -172,9 +200,10 @@ def test_lorentz_projector_analytic_cpu():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_solver_selection_parity_gpu():
-  # PGS/Newton/CG selections run identical native code (mapped); all match
-  # the CPU PGS oracle on a sustained press.
+  # Distinct algorithms converge to their pinned CPU physical trajectory;
+  # intermediate iterates are not required to be bit-identical.
   refs = {}
+  cpu_refs = {}
   for solver in ("PGS", "Newton", "CG"):
     m = _press_model(solver=solver)
     sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
@@ -184,28 +213,29 @@ def test_solver_selection_parity_gpu():
       sim.step(1)
     refs[solver] = (sim.state.qpos.cpu().numpy().copy(),
                     sim.state.qacc.cpu().numpy().copy())
-  np.testing.assert_array_equal(refs["PGS"][0], refs["CG"][0])
-  np.testing.assert_array_equal(refs["PGS"][1], refs["CG"][1])
-  np.testing.assert_array_equal(refs["PGS"][0], refs["Newton"][0])
-  m = _press_model(solver="PGS")
-  cpu = mujoco.MjData(m)
-  cpu.qpos[:] = m.qpos0
-  cpu.qvel[:] = 0
-  mujoco.mj_forward(m, cpu)
-  for _ in range(50):
-    mujoco.mj_step(m, cpu)
-  np.testing.assert_allclose(refs["PGS"][0][0, :3], np.asarray(cpu.qpos)[:3],
-                             atol=2e-3, err_msg="native-vs-cpu press")
+    cpu = mujoco.MjData(m)
+    cpu.qpos[:] = m.qpos0
+    cpu.qvel[:] = 0
+    mujoco.mj_forward(m, cpu)
+    for _ in range(50):
+      mujoco.mj_step(m, cpu)
+    cpu_refs[solver] = (np.asarray(cpu.qpos).copy(), np.asarray(cpu.qacc).copy())
+  for solver in ("PGS", "Newton", "CG"):
+    np.testing.assert_allclose(refs[solver][0][0, :3], cpu_refs[solver][0][:3],
+                               atol=2e-3,
+                               err_msg=f"native-vs-cpu {solver} trajectory")
+    np.testing.assert_allclose(refs[solver][1][0], cpu_refs[solver][1],
+                               atol=4e-2, rtol=3e-2,
+                               err_msg=f"native-vs-cpu {solver} acceleration")
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 @pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
 def test_warm_beats_cold_gpu(cone):
-  # Sustained press: warm starts certify in fewer total iterations than
-  # clearing every step, reaching the same physics. Iteration counts are
-  # read directly from the step workspace (assembled_system would recompute
-  # at the post-step state and mask the step-save).
+  # Sustained press: compare warm-start iteration behavior to pinned 3.10.
+  # Some solver/cone combinations reach the same one-sweep solution cold, so
+  # a strict warm< cold claim is only valid when the CPU oracle demonstrates it.
   def run(warm):
     m = _press_model(cone=cone)
     sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
@@ -219,10 +249,33 @@ def test_warm_beats_cold_gpu(cone):
       w = sim._coupled_constraints._workspace["out_diagnostics"][:10].reshape(10)
       total += int(w[1].detach().cpu().numpy())
     return total, sim.state.qpos.cpu().numpy().copy()
+
+  def run_cpu(warm):
+    m = _press_model(cone=cone)
+    data = mujoco.MjData(m)
+    data.qpos[:] = np.asarray(m.qpos0, dtype=np.float32)
+    data.qvel[:] = 0
+    total = 0
+    for _ in range(40):
+      if not warm:
+        data.qacc_warmstart[:] = 0
+      mujoco.mj_step(m, data)
+      total += int(data.solver_niter[0])
+    return total, np.asarray(data.qpos).copy()
+
   cold_iters, cold_q = run(False)
   warm_iters, warm_q = run(True)
-  assert warm_iters < cold_iters, (warm_iters, cold_iters)
+  cpu_cold_iters, cpu_cold_q = run_cpu(False)
+  cpu_warm_iters, cpu_warm_q = run_cpu(True)
+  assert (warm_iters < cold_iters) == (cpu_warm_iters < cpu_cold_iters), (
+      cone, warm_iters, cold_iters, cpu_warm_iters, cpu_cold_iters)
+  if cpu_warm_iters == cpu_cold_iters:
+    assert warm_iters == cold_iters, (cone, warm_iters, cold_iters)
   np.testing.assert_allclose(warm_q, cold_q, atol=1e-4, err_msg="warm-vs-cold")
+  np.testing.assert_allclose(cold_q[0], cpu_cold_q, atol=2e-3,
+                             err_msg="cold-vs-pinned")
+  np.testing.assert_allclose(warm_q[0], cpu_warm_q, atol=2e-3,
+                             err_msg="warm-vs-pinned")
 
 
 @pytest.mark.gpu
@@ -519,10 +572,29 @@ def test_opposing_pinch_cold_vs_warm_gpu():
       total_iters += int(w[1].item())
     return total_iters, sim.state.qpos.cpu().numpy()[0]
 
+  def run_cpu(warm):
+    data = mujoco.MjData(m)
+    data.qpos[:] = np.asarray(m.qpos0, dtype=np.float32)
+    data.qvel[:] = 0
+    total_iters = 0
+    for _ in range(30):
+      if not warm:
+        data.qacc_warmstart[:] = 0
+      mujoco.mj_step(m, data)
+      total_iters += int(data.solver_niter[0])
+    return total_iters, np.asarray(data.qpos).copy()
+
   iters_cold, q_cold = run(False)
   iters_warm, q_warm = run(True)
-  assert iters_warm < iters_cold
+  cpu_iters_cold, cpu_q_cold = run_cpu(False)
+  cpu_iters_warm, cpu_q_warm = run_cpu(True)
+  assert (iters_warm < iters_cold) == (cpu_iters_warm < cpu_iters_cold), (
+      iters_warm, iters_cold, cpu_iters_warm, cpu_iters_cold)
+  if cpu_iters_warm == cpu_iters_cold:
+    assert iters_warm == iters_cold, (iters_warm, iters_cold)
   np.testing.assert_allclose(q_warm[:3], q_cold[:3], atol=1e-4)
+  np.testing.assert_allclose(q_cold[:3], cpu_q_cold[:3], atol=2e-3)
+  np.testing.assert_allclose(q_warm[:3], cpu_q_warm[:3], atol=2e-3)
 
 
 @pytest.mark.gpu
@@ -557,8 +629,7 @@ def test_teleport_rejects_stale_seed_gpu():
   sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
   for _ in range(5):
     sim.step(1)
-  nr = sim._coupled_constraints.descriptor.nr
-  sim.set_warmstart(np.full(nr, 10.0, dtype=np.float32))
+  sim.set_warmstart(np.full(m.nv, 10.0, dtype=np.float32))
   gated = sim.assembled_system(recompute=True)
   sim.clear_warmstart()
   cold = sim.assembled_system(recompute=True)
@@ -795,8 +866,7 @@ def test_warmstart_cost_guard_gpu():
   sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
   qp = np.asarray(m.qpos0, dtype=np.float32)
   sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
-  nr = sim._coupled_constraints.descriptor.nr
-  sim.set_warmstart(np.full(nr, 1e6, dtype=np.float32))
+  sim.set_warmstart(np.full(m.nv, 1e6, dtype=np.float32))
   for _ in range(20):
     sim.step(1)
   poisoned = sim.state.qpos.cpu().numpy().copy()
@@ -822,8 +892,7 @@ def test_warmstart_disable_flag_gpu():
   sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
   qp = np.asarray(m.qpos0, dtype=np.float32)
   sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
-  nr = sim._coupled_constraints.descriptor.nr
-  sim.set_warmstart(np.full(nr, 3.0, dtype=np.float32))
+  sim.set_warmstart(np.full(m.nv, 3.0, dtype=np.float32))
   for _ in range(10):
     sim.step(1)
   seeded = (sim.state.qpos.cpu().numpy().copy(),
@@ -845,28 +914,28 @@ def test_warmstart_api_gpu():
   sim = MetalSimulation(m, batch_size=2, profile=PROFILE)
   qp = np.asarray(m.qpos0, dtype=np.float32)
   sim.reset(qpos=np.stack([qp, qp]), qvel=np.zeros((2, m.nv), dtype=np.float32))
-  nr = sim._coupled_constraints.descriptor.nr
+  nv = sim._mjmodel.nv
   w0 = sim.get_warmstart()
-  assert w0.shape == (2, nr) and np.all(w0 == 0)
+  assert w0.shape == (2, nv) and np.all(w0 == 0)
   # Broadcast + per-env set.
-  sim.set_warmstart(np.full(nr, 0.5, dtype=np.float32))
+  sim.set_warmstart(np.full(nv, 0.5, dtype=np.float32))
   np.testing.assert_allclose(sim.get_warmstart(), 0.5)
-  sim.set_warmstart(np.zeros(nr, dtype=np.float32), env_ids=[1])
+  sim.set_warmstart(np.zeros(nv, dtype=np.float32), env_ids=[1])
   got = sim.get_warmstart()
   assert float(np.max(got[0])) == 0.5 and float(np.max(got[1])) == 0.0
   # Invalid: shape, nonfinite, bad/duplicate ids.
   with pytest.raises(ValueError, match="shape"):
-    sim.set_warmstart(np.zeros(nr + 1, dtype=np.float32))
+    sim.set_warmstart(np.zeros(nv + 1, dtype=np.float32))
   with pytest.raises(ValueError, match="finite"):
-    sim.set_warmstart(np.full(nr, np.inf))
-  with pytest.raises(ValueError, match="out of range"):
-    sim.set_warmstart(np.zeros(nr), env_ids=[7])
+    sim.set_warmstart(np.full(nv, np.inf))
+  with pytest.raises(IndexError, match="in \\[0, 2\\)"):
+    sim.set_warmstart(np.zeros(nv), env_ids=[7])
   with pytest.raises(ValueError, match="duplicate"):
-    sim.set_warmstart(np.zeros((2, nr)), env_ids=[0, 0])
+    sim.set_warmstart(np.zeros((2, nv)), env_ids=[0, 0])
   with pytest.raises(ValueError, match="at least one"):
     sim.clear_warmstart(env_ids=[])
   # Reset clears.
-  sim.set_warmstart(np.full((2, nr), 2.0, dtype=np.float32))
+  sim.set_warmstart(np.full((2, nv), 2.0, dtype=np.float32))
   sim.reset()
   np.testing.assert_allclose(sim.get_warmstart(), 0.0)
 
@@ -874,14 +943,21 @@ def test_warmstart_api_gpu():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_history_contract_gpu():
-  # Histories are finite, nonnegative and overall decreasing across the
-  # main sweep; a converged step certifies within tolerance.
+  # History samples the source optimizer metric; diagnostics[0] independently
+  # certifies the retained dual row system.  Finite-budget PGS can stop by cost
+  # improvement with a KKT residual above the requested stopping tolerance.
   m = _press_model()
   sim = MetalSimulation(m, batch_size=1, profile=PROFILE)
   qp = np.asarray(m.qpos0, dtype=np.float32)
   sim.reset(qpos=qp.reshape(1, -1), qvel=np.zeros((1, m.nv), dtype=np.float32))
+  cpu = mujoco.MjData(m)
+  cpu.qpos[:] = qp
   for _ in range(10):
     sim.step(1)
+    mujoco.mj_step(m, cpu)
+  # Match the native assembled_system(recompute=True) query at the same
+  # post-step state and use pinned 3.10's retained row force as the oracle.
+  mujoco.mj_forward(m, cpu)
   asm = sim.assembled_system(recompute=True)
   hist = np.asarray(asm["solver_history"].cpu().numpy()[0])
   diag = np.asarray(asm["solver_diagnostics"].cpu().numpy()[0])
@@ -889,7 +965,8 @@ def test_history_contract_gpu():
   assert np.all(np.isfinite(hist)) and np.all(hist >= 0)
   assert hist[0] >= hist[7], hist
   assert int(sim.state.status.cpu().numpy()[0]) == 0
-  assert diag[0] <= float(np.asarray(m.opt.tolerance)) * 10 + 1e-6
+  cpu_residual = kkt_violation(_cpu_press_assembly_for_kkt(m, cpu))
+  assert abs(diag[0] - cpu_residual) <= 1.1e-6, (diag[0], cpu_residual)
 
 
 @pytest.mark.gpu
@@ -1107,8 +1184,8 @@ def test_noslip_sticking_unsaturated_parity_gpu(cone, condim):
 @pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
 def test_noslip_tolerance_stop_and_parity_gpu(cone):
   # Tolerance-sensitive stopping: a loose no-slip tolerance stops after
-  # ~1 sweep while a tight one runs the budget; both match the CPU oracle
-  # (same tolerance) on forces. Stage diagnostics expose the sweep count.
+  # ~1 sweep while a tight tolerance may still stop before its budget when
+  # pinned cost improvement is exhausted. Both match the CPU oracle.
   base = (f'<option timestep="0.002" integrator="Euler" iterations="100" '
           f'tolerance="1e-9" gravity="0 0 -9.81" cone="{cone}" TOL/>'
           '<worldbody><geom name="floor" type="plane" size="5 5 0.1" friction="0.8 0.05 0.02"/>'
@@ -1118,6 +1195,9 @@ def test_noslip_tolerance_stop_and_parity_gpu(cone):
           '<geom name="ball" type="sphere" size="0.05" condim="3" friction="0.8 0.05 0.02"/>'
           '</body></worldbody>')
   counts = {}
+  cpu_counts = {}
+  native_stage_counts = {}
+  source_stage_counts = {}
   for tag, tol in (("loose", 'noslip_iterations="5" noslip_tolerance="1e2"'),
                    ("tight", 'noslip_iterations="5" noslip_tolerance="1e-12"')):
     m = mujoco.MjModel.from_xml_string(
@@ -1126,22 +1206,78 @@ def test_noslip_tolerance_stop_and_parity_gpu(cone):
     qp = np.asarray(m.qpos0, dtype=np.float32)
     qv = np.zeros((1, m.nv), dtype=np.float32)
     qv[0, 0] = 0.4
-    sim.reset(qpos=qp.reshape(1, -1), qvel=qv)
     cpu = mujoco.MjData(m)
     cpu.qpos[:] = qp
     cpu.qvel[:] = qv[0]
-    for _ in range(30):
+    sim.reset(qpos=qp.reshape(1, -1), qvel=qv)
+    sim._coupled_constraints.set_iteration_trace(True)
+    sim._coupled_constraints.set_primal_detail_trace(True)
+    pre_last_cpu = None
+    for step_index in range(30):
       sim.step(1)
+      if step_index == 29:
+        pre_last_cpu = mujoco.MjData(m)
+        mujoco.mj_copyData(pre_last_cpu, m, cpu)
       mujoco.mj_step(m, cpu)
     assert int(sim.state.status.cpu().numpy()[0]) == 0
-    dg = sim.assembled_system()["solver_diagnostics"].cpu().numpy()[0]
+    dg = (sim._coupled_constraints._workspace["out_diagnostics"][:10]
+          .reshape(10).detach().cpu().numpy())
     counts[tag] = int(dg[1])
+    cpu_counts[tag] = int(cpu.solver_niter[0])
+    native_stage_counts[tag] = tuple(int(x) for x in dg[2:4])
+    # A second pinned forward at the exact pre-final-step CPU state with
+    # no-slip disabled isolates the source main-solver count. The original
+    # step's total remains the independent source count for the no-slip pass.
+    assert pre_last_cpu is not None
+    pre_source_state = {name: getattr(pre_last_cpu, name).copy().tolist()
+                        for name in ("qpos", "qvel", "qacc", "qacc_warmstart")}
+    configured_noslip_iterations = int(m.opt.noslip_iterations)
+    try:
+      m.opt.noslip_iterations = 0
+      mujoco.mj_forward(m, pre_last_cpu)
+      source_main = int(pre_last_cpu.solver_niter[0])
+    finally:
+      m.opt.noslip_iterations = configured_noslip_iterations
+    source_noslip = cpu_counts[tag] - source_main
+    source_stage_counts[tag] = (source_main, source_noslip)
+    print("ITER_TRACE no-slip", cone, "solver=", int(m.opt.solver), tag,
+          "native=", native_stage_counts[tag],
+          "source=", source_stage_counts[tag], flush=True)
     gq = sim.state.qpos.cpu().numpy()[0]
     np.testing.assert_allclose(
         gq, np.asarray(cpu.qpos), atol=5e-3, err_msg=f"{cone}/{tag} traj")
+    print("PRIMAL_DETAIL no-slip", cone, tag,
+          "fields=[main,noslip,cold_cost,warm_delta,"
+          "initial_scaled_grad,alpha,scaled_improvement,"
+          "post_scaled_grad] native=",
+          dg[2:10].tolist(),
+          "source_stats=",
+          {"main_count": source_main,
+             "total_count": cpu_counts[tag],
+             "pre_state": pre_source_state,
+             "main_only_qacc": pre_last_cpu.qacc.copy().tolist(),
+             "post_qacc": cpu.qacc.copy().tolist(),
+             "main_only_improvement": pre_last_cpu.solver.improvement[:source_main].tolist(),
+             "main_only_gradient": pre_last_cpu.solver.gradient[:source_main].tolist(),
+             "main_only_lineslope": pre_last_cpu.solver.lineslope[:source_main].tolist(),
+             "full_improvement": cpu.solver.improvement[:cpu_counts[tag]].tolist(),
+             "full_gradient": cpu.solver.gradient[:cpu_counts[tag]].tolist(),
+             "full_lineslope": cpu.solver.lineslope[:cpu_counts[tag]].tolist(),
+           "tolerance": float(m.opt.tolerance),
+           "scale": float(1.0 / (m.stat.meaninertia * max(1, m.nv)))},
+          flush=True)
+  # Compare both stages only after both tolerance cases have run and printed;
+  # a mismatch in the loose case must not suppress tight-case diagnostics.
+  for tag in ("loose", "tight"):
+    assert native_stage_counts[tag] == source_stage_counts[tag], (
+        cone, tag, native_stage_counts[tag], source_stage_counts[tag])
   # The loose budget demonstrably stops earlier.
   assert counts["loose"] <= counts["tight"], counts
-  assert counts["tight"] >= 5, counts  # full budget executed when asked
+  # Tight tolerance still stops early when the source improvement criterion
+  # is met. Compare the diagnostic count with pinned 3.10's per-step solver
+  # count rather than assuming the configured no-slip iteration budget is
+  # always exhausted.
+  assert counts == cpu_counts, (counts, cpu_counts)
 
 
 @pytest.mark.gpu
@@ -1241,3 +1377,43 @@ def test_noslip_regularizer_removal_iteration_0_parity_gpu(cone, condim, ns_iter
   np.testing.assert_allclose(nat_qacc, cpu_qacc, atol=2e-3, err_msg=f"{cone} condim={condim} iters={ns_iters} qacc")
   np.testing.assert_allclose(nat_force, cpu_force, atol=2e-3, err_msg=f"{cone} condim={condim} iters={ns_iters} force")
 
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("noslip_iterations", [0, 4])
+@pytest.mark.parametrize("detail_trace", [False, True])
+def test_iteration_trace_is_physics_inert_gpu(noslip_iterations, detail_trace):
+  xml = '''<mujoco><option timestep="0.002" integrator="Euler" solver="SOLVER"
+    iterations="20" tolerance="1e-8" gravity="0 0 -9.81"
+    noslip_iterations="NOSLIP" noslip_tolerance="1e-8"/>
+    <worldbody><geom name="floor" type="plane" size="3 3 .1"/>
+      <body pos="0 0 .045"><joint type="slide" axis="1 0 0" frictionloss="1"/>
+        <geom type="sphere" size=".05" condim="3" friction=".7 .05 .02"/>
+      </body></worldbody></mujoco>'''
+  for solver in ("PGS", "CG", "Newton"):
+    model = mujoco.MjModel.from_xml_string(
+        xml.replace("SOLVER", solver).replace("NOSLIP", str(noslip_iterations)))
+    qpos = np.asarray(model.qpos0, dtype=np.float32).reshape(1, -1)
+    qvel = np.zeros((1, model.nv), dtype=np.float32)
+    qvel[0, 0] = .25
+    results = []
+    for enabled in (False, True):
+      sim = MetalSimulation(model, batch_size=1, profile=PROFILE)
+      sim.reset(qpos=qpos, qvel=qvel)
+      sim._coupled_constraints.set_iteration_trace(enabled)
+      if detail_trace:
+        sim._coupled_constraints.set_primal_detail_trace(enabled)
+      sim.step(1)
+      workspace = sim._coupled_constraints._workspace
+      results.append({
+          "qpos": sim.state.qpos.detach().cpu().numpy().copy(),
+          "qvel": sim.state.qvel.detach().cpu().numpy().copy(),
+          "qacc": sim.state.qacc.detach().cpu().numpy().copy(),
+          "status": sim.state.status.detach().cpu().numpy().copy(),
+          "force": workspace["out_force"].detach().cpu().numpy().copy(),
+          "acc": workspace["out_acc"].detach().cpu().numpy().copy(),
+          "diagnostics": workspace["out_diagnostics"][:2].detach().cpu().numpy().copy(),
+      })
+    for key in results[0]:
+      np.testing.assert_array_equal(results[0][key], results[1][key],
+                                    err_msg=f"{solver}/{key}")

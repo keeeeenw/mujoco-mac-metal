@@ -1475,6 +1475,7 @@ def test_gpu_capacity_pairs_boundary_execution_batch2():
 
 
 def test_capacity_overflow_rejection():
+  from mujoco_metal.capacity import CapacityLimits
   """Admission guards cleanly reject models exceeding pair, contact, or row limits before construction."""
   # 1. 17 pairs exceeds capacity 16
   xml_p33 = """<mujoco><worldbody><geom name="floor" type="plane" size="5 5 .1"/>"""
@@ -1502,7 +1503,8 @@ def test_capacity_overflow_rejection():
   xml_c49 += """</contact></mujoco>"""
 
   with pytest.raises(ValueError, match="total candidate contact slots \\(49\\) exceeds capacity 48"):
-    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_c49))
+    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_c49),
+                              limits=CapacityLimits(max_slots=48))
 
   # 3. 99 rows exceeds capacity 96 (3 box-box pairs with condim=1 = 24 rows, plus 25 slide joints = 75 rows -> 99 rows)
   xml_r97 = """<mujoco><compiler angle="radian"/><worldbody>"""
@@ -1517,7 +1519,8 @@ def test_capacity_overflow_rejection():
   xml_r97 += """</contact></mujoco>"""
 
   with pytest.raises(ValueError, match="total candidate constraint rows \\(99\\) exceeds capacity 96"):
-    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_r97))
+    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_r97),
+                              limits=CapacityLimits(max_rows=96))
 
 
 # =============================================================================
@@ -1599,8 +1602,12 @@ def test_checkpoint_snapshot_restore_and_replay():
   assert_rows_cleared(0, range(4))  # separated world rows must be exactly zero
   assert_rows_cleared(2, range(4))
 
-  # 3. Snapshot during mixed active/separated/contact-free state
-  chk = sim.state.snapshot()
+  # 3. Capture the full simulation checkpoint during a mixed
+  # active/separated/contact-free state. DeviceState.snapshot() intentionally
+  # omits the acceleration warmstart, held inputs, sensors, and delay/plugin
+  # state, so it cannot promise bitwise trajectory replay.
+  chk = sim.snapshot()
+  assert chk["native_state"]["qacc_warmstart"].shape == (3, m.nv)
 
   # 4. Step 45 more steps: World 0 re-impacts ground (rows re-activated)
   for _ in range(45):
@@ -1615,6 +1622,7 @@ def test_checkpoint_snapshot_restore_and_replay():
   qpos_target = sim.state.qpos.clone()
   qvel_target = sim.state.qvel.clone()
   qacc_target = sim.state.qacc.clone()
+  time_target = sim.state.time.clone()
 
   # 5. Test selective reset isolation: reset World 2, Worlds 0/1 unaffected
   qpos_before = sim.state.qpos.clone()
@@ -1623,30 +1631,135 @@ def test_checkpoint_snapshot_restore_and_replay():
   assert torch.equal(sim.state.qpos[1], qpos_before[1]), "Selective reset of World 2 must isolate World 1"
 
   # 6. Test restore and replay
-  sim.state.restore(chk)
+  sim.restore(chk)
   for _ in range(45):
     sim.step(1)
 
   assert torch.equal(sim.state.qpos, qpos_target), "Bit-for-bit qpos replay after restore"
   assert torch.equal(sim.state.qvel, qvel_target), "Bit-for-bit qvel replay after restore"
   assert torch.equal(sim.state.qacc, qacc_target), "Bit-for-bit qacc replay after restore"
+  assert torch.equal(sim.state.time, time_target), "Bit-for-bit time replay after restore"
+
+
+def _primitive_overflow_recovery_model():
+  # All compiled coefficients fit float32. World 0's nonzero quartic
+  # displacement creates a Delassus entry beyond float32 range, while the
+  # reference-position neighbor has a finite one-row equality system.
+  xml = """<mujoco>
+  <option timestep="0.002" gravity="0 0 0" integrator="Euler" iterations="2" tolerance="1e-6"/>
+  <worldbody>
+    <geom type="plane" size="1 1 0.1"/>
+    <body pos="0 0 0.049">
+      <joint name="j1" type="slide" axis="0 0 1"/>
+      <geom type="box" size="0.1 0.1 0.05" friction="1 0.1 0.1" mass="1.0"/>
+    </body>
+    <body pos="0 1 0.549">
+      <joint name="j2" type="slide" axis="0 0 1" ref="0.5"/>
+      <geom type="box" size="0.1 0.1 0.05" friction="1 0.1 0.1" mass="1.0"/>
+    </body>
+  </worldbody>
+  <equality>
+    <joint joint1="j1" joint2="j2" polycoef="0.5 0 0 0 1e37"/>
+  </equality>
+  </mujoco>"""
+  return mujoco.MjModel.from_xml_string(xml)
+
+
+def test_primitive_overflow_recovery_fixture_has_isolated_numerical_trigger():
+  model = _primitive_overflow_recovery_model()
+  assert np.all(np.isfinite(np.asarray(model.eq_data, np.float32)))
+  assert 4 * model.eq_data[0, 4] < np.finfo(np.float32).max
+  for qpos, count, overflow in (([0., 0.], 8, True), ([.5, .5], 0, False)):
+    data = mujoco.MjData(model)
+    data.qpos[:] = qpos
+    mujoco.mj_forward(model, data)
+    assert data.ncon == count
+    assert np.all(np.isfinite(data.qacc))
+    mass = np.empty((model.nv, model.nv), dtype=np.float64)
+    mujoco.mj_fullM(model, data, mass)
+    jacobian = np.asarray(data.efc_J).reshape(data.nefc, model.nv)[0]
+    diagonal = float(jacobian @ np.linalg.solve(mass, jacobian))
+    assert (diagonal > float(np.finfo(np.float32).max)) == overflow
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_primitive_contact_failure_isolation_and_recovery():
-  """Failed primitive-contact worlds: sticky failure, rollback, per-world reset recovery.
+  """Numerical overflow rolls back only the failed primitive-contact world.
 
-  Batch has 2 worlds:
-  - World 0: failing primitive-contact world (boxes penetrating plane, conflicting joint
-    equality, tight tolerance, iteration exhaustion -> status 3, state rolled back).
-  - World 1: healthy contact-free world (boxes elevated with equality satisfied ->
-    status 0, steps forward normally).
-  Failed world rolls back state, remains sticky on subsequent steps, and recovers via
-  selective per-world reset while the healthy world's continuous stepping is preserved.
+  The finite compiled quartic coefficient produces an unrepresentable float32
+  Delassus entry in world 0. World 1 stays at the polynomial reference and
+  advances normally. This is a true numerical failure, not iteration-budget
+  exhaustion; finite unconverged iterates have a separate acceptance gate.
   """
   import torch
 
+  m = _primitive_overflow_recovery_model()
+
+  # The compiled joint-2 reference is .5. Its world-0 displacement is -.5,
+  # placing both boxes on the floor and overflowing its equality row system.
+  # World 1 has no contacts, zero polynomial displacement, and a moving joint 1.
+  q0 = np.array([
+      [0.0, 0.0],
+      [0.5, 0.5]
+  ], dtype=np.float32)
+
+  sim = MetalSimulation(m, batch_size=2, qpos=q0, qvel=np.array([[0., 0.], [.1, 0.]], np.float32), profile="integrated_euler_v1")
+
+  # Verify initial contact states: World 0 has 8 contacts (4 per box), World 1 has 0 contacts
+  a0 = sim.assembled_system()
+  mask0 = a0["contact_mask"].cpu().numpy()
+  assert np.sum(mask0[0] > 0.5) == 8, f"World 0 must engage 8 box-plane contacts (4 per box), got {np.sum(mask0[0] > 0.5)}"
+  assert np.sum(mask0[1] > 0.5) == 0, f"World 1 must be contact-free, got {np.sum(mask0[1] > 0.5)}"
+
+  qpos_initial = sim.state.qpos.clone()
+  qvel_initial = sim.state.qvel.clone()
+  time_initial = sim.state.time.clone()
+  sim.step(1)
+
+  # Step 1: World 0 fails (status 2), World 1 succeeds (status 0)
+  status1 = sim.state.status.cpu().numpy()
+  assert status1[0] == 2, f"World 0 must fail with status 2 (invalid numerical row system), got {status1[0]}"
+  assert status1[1] == 0, f"World 1 must succeed with status 0, got {status1[1]}"
+  assert torch.equal(sim.state.qpos[0], qpos_initial[0]), "Failed World 0 must roll back state"
+  assert not torch.equal(sim.state.qpos[1], qpos_initial[1]), "Healthy World 1 must advance state"
+  assert torch.equal(sim.state.qvel[0], qvel_initial[0])
+  assert torch.equal(sim.state.time[0], time_initial[0])
+  qpos_w1_step1 = sim.state.qpos[1].clone()
+
+  # Step 2: Sticky failure on World 0; World 1 advances again
+  sim.step(1)
+  status2 = sim.state.status.cpu().numpy()
+  assert status2[0] == 2, "World 0 failure must remain sticky"
+  assert status2[1] == 0, "World 1 must continue stepping successfully"
+  assert torch.equal(sim.state.qpos[0], qpos_initial[0]), "World 0 state must remain rolled back"
+  assert not torch.equal(sim.state.qpos[1], qpos_w1_step1), "World 1 must advance on step 2"
+
+  assert torch.equal(sim.state.qvel[0], qvel_initial[0])
+  assert torch.equal(sim.state.time[0], time_initial[0])
+
+  # Selective per-world reset of World 0 into the finite reference state
+  admissible_qpos = np.array([[0.5, 0.5]], dtype=np.float32)
+  sim.state.reset(env_ids=[0], qpos=admissible_qpos,
+                  qvel=np.array([[.1, 0.]], np.float32))
+  assert sim.state.status[0].item() == 0, "Reset World 0 must clear status"
+  assert sim.state.status[1].item() == 0, "World 1 status must remain 0"
+  np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), admissible_qpos[0], atol=1e-6)
+
+  # Step 3: Both worlds now succeed with status 0
+  qpos_w1_step2 = sim.state.qpos[1].clone()
+  sim.step(1)
+  status3 = sim.state.status.cpu().numpy()
+  assert status3[0] == 0, f"Recovered World 0 must step successfully, got status {status3[0]}"
+  assert status3[1] == 0, f"Healthy World 1 must step successfully, got status {status3[1]}"
+  assert not torch.equal(sim.state.qpos[0], torch.from_numpy(admissible_qpos[0]).to(sim.state.qpos.device))
+  assert not torch.equal(sim.state.qpos[1], qpos_w1_step2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_primitive_contact_finite_iteration_budget_is_retained():
+  """A finite low-budget solve advances instead of becoming sticky failure."""
   xml = """<mujoco>
   <option timestep="0.002" integrator="Euler" iterations="2" tolerance="1e-6"/>
   <worldbody>
@@ -1664,57 +1777,26 @@ def test_primitive_contact_failure_isolation_and_recovery():
     <joint joint1="j1" joint2="j2" polycoef="0.05 1 0 0 0"/>
   </equality>
   </mujoco>"""
-  m = mujoco.MjModel.from_xml_string(xml)
-
-  # World 0: j1=0, j2=0 (active 8-contact box-plane manifold, equality residual 0.05 -> iteration exhaustion)
-  # World 1: j1=0.5, j2=0.55 (contact-free, equality exactly satisfied j2 - j1 = 0.05 -> convergent status 0)
-  q0 = np.array([
-      [0.0, 0.0],
-      [0.5, 0.55]
-  ], dtype=np.float32)
-
-  sim = MetalSimulation(m, batch_size=2, qpos=q0, profile="integrated_euler_v1")
-
-  # Verify initial contact states: World 0 has 8 contacts (4 per box), World 1 has 0 contacts
-  a0 = sim.assembled_system()
-  mask0 = a0["contact_mask"].cpu().numpy()
-  assert np.sum(mask0[0] > 0.5) == 8, f"World 0 must engage 8 box-plane contacts (4 per box), got {np.sum(mask0[0] > 0.5)}"
-  assert np.sum(mask0[1] > 0.5) == 0, f"World 1 must be contact-free, got {np.sum(mask0[1] > 0.5)}"
-
-  qpos_initial = sim.state.qpos.clone()
+  model = mujoco.MjModel.from_xml_string(xml)
+  model.opt.iterations = 1
+  qpos = np.asarray([[0., 0.], [.55, .5]], dtype=np.float32)
+  sim = MetalSimulation(model, batch_size=2, qpos=qpos,
+                        profile="integrated_euler_v1")
   sim.step(1)
-
-  # Step 1: World 0 fails (status 3), World 1 succeeds (status 0)
-  status1 = sim.state.status.cpu().numpy()
-  assert status1[0] == 3, f"World 0 must fail with status 3 (nonconvergence), got {status1[0]}"
-  assert status1[1] == 0, f"World 1 must succeed with status 0, got {status1[1]}"
-  assert torch.equal(sim.state.qpos[0], qpos_initial[0]), "Failed World 0 must roll back state"
-  assert not torch.equal(sim.state.qpos[1], qpos_initial[1]), "Healthy World 1 must advance state"
-  qpos_w1_step1 = sim.state.qpos[1].clone()
-
-  # Step 2: Sticky failure on World 0; World 1 advances again
-  sim.step(1)
-  status2 = sim.state.status.cpu().numpy()
-  assert status2[0] == 3, "World 0 failure must remain sticky"
-  assert status2[1] == 0, "World 1 must continue stepping successfully"
-  assert torch.equal(sim.state.qpos[0], qpos_initial[0]), "World 0 state must remain rolled back"
-  assert not torch.equal(sim.state.qpos[1], qpos_w1_step1), "World 1 must advance on step 2"
-
-  # Selective per-world reset of World 0 into an admissible convergent state
-  admissible_qpos = np.array([[0.3, 0.35]], dtype=np.float32)
-  sim.state.reset(env_ids=[0], qpos=admissible_qpos)
-  assert sim.state.status[0].item() == 0, "Reset World 0 must clear status"
-  assert sim.state.status[1].item() == 0, "World 1 status must remain 0"
-  np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), admissible_qpos[0], atol=1e-6)
-
-  # Step 3: Both worlds now succeed with status 0
-  qpos_w1_step2 = sim.state.qpos[1].clone()
-  sim.step(1)
-  status3 = sim.state.status.cpu().numpy()
-  assert status3[0] == 0, f"Recovered World 0 must step successfully, got status {status3[0]}"
-  assert status3[1] == 0, f"Healthy World 1 must step successfully, got status {status3[1]}"
-  assert not torch.equal(sim.state.qpos[0], torch.from_numpy(admissible_qpos[0]).to(sim.state.qpos.device))
-  assert not torch.equal(sim.state.qpos[1], qpos_w1_step2)
+  np.testing.assert_array_equal(sim.state.status.cpu().numpy(), [0, 0])
+  diagnostics = sim._last_coupled["solver_diagnostics"].cpu().numpy()
+  assert np.all(np.isfinite(diagnostics[:, 0]))
+  assert np.all(diagnostics[:, 1] <= model.opt.iterations)
+  assert diagnostics[0, 0] > model.opt.tolerance
+  for world in range(2):
+    cpu = mujoco.MjData(model)
+    cpu.qpos[:] = qpos[world]
+    mujoco.mj_step(model, cpu)
+    np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[world], cpu.qpos,
+                               rtol=0, atol=1e-4)
+    np.testing.assert_allclose(sim.state.qvel.cpu().numpy()[world], cpu.qvel,
+                               rtol=0, atol=1e-3)
+    assert sim.state.time.cpu().numpy()[world] > 0
 
 
 @pytest.mark.gpu

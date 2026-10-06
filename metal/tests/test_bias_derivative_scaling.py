@@ -87,3 +87,43 @@ def test_native_analytical_bias_derivative_parity_and_workspace_reuse(kind):
     if pointer is not None:
       assert result.data_ptr() == pointer
     pointer = result.data_ptr()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
+@pytest.mark.parametrize("kind", ["scalar", "mixed"])
+def test_native_analytical_bias_derivative_writes_compiled_coo(kind):
+  import torch
+  from mujoco_metal.model import load_model
+  from mujoco_metal.smooth_metal import MetalSmoothDynamics
+  from mujoco_metal.velocity_derivative import (
+      MetalVelocityDerivativeValues, compile_velocity_derivative_layout)
+
+  model = _model(kind)
+  layout = compile_velocity_derivative_layout(model)
+  program = MetalSmoothDynamics(
+      load_model(model), batch_size=2, velocity_derivative_layout=layout)
+  qpos, qvel, expected = [], [], []
+  for world in range(2):
+    q = model.qpos0.copy()
+    mujoco.mj_integratePos(model, q, np.linspace(-.04, .07, model.nv), 1)
+    v = np.linspace(.1, .7, model.nv) * (world + 1)
+    qpos.append(q)
+    qvel.append(v)
+    expected.append(_reference(model, q, v))
+  tensor = lambda x: torch.tensor(np.asarray(x), dtype=torch.float32,
+                                 device="mps")
+  qp, qv = tensor(qpos), tensor(qvel)
+  dynamics = program.run_device(qp, qv)
+  values = torch.zeros((2, max(layout.edge_count, 1)), dtype=torch.float32,
+                       device="mps")
+  writer = MetalVelocityDerivativeValues(layout, 2, values)
+  result = program.bias_derivative_device(qp, qv, dynamics,
+                                          edge_values=writer.values)
+  torch.mps.synchronize()
+  expected_coo = np.zeros((2, max(layout.edge_count, 1)), dtype=np.float32)
+  expected_coo[:, :layout.edge_count] = np.asarray(expected)[:,
+      layout.edge_rows, layout.edge_cols]
+  np.testing.assert_allclose(result.cpu().numpy(), expected_coo,
+                             atol=5e-4, rtol=3e-4)
+  assert "bias_derivative" not in program._workspace

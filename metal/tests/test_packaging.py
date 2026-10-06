@@ -64,10 +64,11 @@ def test_missing_shader_is_detected(tmp_path):
 def test_manifest_covers_shaders_directory():
   # The build must ship every shader in the directory, not just the ones
   # referenced today: compare the manifest glob against directory contents.
-  # NOTE: only an editable install exists in this environment and no build
-  # backend (setuptools/wheel/build) is installed, so no distributable
-  # wheel can be inspected here; the manifest string is static evidence.
-  pyproject = _package_dir().parent / "pyproject.toml"
+  # This is static source-manifest evidence. A wheel does not install its
+  # build pyproject beside the package; shader existence checks above work
+  # against either source or installed payloads. Distribution qualification
+  # separately compares an actual wheel and an isolated installation.
+  pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
   assert pyproject.is_file(), pyproject
   text = pyproject.read_text()
   assert "shaders/*.metal" in text

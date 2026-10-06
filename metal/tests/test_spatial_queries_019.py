@@ -79,17 +79,8 @@ def _stages(model, seed, device):
   mujoco.mj_rnePostConstraint(model, data)
   def tensor(values):
     return torch.tensor(np.asarray(values).copy()[None], dtype=torch.float32, device=device)
-  poses = {name: tensor(values) for name, values in (
-      ('body_pos', data.xpos), ('body_quat', data.xquat),
-      ('inertial_pos', data.xipos), ('inertial_quat', None),
-      ('geom_pos', data.geom_xpos), ('geom_quat', None),
-      ('site_pos', data.site_xpos), ('site_quat', None),
-      ('joint_anchor', data.xanchor), ('joint_axis', data.xaxis)) if values is not None}
-  for prefix, matrices in (('inertial', data.ximat), ('geom', data.geom_xmat), ('site', data.site_xmat)):
-    quat = np.empty((len(matrices), 4))
-    for i, matrix in enumerate(matrices):
-      mujoco.mju_mat2Quat(quat[i], matrix)
-    poses[prefix+'_quat'] = tensor(quat)
+  from tests.pinned_pose_abi import pinned_pose_abi
+  poses = pinned_pose_abi(data, device)
   dynamics = {name: tensor(value) for name, value in (
       ('cdof', data.cdof), ('cdof_dot', data.cdof_dot), ('cvel', data.cvel),
       ('root_com', data.subtree_com))}
@@ -263,3 +254,147 @@ def test_spatial_queries_execute_on_mps_with_native_smooth_stages():
       public = native_api.mj_objectAcceleration(sim, kind, objid, int(local), qacc=qacc)
       assert public.device.type == 'mps'
       np.testing.assert_allclose(public.cpu().numpy()[0], expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.parametrize('seed', [17, 31])
+def test_subtree_angular_momentum_matrix_matches_pinned_and_independent_momentum(seed):
+  torch = pytest.importorskip('torch')
+  from mujoco_metal.spatial_queries import DeviceSpatialQueries
+  model = _fixture()
+  data, dynamics, qvel, _ = _stages(model, seed, 'cpu')
+  program = DeviceSpatialQueries(model, 1, 'cpu')
+  for body in range(model.nbody):
+    expected = np.empty((3, model.nv))
+    mujoco.mj_angmomMat(model, data, expected, body)
+    actual = program.angmom_matrix(dynamics, body)
+    np.testing.assert_allclose(actual.numpy()[0], expected, atol=3e-6, rtol=3e-5)
+    # Independent physical momentum sum uses CPU object COM velocities, not
+    # either implementation's angular-momentum matrix or Jacobian routine.
+    momentum = np.zeros(3)
+    for child in range(body, model.nbody):
+      if child > body and model.body_parentid[child] < body:
+        break
+      velocity = np.empty(6)
+      mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY,
+                               child, velocity, 0)
+      rotation = data.ximat[child].reshape(3, 3)
+      inertia = rotation @ np.diag(model.body_inertia[child]) @ rotation.T
+      momentum += inertia @ velocity[:3]
+      momentum += np.cross(data.xipos[child]-data.subtree_com[body],
+                           model.body_mass[child]*velocity[3:])
+    np.testing.assert_allclose((actual @ qvel.unsqueeze(-1)).numpy()[0, :, 0],
+                               momentum, atol=3e-6, rtol=3e-5)
+    saved = actual.clone()
+    program.angmom_matrix(dynamics, 0).zero_()
+    assert torch.equal(actual, saved)
+  for bad in (-1, model.nbody):
+    with pytest.raises(ValueError):
+      program.angmom_matrix(dynamics, bad)
+  for bad in (True, 1.0):
+    with pytest.raises(TypeError):
+      program.angmom_matrix(dynamics, bad)
+
+
+def test_fixed_world_angular_momentum_has_zero_width_and_owned_result():
+  torch = pytest.importorskip('torch')
+  from mujoco_metal.spatial_queries import DeviceSpatialQueries
+  model = mujoco.MjModel.from_xml_string(
+      '<mujoco><worldbody><body><geom size=".1"/></body></worldbody></mujoco>')
+  data, dynamics, _, _ = _stages(model, 17, 'cpu')
+  program = DeviceSpatialQueries(model, 1, 'cpu')
+  for body in range(model.nbody):
+    expected = np.empty((3, 0))
+    mujoco.mj_angmomMat(model, data, expected, body)
+    actual = program.angmom_matrix(dynamics, body)
+    assert actual.shape == (1, 3, 0)
+    assert actual.dtype == torch.float32
+
+
+@pytest.mark.parametrize('seed', [17, 31])
+def test_full_state_subtree_motion_matches_pinned_com_momentum_and_velocity(seed):
+  torch = pytest.importorskip('torch')
+  from mujoco_metal.spatial_queries import DeviceSpatialQueries
+  model = _fixture()
+  data, dynamics, qvel, _ = _stages(model, seed, 'cpu')
+  mujoco.mj_subtreeVel(model, data)
+  program = DeviceSpatialQueries(model, 1, 'cpu')
+  result = program.subtree_velocity(dynamics)
+  for name in ('subtree_linvel', 'subtree_angmom'):
+    np.testing.assert_allclose(result[name].numpy()[0], getattr(data, name),
+                               atol=3e-6, rtol=3e-5)
+  for body in range(model.nbody):
+    momentum = (program.angmom_matrix(dynamics, body) @ qvel.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(result['subtree_angmom'][:, body], momentum,
+                               atol=3e-6, rtol=3e-5)
+  saved = {name: tensor.clone() for name, tensor in result.items()}
+  next_result = program.subtree_velocity(dynamics)
+  for name in result:
+    next_result[name].zero_()
+    assert torch.equal(result[name], saved[name])
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='native opt-in')
+@pytest.mark.parametrize('profile', ['integrated_euler_v1', 'integrated_scalable_v1'])
+def test_native_public_angular_momentum_dense_and_component_with_state_changes(profile, monkeypatch):
+  import torch
+  from mujoco_metal.simulation import MetalSimulation
+  from mujoco_metal import native_api as api
+  model = _fixture()
+  worlds = [_stages(model, seed, 'cpu')[0] for seed in (17, 31)]
+  qp = np.stack([data.qpos.copy() for data in worlds]).astype(np.float32)
+  qv = np.stack([data.qvel.copy() for data in worlds]).astype(np.float32)
+  # Oracle starts from the exact float32 device inputs, not their original
+  # binary64 randomizations. All runtime CPU physics is then forbidden.
+  for world, data in enumerate(worlds):
+    data.qpos[:] = qp[world]
+    data.qvel[:] = qv[world]
+    mujoco.mj_forward(model, data)
+  expected = []
+  for data in worlds:
+    mujoco.mj_subtreeVel(model, data)
+  expected_motion = {name: np.stack([getattr(data, name).copy() for data in worlds])
+                     for name in ('subtree_linvel', 'subtree_angmom')}
+  for body in range(model.nbody):
+    rows = []
+    for data in worlds:
+      matrix = np.empty((3, model.nv))
+      mujoco.mj_angmomMat(model, data, matrix, body)
+      rows.append(matrix)
+    expected.append(np.stack(rows))
+  sim = MetalSimulation(model, batch_size=2, qpos=qp, qvel=qv, profile=profile)
+  def forbidden(*args, **kwargs):
+    raise AssertionError('CPU physics/query fallback invoked')
+  for name in ('mj_forward', 'mj_step', 'mj_kinematics', 'mj_comPos',
+               'mj_comVel', 'mj_jac', 'mj_angmomMat', 'mj_subtreeVel'):
+    monkeypatch.setattr(mujoco, name, forbidden)
+  before_qpos = sim.state._qpos.clone()
+  before_qvel = sim.state._qvel.clone()
+  retained = []
+  for body in range(model.nbody):
+    actual = api.mj_angmomMat(sim, body)
+    assert actual.device.type == 'mps'
+    np.testing.assert_allclose(actual.cpu().numpy(), expected[body],
+                               atol=8e-6, rtol=5e-5)
+    retained.append((actual, actual.clone()))
+  assert torch.equal(sim.state._qpos, before_qpos)
+  assert torch.equal(sim.state._qvel, before_qvel)
+  motion = api.mj_subtreeVel(sim)
+  retained_motion = {name: tensor.clone() for name, tensor in motion.items()}
+  for name, tensor in motion.items():
+    assert tensor.device.type == 'mps'
+    np.testing.assert_allclose(tensor.cpu().numpy(), expected_motion[name],
+                               atol=8e-6, rtol=5e-5)
+  sim.state._qpos[:, 0].add_(.13)
+  shifted = api.mj_angmomMat(sim, 1)
+  # Translating this free root translates its whole subtree. World subtree
+  # 0 also contains a separate fixed body, so its COM/matrix can change.
+  np.testing.assert_allclose(shifted.cpu().numpy(), expected[1],
+                             atol=8e-6, rtol=5e-5)
+  for actual, saved in retained:
+    assert torch.equal(actual, saved)
+  shifted_motion = api.mj_subtreeVel(sim)
+  for name, tensor in motion.items():
+    assert torch.equal(tensor, retained_motion[name])
+    np.testing.assert_allclose(shifted_motion[name][:, 1].cpu().numpy(),
+                               expected_motion[name][:, 1], atol=8e-6, rtol=5e-5)

@@ -99,3 +99,31 @@ def test_real_torch_mutation_and_inference_tensor_counters():
   record = stages.begin(generation=0, qpos=untracked, position={'poses': object()})
   with pytest.raises(ValueError, match='mutation counter'):
     stages.consume(record, Stage.POS, generation=0)
+
+
+def test_internal_masked_reset_marks_only_selected_record_rows():
+  torch = pytest.importorskip('torch')
+  class State:
+    batch_size = 3
+    _device = torch.device('cpu')
+    _torch = torch
+    _row_reset_epoch = torch.zeros(3, dtype=torch.int32)
+  class Owner:
+    _state = State()
+  owner = Owner()
+  stages = ForwardStageCoordinator(owner)
+  record = stages.begin(generation=3, qpos=torch.zeros(3, 1),
+                        position={'poses': object()})
+  assert record.row_valid.tolist() == [True, True, True]
+  owner._state._row_reset_epoch[1] += 1
+  stages.note_masked_reset(torch.tensor([False, True, False]),
+                           owner._state._row_reset_epoch)
+  # Internal reset preserves the global stage token and healthy rows, while
+  # the reset row is explicitly unavailable to cached-stage consumers.
+  assert stages.validate(record, generation=3) is record
+  assert record.row_valid.tolist() == [True, False, True]
+  assert record.generation == 3 and record.epoch == stages.epoch
+  stage = stages.consume(record, Stage.POS, generation=3)
+  assert stage["row_valid"] is record.row_valid
+  status = stages.invalid_row_status(torch.zeros(3, dtype=torch.int32), record)
+  assert status.tolist() == [0, 3, 0]

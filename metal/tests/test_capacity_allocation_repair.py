@@ -38,10 +38,23 @@ def test_workspace_mirror_is_byte_exact_cpu():
   assert by_name["contact_frame"] == 2 * 2 * 12 * 4
   assert by_name["contact_jacobian"] == 2 * 2 * 6 * 1 * 4
   assert by_name["pair_mask"] == 2 * 1 * 4
-  assert by_name["workspace_J"] == 2 * 3 * 1 * 4
-  assert by_name["workspace_debug"] == 2 * (9 + 21 + 1) * 4
+  # Dense records keep the typed 12-word row-layout header ahead of values.
+  assert by_name["workspace_J"] == 2 * (12 + 3 * 1) * 4
+  assert by_name["position_cache_J"] == by_name["workspace_J"]
+  assert by_name["position_context_zero"] == 2 * 3 * 4
+  # PGS core plus qacc input/output, canonical labels, union-find and tree
+  # masks, midpoint body eligibility, and the independent warmstart tail.
+  # Dense mass factor and vectors are dynamic device scratch here; sparse
+  # component mode omits them and is checked against its separate estimate.
+  # This is a one-DOF, three-row PGS fixture.  The tail includes the dynamic
+  # row/cone metadata (12 words per row), the retained J-transpose solve
+  # block (nv*nr), island/equality workspaces, and the dense factor backing.
+  # The independent high/low tail adds 8*nv + 3*nr words (17 here),
+  # including the retained aref residual row. Keep this expected
+  # arithmetic independent of the estimator helper.
+  assert by_name["workspace_debug"] == 2 * (9 + 21 + 107 + 17) * 4
   assert by_name["out_force"] == 2 * 1 * 4
-  assert by_name["out_acc"] == 2 * 1 * 4
+  assert by_name["out_acc"] == 2 * 2 * 1 * 4
   assert by_name["out_status"] == 2 * 4
   assert by_name["out_diagnostics"] == 2 * 10 * 4
   assert by_name["out_contact_force"] == 2 * 2 * 11 * 4
@@ -75,10 +88,25 @@ def test_static_heavy_model_checks_real_spatial_matrix_buffer_before_allocation(
   # legal arithmetic shape remains below int32; the next batch crosses the
   # actual crb[batch,nbody,6,6] backing allocation.
   boundary_batch = (SIGNED_I32_ELEMENT_LIMIT // (model.nbody * 36))
-  below = estimate_capacity(model, boundary_batch, 0, 0, 0)
-  assert dict(below.memory_breakdown)["smooth.crb"] <= SIGNED_I32_ELEMENT_LIMIT * 4
+  from mujoco_metal.capacity import _runtime_buffer_sizes
+  # The consolidated FK arena is now larger than CRB. Exercise the actual
+  # CRB element shape independently, then check the earliest physical backing
+  # in the complete preflight rather than pretending CRB is still first.
+  below = dict(_runtime_buffer_sizes(model, boundary_batch))
+  assert below["smooth.crb"] == boundary_batch * model.nbody * 36
+  _check_i32_elements("smooth.crb", below["smooth.crb"])
+  above = dict(_runtime_buffer_sizes(model, boundary_batch + 1))
   with pytest.raises(CapacityOverflow, match="smooth.crb.*signed 32-bit"):
-    estimate_capacity(model, boundary_batch + 1, 0, 0, 0)
+    _check_i32_elements("smooth.crb", above["smooth.crb"])
+  # Body/inertial (2 * 3 * (3+4)) and geom (3 * (3+4+9))
+  # outputs share one arena; absent site/joint fields keep eight sentinel words.
+  arena_stride = model.nbody * 42 + model.ngeom * 48
+  arena_batch = (SIGNED_I32_ELEMENT_LIMIT - 8) // arena_stride
+  complete = estimate_capacity(model, arena_batch, 0, 0, 0)
+  assert dict(complete.memory_breakdown)["fk.pose_output_arena"] == (
+      arena_batch * arena_stride + 8) * 4
+  with pytest.raises(CapacityOverflow, match="fk.pose_output_arena.*signed 32-bit"):
+    estimate_capacity(model, arena_batch + 1, 0, 0, 0)
   _check_i32_elements("exact-boundary", SIGNED_I32_ELEMENT_LIMIT)
   with pytest.raises(CapacityOverflow, match="exact-boundary"):
     _check_i32_elements("exact-boundary", SIGNED_I32_ELEMENT_LIMIT + 1)
@@ -94,7 +122,7 @@ def test_simulation_constructor_checks_body_spatial_stride_before_device_init():
   boundary_batch = SIGNED_I32_ELEMENT_LIMIT // (model.nbody * 36)
   # This exercises the constructor's early guard. Without it the call would
   # proceed into MPS initialization rather than rejecting the invalid shape.
-  with pytest.raises(CapacityOverflow, match="smooth.crb.*signed 32-bit"):
+  with pytest.raises(CapacityOverflow, match="fk.pose_output_arena.*signed 32-bit"):
     MetalSimulation(model, batch_size=boundary_batch + 1,
                     profile="contact_free_euler_v1")
 

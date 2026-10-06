@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from mujoco_metal.sensors import lower_sensors, sensor_workspace_sizes
+from mujoco_metal.sensor_sleep import sensor_sleep_workspace_sizes
 
 
 def _large_model():
@@ -34,10 +35,33 @@ def test_lowering_above_old_body_and_dof_caps_and_workspace_overflow():
   descriptor = lower_sensors(model)
   assert descriptor.nbody == 73 and descriptor.nv == 72
   sizes = sensor_workspace_sizes(descriptor, 2)
-  assert sizes["subtree_runtime"] == 4+2*73*32
+  assert sizes["subtree_runtime"] == 4 + 2*73*32 + 2*descriptor.nsensor
   assert sizes["com_scratch"] == 2*73*12
   with pytest.raises(ValueError, match="workspace.*int32"):
     sensor_workspace_sizes(replace(descriptor, nbody=1 << 30), 2)
+
+
+def test_sensor_sleep_inventory_exact_shapes_and_preallocation_guard(monkeypatch):
+  import builtins
+  model = _large_model()
+  sizes = sensor_sleep_workspace_sizes(model, 3)
+  assert sizes == {
+      "sensor_sleep.treeids": model.nsensor * 4,
+      "sensor_sleep.counts": model.nsensor * 2,
+      "sensor_sleep.always": model.nsensor,
+      "sensor_sleep.sensor_refs": model.nsensor * 2,
+      "sensor_sleep.output": 3 * model.nsensor,
+      "sensor_sleep.dims": 3,
+  }
+  original_import = builtins.__import__
+  def guarded_import(name, *args, **kwargs):
+    if name == "torch":
+      raise AssertionError("torch imported before sensor-sleep admission")
+    return original_import(name, *args, **kwargs)
+  monkeypatch.setattr(builtins, "__import__", guarded_import)
+  from mujoco_metal.sensor_sleep import SensorSleepPolicy
+  with pytest.raises(ValueError, match="batch_size exceeds.*int32"):
+    SensorSleepPolicy(model, 1 << 31)
 
 
 @pytest.mark.gpu
@@ -47,6 +71,10 @@ def test_native_sensor_workspaces_above_old_caps_match_pinned_and_reuse():
   from mujoco_metal.sensors import SensorProgram
   model = _large_model()
   program = SensorProgram(model, 2)
+  assert not program._sp_ready  # state/RNE sensors do not need spatial kernels
+  assert program._sensor_awake_offset == 4 + 2*model.nbody*32
+  assert program._s_subtree_runtime.numel() == (
+      program._sensor_awake_offset + 2*model.nsensor)
   scratch_ptr = program._s_subtree_runtime.data_ptr()
   com_ptr = program._rne_com_scratch.data_ptr()
   for replay in range(2):
@@ -62,7 +90,8 @@ def test_native_sensor_workspaces_above_old_caps_match_pinned_and_reuse():
       q.append(data.qpos.copy()); v.append(data.qvel.copy())
       acc.append(data.qacc.copy()); expected.append(data.sensordata.copy())
       arrays = dict(body_pos=data.xpos, body_quat=data.xquat,
-          inertial_pos=data.xipos, inertial_quat=data.xiquat,
+          inertial_pos=data.xipos, inertial_quat=np.array([
+              _mat_quat(mat) for mat in data.ximat]),
           site_pos=data.site_xpos, site_quat=np.array([
               _mat_quat(mat) for mat in data.site_xmat]),
           geom_pos=data.geom_xpos, geom_quat=np.array([

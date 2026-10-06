@@ -9,6 +9,7 @@ batched heterogeneous worlds with an inactive world 0, immutable-input
 sentinels, and the restored pinball body FORCE/TORQUE sensors.
 """
 
+import ast
 import os
 import re
 from pathlib import Path
@@ -33,6 +34,20 @@ def _kernel_buffers(path, name):
   return len(bufs)
 
 
+def _python_dispatch_arities(method, attr):
+  """Return actual positional argument counts for a SensorProgram dispatch."""
+  source = (SHADERS.parent / "sensors.py").read_text()
+  tree = ast.parse(source)
+  owner = next(node for node in ast.walk(tree)
+               if isinstance(node, ast.ClassDef) and node.name == "SensorProgram")
+  function = next(node for node in owner.body
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and node.name == method)
+  return [len(node.args) for node in ast.walk(function)
+          if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+          and node.func.attr == attr]
+
+
 def _cpu_frame(model, qpos, qvel, time=0.0, ctrl=None, xfrc=None):
   d = mujoco.MjData(model)
   d.qpos[:] = qpos
@@ -48,12 +63,45 @@ def _cpu_frame(model, qpos, qvel, time=0.0, ctrl=None, xfrc=None):
 
 
 def test_sensor_kernel_arity_matches_python_calls_cpu():
-  # Static contract: every sensor kernel's declared buffers are contiguous
-  # from zero (dispatcher displacement tripwire; see R01).
-  assert _kernel_buffers("sensors_rne.metal", "assemble_cfrc_ext") == 24
-  assert _kernel_buffers("sensors_rne.metal", "rne_post") == 21
-  assert _kernel_buffers("sensors_rne.metal", "evaluate_acc_sensors") == 31
-  assert _kernel_buffers("sensors.metal", "evaluate_state_sensors") == 31
+  # Compare declared contiguous Metal slots to executable dispatcher arity;
+  # do not repeat buffer counts as independent constants.
+  contracts = (
+      ("sensors_rne.metal", "assemble_cfrc_ext", "run_acc_device",
+       "_rne_assemble"),
+      ("sensors_rne.metal", "rne_post", "run_acc_device", "_rne_post"),
+      ("sensors_rne.metal", "evaluate_acc_sensors", "run_acc_device",
+       "_rne_acc"),
+      ("sensors.metal", "evaluate_state_sensors", "run_state_device",
+       "_s_state_kernel"),
+  )
+  for shader, kernel, method, attr in contracts:
+    declared = _kernel_buffers(shader, kernel)
+    calls = _python_dispatch_arities(method, attr)
+    assert calls == [declared], (kernel, calls, declared)
+
+
+def test_rne_product_residual_pair_is_preserved_behind_world_guards_cpu():
+  source = (SHADERS / "sensors_rne.metal").read_text()
+  for kernel, mask in (("assemble_cfrc_ext", "dims[8+int(world)] == 0"),
+                       ("rne_post", "dims[5+int(world)] == 0")):
+    start = source.index(f"kernel void {kernel}(")
+    end = source.find("\nkernel void ", start + 1)
+    body = source[start:end if end >= 0 else len(source)]
+    assert mask in body
+    assert body.index("if (world>=batch) return;") < body.index(mask)
+    first_input = ("uint b3=world*nbody*3" if kernel == "assemble_cfrc_ext"
+                   else "uint vb=world*nv")
+    assert body.index(mask) < body.index(first_input)
+  rne_start = source.index("kernel void rne_post(")
+  acc_start = source.index("kernel void evaluate_acc_sensors(", rne_start)
+  rne = source[rne_start:acc_start]
+  assert "sensor_dd_cross_motion" in rne
+  assert "sensor_dd_axpy3(ca_pair" in rne
+  assert "sensor_dd_residual(ca_pair[0],ca.x)" in rne
+  assert "sensor_dd_residual(cl_pair[1],cl.y)" in rne
+  acc = source[acc_start:]
+  assert "if (dims[14+int(world)] == 0) return;" in acc
+  assert "stage_mask[1+batch*max(nsensor,1u)+world] == 0" in acc
 
 
 @pytest.mark.gpu
@@ -75,7 +123,11 @@ def test_assemble_dispatch_arity_and_contiguity_gpu():
 
   import torch
   orig = {}
-  for attr, expect in (("_rne_assemble", 24), ("_rne_post", 21), ("_rne_acc", 31)):
+  contracts = (("_rne_assemble", "assemble_cfrc_ext"),
+               ("_rne_post", "rne_post"),
+               ("_rne_acc", "evaluate_acc_sensors"))
+  for attr, _kernel in contracts:
+    expect = _kernel_buffers("sensors_rne.metal", _kernel)
     orig[attr] = getattr(sim._sensors, attr)
 
   def _make(attr, expect, kernel):
@@ -90,8 +142,8 @@ def test_assemble_dispatch_arity_and_contiguity_gpu():
     wrap.expect = expect
     return wrap
 
-  wrappers = {a: _make(a, e, orig[a]) for a, e in
-              (("_rne_assemble", 24), ("_rne_post", 21), ("_rne_acc", 31))}
+  wrappers = {a: _make(a, _kernel_buffers("sensors_rne.metal", kernel), orig[a])
+              for a, kernel in contracts}
   for a, w in wrappers.items():
     setattr(sim._sensors, a, w)
   sim.sensor_values()

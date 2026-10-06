@@ -25,6 +25,16 @@ XML_KEYS = """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
 <keyframe><key name="k0" qpos="0 0 0.5 1 0 0 0" mpos="0.2 0 1.1" mquat="1 0 0 0" time="0.5"/></keyframe>
 </mujoco>"""
 
+XML_SLEEP_MUTATIONS = """<mujoco>
+<option timestep="0.002" gravity="0 0 0"><flag sleep="enable"/></option>
+<worldbody>
+  <body name="mover" mocap="true"><geom name="mover_geom" size="0.05" contype="0" conaffinity="0"/></body>
+  <body name="a" pos="1 0 0" sleep="allowed"><freejoint/><geom name="ga" size="0.08" mass="0.5" contype="0" conaffinity="0"/></body>
+  <body name="b" pos="3 0 0" sleep="allowed"><freejoint/><geom name="gb" size="0.08" mass="0.5" contype="0" conaffinity="0"/></body>
+</worldbody>
+<equality><weld name="ab" body1="a" body2="b" active="false"/></equality>
+</mujoco>"""
+
 
 def _profile(name="integrated_euler_v1"):
   from mujoco_metal.stepping import validate_stepping_profile
@@ -90,7 +100,7 @@ def test_mocap_reset_snapshot_restore_cpu():
   st = DeviceState(m, profile, 2, device="cpu")
   st.set_mocap(np.array([[0.4, 0, 1.0]]), np.array([[1., 0, 0, 0]]), env_ids=[0])
   snap = st.snapshot()
-  assert snap.schema_version == 3 and snap.nmocap == 1
+  assert snap.schema_version == 6 and snap.nmocap == 1
   st.set_mocap(np.array([[0.9, 0, 1.2]]), np.array([[1., 0, 0, 0]]))
   st.restore(snap)
   np.testing.assert_allclose(st.mocap_pos.numpy()[0, 0], [0.4, 0, 1.0], atol=1e-6)
@@ -114,6 +124,38 @@ def test_mocap_reset_snapshot_restore_cpu():
   np.testing.assert_allclose(st.mocap_pos.numpy()[1, 0], [0.7, 0, 1.0], atol=1e-6)
   with pytest.raises(ValueError):
     st.copy_environment(0, 5)
+
+
+def test_device_state_mutation_hooks_preserve_selected_environment_identity():
+  pytest.importorskip("torch")
+  from mujoco_metal.device_state import DeviceState
+  m, profile = _profile()
+  # Exercise sparse selected-row notifications with a batch much larger than
+  # the two-world native lifecycle fixture.  This is a CPU ownership test; the
+  # separate opt-in MPS test below qualifies the scheduler/FK effects.
+  batch = 257
+  st = DeviceState(m, profile, batch, device="cpu")
+  seen = []
+  st._on_mocap_change = lambda env_ids=None: seen.append(("mocap", tuple(env_ids)))
+  st._on_eq_active_change = lambda env_ids=None: seen.append(("eq", tuple(env_ids)))
+  st._on_environment_copy = lambda src, dst: seen.append(("copy", src, dst))
+  st._on_reset = lambda env_ids=None: seen.append(("reset", tuple(env_ids)))
+  st._on_restore = lambda snap, env_ids=None: seen.append(("restore", None if env_ids is None else tuple(env_ids)))
+
+  snap = st.snapshot()
+  st.set_mocap(np.array([[0.2, 0, 1]]), np.array([[1., 0, 0, 0]]), env_ids=[256])
+  st.set_equality_active(np.array([0], dtype=np.int32), env_ids=[128])
+  st.copy_environment(128, 256)
+  st.reset(env_ids=[127, 256])
+  st.restore(snap, env_ids=[0, 256])
+
+  assert seen == [
+      ("mocap", (256,)),
+      ("eq", (128,)),
+      ("copy", 128, 256),
+      ("reset", (127, 256)),
+      ("restore", (0, 256)),
+  ]
 
 
 def test_geom_contact_update_lifecycle_cpu():
@@ -206,7 +248,7 @@ def test_mocap_keyframe_copy_snapshot_gpu():
   # Unselected world untouched by the keyframe.
   assert abs(float(sim.state.time.cpu().numpy()[1]) - 0.006) < 1e-3
   snap = sim.state.snapshot()
-  assert snap.schema_version == 3
+  assert snap.schema_version == 6
   sim.set_mocap(np.array([[0.9, 0, 1.3]]), np.array([[1., 0, 0, 0]]), env_ids=[0])
   sim.state.restore(snap)
   np.testing.assert_allclose(sim.state.mocap_pos.cpu().numpy()[0, 0], [0.2, 0, 1.1], atol=1e-6)
@@ -216,6 +258,64 @@ def test_mocap_keyframe_copy_snapshot_gpu():
     sim.reset_to_keyframe(7)
   with pytest.raises(ValueError):
     sim.set_mocap(np.array([[0, 0, 1]]), np.array([[0, 0, 0, 0]]))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_sleep_schedule_state_mutation_routes_are_selected_and_replayable_gpu():
+  import torch
+  from mujoco_metal import MetalSimulation
+  from mujoco_metal.lifecycle import ModelLifecycle
+  m = mujoco.MjModel.from_xml_string(XML_SLEEP_MUTATIONS)
+  sim = MetalSimulation(m, batch_size=2, profile="integrated_scalable_v1")
+  scheduler = sim._sleep_schedule
+  assert scheduler is not None
+  scheduler.tree_state.copy_(torch.tensor([[-5, 1], [-7, 1]], dtype=torch.int32, device="mps"))
+  scheduler.tree_awake.copy_((scheduler.tree_state < 0).to(dtype=torch.int32))
+  fk = sim._smooth._fk
+  fk.run_device(sim.state._qpos, sim.state._mpos, sim.state._mquat,
+                tree_awake=torch.ones_like(scheduler.tree_awake))
+  cache_valid = fk._workspace["outputs"]["cache_valid"]
+  np.testing.assert_array_equal(cache_valid.cpu().numpy(), [1, 1])
+
+  # A moving mocap body is a static-tree participant in pinned wake logic:
+  # invalidate selected FK only, leaving the dynamic sleep cycles unchanged.
+  sim.set_mocap(np.array([[0.5, 0, 1.0]], dtype=np.float32),
+                np.array([[1, 0, 0, 0]], dtype=np.float32), env_ids=[1])
+  np.testing.assert_array_equal(cache_valid.cpu().numpy(), [1, 0])
+  np.testing.assert_array_equal(scheduler.tree_state.cpu().numpy(), [[-5, 1], [-7, 1]])
+
+  # Equality activation is consumed by the next same-position wake sweep;
+  # only world 1's first sleeping equality tree wakes fully.
+  sim.state.set_equality_active(np.array([1], dtype=np.int32), env_ids=[1])
+  sim._prepare_sleep_schedule(sim.state._qpos, sim.state._qvel)
+  np.testing.assert_array_equal(scheduler.tree_state.cpu().numpy(), [[-5, 1], [-7, -11]])
+
+  saved = sim.snapshot()
+  scheduler.tree_state.fill_(-11)
+  sim.restore(saved)
+  np.testing.assert_array_equal(scheduler.tree_state.cpu().numpy(), [[-5, 1], [-7, -11]])
+  np.testing.assert_array_equal(cache_valid.cpu().numpy(), [1, 1])
+
+  # Restore followed by a selected setter invalidates only that row and does
+  # not wake its dynamic trees; a direct DeviceState row copy copies sleep.
+  sim.state.set_mocap(np.array([[0.2, 0, 1.0]], dtype=np.float32),
+                      np.array([[1, 0, 0, 0]], dtype=np.float32), env_ids=[0])
+  np.testing.assert_array_equal(cache_valid.cpu().numpy(), [0, 1])
+  np.testing.assert_array_equal(scheduler.tree_state.cpu().numpy(), [[-5, 1], [-7, -11]])
+  sim.state.copy_environment(1, 0)
+  np.testing.assert_array_equal(scheduler.tree_state.cpu().numpy(), [[-7, -11], [-7, -11]])
+  sim.state.reset(env_ids=[1])
+  np.testing.assert_array_equal(scheduler.tree_state.cpu().numpy()[0], [-7, -11])
+  np.testing.assert_array_equal(scheduler.tree_awake.cpu().numpy()[1], [1, 1])
+
+  # Rebuilt model constants have a new contact/equality graph, so lifecycle
+  # adoption starts with all trees awake for the first current-position pass.
+  life = ModelLifecycle(m)
+  geom = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "ga")
+  life.update_geom_contact([geom], friction=np.array([[0.6, 0.1, 0.01]]))
+  sim.apply_lifecycle(life)
+  np.testing.assert_array_equal(sim._sleep_schedule.tree_awake.cpu().numpy(), [[1, 1], [1, 1]])
 
 
 XML_KEYCTRL = """<mujoco><option timestep="0.002" gravity="0 0 -9.81"/>

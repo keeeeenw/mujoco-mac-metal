@@ -7,6 +7,7 @@ from mujoco_metal.active_contact_links import (
     active_contact_tree_links_cpu,
     equality_tree_links,
     equality_tree_ids,
+    equality_wake_plan,
     pair_tree_ids,
 )
 
@@ -146,8 +147,47 @@ def test_flex_equality_expands_all_dynamic_tree_members_as_one_star():
 
 def test_invalid_slot_partition_rejected():
   with pytest.raises(ValueError, match="partition all logical slots"):
-    active_contact_tree_links_cpu(
-        np.zeros((1, 2), dtype=np.int32), [0, 1], [[0, 1]])
+        active_contact_tree_links_cpu(
+            np.zeros((1, 2), dtype=np.int32), [0, 1], [[0, 1]])
+
+
+def test_equality_wake_plan_keeps_model_order_and_flex_body_order():
+  mujoco = pytest.importorskip("mujoco")
+
+  class Model:
+    neq = 4
+    nflex = 1
+    body_treeid = np.array([-1, 2, 0, 1], dtype=np.int32)
+    eq_type = np.array([
+        mujoco.mjtEq.mjEQ_CONNECT,
+        mujoco.mjtEq.mjEQ_FLEX,
+        mujoco.mjtEq.mjEQ_TENDON,
+        mujoco.mjtEq.mjEQ_JOINT,
+    ], dtype=np.int32)
+    eq_objtype = np.array([
+        mujoco.mjtObj.mjOBJ_BODY,
+        mujoco.mjtObj.mjOBJ_FLEX,
+        mujoco.mjtObj.mjOBJ_TENDON,
+        mujoco.mjtObj.mjOBJ_JOINT,
+    ], dtype=np.int32)
+    eq_obj1id = np.array([1, 0, 0, 0], dtype=np.int32)
+    eq_obj2id = np.array([2, -1, -1, 1], dtype=np.int32)
+    site_bodyid = np.zeros((0,), dtype=np.int32)
+    jnt_bodyid = np.array([2, 3], dtype=np.int32)
+    flex_interp = np.array([0], dtype=np.int32)
+    flex_vertadr = np.array([0], dtype=np.int32)
+    flex_vertnum = np.array([3], dtype=np.int32)
+    flex_vertbodyid = np.array([1, 2, 3], dtype=np.int32)
+    flex_nodeadr = np.array([0], dtype=np.int32)
+    flex_nodenum = np.array([0], dtype=np.int32)
+    flex_nodebodyid = np.zeros((0,), dtype=np.int32)
+
+  plan = equality_wake_plan(Model())
+  np.testing.assert_array_equal(plan["eq_kinds"], [1, 2, 0, 1])
+  np.testing.assert_array_equal(plan["pair_trees"], [[2, 0], [-1, -1], [-1, -1], [0, 1]])
+  np.testing.assert_array_equal(plan["flex_offsets"], [0, 0, 3, 3, 3])
+  np.testing.assert_array_equal(plan["flex_tree_ids"], [2, 0, 1])
+  np.testing.assert_array_equal(plan["unsupported_tendon_eq_ids"], [2])
 
 
 def test_pair_tree_ids_follow_compiled_geom_body_and_tree_maps():
@@ -179,3 +219,28 @@ def test_mps_link_map_native_batch_local():
       [[[0, 1], [-1, -1], [2, 3]],
        [[-1, -1], [1, 2], [-1, -1]]])
   np.testing.assert_array_equal(overflow.cpu().numpy(), [0, 0])
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(__import__("os").getenv("MUJOCO_METAL_RUN_GPU") != "1",
+                    reason="opt-in GPU")
+def test_mps_contact_only_map_does_not_fold_equalities_into_contact_edges():
+  torch = pytest.importorskip("torch")
+  if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
+    pytest.skip("requires native MPS shader execution")
+  from mujoco_metal.active_contact_links import ActiveContactLinkWorkspace
+  from mujoco_metal.row_compaction import compact_flags
+  flags = torch.tensor([[1]], dtype=torch.float32, device="mps")
+  slots = compact_flags(flags, capacity=1)
+  workspace = ActiveContactLinkWorkspace(
+      1, [0, 1], [[0, 1]], capacity=2,
+      equality_trees=[[2, 3]], equality_activity_ids=[0],
+      equality_active0=[1])
+  contacts, contact_overflow = workspace.run_contacts(slots)
+  torch.mps.synchronize()
+  np.testing.assert_array_equal(contacts.cpu().numpy(), [[[0, 1], [-1, -1]]])
+  np.testing.assert_array_equal(contact_overflow.cpu().numpy(), [0])
+  combined, combined_overflow = workspace.run(slots)
+  torch.mps.synchronize()
+  np.testing.assert_array_equal(combined.cpu().numpy(), [[[0, 1], [2, 3]]])
+  np.testing.assert_array_equal(combined_overflow.cpu().numpy(), [0])

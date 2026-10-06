@@ -29,6 +29,59 @@ def _filter_model(disabled=True):
   return m
 
 
+def test_set_warmstart_broadcasts_cpu_tensor_through_public_method(monkeypatch):
+  """The public warmstart setter recognizes device tensors via state Torch."""
+  torch = pytest.importorskip("torch")
+  from types import SimpleNamespace
+  from mujoco_metal import native_api
+  from mujoco_metal.simulation import MetalSimulation
+
+  model = mujoco.MjModel.from_xml_string(
+      "<mujoco><worldbody><body><joint type='hinge'/>"
+      "<geom type='sphere' size='.1' mass='1'/></body></worldbody></mujoco>")
+  state = SimpleNamespace(generation=17, _torch=torch)
+  sim = SimpleNamespace(batch_size=3, _mjmodel=model, _state=state)
+  sim.set_warmstart = MetalSimulation.set_warmstart.__get__(sim)
+  calls = []
+
+  def capture_set_state(target, values, env_ids=None):
+    calls.append((target, values, env_ids))
+    target._state.generation += 1
+
+  monkeypatch.setattr(native_api, "mj_setState", capture_set_state)
+  source = torch.tensor([0.25], dtype=torch.float32)
+  generation = sim.set_warmstart(source, env_ids=[0, 2])
+
+  assert generation == 18
+  assert calls[0][0] is sim
+  assert calls[0][2] == [0, 2]
+  staged = calls[0][1]["warmstart"]
+  assert tuple(staged.shape) == (2, model.nv)
+  assert staged.dtype == torch.float32
+  torch.testing.assert_close(staged, torch.tensor([[0.25], [0.25]]))
+
+
+@pytest.mark.parametrize("env_ids", [[], np.array([], dtype=np.int64)])
+def test_clear_warmstart_rejects_empty_selection_before_state_update(
+    monkeypatch, env_ids):
+  """Both empty Python and typed selections preserve the public contract."""
+  from types import SimpleNamespace
+  from mujoco_metal import native_api
+  from mujoco_metal.simulation import MetalSimulation
+
+  sim = SimpleNamespace(batch_size=3, _mjmodel=SimpleNamespace(nv=1),
+                        _state=SimpleNamespace(generation=17))
+  sim.set_warmstart = MetalSimulation.set_warmstart.__get__(sim)
+  sim.clear_warmstart = MetalSimulation.clear_warmstart.__get__(sim)
+  calls = []
+  monkeypatch.setattr(native_api, "mj_setState",
+                      lambda *args, **kwargs: calls.append((args, kwargs)))
+  with pytest.raises(ValueError, match="at least one"):
+    sim.clear_warmstart(env_ids=env_ids)
+  assert calls == []
+  assert sim._state.generation == 17
+
+
 def test_disabled_actuation_preserves_activation_cpu():
   model = _filter_model(disabled=True)
   assert model.na == 1
@@ -127,8 +180,8 @@ def test_failed_world_rolls_back_sensors_warmstarts_and_state_gpu(fail_stage):
   # Inject failure into world 1 specifically at the selected pipeline stage
   if fail_stage == "force":
     orig_solver = sim._solver.run_device
-    def fail_solver(mass, rhs):
-      acc, st = orig_solver(mass, rhs)
+    def fail_solver(*args, **kwargs):
+      acc, st = orig_solver(*args, **kwargs)
       st = st.clone()
       st[1] = 3
       return acc, st
@@ -457,6 +510,11 @@ def test_retained_step_and_zero_solves_on_assembled_system_gpu():
   assert acc["generation"] == sim.state.generation
   assert int(acc["status"].cpu().numpy()[0]) == 0
   np.testing.assert_array_equal(acc["acceleration"].cpu().numpy(), sim.state.qacc.cpu().numpy())
+  retained_time = sim._accepted_step["input_time"].clone()
+  acc["input_time"].fill_(12345.0)
+  np.testing.assert_array_equal(
+      sim._accepted_step["input_time"].cpu().numpy(),
+      retained_time.cpu().numpy())
 
   # Calling assembled_system() immediately after step must return accepted-step without solve
   dispatches_before = sim._coupled_solve_dispatches
@@ -546,23 +604,30 @@ def test_warmstart_invalidation_forces_fresh_assembly_and_caller_immutability_gp
   asm_cached = sim.assembled_system()
   assert sim._coupled_solve_dispatches == pre_disp
 
-  # 2. clear_warmstart must invalidate forward assembly cache
+  # Returned nested buffers are detached from the retained history.
+  before_time = sim._accepted_step["input_time"].clone()
+  before_lambda = sim._accepted_step["system"]["lambda"].clone()
+  acc["input_time"].fill_(12345.0)
+  acc["system"]["lambda"][0, 0] = 9999.0
+  current = sim.accepted_step
+  assert current is not None
+  np.testing.assert_array_equal(current["input_time"].cpu().numpy(),
+                                before_time.cpu().numpy())
+  np.testing.assert_array_equal(current["system"]["lambda"].cpu().numpy(),
+                                before_lambda.cpu().numpy())
+
+  # 2. clear_warmstart must invalidate forward assembly cache and current record.
   sim.clear_warmstart()
+  assert sim.accepted_step is None
   asm_fresh1 = sim.assembled_system()
   assert sim._coupled_solve_dispatches == pre_disp + 1, "clear_warmstart must force fresh solve"
 
-  # 3. set_warmstart must invalidate forward assembly cache
-  nr = int(sim._coupled_constraints.descriptor.nr)
-  sim.set_warmstart(np.zeros((2, nr), dtype=np.float32))
+  # 3. set_warmstart must invalidate forward assembly cache and current record.
+  nv = int(model.nv)
+  sim.set_warmstart(np.zeros((2, nv), dtype=np.float32))
+  assert sim.accepted_step is None
   asm_fresh2 = sim.assembled_system()
   assert sim._coupled_solve_dispatches == pre_disp + 2, "set_warmstart must force fresh solve"
-
-  # 4. Caller immutability: modifying the returned accepted_step does not corrupt history
-  acc2 = sim.accepted_step
-  assert acc2 is not None
-  acc2["system"]["lambda"][0, 0] = 9999.0
-  acc3 = sim.accepted_step
-  assert float(acc3["system"]["lambda"][0, 0]) != 9999.0, "Caller must not be able to corrupt accepted_step"
 
 
 @_needs_gpu()
@@ -596,14 +661,22 @@ def test_first_step_failure_nan_inf_sensor_rollback_and_all_failed_omission_gpu(
   prof = "integrated_euler_v1" if integrator == "Euler" else "contact_free_sensor_rk4_v1"
   sim = MetalSimulation(m, batch_size=2, profile=prof)
 
+  # Give the healthy world a nonzero state so an accidentally zeroed sensor
+  # buffer cannot satisfy the rollback oracle. Seed the independent pinned
+  # reference with the same state below.
+  healthy_qpos = np.asarray([0.25], dtype=np.float32)
+  healthy_qvel = np.asarray([0.3], dtype=np.float32)
+  sim.reset(env_ids=[1], qpos=healthy_qpos, qvel=healthy_qvel)
+
   # Initial sensordata is None
   assert sim._sensordata is None
 
   # Patch _acceleration to inject failure + NaN/Inf in World 0, healthy World 1
   orig_accel = sim._acceleration
   step_idx = [0]
-  def patched_accel(qpos, qvel, act_override=None):
-    acc, status, dyn = orig_accel(qpos, qvel, act_override=act_override)
+  def patched_accel(qpos, qvel, act_override=None, **kwargs):
+    acc, status, dyn = orig_accel(
+        qpos, qvel, act_override=act_override, **kwargs)
     if step_idx[0] == 0:
       # World 0 fails with status 1
       status = status.clone()
@@ -625,20 +698,32 @@ def test_first_step_failure_nan_inf_sensor_rollback_and_all_failed_omission_gpu(
   sdata = sim.step_sensordata()
   assert bool(np.all(np.isfinite(sdata))), f"Sensors must be finite, found {sdata}"
   np.testing.assert_array_equal(sdata[0], [0.0, 0.0])
-  assert sdata[1, 1] != 0.0 or sdata[1, 0] != 0.0 or True  # World 1 evaluated
+  healthy_cpu = mujoco.MjData(m)
+  healthy_cpu.qpos[:] = healthy_qpos
+  healthy_cpu.qvel[:] = healthy_qvel
+  mujoco.mj_step(m, healthy_cpu)
+  np.testing.assert_allclose(
+      sdata[1], healthy_cpu.sensordata,
+      rtol=4e-4, atol=4e-5)
+  assert np.any(np.abs(healthy_cpu.sensordata) > 1e-6), (
+      "healthy sensor oracle must be nonzero to detect accidental zeroing")
 
   # Verify accepted step recorded world 1 as accepted, world 0 as rejected
   acc = sim.accepted_step
-  if acc is not None and "accepted_mask" in acc:
-    mask = acc["accepted_mask"].cpu().numpy()
-    assert not bool(mask[0])
-    assert bool(mask[1])
+  assert acc is not None, "the healthy world must establish an accepted record"
+  assert "accepted_mask" in acc, "accepted record must expose its world mask"
+  mask = acc["accepted_mask"].cpu().numpy()
+  assert not bool(mask[0])
+  assert bool(mask[1])
 
   # All-failed step: both worlds fail
   pre_accepted = sim.accepted_step
+  assert pre_accepted is not None, "healthy world must have established an accepted record"
+  assert bool(pre_accepted["accepted_mask"][1])
   pre_gen = sim.state.generation
-  def all_fail_accel(qpos, qvel, act_override=None):
-    acc, status, dyn = orig_accel(qpos, qvel, act_override=act_override)
+  def all_fail_accel(qpos, qvel, act_override=None, **kwargs):
+    acc, status, dyn = orig_accel(
+        qpos, qvel, act_override=act_override, **kwargs)
     status = torch.ones_like(status)  # all fail
     return acc, status, dyn
   sim._acceleration = all_fail_accel
@@ -646,6 +731,4 @@ def test_first_step_failure_nan_inf_sensor_rollback_and_all_failed_omission_gpu(
   sim.step(1)
   assert bool(np.all(sim.state.status.cpu().numpy() != 0))
   # All-failed step must NOT record a new accepted step
-  if pre_accepted is not None:
-    assert sim.accepted_step["input_generation"] == pre_accepted["input_generation"]
-
+  assert sim.accepted_step["input_generation"] == pre_accepted["input_generation"]

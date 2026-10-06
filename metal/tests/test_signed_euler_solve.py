@@ -127,3 +127,23 @@ def test_native_signed_solve_failures_sleep_and_zero_dofs():
                                     torch.empty((2, 0), device="mps"))
   assert actual.shape == (2, 0)
   np.testing.assert_array_equal(status.cpu().numpy(), 0)
+
+
+@pytest.mark.gpu
+@native
+def test_native_simulation_signed_euler_matches_actual_update():
+  from mujoco_metal import MetalSimulation
+  model = _model()
+  simulation = MetalSimulation(model, qvel=np.array([[.4, -.2]], np.float32),
+                                profile="integrated_euler_v1")
+  assert isinstance(simulation._euler_solver, MetalSymmetricLDLSolve)
+  cpu = mujoco.MjData(model)
+  cpu.qvel[:] = [.4, -.2]
+  cpu.qfrc_applied[:] = [2, -3]
+  for _ in range(4):
+    simulation.step(qfrc_applied=np.array([[2., -3.]], np.float32))
+    mujoco.mj_step(model, cpu)
+    actual = simulation.state.snapshot()
+    np.testing.assert_array_equal(actual.status, 0)
+    np.testing.assert_allclose(actual.qvel[0], cpu.qvel, atol=2e-5, rtol=2e-5)
+    np.testing.assert_allclose(actual.qpos[0], cpu.qpos, atol=2e-5, rtol=2e-5)

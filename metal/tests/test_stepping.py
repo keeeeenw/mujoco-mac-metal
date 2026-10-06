@@ -68,7 +68,46 @@ def test_accepts_empty_static_world_and_energy_diagnostic_flag():
   model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_ENERGY)
   profile = validate_stepping_profile(model)
   assert (profile.nq, profile.nv) == (0, 0)
-  assert any("energy diagnostics" in entry for entry in profile.irrelevant)
+  assert "pinned potential and kinetic energy stage diagnostics" in profile.supported
+
+
+def test_diagexact_enable_is_admitted_by_dense_and_sparse_integrated_profiles():
+  model = _model()
+  model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_DIAGEXACT)
+  profile = validate_stepping_profile(model, profile="integrated_scalable_v1")
+  assert profile.name == "integrated_scalable_v1"
+  dense = validate_stepping_profile(model, profile="integrated_euler_v1")
+  assert dense.name == "integrated_euler_v1"
+
+
+def test_diagexact_dense_preflight_accounts_factorized_row_solve():
+  from mujoco_metal.capacity import estimate_capacity
+  from mujoco_metal.constraint_impedance import compile_contact_cone_groups
+  from mujoco_metal.coupled_constraints import lower_coupled_constraints
+
+  model = mujoco.MjModel.from_xml_string("""<mujoco>
+    <option timestep='.001'><flag contact='disable'/></option>
+    <worldbody>
+      <body><joint name='a' type='slide' axis='1 0 0'/>
+        <geom type='sphere' size='.1'/></body>
+      <body><joint name='b' type='slide' axis='1 0 0'/>
+        <geom type='sphere' size='.1'/></body>
+    </worldbody>
+    <equality><joint joint1='a' joint2='b' polycoef='0 1 0 0 0'/></equality>
+  </mujoco>""")
+  model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_DIAGEXACT)
+  descriptor = lower_coupled_constraints(model)
+  groups, _ = compile_contact_cone_groups(descriptor)
+  estimate = estimate_capacity(
+      model, 2, descriptor.npairs, descriptor.ncontacts_max, descriptor.nr,
+      mass_storage="dense", diag_exact_rows=descriptor.nr,
+      diag_exact_cones=int(groups.shape[0]))
+  parts = dict(estimate.memory_breakdown)
+  assert parts["simulation.diag_exact_dense_factor"] == 2 * model.nv ** 2 * 4
+  assert parts["simulation.diag_exact_dense_solution"] == (
+      2 * model.nv * max(descriptor.nr, 1) * 4)
+  assert parts["simulation.diag_exact_status"] == 2 * 4
+  assert parts["component_mass_rhs"] == 0
 
 
 def test_forces_profile_accepts_linear_damping_and_honors_euler_flags():
@@ -151,8 +190,7 @@ def test_version_contract_and_unavailable_enable_flags(monkeypatch):
   )
 
   model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_FWDINV)
-  with pytest.raises(ValueError, match="unsupported enable flags"):
-    validate_stepping_profile(model)
+  assert validate_stepping_profile(model).name == "contact_free_euler_v1"
 
 
 def test_profile_requires_contact_disabled_euler_and_valid_timesteps():

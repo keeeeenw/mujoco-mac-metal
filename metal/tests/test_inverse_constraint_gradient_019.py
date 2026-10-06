@@ -14,8 +14,11 @@ import pytest
         pytest.mark.skipif(os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='native opt-in')])])
 @pytest.mark.parametrize('condim', [3, 4, 6])
 @pytest.mark.parametrize('cone', ['pyramidal', 'elliptic'])
-@pytest.mark.parametrize('region', ['top', 'bottom', 'middle'])
-def test_inverse_gradient_matches_pinned_contact_cost(device, condim, cone, region):
+@pytest.mark.parametrize('region', [
+    'top', 'bottom', 'middle', 'near-top', 'near-bottom'])
+@pytest.mark.parametrize('jacobian_storage', ['dense', 'csr'])
+def test_inverse_gradient_matches_pinned_contact_cost(
+    device, condim, cone, region, jacobian_storage):
   torch = pytest.importorskip('torch')
   from mujoco_metal.inverse_constraints import inverse_constraint_force
   model = mujoco.MjModel.from_xml_string(f'''<mujoco>
@@ -34,33 +37,75 @@ def test_inverse_gradient_matches_pinned_contact_cost(device, condim, cone, regi
     jar = np.full(nr, 1000.)
   elif region == 'bottom':
     jar = np.full(nr, -1000.)
+  elif region in ('near-top', 'near-bottom') and cone == 'elliptic':
+    jar = np.zeros(nr)
+    tangent = np.linspace(0.4, 1.1, condim - 1)
+    friction = np.asarray(data.contact[0].friction)
+    mu = float(friction[0])
+    T = np.linalg.norm(tangent * friction[:condim-1])
+    # Put the represented residual just to either side of the cone boundary.
+    jar[1:condim] = tangent
+    jar[0] = (T * (1 + 2e-7) if region == 'near-top'
+              else -T/mu * (1 - 2e-7))
   else:
     jar = (-5 + np.tile([-20., 20.], nr//2) if cone == 'pyramidal'
            else np.linspace(-10, 30, nr))
   if cone == 'elliptic':
-    if region != 'middle':
+    if region not in ('middle', 'near-top', 'near-bottom'):
       jar[1:] = 0
-    else:
+    elif region == 'middle':
       jar[0] = 0
   data.qacc[:] = np.linalg.lstsq(J, jar+data.efc_aref, rcond=None)[0]
   mujoco.mj_inverse(model, data)
-  if region == 'top':
+  if region == 'top' or (region == 'near-top' and cone == 'elliptic'):
     assert np.linalg.norm(data.qfrc_constraint) < 1e-8
   else:
     assert np.linalg.norm(data.qfrc_constraint) > 1
   def tensor(value):
     return torch.tensor(np.asarray(value).copy()[None], dtype=torch.float32, device=device)
+  aref_hi = np.asarray(data.efc_aref, dtype=np.float32)
+  aref_low = (np.asarray(data.efc_aref, dtype=np.float64)
+              - aref_hi.astype(np.float64)).astype(np.float32)
   lo = np.full(nr, 0 if cone == 'pyramidal' else -np.inf)
-  rows = dict(J=tensor(J), R=tensor(data.efc_R), ar=tensor(data.efc_aref),
+  rows = dict(J=tensor(J), R=tensor(data.efc_R), ar=tensor(aref_hi),
+      ar_low=tensor(aref_low),
       lo=tensor(lo), hi=tensor(np.full(nr, np.inf)), active=tensor(np.ones(nr)),
       contact_mask=tensor([1.]), contact_friction=tensor(data.contact[0].friction))
+  if jacobian_storage == 'csr':
+    from mujoco_metal.constraint_jacobian import (
+        ConstraintJacobianPattern, PackedJacobianLayout, PACKED_J_CSR,
+        packed_jacobian_device_storage, packed_jacobian_scatter_rows_torch)
+    row_columns = [np.flatnonzero(J[row] != 0).astype(np.int32)
+                   for row in range(nr)]
+    row_offsets = np.zeros(nr + 1, dtype=np.int32)
+    for row, support in enumerate(row_columns):
+      row_offsets[row + 1] = row_offsets[row] + len(support)
+    columns = (np.concatenate(row_columns) if row_offsets[-1]
+               else np.zeros((0,), dtype=np.int32))
+    pattern = ConstraintJacobianPattern(row_offsets, columns, nv, nr)
+    assert pattern.nnz < nr * nv
+    packed, layout = packed_jacobian_device_storage(
+        torch, device, 1, pattern, mode=PACKED_J_CSR)
+    packed_jacobian_scatter_rows_torch(
+        torch, packed, 1, layout, pattern, tensor(J), 0,
+        row_count=nr, active=rows['active'])
+    rows.pop('J')
+    rows.update(J_packed=packed, jacobian_layout=layout,
+                jacobian_pattern=pattern)
   desc = SimpleNamespace(nr=nr, nv=nv, n_eq_rows=0, ncontacts_max=1,
       nr_joint=0, cone_type=int(model.opt.cone),
       contact_condim_packed=np.array([[condim, 0, int(model.opt.cone)]], np.int32))
-  original = {name: value.clone() for name, value in rows.items()}
+  original = {name: value.clone() for name, value in rows.items()
+              if hasattr(value, 'clone')}
   result = inverse_constraint_force(rows, tensor(data.qacc), desc)
   assert result.device.type == device
   np.testing.assert_allclose(result.detach().cpu().numpy()[0], data.qfrc_constraint,
+                             atol=4e-3, rtol=3e-5)
+  paired_hi, paired_low = inverse_constraint_force(
+      rows, tensor(data.qacc), desc, return_low=True)
+  paired = (paired_hi.detach().cpu().double()
+            + paired_low.detach().cpu().double()).numpy()[0]
+  np.testing.assert_allclose(paired, data.qfrc_constraint,
                              atol=4e-3, rtol=3e-5)
   for name, value in original.items():
     torch.testing.assert_close(rows[name], value, rtol=0, atol=0)

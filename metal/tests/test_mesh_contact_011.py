@@ -194,8 +194,7 @@ def test_pair_matrix_mesh_gpu():
 
 def _notch_model():
   # Preserved-concave L extrusion (MuJoCo keeps all 24 faces; the CPU
-  # collides it by convex hull, verified separately). The native gate
-  # rejects it: single-convex-piece scope.
+  # collides it by the compiled convex hull, which native lowering preserves).
   v = [(0, 0, 0), (2, 0, 0), (2, 0, 1), (1.5, 0, 1), (1.5, 0, 0.5),
        (0.5, 0, 0.5), (0.5, 0, 1), (0, 0, 1)]
   v += [(x, 1, z) for (x, y, z) in v]
@@ -219,11 +218,30 @@ def _notch_model():
 
 
 def test_mesh_rejections_cpu():
+  model = _notch_model()
+  desc = lower_coupled_constraints(model)
+  geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "ma")
+  header = int(model.mesh_graphadr[0])
+  hull_count = int(model.mesh_graph[header])
+  hull_ids = model.mesh_graph[header + 2 + hull_count:header + 2 + 2 * hull_count]
+  base, count = desc.mesh_hull_info[9 * geom:9 * geom + 2]
+  assert count == hull_count
+  np.testing.assert_array_equal(
+      desc.mesh_hull[3 * base:3 * (base + count)].reshape(count, 3),
+      model.mesh_vert[int(model.mesh_vertadr[0]) + hull_ids])
+  # A missing collision graph must not use concave surface faces as a hull.
+  model.mesh_graphadr[0] = -1
   with pytest.raises(ValueError, match="non-convex"):
-    lower_coupled_constraints(_notch_model())
-  # Oversize hull (>64 verts).
-  verts = " ".join(f"{i * 0.01} {(i * 7 % 13) * 0.01} {(i * 11 % 17) * 0.01}"
-                   for i in range(70))
+    lower_coupled_constraints(model)
+  # Every Fibonacci-sphere vertex belongs to the hull, so the compiled hull
+  # actually exceeds64; random interior points would not exercise this cap.
+  points = []
+  for i in range(70):
+    z = 1 - 2 * (i + .5) / 70
+    phi = i * np.pi * (3 - np.sqrt(5))
+    radius = np.sqrt(1 - z*z)
+    points.append((radius*np.cos(phi), radius*np.sin(phi), z))
+  verts = " ".join(str(value) for point in points for value in point)
   m2 = mujoco.MjModel.from_xml_string(
       f'<mujoco><asset><mesh name="big" vertex="{verts}"/></asset>{OPT}'
       '<worldbody><body><freejoint/>'
@@ -231,6 +249,7 @@ def test_mesh_rejections_cpu():
       '</body><body pos="2 0 0"><freejoint/>'
       '<geom name="mb" type="sphere" size="0.1" contype="1" conaffinity="1"/>'
       '</body></worldbody></mujoco>')
+  assert int(m2.mesh_graph[int(m2.mesh_graphadr[0])]) == 70
   with pytest.raises(ValueError, match="64"):
     lower_coupled_constraints(m2)
 

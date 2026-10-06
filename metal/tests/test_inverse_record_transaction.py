@@ -7,6 +7,57 @@ import pytest
 
 
 @pytest.mark.parametrize('fail', [False, True])
+@pytest.mark.parametrize('stale', [False, True])
+def test_query_restores_paired_acceleration_values_aliases_and_coherence(fail, stale):
+  torch = pytest.importorskip('torch')
+  from mujoco_metal.native_api import _inverse_query_workspaces
+  from mujoco_metal.simulation import MetalSimulation
+  high = torch.tensor([[1., 2.]])
+  low = torch.tensor([[1e-7, -2e-7]])
+  rhs_low = torch.tensor([[3e-7, 4e-7]])
+  sim = SimpleNamespace(
+      _state=SimpleNamespace(_torch=torch, generation=7),
+      _component_solution_vector=high,
+      _component_solution_low_vector=low, _rhs_low=rhs_low,
+      _last_sensor_qacc=high, _last_sensor_qacc_low=low,
+      _last_sensor_qacc_generation=7, _last_sensor_qacc_version=int(high._version),
+      _last_coupled={'qacc': high, 'qacc_low': low},
+      _last_coupled_generation=7, _last_coupled_qacc_version=int(high._version))
+  sim._forward_position_buffers = {'actuators': {'length': rhs_low}}
+  if stale:
+    high.add_(1.)
+  saved = [value.clone() for value in (high, low, rhs_low)]
+  def query():
+    with _inverse_query_workspaces(sim):
+      high.add_(10.)
+      low.zero_()
+      rhs_low.fill_(99.)
+      sim._forward_position_buffers['actuators'] = {'length': torch.zeros_like(rhs_low)}
+      sim._last_sensor_qacc = torch.zeros_like(high)
+      sim._last_sensor_qacc_low = None
+      sim._component_solution_low_vector = torch.zeros_like(low)
+      sim._last_sensor_qacc_generation = 100
+      sim._last_coupled = None
+      if fail:
+        raise RuntimeError('paired query failed')
+  if fail:
+    with pytest.raises(RuntimeError, match='paired query failed'):
+      query()
+  else:
+    query()
+  assert sim._last_sensor_qacc is high
+  assert sim._last_sensor_qacc_low is low
+  assert sim._component_solution_low_vector is low
+  assert sim._last_coupled['qacc'] is high
+  assert sim._last_coupled['qacc_low'] is low
+  assert sim._forward_position_buffers['actuators']['length'] is rhs_low
+  for value, before in zip((high, low, rhs_low), saved):
+    torch.testing.assert_close(value, before, rtol=0, atol=0)
+  assert sim._last_sensor_qacc_generation == 7
+  assert MetalSimulation._qacc_low_for_sensor(sim, high) is (None if stale else low)
+
+
+@pytest.mark.parametrize('fail', [False, True])
 def test_query_restores_record_values_owners_tokens_and_bookkeeping(fail):
   torch = pytest.importorskip('torch')
   from mujoco_metal.forward_stages import ForwardStage as Stage, ForwardStageCoordinator

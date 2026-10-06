@@ -66,11 +66,66 @@ def test_factories_validate_role_binding_and_reused_instances():
     bad.register_factory("invalid", PluginType.SENSOR, None)
 
 
+def test_workspace_preflight_and_plugin_binding_share_one_registry_snapshot():
+  class MagneticForce(ConfiguredForce):
+    spatial_force_workspace_kind = "magnetic"
+
+    def __init__(self):
+      super().__init__("magnetic")
+
+  class SiteForce(ConfiguredForce):
+    spatial_force_workspace_kind = "site_feedback"
+
+    def __init__(self):
+      super().__init__("site")
+
+  registry = ExtensionRegistry()
+  registry.register_factory("magnetic", PluginType.FORCE, MagneticForce,
+                            spatial_force_kind="magnetic")
+  captured = registry.registration_snapshot()
+  assert registry.spatial_force_workspace_counts(captured) == {
+      "magnetic": 1, "site_feedback": 0}
+
+  # A concurrent configuration edit after preflight cannot cause this
+  # simulation to bind a different plugin set than the one it budgeted.
+  registry.unregister("magnetic")
+  registry.register_factory("site", PluginType.FORCE, SiteForce,
+                            spatial_force_kind="site_feedback")
+  assert registry.spatial_force_workspace_counts() == {
+      "magnetic": 0, "site_feedback": 1}
+  instance = registry.instantiate(_model(), 2, "cpu",
+                                  registrations=captured)
+  assert len(instance) == 1 and isinstance(instance[0], MagneticForce)
+  assert registry.spatial_force_workspace_counts(captured) == {
+      "magnetic": 1, "site_feedback": 0}
+
+  mismatched = ExtensionRegistry()
+  mismatched.register_factory("mismatch", PluginType.FORCE,
+                              lambda: ConfiguredForce("mismatch"),
+                              spatial_force_kind="magnetic")
+  with pytest.raises(ValueError, match="workspace kind"):
+    mismatched.instantiate(_model(), 1, "cpu")
+
+
 def test_bound_configuration_cannot_be_registered_as_a_prototype():
   plugin = ConfiguredForce()
   plugin.init(_model(), 1, "cpu")
   with pytest.raises(ValueError, match="unbound plugin"):
     ExtensionRegistry().register(plugin)
+
+
+def test_plugin_mask_device_uses_stable_canonical_runtime_device():
+  import torch
+
+  plugin = ConfiguredForce()
+  plugin.init(_model(), 2, "cpu:0")
+  # Configuration values precede runtime tensors on real plugins; device
+  # validation must use the device resolved at bind time, never vars() order.
+  plugin.configuration_tensor = torch.zeros((1,), device="cpu")
+  assert plugin._owned_device() == torch.zeros((1,), device="cpu").device
+  assert plugin._owned_device() == plugin.device
+  plugin.reset_masked(torch.tensor([True, False], dtype=torch.bool,
+                                   device="cpu"))
 
 
 @pytest.mark.gpu

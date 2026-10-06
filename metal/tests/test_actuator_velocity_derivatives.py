@@ -92,3 +92,77 @@ def test_native_actuator_velocity_derivative_matches_pinned_engine(family, veloc
   got = program.run_velocity_derivative(tensor("ctrl"), tensor("act"), kin)
   np.testing.assert_allclose(got.cpu().numpy(), np.stack([s[1] for s in stages]),
                              rtol=4e-5, atol=5e-6)
+
+
+@pytest.mark.gpu
+@gpu
+@pytest.mark.parametrize("family", ["affine", "muscle", "dccurrent"])
+def test_native_actuator_derivative_writes_compiled_coo_directly(family):
+  import torch
+  from mujoco_metal.stateful_actuation import MetalActuators
+  from mujoco_metal.velocity_derivative import compile_velocity_derivative_layout
+
+  model = _model(family)
+  layout = compile_velocity_derivative_layout(model)
+  stages = [_stages(model, .17), _stages(model, -.23)]
+  tensor = lambda key: torch.as_tensor(
+      np.stack([s[0][key] for s in stages]).astype(np.float32), device="mps")
+  kin = {key: tensor(key) for key in ("length", "velocity", "moment")}
+  program = MetalActuators(model, 2, velocity_derivative_layout=layout)
+  program.run_forces(tensor("ctrl"), tensor("act"), kin)
+  initial = 0.375
+  values = torch.full((2, max(layout.edge_count, 1)), initial,
+                      dtype=torch.float32, device="mps")
+  got = program.run_velocity_derivative(
+      tensor("ctrl"), tensor("act"), kin, edge_values=values)
+  expected = np.full((2, max(layout.edge_count, 1)), initial,
+                     dtype=np.float32)
+  dense = np.stack([s[1] for s in stages])
+  if layout.edge_count:
+    expected[:, :layout.edge_count] += dense[:, layout.edge_rows,
+                                             layout.edge_cols]
+  torch.mps.synchronize()
+  np.testing.assert_allclose(got.cpu().numpy(), expected,
+                             rtol=4e-5, atol=5e-6)
+
+
+@pytest.mark.gpu
+@gpu
+@pytest.mark.parametrize("integrator,profile", [
+    ("implicit", "integrated_implicit_v1"),
+    ("implicitfast", "integrated_implicitfast_v1"),
+])
+@pytest.mark.parametrize("family", ["affine", "filterearly", "muscle", "dcstateless", "dccurrent"])
+def test_integrated_implicit_actuator_trajectory_and_replay(integrator, profile, family):
+  from mujoco_metal import MetalSimulation
+  model = _model(family)
+  model.opt.integrator = getattr(mujoco.mjtIntegrator, "mjINT_"+integrator.upper())
+  qpos = np.tile([.3, .1], (2, 1)).astype(np.float32)
+  qvel = np.array([[-.2, -.23], [.01, .15]], dtype=np.float32)
+  sim = MetalSimulation(model, 2, qpos, qvel, profile=profile)
+  refs = [mujoco.MjData(model) for _ in range(2)]
+  for row, data in enumerate(refs):
+    data.qpos[:], data.qvel[:] = qpos[row], qvel[row]
+    data.act[:] = np.linspace(.03, .3, model.na)
+  if model.na:
+    sim.state.reset(qpos=qpos, qvel=qvel, act=np.stack([d.act for d in refs]).astype(np.float32))
+  ctrl = np.array([[.2, .7], [-.1, .4]], dtype=np.float32)
+  for _ in range(40):
+    sim.step(ctrl=ctrl)
+    for row, data in enumerate(refs):
+      data.ctrl[:] = ctrl[row]
+      mujoco.mj_step(model, data)
+    np.testing.assert_array_equal(sim.state._status.cpu().numpy(), 0)
+    np.testing.assert_allclose(sim.state._qpos.cpu().numpy(), np.stack([d.qpos for d in refs]),
+                               atol=2e-5, rtol=2e-4)
+    np.testing.assert_allclose(sim.state._qvel.cpu().numpy(), np.stack([d.qvel for d in refs]),
+                               atol=5e-4, rtol=4e-4)
+    if model.na:
+      np.testing.assert_allclose(sim.state._act.cpu().numpy(), np.stack([d.act for d in refs]),
+                                 atol=2e-6, rtol=3e-5)
+  snapshot = sim.snapshot()
+  sim.step(3, ctrl=ctrl)
+  expected = sim.state._qpos.cpu().numpy().copy()
+  sim.restore(snapshot)
+  sim.step(3, ctrl=ctrl)
+  np.testing.assert_array_equal(sim.state._qpos.cpu().numpy(), expected)

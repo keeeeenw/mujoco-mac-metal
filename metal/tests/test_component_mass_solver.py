@@ -39,9 +39,11 @@ def test_component_layout_packing_and_workspace_sizes_match_tensor_shapes():
       "component_mass_dof_mask": 6,
       "component_mass_factor_dof_mask": 6,
       "component_mass_factor": 10,
-      "component_mass_output": 24,
-      "component_mass_single_output": 6,
+      "component_mass_zero_rhs_low": 6,
+      "component_mass_output_pair": 48,
+      "component_mass_single_output_pair": 12,
       "component_mass_matvec_output": 6,
+      "component_mass_retained_matrix": 10,
       "component_mass_status": 4,
       "component_mass_factor_status": 4,
       "component_mass_zero_blocks": 10,
@@ -56,6 +58,9 @@ def test_component_layout_packing_and_workspace_sizes_match_tensor_shapes():
       "component_mass_dims": 5,
       "component_mass_single_dims": 5,
       "component_mass_merge_dims": 2,
+      "component_mass_all_world_mask": 2,
+      "component_mass_row_dims": 3,
+      "component_mass_row_index": 1,
   }
 
 
@@ -467,6 +472,8 @@ def test_component_ldlt_native_descending_pivot_failure_isolation_and_recovery()
   np.testing.assert_array_equal(bad_rhs_status.cpu().numpy(),
                                 [[1, 0, 0], [0, 0, 0]])
   np.testing.assert_array_equal(output.cpu().numpy()[0, :, :2], 0.0)
+  np.testing.assert_array_equal(
+      solver.paired_output.cpu().numpy()[1, 0, :, :2], 0.0)
 
   bad_mass = good_mass.clone()
   bad_mass[0, 0] = float("nan")
@@ -475,6 +482,8 @@ def test_component_ldlt_native_descending_pivot_failure_isolation_and_recovery()
   np.testing.assert_array_equal(bad_mass_status.cpu().numpy(),
                                 [[1, 0, 0], [0, 0, 0]])
   np.testing.assert_array_equal(bad_mass_output.cpu().numpy()[0, :, :2], 0.0)
+  np.testing.assert_array_equal(
+      solver.paired_output.cpu().numpy()[1, 0, :, :2], 0.0)
 
   armature = torch.zeros_like(good_mass)
   armature[0, 0] = torch.finfo(torch.float32).max
@@ -601,6 +610,35 @@ def test_component_retained_factors_match_pinned_mass_in_distinct_worlds():
                        for dense, right in zip(dense_worlds, rhs_np)])
   np.testing.assert_array_equal(status.cpu().numpy(), 0)
   np.testing.assert_allclose(fused.cpu().numpy(), expected, atol=1e-4, rtol=1e-4)
+  # The low plane is the same-factor solve of the true equation residual left
+  # by the rounded high result. Both planes together recover the float64
+  # oracle more closely than the established high-only ABI.
+  paired = solver.paired_output.cpu().numpy()
+  residuals = np.stack([
+      rhs_np[w].astype(np.float64) -
+      (dense_worlds[w] @ fused.cpu().numpy()[w].astype(np.float64).T).T
+      for w in range(2)])
+  expected_low = np.stack([
+      np.linalg.solve(dense_worlds[w], residuals[w].T).T
+      for w in range(2)])
+  np.testing.assert_allclose(paired[1, :, :, :model.nv], expected_low,
+                             atol=2e-5, rtol=2e-4)
+  np.testing.assert_allclose(
+      fused.cpu().numpy().astype(np.float64) + paired[1, :, :, :model.nv],
+      expected, atol=2e-5, rtol=2e-5)
+  rhs_low_np = np.zeros((2, model.nv), dtype=np.float32)
+  rhs_low_np[:, 0] = [2.0e-5, -3.0e-5]
+  rhs_low = torch.as_tensor(rhs_low_np, device="mps")
+  low_fused, low_status = solver.run_device(mass, rhs, rhs_low=rhs_low)
+  np.testing.assert_array_equal(low_status.cpu().numpy(), 0)
+  low_pair = solver.paired_output.cpu().numpy()
+  expected_with_low = expected.copy()
+  expected_with_low[:, -1, :] += np.stack([
+      np.linalg.solve(dense_worlds[w], rhs_low_np[w]) for w in range(2)])
+  np.testing.assert_allclose(
+      low_fused.cpu().numpy().astype(np.float64)
+      + low_pair[1, :, :, :model.nv],
+      expected_with_low, atol=3e-5, rtol=3e-5)
   factor_status = solver.factorize_device(mass)
   np.testing.assert_array_equal(factor_status.cpu().numpy(), 0)
   for scale in (1., -.75):

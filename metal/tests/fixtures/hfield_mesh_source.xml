@@ -1,0 +1,14 @@
+<mujoco>
+  <asset>
+    <hfield name="terrain_asset" nrow="9" ncol="9" size=".4 .4 .05 .02" elevation="0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5"/>
+    <mesh name="convex_box" vertex="-0.12 -0.12 -0.05 0.12 -0.12 -0.05 -0.12 0.12 -0.05 0.12 0.12 -0.05 -0.12 -0.12 0.05 0.12 -0.12 0.05 -0.12 0.12 0.05 0.12 0.12 0.05"/>
+  </asset>
+  <option timestep=".001" integrator="Euler" iterations="100" tolerance="1e-8" gravity="0 0 -9.81" cone="elliptic"/>
+  <worldbody>
+    <geom name="terrain" type="hfield" hfield="terrain_asset" contype="1" conaffinity="1" condim="1" friction=".7"/>
+    <body name="mesh_body" pos="0 0 .03">
+      <freejoint/>
+      <geom name="mesh_geom" type="mesh" mesh="convex_box" contype="1" conaffinity="1" condim="1" friction=".7"/>
+    </body>
+  </worldbody>
+</mujoco>

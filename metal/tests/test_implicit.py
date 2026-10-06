@@ -127,4 +127,5 @@ def test_shader_argument_abi_is_dense():
   from pathlib import Path
   shader = Path(__file__).parents[1] / "mujoco_metal" / "shaders" / "implicit.metal"
   indices = [int(x) for x in re.findall(r"\[\[buffer\((\d+)\)\]\]", shader.read_text())]
-  assert indices == list(range(5))
+  # Sixth output retains the full nonsymmetric operator for stiffness CG.
+  assert indices == list(range(6))

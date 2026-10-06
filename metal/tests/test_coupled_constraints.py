@@ -15,10 +15,13 @@ from mujoco_metal.coupled_constraints import (
     coupled_constraint_oracle,
     lower_coupled_constraints,
     MetalCoupledConstraints,
+    _clear_current_row_ownership,
+    _row_velocity_scales,
 )
 from mujoco_metal.model import load_model
 from mujoco_metal.metal_kinematics import MetalKinematics
 from mujoco_metal.smooth_metal import MetalSmoothDynamics
+from mujoco_metal.solver_islands import lower_solver_row_metadata
 
 COUPLED_XML = """<mujoco model="coupled_test">
   <compiler angle="radian"/>
@@ -53,17 +56,78 @@ COUPLED_XML = """<mujoco model="coupled_test">
 </mujoco>"""
 
 
+def test_current_row_ownership_reset_preserves_retained_rows():
+  """Only current preassembly ownership is cleared between assemblies."""
+  batch, nr, stride = 2, 3, 64
+  debug = np.arange(batch * stride, dtype=np.float32).reshape(batch, stride)
+  before = debug.copy()
+  start = nr * nr + 6 * nr
+
+  _clear_current_row_ownership(debug, batch, nr, stride)
+
+  np.testing.assert_array_equal(debug[:, :start], before[:, :start])
+  np.testing.assert_array_equal(debug[:, start:start + nr], 0.0)
+  np.testing.assert_array_equal(debug[:, start + nr:], before[:, start + nr:])
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_separated_contact_does_not_replay_prior_active_row():
+  """A fresh no-contact assembly drops a prior contact without resetting."""
+  import torch
+
+  model = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep=".001" iterations="80" tolerance="1e-8"/>'
+      '<worldbody><geom type="plane" size="2 2 .1"/>'
+      '<body pos="0 0 .09"><freejoint/><geom type="sphere" size=".1" '
+      'mass="1" condim="1"/></body></worldbody></mujoco>')
+  descriptor = load_model(model)
+  smooth = MetalSmoothDynamics(descriptor, batch_size=1)
+  coupled = MetalCoupledConstraints(model, batch_size=1)
+  qpos = torch.as_tensor(model.qpos0, dtype=torch.float32, device="mps").reshape(1, -1)
+  qvel = torch.zeros((1, model.nv), dtype=torch.float32, device="mps")
+
+  touching = smooth.run_device(qpos, qvel)
+  contact = coupled.run_device(
+      touching["poses"], touching["mass_matrix"], -touching["qfrc_bias"],
+      qpos, qvel)
+  assert torch.any(contact["contact_mask"] > 0.5)
+  assert torch.max(torch.abs(contact["qfrc_constraint"])).item() > 1.0
+
+  separated_qpos = qpos.clone()
+  separated_qpos[0, 2] = 0.4
+  separated = smooth.run_device(separated_qpos, qvel)
+  clear = coupled.run_device(
+      separated["poses"], separated["mass_matrix"], -separated["qfrc_bias"],
+      separated_qpos, qvel)
+  assert not torch.any(clear["contact_mask"] > 0.5)
+  assert torch.max(torch.abs(clear["qfrc_constraint"])).item() < 1e-6
+
+
 def test_contact_pair_header_layout_cpu():
   dims = np.asarray([6, 3, 6, 3, 4, 3, 4, 0, 0, 1], dtype=np.int32)
   offsets = np.asarray([0, 1, 2, 6], dtype=np.int32)
   packed = _pack_contact_dims_offsets(dims, offsets)
   np.testing.assert_array_equal(packed[:10], dims)
-  np.testing.assert_array_equal(packed[10:], offsets)
+  np.testing.assert_array_equal(packed[10:14], offsets)
+  np.testing.assert_array_equal(packed[14:20], np.zeros(6, dtype=np.int32))
+  assert packed[20] == 21
+  np.testing.assert_array_equal(packed[21:24], np.ones(3, dtype=np.int32))
   assert packed[1] == 3  # Pair count is independent of the first slot end.
+  sparse_dims = dims.copy()
+  sparse_dims[9] = 2
+  sparse = _pack_contact_dims_offsets(
+      sparse_dims, offsets, np.arange(6, dtype=np.int32) + 12)
+  assert sparse[9] == 2
+  np.testing.assert_array_equal(sparse[14:20], np.arange(6, dtype=np.int32) + 12)
+  assert sparse[20] == 21
+  np.testing.assert_array_equal(sparse[21:24], np.ones(3, dtype=np.int32))
   empty = _pack_contact_dims_offsets(
       np.asarray([0, 0, 0, 1, 1, 0, 1, 0, 0, 1], dtype=np.int32),
       np.asarray([0], dtype=np.int32))
-  assert empty.shape == (11,)
+  assert empty.shape == (13,)
+  assert empty[11] == 12
+  assert empty[12] == 1
   with pytest.raises(ValueError, match="10 entries"):
     _pack_contact_dims_offsets(np.zeros(9, dtype=np.int32), offsets)
   with pytest.raises(ValueError, match="final pair contact offset"):
@@ -230,6 +294,49 @@ def test_coupled_lowering_allocates_exact_cone_dimensions(cone, condim):
   assert desc.contact_condim_packed.tolist() == [condim, 0, int(desc.cone_type)]
 
 
+@pytest.mark.parametrize("condim", [3, 4, 6])
+@pytest.mark.parametrize("solref", [".02 1", "-.4 -2"])
+def test_pyramidal_cached_velocity_coefficient_is_per_edge_base(condim, solref):
+  """The pyramid edge Jacobian already contains its signed friction term."""
+  xml = f'''<mujoco><option cone="pyramidal" timestep=".002"/>
+    <worldbody><geom type="plane" size="2 2 .1" condim="{condim}"
+        friction=".8 .6 .07" solref="{solref}" solimp=".9 .6 .01 .5 2"/>
+      <body pos="0 0 .15"><freejoint/><geom type="sphere" size=".2"
+        condim="{condim}" friction=".8 .6 .07"/></body></worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  desc = lower_coupled_constraints(model)
+  row_meta = lower_solver_row_metadata(model, desc)
+  scales = _row_velocity_scales(model, desc, row_meta)
+
+  start = int(desc.nr_joint + desc.contact_condim_packed[1])
+  count = 2 * (condim - 1)
+  width = float(desc.solimp[0, 1])
+  r0, r1 = (float(x) for x in desc.solref[0, :2])
+  expected = (2.0 / (width * r0) if r0 > 0 and r1 > 0
+              else -r1 / width)
+  np.testing.assert_allclose(scales[start:start + count], expected, rtol=1e-7, atol=1e-7)
+
+  # Verify B from pinned MuJoCo behavior at a fixed position with two
+  # velocities.  The pyramid edge J already includes its signed friction
+  # coefficient, so each row's aref delta is exactly -B * J*v.
+  zero = mujoco.MjData(model)
+  moving = mujoco.MjData(model)
+  zero.qpos[:] = moving.qpos[:] = model.qpos0
+  velocity = np.asarray([.12, -.08, .03, .4, -.7, 1.1], dtype=np.float64)
+  moving.qvel[:] = velocity
+  mujoco.mj_forward(model, zero)
+  mujoco.mj_forward(model, moving)
+  cpu_J = np.asarray(zero.efc_J).reshape(zero.nefc, model.nv)
+  cpu_type = np.asarray(zero.efc_type)
+  pyramid_rows = np.flatnonzero(
+      cpu_type == int(mujoco.mjtConstraint.mjCNSTR_CONTACT_PYRAMIDAL))
+  assert pyramid_rows.size == count
+  cpu_velocity = cpu_J[pyramid_rows] @ velocity
+  assert np.all(np.abs(cpu_velocity) > 1e-6)
+  inferred = -(moving.efc_aref[pyramid_rows] - zero.efc_aref[pyramid_rows]) / cpu_velocity
+  np.testing.assert_allclose(inferred, expected, rtol=1e-7, atol=1e-8)
+
+
 def test_coupled_explicit_pair_preserves_five_friction_and_solreffriction():
   xml = '''<mujoco><option cone="elliptic"/>
     <worldbody><geom name="floor" type="plane" size="2 2 .1"/>
@@ -294,12 +401,14 @@ def _row_capacity_model(cone, contact_count):
     ("pyramidal", 7, 8),
 ])
 def test_contact_row_capacity_boundary_rejects_overflow(cone, max_contacts, overflow_contacts):
-  desc = lower_coupled_constraints(_row_capacity_model(cone, max_contacts))
+  from mujoco_metal.capacity import CapacityLimits
+  limits = CapacityLimits(max_rows=96)
+  desc = lower_coupled_constraints(_row_capacity_model(cone, max_contacts), limits=limits)
   rows_per_contact = 6 if cone == "elliptic" else 10
   assert desc.nr <= 96
   assert desc.contact_condim_packed[-2] + rows_per_contact == (max_contacts - 1) * rows_per_contact + rows_per_contact
   with pytest.raises(ValueError, match="total candidate constraint rows"):
-    lower_coupled_constraints(_row_capacity_model(cone, overflow_contacts))
+    lower_coupled_constraints(_row_capacity_model(cone, overflow_contacts), limits=limits)
 
 
 def _elliptic_project(x):
@@ -1312,6 +1421,11 @@ def test_coupled_solver_settings_range_contracts():
   assert settings.metric == "max_normalized_projected_gradient"
   # The runtime follows the pinned configured budget exactly.
   assert settings.adaptive_max_iterations == 0
+  from mujoco_metal.coupled_constraints import _solver_parameter_values
+  packed = _solver_parameter_values(desc)
+  assert packed.shape == (7,)
+  assert packed[2] == pytest.approx(settings.effective_tolerance)
+  assert packed[6] == pytest.approx(settings.requested_tolerance)
 
   # Iterations contract: [0, 2048], with no hidden extension.
   m100 = mujoco.MjModel.from_xml_string(COUPLED_XML)
@@ -1348,12 +1462,16 @@ def test_coupled_solver_settings_range_contracts():
   d_tol4 = lower_coupled_constraints(m_tol4)
   assert d_tol4.solver_settings.requested_tolerance == 1e-4
   assert d_tol4.solver_settings.effective_tolerance == 1e-4
+  assert _solver_parameter_values(d_tol4)[2] == pytest.approx(1e-4)
+  assert _solver_parameter_values(d_tol4)[6] == pytest.approx(1e-4)
 
   m_tol8 = mujoco.MjModel.from_xml_string(COUPLED_XML)
   m_tol8.opt.tolerance = 1e-8
   d_tol8 = lower_coupled_constraints(m_tol8)
   assert d_tol8.solver_settings.requested_tolerance == 1e-8
   assert d_tol8.solver_settings.effective_tolerance == 1e-6
+  assert _solver_parameter_values(d_tol8)[2] == pytest.approx(1e-6)
+  assert _solver_parameter_values(d_tol8)[6] == pytest.approx(1e-8)
 
   for bad_tol in [0.0, -1e-6, float("nan"), float("inf")]:
     mtol_bad = mujoco.MjModel.from_xml_string(COUPLED_XML)

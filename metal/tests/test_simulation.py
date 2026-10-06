@@ -69,7 +69,9 @@ def test_invalid_profile_rejected_before_device_construction():
 
 def test_batch_overflow_rejected_before_device_construction():
   model = mujoco.MjModel.from_xml_string(_XML)
-  with pytest.raises(ValueError, match="uint32 index capacity"):
+  # State-owned warning tables precede FK workspaces in the complete admission
+  # plan and are the first actual allocation that exceeds signed addressing.
+  with pytest.raises(ValueError, match=r"state\.warning_number.*signed 32-bit"):
     MetalSimulation(model, batch_size=1 << 30)
 
 
@@ -91,7 +93,7 @@ def test_fixed_geom_output_overflow_rejected_before_state_allocation(
     raise AssertionError("device state allocation must follow capacity checks")
 
   monkeypatch.setattr("mujoco_metal.simulation.DeviceState", forbidden_state)
-  with pytest.raises(ValueError, match="geom_quat.*uint32 index capacity"):
+  with pytest.raises(ValueError, match=r"fk\.pose_output_arena.*signed 32-bit"):
     MetalSimulation(model, batch_size=110_000_000)
 
 

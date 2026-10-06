@@ -243,7 +243,10 @@ def test_preflight_is_cpu_only_and_includes_stage_inventory(tmp_path):
       "native semi-implicit Euler"
   )
   assert "narrowly GPU-qualified" in result["stages"]["contact_free_euler_v1"]
-  assert result["stages"]["full_stepping"].startswith("unsupported")
+  # Explicit profiles now implement stepping; that does not qualify the full
+  # backend. Keep the broad-qualification boundary without requiring the old
+  # pre-profile label that incorrectly described every stepping path as absent.
+  assert "unqualified" in result["stages"]["full_stepping"]
   assert any(
       row["name"].startswith("python-api:mj_") for row in result["features"]
   )

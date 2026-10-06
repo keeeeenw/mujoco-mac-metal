@@ -9,6 +9,7 @@ any other failure (new demo rot, capacity breach) fails this test.
 """
 
 import glob
+import runpy
 from pathlib import Path
 
 import mujoco
@@ -38,8 +39,13 @@ def test_all_demo_models_admit_or_documented():
     name = path.stem
     try:
       model = mujoco.MjModel.from_xml_path(str(path))
-      validate_stepping_profile(model, profile=_PROFILE)
-      desc = lower_coupled_constraints(model)
+      # The gripper declares an explicit row budget for capsule manifolds.
+      # Read its actual entry-point constant, rather than enlarging defaults
+      # or copying a second independent value into this admission gate.
+      limits = (runpy.run_path(str(path.with_suffix(".py")))["DEMO_LIMITS"]
+                if name == "muscle_gripper" else None)
+      validate_stepping_profile(model, profile=_PROFILE, limits=limits)
+      desc = lower_coupled_constraints(model, limits=limits)
       admitted[name] = (desc.npairs, desc.ncontacts_max)
     except Exception as exc:  # noqa: BLE001 - collected, not hidden
       failures[name] = str(exc)
@@ -50,4 +56,3 @@ def test_all_demo_models_admit_or_documented():
   from mujoco_metal.capacity import BASE_MAX_PAIRS, BASE_MAX_SLOTS
   for name, counts in sorted(admitted.items()):
     assert counts[0] <= BASE_MAX_PAIRS and counts[1] <= BASE_MAX_SLOTS, (name, counts)
-

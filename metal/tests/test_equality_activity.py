@@ -39,7 +39,7 @@ def test_device_state_eq_defaults_and_reset_override_cpu():
     st.reset(env_ids=[1], eq_active=np.array([[0]], dtype=np.int32))
     np.testing.assert_array_equal(st.eq_active.numpy(), [[1], [0]])
     snap = st.snapshot()
-    assert snap.schema_version == 2 and snap.neq == 1
+    assert snap.schema_version == 6 and snap.neq == 1
     st.set_equality_active(np.array([[0], [0]], dtype=np.int32))
     st.restore(snap)
     np.testing.assert_array_equal(st.eq_active.numpy(), [[1], [0]])
@@ -75,7 +75,7 @@ def test_snapshot_old_schema_rejected_for_equalities_cpu():
     st = DeviceState(m, profile, 1, device="cpu")
     # Manually craft a v1 snapshot (no activity) with matching fingerprints.
     v1 = st.snapshot()
-    assert v1.schema_version == 2  # current state has equalities, so v2
+    assert v1.schema_version == 6  # current state has epochs plus warnings
     # Forge a v1 with same physical fields but schema 1.
     forged = StateSnapshot(
         model_fingerprint=v1.model_fingerprint,

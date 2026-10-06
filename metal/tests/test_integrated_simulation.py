@@ -464,6 +464,7 @@ def test_integrated_simulation_plan_runtime_agreement():
 
 
 def test_integrated_simulation_capacity_boundary_and_overflow_rejection():
+  from mujoco_metal.capacity import CapacityLimits
   from mujoco_metal.coupled_constraints import lower_coupled_constraints
 
   # 1. nv boundary: nv=32 accepted, nv=33 rejected
@@ -516,12 +517,14 @@ def test_integrated_simulation_capacity_boundary_and_overflow_rejection():
     xml_nr96 = xml_nr96.replace(f'<body pos="{i} 0 1"><joint type="slide"', f'<body pos="{i} 0 1"><joint name="j{i}" type="slide"')
     xml_nr96 += f'<joint joint1="j{i}" polycoef="0 1 0 0 0"/>'
   xml_nr96 += "</equality></mujoco>"
-  d96 = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_nr96))
+  d96 = lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_nr96),
+                                 limits=CapacityLimits(max_rows=96))
   assert d96.nr == 96
 
   xml_nr97 = xml_nr96.replace("</equality></mujoco>", '<joint joint1="j0" joint2="j1" polycoef="0 1 0 0 0"/></equality></mujoco>')
   with pytest.raises(ValueError, match="total candidate constraint rows \\(97\\) exceeds capacity 96"):
-    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_nr97))
+    lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_nr97),
+                              limits=CapacityLimits(max_rows=96))
 
   # If running in GPU mode, execute the accepted capacity boundaries on MPS
   if os.getenv("MUJOCO_METAL_RUN_GPU") == "1":

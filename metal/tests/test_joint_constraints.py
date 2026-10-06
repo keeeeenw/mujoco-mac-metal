@@ -35,6 +35,29 @@ def test_lowering_is_immutable_and_preserves_row_capacity():
     d.qpos0[0] = 0
 
 
+def test_lowering_and_oracle_use_configured_solver_iterations_and_tolerance():
+  model = mujoco.MjModel.from_xml_string(XML)
+  model.opt.iterations = 1
+  model.opt.tolerance = 0.125
+  d = lower_joint_constraints(model)
+  assert d.iterations == 1
+  assert d.tolerance == pytest.approx(0.125)
+  assert d.meaninertia == pytest.approx(model.stat.meaninertia)
+  assert d.warmstart_enabled
+  qpos, qvel = np.asarray([[.24, .16]]), np.asarray([[1., -.4]])
+  data, mass = _mj_state(model, qpos[0], qvel[0])
+  result = joint_constraint_oracle(
+      model, qpos, qvel, mass[None], data.qfrc_smooth[None],
+      max_iterations=d.iterations, tolerance=d.tolerance)
+  assert result["iterations"][0] <= 1
+
+
+def test_iteration_lowering_has_no_unrelated_512_sweep_ceiling():
+  model = mujoco.MjModel.from_xml_string(XML)
+  model.opt.iterations = 513
+  assert lower_joint_constraints(model).iterations == 513
+
+
 def test_oracle_matches_real_mujoco_forward_for_coupled_equality_friction_limits():
   model = mujoco.MjModel.from_xml_string(XML)
   states = [([.24, .16], [1., -.4]), ([-.24, -.16], [-.7, .5]), ([.04, -.02], [.1, -.2])]
@@ -98,4 +121,4 @@ def test_metal_argument_abi_is_dense_and_matches_host_pack_order():
   from pathlib import Path
   source = Path(__file__).parents[1] / "mujoco_metal" / "shaders" / "joint_constraints.metal"
   indices = [int(x) for x in re.findall(r"\[\[buffer\((\d+)\)\]\]", source.read_text())]
-  assert indices == list(range(29))
+  assert indices == list(range(31))
