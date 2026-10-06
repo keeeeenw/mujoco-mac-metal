@@ -7,21 +7,43 @@
 """Render the actual hybrid rollout to a GIF (requires Pillow and OpenGL)."""
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 
 import mujoco
-from PIL import Image
-from PIL import ImageDraw
 
-from pendulum import camera
-from pendulum import Comparison
+try:
+  # Installed wheels expose the sibling as a real package module. This is
+  # independent of the caller's working directory and the script directory.
+  _pendulum = importlib.import_module("mujoco_metal.examples.pendulum")
+except ModuleNotFoundError as error:
+  if error.name != "mujoco_metal.examples":
+    raise
+  # Preserve the documented source-checkout invocation, where examples are
+  # loose files rather than an importable package directory.
+  _sibling = Path(__file__).with_name("pendulum.py")
+  _spec = importlib.util.spec_from_file_location(
+      "_mujoco_metal_pendulum_example", _sibling)
+  if _spec is None or _spec.loader is None:
+    raise ImportError(f"cannot load sibling demo {_sibling}") from error
+  _pendulum = importlib.util.module_from_spec(_spec)
+  _spec.loader.exec_module(_pendulum)
+
+camera = _pendulum.camera
+Comparison = _pendulum.Comparison
 
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("output", type=Path)
   args = parser.parse_args()
+  try:
+    from PIL import Image
+    from PIL import ImageDraw
+  except ImportError as error:
+    raise RuntimeError(
+        "record_pendulum requires the optional Pillow package") from error
   sim = Comparison("metal-hybrid")
   frames = []
   with mujoco.Renderer(sim.model, height=480, width=640) as renderer:

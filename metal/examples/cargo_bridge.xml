@@ -1,6 +1,6 @@
 <mujoco model="cargo_bridge">
   <compiler angle="radian"/>
-  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6" gravity="0 0 -9.81">
+  <option timestep="0.001" integrator="Euler" iterations="1000" tolerance="1e-6" gravity="0 0 -9.81">
     <flag contact="enable" equality="enable" limit="disable" frictionloss="disable"/>
   </option>
   <asset>
@@ -31,7 +31,7 @@
     <!-- Landing stop: normal-only support (condim=1 keeps the 8-point
          box-box manifold within the native 96-row budget); tangential
          restraint comes from the deckA hinge + deck_link connect. -->
-    <pair geom1="deckB_geom" geom2="tray" condim="1" solref="0.006 1" solimp="0.99 0.999 0.001"/>
+    <pair geom1="deckB_geom" geom2="tray" condim="1" solref="0.002 1" solimp="0.99 0.999 0.001"/>
     <pair geom1="payload_geom" geom2="deckA_geom"/>
     <pair geom1="payload_geom" geom2="deckB_geom"/>
     <pair geom1="payload_geom" geom2="tray"/>

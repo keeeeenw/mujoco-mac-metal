@@ -1,85 +1,75 @@
 # Muscle gripper (antagonistic muscle actuation)
 
 Use the [shared source setup](../INSTALL.md#development-source), with its Python
-environment active, and run these commands from the repository root.
-This integrated demo requires current main source; it is not supported by the
-published 0.4.0 wheel alone.
+environment active, and run the commands below from the repository root.
+This integrated demo requires development source; the published 0.4.0 wheel
+alone does not provide it.
 
-A mocap gantry carries two muscle-driven fingers. Each slide joint is driven by
-an antagonistic flexor/extensor pair using MuJoCo muscle dynamics
-(`dyntype="muscle"` with activation state), force-length-velocity gains
-(`gaintype="muscle"`) and passive force biases (`biastype="muscle"`).
-Phase A grasps a red sphere (r=0.055, 0.25 kg), carries it over a walled bin
-and sets it down inside. Phase B grasps a blue sphere (r=0.055, 0.15 kg),
-carries it to a pedestal and sets it down on top. Gantry motion and finger
-schedules are deterministic open-loop inputs identical in CPU/native runs
-(3000 steps, dt=0.002 s). A paired always-open run shows the physical effect
-of grasping. The parallel jaws have small supporting ledges, so carrying does
-not depend on a friction-only pinch. Release heights clear the bin walls and
-pedestal, and the pedestal sits outside the first pickup's jaw sweep. Its
-sphere contact includes rolling resistance to keep the deposited ball from
-rolling off. The simulation starts from the compiled `start` keyframe via
-`sim.reset_to_keyframe`. Rendering uses MuJoCo OpenGL; playback speed is
-presentation only, not a physics throughput claim.
+A mocap gantry carries two muscle-driven slide jaws. Each joint uses an
+antagonistic flexor/extensor pair with MuJoCo muscle activation dynamics,
+force-length-velocity gains and passive force biases. Thin, symmetric support
+ledges carry a 20 g sphere and a 20 g capsule; this is a supported grasp, not a friction-only
+pinch. Phase A delivers the red sphere to the green bin. Phase B delivers the
+blue capsule to a pedestal in the second pickup lane. Both objects have a
+55 mm radius; the horizontal capsule has a 40 mm centerline segment. Their positions advance through contact physics, with no payload
+teleportation, weld or attachment toggle.
 
-Run a CPU reference smoke test:
+The 44-second schedule (22,000 steps at dt=0.002 s) acquires each object while
+stationary, lifts it before transport, lowers it over its receiver, and then
+relaxes the muscles. Ten-second horizontal carries limit acceleration to
+0.048 m/s². The wider bin and separate pickup lanes keep the empty jaws clear
+of the furniture. Slide travel is [-0.018, 0.04] m, giving the pads a 2 mm radial
+gap around a centered payload at closure. The compiled start keyframe is shared
+by the CPU and native paths. Capsule manifolds reserve 128 constraint rows;
+the demo explicitly requests the 256-row block-solver budget rather than
+truncating contacts to fit the small-model default.
 
-```bash
-PYTHONPATH=metal python metal/examples/muscle_gripper.py --mode cpu --headless --steps 3000
-```
-
-Run the native Metal comparison check on an Apple Silicon Mac:
+Run the complete CPU reference delivery and geometry check:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/muscle_gripper.py --headless --check --steps 3000
+PYTHONPATH=metal:metal/examples python metal/examples/muscle_gripper.py --mode cpu --headless --check
 ```
 
-Record the side-by-side native Metal and CPU MuJoCo renders (left panel native,
-right CPU):
+Run the complete native Metal comparison check on an Apple Silicon Mac:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/muscle_gripper.py --record metal/examples/assets/muscle_gripper.gif --steps 3000
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/muscle_gripper.py --headless --check
 ```
 
-Launch the interactive viewer on a Mac (requires a display; headless
-verification uses `--headless --check` plus the GIF below):
+Record genuine side-by-side native Metal and CPU MuJoCo renders:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples mjpython metal/examples/muscle_gripper.py --steps 3000
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/muscle_gripper.py --record metal/examples/assets/muscle_gripper.gif
 ```
 
-Add `--viewer-seconds 20` to auto-close after 20 s of wall time for explicit
-visual checks (without it, the viewer runs the finite `steps` rollout, then
-closes; interactive visual validation additionally requires a display and is
-otherwise unverified here). The viewer steps the native simulation with the deterministic
-schedule and reports native/CPU divergence live.
+Launch the native interactive viewer (requires a display):
 
-![Muscle gripper](assets/muscle_gripper.gif)
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples mjpython metal/examples/muscle_gripper.py
+```
 
-The `--headless --check` run asserts actual native behavior: muscle activation
-state advances on device, finger contacts occur on grasp steps, the released
-ball lands inside the bin footprint while the always-open counterfactual stays
-outside, and the second ball lands on the pedestal top.
+Add `--viewer-seconds 20` to close after 20 seconds of wall time. Shorter
+`--steps` values can inspect part of the motion, but `--check` requires the
+complete schedule and refuses to certify an incomplete rollout. Rendering uses
+MuJoCo OpenGL; presentation speed is not a physics throughput measurement.
+Lighting and the checkerboard match the robotic marble music machine.
 
-The demo checks the moving palm, jaws and ledges against the floor, bin and
-pedestal throughout the native rollout, using geometry-distance queries on a
-separate CPU model. Those queries also cover pairs omitted from collision
-filtering; they do not advance the native physics. Output separates the
-minimum unnudged geometry query from a conservative lower bound built from
-nearby pose samples and analytic slab bounds; the reported uncertainty is the
-maximum nudge radius (0.5 mm), not a substitute for either distance value.
-The CPU regression suite replays the complete schedule, verifies both
-deliveries and furniture clearance, and drives empty jaws through all 16
-corners of the four-muscle [0, 1] control box. Both slide joints retain their
-[-0.065, 0.04] m travel interval. The two 48 mm support ledges flank a 2 mm
-center gap, and the finger pads stop 2 mm above their ledge tops. This geometry
-supports the balls while keeping ledge-ledge and ledge-opposite-jaw pairs
-separated through symmetric empty closure. Finger-finger, ledge-ledge and
-ledge-opposite-jaw pairs are checked for penetration at every tested control
-corner and trajectory step. Attached jaw parts intentionally meet at their
-mechanical joints. Slide limits remain compliant, so joint-limit travel is
-reported separately from geometry clearance.
+The revised full CPU schedule passes delivery, furniture clearance and the
+1 mm contact-penetration limit. Empty-jaw checks exercise all 16 corners of the
+four-muscle [0,1] control box. Independent native qualification and the updated
+comparison GIF for this revised scene are still pending.
 
-Lighting and the dark checkerboard match the robotic marble music machine.
-This is a deterministic open-loop manipulation demo, not a qualified general
-purpose grasp controller or a friction-only pinch benchmark.
+The report separates geometry-distance queries from actual solver contact
+distances. Queries run on a separate CPU model and cover even pairs omitted
+from collision filtering; they do not advance native physics. Output also
+separates the unnudged query, a conservative lower bound, and the pose-sampling
+uncertainty (at most 0.5 mm). Functional grasp/rest contacts must penetrate less
+than 1 mm; compliant joint-limit overshoot is reported separately. Attached
+parts intentionally meet at their mechanical joints.
+
+In native mode, contact counts and contact penetration are read from the
+actual native solver. The CPU oracle's contact counts are reported separately.
+Checks require both payloads to lift and arrive at their receivers, and compare
+with a paired always-open rollout that cannot make the deliveries. This is a
+deterministic open-loop manipulation demonstration, not a qualified general
+purpose grasp controller.

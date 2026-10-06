@@ -5,7 +5,7 @@
 Two deck sections (deckA hinged to frame, deckB free) are joined through a
 ball-like connect constraint at midspan and latched to the world frame through
 a weld brace (deckB-to-world). A payload sphere rests on the decks. At
-release step 50 (t=0.1s) the brace weld is released via the public
+release step 100 (t=0.1s) the brace weld is released via the public
 set_equality_active API; the connected sections articulate under gravity,
 deckB lands on the solid tray stop (explicit deck-tray contact, no
 pass-through), and the payload shifts along the bridge but remains aboard.
@@ -21,7 +21,7 @@ import mujoco
 import numpy as np
 
 PROFILE = "integrated_euler_v1"
-RELEASE_STEP = 50
+RELEASE_STEP = 100
 
 
 def _load_model():
@@ -53,7 +53,7 @@ def _anchor_residuals(model, data):
   return connect_err, weld_trans_err
 
 
-def run(steps=1200, mode="metal", check=False, record=None, release_step=RELEASE_STEP):
+def run(steps=2400, mode="metal", check=False, record=None, release_step=RELEASE_STEP):
   if mode not in ("metal", "cpu"):
     raise ValueError(f"Unknown mode {mode!r}")
   model = _load_model()
@@ -239,10 +239,15 @@ def run(steps=1200, mode="metal", check=False, record=None, release_step=RELEASE
       "minimum_geometry_distance": clearance.minimum,
       "conservative_geometry_distance_lower_bound": clearance.reported,
       "geometry_distance_uncertainty_bound": clearance.uncertainty,
+      # clearance.sample receives accepted native qpos in Metal mode. This is
+      # the measured overlap of deckB_geom/tray, independent of its collision
+      # masks and separate from the conservative clearance lower bound.
+      "max_actual_deck_tray_overlap_m": max(
+          0.0, -float(clearance.minimum["deckB_geom/tray"])),
   }
   if check:
     # Impact contact is compliant; reject gross overlap through the stop.
-    clearance.check(allowed_penetration=0.007)
+    clearance.check(allowed_penetration=0.0015)
   if check and mode == "metal":
     # Actual native latch force carries load when latched, removed after release.
     assert native_latch_force_before > 1.0, native_latch_force_before
@@ -282,7 +287,7 @@ def run(steps=1200, mode="metal", check=False, record=None, release_step=RELEASE
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--steps", type=int, default=1200)
+  parser.add_argument("--steps", type=int, default=2400)
   parser.add_argument("--mode", choices=["metal", "cpu"], default="metal")
   parser.add_argument("--headless", action="store_true")
   parser.add_argument("--check", action="store_true", help="check native/CPU rollout")

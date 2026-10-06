@@ -1,6 +1,6 @@
 <mujoco model="suspension_platform">
   <compiler angle="radian"/>
-  <option timestep="0.002" integrator="Euler" iterations="1000" tolerance="1e-6" gravity="0 0 -9.81">
+  <option timestep="0.0005" integrator="Euler" iterations="1000" tolerance="1e-6" gravity="0 0 -9.81">
     <flag contact="enable" equality="enable" limit="enable" frictionloss="disable"/>
   </option>
   <asset>
@@ -19,7 +19,7 @@
       <site name="c3" pos="0.4 -0.3 -0.03"/>
       <geom name="strut_mount" type="capsule" fromto="0 0 -0.03 0 -0.5 -0.03" size="0.025" mass="0" contype="0" conaffinity="0" rgba="0.5 0.5 0.55 1"/>
       <body name="strut" pos="0 -0.5 -0.03">
-        <joint name="swivel" type="ball" limited="true" range="0 0.28"/>
+        <joint name="swivel" type="ball" limited="true" range="0 0.2788" solreflimit="0.001 1" solimplimit="0.999 0.9999 0.0001"/>
         <geom name="strut_geom" type="capsule" size="0.02 0.25" pos="0 0 -0.25" rgba="0.8 0.6 0.2 1" mass="0.2" contype="0" conaffinity="0"/>
         <geom name="bob_geom" type="sphere" size="0.05" pos="0 0 -0.5" rgba="0.8 0.6 0.2 1" mass="0.3" contype="0" conaffinity="0"/>
       </body>
@@ -51,7 +51,7 @@
     <spatial name="cable2" stiffness="200" damping="8" springlength="0.62 0.62">
       <site site="c2"/><site site="p2"/>
     </spatial>
-    <spatial name="cable3" stiffness="200" damping="8" springlength="0.62 0.62" limited="true" range="0 0.66">
+    <spatial name="cable3" stiffness="200" damping="8" springlength="0.62 0.62" limited="true" range="0 0.6578" solreflimit="0.001 1" solimplimit="0.999 0.9999 0.0001">
       <site site="c3"/><site site="p3"/>
     </spatial>
   </tendon>

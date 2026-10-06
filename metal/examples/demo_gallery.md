@@ -12,6 +12,7 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [Friction laboratory](friction_laboratory.md) | Low, medium, and high friction turn sliding into rolling at different rates | Pyramidal condim-3 contact |
 | [Spin-and-Grip arcade](spin_and_grip.md) | A rolling sphere slows, a spinning sphere loses spin, and an actuated press holds and releases a sliding block | Integrated elliptic condim-4/6 torsional and rolling friction; condim-3 press contact |
 | [Sensor scanning rig](scanning_rig.md) | A pan/tilt scanner plots its measured pose and direction | Current-state frame, gyro and velocity sensors |
+| [Haptic calligraphy](haptic_calligraphy.md) | A two-link arm follows a moving pen target while showing measured position, velocity and force | Native site-feedback FORCE extension and Jacobian-transpose wrench projection |
 | [Cable plotter](cable_plotter.md) | Crossed tendons guide an XY pen around a figure eight | Fixed-joint tendon servos |
 | [Clockwork automaton](clockwork_automaton.md) | Counter-rotating gears and a sequenced pawl | Polynomial joint equality, limits and dry joint friction |
 | [Current-driven bodies](fluid_buoys.md) | Colorful shapes drift and rotate in a current | MuJoCo inertia-box fluid drag and viscosity |
@@ -26,7 +27,6 @@ simulations with CPU MuJoCo reference checks; the clips are not benchmarks.
 | [SDF screw chute](sdf_chute.md) | Three balls traverse a helical SDF chute to the floor | SDF collision: Halton/descent witnesses vs spheres |
 | [Friction carousel](friction_carousel.md) | A high-grip box stack rides a turntable while a low-grip sphere slips and rolls off | Solver completion: warm starts, convergence history, no-slip subsumption across grip stations |
 | [Tide jellyfish](tide_jellyfish.md) | Filter-driven fins flap in modeled fluid while a passive sphere drifts with the current | Integrators/passive: geom ellipsoid fluid + lift, stateful actuation, Euler trajectory parity |
-| [Latch-and-release cargo bridge](cargo_bridge.md) | Two deck sections joined by a connect constraint unlatch a weld brace and spill a payload into a tray | Connect/weld equalities with per-environment activation, coupled contact solve |
 | [Magnetic crane](magnetic_crane.md) | A mocap hook carries a welded cargo box to a bin and releases it | Per-environment mocap inputs, weld attach/release, keyframe reset |
 | [Muscle-powered gripper](muscle_gripper.md) | Parallel jaws with supporting ledges, bin delivery and pedestal placement | Stateful actuation and contact-rich manipulation |
 | [Cable drawbridge](cable_drawbridge.md) | A routed cable hauls, goes slack and re-tensions a loaded deck | Spatial tendon wrapping, pulley division and spring/damping forces |

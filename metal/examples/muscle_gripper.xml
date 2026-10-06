@@ -11,34 +11,34 @@
     <light directional="true" pos="0 -2 5" dir="0 0.3 -1" diffuse="0.9 0.9 0.9" specular="0.3 0.3 0.3"/>
 
     <geom material="floor_material" name="floor" type="plane" size="5 5 0.1" pos="0 0 0" condim="1" priority="1" contype="1" conaffinity="0"/>
-    <body name="pedestal" pos="-0.5 0 0">
+    <body name="pedestal" pos="-0.5 0.3 0">
       <geom name="pedestal_geom" type="box" size="0.12 0.07 0.1" pos="0 0 0.1" rgba="0.5 0.5 0.55 1" mass="0" contype="1" conaffinity="0" condim="3"/>
     </body>
     <body name="bin" pos="0.62 0 0">
-      <geom name="bin_geom" type="box" size="0.12 0.12 0.04" pos="0 0 0.04" rgba="0.1 0.7 0.2 1" mass="0" condim="1" priority="1" contype="1" conaffinity="0"/>
-      <geom name="wallL_geom" type="box" size="0.02 0.12 0.08" pos="-0.13 0 0.12" rgba="0.1 0.6 0.2 1" mass="0" contype="1" conaffinity="0" condim="3"/>
-      <geom name="wallR_geom" type="box" size="0.02 0.12 0.08" pos="0.13 0 0.12" rgba="0.1 0.6 0.2 1" mass="0" contype="1" conaffinity="0" condim="3"/>
+      <geom name="bin_geom" type="box" size="0.20 0.12 0.04" pos="0 0 0.04" rgba="0.1 0.7 0.2 1" mass="0" condim="1" priority="1" contype="1" conaffinity="0"/>
+      <geom name="wallL_geom" type="box" size="0.02 0.12 0.08" pos="-0.21 0 0.12" rgba="0.1 0.6 0.2 1" mass="0" contype="1" conaffinity="0" condim="3"/>
+      <geom name="wallR_geom" type="box" size="0.02 0.12 0.08" pos="0.21 0 0.12" rgba="0.1 0.6 0.2 1" mass="0" contype="1" conaffinity="0" condim="3"/>
     </body>
     <body name="gantry" pos="0 0 0.62" mocap="true">
       <geom name="palm_geom" type="box" size="0.13 0.05 0.03" rgba="0.85 0.55 0.15 1" mass="0.3" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
       <body name="fingerL" pos="-0.095 0 -0.02">
-        <joint name="gripL" type="slide" axis="-1 0 0" limited="true" range="-0.065 0.04" damping="1.0"/>
+        <joint name="gripL" type="slide" axis="-1 0 0" limited="true" range="-0.018 0.04" damping="8.0" solreflimit="0.003 1"/>
         <geom name="fingerL_geom" type="box" size="0.02 0.04 0.09" pos="0 0 -0.02" rgba="0.9 0.5 0.1 1" mass="0.15" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
-        <geom name="ledgeL" type="box" size="0.035 0.024 0.008" pos="0.025 0.025 -0.12" mass="0" contype="1" conaffinity="0" rgba="0.9 0.6 0.2 1"/>
+        <geom name="ledgeL" type="box" size="0.01 0.03 0.002" pos="0.04 0 -0.12" mass="0" contype="1" conaffinity="0" rgba="0.9 0.6 0.2 1"/>
       </body>
       <body name="fingerR" pos="0.095 0 -0.02">
-        <joint name="gripR" type="slide" axis="1 0 0" limited="true" range="-0.065 0.04" damping="1.0"/>
+        <joint name="gripR" type="slide" axis="1 0 0" limited="true" range="-0.018 0.04" damping="8.0" solreflimit="0.003 1"/>
         <geom name="fingerR_geom" type="box" size="0.02 0.04 0.09" pos="0 0 -0.02" rgba="0.85 0.55 0.15 1" mass="0.15" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
-        <geom name="ledgeR" type="box" size="0.035 0.024 0.008" pos="-0.025 -0.025 -0.12" mass="0" contype="1" conaffinity="0" rgba="0.9 0.6 0.2 1"/>
+        <geom name="ledgeR" type="box" size="0.01 0.03 0.002" pos="-0.04 0 -0.12" mass="0" contype="1" conaffinity="0" rgba="0.9 0.6 0.2 1"/>
       </body>
     </body>
     <body name="ball" pos="0 0 0.055">
       <freejoint name="ball_free"/>
-      <geom name="ball_geom" type="sphere" size="0.055" rgba="0.9 0.1 0.1 1" mass="0.25" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
+      <geom name="ball_geom" type="sphere" size="0.055" rgba="0.9 0.1 0.1 1" mass="0.02" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
     </body>
-    <body name="ball2" pos="0.3 0 0.055">
+    <body name="ball2" pos="0.3 0.3 0.055">
       <freejoint name="ball2_free"/>
-      <geom name="ball2_geom" type="sphere" size="0.055" rgba="0.2 0.5 0.9 1" mass="0.15" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
+      <geom name="ball2_geom" type="capsule" size="0.055 0.02" quat="0.7071067811865476 0.7071067811865476 0 0" rgba="0.2 0.5 0.9 1" mass="0.02" friction="2.0 0.05 0.02" contype="1" conaffinity="0" condim="3"/>
     </body>
   </worldbody>
   <contact>
@@ -60,12 +60,12 @@
     <pair solref="0.006 1" solimp="0.95 0.99 0.001" geom1="ball_geom" geom2="floor"/>
   </contact>
   <actuator>
-    <general joint="gripL" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="1" ctrllimited="true" ctrlrange="0 1"/>
-    <general joint="gripL" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="-1" ctrllimited="true" ctrlrange="0 1"/>
-    <general joint="gripR" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="1" ctrllimited="true" ctrlrange="0 1"/>
-    <general joint="gripR" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 25 25 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="-1" ctrllimited="true" ctrlrange="0 1"/>
+    <general joint="gripL" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 2 2 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 2 2 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="1" ctrllimited="true" ctrlrange="0 1"/>
+    <general joint="gripL" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 2 2 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 2 2 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="-1" ctrllimited="true" ctrlrange="0 1"/>
+    <general joint="gripR" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 2 2 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 2 2 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="1" ctrllimited="true" ctrlrange="0 1"/>
+    <general joint="gripR" dyntype="muscle" dynprm="0.01 0.04 0.01" gaintype="muscle" gainprm="0.6 1.4 2 2 0.5 1.5 1 1 1.2 0" biastype="muscle" biasprm="0.6 1.4 2 2 0.5 1.5 1 1 1.2 0" lengthrange="-0.6 0.6" gear="-1" ctrllimited="true" ctrlrange="0 1"/>
   </actuator>
   <keyframe>
-    <key name="start" qpos="0.04 0.04 0 0 0.055 1 0 0 0 0.3 0 0.055 1 0 0 0" mpos="0 0 0.62" mquat="1 0 0 0" act="0 0 0 0"/>
+    <key name="start" qpos="0.04 0.04 0 0 0.055 1 0 0 0 0.3 0.3 0.055 1 0 0 0" mpos="0 0 0.62" mquat="1 0 0 0" act="0 0 0 0"/>
   </keyframe>
 </mujoco>

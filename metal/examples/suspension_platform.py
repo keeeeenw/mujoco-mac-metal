@@ -21,7 +21,11 @@ import numpy as np
 
 PROFILE = "integrated_euler_v1"
 TILT_AMP = 0.35
-TILT_PERIOD = 400
+TILT_PERIOD = 1600
+NOMINAL_STRUT_STOP = 0.28
+NOMINAL_CABLE_LIMIT = 0.66
+STRUT_CONFIGURED_STOP = 0.2788
+CABLE_CONFIGURED_LIMIT = 0.6578
 
 
 def _load_model():
@@ -44,7 +48,17 @@ def _strut_angle(qpos):
   return 2.0 * math.acos(min(1.0, abs(q[0])))
 
 
-def run(steps=1200, mode="metal", check=False, record=None):
+def _tendon_length_at(model, data, qpos, mocap_pos, mocap_quat, tendon_id):
+  """Query a tendon length at an accepted state without advancing physics."""
+  data.qpos[:] = qpos
+  data.mocap_pos[:] = mocap_pos
+  data.mocap_quat[:] = mocap_quat
+  mujoco.mj_kinematics(model, data)
+  mujoco.mj_tendon(model, data)
+  return float(data.ten_length[tendon_id])
+
+
+def run(steps=4800, mode="metal", check=False, record=None):
   if mode not in ("metal", "cpu"):
     raise ValueError(f"Unknown mode {mode!r}")
   model = _load_model()
@@ -96,8 +110,10 @@ def run(steps=1200, mode="metal", check=False, record=None):
   max_rigid_quat_err = 0.0
   end_rigid_quat_err = 0.0
   nat_strut_peak = 0.0
+  nat_cable_peak = 0.0
   nat_strut_hits = 0
   _AXIS = np.array([0.0, 0.0, -1.0])
+  native_query = mujoco.MjData(model) if native is not None else None
 
   for step in range(steps):
     quat = _carrier_quat(step)
@@ -112,9 +128,9 @@ def run(steps=1200, mode="metal", check=False, record=None):
     mujoco.mj_step(model, cpu_level)
     strut_peak = max(strut_peak, _strut_angle(cpu_swing.qpos))
     cable_peak = max(cable_peak, float(np.asarray(cpu_swing.ten_length)[3]))
-    if _strut_angle(cpu_swing.qpos) > 0.28 - 1e-9:
+    if _strut_angle(cpu_swing.qpos) > STRUT_CONFIGURED_STOP - 1e-9:
       strut_hits += 1
-    if float(np.asarray(cpu_swing.ten_length)[3]) > 0.66 - 1e-9:
+    if float(np.asarray(cpu_swing.ten_length)[3]) > CABLE_CONFIGURED_LIMIT - 1e-9:
       cable_hits += 1
     for c in range(cpu_swing.ncon):
       g1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(cpu_swing.contact[c].geom[0]))
@@ -150,7 +166,15 @@ def run(steps=1200, mode="metal", check=False, record=None):
       max_qpos_err = max(max_qpos_err, float(np.max(np.abs(gq - cpu_swing.qpos))))
       ns = _strut_angle(gq)
       nat_strut_peak = max(nat_strut_peak, ns)
-      if ns > 0.28 - 1e-9:
+      # Measure the cable from the accepted native qpos. This is a kinematic
+      # query only; MuJoCo does not advance this scratch state. Keeping it
+      # separate from cpu_swing.ten_length prevents CPU trajectory values
+      # from standing in for the native limit response.
+      native_cable = _tendon_length_at(
+          model, native_query, gq, np.asarray([base_pos]),
+          np.asarray([quat]), 3)
+      nat_cable_peak = max(nat_cable_peak, native_cable)
+      if ns > STRUT_CONFIGURED_STOP - 1e-9:
         nat_strut_hits += 1
       if step == steps - 1:
         end_pos_err, end_quat_err = epos, equat
@@ -187,6 +211,12 @@ def run(steps=1200, mode="metal", check=False, record=None):
     swing = (float(np.max(np.abs(cpu_swing.qpos[plat_idx:plat_idx + 1]))), float(cpu_swing.qpos[cargo_idx + 2]))
     level = (float(np.max(np.abs(cpu_level.qpos[plat_idx:plat_idx + 1]))), float(cpu_level.qpos[cargo_idx + 2]))
 
+  strut_tip_overrun = max(0.0, strut_peak - NOMINAL_STRUT_STOP) * 0.5
+  cable_limit_overrun = max(0.0, cable_peak - NOMINAL_CABLE_LIMIT)
+  native_strut_tip_overrun = max(
+      0.0, nat_strut_peak - NOMINAL_STRUT_STOP) * 0.5
+  native_cable_limit_overrun = max(
+      0.0, nat_cable_peak - NOMINAL_CABLE_LIMIT)
   result = {
       "max_qpos_err": max_qpos_err,
       "max_pos_err": max_pos_err,
@@ -198,7 +228,15 @@ def run(steps=1200, mode="metal", check=False, record=None):
       "end_tilt_err": end_tilt_err,
       "end_rigid_quat_err": end_rigid_quat_err,
       "nat_strut_peak": nat_strut_peak,
+      "nat_cable_peak": nat_cable_peak if native is not None else None,
       "nat_strut_hits": nat_strut_hits,
+      "strut_configured_stop": STRUT_CONFIGURED_STOP,
+      "cable_configured_limit": CABLE_CONFIGURED_LIMIT,
+      "strut_tip_overrun_m": strut_tip_overrun,
+      "cable_limit_overrun_m": cable_limit_overrun,
+      "native_strut_tip_overrun_m": native_strut_tip_overrun,
+      "native_cable_limit_overrun_m": (
+          native_cable_limit_overrun if native is not None else None),
       "strut_peak": strut_peak,
       "cable_peak": cable_peak,
       "cargo_contacts": cargo_contacts,
@@ -210,6 +248,10 @@ def run(steps=1200, mode="metal", check=False, record=None):
       "minimum_geometry_distance": clearance.minimum,
       "conservative_geometry_distance_lower_bound": clearance.reported,
       "geometry_distance_uncertainty_bound": clearance.uncertainty,
+      # These strict distances are evaluated at accepted qpos (native qpos in
+      # Metal mode); the lower-bound ensemble is reported separately.
+      "max_actual_hardware_overlap_m": max(
+          0.0, -min(float(value) for value in clearance.minimum.values())),
   }
   if check:
     clearance.check()
@@ -224,10 +266,15 @@ def run(steps=1200, mode="metal", check=False, record=None):
     assert max_tilt_err < 8e-2, max_tilt_err
     assert end_pos_err < 5e-3 and end_rigid_quat_err < 5e-3, (end_pos_err, end_rigid_quat_err)
     assert end_tilt_err < 5e-2, end_tilt_err
-    assert nat_strut_peak > 0.28, nat_strut_peak  # native ball stop engaged
+    assert nat_strut_peak > STRUT_CONFIGURED_STOP, nat_strut_peak
     assert nat_strut_hits > 100, nat_strut_hits
-    assert strut_peak > 0.28, strut_peak  # ball stop engaged
-    assert cable_peak > 0.66, cable_peak  # cable limit engaged
+    assert nat_cable_peak > CABLE_CONFIGURED_LIMIT, nat_cable_peak
+    assert strut_peak > STRUT_CONFIGURED_STOP, strut_peak
+    assert cable_peak > CABLE_CONFIGURED_LIMIT, cable_peak
+    assert native_strut_tip_overrun <= 0.001, native_strut_tip_overrun
+    assert strut_tip_overrun <= 0.001, strut_tip_overrun
+    assert cable_limit_overrun <= 0.001, cable_limit_overrun
+    assert native_cable_limit_overrun <= 0.001, native_cable_limit_overrun
     assert cargo_contacts > 100, cargo_contacts
     assert swing[0] > 0.02 or swing[1] > 1.0, swing  # platform moves
     assert level[0] < 0.035, level  # level hold stays put (settle transient)
@@ -236,7 +283,7 @@ def run(steps=1200, mode="metal", check=False, record=None):
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--steps", type=int, default=1200)
+  parser.add_argument("--steps", type=int, default=4800)
   parser.add_argument("--mode", choices=["metal", "cpu"], default="metal")
   parser.add_argument("--headless", action="store_true")
   parser.add_argument("--check", action="store_true", help="check native/CPU rollout")

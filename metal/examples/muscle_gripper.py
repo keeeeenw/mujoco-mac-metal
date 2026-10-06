@@ -6,7 +6,7 @@ A mocap gantry carries two muscle-driven fingers (antagonistic flexor/
 extensor pairs with MuJoCo muscle dynamics, force-length-velocity gains and
 passive biases). Parallel jaws include supporting ledges; the schedule clears
 the bin walls and pedestal. Phase A delivers a sphere to a bin (grasp, carry,
-release). Phase B delivers a second sphere onto a pedestal (grasp,
+release). Phase B delivers a horizontal capsule onto a pedestal (grasp,
 carry, set-down release). Gantry motion and finger schedules are deterministic
 open-loop inputs identical in CPU/native runs; a paired always-open run shows
 the physical effect of grasping.
@@ -19,36 +19,41 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from mujoco_metal.capacity import CapacityLimits
+
+# Capsule manifolds need more reserved rows than the small-model default.
+# The explicit budget uses the tiled block path; it never truncates contacts.
+DEMO_LIMITS = CapacityLimits(max_rows=256)
 PROFILE = "integrated_euler_v1"
 
-OPEN = [0.05, 0.9, 0.05, 0.9]
-TOUCH = [0.6, 0.2, 0.6, 0.2]
-FIRM = [1.0, 0.0, 1.0, 0.0]
-RELEASE = [0.05, 0.5, 0.05, 0.5]
-CHANNEL = [0.35, 0.45, 0.35, 0.45]
+OPEN = [0.02, 0.6, 0.02, 0.6]
+FIRM = [0.65, 0.02, 0.65, 0.02]
 
-# (step, x, z, ctrl)
+# (step, x, y, z, ctrl), dt=0.002 s. Acquire while stationary, lift,
+# carry with bounded acceleration, lower over the receiver, then open.
+# Separate pickup lanes keep the returning empty jaws clear of the bin walls.
 WPS = [
-    (0, 0.0, 0.62, OPEN),
-    (100, 0.0, 0.62, OPEN),
-    (250, 0.0, 0.15, OPEN),
-    (350, 0.0, 0.15, TOUCH),
-    (500, 0.0, 0.15, FIRM),
-    (700, 0.53, 0.40, FIRM),
-    (1000, 0.53, 0.40, FIRM),
-    (1100, 0.53, 0.37, FIRM),
-    (1150, 0.53, 0.37, OPEN),
-    (1300, 0.53, 0.45, OPEN),
-    (1450, 0.30, 0.45, OPEN),
-    (1600, 0.30, 0.15, OPEN),
-    (1750, 0.30, 0.15, FIRM),
-    (1900, 0.30, 0.40, FIRM),
-    (2400, -0.5, 0.40, FIRM),
-    (2500, -0.5, 0.38, FIRM),
-    (2550, -0.5, 0.38, OPEN),
-    (2700, -0.5, 0.50, OPEN),
-    (3000, -0.5, 0.50, OPEN),
+    (0, 0.0, 0.0, 0.62, OPEN),
+    (500, 0.0, 0.0, 0.62, OPEN),
+    (1500, 0.0, 0.0, 0.15, OPEN),
+    (2500, 0.0, 0.0, 0.15, FIRM),
+    (3500, 0.0, 0.0, 0.40, FIRM),
+    (8500, 0.62, 0.0, 0.40, FIRM),
+    (9500, 0.62, 0.0, 0.23, FIRM),
+    (10000, 0.62, 0.0, 0.23, OPEN),
+    (10500, 0.62, 0.0, 0.50, OPEN),
+    (11500, 0.30, 0.30, 0.50, OPEN),
+    (12500, 0.30, 0.30, 0.15, OPEN),
+    (13500, 0.30, 0.30, 0.15, FIRM),
+    (14500, 0.30, 0.30, 0.40, FIRM),
+    (19500, -0.5, 0.30, 0.40, FIRM),
+    (20500, -0.5, 0.30, 0.35, FIRM),
+    (21000, -0.5, 0.30, 0.35, OPEN),
+    (21500, -0.5, 0.30, 0.50, OPEN),
+    (22000, -0.5, 0.30, 0.50, OPEN),
 ]
+DEFAULT_STEPS = WPS[-1][0]
+FUNCTIONAL_PENETRATION_LIMIT = 0.001  # metres; do not hide visible clipping.
 
 
 def _load_model():
@@ -63,16 +68,14 @@ def _load_model():
 
 def _sched(step):
   if step <= WPS[0][0]:
-    return np.array([WPS[0][1], 0, WPS[0][2]]), WPS[0][3]
-  for k in range(len(WPS) - 1):
-    t0, x0, z0, _ = WPS[k]
-    t1, x1, z1, _ = WPS[k + 1]
-    if step <= t1:
-      s = (step - t0) / max(1, t1 - t0)
+    return np.asarray(WPS[0][1:4], dtype=float), WPS[0][4]
+  for left, right in zip(WPS, WPS[1:]):
+    if step <= right[0]:
+      s = (step - left[0]) / (right[0] - left[0])
       e = s * s * (3 - 2 * s)
-      u = WPS[k + 1][3] if s > 0 else WPS[k][3]
-      return np.array([x0 + (x1 - x0) * e, 0, z0 + (z1 - z0) * e]), u
-  return np.array([WPS[-1][1], 0, WPS[-1][2]]), WPS[-1][3]
+      start, end = np.asarray(left[1:4]), np.asarray(right[1:4])
+      return start + e * (end - start), right[4] if s > 0 else left[4]
+  return np.asarray(WPS[-1][1:4], dtype=float), WPS[-1][4]
 
 
 def _clearance_monitor(model):
@@ -157,9 +160,11 @@ def _state_error_breakdown(model, qpos_a, qvel_a, qpos_b, qvel_b):
   return errors
 
 
-def run(steps=3000, mode="metal", check=False, record=None):
+def run(steps=DEFAULT_STEPS, mode="metal", check=False, record=None):
   if mode not in ("metal", "cpu"):
     raise ValueError(f"Unknown mode {mode!r}")
+  if check and steps < DEFAULT_STEPS:
+    raise ValueError(f"complete demo checks require at least {DEFAULT_STEPS} steps")
   model = _load_model()
   qpos0 = model.qpos0.copy().astype(np.float32)
   qvel0 = np.zeros(model.nv, dtype=np.float32)
@@ -167,7 +172,7 @@ def run(steps=3000, mode="metal", check=False, record=None):
   native = None
   if mode == "metal":
     from mujoco_metal import MetalSimulation
-    native = MetalSimulation(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :], profile=PROFILE)
+    native = MetalSimulation(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :], profile=PROFILE, limits=DEMO_LIMITS)
     native.reset_to_keyframe(0)
 
   cpu_grasp = mujoco.MjData(model)
@@ -182,8 +187,20 @@ def run(steps=3000, mode="metal", check=False, record=None):
   finger_geoms = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n)
                   for n in ("fingerL_geom", "fingerR_geom")]
 
+  support_geoms = set(finger_geoms + [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+                                     for name in ("ledgeL", "ledgeR")])
+  native_slot_pairs = []
+  native_contact_counts = {"payload_support_steps": 0, "red_bin_steps": 0}
+  max_actual_contact_penetration = {"cpu": 0.0, "metal": 0.0}
+  if native is not None:
+    descriptor = native._coupled_constraints.descriptor
+    for index in range(descriptor.npairs):
+      pair = (int(descriptor.geom1[index]), int(descriptor.geom2[index]))
+      native_slot_pairs.extend([pair] * int(descriptor.pair_contact_offset[index + 1]
+                                           - descriptor.pair_contact_offset[index]))
+
   # Clearance (must stay separated): gripper hardware vs furniture, jaw
-  # self-pairs (finger-finger, ledge-ledge across the staggered fork,
+  # self-pairs (finger-finger, ledge-ledge across the split support,
   # ledges vs opposite jaws), cross-station balls, and ball-ball.
   # Mechanical slide joints (palm shafts through finger tracks) and rigid
   # same-body attachments are excluded by design (documented, not contacts).
@@ -195,7 +212,7 @@ def run(steps=3000, mode="metal", check=False, record=None):
   if record:
     from demo_recording import ComparisonRecorder
     recorder = ComparisonRecorder(model, record, "Muscle Gripper | Grasp and Carry",
-                                  [0.1, 0, 0.30], 1.8, azimuth=110, elevation=-30)
+                                  [0.1, 0.15, 0.30], 2.1, azimuth=110, elevation=-30)
 
   max_qpos_err = 0.0; max_qvel_err = 0.0
   max_act_err = 0.0
@@ -217,6 +234,8 @@ def run(steps=3000, mode="metal", check=False, record=None):
   ball_bin_hits = 0
   latched_bin_hits = 0
   finger_contacts = 0
+  support_contact_steps = 0
+  first_red_ball_support_contact_step = None
   first_finger_contact_step = None
   first_red_ball_finger_contact_step = None
   first_red_ball_bin_contact_step = None
@@ -228,6 +247,7 @@ def run(steps=3000, mode="metal", check=False, record=None):
   lo_R, hi_R = float(model.jnt_range[gripR_id][0]), float(model.jnt_range[gripR_id][1])
   min_limit_margin = 1.0
 
+  peak_payload_heights = {"ball": 0.0, "ball2": 0.0}
   for step in range(steps):
     target, ctrl = _sched(step)
     t32 = target.astype(np.float32)
@@ -241,7 +261,7 @@ def run(steps=3000, mode="metal", check=False, record=None):
     cpu_open.mocap_pos[0] = target
     cpu_open.ctrl[:] = OPEN
     mujoco.mj_step(model, cpu_open)
-    grasped = step >= 350
+    grasped = step > WPS[2][0]
     if native is not None:
       gq = native.state.qpos[0].cpu().numpy()
       gv = native.state.qvel[0].cpu().numpy()
@@ -266,6 +286,27 @@ def run(steps=3000, mode="metal", check=False, record=None):
       if step < 100:
         pre_qpos_err = max(pre_qpos_err, step_qpos_err)
         pre_qvel_err = max(pre_qvel_err, step_qvel_err)
+    if native is not None:
+      # Read observation metadata from the actual native solve, not the CPU
+      # oracle. Host queries here are demo validation, outside throughput claims.
+      contacts = native._last_coupled
+      if contacts is None or "contact_mask" not in contacts:
+        raise RuntimeError("native contact observation metadata is unavailable")
+      mask = contacts["contact_mask"][0].cpu().numpy()
+      distances = contacts["contact_distance"][0].cpu().numpy()
+      max_actual_contact_penetration["metal"] = max(
+          max_actual_contact_penetration["metal"],
+          float(np.max(np.maximum(-distances[mask > 0.5], 0), initial=0)))
+      active_pairs = [native_slot_pairs[i] for i in np.flatnonzero(mask > 0.5)]
+      native_contact_counts["payload_support_steps"] += int(any(
+          (g1 in (ball_geom, block_geom) and g2 in support_geoms)
+          or (g2 in (ball_geom, block_geom) and g1 in support_geoms)
+          for g1,g2 in active_pairs))
+      native_contact_counts["red_bin_steps"] += int(any(
+          {g1,g2} == {ball_geom,bin_geom} for g1,g2 in active_pairs))
+    measured_qpos = native.state.qpos[0].cpu().numpy() if native is not None else cpu_grasp.qpos
+    peak_payload_heights["ball"] = max(peak_payload_heights["ball"], float(measured_qpos[4]))
+    peak_payload_heights["ball2"] = max(peak_payload_heights["ball2"], float(measured_qpos[11]))
     for c in range(cpu_grasp.ncon):
       g1, g2 = int(cpu_grasp.contact[c].geom[0]), int(cpu_grasp.contact[c].geom[1])
       if (g1 == ball_geom and g2 == bin_geom) or (g2 == ball_geom and g1 == bin_geom):
@@ -287,6 +328,17 @@ def run(steps=3000, mode="metal", check=False, record=None):
         other = g2 if g1 in finger_geoms else g1
         if other == ball_geom and first_red_ball_finger_contact_step is None:
           first_red_ball_finger_contact_step = step
+        break
+    for contact in cpu_grasp.contact:
+      max_actual_contact_penetration["cpu"] = max(
+          max_actual_contact_penetration["cpu"],max(-float(contact.dist),0.0))
+    for contact in cpu_grasp.contact:
+      g1,g2 = map(int,contact.geom)
+      if ((g1 in (ball_geom,block_geom) and g2 in support_geoms)
+          or (g2 in (ball_geom,block_geom) and g1 in support_geoms)):
+        support_contact_steps += 1
+        if ball_geom in (g1,g2) and first_red_ball_support_contact_step is None:
+          first_red_ball_support_contact_step = step
         break
     clearance.sample(
         native.state.qpos[0].cpu().numpy() if native is not None else cpu_grasp.qpos,
@@ -313,7 +365,7 @@ def run(steps=3000, mode="metal", check=False, record=None):
     rel = native.state.qpos[0].cpu().numpy()
     released = (float(rel[2]), float(rel[4]))
     from mujoco_metal import MetalSimulation as MS
-    lat_sim = MS(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :], profile=PROFILE)
+    lat_sim = MS(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :], profile=PROFILE, limits=DEMO_LIMITS)
     lat_sim.reset_to_keyframe(0)
     for step in range(steps):
       target, _ = _sched(step)
@@ -338,12 +390,19 @@ def run(steps=3000, mode="metal", check=False, record=None):
       "first_large_divergence_steps": first_large_divergence,
       "ball_bin_hits": ball_bin_hits, "latched_bin_hits": latched_bin_hits,
       "finger_contacts": finger_contacts,
+      "support_contact_steps_cpu": support_contact_steps,
+      "first_red_ball_support_contact_step_cpu": first_red_ball_support_contact_step,
+      "native_contact_counts": native_contact_counts if native is not None else None,
+      "max_actual_contact_penetration_m": max_actual_contact_penetration,
       "first_finger_contact_step": first_finger_contact_step,
       "first_red_ball_finger_contact_step": first_red_ball_finger_contact_step,
       "first_red_ball_bin_contact_step": first_red_ball_bin_contact_step,
       "released_ball": released, "latched_ball": latched,
       "block_rel": block_rel, "block_lat": block_lat,
       "steps": steps,
+      "peak_payload_heights_m": peak_payload_heights,
+      "released_ball_xyz": (rel[2:5].tolist() if native is not None else cpu_grasp.qpos[2:5].tolist()),
+      "block_rel_xyz": (rel[9:12].tolist() if native is not None else cpu_grasp.qpos[9:12].tolist()),
       "minimum_geometry_distance": clearance.minimum,
       "conservative_geometry_distance_lower_bound": clearance.reported,
       "geometry_distance_uncertainty_bound": clearance.uncertainty,
@@ -352,12 +411,16 @@ def run(steps=3000, mode="metal", check=False, record=None):
   }
   if check:
     clearance.check()
+    assert max(max_actual_contact_penetration.values()) < FUNCTIONAL_PENETRATION_LIMIT, max_actual_contact_penetration
     for pair, pen in clearance.max_pen.items():
-      assert pen < 0.015, (pair, pen)
+      assert pen < FUNCTIONAL_PENETRATION_LIMIT, (pair, pen)
   if check and mode == "metal":
     assert pre_qpos_err < 2e-3, pre_qpos_err
     assert pre_qvel_err < 0.2, pre_qvel_err
-    assert finger_contacts > 100, finger_contacts
+    assert native_contact_counts["payload_support_steps"] > 100, native_contact_counts
+    assert native_contact_counts["red_bin_steps"] > 20, native_contact_counts
+  if check:
+    assert support_contact_steps > 100, support_contact_steps
     assert ball_bin_hits > 20, ball_bin_hits
     assert latched_bin_hits == 0, latched_bin_hits
     # Ball delivered into the bin footprint at bin-top height.
@@ -365,14 +428,17 @@ def run(steps=3000, mode="metal", check=False, record=None):
     assert released[1] < 0.25, released
     # Always-open counterfactual never delivers (ball stays on the floor outside).
     assert not (0.45 <= latched[0] <= 0.75 and latched[1] < 0.25), latched
-    # Second ball set down onto the pedestal (top z=0.2, rest center 0.255).
+    # Capsule set down onto the pedestal (top z=0.2, rest center 0.255).
     assert abs(block_rel[0] - -0.5) < 0.10, block_rel
     assert abs(block_rel[1] - 0.255) < 0.03, block_rel
     assert abs(block_rel[0] - block_lat[0]) > 0.1
+    assert abs(result["released_ball_xyz"][1]) < 0.04
+    assert abs(result["block_rel_xyz"][1] - 0.30) < 0.04
+    assert min(peak_payload_heights.values()) > 0.28, peak_payload_heights
   return result
 
 
-def run_viewer(steps=3000, seconds=0):
+def run_viewer(steps=DEFAULT_STEPS, seconds=0):
   """Interactive native viewer (requires a display; headless uses --headless).
 
   Steps the native simulation with the deterministic gantry/finger schedule
@@ -387,7 +453,7 @@ def run_viewer(steps=3000, seconds=0):
   qpos0 = model.qpos0.copy().astype(np.float32)
   qvel0 = np.zeros(model.nv, dtype=np.float32)
   native = MetalSimulation(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :],
-                           profile=PROFILE)
+                           profile=PROFILE, limits=DEMO_LIMITS)
   native.reset_to_keyframe(0)
   cpu = mujoco.MjData(model)
   mujoco.mj_resetDataKeyframe(model, cpu, 0)
@@ -397,8 +463,8 @@ def run_viewer(steps=3000, seconds=0):
   mujoco.mj_forward(model, actual)
   max_err = 0.0
   with mj_viewer.launch_passive(model, actual) as viewer:
-    viewer.cam.lookat[:] = [0.1, 0, 0.30]
-    viewer.cam.distance = 1.8
+    viewer.cam.lookat[:] = [0.1, 0.15, 0.30]
+    viewer.cam.distance = 2.1
     viewer.cam.azimuth = 110
     viewer.cam.elevation = -30
     deadline = time.monotonic() + seconds
@@ -427,7 +493,7 @@ def run_viewer(steps=3000, seconds=0):
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--steps", type=int, default=3000)
+  parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
   parser.add_argument("--mode", choices=["metal", "cpu"], default="metal")
   parser.add_argument("--headless", action="store_true")
   parser.add_argument("--check", action="store_true", help="check native/CPU rollout")

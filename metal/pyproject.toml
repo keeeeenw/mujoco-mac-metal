@@ -32,12 +32,15 @@ mujoco-metal = "mujoco_metal.__main__:main"
 [project.optional-dependencies]
 metal = ["torch==2.9.1"]
 test = ["absl-py", "pytest"]
+demo = ["pillow"]
 
-[tool.setuptools.packages.find]
-include = ["mujoco_metal*"]
+[tool.setuptools]
+packages = ["mujoco_metal", "mujoco_metal.examples"]
+package-dir = {"mujoco_metal.examples" = "examples"}
 
 [tool.setuptools.package-data]
-mujoco_metal = ["shaders/*.metal"]
+mujoco_metal = ["shaders/*.metal", "pinned_enums.json", "pinned_surface.json"]
+"mujoco_metal.examples" = ["*.xml", "*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

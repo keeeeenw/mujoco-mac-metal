@@ -27,3 +27,34 @@ read/advance ordering in engine_sensor.c and engine_forward.c. The tactile
 kernels follow the taxel layout, distance and velocity semantics in
 engine_sensor.c. These upstream files carry the DeepMind copyright and Apache
 License, Version 2.0, identified above.
+
+Additional native algorithms and stage semantics adapt these MuJoCo 3.10.0
+sources under src/engine (Apache License, Version 2.0):
+
+- Constraint assembly, solving, collision dispatch, passive forces, forward
+  and inverse stages, ray queries, constant recomputation, and vector utilities:
+  engine_core_constraint.c, engine_solver.c, engine_collision_driver.c,
+  engine_passive.c, engine_forward.c, engine_inverse.c, engine_ray.c,
+  engine_setconst.c, engine_support.c, and engine_util_blas.c.
+  Copyright 2021 DeepMind Technologies Limited.
+- Finite-difference derivative semantics: engine_derivative.c.
+  Copyright 2022 DeepMind Technologies Limited.
+- Island construction: engine_island.c.
+  Copyright 2023 DeepMind Technologies Limited.
+- Convex and deformable GJK/EPA collision semantics: engine_collision_gjk.c.
+  Copyright 2024 DeepMind Technologies Limited.
+- Flex/core utilities and sleep scheduling: engine_core_util.c and
+  engine_sleep.c. Copyright 2025 DeepMind Technologies Limited.
+
+The bundled native PID, cable elasticity, touch-grid, and analytic SDF adapters
+follow the corresponding upstream plugin algorithms and configuration semantics:
+
+- plugin/actuator/pid.cc and plugin/sensor/touch_grid.cc:
+  Copyright 2023 DeepMind Technologies Limited.
+- plugin/elasticity/cable.cc, plugin/elasticity/elasticity.cc, and
+  plugin/sdf/{bolt,bowl,gear,nut,torus}.cc:
+  Copyright 2022 DeepMind Technologies Limited.
+
+These upstream plugin sources are also licensed under the Apache License,
+Version 2.0. Attribution identifies algorithm provenance; it does not imply
+complete native support or qualification of every upstream feature.

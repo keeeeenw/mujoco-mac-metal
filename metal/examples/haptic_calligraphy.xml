@@ -1,0 +1,59 @@
+<mujoco model="two-link haptic calligraphy arm">
+  <compiler angle="radian" inertiafromgeom="true" autolimits="true"/>
+  <option timestep="0.002" gravity="0 0 0" integrator="Euler"
+      solver="PGS" iterations="80" tolerance="1e-8">
+    <flag contact="disable" energy="disable"/>
+  </option>
+  <visual>
+    <global offwidth="1280" offheight="900"/>
+    <headlight ambient=".42 .42 .42" diffuse=".65 .65 .65"
+        specular=".2 .2 .2"/>
+    <rgba haze=".045 .07 .11 1"/>
+  </visual>
+  <asset>
+    <texture name="checker" type="2d" builtin="checker" width="512" height="512"
+        rgb1=".12 .15 .20" rgb2=".22 .28 .35"/>
+    <material name="floor_mat" texture="checker" texrepeat="8 8" reflectance=".1"/>
+  </asset>
+  <worldbody>
+    <light directional="true" pos="0 -2 5" dir="0 .25 -1"
+        diffuse=".9 .9 .9" specular=".3 .3 .3"/>
+    <light directional="true" pos="-3 1 2" dir="1 -.2 -.6"
+        diffuse=".22 .32 .45" specular=".08 .08 .08"/>
+    <geom name="floor" type="plane" size="3 2 .1" pos="0 0 .02"
+        material="floor_mat" contype="0" conaffinity="0"/>
+    <geom name="backdrop" type="box" size=".72 .012 .38"
+        pos=".54 .20 .94" rgba=".12 .16 .22 1"
+        contype="0" conaffinity="0"/>
+
+    <body name="shoulder_mount" pos="0 0 .92">
+      <geom type="cylinder" size=".15 .055" pos="0 0 -.08"
+          rgba=".18 .25 .34 1" contype="0" conaffinity="0"/>
+      <geom type="sphere" size=".085" rgba=".95 .48 .16 1"
+          contype="0" conaffinity="0"/>
+      <body name="upper_link">
+        <joint name="shoulder" type="hinge" axis="0 1 0"
+            damping=".035" armature=".012"/>
+        <geom name="upper_arm" type="capsule" fromto="0 0 0 .58 0 0"
+            size=".042" mass=".22" rgba=".15 .63 .85 1"
+            contype="0" conaffinity="0"/>
+        <body name="forearm_link" pos=".58 0 0">
+          <joint name="elbow" type="hinge" axis="0 1 0"
+              damping=".025" armature=".008"/>
+          <geom name="forearm" type="capsule" fromto="0 0 0 .5 0 0"
+              size=".034" mass=".15" rgba=".18 .82 .73 1"
+              contype="0" conaffinity="0"/>
+          <geom name="pen_nib" type="sphere" size=".046" pos=".5 0 0"
+              mass=".025" rgba="1 .73 .19 1"
+              contype="0" conaffinity="0"/>
+          <site name="pen_tip" pos=".54 0 0" size=".018"
+              rgba="1 .16 .46 1"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <sensor>
+    <framepos name="pen_world_position" objtype="site" objname="pen_tip"/>
+    <framelinvel name="pen_world_velocity" objtype="site" objname="pen_tip"/>
+  </sensor>
+</mujoco>
