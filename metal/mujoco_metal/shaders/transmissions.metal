@@ -3,6 +3,25 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline bool transmission_actuator_awake(
+    int actuator, uint world, int ntree,
+    device const int* actuator_treeids,
+    device const int* actuator_treenum,
+    device const int* tree_awake) {
+  int count = actuator_treenum[actuator];
+  if (count == 1 || count == 2) {
+    for (int k=0; k<count; ++k) {
+      int tree = actuator_treeids[2*actuator+k];
+      if (tree >= 0 && tree < ntree
+          && tree_awake[int(world)*max(ntree, 1)+tree] != 0) return true;
+    }
+    return false;
+  }
+  // Pinned policy leaves world/no-tree and multi-tree actuators on the normal
+  // evaluation path; only one- and two-tree rows receive a sleep shortcut.
+  return true;
+}
+
 kernel void scalar_transmission_force(
     device const float* qpos [[buffer(0)]],
     device const float* qvel [[buffer(1)]],
@@ -19,12 +38,28 @@ kernel void scalar_transmission_force(
     device const float* force_range [[buffer(12)]],
     device const int* actuator_group [[buffer(13)]],
     constant int* dims [[buffer(14)]],
-    device float* qfrc [[buffer(15)]],
-    device float* act_force [[buffer(16)]],
+    device const int* actuator_treeids [[buffer(15)]],
+    device const int* actuator_treenum [[buffer(16)]],
+    device const int* tree_awake [[buffer(17)]],
+    device const int* awake_dof_ids [[buffer(18)]],
+    device const int* awake_dof_count [[buffer(19)]],
+    constant int* sleep_filter [[buffer(20)]],
+    device float* qfrc [[buffer(21)]],
+    device float* act_force [[buffer(22)]],
+    device const float* position_length [[buffer(23)]],
+    device const float* actuator_gravcomp [[buffer(24)]],
+    device const int* jnt_actgravcomp [[buffer(25)]],
+    device const int* jnt_dofadr [[buffer(26)]],
+    device const int* jnt_type [[buffer(27)]],
+    constant int* gravcomp_dims [[buffer(28)]],
     uint world [[thread_position_in_grid]]) {
   int nq=dims[0], nv=dims[1], nu=dims[2];
   int actuation_disabled=dims[3], clampctrl_disabled=dims[4], disableactuator=dims[5];
+  if (dims[8 + int(world)] == 0) return;
   uint qbase=world*uint(nq), vbase=world*uint(nv), ubase=world*uint(nu);
+  bool filtering = sleep_filter[0] != 0;
+  // Pinned mj_fwdActuation clears actuator_force for every actuator, skips
+  // sleeping rows, then rebuilds qfrc_actuator from the current active moment.
   for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]=0.0f;
   for (int a=0;a<nu;++a) act_force[ubase+uint(a)]=0.0f;
   for (int i=0;i<nq;++i) {
@@ -52,11 +87,24 @@ kernel void scalar_transmission_force(
   }
   if (actuation_disabled) return;
   for (int a=0;a<nu;++a) {
+    if (filtering && !transmission_actuator_awake(
+        a, world, dims[6], actuator_treeids, actuator_treenum, tree_awake))
+      continue;
     int group=actuator_group[a];
     if ((disableactuator & (1 << group)) != 0) continue;
     float length=0.0f, velocity=0.0f;
-    for (int q=0;q<nq;++q) length+=length_map[a*nq+q]*qpos[qbase+uint(q)];
-    for (int d=0;d<nv;++d) velocity+=moment_map[a*nv+d]*qvel[vbase+uint(d)];
+    if (dims[7] != 0) {
+      length=position_length[ubase+uint(a)];
+    } else {
+      for (int q=0;q<nq;++q)
+        length+=length_map[a*nq+q]*qpos[qbase+uint(q)];
+    }
+    int active_dofs = sleep_filter[0] != 0 ? awake_dof_count[world*3+2] : nv;
+    for (int k=0;k<active_dofs;++k) {
+      int d = sleep_filter[0] != 0
+          ? awake_dof_ids[int(world)*max(nv,1)+k] : k;
+      if (d >= 0 && d < nv) velocity+=moment_map[a*nv+d]*qvel[vbase+uint(d)];
+    }
     float input=ctrl[ubase+uint(a)];
     if (!clampctrl_disabled && ctrl_limited[a]) {
       input=clamp(input,ctrl_range[2*a],ctrl_range[2*a+1]);
@@ -67,7 +115,23 @@ kernel void scalar_transmission_force(
     if (bias_enabled[a]) force+=biasprm[3*a]+biasprm[3*a+1]*length+biasprm[3*a+2]*velocity;
     if (force_limited[a]) force=clamp(force,force_range[2*a],force_range[2*a+1]);
     act_force[ubase+uint(a)]=force;
-    for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]+=moment_map[a*nv+d]*force;
+    for (int k=0;k<active_dofs;++k) {
+      int d = sleep_filter[0] != 0
+          ? awake_dof_ids[int(world)*max(nv,1)+k] : k;
+      if (d >= 0 && d < nv) qfrc[vbase+uint(d)]+=moment_map[a*nv+d]*force;
+    }
+  }
+  // Pinned mj_fwdActuation adds body gravity compensation after actuator
+  // force projection and before joint-level actuator-force clipping.
+  int njnt=gravcomp_dims[0];
+  for (int j=0;j<njnt;++j) {
+    if (jnt_actgravcomp[j] == 0) continue;
+    int dof=jnt_dofadr[j], type=jnt_type[j];
+    int count=type==0?6:(type==1?3:1);
+    for (int k=0;k<count;++k) {
+      int d=dof+k;
+      if (d>=0 && d<nv) qfrc[vbase+uint(d)]+=actuator_gravcomp[vbase+uint(d)];
+    }
   }
   for (int d=0;d<nv;++d) {
     if ((as_type<uint>(qfrc[vbase+uint(d)]) & 0x7f800000u)==0x7f800000u) {
@@ -75,6 +139,27 @@ kernel void scalar_transmission_force(
       for (int k=0;k<nv;++k) qfrc[vbase+uint(k)]=bad;
       return;
     }
+  }
+}
+
+kernel void cache_scalar_transmission_position(
+    device const float* qpos [[buffer(0)]],
+    device const float* length_map [[buffer(1)]],
+    device float* position_length [[buffer(2)]],
+    constant int* dims [[buffer(3)]],
+    uint world [[thread_position_in_grid]]) {
+  int nq=dims[0], nu=dims[2], batch=dims[3];
+  if (int(world) >= batch) return;
+  if (dims[4 + int(world)] == 0) return;
+  int qbase=int(world)*max(nq,1);
+  int length_base=int(world)*max(nu,1);
+  for (int actuator=0; actuator<max(nu,1); ++actuator) {
+    float length=0.0f;
+    if (actuator < nu) {
+      for (int q=0; q<nq; ++q)
+        length+=length_map[actuator*nq+q]*qpos[qbase+q];
+    }
+    position_length[length_base+actuator]=length;
   }
 }
 
@@ -197,6 +282,7 @@ kernel void general_actuator_kinematics(
   int nq=dims[0], nv=dims[1], nu=dims[2];
   int nbody=dims[3], njnt=dims[4], nsite=dims[5], batch=dims[7];
   if (uint(world)>=uint(batch)) return;
+  if (dims[8 + int(world)] == 0) return;
   uint qbase=uint(world)*uint(max(nq,1)), vbase=uint(world)*uint(max(nv,1));
   uint ubase=uint(world)*uint(max(nu,1));
   int bo=world*nbody, jo=world*max(njnt,1), so=world*max(nsite,1);
@@ -369,6 +455,25 @@ kernel void general_actuator_kinematics(
   }
 }
 
+// Refresh velocity from cached transmission moments without evaluating any
+// inactive world's generalized velocity or moment rows during masked stages.
+kernel void general_actuator_velocity_from_moment(
+    device const float* qvel [[buffer(0)]],
+    device const float* moment [[buffer(1)]],
+    constant int* dims [[buffer(2)]],
+    device float* velocity [[buffer(3)]],
+    uint world [[thread_position_in_grid]]) {
+  int nv=dims[0], nu=dims[1], batch=dims[2];
+  if (int(world)>=batch || dims[3+int(world)]==0) return;
+  for (int actuator=0; actuator<nu; ++actuator) {
+    float value=0.0f;
+    for (int dof=0; dof<nv; ++dof)
+      value += moment[(int(world)*nu+actuator)*max(nv,1)+dof]
+          * qvel[int(world)*nv+dof];
+    velocity[int(world)*nu+actuator]=value;
+  }
+}
+
 // BODY-transmission adhesion moments from same-step candidate contacts.
 // Pinned source: engine/engine_core_smooth.c mj_transmission (mjTRN_BODY).
 // Averages contact normal Jacobian rows over candidate contacts involving the
@@ -378,6 +483,41 @@ kernel void general_actuator_kinematics(
 // normal row by +/- symmetry. Gap candidates are included like the pinned
 // exclude==1 path. Candidate buffers must be zeroed before generation so
 // unwritten slots read exact zero (their frame normal is degenerate).
+inline float transmission_contact_jacobian_get(
+    device const float* storage, int world, int row, int dof,
+    int nv, int sparse_mode) {
+  if (!sparse_mode) {
+    // Dense contact rows are laid out [world, slot, axis, dof]; the caller
+    // computes that offset directly in the legacy branch below.
+    return 0.0f;
+  }
+  device const int* first = reinterpret_cast<device const int*>(storage);
+  int first_stride = first[9];
+  if (first_stride < 12 || first_stride > 0x7fffffff / max(world + 1, 1))
+    return 0.0f;
+  device const int* h = first + world * first_stride;
+  // Each world owns a typed CSR record. Validate all offsets before using its
+  // row pointers so a malformed record cannot redirect an adhesion read.
+  int stride = h[9], nr = h[3], nnz = h[5];
+  if (stride < 12 || h[0] != 0x4d4a4353 || h[1] != 1 || h[2] != 1
+      || nr < 0 || h[4] != nv || nnz < 0 || row < 0 || row >= nr
+      || dof < 0 || dof >= nv || h[6] < 12 || h[7] < h[6] + nr + 1
+      || h[8] < h[7] + nnz || h[8] + nnz > stride) return 0.0f;
+  device const int* rowptr = h + h[6];
+  device const int* columns = h + h[7];
+  int lo = rowptr[row], hi = rowptr[row + 1];
+  if (lo < 0 || hi < lo || hi > nnz) return 0.0f;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (columns[mid] < 0 || columns[mid] >= nv) return 0.0f;
+    if (columns[mid] < dof) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo >= rowptr[row + 1] || columns[lo] != dof) return 0.0f;
+  device const float* values = storage + world * stride + h[8];
+  return values[lo];
+}
+
 kernel void body_adhesion_moment(
     device float* moment [[buffer(0)]],
     device const float* contact_frame [[buffer(1)]],
@@ -390,33 +530,44 @@ kernel void body_adhesion_moment(
     constant int* dims [[buffer(8)]],
     uint world [[thread_position_in_grid]]) {
   int nc=dims[0], npairs=dims[1], nv=dims[2], nu=dims[3], batch=dims[4];
+  int sparse_j = dims[5];
   if (uint(world)>=uint(batch)) return;
+  if (dims[6 + int(world)] == 0) return;
+  if (dims[6 + int(world)] == 0) return;
   uint ubase=uint(world)*uint(max(nu,1));
   for (int a=0;a<nu;++a) {
     if (trntype[a]!=5) continue;
     int id=trnid[2*a];
-    float row[32];
-    for (int d=0;d<32;++d) row[d]=0.0f;
-    int counter=0;
-    for (int s=0;s<nc;++s) {
-      int p=-1;
-      for (int q=0;q<npairs;++q) {
-        if (s>=pair_offset[q]&&s<pair_offset[q+1]) { p=q; break; }
+    for (int d=0;d<nv;++d) {
+      float normal_sum=0.0f;
+      int counter=0;
+      for (int s=0;s<nc;++s) {
+        int p=-1;
+        for (int q=0;q<npairs;++q) {
+          if (s>=pair_offset[q]&&s<pair_offset[q+1]) { p=q; break; }
+        }
+        if (p<0) continue;
+        int ba=geom_bodyid[pair_geoms[2*p]], bb=geom_bodyid[pair_geoms[2*p+1]];
+        if (ba!=id&&bb!=id) continue;
+        uint fb=(uint(world)*uint(max(nc,1))+uint(s))*12u;
+        float3 n=float3(contact_frame[fb],contact_frame[fb+1],contact_frame[fb+2]);
+        if (dot(n,n)<1e-20f) continue;
+        float normal_j;
+        if (sparse_j) {
+          int slot_rows_base=npairs+1;
+          int canonical_row=pair_offset[slot_rows_base+s];
+          normal_j=transmission_contact_jacobian_get(
+              contact_jacobian,int(world),canonical_row,d,nv,sparse_j);
+        } else {
+          uint jb=(uint(world)*uint(max(nc,1))+uint(s))*uint(6*max(nv,1));
+          normal_j=contact_jacobian[jb+uint(d)];
+        }
+        normal_sum+=normal_j;
+        counter++;
       }
-      if (p<0) continue;
-      int ba=geom_bodyid[pair_geoms[2*p]], bb=geom_bodyid[pair_geoms[2*p+1]];
-      if (ba!=id&&bb!=id) continue;
-      uint fb=(uint(world)*uint(max(nc,1))+uint(s))*12u;
-      float3 n=float3(contact_frame[fb],contact_frame[fb+1],contact_frame[fb+2]);
-      if (dot(n,n)<1e-20f) continue;
-      uint jb=(uint(world)*uint(max(nc,1))+uint(s))*uint(6*max(nv,1));
-      for (int d=0;d<nv;++d)
-        row[d]+=contact_jacobian[jb+uint(d)];
-      counter++;
-    }
-    if (counter>0) {
-      for (int d=0;d<nv;++d)
-        moment[(ubase+uint(a))*uint(max(nv,1))+uint(d)]+= -row[d]/float(counter);
+      if (counter>0)
+        moment[(ubase+uint(a))*uint(max(nv,1))+uint(d)]
+            += -normal_sum/float(counter);
     }
   }
 }

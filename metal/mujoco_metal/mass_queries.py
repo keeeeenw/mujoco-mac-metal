@@ -80,6 +80,10 @@ def _factor(mass):
   b, nv, _ = mass.shape
   factor = torch.eye(nv, dtype=mass.dtype, device=mass.device).expand(b, nv, nv).clone()
   work, diagonal = mass.clone(), torch.zeros((b, nv), dtype=mass.dtype, device=mass.device)
+  if not nv:
+    # An empty mass has no invalid pivots. MPS empty ``all`` reductions do
+    # not reliably implement this vacuous truth, so return it explicitly.
+    return factor, diagonal, torch.ones(b, dtype=torch.bool, device=mass.device)
   scale = mass.abs().amax(dim=(1, 2)) if nv else torch.zeros(b, device=mass.device)
   good = torch.isfinite(mass).all(dim=(1, 2))
   if nv:
@@ -100,6 +104,45 @@ def _factor(mass):
   return factor, diagonal, good
 
 
+def factor_mass(dynamics):
+  """Return owned component factors with the pinned ``M = L' D L`` order.
+
+  Each entry in ``blocks`` contains device ``dof_ids``, unit lower-triangular
+  ``L``, ``D`` and ``Dinv``. Dense inputs produce one block; component inputs
+  retain their local blocks, including tendon armature, without constructing
+  a global dense matrix. ``status`` is int32[batch]: 0 for a finite SPD factor
+  and 2 for failure. All factor outputs of a failed world are zero, even when
+  only one of its components failed. Inputs and prepared solver factors are
+  never mutated. This explicit query does not change the stepping factor.
+  """
+  import torch
+  reference, nv = _shape(dynamics)
+  good_world = torch.ones(reference.shape[0], dtype=torch.bool,
+                          device=reference.device)
+  blocks = []
+  for ids, mass in _mass_blocks(dynamics):
+    lower, diagonal, good = _factor(mass)
+    inverse = torch.reciprocal(diagonal)
+    if diagonal.shape[1]:
+      good &= torch.isfinite(inverse).all(dim=1)
+    good_world &= good
+    blocks.append({
+        'dof_ids': (torch.arange(nv, device=reference.device) if ids is None
+                    else ids.clone()),
+        'L': lower, 'D': diagonal, 'Dinv': inverse,
+    })
+  for block in blocks:
+    block['L'] = torch.where(good_world[:, None, None], block['L'],
+                             torch.zeros_like(block['L']))
+    for name in ('D', 'Dinv'):
+      block[name] = torch.where(good_world[:, None], block[name],
+                                torch.zeros_like(block[name]))
+  status = torch.where(good_world,
+      torch.zeros_like(good_world, dtype=torch.int32),
+      torch.full_like(good_world, 2, dtype=torch.int32))
+  return {'blocks': tuple(blocks), 'status': status, 'nv': nv}
+
+
 def mass_factor_query(dynamics, vector, operation):
   """Return owned (value,status) for solve, sqrt product, or half solve.
 
@@ -112,7 +155,9 @@ def mass_factor_query(dynamics, vector, operation):
     raise ValueError('unknown mass factor query')
   rhs = _rhs(dynamics, vector)
   result = torch.zeros_like(rhs)
-  good_world = torch.isfinite(rhs).all(dim=(1, 2))
+  good_world = (torch.isfinite(rhs).all(dim=(1, 2))
+                if rhs.shape[1] and rhs.shape[2] else
+                torch.ones(rhs.shape[0], dtype=torch.bool, device=rhs.device))
   for ids, mass in _mass_blocks(dynamics):
     local = rhs if ids is None else rhs.index_select(2, ids)
     factor, diagonal, good = _factor(mass)
@@ -130,7 +175,8 @@ def mass_factor_query(dynamics, vector, operation):
         value /= diagonal[:, None]
         for k in range(1, nv):
           value[:, :, k] -= (value[:, :, :k] * factor[:, None, k, :k]).sum(dim=2)
-    good &= torch.isfinite(value).all(dim=(1, 2))
+    if value.shape[1] and value.shape[2]:
+      good &= torch.isfinite(value).all(dim=(1, 2))
     good_world &= good
     if ids is None:
       result.copy_(value)

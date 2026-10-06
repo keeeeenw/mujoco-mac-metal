@@ -86,17 +86,26 @@ kernel void semi_implicit_euler(
     device const float* next_velocity [[buffer(17)]],
     device const float* position_velocity [[buffer(18)]],
     constant int* velocity_mode [[buffer(19)]],
+    device const int* body_jntadr [[buffer(20)]],
+    device const int* body_jntnum [[buffer(21)]],
+    device const int* awake_body_ids [[buffer(22)]],
+    device const int* awake_dof_ids [[buffer(23)]],
+    device const int* awake_counts [[buffer(24)]],
+    constant int* sleep_filter [[buffer(25)]],
     uint world [[thread_position_in_grid]]) {
   uint nq = uint(dims[0]);
   uint nv = uint(dims[1]);
   uint njnt = uint(dims[2]);
   uint batch = uint(dims[3]);
+  uint nbody = uint(dims[4]);
   if (world >= batch) return;
 
   uint qb = world * nq;
   uint vb = world * nv;
   for (uint i = 0; i < nq; ++i) output_qpos[qb + i] = qpos[qb + i];
-  for (uint i = 0; i < nv; ++i) output_qvel[vb + i] = qvel[vb + i];
+  bool filtering = sleep_filter[0] != 0;
+  for (uint i = 0; i < nv; ++i)
+    output_qvel[vb + i] = filtering ? 0.0f : qvel[vb + i];
   output_time[world] = time[world];
 
   int prior_status = solve_status[world];
@@ -127,8 +136,15 @@ kernel void semi_implicit_euler(
 
   float dt = timestep[0];
   for (uint i = 0; i < nq; ++i) candidate_qpos[qb + i] = qpos[qb + i];
+  for (uint i = 0; i < nv; ++i)
+    candidate_qvel[vb + i] = filtering ? 0.0f : qvel[vb + i];
   bool valid = true;
-  for (uint i = 0; i < nv; ++i) {
+  int awake_dof_count = filtering ? awake_counts[world*3+2] : int(nv);
+  for (int k = 0; k < awake_dof_count; ++k) {
+    int dof = filtering
+        ? awake_dof_ids[int(world)*max(int(nv),1)+k] : k;
+    if (dof < 0 || dof >= int(nv)) continue;
+    uint i = uint(dof);
     float velocity = (velocity_mode[0] & 1) ? next_velocity[vb + i] :
                      qvel[vb + i] + dt * qacc[vb + i];
     if (!finite_float(velocity)) valid = false;
@@ -146,49 +162,59 @@ kernel void semi_implicit_euler(
   device const float* pos_velocity = (velocity_mode[0] & 2) ?
                                     position_velocity : candidate_qvel;
   // Apply position velocity using MuJoCo's joint address conventions.
-  for (uint j = 0; j < njnt; ++j) {
-    int type = joint_type[j];
-    uint pa = uint(joint_qposadr[j]);
-    uint da = uint(joint_dofadr[j]);
-    if (type == 0) {
-      for (uint k = 0; k < 3; ++k) {
-        float value = candidate_qpos[qb + pa + k] +
-                      dt * pos_velocity[vb + da + k];
-        if (!finite_float(value)) valid = false;
-        candidate_qpos[qb + pa + k] = value;
+  int awake_body_count = filtering ? awake_counts[world*3] : int(nbody-1);
+  for (int bi = 0; bi < awake_body_count; ++bi) {
+    int body = filtering
+        ? awake_body_ids[int(world)*max(int(nbody),1)+bi] : bi+1;
+    if (body <= 0 || body >= int(nbody)) continue;
+    int first_joint = body_jntadr[body];
+    int body_joint_count = body_jntnum[body];
+    for (int jj = 0; jj < body_joint_count; ++jj) {
+      int j = first_joint + jj;
+      if (j < 0 || j >= int(njnt)) continue;
+      int type = joint_type[j];
+      uint pa = uint(joint_qposadr[j]);
+      uint da = uint(joint_dofadr[j]);
+      if (type == 0) {
+        for (uint k = 0; k < 3; ++k) {
+          float value = candidate_qpos[qb + pa + k] +
+                        dt * pos_velocity[vb + da + k];
+          if (!finite_float(value)) valid = false;
+          candidate_qpos[qb + pa + k] = value;
+        }
+        pa += 3;
+        da += 3;
       }
-      pa += 3;
-      da += 3;
-    }
 
-    if (type == 0 || type == 1) {
-      float4 q = float4(candidate_qpos[qb + pa],
-                        candidate_qpos[qb + pa + 1],
-                        candidate_qpos[qb + pa + 2],
-                        candidate_qpos[qb + pa + 3]);
-      float scale = max(max(abs(q.x), abs(q.y)), max(abs(q.z), abs(q.w)));
-      if (scale == 0.0f) {
-        output_status[world] = 11;
+      if (type == 0 || type == 1) {
+        float4 q = float4(candidate_qpos[qb + pa],
+                          candidate_qpos[qb + pa + 1],
+                          candidate_qpos[qb + pa + 2],
+                          candidate_qpos[qb + pa + 3]);
+        float scale = max(max(abs(q.x), abs(q.y)), max(abs(q.z), abs(q.w)));
+        if (scale == 0.0f) {
+          output_status[world] = 11;
+          return;
+        }
+        float4 normalized = quat_normalize_stable(q);
+        float3 omega = float3(pos_velocity[vb + da],
+                              pos_velocity[vb + da + 1],
+                              pos_velocity[vb + da + 2]);
+        float4 increment = quat_increment(omega, dt, valid);
+        float4 next_quat = quat_normalize_stable(quat_multiply(normalized, increment));
+        for (uint k = 0; k < 4; ++k) {
+          if (!finite_float(next_quat[k])) valid = false;
+          candidate_qpos[qb + pa + k] = next_quat[k];
+        }
+      } else if (type == 2 || type == 3) {
+        float value = candidate_qpos[qb + pa] + dt * pos_velocity[vb + da];
+        if (!finite_float(value)) valid = false;
+        candidate_qpos[qb + pa] = value;
+      }
+      if (!valid) {
+        output_status[world] = 12;
         return;
       }
-      float4 normalized = quat_normalize_stable(q);
-      float3 omega = float3(pos_velocity[vb + da],
-                            pos_velocity[vb + da + 1],
-                            pos_velocity[vb + da + 2]);
-      float4 increment = quat_increment(omega, dt, valid);
-      float4 next_quat = quat_normalize_stable(quat_multiply(normalized, increment));
-      for (uint k = 0; k < 4; ++k) {
-        if (!finite_float(next_quat[k])) valid = false;
-        candidate_qpos[qb + pa + k] = next_quat[k];
-      }
-    } else if (type == 2 || type == 3) {
-      float value = candidate_qpos[qb + pa] + dt * pos_velocity[vb + da];
-      if (!finite_float(value)) valid = false;
-      candidate_qpos[qb + pa] = value;
-    }
-    if (!valid) {
-      output_status[world] = 12;
-      return;
     }
   }
 

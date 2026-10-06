@@ -20,6 +20,7 @@ using namespace metal;
 #define CX_CYLINDER 5
 #define CX_BOX 6
 #define CX_MESH 7
+#define CX_FLEX 8
 
 // Milestone 011: convex-hull vertex support. Hull verts are geom-local
 // (world = geom frame composed with mesh_vert, calibrated against CPU
@@ -97,6 +98,25 @@ inline float3 cx_support(int type, float3 p, float3x3 R, float3 sz, float3 d,
       if (q > best) { best = q; bs = prismV[istart + k]; }
     }
     return bs;
+  } else if (type == CX_FLEX) {
+    // Flex simplexes are supplied per candidate in prismV as up to four
+    // element-local vertices. gi selects the first vertex (0 or 4 for the
+    // two sides of a flex-flex pair); sz.x is vertex count, sz.y is flex
+    // radius, and sz.z is the common contact margin. Keeping the simplex in
+    // its own local frame lets collide_convex_multi rotate/restore it using
+    // the same frame perturbation used for rigid convex pairs.
+    int off = gi;
+    int cnt = clamp((int)sz.x, 1, 4);
+    // Pinned mjc_flexSupport uses strict > and therefore retains the first
+    // simplex vertex on a projection tie (unlike the mesh tie-centroid path).
+    float3 bs = prismV[off];
+    float best = dot(bs, l);
+    for (int k = 1; k < cnt; ++k) {
+      float3 v = prismV[off + k];
+      float dp = dot(v, l);
+      if (dp > best) { best = dp; bs = v; }
+    }
+    s = bs + l * (sz.y + 0.5f * sz.z);
   } else {  // CX_BOX
     s = float3(l.x >= 0.0f ? sz.x : -sz.x,
                l.y >= 0.0f ? sz.y : -sz.y,
@@ -752,7 +772,13 @@ inline float cx_mpr(int ta, float3 pa, float3x3 Ra, float3 sza,
   // for continuity, else min penetration depth (CPU EPA is the global
   // minimum). Analytic pairs use the barycentric restore below
   // (010-qualified).
-  if (ta == 7 || tb == 7) {
+  // Heightfield collision supplies a temporary triangular prism as one
+  // support object.  The pinned path calls mjc_penetration for each prism,
+  // not the compiled-mesh face-snap readout used for a mesh-vs-geom pair.
+  // Keep this pair on the common penetration path.  This Metal path still
+  // uses cx_mpr rather than the pinned default nativeCCD GJK/EPA consumer;
+  // source-exact prism depth/normal matching remains an open qualification.
+  if ((ta == 7 || tb == 7) && ta != CX_HFIELD && tb != CX_HFIELD) {
     float bl = length(bestNrm);
     float3 uu = bl > 1e-24f ? bestNrm / bl : float3(1.0f, 0.0f, 0.0f);
     float3 d0 = pa - pb;
@@ -1395,7 +1421,8 @@ inline int collide_hfield(
     int t2, float3 po, float4 qo, float3 szo, float rbo,
     float margin, float gap, int maxn, thread ContactGeom* con,
     int gih, int gio,
-    device const float* hull, device const int* hull_info) {
+    device const float* hull, device const int* hull_info,
+    thread const float3* flex_vertices, int flex_count, float flex_radius) {
   int doff = hull_info[gih * 9 + 5];
   int nrow = hull_info[gih * 9 + 6];
   int ncol = hull_info[gih * 9 + 7];
@@ -1431,14 +1458,30 @@ inline int collide_hfield(
   float3 poh = lp;
   float3 I0 = float3(1,0,0), I1 = float3(0,1,0), I2 = float3(0,0,1);
   float3x3 Im = float3x3(I0, I1, I2);
+  thread float3 supportV[14];
+  for (int i=0; i<6; ++i) supportV[i]=float3(0.0f);
+  bool flexShape=(t2==CX_FLEX && flex_vertices!=nullptr
+                  && flex_count>=1 && flex_count<=4);
+  if (flexShape) {
+    for (int i=0; i<flex_count; ++i) supportV[6+i]=flex_vertices[i];
+  }
+  float3 otherSize=flexShape
+      ? float3(float(flex_count),flex_radius,margin) : szo;
+  int otherIndex=flexShape ? 6 : gio;
 
   // Other geom AABB in the hfield frame via supports.
-  float3 sx = cx_support(t2, poh, Roh, szo, I0, gio, hull, hull_info, nullptr);
-  float3 nx = cx_support(t2, poh, Roh, szo, -I0, gio, hull, hull_info, nullptr);
-  float3 sy = cx_support(t2, poh, Roh, szo, I1, gio, hull, hull_info, nullptr);
-  float3 ny = cx_support(t2, poh, Roh, szo, -I1, gio, hull, hull_info, nullptr);
-  float3 sz = cx_support(t2, poh, Roh, szo, I2, gio, hull, hull_info, nullptr);
-  float3 nz = cx_support(t2, poh, Roh, szo, -I2, gio, hull, hull_info, nullptr);
+  float3 sx = cx_support(t2, poh, Roh, otherSize, I0, otherIndex,
+                         hull, hull_info, supportV);
+  float3 nx = cx_support(t2, poh, Roh, otherSize, -I0, otherIndex,
+                         hull, hull_info, supportV);
+  float3 sy = cx_support(t2, poh, Roh, otherSize, I1, otherIndex,
+                         hull, hull_info, supportV);
+  float3 ny = cx_support(t2, poh, Roh, otherSize, -I1, otherIndex,
+                         hull, hull_info, supportV);
+  float3 sz = cx_support(t2, poh, Roh, otherSize, I2, otherIndex,
+                         hull, hull_info, supportV);
+  float3 nz = cx_support(t2, poh, Roh, otherSize, -I2, otherIndex,
+                         hull, hull_info, supportV);
   float xmax = sx.x, xmin = nx.x;
   float ymax = sy.y, ymin = ny.y;
   float zmax = sz.z, zmin = nz.z;
@@ -1494,11 +1537,10 @@ inline int collide_hfield(
         float3 v1 = float3(dx * (float)n1c - size0, dy * (float)n1r - size1, 0.0f);
         float3 v2 = float3(dx * (float)n2c - size0, dy * (float)n2r - size1, 0.0f);
         float3 bot = float3(0.0f, 0.0f, -size3);
-        thread float3 prismV[6];
-        prismV[0] = v0 + bot; prismV[1] = v1 + bot; prismV[2] = v2 + bot;
-        prismV[3] = v0 + float3(0.0f, 0.0f, h0);
-        prismV[4] = v1 + float3(0.0f, 0.0f, h1);
-        prismV[5] = v2 + float3(0.0f, 0.0f, h2);
+        supportV[0] = v0 + bot; supportV[1] = v1 + bot; supportV[2] = v2 + bot;
+        supportV[3] = v0 + float3(0.0f, 0.0f, h0);
+        supportV[4] = v1 + float3(0.0f, 0.0f, h1);
+        supportV[5] = v2 + float3(0.0f, 0.0f, h2);
         float3 centroid = (v0 + v1 + v2) / 3.0f
                         + float3(0.0f, 0.0f, (h0 + h1 + h2) / 3.0f - size3) * 0.5f;
         float3 d0 = centroid - poh;
@@ -1508,9 +1550,9 @@ inline int collide_hfield(
         cand.normal = float3(0.0f); cand.t1 = float3(0.0f); cand.t2 = float3(0.0f);
         float3 zsz = float3(0.0f);
         int got = cx_single_contact(1, centroid, Im, zsz,
-                                    t2, poh, Roh, szo,
+                                    t2, poh, Roh, otherSize,
                                     margin + gap, d0, false, &cand,
-                                    gih, gio, hull, hull_info, prismV);
+                                    gih, otherIndex, hull, hull_info, supportV);
         if (got) {
           // Pinned expanded-penetration report (R05-2): GJK runs on true
           // geometry (preserving margin-0 witness quality); the reported

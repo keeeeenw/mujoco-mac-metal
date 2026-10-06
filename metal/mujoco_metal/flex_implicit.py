@@ -15,6 +15,23 @@ OPERATOR_NAMES = ("interp_stiffness", "interp_damped_stiffness",
                   "bend_stiffness", "bend_damped_stiffness")
 
 
+def requires_flex_implicit_correction(model):
+  """Pinned flex_has_implicit_stiffness admission, independent of passive flags."""
+  if not isinstance(model, mujoco.MjModel):
+    raise TypeError("flex stiffness admission requires a MuJoCo MjModel")
+  for fid in range(int(model.nflex)):
+    if model.flex_rigid[fid]:
+      continue
+    if model.flex_interp[fid]:
+      adr = int(model.flex_stiffnessadr[fid])
+      if (int(model.flex_edgeequality[fid]) != 3 and adr >= 0
+          and model.flex_stiffness[adr] != 0):
+        return True
+    elif int(model.flex_dim[fid]) == 2 and int(model.flex_bendingadr[fid]) >= 0:
+      return True
+  return False
+
+
 class FlexImplicitCorrection:
   """Source-derived 50-iteration preconditioned CG with per-world stopping.
 

@@ -62,6 +62,10 @@ def __getattr__(name):
     from mujoco_metal.simulation import MetalSimulation
 
     return MetalSimulation
+  if name == "NativeActuatorUserPlugin":
+    from mujoco_metal.extensions import NativeActuatorUserPlugin
+
+    return NativeActuatorUserPlugin
   if name in (
       "CoupledConstraintDescriptor",
       "lower_coupled_constraints",

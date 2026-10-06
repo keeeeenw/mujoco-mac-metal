@@ -88,6 +88,7 @@ kernel void free_body_midpoint(
     device float* qvel_next [[buffer(13)]], device float* position_velocity [[buffer(14)]],
     device float* reported_qacc [[buffer(15)]], device int* status [[buffer(16)]],
     constant int* dims [[buffer(17)]], constant float* timestep [[buffer(18)]],
+    device const int* eligible_mask [[buffer(19)]],
     uint world [[thread_position_in_grid]]) {
   int nv=dims[0],nbody=dims[1],nfree=dims[2],batch=dims[3];
   bool gravity_enabled=dims[4]!=0;
@@ -105,6 +106,7 @@ kernel void free_body_midpoint(
   }
   for(int k=0;k<nbody*4;++k) if(!finite_bits(body_quat[qb+k])) status[world]=21;
   for(int slot=0;slot<nfree;++slot) {
+    if(!eligible_mask[int(world)*nfree+slot])continue;
     int dof=dofadr[slot],body=bodyid[slot],offset=vb+dof;
     int body_offset=qb+body*4;
     float4 iquat=float4(body_iquat[slot*4],body_iquat[slot*4+1],body_iquat[slot*4+2],body_iquat[slot*4+3]);

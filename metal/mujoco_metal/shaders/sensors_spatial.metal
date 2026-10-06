@@ -40,13 +40,18 @@ kernel void evaluate_tactile(
     device const float* octree [[buffer(15)]],
     device float* output [[buffer(16)]],
     device const int* dims [[buffer(17)]],
+    device const int* sensor_awake [[buffer(18)]],
     uint thread_id [[thread_position_in_grid]]) {
   int nt=dims[5];
   if (nt<=0 || thread_id>=uint(dims[0]*nt)) return;
   int w=int(thread_id)/nt, t=int(thread_id)%nt;
   int ng=dims[1], nb=dims[2], ns=dims[3], nc=dims[4];
-  int pad=taxels[6*t], weld=taxels[6*t+1], nvert=taxels[6*t+2];
-  int adr=w*ns+taxels[6*t+3], hasframe=taxels[6*t+4], channels=taxels[6*t+5];
+  if (sensor_awake[1+dims[0]*max(dims[7],1)+w] == 0) return;
+  int pad=taxels[7*t], weld=taxels[7*t+1], nvert=taxels[7*t+2];
+  int adr=w*ns+taxels[7*t+3], hasframe=taxels[7*t+4], channels=taxels[7*t+5];
+  int sensor_id=taxels[7*t+6];
+  if (sensor_id < 0 || sensor_id >= dims[7]
+      || sensor_awake[1+w*dims[7]+sensor_id] == 0) return;
   float depth=0.0f, v1=0.0f, v2=0.0f;
   float3 point=sp_r3(geom_pos,3*(w*ng+pad))
       +sp_qrot(sp_r4(geom_quat,4*(w*ng+pad)),sp_r3(frames,10*t));
@@ -116,11 +121,34 @@ inline void rg_map(float3 pos, float3x3 mat, float3 pnt, float3 vec,
 
 inline float rg_quad(float a, float b, float c, thread float2& xx) {
   float disc = b*b - a*c;
-  if (disc < 0.0f || abs(a) < 1e-30f) return -1.0f;
+  // engine_ray.c ray_quad rejects coefficients below mjMINVAL and initializes
+  // both roots on rejection. Capsule cap queries inspect those roots directly.
+  xx = float2(-1.0f);
+  if (disc < 0.0f || a < 1e-15f) return -1.0f;
   float root = sqrt(disc);
   xx = float2((-b - root)/a, (-b + root)/a);
   if (xx.x >= 0.0f) return xx.x;
   if (xx.y >= 0.0f) return xx.y;
+  return -1.0f;
+}
+
+// The algebraic b*b-a*c form loses the entire radius contribution when the
+// ray origin is far from a small sphere/capsule. Work around the closest point
+// of the ray instead, retaining mjMINVAL eligibility and source root ordering.
+// FMA preserves the small perpendicular offset during that translation.
+inline float rg_radial_quad(float3 vec, float3 dif, float radius_squared,
+                            thread float2& xx) {
+  xx=float2(-1.0f);
+  float a=dot(vec,vec);
+  if (a<1e-15f) return -1.0f;
+  float center=-dot(vec,dif)/a;
+  float3 offset=fma(vec,float3(center),dif);
+  float gap=radius_squared-dot(offset,offset);
+  if (gap<0.0f) return -1.0f;
+  float delta=sqrt(gap/a);
+  xx=float2(center-delta,center+delta);
+  if (xx.x>=0) return xx.x;
+  if (xx.y>=0) return xx.y;
   return -1.0f;
 }
 
@@ -132,7 +160,7 @@ inline float rg_analytic(int type, float3 pos, float3x3 mat, float3 size,
   rg_map(pos, mat, pnt, vec, lpnt, lvec);
   if (type == 0) {
     // Plane: front face only, rendered rectangle.
-    if (lvec.z > -1e-12f) return -1.0f;
+    if (lvec.z > -1e-15f) return -1.0f;
     float x = -lpnt.z/lvec.z;
     if (x < 0.0f) return -1.0f;
     float p0 = lpnt.x + x*lvec.x, p1 = lpnt.y + x*lvec.y;
@@ -145,10 +173,8 @@ inline float rg_analytic(int type, float3 pos, float3x3 mat, float3 size,
   }
   if (type == 2) {
     float3 dif = pnt - pos;
-    float a = dot(vec, vec), b = dot(vec, dif);
-    float c = dot(dif, dif) - size.x*size.x;
     float2 xx;
-    float x = rg_quad(a, b, c, xx);
+    float x = rg_radial_quad(vec,dif,size.x*size.x,xx);
     if (x >= 0.0f) {
       normal = normalize(pnt + vec*x - pos);
     }
@@ -158,23 +184,16 @@ inline float rg_analytic(int type, float3 pos, float3x3 mat, float3 size,
     float ssz = size.x + size.y;
     float3 dif = pnt - pos;
     float2 xx0;
-    if (rg_quad(dot(vec,vec), dot(vec,dif),
-                dot(dif,dif)-ssz*ssz, xx0) < 0.0f) return -1.0f;
+    if (rg_radial_quad(vec,dif,ssz*ssz,xx0) < 0.0f) return -1.0f;
     float x = -1.0f;
     int tp = 0;
-    float a = lvec.x*lvec.x + lvec.y*lvec.y;
-    float b = lvec.x*lpnt.x + lvec.y*lpnt.y;
-    float c = lpnt.x*lpnt.x + lpnt.y*lpnt.y - size.x*size.x;
     float2 xx;
-    float sol = rg_quad(a, b, c, xx);
+    float sol = rg_radial_quad(float3(lvec.xy,0),float3(lpnt.xy,0),size.x*size.x,xx);
     if (sol >= 0.0f && abs(lpnt.z+sol*lvec.z) <= size.y) { x = sol; tp = 0; }
-    float avec = dot(lvec, lvec);
     for (int side = -1; side <= 1; side += 2) {
       float3 ld = lpnt - float3(0.0f, 0.0f, float(side)*size.y);
-      float bb = dot(lvec, ld);
-      float cc = dot(ld, ld) - size.x*size.x;
       float2 rts = float2(-1.0f);
-      rg_quad(avec, bb, cc, rts);
+      rg_radial_quad(lvec,ld,size.x*size.x,rts);
       for (int k = 0; k < 2; ++k) {
         float cand = k == 0 ? rts.x : rts.y;
         float z = lpnt.z + cand*lvec.z;
@@ -208,10 +227,10 @@ inline float rg_analytic(int type, float3 pos, float3x3 mat, float3 size,
     float ssz = size.x*size.x + size.y*size.y;
     float3 dif = pnt - pos;
     float2 xx0;
-    if (rg_quad(dot(vec,vec), dot(vec,dif), dot(dif,dif)-ssz, xx0) < 0.0f) return -1.0f;
+    if (rg_radial_quad(vec,dif,ssz,xx0) < 0.0f) return -1.0f;
     float x = -1.0f;
     int tp = 0;
-    if (abs(lvec.z) > 1e-12f) {
+    if (abs(lvec.z) > 1e-15f) {
       for (int side = -1; side <= 1; side += 2) {
         float sol = (float(side)*size.y-lpnt.z)/lvec.z;
         if (sol >= 0.0f) {
@@ -222,11 +241,8 @@ inline float rg_analytic(int type, float3 pos, float3x3 mat, float3 size,
         }
       }
     }
-    float a = lvec.x*lvec.x + lvec.y*lvec.y;
-    float b = lvec.x*lpnt.x + lvec.y*lpnt.y;
-    float c = lpnt.x*lpnt.x + lpnt.y*lpnt.y - size.x*size.x;
     float2 xx;
-    float sol = rg_quad(a, b, c, xx);
+    float sol = rg_radial_quad(float3(lvec.xy,0),float3(lpnt.xy,0),size.x*size.x,xx);
     if (sol >= 0.0f && abs(lpnt.z+sol*lvec.z) <= size.y && (x < 0.0f || sol < x)) {
       x = sol; tp = 0;
     }
@@ -242,14 +258,14 @@ inline float rg_analytic(int type, float3 pos, float3x3 mat, float3 size,
     float ssz = dot(size, size);
     float3 dif = pnt - pos;
     float2 xx0;
-    if (rg_quad(dot(vec,vec), dot(vec,dif), dot(dif,dif)-ssz, xx0) < 0.0f) return -1.0f;
+    if (rg_radial_quad(vec,dif,ssz,xx0) < 0.0f) return -1.0f;
     float x = -1.0f;
     int ax = -1, sd = 0;
     for (int k = 0; k < 3; ++k) {
       float lk = k==0 ? lvec.x : (k==1 ? lvec.y : lvec.z);
       float pk = k==0 ? lpnt.x : (k==1 ? lpnt.y : lpnt.z);
       float sk = k==0 ? size.x : (k==1 ? size.y : size.z);
-      if (abs(lk) <= 1e-12f) continue;
+      if (abs(lk) <= 1e-15f) continue;
       for (int side = -1; side <= 1; side += 2) {
         float sol = (float(side)*sk-pk)/lk;
         if (sol < 0.0f) continue;
@@ -287,14 +303,14 @@ inline float rg_triangle(float3 v0, float3 v1, float3 v2,
   float2 A0 = float2(p0.x-p2.x, p1.x-p2.x);
   float2 A1 = float2(p0.y-p2.y, p1.y-p2.y);
   float det = A0.x*A1.y - A0.y*A1.x;
-  if (abs(det) < 1e-12f) return -1.0f;
+  if (abs(det) < 1e-15f) return -1.0f;
   float t0 = (A1.y*(-p2.x)-A0.y*(-p2.y))/det;
   float t1 = (-A1.x*(-p2.x)+A0.x*(-p2.y))/det;
   if (t0<0.0f || t1<0.0f || t0+t1>1.0f) return -1.0f;
   float3 e0=v0-v2, e1=v1-v2, dd=lpnt-v2;
   float3 n=cross(e0,e1);
   float denom=dot(lvec,n);
-  if (abs(denom) < 1e-12f) return -1.0f;
+  if (abs(denom) < 1e-15f) return -1.0f;
   float x=-dot(dd,n)/denom;
   if (x>=0.0f) nrm=normalize(n);
   return x>=0.0f ? x : -1.0f;
@@ -335,7 +351,7 @@ inline void rg_box_all(float3 pos, float3x3 mat, float3 size,
   float3 lvec = transpose(mat)*vec;
   for (int k=0;k<3;++k) {
     float lk = k==0?lvec.x:(k==1?lvec.y:lvec.z);
-    if (abs(lk) <= 1e-12f) continue;
+    if (abs(lk) <= 1e-15f) continue;
     for (int side=-1;side<=1;side+=2) {
       float pk = k==0?lpnt.x:(k==1?lpnt.y:lpnt.z);
       float sk = k==0?size.x:(k==1?size.y:size.z);
@@ -382,7 +398,7 @@ inline float rg_hfield(float3 gpos, float3x3 gmat,
     for (int k=0;k<6;++k) lb_all[k]=-1.0f;
     for (int k=0;k<3;++k) {
       float lk = k==0?lvec.x:(k==1?lvec.y:lvec.z);
-      if (abs(lk) <= 1e-12f) continue;
+      if (abs(lk) <= 1e-15f) continue;
       for (int side=-1;side<=1;side+=2) {
         float pk = k==0?lpnt.x:(k==1?lpnt.y:lpnt.z);
         float ck = k==0?bp.x:(k==1?bp.y:bp.z);
@@ -402,12 +418,12 @@ inline float rg_hfield(float3 gpos, float3x3 gmat,
   }
   float top_hit = -1.0f;
   {
-    float3 bp = float3(0.0f,0.0f,0.0f);
+    float3 bp = float3(0.0f,0.0f,sz2*0.5f);
     float3 bs = float3(sx,sy,sz2*0.5f);
     for (int k=0;k<6;++k) lt_all[k]=-1.0f;
     for (int k=0;k<3;++k) {
       float lk = k==0?lvec.x:(k==1?lvec.y:lvec.z);
-      if (abs(lk) <= 1e-12f) continue;
+      if (abs(lk) <= 1e-15f) continue;
       for (int side=-1;side<=1;side+=2) {
         float pk = k==0?lpnt.x:(k==1?lpnt.y:lpnt.z);
         float ck = k==0?bp.x:(k==1?bp.y:bp.z);
@@ -565,6 +581,8 @@ kernel void evaluate_contact_sensors(
   if ((uint(stage_mask[0])&(1u<<ACC))==0) return;
   if (dims[6] & 8192) return;
   uint world=index/nsensor, i=index-world*nsensor;
+  if (stage_mask[1+batch*max(nsensor,1u)+world] == 0) return;
+  if (stage_mask[1+index] == 0) return;
   if (uint(meta[i*10+2])!=ACC) return;
   int styp=meta[i*10+0];
   if (styp!=42 && styp!=0) return;
@@ -794,6 +812,8 @@ kernel void evaluate_rays(
   if ((uint(stage_mask[0])&(1u<<POS))==0) return;
   if (dims[6] & 8192) return;
   uint world=index/nsensor, i=index-world*nsensor;
+  if (stage_mask[1+batch*max(nsensor,1u)+world] == 0) return;
+  if (stage_mask[1+index] == 0) return;
   if (uint(meta[i*10+2])!=POS || meta[i*10+0]!=7) return;
   uint s=uint(meta[i*10+4]);
   uint dim=uint(meta[i*10+5]), adr=uint(meta[i*10+6]);
@@ -882,6 +902,8 @@ kernel void evaluate_geomdist(
   if ((uint(stage_mask[0])&(1u<<POS))==0) return;
   if (dims[5] & 8192) return;
   uint world=index/nsensor, i=index-world*nsensor;
+  if (stage_mask[1+batch*max(nsensor,1u)+world] == 0) return;
+  if (stage_mask[1+index] == 0) return;
   uint stage=uint(meta[i*10+2]);
   if (stage!=POS) return;
   int typ=meta[i*10+0];

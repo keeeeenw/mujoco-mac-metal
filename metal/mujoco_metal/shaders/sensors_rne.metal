@@ -58,6 +58,70 @@ inline void mul_inert(thread float* I, float3 va, float3 vl,
 inline float3 shift_torque(float3 torque, float3 force, float3 np_, float3 op) {
   return torque-cross(np_-op,force);
 }
+// Two-word arithmetic used only for the derivative side-channel.  Existing
+// sensor values keep their original single-word operation order; the low word
+// records the residual of a more accurate evaluation of the same transform.
+inline float2 sensor_dd_add(float2 a, float2 b) {
+  float s=a.x+b.x;
+  float v=s-a.x;
+  float e=(a.x-(s-v))+(b.x-v)+a.y+b.y;
+  float h=s+e;
+  return float2(h,e-(h-s));
+}
+inline float2 sensor_dd_neg(float2 a) { return float2(-a.x,-a.y); }
+inline float2 sensor_dd_sub(float2 a, float2 b) {
+  return sensor_dd_add(a,sensor_dd_neg(b));
+}
+inline float2 sensor_dd_mul(float2 a, float2 b) {
+  float p=a.x*b.x;
+  float e=fma(a.x,b.x,-p)+a.x*b.y+a.y*b.x+a.y*b.y;
+  float h=p+e;
+  return float2(h,e-(h-p));
+}
+inline void sensor_dd_cross(thread const float2* a,
+                            thread const float2* b,
+                            thread float2* out) {
+  out[0]=sensor_dd_sub(sensor_dd_mul(a[1],b[2]),
+                       sensor_dd_mul(a[2],b[1]));
+  out[1]=sensor_dd_sub(sensor_dd_mul(a[2],b[0]),
+                       sensor_dd_mul(a[0],b[2]));
+  out[2]=sensor_dd_sub(sensor_dd_mul(a[0],b[1]),
+                       sensor_dd_mul(a[1],b[0]));
+}
+inline void sensor_dd_cross_motion(thread const float2* wa,
+                                   thread const float2* wl,
+                                   thread const float2* sa,
+                                   thread const float2* sl,
+                                   thread float2* ra,
+                                   thread float2* rl) {
+  float2 first[3], second[3];
+  sensor_dd_cross(wa, sa, ra);
+  sensor_dd_cross(wa, sl, first);
+  sensor_dd_cross(wl, sa, second);
+  for (uint k=0;k<3;++k) rl[k]=sensor_dd_add(first[k],second[k]);
+}
+inline void sensor_dd_axpy3(thread float2* dst,
+                            thread const float2* src, float scale) {
+  float2 s=float2(scale,0.0f);
+  for (uint k=0;k<3;++k)
+    dst[k]=sensor_dd_add(dst[k],sensor_dd_mul(src[k],s));
+}
+inline void sensor_dd_rotate(float4 q, thread const float2* v,
+                             thread float2* out) {
+  float2 qv[3] = {float2(q.y,0.0f),float2(q.z,0.0f),
+                  float2(q.w,0.0f)};
+  float2 cross1[3], cross2[3];
+  sensor_dd_cross(qv,v,cross1);
+  for (uint k=0;k<3;++k)
+    cross1[k]=sensor_dd_add(cross1[k],sensor_dd_mul(float2(q.x,0.0f),v[k]));
+  sensor_dd_cross(qv,cross1,cross2);
+  for (uint k=0;k<3;++k)
+    out[k]=sensor_dd_add(v[k],sensor_dd_mul(float2(2.0f,0.0f),cross2[k]));
+}
+inline float sensor_dd_residual(float2 accurate, float legacy) {
+  float2 diff=sensor_dd_sub(accurate,float2(legacy,0.0f));
+  return diff.x+diff.y;
+}
 struct SensorComScratch { float3 scom; float smass; float3 smom; };
 static_assert(sizeof(SensorComScratch)==48, "sensor COM workspace ABI");
 // cfrc_ext assembly: xfrc_applied + solver-included contacts +
@@ -94,11 +158,13 @@ kernel void assemble_cfrc_ext(
   // lam_all: raw workspace_debug; lam region at nr*nr+3*nr, stride S.
   // contact_packed per slot (3 ints): cdim, row_offset, cone.
   // contact_row per slot (1 float): row_data active flag.
-  // dims (8 ints): batch, nbody, neq, nc, npairs, has_xfrc, nr, S.
+  // dims prefix (8 ints): batch, nbody, neq, nc, npairs, has_xfrc, nr, S;
+  // the appended batch selector uses 1=compute and 0=preserve.
   uint batch=uint(dims[0]), nbody=uint(dims[1]);
   uint neq=uint(dims[2]), nc=uint(dims[3]);
   uint has_xfrc=uint(dims[5]), nr=uint(dims[6]), S=uint(dims[7]);
   if (world>=batch) return;
+  if (dims[8+int(world)] == 0) return;
   uint b3=world*nbody*3, b6=world*nbody*6;
   for (uint b=0;b<nbody;++b) {
     cfrc_ext[b6+b*6+0]=0.0f; cfrc_ext[b6+b*6+1]=0.0f; cfrc_ext[b6+b*6+2]=0.0f;
@@ -284,13 +350,17 @@ kernel void rne_post(
     constant int* dims [[buffer(18)]],
     device const float* gravity [[buffer(19)]],
     device SensorComScratch* scratch [[buffer(20)]],
+    device const float* qacc_low [[buffer(21)]],
     uint world [[thread_position_in_grid]]) {
   // body_jnt per body (4 ints): jntadr, jntnum, dofadr, dofnum.
-  // dims (5 ints): batch, nbody, nv, njnt, grav_off.
+  // dims prefix (5 ints): batch, nbody, nv, njnt, grav_off; the appended
+  // batch selector uses 1=compute and 0=preserve.
   uint batch=uint(dims[0]), nbody=uint(dims[1]), nv=uint(dims[2]);
   uint njnt=uint(dims[3]);
   if (world>=batch) return;
+  if (dims[5+int(world)] == 0) return;
   uint vb=world*nv, b3=world*nbody*3, b6=world*nbody*6;
+  device float* cacc_low=cacc+batch*nbody*6;
   // Subtree com (pinned mj_comPos: moment accumulation + MINVAL fallback).
   device SensorComScratch* sub=scratch+world*nbody;
   for (uint b=0;b<nbody;++b) {
@@ -316,7 +386,10 @@ kernel void rne_post(
   // World cacc = -gravity.
   float3 wg=float3(0.0f);
   if (dims[4]==0) wg=-float3(gravity[0],gravity[1],gravity[2]);
-  for (uint k=0;k<6;++k) cacc[b6+k]=0.0f;
+  for (uint k=0;k<6;++k) {
+    cacc[b6+k]=0.0f;
+    cacc_low[b6+k]=0.0f;
+  }
   cacc[b6+3]=wg.x; cacc[b6+4]=wg.y; cacc[b6+5]=wg.z;
   // Per-body forward pass (bodies are topologically ordered).
   for (uint b=1;b<nbody;++b) {
@@ -324,6 +397,18 @@ kernel void rne_post(
     uint root=uint(body_tree[b*2+1]);
     float3 cw=r3(cvel,b6+p*6), cv=r3(cvel,b6+p*6+3);
     float3 ca=r3(cacc,b6+p*6), cl=r3(cacc,b6+p*6+3);
+    float3 ca_low=r3(cacc_low,b6+p*6), cl_low=r3(cacc_low,b6+p*6+3);
+    // Keep an independent two-word spatial-acceleration recurrence.  The
+    // legacy high-word recurrence below preserves its established operation
+    // order; this pair carries product residuals (not just qacc_low) through
+    // cdof*qacc and cdof_dot*qvel before the ACC side-channel is formed.
+    float2 cw_pair[3], cv_pair[3], ca_pair[3], cl_pair[3];
+    for (uint k=0;k<3;++k) {
+      cw_pair[k]=float2(cw[k],0.0f);
+      cv_pair[k]=float2(cv[k],0.0f);
+      ca_pair[k]=float2(ca[k],ca_low[k]);
+      cl_pair[k]=float2(cl[k],cl_low[k]);
+    }
     float3 com=sub[root].scom;
     int ja=body_jnt[b*4+0], jn=body_jnt[b*4+1];
     for (int j=0;j<jn;++j) {
@@ -337,54 +422,135 @@ kernel void rne_post(
         float3 Sa, Sl;
         if (jt==3) { Sa=axis; Sl=cross(axis,off); }
         else { Sa=float3(0.0f); Sl=axis; }
+        float2 Sa_pair[3], Sl_pair[3];
+        for (uint k=0;k<3;++k) {
+          Sa_pair[k]=float2(Sa[k],0.0f);
+          Sl_pair[k]=float2(Sl[k],0.0f);
+        }
         float qv=qvel[vb+uint(dd)], qa=qacc[vb+uint(dd)];
+        float qa_low=qacc_low[vb+uint(dd)];
         float3 cda, cdl;
         cross_motion(cw,cv,Sa,Sl,cda,cdl);
         ca+=cda*qv; cl+=cdl*qv;
         ca+=Sa*qa; cl+=Sl*qa;
+        ca_low+=Sa*qa_low; cl_low+=Sl*qa_low;
+        float2 cda_pair[3], cdl_pair[3];
+        sensor_dd_cross_motion(cw_pair,cv_pair,Sa_pair,Sl_pair,
+                               cda_pair,cdl_pair);
+        sensor_dd_axpy3(ca_pair,cda_pair,qv);
+        sensor_dd_axpy3(cl_pair,cdl_pair,qv);
+        sensor_dd_axpy3(ca_pair,Sa_pair,qa);
+        sensor_dd_axpy3(cl_pair,Sl_pair,qa);
+        sensor_dd_axpy3(ca_pair,Sa_pair,qa_low);
+        sensor_dd_axpy3(cl_pair,Sl_pair,qa_low);
         cw+=Sa*qv; cv+=Sl*qv;
+        sensor_dd_axpy3(cw_pair,Sa_pair,qv);
+        sensor_dd_axpy3(cv_pair,Sl_pair,qv);
       } else if (jt==1 || jt==0) {
         // Ball (3 rotary dofs) and free (3 slide + 3 rotary): pinned
         // mj_comVel computes all rotary cdofdots from the same cvel.
         float4 q=rqunit(r4(body_quat,(world*nbody+b)*4));
         int r0 = jt==0 ? dd+3 : dd;
         float3 cw0=cw, cv0=cv;
+        float2 cw0_pair[3], cv0_pair[3];
+        for (uint k=0;k<3;++k) {
+          cw0_pair[k]=cw_pair[k];
+          cv0_pair[k]=cv_pair[k];
+        }
         if (jt==0) {
           for (int k=0;k<3;++k) {
             float qv=qvel[vb+uint(dd+k)], qa=qacc[vb+uint(dd+k)];
+            float qa_low=qacc_low[vb+uint(dd+k)];
             cv0[k]+=qv; cl[k]+=qa;
+            cl_low[k]+=qa_low;
+            cv0_pair[k]=sensor_dd_add(cv0_pair[k],float2(qv,0.0f));
+            cl_pair[k]=sensor_dd_add(
+                cl_pair[k],sensor_dd_mul(float2(qa,qa_low),float2(1.0f,0.0f)));
           }
           cw=cw0;
           // NOTE: translation part of cvel for cdofdot below uses updated cv0.
           float3 cda, cdl;
           for (int k=0;k<3;++k) {
             float3 ax=rmat_col(q,k);
+            float2 ax_pair[3], off_pair[3], cross_axis[3];
+            for (uint c=0;c<3;++c) {
+              ax_pair[c]=float2(ax[c],0.0f);
+              off_pair[c]=float2(off[c],0.0f);
+            }
+            sensor_dd_cross(ax_pair,off_pair,cross_axis);
             float qv=qvel[vb+uint(r0+k)], qa=qacc[vb+uint(r0+k)];
+            float qa_low=qacc_low[vb+uint(r0+k)];
             cross_motion(cw0,cv0,ax,cross(ax,off),cda,cdl);
             ca+=cda*qv; cl+=cdl*qv;
             ca+=ax*qa; cl+=cross(ax,off)*qa;
+            ca_low+=ax*qa_low; cl_low+=cross(ax,off)*qa_low;
+            float2 cda_pair[3], cdl_pair[3];
+            sensor_dd_cross_motion(cw0_pair,cv0_pair,ax_pair,cross_axis,
+                                   cda_pair,cdl_pair);
+            sensor_dd_axpy3(ca_pair,cda_pair,qv);
+            sensor_dd_axpy3(cl_pair,cdl_pair,qv);
+            sensor_dd_axpy3(ca_pair,ax_pair,qa);
+            sensor_dd_axpy3(cl_pair,cross_axis,qa);
+            sensor_dd_axpy3(ca_pair,ax_pair,qa_low);
+            sensor_dd_axpy3(cl_pair,cross_axis,qa_low);
             cw+=ax*qv; cv+=cross(ax,off)*qv;
+            sensor_dd_axpy3(cw_pair,ax_pair,qv);
+            sensor_dd_axpy3(cv_pair,cross_axis,qv);
           }
         } else {
           for (int k=0;k<3;++k) {
             float3 ax=rmat_col(q,k);
+            float2 ax_pair[3], off_pair[3], cross_axis[3];
+            for (uint c=0;c<3;++c) {
+              ax_pair[c]=float2(ax[c],0.0f);
+              off_pair[c]=float2(off[c],0.0f);
+            }
+            sensor_dd_cross(ax_pair,off_pair,cross_axis);
             float qv=qvel[vb+uint(r0+k)], qa=qacc[vb+uint(r0+k)];
+            float qa_low=qacc_low[vb+uint(r0+k)];
             float3 cda, cdl;
             cross_motion(cw0,cv0,ax,cross(ax,off),cda,cdl);
             ca+=cda*qv; cl+=cdl*qv;
             ca+=ax*qa; cl+=cross(ax,off)*qa;
+            ca_low+=ax*qa_low; cl_low+=cross(ax,off)*qa_low;
+            float2 cda_pair[3], cdl_pair[3];
+            sensor_dd_cross_motion(cw0_pair,cv0_pair,ax_pair,cross_axis,
+                                   cda_pair,cdl_pair);
+            sensor_dd_axpy3(ca_pair,cda_pair,qv);
+            sensor_dd_axpy3(cl_pair,cdl_pair,qv);
+            sensor_dd_axpy3(ca_pair,ax_pair,qa);
+            sensor_dd_axpy3(cl_pair,cross_axis,qa);
+            sensor_dd_axpy3(ca_pair,ax_pair,qa_low);
+            sensor_dd_axpy3(cl_pair,cross_axis,qa_low);
           }
           cw+=float3(0.0f);
           for (int k=0;k<3;++k) {
             float3 ax=rmat_col(q,k);
             float qv=qvel[vb+uint(r0+k)];
             cw+=ax*qv; cv+=cross(ax,off)*qv;
+            float2 ax_pair[3], off_pair[3], cross_axis[3];
+            for (uint c=0;c<3;++c) {
+              ax_pair[c]=float2(ax[c],0.0f);
+              off_pair[c]=float2(off[c],0.0f);
+            }
+            sensor_dd_cross(ax_pair,off_pair,cross_axis);
+            sensor_dd_axpy3(cw_pair,ax_pair,qv);
+            sensor_dd_axpy3(cv_pair,cross_axis,qv);
           }
         }
       }
     }
     cacc[b6+b*6+0]=ca.x; cacc[b6+b*6+1]=ca.y; cacc[b6+b*6+2]=ca.z;
     cacc[b6+b*6+3]=cl.x; cacc[b6+b*6+4]=cl.y; cacc[b6+b*6+5]=cl.z;
+    cacc_low[b6+b*6+0]=ca_low.x; cacc_low[b6+b*6+1]=ca_low.y;
+    cacc_low[b6+b*6+2]=ca_low.z; cacc_low[b6+b*6+3]=cl_low.x;
+    cacc_low[b6+b*6+4]=cl_low.y; cacc_low[b6+b*6+5]=cl_low.z;
+    cacc_low[b6+b*6+0]=sensor_dd_residual(ca_pair[0],ca.x);
+    cacc_low[b6+b*6+1]=sensor_dd_residual(ca_pair[1],ca.y);
+    cacc_low[b6+b*6+2]=sensor_dd_residual(ca_pair[2],ca.z);
+    cacc_low[b6+b*6+3]=sensor_dd_residual(cl_pair[0],cl.x);
+    cacc_low[b6+b*6+4]=sensor_dd_residual(cl_pair[1],cl.y);
+    cacc_low[b6+b*6+5]=sensor_dd_residual(cl_pair[2],cl.z);
     // cfrc_body = cinert*cacc + cvel x (cinert*cvel), com-based.
     float3 xip=r3(inertial_pos,b3+b*3);
     float4 xiq=rqunit(r4(inertial_quat,(world*nbody+b)*4));
@@ -465,24 +631,30 @@ kernel void evaluate_acc_sensors(
   //   trntype, trnid0. contact_packed per slot (3 ints): cdim, row_offset,
   //   cone. site_geom per site (4 floats): size + type.
   // dims (14 ints): batch, nsensor, ndata, nr, S, nc, nu, nt, nv, njnt,
-  //   nbody, has_act, nsite, ngeom.
+  //   nbody, has_act, nsite, ngeom, followed by a batch selector.
   uint batch=uint(dims[0]), nsensor=uint(dims[1]), ndata=uint(dims[2]);
-  uint nr=uint(dims[3]), S=uint(dims[4]), nc=uint(dims[5]);
-  uint nu=uint(dims[6]), nt=uint(dims[7]), nv=uint(dims[8]);
+  device const float* cacc_low=cacc+batch*uint(dims[10])*6;
+  device float* output_low=output+batch*ndata;
+  uint nr=uint(dims[3]), S=uint(dims[4]);
+  uint nu=uint(dims[6]), nv=uint(dims[8]);
   uint nbody=uint(dims[10]), nsite=uint(dims[12]);
   uint ACC=3;
   if (index>=batch*nsensor) return;
   if ((uint(stage_mask[0])&(1u<<ACC))==0) return;
   uint world=index/nsensor, i=index-world*nsensor;
+  if (dims[14+int(world)] == 0) return;
+  if (stage_mask[1+batch*max(nsensor,1u)+world] == 0) return;
+  if (stage_mask[1+index] == 0) return;
   if (uint(meta[i*10+2])!=ACC) return;
   int typ=meta[i*10+0], objid=meta[i*10+4];
   uint dim=uint(meta[i*10+5]), adr=uint(meta[i*10+6]);
+  uint base=world*ndata+adr;
   // Force families here; touch(0)/contact(42) have the spatial kernel.
   bool handled = typ==1||typ==4||typ==5||typ==15||typ==16||typ==17
       ||typ==22||typ==25||typ==33||typ==34;
   if (!handled) return;
   float value[6] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
-  uint vb=world*nv, b6=world*nbody*6, b3=world*nbody*3;
+  uint vb=world*nv;
   if (typ==15) {
     if (objid>=0 && uint(objid)<nu && dims[11]!=0)
       value[0]=act_force[world*nu+uint(objid)];
@@ -513,20 +685,55 @@ kernel void evaluate_acc_sensors(
     // each body's own root com, so no root lookup is needed.
     uint s=uint(objid);
     int b=site_bodyid[s];
-    float3 sp=r3(site_pos,(world*nsite+s)*3);
-    float3 com=r3(scom,(world*nbody+uint(b))*3);
-    float3 aa=r3(cacc,(world*nbody+uint(b))*6);
-    float3 al=r3(cacc,(world*nbody+uint(b))*6+3);
-    al=al-cross(sp-com,aa);
-    float3 wa=r3(cvel,(world*nbody+uint(b))*6);
-    float3 wl=r3(cvel,(world*nbody+uint(b))*6+3);
-    float3 vw=wl+cross(wa,sp-com);
-    float4 sq=rqunit(r4(site_quat,(world*nsite+s)*4));
-    float3 ll=rqrot(rqconj(sq),al);
-    float3 lv_ang=rqrot(rqconj(sq),wa);
-    float3 lv_lin=rqrot(rqconj(sq),vw);
-    ll+=cross(lv_ang,lv_lin);
-    value[0]=ll.x; value[1]=ll.y; value[2]=ll.z;
+    // Pinned mj_objectAcceleration returns zero for bodies welded to world,
+    // including mocap frames. Do not expose RNE's -gravity cacc in this case.
+    if (body_weld[b] == 0) {
+      for (uint k=0;k<dim;++k) output_low[base+k]=0.0f;
+    } else {
+      float3 sp=r3(site_pos,(world*nsite+s)*3);
+      float3 com=r3(scom,(world*nbody+uint(b))*3);
+      float3 aa=r3(cacc,(world*nbody+uint(b))*6);
+      float3 al0=r3(cacc,(world*nbody+uint(b))*6+3);
+      float3 al=al0;
+      al=al-cross(sp-com,aa);
+      float3 wa=r3(cvel,(world*nbody+uint(b))*6);
+      float3 wl=r3(cvel,(world*nbody+uint(b))*6+3);
+      float3 vw=wl+cross(wa,sp-com);
+      float4 sq=rqunit(r4(site_quat,(world*nsite+s)*4));
+      float3 ll=rqrot(rqconj(sq),al);
+      float3 lv_ang=rqrot(rqconj(sq),wa);
+      float3 lv_lin=rqrot(rqconj(sq),vw);
+      ll+=cross(lv_ang,lv_lin);
+      value[0]=ll.x; value[1]=ll.y; value[2]=ll.z;
+      // Evaluate the same angular-acceleration, point-shift, Coriolis and site
+      // rotation with two-word intermediates.  This is a side-channel for
+      // finite differences: the ordinary output above remains bit-for-bit on
+      // its established float32 path.
+      float2 off[3], aa_dd[3], al_dd[3], wa_dd[3], wl_dd[3];
+      float2 cross_a[3], cross_v[3], vw_dd[3], lv_ang_dd[3], lv_lin_dd[3];
+      for (uint k=0;k<3;++k) {
+        off[k]=sensor_dd_sub(float2(sp[k],0.0f),float2(com[k],0.0f));
+        aa_dd[k]=float2(aa[k],cacc_low[(world*nbody+uint(b))*6+k]);
+        wa_dd[k]=float2(wa[k],0.0f);
+        wl_dd[k]=float2(wl[k],0.0f);
+      }
+      sensor_dd_cross(off,aa_dd,cross_a);
+      for (uint k=0;k<3;++k)
+        al_dd[k]=sensor_dd_sub(
+            float2(al0[k],cacc_low[(world*nbody+uint(b))*6+3+k]),cross_a[k]);
+      sensor_dd_cross(wa_dd,off,cross_v);
+      for (uint k=0;k<3;++k)
+        vw_dd[k]=sensor_dd_add(wl_dd[k],cross_v[k]);
+      float4 sqc=rqconj(sq);
+      sensor_dd_rotate(sqc,al_dd,lv_ang_dd); // angular acceleration
+      sensor_dd_rotate(sqc,wa_dd,cross_a);   // angular velocity
+      sensor_dd_rotate(sqc,vw_dd,lv_lin_dd); // point linear velocity
+      sensor_dd_cross(cross_a,lv_lin_dd,cross_v);
+      for (uint k=0;k<3;++k) {
+        float2 acc_dd=sensor_dd_add(lv_ang_dd[k],cross_v[k]);
+        output_low[base+k]=sensor_dd_residual(acc_dd,value[k]);
+      }
+    }
   } else if (typ==4 || typ==5) {
     // Force/torque: body interaction wrench in site frame (pinned
     // transformSpatial flg_force=1, then site rotation).
@@ -572,6 +779,39 @@ kernel void evaluate_acc_sensors(
       value[0]=v.x; value[1]=v.y; value[2]=v.z;
     }
   }
-  uint base=world*ndata+adr;
+  float cutoff=as_type<float>(meta[i*10+7]);
+  int datatype=meta[i*10+1];
+  if (cutoff>0.0f && (datatype==0 || datatype==1)) {
+    for (uint j=0;j<dim && j<6;++j) {
+      float unclamped=value[j];
+      float clipped=datatype==0 ? clamp(unclamped,-cutoff,cutoff)
+                                : min(unclamped,cutoff);
+      if (typ==1) {
+        float2 accurate=sensor_dd_add(float2(unclamped,0.0f),
+                                      float2(output_low[base+j],0.0f));
+        if (datatype==0) {
+          if (accurate.x>cutoff ||
+              (accurate.x==cutoff && accurate.y>0.0f)) {
+            clipped=cutoff; output_low[base+j]=0.0f;
+          } else if (accurate.x< -cutoff ||
+                     (accurate.x== -cutoff && accurate.y<0.0f)) {
+            clipped= -cutoff; output_low[base+j]=0.0f;
+          } else {
+            output_low[base+j]=sensor_dd_residual(accurate,clipped);
+          }
+        } else if (accurate.x>cutoff ||
+                   (accurate.x==cutoff && accurate.y>0.0f)) {
+          clipped=cutoff; output_low[base+j]=0.0f;
+        } else {
+          output_low[base+j]=sensor_dd_residual(accurate,clipped);
+        }
+      } else {
+        output_low[base+j]=0.0f;
+      }
+      value[j]=clipped;
+    }
+  } else if (typ!=1) {
+    for (uint j=0;j<dim && j<6;++j) output_low[base+j]=0.0f;
+  }
   for (uint j=0;j<dim && j<6;j++) output[base+j]=value[j];
 }

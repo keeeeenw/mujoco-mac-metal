@@ -30,32 +30,70 @@ kernel void passive_joint_force(
     device const float* damping [[buffer(8)]],
     device const float* damperpoly [[buffer(9)]],
     constant int* dims [[buffer(10)]],
-    device float* force [[buffer(11)]],
-    device float* damping_derivative [[buffer(12)]],
+    device const int* body_jntadr [[buffer(11)]],
+    device const int* body_jntnum [[buffer(12)]],
+    device const int* awake_body_ids [[buffer(13)]],
+    device const int* awake_body_count [[buffer(14)]],
+    device const int* awake_dof_ids [[buffer(15)]],
+    device const int* awake_dof_count [[buffer(16)]],
+    constant int* sleep_filter [[buffer(17)]],
+    device float* force [[buffer(18)]],
+    device float* damping_derivative [[buffer(19)]],
     uint world [[thread_position_in_grid]]) {
-  int nq = dims[0], nv = dims[1], njnt = dims[2], n_poly = dims[3];
+  int nq = dims[0], nv = dims[1], njnt = dims[2], n_poly = dims[3], nbody=dims[6];
+  if (dims[7 + int(world)] == 0) return;
   int spring_disabled = dims[4];
   int damper_disabled = dims[5];
   if (n_poly != 2) return;
+  bool filtering = sleep_filter[0] != 0;
   uint qo = world * uint(nq), vo = world * uint(nv), fo = world * uint(nv);
-  for (int d = 0; d < nv; ++d) { force[fo + uint(d)] = 0.0f; damping_derivative[fo + uint(d)] = 0.0f; }
+  if (!filtering) {
+    for (int d = 0; d < nv; ++d) { force[fo + uint(d)] = 0.0f; damping_derivative[fo + uint(d)] = 0.0f; }
+  } else {
+    for (int k=0; k<awake_dof_count[world*3+2]; ++k) {
+      int d=awake_dof_ids[world*uint(max(nv,1))+uint(k)];
+      if (d>=0 && d<nv) { force[fo+uint(d)]=0.0f; damping_derivative[fo+uint(d)]=0.0f; }
+    }
+  }
   for (int i=0; i<nq; ++i) {
     if ((as_type<uint>(qpos[qo+uint(i)]) & 0x7f800000u) == 0x7f800000u) {
       float bad = as_type<float>(0x7fc00000u);
-      for (int d=0; d<nv; ++d) { force[fo+uint(d)] = bad; damping_derivative[fo+uint(d)] = bad; }
+      if (!filtering) {
+        for (int d=0; d<nv; ++d) { force[fo+uint(d)] = bad; damping_derivative[fo+uint(d)] = bad; }
+      } else {
+        for (int k=0; k<awake_dof_count[world*3+2]; ++k) {
+          int d=awake_dof_ids[world*uint(max(nv,1))+uint(k)];
+          if (d>=0 && d<nv) { force[fo+uint(d)]=bad; damping_derivative[fo+uint(d)]=bad; }
+        }
+      }
       return;
     }
   }
   for (int i=0; i<nv; ++i) {
     if ((as_type<uint>(qvel[vo+uint(i)]) & 0x7f800000u) == 0x7f800000u) {
       float bad = as_type<float>(0x7fc00000u);
-      for (int d=0; d<nv; ++d) { force[fo+uint(d)] = bad; damping_derivative[fo+uint(d)] = bad; }
+      if (!filtering) {
+        for (int d=0; d<nv; ++d) { force[fo+uint(d)] = bad; damping_derivative[fo+uint(d)] = bad; }
+      } else {
+        for (int k=0; k<awake_dof_count[world*3+2]; ++k) {
+          int d=awake_dof_ids[world*uint(max(nv,1))+uint(k)];
+          if (d>=0 && d<nv) { force[fo+uint(d)]=bad; damping_derivative[fo+uint(d)]=bad; }
+        }
+      }
       return;
     }
   }
   if (!spring_disabled) {
-    for (int j = 0; j < njnt; ++j) {
-      int qa = qadr[j], da = dadr[j];
+    int body_count = filtering ? awake_body_count[world*3] : nbody;
+    for (int bi = 0; bi < body_count; ++bi) {
+      int body = filtering ? awake_body_ids[world*uint(nbody)+uint(bi)] : bi;
+      if (body < 0 || body >= nbody) continue;
+      int jstart = body_jntadr[body];
+      int jcount = body_jntnum[body];
+      for (int ji = 0; ji < jcount; ++ji) {
+        int j = jstart + ji;
+        if (j < 0 || j >= njnt) continue;
+        int qa = qadr[j], da = dadr[j];
       if (type[j] == 2 || type[j] == 3) {
         float x = qpos[qo + uint(qa)] - springref[qa];
         float k = stiffness[j] + springpoly[2*j] * x + springpoly[2*j+1] * x*x;
@@ -79,10 +117,14 @@ kernel void passive_joint_force(
         float k = stiffness[j] + springpoly[2*j]*r + springpoly[2*j+1]*r*r;
         for (int a=0; a<3; ++a) force[fo+uint(da+a)] -= angular[a]*k;
       }
+      }
     }
   }
   if (!damper_disabled) {
-    for (int d=0; d<nv; ++d) {
+    int damper_count = filtering ? awake_dof_count[world*3+2] : nv;
+    for (int di=0; di<damper_count; ++di) {
+      int d = filtering ? awake_dof_ids[world*uint(max(nv,1))+uint(di)] : di;
+      if (d < 0 || d >= nv) continue;
       float v = qvel[vo+uint(d)];
       float av = abs(v);
       float c = damping[d] + damperpoly[2*d]*av + damperpoly[2*d+1]*v*v;
@@ -113,11 +155,31 @@ kernel void project_body_wrenches(
     device const float* gravity [[buffer(12)]],
     device const float* xfrc_applied [[buffer(13)]],
     constant int* dims [[buffer(14)]],
-    device float* qfrc [[buffer(15)]],
+    device const int* awake_body_ids [[buffer(15)]],
+    device const int* awake_body_count [[buffer(16)]],
+    constant int* sleep_filter [[buffer(17)]],
+    device float* qfrc [[buffer(18)]],
+    constant int* clear_output [[buffer(19)]],
+    device const int* jnt_actgravcomp [[buffer(20)]],
+    device const int* awake_dof_ids [[buffer(21)]],
+    device const int* awake_dof_count [[buffer(22)]],
     uint world [[thread_position_in_grid]]) {
   (void)jnt_bodyid;  // Reserved metadata binding; ancestry uses body_jntadr.
   int nbody=dims[0], njnt=dims[1], nv=dims[2], gravity_disabled=dims[3];
+  if (dims[4 + int(world)] == 0) return;
   uint forcebase=world*uint(nv), bodybase=world*uint(nbody), jointbase=world*uint(njnt);
+  // Passive callers have already assembled joint forces in this buffer.
+  // Standalone gravcomp callers instead own a replacement output.
+  if (clear_output[0]) {
+    if (sleep_filter[0]) {
+      for (int k=0;k<awake_dof_count[world*3+2];++k) {
+        int d=awake_dof_ids[world*uint(max(nv,1))+uint(k)];
+        if (d>=0 && d<nv) qfrc[forcebase+uint(d)]=0.0f;
+      }
+    } else {
+      for (int d=0;d<nv;++d) qfrc[forcebase+uint(d)]=0.0f;
+    }
+  }
   for (int i=0;i<nbody*6;++i) {
     uint wi=world*uint(nbody*6)+uint(i);
     if ((as_type<uint>(xfrc_applied[wi]) & 0x7f800000u) == 0x7f800000u) {
@@ -126,7 +188,11 @@ kernel void project_body_wrenches(
       return;
     }
   }
-  for (int body=1; body<nbody; ++body) {
+  int body_count = sleep_filter[0] ? awake_body_count[world*3] : nbody-1;
+  for (int bi=0; bi<body_count; ++bi) {
+    int body = sleep_filter[0]
+        ? awake_body_ids[world*uint(nbody)+uint(bi)] : bi+1;
+    if (body <= 0 || body >= nbody) continue;
     uint wi=(world*uint(nbody)+uint(body))*6;
     float3 force=float3(xfrc_applied[wi],xfrc_applied[wi+1],xfrc_applied[wi+2]);
     float3 torque=float3(xfrc_applied[wi+3],xfrc_applied[wi+4],xfrc_applied[wi+5]);
@@ -140,23 +206,35 @@ kernel void project_body_wrenches(
       int start=body_jntadr[ancestor], count=body_jntnum[ancestor];
       for (int k=0;k<count;++k) {
         int j=start+k, typ=jnt_type[j], da=jnt_dofadr[j];
+        // MuJoCo routes gravity compensation for this joint through
+        // qfrc_actuator when actuatorgravcomp is set. Applied body wrenches
+        // still project normally; only the gravity-compensation component
+        // is removed from passive force for these DOFs.
+        // Standalone gravcomp always reports the complete model source term;
+        // joint routing is applied only when this projection is accumulating
+        // passive force. In standalone mode the caller may bind an inert
+        // one-word flag buffer, so do not index it.
+        bool route_from_actuator = !clear_output[0] && jnt_actgravcomp[j] != 0;
+        float3 joint_gravforce = route_from_actuator
+            ? float3(0.0f) : gravforce;
+        float3 joint_force = force + joint_gravforce;
         uint ai=(jointbase+uint(j))*3;
         float3 anchor=float3(joint_anchor[ai],joint_anchor[ai+1],joint_anchor[ai+2]);
         float3 axis=float3(joint_axis[ai],joint_axis[ai+1],joint_axis[ai+2]);
         if (typ==2) {
-          qfrc[forcebase+uint(da)]+=dot(axis,force+gravforce);
+          qfrc[forcebase+uint(da)]+=dot(axis,joint_force);
         } else if (typ==3) {
-          qfrc[forcebase+uint(da)]+=dot(axis,cross(com-anchor,force+gravforce)+torque);
+          qfrc[forcebase+uint(da)]+=dot(axis,cross(com-anchor,joint_force)+torque);
         } else if (typ==1) {
-          float3 moment=cross(com-anchor,force+gravforce)+torque;
+          float3 moment=cross(com-anchor,joint_force)+torque;
           float4 q=float4(body_quat[(bodybase+uint(ancestor))*4],body_quat[(bodybase+uint(ancestor))*4+1],body_quat[(bodybase+uint(ancestor))*4+2],body_quat[(bodybase+uint(ancestor))*4+3]);
           for (int a=0;a<3;++a) {
             float3 local=float3(a==0 ? 1.0f : 0.0f,a==1 ? 1.0f : 0.0f,a==2 ? 1.0f : 0.0f);
             qfrc[forcebase+uint(da+a)]+=dot(rotate_vec(q,local),moment);
           }
         } else if (typ==0) {
-          float3 moment=cross(com-anchor,force+gravforce)+torque;
-          for (int a=0;a<3;++a) qfrc[forcebase+uint(da+a)]+=force[a]+gravforce[a];
+          float3 moment=cross(com-anchor,joint_force)+torque;
+          for (int a=0;a<3;++a) qfrc[forcebase+uint(da+a)]+=joint_force[a];
           float4 q=float4(body_quat[(bodybase+uint(ancestor))*4],body_quat[(bodybase+uint(ancestor))*4+1],body_quat[(bodybase+uint(ancestor))*4+2],body_quat[(bodybase+uint(ancestor))*4+3]);
           for (int a=0;a<3;++a) qfrc[forcebase+uint(da+3+a)]+=dot(rotate_vec(q,float3(a==0 ? 1.0f : 0.0f,a==1 ? 1.0f : 0.0f,a==2 ? 1.0f : 0.0f)),moment);
         }

@@ -18,12 +18,13 @@ _SHADER = Path(__file__).parent / "shaders" / "joint_constraints.metal"
 _MINVAL = 1e-15
 _MAX_NV = 24
 _MAX_ROWS = 32
-_MAX_ITERATIONS = 512
-_TOLERANCE = 2e-6
+_ORACLE_ITERATIONS = 512
+_ORACLE_TOLERANCE = 2e-6
 _DISABLE_CONSTRAINT = int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
 _DISABLE_EQUALITY = int(mujoco.mjtDisableBit.mjDSBL_EQUALITY)
 _DISABLE_FRICTION = int(mujoco.mjtDisableBit.mjDSBL_FRICTIONLOSS)
 _DISABLE_LIMIT = int(mujoco.mjtDisableBit.mjDSBL_LIMIT)
+_DISABLE_WARMSTART = int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
 _HINGE = int(mujoco.mjtJoint.mjJNT_HINGE)
 _SLIDE = int(mujoco.mjtJoint.mjJNT_SLIDE)
 _EQ_JOINT = int(mujoco.mjtEq.mjEQ_JOINT)
@@ -44,6 +45,10 @@ class JointConstraintDescriptor:
   neq: int
   nrow: int
   timestep: float
+  iterations: int
+  tolerance: float
+  meaninertia: float
+  warmstart_enabled: bool
   disableflags: int
   refsafe: bool
   joint_type: np.ndarray
@@ -112,9 +117,18 @@ def lower_joint_constraints(model):
       int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST),
   ):
     raise ValueError("joint constraint stage does not support RK4 constraint timing")
+  iterations = int(model.opt.iterations)
+  tolerance = float(model.opt.tolerance)
+  if iterations < 0 or iterations > (1 << 31) - 1:
+    raise ValueError("joint constraint iterations exceed signed int32 range")
+  if not np.isfinite(tolerance) or tolerance <= 0:
+    raise ValueError("joint constraint tolerance must be finite and positive")
   return JointConstraintDescriptor(
       nq=int(model.nq), nv=int(model.nv), njnt=int(model.njnt),
       neq=int(model.neq), nrow=nrow, timestep=float(model.opt.timestep),
+      iterations=iterations, tolerance=tolerance,
+      meaninertia=float(model.stat.meaninertia),
+      warmstart_enabled=not bool(int(model.opt.disableflags) & _DISABLE_WARMSTART),
       disableflags=int(model.opt.disableflags),
       refsafe=not bool(int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)),
       joint_type=_frozen(model.jnt_type, np.int32),
@@ -159,10 +173,15 @@ def _impedance(solimp, pos, margin):
 
 
 def joint_constraint_oracle(model, qpos, qvel, mass_matrix, qfrc_smooth,
-                            eq_active=None, *, max_iterations=_MAX_ITERATIONS,
-                            tolerance=_TOLERANCE):
+                            eq_active=None, *, max_iterations=None,
+                            tolerance=None):
   """Float64 projected coupled solve; reference only, never used by MPS stage."""
   d = lower_joint_constraints(model)
+  # Keep the standalone mathematical oracle's convergence budget independent
+  # from model.opt: native dispatch below uses the exact configured budget,
+  # while this float64 helper is used to validate converged row algebra.
+  max_iterations = _ORACLE_ITERATIONS if max_iterations is None else max_iterations
+  tolerance = _ORACLE_TOLERANCE if tolerance is None else tolerance
   qpos, qvel = np.asarray(qpos, dtype=np.float64), np.asarray(qvel, dtype=np.float64)
   mass = np.asarray(mass_matrix, dtype=np.float64)
   force = np.asarray(qfrc_smooth, dtype=np.float64)
@@ -310,6 +329,10 @@ class JointConstraintProgram:
     if isinstance(batch_size, (bool, np.bool_)) or not isinstance(batch_size, (int, np.integer)) or batch_size <= 0:
       raise ValueError("batch_size must be a positive integer")
     self.batch_size = int(batch_size)
+    if (self.batch_size > (1 << 31) - 1
+        or self.batch_size * max(self.descriptor.nrow, 1)
+        * max(self.descriptor.nv + 5, 1) > (1 << 32)):
+      raise ValueError("joint canonical row workspace exceeds Metal index capacity")
     import torch
     if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
       raise RuntimeError("joint constraint stage requires PyTorch MPS compile_shader")
@@ -331,22 +354,52 @@ class JointConstraintProgram:
       self._arrays[name] = torch.as_tensor(host, device=self._device)
     self._dims = torch.tensor(
         [d.nq, d.nv, d.njnt, d.neq, d.nrow, self.batch_size,
-         d.disableflags, int(d.refsafe), _MAX_ITERATIONS],
+         d.disableflags, int(d.refsafe), d.iterations, 0,
+         int(d.warmstart_enabled)] + [1] * self.batch_size,
         dtype=torch.int32, device=self._device,
     )
-    self._timestep = torch.tensor([d.timestep], dtype=torch.float32, device=self._device)
+    self._assembly_dims = torch.tensor(
+        [d.nq, d.nv, d.njnt, d.neq, d.nrow, self.batch_size,
+         d.disableflags, int(d.refsafe), d.iterations, 1,
+         int(d.warmstart_enabled)] + [1] * self.batch_size,
+        dtype=torch.int32, device=self._device,
+    )
+    self._solver_params = torch.tensor(
+        [d.timestep, d.tolerance, d.meaninertia], dtype=torch.float32,
+        device=self._device)
     self._outputs = {
         "qfrc_constraint": torch.empty((self.batch_size, d.nv), dtype=torch.float32, device=self._device),
         "qacc": torch.empty((self.batch_size, d.nv), dtype=torch.float32, device=self._device),
         "status": torch.empty((self.batch_size,), dtype=torch.int32, device=self._device),
         "residual": torch.empty((self.batch_size,), dtype=torch.float32, device=self._device),
         "iterations": torch.empty((self.batch_size,), dtype=torch.int32, device=self._device),
+        "canonical_rows": torch.empty(
+            (self.batch_size, max(d.nrow, 1) * (d.nv + 5)),
+            dtype=torch.float32, device=self._device),
+        # MuJoCo retains efc_force between PGS calls when warmstart is enabled.
+        # This workspace is initialized to the same cold state as mj_resetData.
+        "lambda": torch.zeros(
+            (self.batch_size, max(d.nrow, 1)), dtype=torch.float32,
+            device=self._device),
     }
     self._eq_active0 = torch.as_tensor(np.array(d.equality_active0, dtype=np.int32, copy=True), device=self._device)
 
-  def run_device(self, mass_matrix, qfrc_smooth, qpos, qvel, eq_active=None):
+  def run_device(self, mass_matrix, qfrc_smooth, qpos, qvel, eq_active=None,
+                 *, qacc_warmstart=None, assemble_only=False,
+                 world_mask=None):
     """Solve one coupled batch; output tensors borrow this program's workspace."""
     torch, d = self._torch, self.descriptor
+    dims = self._assembly_dims if assemble_only else self._dims
+    if world_mask is None:
+      dims[11:].fill_(1)
+    else:
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.device.type != "mps"
+          or world_mask.dtype != torch.int32
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 MPS with shape (batch_size,)")
+      dims[11:].copy_(world_mask)
     expected = {
         "mass_matrix": (self.batch_size, d.nv, d.nv),
         "qfrc_smooth": (self.batch_size, d.nv),
@@ -358,6 +411,18 @@ class JointConstraintProgram:
       tensor = values[name]
       if not isinstance(tensor, torch.Tensor) or tensor.device.type != "mps" or tensor.dtype != torch.float32 or tuple(tensor.shape) != shape or not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
+    if qacc_warmstart is None:
+      self._outputs["qacc"].zero_()
+    else:
+      if (not isinstance(qacc_warmstart, torch.Tensor)
+          or qacc_warmstart.device.type != "mps"
+          or qacc_warmstart.dtype != torch.float32
+          or tuple(qacc_warmstart.shape) != expected["qvel"]
+          or not qacc_warmstart.is_contiguous()):
+        raise ValueError(
+            f"qacc_warmstart must be contiguous float32 MPS with shape "
+            f"{expected['qvel']}")
+      self._outputs["qacc"].copy_(qacc_warmstart)
     if eq_active is None:
       active = self._eq_active0.unsqueeze(0).expand(self.batch_size, d.neq).contiguous()
     else:
@@ -373,7 +438,24 @@ class JointConstraintProgram:
         "equality_solimp",
     ):
       args.append(self._arrays[name].reshape(-1))
-    args.extend([self._dims, self._timestep])
-    args.extend(self._outputs[name] for name in ("qfrc_constraint", "qacc", "status", "residual", "iterations"))
+    args.extend([dims,
+                 self._solver_params])
+    args.extend(self._outputs[name] for name in (
+        "qfrc_constraint", "qacc", "status", "residual", "iterations",
+        "canonical_rows", "lambda"))
     self._kernel(*args, threads=(self.batch_size,), group_size=(1,))
+    packed = self._outputs["canonical_rows"][:, :d.nrow * (d.nv + 5)].reshape(
+        self.batch_size, d.nrow, d.nv + 5)
+    self._outputs["canonical_rows_view"] = {
+        "J": packed[..., :d.nv],
+        "R": packed[..., d.nv],
+        "ar": packed[..., d.nv + 1],
+        "lo": packed[..., d.nv + 2],
+        "hi": packed[..., d.nv + 3],
+        "active": packed[..., d.nv + 4],
+    }
     return self._outputs
+
+  def get_multipliers(self):
+    """Return a host diagnostic copy of the last scalar PGS row forces."""
+    return self._outputs["lambda"].detach().cpu().numpy().copy()

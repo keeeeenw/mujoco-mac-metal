@@ -204,7 +204,7 @@ def _inventory():
           Implementation.UPSTREAM_CPU_ONLY,
           Qualification.UNQUALIFIED,
           Execution.UPSTREAM_HOST,
-          "upstream Python binding only; not exposed as a Metal API",
+          "this mujoco module binding remains upstream-host execution; any similarly named package wrapper is separately inventoried in pinned_surface.json and has its own execution contract",
       )
       for name in sorted(dir(mujoco))
       if name.startswith(("mj_", "mju_")) and callable(getattr(mujoco, name))
@@ -466,6 +466,16 @@ REQUIREMENTS = (
         "accept listed profiles, reject others",
         "MetalSimulation", "baseline", ("test_stepping.py",),
     ),
+    Requirement(
+        "REQ-MOD-003", "pinned MjOption lowering",
+        Stage.MODEL, Implementation.LOWERED, Qualification.CPU_ORACLE,
+        Execution.HOST,
+        "all 29 pinned MjOption fields are explicitly assigned to physics, solver, collision, extension, or visualization requirements; unlisted option combinations remain rejected by profile validation",
+        "mujoco_metal/stepping.py; pinned_surface.json:option_fields",
+        "field-level requirement crosswalk plus bounded profile admission",
+        "load_model; validate_stepping_profile", "005",
+        ("test_binding_inventory.py", "test_stepping.py"),
+    ),
     # Joint types.
     Requirement(
         "REQ-JNT-001", "hinge/slide/ball/free kinematics",
@@ -559,8 +569,8 @@ REQUIREMENTS = (
     # Contact condim/cone matrix.
     Requirement(
         "REQ-CON-001", "condim 1/3/4/6 with pyramidal/elliptic cones",
-        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "other condim values rejected",
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "selected both-cone force and sensor trajectories pass after packed-J consumer correction; complete option/integrator/contact composition remains unqualified; other condim values rejected",
         "mujoco_metal/coupled_constraints.py",
         "accept 1/3/4/6, reject others",
         "MetalSimulation(profile='integrated_euler_v1')", "baseline",
@@ -578,8 +588,8 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-CON-003", "anisotropic sliding/torsional/rolling friction",
-        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "five-coefficient friction expansion with pair mixing",
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "five-coefficient friction expansion and pair mixing implemented; current development anisotropic and rolling-friction numerical gates remain open",
         "mujoco_metal/coupled_constraints.py", "accept finite friction rows",
         "MetalSimulation(profile='integrated_euler_v1')", "baseline",
         ("test_coupled_constraints.py",),
@@ -598,9 +608,29 @@ REQUIREMENTS = (
         "REQ-INT-002", "implicit integrator (bounded contact-free)",
         Stage.INTEGRATION, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
         Execution.DEVICE, "nonsymmetric LU solve with automatic passive, tendon, Coriolis and FD fluid derivatives (eps 1e-3); coupled contacts/equalities/flex guarded",
-        "mujoco_metal/implicit.py:ImplicitProgram", "admit mjINT_IMPLICIT in contact_free_implicit_v1; reject coupled constraints and unsupported compositions",
+        "mujoco_metal/implicit.py:ImplicitProgram", "admit mjINT_IMPLICIT in contact_free_implicit_v1 and integrated_implicit_v1; integrated combinations remain under REQ-INT-003 qualification and explicit composition guards",
         "MetalSimulation", "015", ("test_implicit_015.py", "test_implicit_derivative_repair.py"),
         enums=("mjtIntegrator.mjINT_IMPLICIT",),
+    ),
+    Requirement(
+        "REQ-INT-003", "component implicit solve and flex integration",
+        Stage.INTEGRATION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE,
+        "native GMRES and all six selected implicit/implicitfast flex material/damping profiles pass 25-step trajectories and exact checkpoint replay; broader contact/material compositions remain unqualified",
+        "mujoco_metal/implicit_effective.py",
+        "development integrated implicit profiles; no CPU physics fallback",
+        "MetalSimulation", "018",
+        ("test_implicit_effective_operator_017.py", "test_flex_implicit_simulation.py",
+         "test_sparse_implicit_public_019.py"),
+    ),
+    Requirement(
+        "REQ-INT-004", "integrated RK4 constraints and sleep lifecycle",
+        Stage.INTEGRATION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE,
+        "selected native constraint/sleep fixtures pass trajectories, checkpoint replay and reset lifecycle; complete contact/sleep compositions remain unqualified",
+        "mujoco_metal/simulation.py",
+        "development integrated RK4 profile; bounded contact-free profiles are separate",
+        "MetalSimulation", "017", ("test_runge_kutta.py", "test_integrated_scalable_public_017.py"),
     ),
     # Jacobian/sparse options.
     Requirement(
@@ -615,29 +645,37 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-JAC-002", "sparse/auto Jacobians",
-        Stage.CONSTRAINTS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "no sparse path; auto must not silently select one",
-        "engine/engine_util_sparse.c", "reject sparse",
-        "none", "017", (),
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "direct canonical CSR producers and packed consumers pass selected rigid both-cone and flex plane/sphere fixtures; complete sparse solver and feature composition remain unqualified",
+        "mujoco_metal/constraint_jacobian.py", "model-derived dense/CSR layout with checked canonical row spans",
+        "MetalSimulation", "017", ("test_constraint_jacobian_pattern_017.py",),
         enums=("mjtJacobian.mjJAC_SPARSE", "mjtJacobian.mjJAC_AUTO"),
     ),
     # Solver selection.
     Requirement(
-        "REQ-SOL-001", "PGS/Newton selector mapping",
+        "REQ-SOL-001", "native projected Gauss-Seidel solver",
         Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "accepted names run the native projected solver, documented as a mapping",
-        "mujoco_metal/coupled_constraints.py", "accept PGS/Newton as mapped",
+        Execution.DEVICE, "recorded PGS subset qualified; complete cone, budget and cross-feature composition gates remain open",
+        "mujoco_metal/coupled_constraints.py", "PGS selects the projected solver",
         "MetalSimulation(profile='integrated_euler_v1')", "baseline",
         ("test_coupled_constraints.py",),
-        enums=("mjtSolver.mjSOL_PGS", "mjtSolver.mjSOL_NEWTON"),
+        enums=("mjtSolver.mjSOL_PGS",),
     ),
     Requirement(
-        "REQ-SOL-002", "CG solver selection",
+        "REQ-SOL-002", "native primal conjugate-gradient solver",
         Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
-        Execution.DEVICE, "accepted as mapped to the native projected solver (same as Newton); selection name does not change execution",
-        "mujoco_metal/coupled_constraints.py", "accept CG as mapped",
-        "MetalSimulation(profile='integrated_euler_v1')", "014", ("test_solver_completion_014.py",),
+        Execution.DEVICE, "native primal CG with configured search budgets; selected mixed-island force and acceleration comparisons pass, but exact iteration counts and full composition remain unqualified",
+        "mujoco_metal/shaders/coupled_constraints.metal", "CG selects native primal CG",
+        "MetalSimulation", "014", ("test_solver_completion_014.py", "test_solver_islands_014.py"),
         enums=("mjtSolver.mjSOL_CG",),
+    ),
+    Requirement(
+        "REQ-SOL-003", "native primal Newton solver",
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "native Newton/PCG Hessian path; selected warm elliptic and mixed mass/contact-island gates pass; complete composition qualification remains open",
+        "mujoco_metal/shaders/coupled_constraints.metal", "Newton selects native primal Newton",
+        "MetalSimulation", "014", ("test_solver_completion_014.py", "test_solver_islands_014.py"),
+        enums=("mjtSolver.mjSOL_NEWTON",),
     ),
     # Equalities.
     Requirement(
@@ -669,10 +707,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-EQ-005", "flex vertex and strain equalities",
-        Stage.CONSTRAINTS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "flex vertex and strain constraints not implemented; rejected at admission",
-        "engine/engine_core_constraint.c", "reject mjEQ_FLEXVERT and mjEQ_FLEXSTRAIN",
-        "none", "018", (),
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "compiled vertex/strain row producers and coupled assembly implemented; full flex/contact/integrator qualification remains open",
+        "mujoco_metal/flex.py:FlexProgram", "validate compiled equality row spans and flex topology",
+        "MetalSimulation", "018", ("test_coupled_flex_equality_rows.py",),
         enums=("mjtEq.mjEQ_FLEXVERT", "mjtEq.mjEQ_FLEXSTRAIN"),
     ),
     Requirement(
@@ -745,10 +783,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-DYN-003", "user-callback actuator dynamics",
-        Stage.DYNAMICS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "arbitrary callbacks cannot execute as Metal kernels",
-        "engine/engine_forward.c", "reject dyntype user (019 extension contract)",
-        "none", "019", (),
+        Stage.DYNAMICS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
+        Execution.DEVICE, "requires an explicitly registered NativeActuatorUserPlugin; unbound USER dynamics use pinned zero-derivative behavior; actnum=1 consumes the callback scalar return and higher-order activation consumes the written act_dot slice",
+        "mujoco_metal/extensions.py", "registered callback writes activation derivative and force-law outputs; Euler/RK4/implicit native parity, accepted-step state, reset/failure/replay tests",
+        "MetalSimulation", "019", ("test_actuator_user_callbacks_019.py",),
         enums=("mjtDyn.mjDYN_USER",),
     ),
     Requirement(
@@ -769,10 +807,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-GAIN-003", "user-callback actuator gains",
-        Stage.DYNAMICS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "arbitrary callbacks cannot execute as Metal kernels",
-        "engine/engine_forward.c", "reject gaintype user (019 extension contract)",
-        "none", "019", (),
+        Stage.DYNAMICS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
+        Execution.DEVICE, "requires an explicitly registered NativeActuatorUserPlugin; unbound USER tags use pinned unit-gain default; implicit USER velocity derivative is zero per MuJoCo 3.10",
+        "mujoco_metal/extensions.py", "registered callback writes USER gain plane; native Euler/RK4/implicit step tests",
+        "MetalSimulation", "019", ("test_actuator_user_callbacks_019.py",),
         enums=("mjtGain.mjGAIN_USER",),
     ),
     Requirement(
@@ -793,10 +831,10 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-BIAS-003", "user-callback actuator biases",
-        Stage.DYNAMICS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "arbitrary callbacks cannot execute as Metal kernels",
-        "engine/engine_forward.c", "reject biastype user (019 extension contract)",
-        "none", "019", (),
+        Stage.DYNAMICS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
+        Execution.DEVICE, "requires an explicitly registered NativeActuatorUserPlugin; unbound USER tags use pinned zero-bias default; implicit USER velocity derivative is zero per MuJoCo 3.10",
+        "mujoco_metal/extensions.py", "registered callback writes USER bias plane; native Euler/RK4/implicit step tests",
+        "MetalSimulation", "019", ("test_actuator_user_callbacks_019.py",),
         enums=("mjtBias.mjBIAS_USER",),
     ),
     # Sensor families and extension contracts are inventoried separately.
@@ -971,24 +1009,26 @@ REQUIREMENTS = (
     # Enable flags.
     Requirement(
         "REQ-ENBL-001", "override/energy enable flags",
-        Stage.API, Implementation.CPU_REFERENCE, Qualification.CPU_ORACLE,
-        Execution.HOST, "override rejected for contacts; energy is metadata-only",
-        "mujoco_metal/coupled_constraints.py", "reject override",
-        "load_model", "baseline", ("test_coupled_constraints.py",),
+        Stage.API, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "global contact overrides and retained energy paths are implemented; complete option and feature composition remains unqualified",
+        "mujoco_metal/coupled_constraints.py", "validate compiled override payload and profile-specific energy paths",
+        "MetalSimulation", "020", ("test_contact_override_020.py", "test_public_enable_history_plugin_composition_019.py"),
         enums=("mjtEnableBit.mjENBL_OVERRIDE", "mjtEnableBit.mjENBL_ENERGY"),
     ),
     Requirement(
         "REQ-ENBL-002", "forward/inverse enable flags",
-        Stage.DYNAMICS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "no fwdinv/invdiscrete execution paths",
-        "engine/engine_inverse.c", "reject fwdinv/invdiscrete",
-        "none", "019", (),
+        Stage.DYNAMICS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "prepared forward/inverse comparison and Euler/implicit discrete conversion implemented; full constrained/flex/extension compositions remain under qualification",
+        "mujoco_metal/native_api.py", "validate supported integration profile and prepared-stage/query ownership",
+        "MetalSimulation; native_api.mj_inverseSkip; native_api.mj_compareFwdInv", "019",
+        ("test_native_inverse_stages.py", "test_native_prepared_api_019.py",
+         "test_sparse_implicit_public_019.py", "test_sparse_implicit_query_transactions.py"),
         enums=("mjtEnableBit.mjENBL_FWDINV", "mjtEnableBit.mjENBL_INVDISCRETE"),
     ),
     Requirement(
         "REQ-ENBL-003", "sleep enable flag",
-        Stage.INTEGRATION, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "kinematic island discovery and sleep/wake lifecycle",
+        Stage.INTEGRATION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "selected native island and sleep/wake fixtures pass; full integrator, reset, constraint and flex combinations remain unqualified",
         "mujoco_metal/islands.py", "native sleep advance",
         "MetalSimulation(profile='integrated_scalable_v1')", "017",
         ("test_scalable_017.py",),
@@ -996,10 +1036,14 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-ENBL-004", "exact-diagonal enable flag",
-        Stage.CONSTRAINTS, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
-        Execution.NONE, "diagapprox used; diagexact not executed",
-        "engine/engine_core_constraint.c", "ignore diagexact",
-        "none", "014", (),
+        Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE,
+        "integrated dense/component paths compute exact diag(J M^-1 J^T) and cone-specific impedance; broad solver, contact, sleep and lifecycle compositions remain under qualification",
+        "mujoco_metal/constraint_impedance.py",
+        "assembly-only rows, exact mass solves, then preassembled-row solve",
+        "MetalSimulation.prepare_forward_position; MetalSimulation.prepare_forward_constraint; native_api.mj_inverseSkip",
+        "014",
+        ("test_constraint_impedance_public_020.py", "test_constraint_impedance_020.py"),
         enums=("mjtEnableBit.mjENBL_DIAGEXACT",),
     ),
     Requirement(
@@ -1055,7 +1099,7 @@ REQUIREMENTS = (
     Requirement(
         "REQ-PROF-006", "RK4 variants",
         Stage.INTEGRATION, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "contact-free RK4 subsets; integrated RK4 deferred",
+        Execution.DEVICE, "qualified contact-free RK4 subsets; development integrated RK4 has separate, incomplete lifecycle qualification",
         "mujoco_metal/runge_kutta.py", "accept listed RK4 profile/model pairs",
         "MetalSimulation", "baseline", ("test_runge_kutta.py",),
     ),
@@ -1082,12 +1126,73 @@ REQUIREMENTS = (
         "demo_recording.ComparisonRecorder", "out-of-scope", (),
     ),
     Requirement(
+        "REQ-API-003", "native public stage and dynamics wrappers",
+        Stage.API, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE,
+        "package wrappers operate on MetalSimulation; similarly named mujoco bindings remain upstream CPU APIs, and wrapper coverage is limited to the explicit pinned entrypoint list in pinned_surface.json",
+        "mujoco_metal/native_api.py; pinned_surface.json:package_entrypoints",
+        "explicit package counterpart map and per-entrypoint stage/query ownership",
+        "mujoco_metal.native_api", "019",
+        ("test_native_prepared_api_019.py", "test_native_inverse_stages.py",
+         "test_mass_queries_019.py", "test_native_api_sparse_019.py"),
+    ),
+    Requirement(
         "REQ-REL-001", "wheel build/install qualification and coverage closure",
         Stage.API, Implementation.NOT_IMPLEMENTED, Qualification.UNQUALIFIED,
         Execution.NONE, "clean workspace-local wheel install, bundled shaders/assets, CLI, viewer startup, reconciled matrix",
         "metal/pyproject.toml", "build/install in workspace-local env",
         "pip install ./metal", "020", (),
     ),
+)
+
+
+# Individual bundled plugins are distinct from our NativePlugin extension
+# protocol. Registering a custom device callback does not port an upstream
+# plugin's compiled configuration, state, force/sensor/SDF or lifecycle ABI.
+# Names verified against the MuJoCo 3.10.0 wheel's plugin registration table.
+_BUNDLED_PLUGIN_ROWS = (
+    ("REQ-PLUG-001", "mujoco.pid", Stage.DYNAMICS, "plugin/actuator/pid.cc"),
+    ("REQ-PLUG-002", "mujoco.elasticity.cable", Stage.DYNAMICS,
+     "plugin/elasticity/cable.cc"),
+    ("REQ-PLUG-003", "mujoco.sensor.touch_grid", Stage.SENSOR,
+     "plugin/sensor/touch_grid.cc"),
+    ("REQ-PLUG-004", "mujoco.sdf.bolt", Stage.COLLISION, "plugin/sdf/bolt.cc"),
+    ("REQ-PLUG-005", "mujoco.sdf.bowl", Stage.COLLISION, "plugin/sdf/bowl.cc"),
+    ("REQ-PLUG-006", "mujoco.sdf.gear", Stage.COLLISION, "plugin/sdf/gear.cc"),
+    ("REQ-PLUG-007", "mujoco.sdf.nut", Stage.COLLISION, "plugin/sdf/nut.cc"),
+    ("REQ-PLUG-008", "mujoco.sdf.torus", Stage.COLLISION, "plugin/sdf/torus.cc"),
+)
+_BUNDLED_PLUGIN_IMPLEMENTATION = {
+    "mujoco.pid": (
+        "MetalSimulation / MetalBundledPID",
+        "compiled PID adapter and stateful actuator integration implemented; selected filter/actearly and lifecycle fixtures pass, complete trajectory/composition qualification remains open",
+        ("test_bundled_plugins_019.py",)),
+    "mujoco.elasticity.cable": (
+        "MetalSimulation / MetalBundledCable",
+        "compiled cable lowering and native force producer integrated; complete force, trajectory and lifecycle qualification remains open",
+        ("test_bundled_cable_019.py",)),
+    "mujoco.sensor.touch_grid": (
+        "MetalSimulation / MetalBundledTouchGrid",
+        "compiled touch-grid lowering and native sensor producer integrated; complete contact/filter/stage/lifecycle qualification remains open",
+        ("test_bundled_touch_grid_019.py",)),
+}
+for _name in ("mujoco.sdf.bolt", "mujoco.sdf.bowl", "mujoco.sdf.gear",
+              "mujoco.sdf.nut", "mujoco.sdf.torus"):
+  _BUNDLED_PLUGIN_IMPLEMENTATION[_name] = (
+      "MetalPluginSDFQuery / MetalSimulation",
+      "compiled native SDF provider and sampled default/custom query fixtures implemented; full collision/ray/lifecycle composition remains unqualified",
+      ("test_bundled_plugins_019.py",))
+
+REQUIREMENTS += tuple(
+    Requirement(
+        ident, name, stage, Implementation.NATIVE_GPU,
+        Qualification.UNQUALIFIED, Execution.DEVICE,
+        _BUNDLED_PLUGIN_IMPLEMENTATION[name][1],
+        source, "validate compiled bundled configuration and profile-specific native composition; reject unknown plugins",
+        _BUNDLED_PLUGIN_IMPLEMENTATION[name][0], "019",
+        ("test_bundled_plugin_inventory.py",) + _BUNDLED_PLUGIN_IMPLEMENTATION[name][2],
+    )
+    for ident, name, stage, source in _BUNDLED_PLUGIN_ROWS
 )
 
 
@@ -1127,7 +1232,7 @@ FIELD_RULES = (
     # Named-object accessors (not physics constants) and counts.
     ("actuator", "007", "actuator objects"),
     ("body", "baseline", "body objects"),
-    ("cam", "out-of-scope", "camera objects are visualization"),
+    ("cam", "016", "camera calibration and pose are inputs to camera-projection sensors; renderer APIs are host-side"),
     ("eq", "004", "equality objects"),
     ("exclude", "baseline", "exclusion objects"),
     ("geom", "baseline", "geom objects"),
@@ -1140,6 +1245,7 @@ FIELD_RULES = (
     ("nbvh", "011", "BVH counts"),
     ("nbvhdynamic", "011", "BVH counts"),
     ("nbvhstatic", "011", "BVH counts"),
+    ("name_keyadr", "006", "keyframe name index for native reset selection"),
     ("nemax", "004", "equality sizing"),
     ("nexclude", "baseline", "exclusion counts"),
     ("nflex", "018", "flex counts"),
@@ -1181,8 +1287,16 @@ FIELD_RULES = (
     ("material", "011", "mesh materials"),
     ("bvh", "011", "collision acceleration structures"),
     # Cameras/lights/visuals/naming: upstream host, out of scope for physics.
-    ("cam_", "out-of-scope", "cameras are visualization"),
-    ("camera", "out-of-scope", "cameras are visualization"),
+    ("cam_", "016", "camera calibration and pose feed native camera-projection sensors"),
+    ("camera", "016", "camera model accessor supplies camera-projection sensor inputs"),
+    ("actuator_user", "019", "actuator extension user parameters"),
+    ("body_user", "019", "body extension user parameters"),
+    ("cam_user", "019", "camera extension user parameters"),
+    ("geom_user", "019", "geometry extension user parameters"),
+    ("jnt_user", "019", "joint extension user parameters"),
+    ("sensor_user", "019", "sensor extension user parameters"),
+    ("site_user", "019", "site extension user parameters"),
+    ("tendon_user", "019", "tendon extension user parameters"),
     ("light", "out-of-scope", "lights are visualization"),
     ("vis", "out-of-scope", "visualization only"),
     ("name", "out-of-scope", "naming metadata"),
@@ -1190,17 +1304,17 @@ FIELD_RULES = (
     ("text", "out-of-scope", "custom text metadata"),
     ("tuple", "out-of-scope", "custom tuple metadata"),
     ("numeric", "out-of-scope", "custom numeric metadata"),
-    ("nuser", "out-of-scope", "custom allocation counts"),
+    ("nuser_", "019", "extension user-parameter dimensions"),
     ("ntext", "out-of-scope", "custom text counts"),
     ("ntex", "out-of-scope", "asset counts"),
     ("nmesh", "out-of-scope", "asset counts"),
     ("nskin", "out-of-scope", "asset counts"),
     ("nhfield", "out-of-scope", "asset counts"),
     ("nlight", "out-of-scope", "visual counts"),
-    ("ncam", "out-of-scope", "visual counts"),
-    ("nkey", "out-of-scope", "keyframes are host-side"),
-    ("key", "out-of-scope", "keyframes are host-side"),
-    ("keyframe", "out-of-scope", "keyframes are host-side"),
+    ("ncam", "016", "camera-projection sensor dimensions"),
+    ("nkey", "006", "compiled keyframe data used by native reset"),
+    ("key", "006", "compiled keyframe values used by native reset"),
+    ("keyframe", "006", "compiled keyframe accessor used by native reset"),
     ("plugin", "019", "plugin lifecycle"),
     ("nplugin", "019", "plugin counts"),
     # Solver/island/sleep internals.
@@ -1219,7 +1333,7 @@ FIELD_RULES = (
     ("oct", "011", "mesh octree"),
     ("tree", "017", "kinematic tree/island bookkeeping"),
     ("ntree", "017", "tree counts"),
-    ("stat", "out-of-scope", "model statistics"),
+    ("stat", "014", "compiled mean inertia is an input to solver cost scaling"),
     ("from", "out-of-scope", "internal source ranges"),
     ("signature", "out-of-scope", "pair/exclude signatures"),
     ("bind", "out-of-scope", "skin binding metadata"),
@@ -1239,7 +1353,7 @@ FIELD_RULES = (
     ("njmax", "baseline", "constraint workspace sizing"),
     ("narena", "017", "arena sizing"),
     ("nbuffer", "017", "buffer counts"),
-    ("nuserdata", "out-of-scope", "custom counts"),
+    ("nuserdata", "019", "user data is retained state and extension input"),
     ("ntuple", "out-of-scope", "custom counts"),
     ("nwrap", "008", "tendon wrap counts"),
     ("nnumeric", "out-of-scope", "custom counts"),
@@ -1267,6 +1381,13 @@ FIELD_RULES = (
 
 def classify_model_field(name):
   """Return the (milestone, note) rule for one MjModel attribute name."""
+  exact = {
+      "from_binary_path": ("005", "host constructor for a pinned compiled model"),
+      "from_xml_path": ("005", "host XML model constructor"),
+      "from_xml_string": ("005", "host XML model constructor"),
+  }
+  if name in exact:
+    return exact[name]
   best = None
   for rule, milestone, note in FIELD_RULES:
     if name == rule or name.startswith(rule):

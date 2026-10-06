@@ -33,6 +33,7 @@ from mujoco_metal import __version__
 from mujoco_metal.model import load_model
 from mujoco_metal.registry import FEATURES
 from mujoco_metal.registry import INVENTORY_COMPLETE
+from mujoco_metal.registry import REQUIREMENTS
 from mujoco_metal.registry import TARGET_MUJOCO_VERSION
 
 _INSTALL_COMMAND = "python -m pip install -e ./metal[metal,test]"
@@ -51,31 +52,15 @@ def _jsonable(value):
 def preflight(model_path=None, include_inventory=False):
   package = Path(__file__).resolve().parent
   shader = package / "shaders" / "kinematics.metal"
-  shader_paths = {
-      "kinematics": shader,
-      "smooth_mass": package / "shaders" / "smooth_mass.metal",
-      "smooth_bias": package / "shaders" / "smooth_bias.metal",
-      "smooth_solve": package / "shaders" / "smooth_solve.metal",
-      "integration": package / "shaders" / "integration.metal",
-      **{
-          name: package / "shaders" / f"{name}.metal"
-          for name in (
-              "actuation",
-              "passive",
-              "transmissions",
-              "sensors",
-              "contact",
-              "tendons",
-              "joint_constraints",
-              "fluid",
-              "implicit",
-              "implicit_midpoint",
-              "coupled_constraints",
-              "collision_primitives",
-              "equality_assembly",
-          )
-      },
-  }
+  # Inventory the installed package, including development kernels. A legacy
+  # hardcoded list hid component solves, deformables and query operators from
+  # source/wheel provenance reports. This is read-only, never a GPU test.
+  shader_paths = {path.stem: path for path in sorted(
+      (package / "shaders").glob("*.metal"))}
+  requirement_counts = {}
+  for requirement in REQUIREMENTS:
+    key = f"{requirement.implementation.value}/{requirement.qualification.value}"
+    requirement_counts[key] = requirement_counts.get(key, 0) + 1
   result = {
       "package_version": __version__,
       "package_path": str(package),
@@ -97,6 +82,12 @@ def preflight(model_path=None, include_inventory=False):
           for name, path in shader_paths.items()
       },
       "inventory_complete": INVENTORY_COMPLETE,
+      "diagnostic_execution": "host_inventory_only",
+      "requirement_counts": requirement_counts,
+      "requirement_counts_scope": (
+          "inventory rows, including host utilities and enum sentinels; "
+          "not a physics completion percentage or a test of this installation"
+      ),
       "gpu_qualified": False,
       "gpu_qualification_scope": (
           "complete physics backend; per-stage narrow results are listed in "
@@ -139,15 +130,15 @@ def preflight(model_path=None, include_inventory=False):
               "narrowly GPU-qualified on M1; scalar hinge/slide motors, "
               "clipping and disable flags; 15 independent 1000-step trajectories"
           ),
-          "full_stepping": "unsupported beyond bounded Euler/RK4/implicitfast profiles; see DEVELOPMENT.md",
+          "full_stepping": "explicit bounded and development integrated profiles; broad compositions unqualified; see DEVELOPMENT.md",
           "passive": "narrowly qualified rigid springs, polynomial damping, Cartesian wrenches and gravcomp",
           "transmissions": "narrowly qualified stateless scalar servos and fixed-joint tendons",
-          "collision": "narrowly qualified plane-sphere and sphere-sphere normal contact",
-          "constraints": "bounded normal/pyramidal sphere contact and scalar joint constraints; wider families incomplete",
-          "fluid": "bounded inertia-box drag, viscosity and wind; no geom-fluid model",
-          "implicitfast": "bounded rigid joints and eligible free-body midpoint; no full implicit",
-          "sensors": "bounded current-state joint/frame/clock/gyro/velocity queries; not full mj_step sensor timing",
-          "rendering": "unsupported",
+          "collision": "qualified primitive subsets; broader rigid/flex development paths have open correction gates",
+          "constraints": "coupled scalar/equality/contact paths; sparse constraint Jacobian missing and broad solver qualification open",
+          "fluid": "inertia-box and geom-fluid development forces; composition qualification separate",
+          "implicitfast": "eligible free-body midpoint and development integrated implicit/implicitfast paths; broad compositions unqualified",
+          "sensors": "current-state queries and development stored step-stage sensors; family/composition limits in coverage inventory",
+          "rendering": "upstream host OpenGL; no native Metal renderer",
       },
   }
   if model_path:
@@ -167,7 +158,11 @@ def preflight(model_path=None, include_inventory=False):
         )
     }
   if include_inventory:
+    from mujoco_metal.binding_inventory import pinned_enum_inventory, pinned_binding_surface
+    result["pinned_enums"] = pinned_enum_inventory()
+    result["pinned_binding_surface"] = pinned_binding_surface()
     result["features"] = [_jsonable(asdict(row)) for row in FEATURES]
+    result["requirements"] = [_jsonable(asdict(row)) for row in REQUIREMENTS]
   return result
 
 
@@ -442,7 +437,26 @@ def main(argv=None):
       "coverage", help="Print the machine-readable support-contract table"
   )
   coverage_parser.add_argument("--json", action="store_true", dest="as_json")
+  demo_parser = subparsers.add_parser(
+      "demo", help="Run bundled demo scripts and their model assets")
+  demo_parser.add_argument("--list", action="store_true", dest="list_demos")
+  demo_parser.add_argument("name", nargs="?")
+  demo_parser.add_argument("demo_args", nargs=argparse.REMAINDER)
   args = parser.parse_args(argv)
+  if args.command == "demo":
+    from mujoco_metal.demo_cli import available_demos, run_demo
+    if args.list_demos:
+      if args.name or args.demo_args:
+        demo_parser.error("--list does not accept a demo name or arguments")
+      print("\n".join(available_demos()))
+      return 0
+    if args.name is None:
+      demo_parser.error("provide a demo name, or use --list")
+    try:
+      run_demo(args.name, args.demo_args)
+    except ValueError as error:
+      demo_parser.error(str(error))
+    return 0
   if args.command == "coverage":
     from mujoco_metal.registry import REQUIREMENTS, coverage_table
     from mujoco_metal.registry import _jsonable_requirement

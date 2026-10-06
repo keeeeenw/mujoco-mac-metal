@@ -209,21 +209,15 @@ def equality_flex_hyperedges(model):
 def equality_wake_plan(model):
   """Lower the equality wake cases implemented by pinned ``mj_wakeEquality``.
 
-  Returns a dictionary of immutable model metadata:
-
-  * ``pair_trees``/``pair_eq_ids``: connect, weld, and joint pairs in model
-    order, excluding static and same-tree operands.
-  * ``flex_offsets``/``flex_tree_ids``/``flex_eq_ids``: ordered dynamic tree
-    members for each flex/flexvert/flexstrain equality, preserving body order.
-  * ``unsupported_tendon_eq_ids``: tendon equalities, for which pinned 3.10
-    calls ``mjERROR`` rather than defining sleep wake semantics.
-  * ``unsupported_eq_ids``: unknown/invalid equality lowering, which must fail
-    explicitly rather than silently treating it as a contact link.
+  Returns per-equality ``kind``, ``pair_trees`` and ordered flex member arrays.
+  Keeping a row for every equality lets the device loop preserve model order,
+  which matters when multiple equalities wake overlapping islands.
   """
   import mujoco
   body_tree = np.asarray(model.body_treeid, dtype=np.int32)
-  pair_trees, pair_ids = [], []
-  flex_offsets, flex_trees, flex_ids = [0], [], []
+  pair_trees = np.full((int(model.neq), 2), -1, dtype=np.int32)
+  kinds = np.zeros((int(model.neq),), dtype=np.int32)
+  flex_offsets, flex_trees = [0], []
   unsupported_tendon, unsupported = [], []
   pair_types = (int(mujoco.mjtEq.mjEQ_CONNECT), int(mujoco.mjtEq.mjEQ_WELD))
   flex_types = (int(mujoco.mjtEq.mjEQ_FLEX), int(mujoco.mjtEq.mjEQ_FLEXVERT),
@@ -242,8 +236,10 @@ def equality_wake_plan(model):
           bodies = (int(site_body[id1]), int(site_body[id2]))
       if bodies is None or any(b < 0 or b >= body_tree.size for b in bodies):
         unsupported.append(eq)
+        flex_offsets.append(len(flex_trees))
         continue
       a, b = int(body_tree[bodies[0]]), int(body_tree[bodies[1]])
+      kinds[eq] = 1
     elif eq_type == int(mujoco.mjtEq.mjEQ_JOINT):
       joint_body = np.asarray(model.jnt_bodyid, dtype=np.int32)
       trees = []
@@ -257,13 +253,14 @@ def equality_wake_plan(model):
           break
       if len(trees) != 2:
         unsupported.append(eq)
+        flex_offsets.append(len(flex_trees))
         continue
       a, b = trees
+      kinds[eq] = 1
     elif eq_type in flex_types:
       fid = id1
       if not 0 <= fid < int(model.nflex):
         unsupported.append(eq)
-        flex_ids.append(eq)
         flex_offsets.append(len(flex_trees))
         continue
       if bool(model.flex_interp[fid]):
@@ -276,26 +273,30 @@ def equality_wake_plan(model):
         body = int(body)
         if 0 <= body < body_tree.size and body_tree[body] >= 0:
           flex_trees.append(int(body_tree[body]))
-      flex_ids.append(eq)
+      kinds[eq] = 2
       flex_offsets.append(len(flex_trees))
       continue
     elif eq_type == int(mujoco.mjtEq.mjEQ_TENDON):
       unsupported_tendon.append(eq)
+      flex_offsets.append(len(flex_trees))
       continue
     else:
       unsupported.append(eq)
+      flex_offsets.append(len(flex_trees))
       continue
     # Pinned mj_wakeEquality ignores static operands and equalities internal
     # to one tree. Both are deliberately absent from the wake-pair list.
     if a >= 0 and b >= 0 and a != b:
-      pair_trees.append((a, b))
-      pair_ids.append(eq)
+      pair_trees[eq] = (a, b)
+    else:
+      # Pinned equality wake ignores static and same-tree pairs.
+      kinds[eq] = 0
+    flex_offsets.append(len(flex_trees))
   return {
-      "pair_trees": np.asarray(pair_trees, dtype=np.int32).reshape(-1, 2),
-      "pair_eq_ids": np.asarray(pair_ids, dtype=np.int32),
+      "eq_kinds": kinds,
+      "pair_trees": pair_trees,
       "flex_offsets": np.asarray(flex_offsets, dtype=np.int32),
       "flex_tree_ids": np.asarray(flex_trees, dtype=np.int32),
-      "flex_eq_ids": np.asarray(flex_ids, dtype=np.int32),
       "unsupported_tendon_eq_ids": np.asarray(unsupported_tendon, dtype=np.int32),
       "unsupported_eq_ids": np.asarray(unsupported, dtype=np.int32),
   }
@@ -450,10 +451,35 @@ class ActiveContactLinkWorkspace:
                                 device=self.device)
     self.dims = torch.tensor(
         (self.ncontacts, self.npairs, self.capacity, self.batch, self.neq,
-         self.nequality_links),
+         self.nequality_links, 1) + (1,) * self.batch,
         dtype=torch.int32, device=self.device)
+    self.contact_dims = torch.tensor(
+        (self.ncontacts, self.npairs, self.capacity, self.batch, self.neq,
+         self.nequality_links, 0) + (1,) * self.batch,
+        dtype=torch.int32, device=self.device)
+    self._world_mask = torch.ones((self.batch,), dtype=torch.int32,
+                                  device=self.device)
 
-  def run(self, slot_map, equality_active=None):
+  def _prepare_world_mask(self, dims, world_mask):
+    import torch
+    if world_mask is None:
+      self._world_mask.fill_(1)
+    else:
+      if (not isinstance(world_mask, torch.Tensor)
+          or tuple(world_mask.shape) != (self.batch,)
+          or world_mask.dtype != torch.int32
+          or world_mask.device != self.links.device
+          or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous MPS int32 [batch]")
+      self._world_mask.copy_(world_mask)
+    dims[7:].copy_(self._world_mask)
+
+  def _clear_masked_outputs(self, dims):
+    width = self.batch * max(self.capacity, 1)
+    _LIBRARY.clear_active_contact_links_masked(
+        self.links, self.overflow, dims, threads=(width,), group_size=(128,))
+
+  def run(self, slot_map, equality_active=None, world_mask=None):
     """Map active slots from a ``CompactionMap`` without host synchronization."""
     import torch
     logical_to_packed = slot_map.logical_to_packed
@@ -477,11 +503,42 @@ class ActiveContactLinkWorkspace:
     global _LIBRARY
     if _LIBRARY is None:
       _LIBRARY = torch.mps.compile_shader(_SHADER.read_text())
-    self.links.fill_(-1)
-    self.overflow.zero_()
+    self._prepare_world_mask(self.dims, world_mask)
+    if world_mask is None:
+      self.links.fill_(-1)
+      self.overflow.zero_()
+    else:
+      self._clear_masked_outputs(self.dims)
     _LIBRARY.map_active_contact_tree_links(
         logical_to_packed, self.pair_contact_offset, self.pair_trees,
         equality_active, self.equality_trees, self.equality_activity_ids,
         self.links, self.overflow, self.dims,
         threads=(self.batch * max(self.npairs + self.nequality_links, 1),), group_size=(1,))
+    return self.links, self.overflow
+
+  def run_contacts(self, slot_map, world_mask=None):
+    """Map only current narrowphase contacts; equalities are handled by scheduler."""
+    import torch
+    logical_to_packed = slot_map.logical_to_packed
+    if (tuple(logical_to_packed.shape) != (self.batch, self.ncontacts)
+        or logical_to_packed.device.type != "mps"
+        or logical_to_packed.dtype != torch.int32
+        or not logical_to_packed.is_contiguous()):
+      raise ValueError("slot map must provide contiguous MPS int32 logical_to_packed")
+    global _LIBRARY
+    if _LIBRARY is None:
+      _LIBRARY = torch.mps.compile_shader(_SHADER.read_text())
+    self._prepare_world_mask(self.contact_dims, world_mask)
+    if world_mask is None:
+      self.links.fill_(-1)
+      self.overflow.zero_()
+    else:
+      self._clear_masked_outputs(self.contact_dims)
+    _LIBRARY.map_active_contact_tree_links(
+        logical_to_packed, self.pair_contact_offset, self.pair_trees,
+        self.equality_active_default, self.equality_trees,
+        self.equality_activity_ids, self.links, self.overflow,
+        self.contact_dims,
+        threads=(self.batch * max(self.npairs + self.nequality_links, 1),),
+        group_size=(1,))
     return self.links, self.overflow

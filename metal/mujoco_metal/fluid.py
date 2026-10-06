@@ -491,7 +491,9 @@ class MetalInertiaBoxFluid:
     spring = int(mujoco.mjtDisableBit.mjDSBL_SPRING)
     damper = int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
     disabled = bool(meta.disableflags & spring and meta.disableflags & damper)
-    self._dims = tensor([meta.nv, meta.nbody, meta.njnt, batch_size, int(disabled), meta.ngeom], torch.int32)
+    self._dims = tensor(
+        [meta.nv, meta.nbody, meta.njnt, batch_size, int(disabled), meta.ngeom]
+        + [1] * int(batch_size), torch.int32)
     # Bodies with an interacting ellipsoid geom skip inertia-box (pinned).
     skip = np.zeros(int(model.nbody), dtype=np.int32)
     gf0 = np.asarray(meta.geom_fluid).reshape(-1, 12)[:, 0]
@@ -505,18 +507,34 @@ class MetalInertiaBoxFluid:
     self._geom_size = tensor(np.asarray(meta.geom_size).reshape(-1))
     self._geom_fluid = tensor(np.asarray(meta.geom_fluid).reshape(-1))
     self._output = torch.empty((batch_size, meta.nv), dtype=torch.float32, device=self._device)
+    # Reused by the compiled-D finite-difference producer. Keep the three
+    # force/velocity vectors prepared once so sparse implicit stepping never
+    # allocates a qvel clone, base-force snapshot, or temporary column.
+    self._derivative_base = torch.empty(
+        (batch_size, meta.nv), dtype=torch.float32, device=self._device)
+    self._derivative_velocity = torch.empty_like(self._derivative_base)
+    self._derivative_column = torch.empty_like(self._derivative_base)
     self._dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
     self._library = torch.mps.compile_shader(_SHADER.read_text())
     self._kernel = self._library.inertia_box_fluid
     self._geom_kernel = self._library.ellipsoid_geom_fluid
 
-  def run_device(self, qpos, qvel, dynamics=None):
+  def run_device(self, qpos, qvel, dynamics=None, *, world_mask=None):
     torch, meta = self._torch, self._meta
     for name, value, shape in (("qpos", qpos, (self.batch_size, meta.nq)), ("qvel", qvel, (self.batch_size, meta.nv))):
       if not isinstance(value, torch.Tensor) or value.device.type != "mps" or value.dtype != torch.float32 or tuple(value.shape) != shape or not value.is_contiguous():
         raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
     if dynamics is None:
       raise ValueError("pass the native smooth-stage result with poses, cvel, and root_com")
+    if world_mask is None:
+      self._dims[6:].fill_(1)
+    else:
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.dtype != torch.int32 or world_mask.device.type != "mps"
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 MPS with shape (batch_size,)")
+      self._dims[6:].copy_(world_mask)
     required = {"poses", "cvel", "root_com"}
     if not isinstance(dynamics, dict) or not required.issubset(dynamics):
       raise ValueError("dynamics must contain native poses, cvel, and root_com")
@@ -559,20 +577,52 @@ class MetalInertiaBoxFluid:
           threads=(self.batch_size,), group_size=(1,))
     return self._output
 
-  def run_derivative_device(self, qpos, qvel, dynamics, smooth):
-    """Compute d(qfrc_fluid)/d(qvel) on MPS device without host readback."""
+  def run_derivative_device(self, qpos, qvel, dynamics, smooth, *,
+                            edge_writer=None):
+    """Compute d(qfrc_fluid)/d(qvel), optionally writing compiled COO slots.
+
+    The sparse writer path retains only a force-sized finite-difference
+    column and accumulates its supported rows directly into the compiled D
+    union; it does not allocate a `[B,nv,nv]` derivative backing.
+    """
     torch, meta = self._torch, self._meta
     b, nv = self.batch_size, meta.nv
     if nv == 0 or (meta.density <= 0 and meta.viscosity <= 0):
+      if edge_writer is not None:
+        return edge_writer.values
       return torch.zeros((b, nv, nv), dtype=torch.float32, device=self._device)
-    base_force = self.run_device(qpos, qvel, dynamics).clone()
-    deriv = torch.zeros((b, nv, nv), dtype=torch.float32, device=self._device)
+    # Finite-difference columns change only the VEL stage.  A full smooth
+    # dispatch here recomputes FK/CRBA into borrowed buffers owned by the
+    # caller's ``dynamics`` dictionary; the following fluid evaluations then
+    # compare against a mixture of the old and new stages.  Capture the
+    # current POS stage once and refresh just velocity-dependent quantities.
+    # This is also the ordering used by forwardSkip(POS).
+    position_context = smooth.position_context(dynamics)
+    base_force = self.run_device(qpos, qvel, dynamics)
+    self._derivative_base.copy_(base_force)
+    deriv = (None if edge_writer is not None else
+             torch.zeros((b, nv, nv), dtype=torch.float32, device=self._device))
     eps = 1e-3
-    for j in range(nv):
-      v_pert = qvel.clone()
-      v_pert[:, j] += eps
-      dyn_pert = smooth.run_device(qpos, v_pert)
-      f_pert = self.run_device(qpos, v_pert, dyn_pert)
-      deriv[:, :, j] = (f_pert - base_force) / eps
+    try:
+      for j in range(nv):
+        v_pert = self._derivative_velocity
+        v_pert.copy_(qvel)
+        v_pert[:, j].add_(eps)
+        dyn_pert = smooth.run_velocity_device(position_context, v_pert)
+        f_pert = self.run_device(qpos, v_pert, dyn_pert)
+        column = self._derivative_column
+        column.copy_(f_pert)
+        column.sub_(self._derivative_base).div_(eps)
+        if edge_writer is None:
+          deriv[:, :, j] = column
+        else:
+          edge_writer.add_column_device(j, column)
+    finally:
+      # Restore every borrowed VEL output even when a fluid/COO dispatch
+      # raises.  The fluid output itself is also a borrowed workspace, so
+      # leave it representing the caller's original state on return.
+      restored = smooth.run_velocity_device(position_context, qvel)
+      self.run_device(qpos, qvel, restored)
+    if edge_writer is not None:
+      return edge_writer.values
     return deriv
-

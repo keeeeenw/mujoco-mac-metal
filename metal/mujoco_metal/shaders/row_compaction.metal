@@ -11,6 +11,25 @@ using namespace metal;
 
 constant int kScanBlockSize = 256;
 
+kernel void clear_compaction_maps_masked(
+    device int* packed_to_logical [[buffer(0)]],
+    device int* logical_to_packed [[buffer(1)]],
+    device int* active_count [[buffer(2)]],
+    device int* overflow [[buffer(3)]],
+    constant int* dims [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]) {
+  int logical_count=dims[0], capacity=dims[1], batch=dims[2];
+  int width=max(max(logical_count,capacity),1);
+  int world=int(tid)/width, lane=int(tid)%width;
+  if(world>=batch || dims[4+world]==0) return;
+  if(lane<capacity) packed_to_logical[world*capacity+lane]=-1;
+  if(lane<logical_count) logical_to_packed[world*logical_count+lane]=-1;
+  if(lane==0) {
+    active_count[world]=0;
+    overflow[world]=0;
+  }
+}
+
 kernel void compact_flag_blocks(
     device const float* flags [[buffer(0)]],
     device int* local_prefix [[buffer(1)]],
@@ -21,7 +40,7 @@ kernel void compact_flag_blocks(
   int logical_count = dims[0];
   int nblocks = dims[3];
   int world = int(group) / nblocks;
-  if (world >= dims[2]) return;
+  if (world >= dims[2] || dims[4 + world] == 0) return;
   int block = int(group) % nblocks;
   int logical = block * kScanBlockSize + int(lane);
   int base = world * logical_count;
@@ -50,7 +69,7 @@ kernel void scan_compaction_blocks(
   int capacity = dims[1];
   int batch = dims[2];
   int nblocks = dims[3];
-  if (int(world) >= batch) return;
+  if (int(world) >= batch || dims[4 + int(world)] == 0) return;
   int total = 0;
   int base = int(world) * nblocks;
   for (int block = 0; block < nblocks; ++block) {
@@ -76,7 +95,7 @@ kernel void scatter_compaction_maps(
   int total_threads = int(tid);
   int world = total_threads / max(logical_count, 1);
   int logical = total_threads % max(logical_count, 1);
-  if (world >= dims[2]) return;
+  if (world >= dims[2] || dims[4 + world] == 0) return;
   if (logical_count == 0 || logical >= logical_count || overflow[world]) return;
   int base = world * logical_count;
   if (flags[base + logical] == 0.0f) return;

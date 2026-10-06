@@ -19,19 +19,29 @@ kernel void fixed_tendon_dynamics(
     device float* damping_matrix [[buffer(12)]],
     device float* armature_matrix [[buffer(13)]],
     device const float* ancestor_mask [[buffer(14)]],
+    device const float* cached_length [[buffer(15)]],
+    device float* out_length [[buffer(16)]],
     uint world [[thread_position_in_grid]]) {
   int nq=dims[0], nv=dims[1], ntendon=dims[2], batch=dims[3];
   int spring_disabled=dims[4], damper_disabled=dims[5];
+  bool write_armature=dims[6] != 0;
   if (world>=uint(batch)) return;
+  if (dims[8 + int(world)] == 0) return;
   uint qbase=world*uint(nq), vbase=world*uint(nv);
   uint mbase=world*uint(nv*nv);
   for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]=0.0f;
-  for (int i=0;i<nv*nv;++i) { damping_matrix[mbase+uint(i)]=0.0f; armature_matrix[mbase+uint(i)]=0.0f; }
+  for (int i=0;i<nv*nv;++i) {
+    damping_matrix[mbase+uint(i)]=0.0f;
+    if (write_armature) armature_matrix[mbase+uint(i)]=0.0f;
+  }
   for (int i=0;i<nq;++i) {
     if ((as_type<uint>(qpos[qbase+uint(i)]) & 0x7f800000u)==0x7f800000u) {
       float bad=as_type<float>(0x7fc00000u);
       for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]=bad;
-      for (int k=0;k<nv*nv;++k) { damping_matrix[mbase+uint(k)]=bad; armature_matrix[mbase+uint(k)]=bad; }
+      for (int k=0;k<nv*nv;++k) {
+        damping_matrix[mbase+uint(k)]=bad;
+        if (write_armature) armature_matrix[mbase+uint(k)]=bad;
+      }
       return;
     }
   }
@@ -39,13 +49,18 @@ kernel void fixed_tendon_dynamics(
     if ((as_type<uint>(qvel[vbase+uint(i)]) & 0x7f800000u)==0x7f800000u) {
       float bad=as_type<float>(0x7fc00000u);
       for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]=bad;
-      for (int k=0;k<nv*nv;++k) { damping_matrix[mbase+uint(k)]=bad; armature_matrix[mbase+uint(k)]=bad; }
+      for (int k=0;k<nv*nv;++k) {
+        damping_matrix[mbase+uint(k)]=bad;
+        if (write_armature) armature_matrix[mbase+uint(k)]=bad;
+      }
       return;
     }
   }
   for (int t=0;t<ntendon;++t) {
     float length=0.0f, velocity=0.0f;
-    for (int q=0;q<nq;++q) length+=length_map[t*nq+q]*qpos[qbase+uint(q)];
+    if (dims[7]) length=cached_length[world*uint(max(ntendon,1))+uint(t)];
+    else for (int q=0;q<nq;++q) length+=length_map[t*nq+q]*qpos[qbase+uint(q)];
+    out_length[world*uint(max(ntendon,1))+uint(t)]=length;
     for (int d=0;d<nv;++d) velocity+=moment_map[t*nv+d]*qvel[vbase+uint(d)];
     float spring_force=0.0f;
     if (!spring_disabled) {
@@ -69,7 +84,8 @@ kernel void fixed_tendon_dynamics(
         float jj=moment_map[t*nv+j];
         uint index=mbase+uint(i*nv+j);
         damping_matrix[index]+=damper_tangent*ji*jj;
-        armature_matrix[index]+=armature[t]*ji*jj*ancestor_mask[i*nv+j];
+        if (write_armature)
+          armature_matrix[index]+=armature[t]*ji*jj*ancestor_mask[i*nv+j];
       }
     }
   }
@@ -77,19 +93,58 @@ kernel void fixed_tendon_dynamics(
     if ((as_type<uint>(qfrc[vbase+uint(i)]) & 0x7f800000u)==0x7f800000u) {
       float bad=as_type<float>(0x7fc00000u);
       for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]=bad;
-      for (int k=0;k<nv*nv;++k) { damping_matrix[mbase+uint(k)]=bad; armature_matrix[mbase+uint(k)]=bad; }
+      for (int k=0;k<nv*nv;++k) {
+        damping_matrix[mbase+uint(k)]=bad;
+        if (write_armature) armature_matrix[mbase+uint(k)]=bad;
+      }
       return;
     }
   }
   for (int i=0;i<nv*nv;++i) {
     if ((as_type<uint>(damping_matrix[mbase+uint(i)]) & 0x7f800000u)==0x7f800000u ||
-        (as_type<uint>(armature_matrix[mbase+uint(i)]) & 0x7f800000u)==0x7f800000u) {
+        (write_armature &&
+         (as_type<uint>(armature_matrix[mbase+uint(i)]) & 0x7f800000u)==0x7f800000u)) {
       float bad=as_type<float>(0x7fc00000u);
       for (int d=0;d<nv;++d) qfrc[vbase+uint(d)]=bad;
-      for (int k=0;k<nv*nv;++k) { damping_matrix[mbase+uint(k)]=bad; armature_matrix[mbase+uint(k)]=bad; }
+      for (int k=0;k<nv*nv;++k) {
+        damping_matrix[mbase+uint(k)]=bad;
+        if (write_armature) armature_matrix[mbase+uint(k)]=bad;
+      }
       return;
     }
   }
+}
+
+// Direct sparse qDeriv contribution from fixed-tendon damping. The compiled
+// D-CSR edge list already restricts the source to MuJoCo's retained pattern.
+kernel void fixed_tendon_damping_coo(
+    device const float* qvel [[buffer(0)]],
+    device const float* moment_map [[buffer(1)]],
+    device const float* damping [[buffer(2)]],
+    device const float* dampingpoly [[buffer(3)]],
+    device const int* edge_rows [[buffer(4)]],
+    device const int* edge_cols [[buffer(5)]],
+    constant int* dims [[buffer(6)]],
+    device float* edge_values [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]) {
+  int nv=dims[0], ntendon=dims[1], batch=dims[2];
+  int edge_count=dims[3], damper_disabled=dims[4];
+  int stride=max(edge_count,1);
+  if (damper_disabled || edge_count<=0 || int(tid)>=batch*stride) return;
+  int world=int(tid)/stride, edge=int(tid)-world*stride;
+  int row=edge_rows[edge], col=edge_cols[edge];
+  if (row<0 || row>=nv || col<0 || col>=nv) return;
+  float value=0.0f;
+  for (int t=0;t<ntendon;++t) {
+    float velocity=0.0f;
+    for (int d=0;d<nv;++d)
+      velocity+=moment_map[t*nv+d]*qvel[world*nv+d];
+    float speed=abs(velocity);
+    float tangent=damping[t]+2.0f*dampingpoly[2*t]*speed+
+                  3.0f*dampingpoly[2*t+1]*velocity*velocity;
+    value-=tangent*moment_map[t*nv+row]*moment_map[t*nv+col];
+  }
+  edge_values[tid]+=value;
 }
 
 // Spatial tendon kinematics for MuJoCo 3.10.0 (milestone 008).
@@ -107,16 +162,15 @@ inline float3 st8_segdir(float3 a, float3 b) {
   float n = length(d);
   return n > 1e-30f ? d / n : float3(0.0f);
 }
-inline void st8_point_jac(float3 point, int body,
+inline float3 st8_point_jac_dof(float3 point, int body, int target_dof,
     device const float* body_pos, device const float* body_quat,
     device const float* anchors, device const float* axes,
     device const int* body_parentid, device const int* body_jntadr,
     device const int* body_jntnum, device const int* jnt_type,
     device const int* jnt_dofadr,
-    int nbody, int njnt, int nv, int bo, int jo,
-    thread float* Jp) {
-  for (int i=0;i<3*32;++i) Jp[i]=0.0f;
-  if (nv==0) return;
+    int nbody, int njnt, int nv, int bo, int jo) {
+  if (nv==0 || target_dof<0 || target_dof>=nv) return float3(0.0f);
+  float3 result=float3(0.0f);
   int b=body;
   while (b>0 && b<nbody) {
     int ja=body_jntadr[b], jn=body_jntnum[b];
@@ -149,11 +203,12 @@ inline void st8_point_jac(float3 point, int body,
             col=cross(ax,point-piv);
           }
         }
-        Jp[0*32+dof]+=col.x; Jp[1*32+dof]+=col.y; Jp[2*32+dof]+=col.z;
+        if (dof==target_dof) result+=col;
       }
     }
     b=body_parentid[b];
   }
+  return result;
 }
 
 // 2D circle wrap port (pinned wrap_circle). Returns arc length or -1.
@@ -362,13 +417,14 @@ kernel void spatial_tendon_kinematics(
   int nv=dims[0], nt=dims[1], nsite=dims[2], ngeom=dims[3];
   int nbody=dims[4], njnt=dims[5], batch=dims[7];
   if (uint(world)>=uint(batch)) return;
+  if (dims[8 + int(world)] == 0) return;
   uint vbase=uint(world)*uint(max(nv,1)), tbase=uint(world)*uint(max(nt,1));
   int bo=world*nbody, jo=world*max(njnt,1), so=world*max(nsite,1), go=world*max(ngeom,1);
   for (int t=0;t<nt;++t) {
     int off=path_offset[t], count=path_count[t];
     float len=0.0f;
-    float row[32];
-    for (int d=0;d<32;++d) row[d]=0.0f;
+    device float* row=out_jacobian+(tbase+uint(t))*uint(max(nv,1));
+    for (int d=0;d<nv;++d) row[d]=0.0f;
     if (count>0) {
       float divisor=1.0f;
       int j=0;
@@ -404,16 +460,16 @@ kernel void spatial_tendon_kinematics(
             // no-wrap fallback: straight site-site segment (pinned)
             len+=distance(p0,p2)/divisor;
             if (b0!=b2) {
-              thread float J0[96], J1[96];
-              st8_point_jac(p0,b0,body_pos,body_quat,joint_anchor,joint_axis,
-                body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
-                nbody,njnt,nv,bo,jo,J0);
-              st8_point_jac(p2,b2,body_pos,body_quat,joint_anchor,joint_axis,
-                body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
-                nbody,njnt,nv,bo,jo,J1);
               float3 dir=st8_segdir(p0,p2);
-              for (int d=0;d<nv;++d)
-                row[d]+=((J1[0*32+d]-J0[0*32+d])*dir.x+(J1[1*32+d]-J0[1*32+d])*dir.y+(J1[2*32+d]-J0[2*32+d])*dir.z)/divisor;
+              for (int d=0;d<nv;++d) {
+                float3 J0=st8_point_jac_dof(p0,b0,d,body_pos,body_quat,joint_anchor,joint_axis,
+                  body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
+                  nbody,njnt,nv,bo,jo);
+                float3 J1=st8_point_jac_dof(p2,b2,d,body_pos,body_quat,joint_anchor,joint_axis,
+                  body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
+                  nbody,njnt,nv,bo,jo);
+                row[d]+=dot(J1-J0,dir)/divisor;
+              }
             }
           } else {
             float3 wp0=float3(wp[0],wp[1],wp[2]), wp1=float3(wp[3],wp[4],wp[5]);
@@ -425,16 +481,16 @@ kernel void spatial_tendon_kinematics(
               float3 qa=s==0?segA[0]:segC[0], qb=s==0?segA[1]:segC[1];
               int ba=s==0?segAB[0]:segCB[0], bb=s==0?segAB[1]:segCB[1];
               if (ba==bb) continue;
-              thread float J0[96], J1[96];
-              st8_point_jac(qa,ba,body_pos,body_quat,joint_anchor,joint_axis,
-                body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
-                nbody,njnt,nv,bo,jo,J0);
-              st8_point_jac(qb,bb,body_pos,body_quat,joint_anchor,joint_axis,
-                body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
-                nbody,njnt,nv,bo,jo,J1);
               float3 dir=st8_segdir(qa,qb);
-              for (int d=0;d<nv;++d)
-                row[d]+=((J1[0*32+d]-J0[0*32+d])*dir.x+(J1[1*32+d]-J0[1*32+d])*dir.y+(J1[2*32+d]-J0[2*32+d])*dir.z)/divisor;
+              for (int d=0;d<nv;++d) {
+                float3 J0=st8_point_jac_dof(qa,ba,d,body_pos,body_quat,joint_anchor,joint_axis,
+                  body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
+                  nbody,njnt,nv,bo,jo);
+                float3 J1=st8_point_jac_dof(qb,bb,d,body_pos,body_quat,joint_anchor,joint_axis,
+                  body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
+                  nbody,njnt,nv,bo,jo);
+                row[d]+=dot(J1-J0,dir)/divisor;
+              }
             }
           }
           j+=2;
@@ -445,16 +501,16 @@ kernel void spatial_tendon_kinematics(
         int b1=(id1>=0&&id1<nsite)?site_bodyid[id1]:0;
         len+=distance(p0,p1)/divisor;
         if (b0!=b1) {
-          thread float J0[96], J1[96];
-          st8_point_jac(p0,b0,body_pos,body_quat,joint_anchor,joint_axis,
-            body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
-            nbody,njnt,nv,bo,jo,J0);
-          st8_point_jac(p1,b1,body_pos,body_quat,joint_anchor,joint_axis,
-            body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
-            nbody,njnt,nv,bo,jo,J1);
           float3 dir=st8_segdir(p0,p1);
-          for (int d=0;d<nv;++d)
-            row[d]+=((J1[0*32+d]-J0[0*32+d])*dir.x+(J1[1*32+d]-J0[1*32+d])*dir.y+(J1[2*32+d]-J0[2*32+d])*dir.z)/divisor;
+          for (int d=0;d<nv;++d) {
+            float3 J0=st8_point_jac_dof(p0,b0,d,body_pos,body_quat,joint_anchor,joint_axis,
+              body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
+              nbody,njnt,nv,bo,jo);
+            float3 J1=st8_point_jac_dof(p1,b1,d,body_pos,body_quat,joint_anchor,joint_axis,
+              body_parentid,body_jntadr,body_jntnum,jnt_type,jnt_dofadr,
+              nbody,njnt,nv,bo,jo);
+            row[d]+=dot(J1-J0,dir)/divisor;
+          }
         }
         j+=1;
       }
@@ -463,7 +519,122 @@ kernel void spatial_tendon_kinematics(
     float vel=0.0f;
     for (int d=0;d<nv;++d) vel+=row[d]*qvel[vbase+uint(d)];
     out_velocity[tbase+uint(t)]=vel;
-    for (int d=0;d<nv;++d) out_jacobian[(tbase+uint(t))*uint(max(nv,1))+uint(d)]=row[d];
+  }
+}
+
+// Refresh speeds from a retained POS-stage tendon Jacobian. The per-world
+// mask is checked before reading qvel/J or touching the cached output, so a
+// state-check recovery leaves every healthy world's sampled VEL workspace
+// byte-for-byte unchanged.
+kernel void spatial_tendon_velocity(
+    device const float* qvel [[buffer(0)]],
+    device const float* jacobian [[buffer(1)]],
+    constant int* dims [[buffer(2)]],
+    device float* out_velocity [[buffer(3)]],
+    uint world [[thread_position_in_grid]]) {
+  int nv=dims[0], nt=dims[1], batch=dims[7];
+  if (world>=uint(batch) || dims[8 + int(world)]==0) return;
+  uint vbase=world*uint(max(nv,1));
+  uint tbase=world*uint(max(nt,1));
+  for (int t=0;t<nt;++t) {
+    float value=0.0f;
+    for (int d=0;d<nv;++d)
+      value+=jacobian[(tbase+uint(t))*uint(max(nv,1))+uint(d)]*
+              qvel[vbase+uint(d)];
+    out_velocity[tbase+uint(t)]=value;
+  }
+}
+
+// Recovery-only actuator state overlay. Each selected world is updated by a
+// single thread; a rejected world returns before reading spatial state or
+// touching the retained actuator kinematics. `row_map` packs (actuator,
+// tendon) pairs and `gear` carries the corresponding tendon gear.
+kernel void spatial_tendon_actuator_state(
+    device const float* tendon_length [[buffer(0)]],
+    device const float* tendon_velocity [[buffer(1)]],
+    device const float* tendon_jacobian [[buffer(2)]],
+    device const int* row_map [[buffer(3)]],
+    device const float* gear [[buffer(4)]],
+    constant int* dims [[buffer(5)]],
+    device float* actuator_length [[buffer(6)]],
+    device float* actuator_velocity [[buffer(7)]],
+    device float* actuator_moment [[buffer(8)]],
+    uint world [[thread_position_in_grid]]) {
+  int batch=dims[0], nu=dims[1], nv=dims[2], rows=dims[3];
+  int ntendon=dims[4];
+  if (int(world)>=batch || dims[5+int(world)]==0) return;
+  int tbase=int(world)*max(nu,1);
+  int jbase=int(world)*max(nu,1)*nv;
+  int Jbase=int(world)*max(ntendon,1)*nv;
+  for (int r=0; r<rows; ++r) {
+    int actuator=row_map[2*r];
+    int tendon=row_map[2*r+1];
+    float scale=gear[r];
+    actuator_length[tbase+actuator]=scale*tendon_length[
+        int(world)*max(ntendon,1)+tendon];
+    actuator_velocity[tbase+actuator]=scale*tendon_velocity[
+        int(world)*max(ntendon,1)+tendon];
+    int moment_base=jbase+actuator*nv;
+    int jac_base=Jbase+tendon*nv;
+    for (int d=0; d<nv; ++d)
+      actuator_moment[moment_base+d] += scale*tendon_jacobian[jac_base+d];
+  }
+}
+
+kernel void spatial_tendon_forces(
+    device const float* length [[buffer(0)]],
+    device const float* velocity [[buffer(1)]],
+    device const float* jacobian [[buffer(2)]],
+    device const float* stiffness [[buffer(3)]],
+    device const float* stiffnesspoly [[buffer(4)]],
+    device const float* damping [[buffer(5)]],
+    device const float* dampingpoly [[buffer(6)]],
+    device const float* spring_range [[buffer(7)]],
+    device const float* armature [[buffer(8)]],
+    device const float* ancestor [[buffer(9)]],
+    constant int* dims [[buffer(10)]],
+    device float* qfrc [[buffer(11)]],
+    device float* damping_matrix [[buffer(12)]],
+    device float* armature_matrix [[buffer(13)]],
+    uint world [[thread_position_in_grid]]) {
+  int nv=dims[0], nt=dims[1], batch=dims[7];
+  if (world>=uint(batch) || dims[8 + int(world)]==0) return;
+  bool write_armature=dims[8+batch]!=0;
+  bool spring_off=dims[9+batch]!=0;
+  bool damper_off=dims[10+batch]!=0;
+  uint vb=world*uint(max(nv,1)), tb=world*uint(max(nt,1));
+  uint mb=world*uint(max(nv*nv,1));
+  for (int d=0;d<nv;++d) qfrc[vb+uint(d)]=0.0f;
+  for (int k=0;k<nv*nv;++k) {
+    damping_matrix[mb+uint(k)]=0.0f;
+    if (write_armature) armature_matrix[mb+uint(k)]=0.0f;
+  }
+  for (int t=0;t<nt;++t) {
+    float L=length[tb+uint(t)], V=velocity[tb+uint(t)];
+    float lo=spring_range[2*t], hi=spring_range[2*t+1];
+    float disp=L>hi?L-hi:(L<lo?L-lo:0.0f);
+    float k=stiffness[t]+stiffnesspoly[2*t]*disp+
+            stiffnesspoly[2*t+1]*disp*disp;
+    float sf=spring_off?0.0f:-disp*k;
+    float av=abs(V);
+    float c=damping[t]+dampingpoly[2*t]*av+dampingpoly[2*t+1]*V*V;
+    float df=damper_off?0.0f:-V*c;
+    float tangent=damper_off?0.0f:
+        damping[t]+2.0f*dampingpoly[2*t]*av+
+        3.0f*dampingpoly[2*t+1]*V*V;
+    float total=sf+df;
+    for (int i=0;i<nv;++i) {
+      float ji=jacobian[(tb+uint(t))*uint(max(nv,1))+uint(i)];
+      qfrc[vb+uint(i)]+=total*ji;
+      for (int j=0;j<nv;++j) {
+        uint ij=mb+uint(i*nv+j);
+        float jj=jacobian[(tb+uint(t))*uint(max(nv,1))+uint(j)];
+        damping_matrix[ij]+=tangent*ji*jj;
+        if (write_armature)
+          armature_matrix[ij]+=armature[t]*ji*jj*
+              ancestor[uint(i*max(nv,1)+j)];
+      }
+    }
   }
 }
 
@@ -559,7 +730,7 @@ kernel void spatial_armature_dots(
     uint world [[thread_position_in_grid]]) {
   int nv=dims[0], nt=dims[1], nsite=dims[2];
   int nbody=dims[4], batch=dims[7];
-  if (uint(world)>=uint(batch)) return;
+  if (uint(world)>=uint(batch) || dims[8 + int(world)]==0) return;
   uint vbase=uint(world)*uint(max(nv,1)), tbase=uint(world)*uint(max(nt,1));
   int bo=world*nbody, so=world*max(nsite,1);
   for (int t=0;t<nt;++t) {
@@ -613,5 +784,24 @@ kernel void spatial_armature_dots(
       }
     }
     out_dots[tbase+uint(t)]=tdot;
+  }
+}
+
+kernel void spatial_armature_bias(
+    device const float* jacobian [[buffer(0)]],
+    device const float* dots [[buffer(1)]],
+    device const float* armature [[buffer(2)]],
+    constant int* dims [[buffer(3)]],
+    device float* out_bias [[buffer(4)]],
+    uint world [[thread_position_in_grid]]) {
+  int nv=dims[0], nt=dims[1], batch=dims[7];
+  if (world>=uint(batch) || dims[8 + int(world)]==0) return;
+  uint vb=world*uint(max(nv,1)), tb=world*uint(max(nt,1));
+  for (int d=0;d<nv;++d) {
+    float value=0.0f;
+    for (int t=0;t<nt;++t)
+      value+=armature[t]*dots[tb+uint(t)]*
+          jacobian[(tb+uint(t))*uint(max(nv,1))+uint(d)];
+    out_bias[vb+uint(d)]=value;
   }
 }

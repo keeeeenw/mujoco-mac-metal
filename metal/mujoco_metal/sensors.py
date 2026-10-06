@@ -1219,7 +1219,8 @@ def _object_velocity(desc, poses, world, objtype, objid, pos):
 def sensor_workspace_sizes(descriptor, batch_size):
   """Check compiled workspace products before importing Torch or allocating."""
   sizes = {
-      "subtree_runtime": 4 + batch_size * descriptor.nbody * 32,
+      "subtree_runtime": (4 + batch_size * descriptor.nbody * 32
+                          + batch_size * max(descriptor.nsensor, 1)),
       "com_scratch": batch_size * descriptor.nbody * 12,
       "sensor_output": batch_size * descriptor.nsensordata,
       "body_spatial": batch_size * descriptor.nbody * 6,
@@ -1252,8 +1253,16 @@ class SensorProgram:
     for name in ("sensor_type", "sensor_datatype", "sensor_needstage", "sensor_objtype", "sensor_objid", "sensor_reftype", "sensor_refid", "sensor_dim", "sensor_adr", "sensor_cutoff", "jnt_type", "jnt_qposadr", "jnt_dofadr", "body_iquat", "body_rootid", "geom_bodyid", "geom_pos", "geom_quat", "site_bodyid", "site_pos", "site_quat"):
       arr = getattr(d, name)
       self._meta[name] = torch.as_tensor(np.array(arr, copy=True), device=self._device)
-    self._dims = torch.tensor([d.nsensor, d.nsensordata, d.nq, d.nv, d.njnt, d.nbody, d.ngeom, d.nsite, batch_size, d.disableflags], dtype=torch.int32, device=self._device)
-    self._stage_mask = torch.zeros(1, dtype=torch.int32, device=self._device)
+    self._dims = torch.tensor(
+        [d.nsensor, d.nsensordata, d.nq, d.nv, d.njnt, d.nbody,
+         d.ngeom, d.nsite, batch_size, d.disableflags],
+        dtype=torch.int32, device=self._device)
+    self._sensor_mask_words = batch_size * max(d.nsensor, 1)
+    self._stage_mask = torch.ones(
+        1 + self._sensor_mask_words + batch_size, dtype=torch.int32,
+        device=self._device)
+    self._world_mask = self._stage_mask[
+        1 + self._sensor_mask_words:]
     self._output = torch.zeros((batch_size, d.nsensordata), dtype=torch.float32, device=self._device)
     self._needs_velocity = bool(np.any(np.isin(d.sensor_type, [
         int(mujoco.mjtSensor.mjSENS_FRAMELINVEL),
@@ -1410,11 +1419,73 @@ class SensorProgram:
     # each body record is 128 bytes, verified in the Metal source ABI.
     self._s_subtree_runtime = torch.zeros(
         self._workspace_sizes["subtree_runtime"], dtype=torch.float32, device=self._device)
+    self._sensor_awake_offset = 4 + self.batch_size * d.nbody * 32
+    self._sensor_awake_mask = None
     self._s_dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
-    self._s_state_out = torch.zeros((self.batch_size, d.nsensordata), dtype=torch.float32, device=self._device)
+    state_output_size = self.batch_size * int(d.nsensordata)
+    self._s_state_out_pair = torch.zeros(
+        (2 * max(state_output_size, 1),), dtype=torch.float32,
+        device=self._device)
+    self._s_state_out = self._s_state_out_pair[:state_output_size].view(
+        self.batch_size, d.nsensordata)
+    # Residual of the paired ACC evaluation, consumed by native finite
+    # differences before division by epsilon. Ordinary sensor APIs continue
+    # to expose only _s_state_out and keep its historical float32 values.
+    self._s_state_out_low = self._s_state_out_pair[
+        max(state_output_size, 1):max(state_output_size, 1) + state_output_size
+    ].view(self.batch_size, d.nsensordata)
     self._build_rne_constants(model)
 
-  def run_device(self, qpos, qvel, time, poses, *, stages=(_POS, _VEL), sensordata=None):
+  def set_sensor_awake_mask(self, mask):
+    """Install fixed per-world sensor skip bits from the native sleep policy.
+
+    ``None`` restores ordinary evaluation. Sleeping built-in outputs remain
+    in the merged sensordata buffer because their sensor threads early-return.
+    USER/PLUGIN/rangefinder/site-contact policy bits are produced as awake by
+    ``SensorSleepPolicy`` and therefore still execute on every required stage.
+    """
+    torch, ns, batch = self._torch, self.descriptor.nsensor, self.batch_size
+    target = self._stage_mask[1:1 + self._sensor_mask_words]
+    if mask is None:
+      target.fill_(1)
+      self._sensor_awake_mask = None
+      return
+    if (not isinstance(mask, torch.Tensor) or mask.device.type != "mps"
+        or mask.dtype != torch.int32
+        or tuple(mask.shape) != (batch, ns)
+        or not mask.is_contiguous()):
+      raise ValueError("sensor awake mask must be contiguous MPS int32 [batch, nsensor]")
+    if ns:
+      target[:batch * ns].copy_(mask.reshape(-1))
+    self._sensor_awake_mask = mask
+
+  def _sync_sensor_awake_runtime(self):
+    """Copy awake bits into the appended fixed sensor-runtime region."""
+    ns, batch = self.descriptor.nsensor, self.batch_size
+    if ns <= 0:
+      return
+    runtime = self._s_subtree_runtime[
+        self._sensor_awake_offset:self._sensor_awake_offset + batch * ns]
+    if self._sensor_awake_mask is None:
+      runtime.fill_(1.0)
+    else:
+      runtime.copy_(self._sensor_awake_mask.reshape(-1))
+
+  def _set_world_mask(self, world_mask):
+    """Set the row predicate shared by native sensor-stage kernels."""
+    if world_mask is None:
+      self._world_mask.fill_(1)
+      return
+    if (not isinstance(world_mask, self._torch.Tensor)
+        or world_mask.device.type != "mps"
+        or world_mask.dtype not in (self._torch.int32, self._torch.bool)
+        or tuple(world_mask.shape) != (self.batch_size,)
+        or not world_mask.is_contiguous()):
+      raise ValueError("world_mask must be contiguous MPS int32 [batch]")
+    self._world_mask.copy_(world_mask)
+
+  def run_device(self, qpos, qvel, time, poses, *, stages=(_POS, _VEL),
+                 sensordata=None, world_mask=None):
     """Update selected sensor stages and return borrowed device sensordata.
 
     ``poses`` is the device-output mapping from MetalKinematics.run_device.
@@ -1465,22 +1536,24 @@ class SensorProgram:
     stage_mask = len(stages) and sum(1 << s for s in stages) or 0
     if stage_mask < 0 or stage_mask > np.iinfo(np.int32).max:
       raise ValueError("invalid sensor stage mask")
-    self._stage_mask.fill_(stage_mask)
+    self._stage_mask[0].fill_(stage_mask)
+    self._set_world_mask(world_mask)
     self._kernel(qpos, qvel, time, poses["body_pos"], poses["body_quat"], poses["inertial_pos"], poses["inertial_quat"], poses["geom_pos"], poses["geom_quat"], poses["site_pos"], poses["site_quat"], cvel, root_com, *(self._meta[n] for n in _KERNEL_METADATA), self._dims, self._output, self._stage_mask, threads=(self.batch_size * max(d.nsensor, 1),), group_size=(1,))
     return self._output
 
   def run_state_device(self, qpos, qvel, poses, *, mass_matrix=None,
+                       mass_qvel=None,
                        ten_spa_len=None, ten_spa_vel=None,
                        act_dyn_len=None, act_dyn_vel=None, act_kind=0,
-                       out=None, stages=(_POS, _VEL)):
+                       out=None, stages=(_POS, _VEL), world_mask=None):
     """Evaluate tendon/actuator/limit/subtree/insidesite/energy/magnetometer
     families on MPS and return borrowed device sensordata.
 
     ``ten_spa_*`` are full-tendon spatial kinematics views (zero rows for
     fixed tendons); ``act_dyn_*`` are general-path kinematics views. Either
     may be None when the model has no spatial tendons / general actuators
-    (dummy storage is bound instead). ``mass_matrix`` is required only when
-    kinetic-energy sensors are present.
+    (dummy storage is bound instead). Dense kinetic-energy queries accept
+    ``mass_matrix``; component-sparse callers may pass ``mass_qvel`` instead.
     """
     torch, d = self._torch, self.descriptor
     b = self.batch_size
@@ -1514,12 +1587,28 @@ class SensorProgram:
     act_l = _view(act_dyn_len, (b, max(d.nu, 1)), "act_dyn_len")
     act_v = _view(act_dyn_vel, (b, max(d.nu, 1)), "act_dyn_vel")
     has_ke = bool(np.any(d.sensor_type == int(mujoco.mjtSensor.mjSENS_E_KINETIC)))
+    has_mass_product = False
     if has_ke:
-      if (mass_matrix is None or not isinstance(mass_matrix, torch.Tensor)
-          or mass_matrix.device.type != "mps" or mass_matrix.dtype != torch.float32
-          or tuple(mass_matrix.shape) != (b, d.nv, d.nv) or not mass_matrix.is_contiguous()):
-        raise ValueError("kinetic-energy sensors require the (batch, nv, nv) mass matrix")
-      mm = mass_matrix.reshape(-1)
+      if mass_qvel is not None:
+        if mass_matrix is not None:
+          raise ValueError("pass either mass_matrix or mass_qvel, not both")
+        if (not isinstance(mass_qvel, torch.Tensor)
+            or mass_qvel.device.type != "mps"
+            or mass_qvel.dtype != torch.float32
+            or tuple(mass_qvel.shape) != (b, d.nv)
+            or not mass_qvel.is_contiguous()):
+          raise ValueError("mass_qvel must be contiguous float32 MPS [batch,nv]")
+        mm = mass_qvel.reshape(-1)
+        has_mass_product = True
+      else:
+        if (mass_matrix is None or not isinstance(mass_matrix, torch.Tensor)
+            or mass_matrix.device.type != "mps"
+            or mass_matrix.dtype != torch.float32
+            or tuple(mass_matrix.shape) != (b, d.nv, d.nv)
+            or not mass_matrix.is_contiguous()):
+          raise ValueError(
+              "kinetic-energy sensors require mass_matrix or mass_qvel")
+        mm = mass_matrix.reshape(-1)
     else:
       mm = self._s_dummy
     dest = self._s_state_out if out is None else out
@@ -1533,18 +1622,23 @@ class SensorProgram:
     if any(s not in (_POS, _VEL, _ACC) for s in stages) or len(set(stages)) != len(stages):
       raise ValueError("stages must contain unique stage ids")
     mask = sum(1 << s for s in stages)
-    self._stage_mask.fill_(int(mask))
+    self._stage_mask[0].fill_(int(mask))
+    self._set_world_mask(world_mask)
     sdims = torch.tensor(
         [d.nsensor, d.nsensordata, d.nq, d.nv, d.njnt, d.nbody, d.ngeom,
          d.nsite, b, d.disableflags, d.ntendon, d.nu, int(act_kind),
-         1 if has_ke else 0],
+         1 if has_ke else 0, 1 if has_mass_product else 0]
+        + [1] * b,
         dtype=torch.int32, device=self._device)
+    if world_mask is not None:
+      sdims[15:].copy_(world_mask)
     self._s_subtree_runtime[0:1].fill_(int(mask))
     self._s_subtree_kernel(
         poses["inertial_pos"].reshape(-1), poses["inertial_quat"].reshape(-1),
         poses["cvel"].reshape(-1), poses["root_com"].reshape(-1),
         self._s_massub.reshape(-1), self._s_body_tree.reshape(-1), sdims,
         self._s_subtree_runtime, threads=(b,), group_size=(1,))
+    self._sync_sensor_awake_runtime()
     self._s_state_kernel(
         qpos.reshape(-1) if d.nq else self._s_dummy,
         qvel.reshape(-1) if d.nv else self._s_dummy,
@@ -1620,14 +1714,33 @@ class SensorProgram:
     self._rne_acc = self._rne_lib.evaluate_acc_sensors
     b = self.batch_size
     nb = self.descriptor.nbody
-    self._rne_cacc = torch.zeros((b, max(nb, 1), 6), dtype=torch.float32, device=self._device)
+    self._rne_cacc_pair = torch.zeros(
+        (2, b, max(nb, 1), 6), dtype=torch.float32, device=self._device)
+    self._rne_cacc = self._rne_cacc_pair[0]
+    self._rne_cacc_low = self._rne_cacc_pair[1]
     self._rne_cfrc = torch.zeros_like(self._rne_cacc)
     self._rne_scom = torch.zeros((b, max(nb, 1), 3), dtype=torch.float32, device=self._device)
     self._rne_ext = torch.zeros_like(self._rne_cacc)
     # Reused sequentially by external-force assembly and the RNE post pass.
     self._rne_com_scratch = torch.zeros(
         (b, max(nb, 1), 12), dtype=torch.float32, device=self._device)
-    self._build_spatial_constants(model)
+    self._rne_qacc_low_zero = torch.zeros(
+        (b, max(self.descriptor.nv, 1)), dtype=torch.float32, device=self._device)
+    # Compile geometry pipelines only for models which request those families.
+    # Plain state/ACC queries do not need collision, SDF, ray or taxel kernels.
+    self._sp_ready = False
+    self._sp_hull = self._s_dummy
+    self._sp_hull_info = torch.zeros(9, dtype=torch.int32, device=self._device)
+    spatial_types = [int(getattr(mujoco.mjtSensor, name)) for name in (
+        "mjSENS_TOUCH", "mjSENS_CONTACT", "mjSENS_TACTILE", "mjSENS_RANGEFINDER",
+        "mjSENS_GEOMDIST", "mjSENS_GEOMNORMAL", "mjSENS_GEOMFROMTO")]
+    if np.any(np.isin(self.descriptor.sensor_type, spatial_types)):
+      self._ensure_spatial_constants()
+
+  def _ensure_spatial_constants(self):
+    if not self._sp_ready:
+      self._build_spatial_constants(self._mjmodel)
+      self._sp_ready = True
 
   def _build_spatial_constants(self, model):
     """Host constants for the milestone-016 spatial-query kernels."""
@@ -1795,13 +1908,13 @@ class SensorProgram:
           tangents += 2 * np.cross(quat[1:],
                                    np.cross(quat[1:], tangents) + quat[0]*tangents)
         metadata.append([geom, weld, nvert, int(model.sensor_adr[i])+j,
-                         int(has_frame), channels])
+                         int(has_frame), channels, i])
         frames.append(np.concatenate([verts[j], tangents.reshape(-1),
                                       [model.sensor_cutoff[i]]]))
     self._tactile_count = len(metadata)
     self._tactile_has_frame = any(row[4] for row in metadata)
     self._tactile_meta = torch.as_tensor(
-        np.asarray(metadata or [[0]*6], dtype=np.int32).reshape(-1), device=self._device)
+        np.asarray(metadata or [[0]*7], dtype=np.int32).reshape(-1), device=self._device)
     self._tactile_frames = torch.as_tensor(
         np.asarray(frames or [[0.0]*10], dtype=np.float32).reshape(-1), device=self._device)
     # A mesh without a compiled octree is intentionally skipped by the pinned
@@ -1836,7 +1949,7 @@ class SensorProgram:
     self._tactile_dims = torch.tensor(
         [self.batch_size, int(model.ngeom), int(model.nbody), int(model.nsensordata),
          0, self._tactile_count, int(bool(int(model.opt.disableflags)
-             & int(mujoco.mjtDisableBit.mjDSBL_SENSOR)))],
+             & int(mujoco.mjtDisableBit.mjDSBL_SENSOR))), int(model.nsensor)],
         dtype=torch.int32, device=self._device)
 
   def _sp_validate_poses(self, poses, need_geom_quat=True):
@@ -1856,8 +1969,9 @@ class SensorProgram:
           or not v.is_contiguous()):
         raise ValueError("poses['geom_quat'] must be contiguous float32 MPS")
 
-  def run_contact_device(self, poses, contact, out=None):
+  def run_contact_device(self, poses, contact, out=None, *, world_mask=None):
     """Evaluate CONTACT sensors into ``out`` (borrowed, merged)."""
+    self._ensure_spatial_constants()
     torch, d, b = self._torch, self.descriptor, self.batch_size
     self._sp_validate_poses(poses, need_geom_quat=bool(getattr(self, "_tactile_sensors", None)))
     nc = 0 if contact is None else int(contact["frame"].shape[1])
@@ -1881,7 +1995,8 @@ class SensorProgram:
     if dest is not self._s_state_out:
       self._s_state_out.copy_(dest)
       dest = self._s_state_out
-    self._stage_mask.fill_(1 << int(mujoco.mjtStage.mjSTAGE_ACC))
+    self._set_world_mask(world_mask)
+    self._stage_mask[0].fill_(1 << int(mujoco.mjtStage.mjSTAGE_ACC))
     cdims = torch.tensor(
         [b, d.nsensor, d.nsensordata, nc, d.nsite, d.nbody, d.disableflags],
         dtype=torch.int32, device=self._device)
@@ -1926,6 +2041,7 @@ class SensorProgram:
         self._sp_geom_type, self._sp_geom_size.reshape(-1),
         self._tactile_meta, self._tactile_frames, self._tactile_oct_info,
         self._tactile_oct, dest.reshape(-1), self._tactile_dims,
+        self._stage_mask,
         threads=(batch*self._tactile_count,), group_size=(1,))
 
   def _s_intprm(self):
@@ -1934,8 +2050,9 @@ class SensorProgram:
         _np.asarray(self.descriptor.sensor_intprm, dtype=_np.int32).reshape(-1).copy(),
         dtype=self._torch.int32, device=self._device)
 
-  def run_rays_device(self, poses, hull, hull_info, out=None):
+  def run_rays_device(self, poses, hull, hull_info, out=None, *, world_mask=None):
     """Evaluate site rangefinders into ``out`` (borrowed, merged)."""
+    self._ensure_spatial_constants()
     torch, d, b = self._torch, self.descriptor, self.batch_size
     self._sp_validate_poses(poses, need_geom_quat=True)
     dest = self._s_state_out if out is None else out
@@ -1945,7 +2062,8 @@ class SensorProgram:
     if dest is not self._s_state_out:
       self._s_state_out.copy_(dest)
       dest = self._s_state_out
-    self._stage_mask.fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
+    self._set_world_mask(world_mask)
+    self._stage_mask[0].fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
     rdims = torch.tensor(
         [b, d.nsensor, d.nsensordata, d.ngeom, d.nsite, self._sp_nmat,
          d.disableflags, 0],
@@ -1963,8 +2081,9 @@ class SensorProgram:
         threads=(b * max(d.nsensor, 1),), group_size=(1,))
     return dest
 
-  def run_geomdist_device(self, poses, hull, hull_info, out=None):
+  def run_geomdist_device(self, poses, hull, hull_info, out=None, *, world_mask=None):
     """Evaluate geom-distance witnesses into ``out`` (borrowed, merged)."""
+    self._ensure_spatial_constants()
     torch, d, b = self._torch, self.descriptor, self.batch_size
     for key, shape in (("geom_pos", (b, d.ngeom, 3)),
                        ("geom_quat", (b, d.ngeom, 4))):
@@ -1980,7 +2099,8 @@ class SensorProgram:
     if dest is not self._s_state_out:
       self._s_state_out.copy_(dest)
       dest = self._s_state_out
-    self._stage_mask.fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
+    self._set_world_mask(world_mask)
+    self._stage_mask[0].fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
     gdims = torch.tensor(
         [b, d.nsensor, d.nsensordata, d.ngeom, d.nbody, d.disableflags,
          0, int(self._sp_sdf_maxn), 0],
@@ -1996,10 +2116,11 @@ class SensorProgram:
         threads=(b * max(d.nsensor, 1),), group_size=(1,))
     return dest
 
-  def run_acc_device(self, qpos, qvel, qacc, poses, *, xfrc=None,
+  def run_acc_device(self, qpos, qvel, qacc, poses, *, qacc_low=None, xfrc=None,
                      contact=None, eq_rowadr=None, jnt_map=None,
                      ten_map=None, slot_pair=None, lam_raw=None, lam_nr=0,
-                     lam_stride=0, act_force=None, qfrc_act=None, out=None):
+                     lam_stride=0, act_force=None, qfrc_act=None, out=None,
+                     world_mask=None):
     """Evaluate ACC force families on MPS; returns borrowed device sensordata.
 
     Runs cfrc_ext assembly, the RNE-post pass, then the ACC sensor kernel.
@@ -2011,6 +2132,7 @@ class SensorProgram:
     torch, d = self._torch, self.descriptor
     b = self.batch_size
     nb = d.nbody
+    self._set_world_mask(world_mask)
     for name, tensor, shape in (
         ("qpos", qpos, (b, d.nq)), ("qvel", qvel, (b, d.nv)),
         ("qacc", qacc, (b, d.nv))):
@@ -2018,6 +2140,13 @@ class SensorProgram:
           or tensor.dtype != torch.float32 or tuple(tensor.shape) != shape
           or not tensor.is_contiguous()):
         raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
+    if qacc_low is None:
+      qacc_low = self._rne_qacc_low_zero
+    elif (not isinstance(qacc_low, torch.Tensor) or qacc_low.device.type != "mps"
+          or qacc_low.dtype != torch.float32
+          or tuple(qacc_low.shape) != (b, d.nv) or not qacc_low.is_contiguous()):
+      raise ValueError(
+          f"qacc_low must be contiguous float32 MPS with shape {(b, d.nv)}")
     for key, shape in (
         ("body_pos", (b, nb, 3)), ("body_quat", (b, nb, 4)),
         ("inertial_pos", (b, nb, 3)), ("inertial_quat", (b, nb, 4)),
@@ -2067,8 +2196,11 @@ class SensorProgram:
     qa = qfrc_act.reshape(-1) if qfrc_act is not None else dummy
     has_act = 0 if act_force is None else 1
     adims = torch.tensor(
-        [b, nb, neq_eff, nc, npairs, has_x, lam_nr, lam_stride],
+        [b, nb, neq_eff, nc, npairs, has_x, lam_nr, lam_stride]
+        + [1] * b,
         dtype=torch.int32, device=self._device)
+    if world_mask is not None:
+      adims[8:].copy_(world_mask)
     self._rne_assemble(
         XF, cfr, cfo, crow, cpk, cmu, pge, pof,
         self._rne_geom_bodyid, bjn,
@@ -2082,8 +2214,10 @@ class SensorProgram:
         threads=(b,), group_size=(1,))
     grav_off = 1 if d.disableflags & int(mujoco.mjtDisableBit.mjDSBL_GRAVITY) else 0
     rdims = torch.tensor(
-        [b, nb, nv, nj, grav_off],
+        [b, nb, nv, nj, grav_off] + [1] * b,
         dtype=torch.int32, device=self._device)
+    if world_mask is not None:
+      rdims[5:].copy_(world_mask)
     # Root-com-per-body for the ACC kernel (written by rne_post).
     self._rne_post(
         qvel.reshape(-1) if nv else dummy,
@@ -2098,9 +2232,10 @@ class SensorProgram:
         poses["inertial_pos"].reshape(-1), poses["inertial_quat"].reshape(-1),
         poses["body_quat"].reshape(-1),
         self._rne_ext.reshape(-1),
-        self._rne_cacc.reshape(-1), self._rne_cfrc.reshape(-1),
+        self._rne_cacc_pair.reshape(-1), self._rne_cfrc.reshape(-1),
         self._rne_scom.reshape(-1),
         rdims, self._rne_gravity, self._rne_com_scratch.reshape(-1),
+        qacc_low.reshape(-1) if nv else dummy,
         threads=(b,), group_size=(1,))
     dest = self._s_state_out if out is None else out
     if dest.device.type != "mps" or tuple(dest.shape) != (b, d.nsensordata) \
@@ -2109,13 +2244,15 @@ class SensorProgram:
     if dest is not self._s_state_out:
       self._s_state_out.copy_(dest)
       dest = self._s_state_out
-    self._stage_mask.fill_(1 << int(mujoco.mjtStage.mjSTAGE_ACC))
+    self._stage_mask[0].fill_(1 << int(mujoco.mjtStage.mjSTAGE_ACC))
     kdims = torch.tensor(
         [b, d.nsensor, d.nsensordata, lam_nr, lam_stride, nc, nu, nt, nv,
-         nj, nb, has_act, d.nsite, d.ngeom],
+         nj, nb, has_act, d.nsite, d.ngeom] + [1] * b,
         dtype=torch.int32, device=self._device)
+    if world_mask is not None:
+      kdims[14:].copy_(world_mask)
     self._rne_acc(
-        self._rne_cacc.reshape(-1), self._rne_cfrc.reshape(-1),
+        self._rne_cacc_pair.reshape(-1), self._rne_cfrc.reshape(-1),
         self._rne_scom.reshape(-1), af, qa,
         self._rne_act_trn.reshape(-1), jm, tm, lam,
         poses["site_pos"].reshape(-1), poses["site_quat"].reshape(-1),

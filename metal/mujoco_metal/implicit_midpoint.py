@@ -42,26 +42,93 @@ class FreeBodyMidpointDescriptor:
   aligned: np.ndarray
 
 
+def midpoint_eligibility(descriptor, batch_size, *, torch, device,
+                         constraint_jacobian=None, tree_awake=None,
+                         dof_treeid=None, dof_island=None,
+                         midpoint_blocked_body=None,
+                         midpoint_blocked_tree=None,
+                         islands_disabled=False):
+  """Compute pinned free-body eligibility from the current solver assembly.
+
+  With islands enabled, MuJoCo tests whether the free DOF belongs to an active
+  constraint island. With islands disabled, it uses structural contact and
+  connect/weld body endpoints plus the first two tendon trees; generic nonzero
+  Jacobian columns are not a substitute for those pinned shortcuts. The
+  Jacobian fallback remains for callers that do not yet have island outputs.
+  No per-world mask is read back to the host.
+  """
+  eligible = torch.ones((batch_size, descriptor.nfree), dtype=torch.bool,
+                        device=device)
+  requested_device = torch.device(device)
+  if islands_disabled and (midpoint_blocked_body is not None
+                           or midpoint_blocked_tree is not None):
+    if midpoint_blocked_body is not None:
+      if (tuple(midpoint_blocked_body.shape) != (batch_size, descriptor.nbody)
+          or midpoint_blocked_body.dtype != torch.int32
+          or midpoint_blocked_body.device.type != requested_device.type
+          or (requested_device.index is not None
+              and midpoint_blocked_body.device.index != requested_device.index)):
+        raise ValueError("midpoint blocked-body mask must have shape [batch,nbody]")
+      for slot, body in enumerate(descriptor.bodyid):
+        eligible[:, slot] &= midpoint_blocked_body[:, int(body)] == 0
+    if midpoint_blocked_tree is not None:
+      if dof_treeid is None:
+        raise ValueError("tendon midpoint eligibility requires compiled dof_treeid")
+      if (midpoint_blocked_tree.ndim != 2
+          or midpoint_blocked_tree.shape[0] != batch_size
+          or midpoint_blocked_tree.dtype != torch.int32
+          or midpoint_blocked_tree.device.type != requested_device.type
+          or (requested_device.index is not None
+              and midpoint_blocked_tree.device.index != requested_device.index)):
+        raise ValueError("midpoint blocked-tree mask must have shape [batch,ntree]")
+      for slot, dof in enumerate(descriptor.dofadr):
+        tree = int(dof_treeid[int(dof)])
+        if tree >= 0:
+          eligible[:, slot] &= midpoint_blocked_tree[:, tree] == 0
+  elif dof_island is not None:
+    if (tuple(dof_island.shape) != (batch_size, descriptor.nv)
+        or dof_island.dtype != torch.int32
+        or dof_island.device.type != requested_device.type
+        or (requested_device.index is not None
+            and dof_island.device.index != requested_device.index)):
+      raise ValueError("dof island labels must have shape [batch,nv]")
+    for slot, dof in enumerate(descriptor.dofadr):
+      eligible[:, slot] &= dof_island[:, int(dof)] < 0
+  elif constraint_jacobian is not None:
+    if (constraint_jacobian.ndim != 3
+        or constraint_jacobian.shape[0] != batch_size
+        or constraint_jacobian.shape[2] != descriptor.nv):
+      raise ValueError("constraint Jacobian must have shape [batch,rows,nv]")
+    for slot, dof in enumerate(descriptor.dofadr):
+      involved = (constraint_jacobian[:, :, int(dof):int(dof)+6] != 0).any(dim=2).any(dim=1)
+      eligible[:, slot] &= ~involved
+  if tree_awake is not None:
+    if dof_treeid is None:
+      raise ValueError("awake tree eligibility requires compiled dof_treeid")
+    for slot, dof in enumerate(descriptor.dofadr):
+      eligible[:, slot] &= tree_awake[:, int(dof_treeid[int(dof)])] != 0
+  return eligible.contiguous()
+
+
 def lower_free_body_midpoints(model):
   """Lower only joints satisfying MuJoCo 3.10 midpoint_eligible guards.
 
   Eligible means: implicitfast; inverse-discrete dynamics disabled; zero
-  density/viscosity; sleep disabled; free joint; exactly six DOFs in its tree;
+  density/viscosity; free joint; exactly six DOFs in its tree;
   and exact equality between that body's subtree mass and its own body mass.
-  The implicit profile also guarantees no constraints, so every such tree is
-  unconstrained. Other free joints deliberately use ordinary implicitfast
-  integration, as MuJoCo does.
+  Awake state and constraint involvement are checked from the current native
+  assembly at runtime. Sleeping eligible bodies remain in the descriptor but
+  are not dispatched. Other free joints use ordinary implicitfast integration.
   """
   lower_implicitfast(model)
-  if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_SLEEP):
-    raise ValueError("free-body midpoint stage requires sleep mode disabled")
   eligible = []
   inverse_discrete = bool(
       int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_INVDISCRETE)
   )
   free = int(mujoco.mjtJoint.mjJNT_FREE)
   for jid in range(model.njnt):
-    if int(model.jnt_type[jid]) != free or inverse_discrete:
+    if (int(model.jnt_type[jid]) != free or inverse_discrete
+        or model.opt.density != 0 or model.opt.viscosity != 0):
       continue
     body = int(model.jnt_bodyid[jid])
     dof = int(model.jnt_dofadr[jid])
@@ -291,7 +358,7 @@ class FreeBodyMidpointProgram:
     self._empty = torch.zeros(1, dtype=torch.float32, device=self._device)
 
   def run_device(self, qvel, effective_acceleration, physical_qacc,
-                 qfrc_total, body_quat):
+                 qfrc_total, body_quat, *, eligible_mask=None):
     """Return qvel_next, midpoint position_velocity, reported qacc, and status."""
     torch, d, b = self._torch, self.descriptor, self.batch_size
     if not np.isfinite(d.timestep) or d.timestep <= 0:
@@ -307,6 +374,14 @@ class FreeBodyMidpointProgram:
       if not isinstance(tensor, torch.Tensor) or tensor.device.type != "mps" or tensor.dtype != torch.float32 or tuple(tensor.shape) != shape or not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
     nv = d.nv
+    if eligible_mask is None:
+      eligible_mask = torch.ones((b, max(d.nfree, 1)), dtype=torch.bool, device=self._device)
+    elif (not isinstance(eligible_mask, torch.Tensor) or eligible_mask.device.type != "mps"
+          or eligible_mask.dtype != torch.bool or tuple(eligible_mask.shape) != (b, d.nfree)):
+      raise ValueError("eligible_mask must be bool MPS[batch,nfree]")
+    eligibility = eligible_mask.to(torch.int32).contiguous().reshape(-1)
+    if not eligibility.numel():
+      eligibility = torch.ones(1, dtype=torch.int32, device=self._device)
     state_buffers = [x.reshape(-1) if x.numel() else self._empty for x in
                      (qvel, effective_acceleration, physical_qacc, qfrc_total, body_quat)]
     outputs = [self._outputs[n].reshape(-1) if nv else self._empty for n in
@@ -315,7 +390,7 @@ class FreeBodyMidpointProgram:
         *state_buffers, self._arrays["dofadr"], self._arrays["bodyid"],
         self._arrays["mass"], self._arrays["inertia"], self._arrays["ipos"],
         self._arrays["iquat"], self._arrays["aligned"], self._gravity,
-        *outputs, self._outputs["status"], self._dims, self._timestep,
+        *outputs, self._outputs["status"], self._dims, self._timestep, eligibility,
         threads=(b,), group_size=(1,),
     )
     return self._outputs

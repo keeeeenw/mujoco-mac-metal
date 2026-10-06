@@ -29,7 +29,9 @@ kernel void broadphase_mask(
   int ngeom = dims[6];
   int world = int(tid) / max(npairs, 1);
   int pair_idx = int(tid) % max(npairs, 1);
-  if (uint(world) >= uint(batch) || pair_idx >= npairs) return;
+  int mask_offset=dims[10+npairs+1+dims[2]];
+  if (uint(world) >= uint(batch) || pair_idx >= npairs
+      || dims[mask_offset+world] == 0) return;
   int a = pair_geoms[pair_idx * 2 + 0];
   int b = pair_geoms[pair_idx * 2 + 1];
   // Planes (type 0) are unbounded: always overlap (conservative).

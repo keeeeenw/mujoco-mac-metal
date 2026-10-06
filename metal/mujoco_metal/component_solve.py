@@ -84,11 +84,17 @@ def component_solver_workspace_sizes(*, batch, nv, ncomponent, nnz,
   maxnv = max(nv, 1)
   return {
       "component_mass_dof_mask": batch * maxnv,
+      "component_mass_all_world_mask": batch,
       "component_mass_factor_dof_mask": batch * maxnv,
       "component_mass_factor": max(batch * nnz, 1),
-      "component_mass_output": batch * rhs_capacity * maxnv,
-      "component_mass_single_output": batch * maxnv,
+      "component_mass_zero_rhs_low": batch * maxnv,
+      # The component solve result is a nonoverlapping hi/lo pair. The high
+      # plane preserves the long-standing run_device return ABI; the low plane
+      # is the residual correction consumed by paired constraint assembly.
+      "component_mass_output_pair": 2 * batch * rhs_capacity * maxnv,
+      "component_mass_single_output_pair": 2 * batch * maxnv,
       "component_mass_matvec_output": batch * maxnv,
+      "component_mass_retained_matrix": max(batch * nnz, 1),
       "component_mass_status": batch * max(ncomponent, 1),
       "component_mass_factor_status": batch * max(ncomponent, 1),
       "component_mass_zero_blocks": max(batch * nnz, 1),
@@ -103,6 +109,8 @@ def component_solver_workspace_sizes(*, batch, nv, ncomponent, nnz,
       "component_mass_dims": 5,
       "component_mass_single_dims": 5,
       "component_mass_merge_dims": 2,
+      "component_mass_row_dims": 3,
+      "component_mass_row_index": 1,
   }
 
 
@@ -362,6 +370,83 @@ def component_mass_matvec_cpu(mass_blocks, layout, vector, *, active_dof=None,
   return output
 
 
+def component_mass_residual_reference(matrix, solution, rhs, *,
+                                      rhs_low=None):
+  """Return the rounded residual of the exact f32-input mass equation.
+
+  This is an independent CPU oracle for the residual refinement performed by
+  ``factor_apply_components``.  Inputs are first interpreted as their actual
+  float32 device values, then the dot product is evaluated in float64 so the
+  reference does not reproduce the shader's sequential-rounding error.
+  """
+  matrix = np.asarray(matrix, dtype=np.float32)
+  solution = np.asarray(solution, dtype=np.float32)
+  rhs = np.asarray(rhs, dtype=np.float32)
+  if (matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]
+      or solution.shape != (matrix.shape[1],)
+      or rhs.shape != (matrix.shape[0],)):
+    raise ValueError("matrix, solution, and rhs must describe one square system")
+  if rhs_low is None:
+    rhs_low = np.zeros_like(rhs)
+  else:
+    rhs_low = np.asarray(rhs_low, dtype=np.float32)
+    if rhs_low.shape != rhs.shape:
+      raise ValueError("rhs_low must have the same shape as rhs")
+  exact = (rhs.astype(np.float64) + rhs_low.astype(np.float64)
+           - matrix.astype(np.float64) @ solution.astype(np.float64))
+  return exact.astype(np.float32)
+
+
+def component_mass_residual_pair_cpu(matrix, solution, rhs, *, rhs_low=None):
+  """Emulate the shader's two-word residual accumulator on the CPU."""
+  matrix = np.asarray(matrix, dtype=np.float32)
+  solution = np.asarray(solution, dtype=np.float32)
+  rhs = np.asarray(rhs, dtype=np.float32)
+  if (matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]
+      or solution.shape != (matrix.shape[1],)
+      or rhs.shape != (matrix.shape[0],)):
+    raise ValueError("matrix, solution, and rhs must describe one square system")
+  if rhs_low is None:
+    rhs_low = np.zeros_like(rhs)
+  else:
+    rhs_low = np.asarray(rhs_low, dtype=np.float32)
+    if rhs_low.shape != rhs.shape:
+      raise ValueError("rhs_low must have the same shape as rhs")
+
+  def renormalize(hi, lo):
+    total = np.float32(hi + lo)
+    virtual_lo = np.float32(total - hi)
+    error = np.float32(
+        np.float32(hi - np.float32(total - virtual_lo))
+        + np.float32(lo - virtual_lo))
+    return total, error
+
+  def add(a, b):
+    total = np.float32(a[0] + b[0])
+    virtual_b = np.float32(total - a[0])
+    error = np.float32(
+        np.float32(a[0] - np.float32(total - virtual_b))
+        + np.float32(b[0] - virtual_b))
+    error = np.float32(error + np.float32(a[1] + b[1]))
+    return renormalize(total, error)
+
+  def product(a, b):
+    high = np.float32(a * b)
+    # A product of two binary32 values is exact in binary64, so this is the
+    # CPU analogue of fma(a, b, -high) in the Metal implementation.
+    low = np.float32(float(a) * float(b) - float(high))
+    return high, low
+
+  result = np.empty_like(rhs)
+  for row in range(matrix.shape[0]):
+    residual = (rhs[row], rhs_low[row])
+    for col in range(matrix.shape[1]):
+      term = product(matrix[row, col], solution[col])
+      residual = add(residual, (-term[0], -term[1]))
+    result[row] = np.float32(residual[0] + residual[1])
+  return result
+
+
 class MetalComponentMassSolver:
   """Apply exact component-wise ``M^-1`` to a fixed-capacity RHS batch.
 
@@ -434,16 +519,29 @@ class MetalComponentMassSolver:
     self._single_dims = torch.tensor(
         [self.nv, self.ncomponent, batch_size, self.nnz, 1],
         dtype=torch.int32, device=self._device)
+    self._row_dims = torch.tensor(
+        [self.nv, rhs_capacity, batch_size], dtype=torch.int32,
+        device=self._device)
+    self._row_index = torch.zeros(1, dtype=torch.int32, device=self._device)
     maxnv = max(self.nv, 1)
+    output_pair = torch.zeros(
+        (2, batch_size, rhs_capacity, maxnv), dtype=torch.float32,
+        device=self._device)
+    single_output_pair = torch.zeros(
+        (2, batch_size, maxnv), dtype=torch.float32, device=self._device)
     self._workspace = {
+        "all_world_mask": torch.ones((batch_size,), dtype=torch.int32,
+                                      device=self._device),
         "dof_mask": torch.zeros((batch_size, maxnv), dtype=torch.int32,
                                 device=self._device),
         "factor": torch.empty(max(batch_size * self.nnz, 1),
                               dtype=torch.float32, device=self._device),
-        "output": torch.zeros((batch_size, rhs_capacity, maxnv),
-                              dtype=torch.float32, device=self._device),
-        "single_output": torch.zeros((batch_size, maxnv),
-                                     dtype=torch.float32, device=self._device),
+        "output_pair": output_pair,
+        "output": output_pair[0],
+        "output_low": output_pair[1],
+        "single_output_pair": single_output_pair,
+        "single_output": single_output_pair[0],
+        "single_output_low": single_output_pair[1],
         "matvec_output": torch.empty((batch_size, maxnv),
                                       dtype=torch.float32, device=self._device),
         "status": torch.zeros((batch_size, max(self.ncomponent, 1)),
@@ -452,6 +550,8 @@ class MetalComponentMassSolver:
                                       dtype=torch.int32, device=self._device),
         "zero_blocks": torch.zeros(max(batch_size * self.nnz, 1),
                                     dtype=torch.float32, device=self._device),
+        "zero_rhs_low": torch.zeros((batch_size, maxnv),
+                                     dtype=torch.float32, device=self._device),
     }
     self._all_dof_ids = torch.arange(maxnv, dtype=torch.int32,
                                      device=self._device).expand(batch_size, -1).contiguous()
@@ -473,10 +573,13 @@ class MetalComponentMassSolver:
         (batch_size, maxnv), dtype=torch.float32, device=self._device)
     self._workspace["factor_dof_mask"] = torch.zeros(
         (batch_size, maxnv), dtype=torch.int32, device=self._device)
+    self._workspace["retained_matrix"] = torch.zeros(
+        (batch_size, max(self.nnz, 1)), dtype=torch.float32,
+        device=self._device)
 
   def run_device(self, mass_blocks, rhs, *, dof_ids=None, counts=None,
                  tendon_armature_blocks=None, diagonal_add=None,
-                 allow_indefinite=False):
+                 allow_indefinite=False, rhs_low=None, world_mask=None):
     """Return borrowed ``(solution, per-component status)`` MPS tensors."""
     torch = self._torch
     if (not isinstance(mass_blocks, torch.Tensor)
@@ -511,17 +614,36 @@ class MetalComponentMassSolver:
           or not tendon_armature_blocks.is_contiguous()):
       raise ValueError("tendon_armature_blocks must be contiguous float32 MPS [batch,nnz]")
     diagonal_add = self._validate_diagonal_add(diagonal_add)
+    if rhs_low is None:
+      rhs_low = self._workspace["zero_rhs_low"]
+    elif (not isinstance(rhs_low, torch.Tensor)
+          or tuple(rhs_low.shape) != (self.batch_size, self.nv)
+          or rhs_low.dtype != torch.float32 or rhs_low.device.type != "mps"
+          or not rhs_low.is_contiguous()):
+      raise ValueError("rhs_low must be contiguous float32 MPS [batch,nv]")
     if not isinstance(allow_indefinite, (bool, np.bool_)):
       raise ValueError("allow_indefinite must be a boolean")
+    if world_mask is None:
+      world_mask = self._workspace["all_world_mask"]
+    elif (not isinstance(world_mask, torch.Tensor)
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or world_mask.dtype != torch.int32
+          or world_mask.device.type != "mps"
+          or not world_mask.is_contiguous()):
+      raise ValueError("world_mask must be contiguous MPS int32 [batch]")
     self._factorized = False
     self._allow_indefinite.fill_(int(allow_indefinite))
     self._phase.fill_(2)
-    output, status, workspace = self._workspace["output"], self._workspace["status"], self._workspace
+    output, output_low = (self._workspace["output"],
+                          self._workspace["output_low"])
+    status, workspace = self._workspace["status"], self._workspace
     if self.nv:
       self._library.build_dof_awake_mask(
           dof_ids.reshape(-1), counts.reshape(-1), workspace["dof_mask"].reshape(-1),
-          self._dims, threads=(self.batch_size,), group_size=(1,))
-    output.zero_()
+          self._dims, world_mask, threads=(self.batch_size,), group_size=(1,))
+    # The per-component kernel initializes outputs and status only for worlds
+    # admitted by this mask. Whole-tensor zeroing here would destroy borrowed
+    # results belonging to healthy worlds during check-state recovery.
     if self.ncomponent:
       self._library.factor_apply_components(
           mass_blocks.reshape(-1), tendon_armature_blocks.reshape(-1),
@@ -532,6 +654,9 @@ class MetalComponentMassSolver:
           self._allow_indefinite,
           self._phase,
           status.reshape(-1),
+          output_low.reshape(-1),
+          rhs_low.reshape(-1),
+          world_mask.reshape(-1),
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     return (output[:, :, :self.nv],
             status[:, :self.ncomponent])
@@ -540,6 +665,16 @@ class MetalComponentMassSolver:
   def factor_active_dof_mask(self):
     """Borrowed `[batch,max(nv,1)]` int mask used by retained factors."""
     return self._workspace["factor_dof_mask"]
+
+  @property
+  def paired_output(self):
+    """Borrowed `[2,batch,rhs_capacity,max(nv,1)]` hi/lo result backing.
+
+    Plane zero is the existing high result returned by :meth:`run_device`;
+    plane one is its mass-equation residual correction. The backing remains
+    valid until this solver is invoked again.
+    """
+    return self._workspace["output_pair"]
 
   def factorize_device(self, mass_blocks, *, dof_ids=None, counts=None,
                        tendon_armature_blocks=None, diagonal_add=None,
@@ -586,12 +721,18 @@ class MetalComponentMassSolver:
     self._allow_indefinite.fill_(int(allow_indefinite))
     self._phase.fill_(0)
     workspace = self._workspace
+    workspace["output"].zero_()
+    workspace["output_low"].zero_()
     if self.nv:
       self._library.build_dof_awake_mask(
           dof_ids.reshape(-1), counts.reshape(-1),
           workspace["dof_mask"].reshape(-1), self._dims,
+          workspace["all_world_mask"],
           threads=(self.batch_size,), group_size=(1,))
     workspace["factor_dof_mask"].copy_(workspace["dof_mask"])
+    if self.nnz:
+      workspace["retained_matrix"][:, :self.nnz].copy_(
+          mass_blocks + tendon_armature_blocks)
     if self.ncomponent:
       self._library.factor_apply_components(
           mass_blocks.reshape(-1), tendon_armature_blocks.reshape(-1),
@@ -601,11 +742,14 @@ class MetalComponentMassSolver:
           workspace["factor_status"].reshape(-1), self._dims,
           diagonal_add.reshape(-1), self._allow_indefinite, self._phase,
           workspace["factor_status"].reshape(-1),
+          workspace["output_low"].reshape(-1),
+          workspace["zero_rhs_low"].reshape(-1),
+          workspace["all_world_mask"],
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     self._factorized = True
     return workspace["factor_status"][:, :self.ncomponent]
 
-  def solve_factored_device(self, rhs):
+  def solve_factored_device(self, rhs, *, rhs_low=None):
     """Apply retained component factors to a new fixed-capacity RHS batch."""
     torch = self._torch
     if not self._factorized:
@@ -617,22 +761,34 @@ class MetalComponentMassSolver:
       raise ValueError(
           "rhs must be contiguous float32 MPS [batch,rhs_capacity,nv]")
     self._phase.fill_(1)
-    output, status, workspace = (
-        self._workspace["output"], self._workspace["status"], self._workspace)
+    if rhs_low is None:
+      rhs_low = self._workspace["zero_rhs_low"]
+    elif (not isinstance(rhs_low, torch.Tensor)
+          or tuple(rhs_low.shape) != (self.batch_size, self.nv)
+          or rhs_low.dtype != torch.float32 or rhs_low.device.type != "mps"
+          or not rhs_low.is_contiguous()):
+      raise ValueError("rhs_low must be contiguous float32 MPS [batch,nv]")
+    output, output_low, status, workspace = (
+        self._workspace["output"], self._workspace["output_low"],
+        self._workspace["status"], self._workspace)
     output.zero_()
+    output_low.zero_()
     if self.ncomponent:
       self._library.factor_apply_components(
-          self._workspace["zero_blocks"].reshape(-1),
+          workspace["retained_matrix"].reshape(-1),
           self._workspace["zero_blocks"].reshape(-1), rhs.reshape(-1),
           workspace["factor_dof_mask"].reshape(-1), self._component_layout,
           workspace["factor"], output.reshape(-1), status.reshape(-1),
           self._dims, self._workspace["diagonal_add"].reshape(-1),
           self._allow_indefinite, self._phase,
           workspace["factor_status"].reshape(-1),
+          output_low.reshape(-1),
+          rhs_low.reshape(-1),
+          workspace["all_world_mask"],
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     return output[:, :, :self.nv], status[:, :self.ncomponent]
 
-  def solve_factored_vector_device(self, rhs):
+  def solve_factored_vector_device(self, rhs, *, rhs_low=None):
     """Apply retained factors to one canonical ``[batch,nv]`` RHS.
 
     This fixed single-vector path lets restarted or full GMRES reuse the same
@@ -648,12 +804,21 @@ class MetalComponentMassSolver:
         or not rhs.is_contiguous()):
       raise ValueError("rhs must be contiguous float32 MPS [batch,nv]")
     self._phase.fill_(1)
+    if rhs_low is None:
+      rhs_low = self._workspace["zero_rhs_low"]
+    elif (not isinstance(rhs_low, torch.Tensor)
+          or tuple(rhs_low.shape) != (self.batch_size, self.nv)
+          or rhs_low.dtype != torch.float32 or rhs_low.device.type != "mps"
+          or not rhs_low.is_contiguous()):
+      raise ValueError("rhs_low must be contiguous float32 MPS [batch,nv]")
     output = self._workspace["single_output"]
+    output_low = self._workspace["single_output_low"]
     output.zero_()
+    output_low.zero_()
     status = self._workspace["status"]
     if self.ncomponent:
       self._library.factor_apply_components(
-          self._workspace["zero_blocks"].reshape(-1),
+          self._workspace["retained_matrix"].reshape(-1),
           self._workspace["zero_blocks"].reshape(-1), rhs.reshape(-1),
           self._workspace["factor_dof_mask"].reshape(-1),
           self._component_layout, self._workspace["factor"],
@@ -661,10 +826,14 @@ class MetalComponentMassSolver:
           self._workspace["diagonal_add"].reshape(-1),
           self._allow_indefinite, self._phase,
           self._workspace["factor_status"].reshape(-1),
+          output_low.reshape(-1),
+          rhs_low.reshape(-1),
+          self._workspace["all_world_mask"],
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     return output[:, :self.nv], status[:, :self.ncomponent]
 
-  def merge_world_status(self, component_status, world_status):
+  def merge_world_status(self, component_status, world_status, *,
+                         world_mask=None):
     """Max-reduce component failures into the caller's per-world status.
 
     This is a device-only merge so a staged component solve can contribute to
@@ -684,11 +853,36 @@ class MetalComponentMassSolver:
         or world_status.device.type != "mps"
         or not world_status.is_contiguous()):
       raise ValueError("world_status must be contiguous MPS int32 [batch]")
+    if world_mask is None:
+      world_mask = self._workspace["all_world_mask"]
+    elif (not isinstance(world_mask, torch.Tensor)
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or world_mask.dtype != torch.int32
+          or world_mask.device.type != "mps"
+          or not world_mask.is_contiguous()):
+      raise ValueError("world_mask must be contiguous MPS int32 [batch]")
     if self.ncomponent:
       self._library.merge_component_world_status(
           component_status.reshape(-1), world_status, self._merge_dims,
+          world_mask,
           threads=(self.batch_size,), group_size=(1,))
     return world_status
+
+  def stage_rhs_rows(self, source, target, *, rhs_index, world_mask):
+    """Write only selected world RHS rows into a retained solver workspace."""
+    self._row_index.fill_(int(rhs_index))
+    self._library.stage_component_rhs(
+        source.reshape(-1), target.reshape(-1), world_mask, self._row_dims,
+        self._row_index, threads=(self.batch_size,), group_size=(1,))
+
+  def publish_solution_rows(self, source, source_low, target, target_low, *,
+                            rhs_index, world_mask):
+    """Commit one paired solved RHS without touching unselected worlds."""
+    self._row_index.fill_(int(rhs_index))
+    self._library.publish_component_solution(
+        source.reshape(-1), source_low.reshape(-1), target.reshape(-1),
+        target_low.reshape(-1), world_mask, self._row_dims, self._row_index,
+        threads=(self.batch_size,), group_size=(1,))
 
   def _validate_diagonal_add(self, diagonal_add):
     torch = self._torch
@@ -740,7 +934,7 @@ class MetalComponentMassSolver:
       self._library.build_euler_damping_diagonal(
           dof_ids.reshape(-1), counts.reshape(-1),
           self._euler_damping_mask, q_deriv.reshape(-1), output.reshape(-1),
-          self._dims, self._euler_dt,
+          self._dims, self._euler_dt, self._workspace["all_world_mask"],
           threads=(self.batch_size,), group_size=(1,))
     return output[:, :self.nv]
 
@@ -793,6 +987,7 @@ class MetalComponentMassSolver:
       self._library.build_dof_awake_mask(
           dof_ids.reshape(-1), counts.reshape(-1),
           self._workspace["dof_mask"].reshape(-1), self._dims,
+          self._workspace["all_world_mask"],
           threads=(self.batch_size,), group_size=(1,))
     if self.ncomponent:
       self._library.apply_component_mass(
@@ -800,5 +995,75 @@ class MetalComponentMassSolver:
           vector.reshape(-1), self._workspace["dof_mask"].reshape(-1),
           self._component_layout, output.reshape(-1), self._dims,
           diagonal_add.reshape(-1),
+          self._workspace["all_world_mask"],
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     return output[:, :self.nv]
+
+  def run_mass_matvec_pair_device(self, mass_blocks, vector_hi, vector_low, *,
+                                  dof_ids=None, counts=None,
+                                  tendon_armature_blocks=None,
+                                  diagonal_add=None, world_mask=None):
+    """Apply the compiled mass map to a two-word vector without collapsing.
+
+    The returned buffers are the component solver's single-RHS pair scratch;
+    callers that keep the values across another component solve must clone
+    them first.
+    """
+    torch = self._torch
+    shape = (self.batch_size, self.nv)
+    for name, value in (("vector_hi", vector_hi), ("vector_low", vector_low)):
+      if (not isinstance(value, torch.Tensor) or tuple(value.shape) != shape
+          or value.dtype != torch.float32 or value.device.type != "mps"
+          or not value.is_contiguous()):
+        raise ValueError(f"{name} must be contiguous float32 MPS {shape}")
+    if (not isinstance(mass_blocks, torch.Tensor)
+        or tuple(mass_blocks.shape) != (self.batch_size, self.nnz)
+        or mass_blocks.dtype != torch.float32 or mass_blocks.device.type != "mps"
+        or not mass_blocks.is_contiguous()):
+      raise ValueError("mass_blocks must be contiguous float32 MPS [batch,nnz]")
+    if dof_ids is None:
+      dof_ids, counts = self._all_dof_ids, self._all_counts
+    if (not isinstance(dof_ids, torch.Tensor)
+        or tuple(dof_ids.shape) != (self.batch_size, max(self.nv, 1))
+        or dof_ids.dtype != torch.int32 or dof_ids.device.type != "mps"
+        or not dof_ids.is_contiguous()):
+      raise ValueError("dof_ids must be contiguous MPS int32 [batch,max(nv,1)]")
+    if (not isinstance(counts, torch.Tensor)
+        or tuple(counts.shape) != (self.batch_size, 3)
+        or counts.dtype != torch.int32 or counts.device.type != "mps"
+        or not counts.is_contiguous()):
+      raise ValueError("counts must be contiguous MPS int32 [batch,3]")
+    if tendon_armature_blocks is None:
+      tendon_armature_blocks = self._workspace["zero_blocks"][
+          :self.batch_size * self.nnz].reshape(self.batch_size, self.nnz)
+    elif (not isinstance(tendon_armature_blocks, torch.Tensor)
+          or tuple(tendon_armature_blocks.shape) != (self.batch_size, self.nnz)
+          or tendon_armature_blocks.dtype != torch.float32
+          or tendon_armature_blocks.device.type != "mps"
+          or not tendon_armature_blocks.is_contiguous()):
+      raise ValueError("tendon_armature_blocks must be contiguous float32 MPS")
+    if world_mask is None:
+      world_mask = self._workspace["all_world_mask"]
+    elif (not isinstance(world_mask, torch.Tensor)
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or world_mask.dtype != torch.int32 or world_mask.device.type != "mps"
+          or not world_mask.is_contiguous()):
+      raise ValueError("world_mask must be contiguous MPS int32 [batch]")
+    diagonal_add = self._validate_diagonal_add(diagonal_add)
+    if self.nv:
+      self._library.build_dof_awake_mask(
+          dof_ids.reshape(-1), counts.reshape(-1),
+          self._workspace["dof_mask"].reshape(-1), self._dims,
+          world_mask,
+          threads=(self.batch_size,), group_size=(1,))
+    high, low = (self._workspace["single_output"],
+                 self._workspace["single_output_low"])
+    if self.ncomponent:
+      self._library.apply_component_mass_pair(
+          mass_blocks.reshape(-1), tendon_armature_blocks.reshape(-1),
+          vector_hi.reshape(-1), vector_low.reshape(-1),
+          self._workspace["dof_mask"].reshape(-1),
+          self._component_layout, high.reshape(-1), low.reshape(-1),
+          self._dims, diagonal_add.reshape(-1), world_mask,
+          threads=(self.batch_size * self.ncomponent,), group_size=(1,))
+    return high[:, :self.nv], low[:, :self.nv]

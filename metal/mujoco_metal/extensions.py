@@ -29,6 +29,7 @@ from dataclasses import dataclass
 import copy
 import threading
 import weakref
+import numbers
 import mujoco
 import numpy as np
 
@@ -48,6 +49,9 @@ class PluginType(Enum):
 class NativePlugin:
   """Base class for device-native plugins."""
 
+  spatial_force_workspace_kind = None
+  device_workspace_bytes = 0
+
   def __init__(self, name: str, plugin_type: PluginType):
     self.name = str(name)
     self.plugin_type = plugin_type
@@ -59,12 +63,38 @@ class NativePlugin:
     """Initialize plugin buffers and bind to model and batch size."""
     self.model = model
     self.batch_size = int(batch_size)
-    self.device = device or (torch.device("mps") if torch is not None and torch.backends.mps.is_available() else "cpu")
+    requested = (device or (torch.device("mps")
+                            if torch is not None and torch.backends.mps.is_available()
+                            else "cpu"))
+    if torch is not None:
+      # Torch's unindexed MPS device compares unequal to the actual `mps:0`
+      # device on tensors. Resolve once through an allocation-free empty
+      # device view and keep that canonical owner for every plugin mask.
+      self.device = torch.empty((0,), dtype=torch.uint8,
+                                device=requested).device
+    else:
+      self.device = requested
+    self._runtime_device = self.device
+
+  def _owned_device(self):
+    """Return the canonical device resolved when plugin storage is bound."""
+    return torch.device(self._runtime_device)
 
   def run_device(self, state, **kwargs):
     """Execute plugin computation natively on device tensors.
     
     Must operate entirely on MPS tensors without CPU readback.
+    ``state`` is a read-only view of this forward stage: its public qpos,
+    qvel, qacc, act and time properties refer to the stage being evaluated,
+    including RK4 sub-stages and post-sleep velocity refreshes. Do not call
+    state mutation/reset/restore methods or mutate its private tensor fields;
+    only the plugin's own registered device state may be changed.
+    An optional ``compute_mask`` is a bool device tensor with shape [batch].
+    It selects worlds requiring a conditional stage (for example the extra
+    velocity forward on a sleep transition). Stateful plugins should gate
+    updates by this mask; the simulation also restores device state for
+    unselected worlds. Callbacks must not rely on untracked host side effects
+    to represent simulation state.
     """
     raise NotImplementedError("NativePlugin subclasses must implement run_device")
 
@@ -90,6 +120,24 @@ class NativePlugin:
     """Reset plugin internal states for selected or all worlds."""
     pass
 
+  def reset_masked(self, reset_mask):
+    """Reset selected runtime worlds from an on-device boolean mask.
+
+    Automatic numerical recovery cannot transfer bad-world indices to the
+    host. Stateful plugins must override this method and reset their owned
+    device state where ``reset_mask`` is true. Stateless plugins need no
+    payload and inherit the no-op implementation.
+    """
+    if torch is None or not isinstance(reset_mask, torch.Tensor):
+      raise TypeError("reset_mask must be a device tensor")
+    if (reset_mask.dtype != torch.bool
+        or tuple(reset_mask.shape) != (self.batch_size,)
+        or reset_mask.device != self._owned_device()):
+      raise ValueError("reset_mask must be bool[batch_size] on the plugin device")
+    if type(self).device_snapshot is not NativePlugin.device_snapshot:
+      raise NotImplementedError(
+          "stateful native plugins must implement device-native reset_masked")
+
   def snapshot(self):
     """Capture plugin internal state for replay."""
     return None
@@ -108,6 +156,19 @@ class NativePlugin:
     Stateless plugins may keep the default ``None`` implementation.
     """
     return None
+
+  def device_snapshot_bytes(self):
+    """Return the exact byte bound for :meth:`device_snapshot` allocations.
+
+    Stateless plugins inherit the zero-byte contract. A stateful plugin that
+    overrides ``device_snapshot`` must also override this method so native
+    derivative queries can admit their complete rollback checkpoint before
+    allocating it.
+    """
+    if type(self).device_snapshot is not NativePlugin.device_snapshot:
+      raise NotImplementedError(
+          "stateful plugins must declare device_snapshot_bytes")
+    return 0
 
   def restore_device(self, snapshot):
     """Restore a complete device snapshot without host transfers."""
@@ -129,10 +190,202 @@ class NativePlugin:
       raise TypeError("accepted_mask must be a device tensor")
     if (accepted_mask.dtype != torch.bool
         or tuple(accepted_mask.shape) != (self.batch_size,)
-        or accepted_mask.device != self.device):
+        or accepted_mask.device != self._owned_device()):
       raise ValueError("accepted_mask must be bool[batch_size] on the plugin device")
     raise NotImplementedError(
         "stateful native plugins must implement device-native restore_masked")
+
+
+@dataclass(frozen=True)
+class ActuatorPluginOutput:
+  """Borrowed native actuator outputs for one force evaluation.
+
+  ``force`` is actuator-space force ``[batch, nu]``. The simulation projects
+  it through the current transmission moment matrix. ``activation_derivative``
+  is an optional additive contribution in compiled activation order
+  ``[batch, na]``. Both tensors remain owned by the plugin and are valid only
+  until its next ``run_actuator_device`` call.
+  """
+
+  force: object
+  activation_derivative: object | None = None
+
+
+class NativeActuatorPlugin(NativePlugin):
+  """Typed actuator-space extension with accepted-step state advancement.
+
+  Implementations return :class:`ActuatorPluginOutput` from
+  ``run_actuator_device``. That callback is an evaluation: it may run several
+  times per physical timestep (RK4 stages included) and must not advance
+  persistent plugin state. Stateful plugins update only in
+  ``advance_actuator_device`` with the accepted-world mask. The simulation
+  snapshots plugin-owned tensors around a step, restores failed worlds, and
+  includes explicit snapshot/reset/restore state in its ordinary lifecycle.
+
+  This typed protocol is separate from legacy ``PluginType.ACTUATOR``
+  callbacks, whose ``run_device`` result is a generalized-force tensor. That
+  older protocol remains supported for source compatibility.
+  """
+
+  def __init__(self, name: str):
+    super().__init__(name, PluginType.ACTUATOR)
+
+  def run_actuator_device(self, state, *, control, kinematics, dynamics,
+                          act=None, act_dot=None, compute_mask=None):
+    """Return actuator-space force and optional activation derivative."""
+    raise NotImplementedError(
+        "NativeActuatorPlugin subclasses must implement run_actuator_device")
+
+  def advance_actuator_device(self, state, *, accepted_mask, timestep,
+                              output):
+    """Advance plugin state once after accepted simulation worlds integrate."""
+    del state, accepted_mask, timestep, output
+
+
+class NativeActuatorUserPlugin(NativePlugin):
+  """Device-native implementation of MuJoCo's USER actuator callbacks.
+
+  Bind explicit actuator IDs using ``dynamics``, ``gain`` and ``bias``.
+  Subclasses implement :meth:`run_user_actuator_device` and write device
+  output planes; arbitrary Python numerical callbacks are never run by the native
+  simulation. Evaluation may occur at multiple RK substages and must be pure
+  with respect to persistent plugin state. Advance state once in
+  :meth:`advance_user_actuator_device` after accepted integration.
+
+  An unbound USER model actuator retains MuJoCo's pinned no-callback defaults:
+  zero activation derivative, unit gain and zero bias.
+
+  The pinned implicit actuator Jacobian treats USER gain/bias velocity
+  derivatives as zero. A callback may still read velocity when evaluating
+  force, but this interface does not declare an implicit derivative for that
+  custom force law.
+
+  ``device_workspace_bytes`` must include every persistent plugin-owned device
+  allocation and rollback/checkpoint copy. The output planes themselves are
+  owned and accounted by ``MetalActuators``.
+  """
+
+  def __init__(self, name: str, *, dynamics=(), gain=(), bias=(),
+               device_workspace_bytes=0):
+    super().__init__(name, PluginType.ACTUATOR)
+    if (isinstance(device_workspace_bytes, bool)
+        or not isinstance(device_workspace_bytes, numbers.Integral)
+        or device_workspace_bytes < 0):
+      raise ValueError("device_workspace_bytes must be a nonnegative integer")
+    self.device_workspace_bytes = int(device_workspace_bytes)
+    self.actuator_user_bindings = _normalize_actuator_user_bindings(
+        {"dynamics": dynamics, "gain": gain, "bias": bias})
+    if not any(ids for _, ids in self.actuator_user_bindings):
+      raise ValueError("NativeActuatorUserPlugin must bind at least one USER callback")
+
+  def run_device(self, state, **kwargs):
+    del state, kwargs
+    raise NotImplementedError(
+        "NativeActuatorUserPlugin is invoked by the actuator USER stage")
+
+  def run_user_actuator_device(self, state, *, control, activation,
+                               activation_derivative, kinematics, time,
+                               compute_mask, out_activation_derivative,
+                               out_gain, out_bias, dynamics_ids, gain_ids,
+                               bias_ids):
+    """Write registered USER callback values into borrowed device planes.
+
+    Shapes are ``out_activation_derivative[B, max(na, 1)]`` and
+    ``out_gain/out_bias[B, max(nu, 1)]``. Write only the activation slots and
+    actuator IDs in ``dynamics_ids``, ``gain_ids`` and ``bias_ids``. Every
+    declared value must be
+    overwritten for each selected world on each evaluation; unregistered rows
+    retain the pinned no-callback defaults.
+    """
+    raise NotImplementedError(
+        "NativeActuatorUserPlugin subclasses must implement "
+        "run_user_actuator_device")
+
+  def advance_user_actuator_device(self, state, *, accepted_mask, timestep,
+                                   output):
+    """Advance plugin state once for accepted worlds.
+
+    ``output`` is a step-local mapping of borrowed activation-derivative,
+    gain and bias tensors plus the bound actuator IDs. It is valid only during
+    this call; copy values into plugin-owned state before returning if needed.
+    """
+    del state, accepted_mask, timestep, output
+
+
+def _normalize_actuator_user_bindings(bindings):
+  if not isinstance(bindings, dict):
+    raise TypeError("actuator USER bindings must be a role-to-ID mapping")
+  roles = ("dynamics", "gain", "bias")
+  if set(bindings) - set(roles):
+    raise ValueError("actuator USER bindings contain an unknown role")
+  normalized = []
+  for role in roles:
+    values = bindings.get(role, ())
+    ids = []
+    seen = set()
+    for value in values:
+      if (isinstance(value, bool) or not isinstance(value, numbers.Integral)
+          or value < 0 or value in seen):
+        raise ValueError(
+            f"actuator USER {role} IDs must be unique nonnegative integers")
+      seen.add(value)
+      ids.append(int(value))
+    normalized.append((role, tuple(ids)))
+  return tuple(normalized)
+
+
+def validate_actuator_user_bindings(model, registrations):
+  """CPU-only binding/type guard run before Simulation initializes MPS."""
+  if not isinstance(model, mujoco.MjModel):
+    raise TypeError("model must be a compiled mujoco.MjModel")
+  import numpy as _np
+  roles = {
+      "dynamics": int(mujoco.mjtDyn.mjDYN_USER),
+      "gain": int(mujoco.mjtGain.mjGAIN_USER),
+      "bias": int(mujoco.mjtBias.mjBIAS_USER),
+  }
+  tags = {
+      "dynamics": _np.asarray(model.actuator_dyntype),
+      "gain": _np.asarray(model.actuator_gaintype),
+      "bias": _np.asarray(model.actuator_biastype),
+  }
+  used = {role: set() for role in roles}
+  for descriptor in registrations:
+    bindings = tuple(descriptor.actuator_user_bindings)
+    if not bindings:
+      continue
+    if descriptor.plugin_type != PluginType.ACTUATOR:
+      raise ValueError("actuator USER bindings require an ACTUATOR plugin")
+    # Validate factories before Simulation initializes MPS. Factories are
+    # cheap, side-effect-free constructors; runtime buffers belong in init().
+    probe = descriptor.factory()
+    if (not isinstance(probe, NativeActuatorUserPlugin)
+        or probe.name != descriptor.name
+        or probe.plugin_type != descriptor.plugin_type
+        or tuple(probe.actuator_user_bindings) != bindings
+        or int(probe.device_workspace_bytes)
+            != int(descriptor.device_workspace_bytes)
+        or probe.model is not None or probe.device is not None):
+      raise ValueError(
+          f"actuator USER factory {descriptor.name!r} must create a matching "
+          "fresh NativeActuatorUserPlugin")
+    for role, ids in bindings:
+      if role not in roles:
+        raise ValueError("actuator USER binding has unknown role")
+      for actuator_id in ids:
+        if actuator_id >= int(model.nu):
+          raise ValueError(
+              f"actuator USER plugin {descriptor.name!r} binds out-of-range ID")
+        if actuator_id in used[role]:
+          raise ValueError(
+              f"actuator {actuator_id} has multiple registered {role} callbacks")
+        if int(tags[role][actuator_id]) != roles[role]:
+          raise ValueError(
+              f"actuator {actuator_id} callback binding requires {role} USER type")
+        if role == "dynamics" and int(model.actuator_actnum[actuator_id]) == 0:
+          raise ValueError(
+              f"actuator {actuator_id} has no activation slots for dynamics callback")
+        used[role].add(actuator_id)
 
 
 @dataclass(frozen=True)
@@ -142,6 +395,9 @@ class PluginRegistration:
   name: str
   plugin_type: PluginType
   factory: object
+  spatial_force_kind: str | None = None
+  actuator_user_bindings: tuple = ()
+  device_workspace_bytes: int = 0
 
 
 class ExtensionRegistry:
@@ -165,40 +421,100 @@ class ExtensionRegistry:
     blueprint = plugin.create_instance()
     if blueprint is plugin or not isinstance(blueprint, NativePlugin):
       raise ValueError("create_instance must return a distinct NativePlugin")
+    if (getattr(blueprint, "actuator_user_bindings", ())
+        and not isinstance(blueprint, NativeActuatorUserPlugin)):
+      raise TypeError(
+          "actuator USER bindings require NativeActuatorUserPlugin")
     with self._lock:
-      self._add_registration(plugin.name, plugin.plugin_type, blueprint.create_instance)
+      spatial_kind = getattr(blueprint, "spatial_force_workspace_kind", None)
+      user_bindings = getattr(blueprint, "actuator_user_bindings", ())
+      workspace_bytes = getattr(blueprint, "device_workspace_bytes", 0)
+      self._add_registration(
+          plugin.name, plugin.plugin_type, blueprint.create_instance,
+          spatial_force_kind=spatial_kind,
+          actuator_user_bindings=user_bindings,
+          device_workspace_bytes=workspace_bytes)
       self._plugins[(plugin.name, plugin.plugin_type)] = plugin
 
-  def _add_registration(self, name, plugin_type, factory):
+  def _add_registration(self, name, plugin_type, factory, *,
+                        spatial_force_kind=None, actuator_user_bindings=(),
+                        device_workspace_bytes=0):
+    if spatial_force_kind not in (None, "magnetic", "site_feedback"):
+      raise ValueError("unknown spatial force workspace kind")
+    if isinstance(actuator_user_bindings, dict):
+      actuator_user_bindings = _normalize_actuator_user_bindings(
+          actuator_user_bindings)
+    else:
+      actuator_user_bindings = tuple(actuator_user_bindings)
+    if (isinstance(device_workspace_bytes, bool)
+        or not isinstance(device_workspace_bytes, numbers.Integral)
+        or device_workspace_bytes < 0):
+      raise ValueError("device_workspace_bytes must be a nonnegative integer")
     key = (name, plugin_type)
     if key in self._registrations:
       raise ValueError(f"Plugin {name!r} of type {plugin_type.value!r} already registered")
-    self._registrations[key] = PluginRegistration(name, plugin_type, factory)
+    self._registrations[key] = PluginRegistration(
+        name, plugin_type, factory, spatial_force_kind,
+        tuple(actuator_user_bindings), int(device_workspace_bytes))
 
-  def register_factory(self, name, plugin_type, factory):
+  def register_factory(self, name, plugin_type, factory, *,
+                       spatial_force_kind=None, actuator_user_bindings=(),
+                       device_workspace_bytes=0):
     """Register a zero-argument factory returning a fresh unbound plugin."""
     if not isinstance(name, str) or not name or not isinstance(plugin_type, PluginType):
       raise ValueError("registration requires a nonempty name and PluginType role")
     if not callable(factory):
       raise TypeError("plugin factory must be callable")
+    if spatial_force_kind not in (None, "magnetic", "site_feedback"):
+      raise ValueError("unknown spatial force workspace kind")
     with self._lock:
-      self._add_registration(name, plugin_type, factory)
+      self._add_registration(
+          name, plugin_type, factory, spatial_force_kind=spatial_force_kind,
+          actuator_user_bindings=actuator_user_bindings,
+          device_workspace_bytes=device_workspace_bytes)
 
-  def instantiate(self, model, batch_size=1, device=None):
+  def registration_snapshot(self):
+    """Return the immutable registrations a consumer can safely preflight."""
+    with self._lock:
+      return tuple(self._registrations.values())
+
+  def spatial_force_workspace_counts(self, registrations=None):
+    """Count per-instance built-in spatial FORCE workspaces.
+
+    Supplying a snapshot ties capacity admission to the same descriptors that
+    will later be instantiated, even if another thread edits the registry.
+    """
+    descriptors = (self.registration_snapshot() if registrations is None
+                   else tuple(registrations))
+    kinds = [entry.spatial_force_kind for entry in descriptors]
+    return {kind: kinds.count(kind) for kind in ("magnetic", "site_feedback")}
+
+  def instantiate(self, model, batch_size=1, device=None, *,
+                  registrations=None):
     """Bind fresh instances to one simulation without changing registrations.
 
     The descriptor list is captured atomically. Registration/unregistration after
     construction affects future simulations only. Failed construction never
     rebinds an existing simulation's instance.
     """
-    with self._lock:
-      descriptors = tuple(self._registrations.values())
+    descriptors = (self.registration_snapshot() if registrations is None
+                   else tuple(registrations))
+    if any(not isinstance(desc, PluginRegistration) for desc in descriptors):
+      raise TypeError("registrations must come from registration_snapshot()")
     instances = []
     for desc in descriptors:
       plugin = desc.factory()
       if (not isinstance(plugin, NativePlugin) or plugin.name != desc.name
-          or plugin.plugin_type != desc.plugin_type):
-        raise ValueError("plugin factory result must match its registered name and role")
+          or plugin.plugin_type != desc.plugin_type
+          or getattr(plugin, "spatial_force_workspace_kind", None)
+              != desc.spatial_force_kind
+          or tuple(getattr(plugin, "actuator_user_bindings", ()))
+              != tuple(desc.actuator_user_bindings)
+          or int(getattr(plugin, "device_workspace_bytes", 0))
+              != int(desc.device_workspace_bytes)):
+        raise ValueError(
+            "plugin factory result must match its registered name and role, "
+            "including its workspace kind")
       with self._lock:
         if plugin in self._instances or plugin.model is not None or plugin.device is not None:
           raise ValueError("plugin factory must return a fresh unbound instance")
@@ -247,53 +563,101 @@ default_registry = ExtensionRegistry()
 # -------------------------------------------------------------------------
 
 class CustomMagneticForcePlugin(NativePlugin):
-  """Native GPU plugin applying Lorentz force F = q (v x B) to bodies.
-  
-  Operates natively on device tensors without host roundtrips.
+  """Apply ``charge * (COM velocity × world magnetic field)`` to bodies.
+
+  Forces act at inertial centers of mass and are projected through each
+  body's translational Jacobian. ``body=None`` applies the configured charge
+  to every non-world body; an integer ID or name selects one body. Generalized
+  joint velocities are never interpreted as Cartesian velocity.
   """
 
-  def __init__(self, name: str = "magnetic_force", charge: float = 1.0, b_field=(0.0, 0.0, 1.0)):
+  spatial_force_workspace_kind = "magnetic"
+
+  def __init__(self, name: str = "magnetic_force", charge: float = 1.0,
+               b_field=(0.0, 0.0, 1.0), body=None):
     super().__init__(name, PluginType.FORCE)
     self.charge = float(charge)
-    self.b_field_init = np.asarray(b_field, dtype=np.float32)
+    self.b_field_init = np.asarray(b_field, dtype=np.float32).copy()
+    with np.errstate(over="ignore", invalid="ignore"):
+      charge32 = np.float32(self.charge)
+    if (not np.isfinite(self.charge) or not np.isfinite(charge32)
+        or self.b_field_init.shape != (3,)
+        or not np.all(np.isfinite(self.b_field_init))):
+      raise ValueError(
+          "charge and three-component magnetic field must be finite float32 values")
+    if body is not None and (isinstance(body, bool)
+        or not isinstance(body, (numbers.Integral, str))):
+      raise TypeError("body must be an integer ID, name, or None")
+    self.body = body
     self._b_field_dev = None
+    self._queries = None
+
+  def _bodies(self, model):
+    if self.body is None:
+      return tuple(range(1, int(model.nbody)))
+    body = (mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, self.body)
+            if isinstance(self.body, str) else int(self.body))
+    if not 0 <= body < int(model.nbody):
+      raise ValueError("selected magnetic body is outside the compiled model")
+    return (body,)
 
   def init(self, model: mujoco.MjModel, batch_size: int = 1, device=None):
-    super().init(model, batch_size, device)
-    if torch is not None:
-      self._b_field_dev = torch.as_tensor(self.b_field_init, dtype=torch.float32, device=self.device)
-
-  def run_device(self, state, poses=None, **kwargs):
-    """Compute Lorentz force natively on MPS.
-    
-    Returns qfrc tensor [batch, nv] to add to external forces.
-    """
     if torch is None:
-      return None
-    b = self.batch_size
-    nv = self.model.nv
-    qvel = state.qvel
-    # If free bodies or 3D joints exist, apply cross(qvel, B) * charge
-    # For demonstration, applies to first 3 linear DOFs
-    qfrc = torch.zeros((b, nv), dtype=torch.float32, device=self.device)
-    if nv >= 3:
-      v = qvel[:, :3]
-      # v x B
-      bx, by, bz = self._b_field_dev[0], self._b_field_dev[1], self._b_field_dev[2]
-      fx = v[:, 1] * bz - v[:, 2] * by
-      fy = v[:, 2] * bx - v[:, 0] * bz
-      fz = v[:, 0] * by - v[:, 1] * bx
-      qfrc[:, :3] = self.charge * torch.stack([fx, fy, fz], dim=1)
+      raise RuntimeError("native magnetic force requires the Torch runtime")
+    bodies = self._bodies(model)
+    super().init(model, batch_size, device)
+    self.device = torch.device(self.device)
+    from mujoco_metal.spatial_queries import DeviceSpatialQueries
+    self._body_ids = bodies
+    self._queries = DeviceSpatialQueries(model, self.batch_size, self.device)
+    # Keep static body maps on the same device as stage inputs. Pad an empty
+    # map with a sentinel because Metal requires a concrete buffer binding.
+    body_map = np.asarray(bodies if bodies else (-1,), dtype=np.int32)
+    self._body_ids_device = torch.tensor(
+        body_map.copy(), dtype=torch.int32, device=self.device)
+    self._b_field_dev = torch.tensor(
+        self.b_field_init, dtype=torch.float32, device=self.device)
+
+  def run_device(self, state, *, dynamics=None, compute_mask=None, **kwargs):
+    """Return generalized force from the supplied native VEL-stage record.
+
+    Initialization may prepare topology on the host; this method performs
+    only device operations. A complete smooth stage is required, including
+    at RK4 sub-stages and after a sleeping world's velocity is refreshed.
+    """
+    if self._queries is None:
+      raise RuntimeError("magnetic plugin must be initialized before execution")
+    if not isinstance(dynamics, dict):
+      raise ValueError("magnetic force requires a smooth dynamics stage")
+    if compute_mask is not None and self.device.type == "mps":
+      return self._queries.masked_magnetic_force(
+          dynamics, body_ids=self._body_ids_device, field=self._b_field_dev,
+          charge=self.charge, compute_mask=compute_mask)
+    qfrc = torch.zeros((self.batch_size, int(self.model.nv)),
+                       dtype=torch.float32, device=self.device)
+    field = self._b_field_dev.expand(self.batch_size, -1)
+    for body in self._body_ids:
+      point = dynamics["poses"]["inertial_pos"][:, body]
+      velocity = self._queries.object_velocity(
+          dynamics, mujoco.mjtObj.mjOBJ_BODY, body)[:, 3:]
+      force = self.charge * torch.cross(velocity, field, dim=-1)
+      jp, _ = self._queries.jac(dynamics, point, body)
+      qfrc.add_(torch.bmm(jp.transpose(-1, -2), force[..., None]).squeeze(-1))
+    if compute_mask is not None:
+      qfrc = torch.where(compute_mask[:, None], qfrc, 0.0)
     return qfrc
 
   def run_host(self, data, **kwargs):
     if not default_registry.allow_host_callbacks:
       raise RuntimeError("Host callback execution requested but allow_host_callbacks is False")
-    qv = np.asarray(data.qvel).reshape(-1)
-    v = np.zeros(3, dtype=np.float64)
-    v[:min(len(qv), 3)] = qv[:min(len(qv), 3)]
-    f = self.charge * np.cross(v, self.b_field_init)
-    data.qfrc_applied[:min(len(qv), 3)] += f[:min(len(qv), 3)]
+    model = data.model
+    for body in self._bodies(model):
+      velocity = np.empty(6, dtype=np.float64)
+      mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY,
+                              body, velocity, 0)
+      force = self.charge * np.cross(velocity[3:], self.b_field_init)
+      mujoco.mj_applyFT(model, data, force, np.zeros(3), data.xipos[body],
+                        body, data.qfrc_applied)
 
 
 class CustomUserSensorPlugin(NativePlugin):

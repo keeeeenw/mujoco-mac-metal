@@ -10,14 +10,42 @@ separate qualification gates. Edge equalities, contact assembly and lifecycle
 are integrated by the owning simulation stages.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 import math
 from pathlib import Path
+from types import MappingProxyType
 from typing import Dict, Optional, Tuple
 
 import mujoco
+
+
+class _FlexPositionContext:
+  """Owner- and generation-checked borrowed frozen flex kinematics."""
+
+  __slots__ = ("owner", "generation", "buffers")
+
+  def __init__(self, owner, generation, buffers):
+    self.owner = owner
+    self.generation = generation
+    self.buffers = buffers
+
+
+class _FlexMaterialOperatorContext:
+  """Frozen flex K/Kd geometry for matrix-free implicit correction."""
+
+  __slots__ = ("owner", "generation", "rotations")
+
+  def __init__(self, owner, generation, rotations):
+    self.owner = owner
+    self.generation = generation
+    self.rotations = rotations
 import numpy as np
-import torch
+try:
+  import torch
+except ImportError:  # Host-only model lowering/preflight does not need Torch.
+  torch = None
 
 _MATERIAL_SHADER = Path(__file__).parent / "shaders" / "flex_material.metal"
 
@@ -27,6 +55,150 @@ def _frozen(values, dtype):
   if array.dtype.kind == "f" and not np.all(np.isfinite(array)):
     raise ValueError("flex constants must be finite and float32-representable")
   return np.frombuffer(array.tobytes(), dtype=array.dtype).reshape(array.shape)
+
+
+def _same_torch_device(actual, expected):
+  """Compare devices while allowing an unspecified accelerator index."""
+  return (actual.type == expected.type
+          and (expected.index is None or actual.index == expected.index))
+
+
+def _lower_flexedge_jacobian_csr(model):
+  """Return the pinned compiled flex-edge Jacobian CSR, with validation.
+
+  The runtime edge geometry can be evaluated for every generalized DOF, but
+  MuJoCo only projects forces through columns present in this compiled CSR.
+  Keeping the support in CSR form avoids an additional ``nflexedge * nv``
+  support matrix on large models.
+  """
+  nedge, nv = int(model.nflexedge), int(model.nv)
+  try:
+    rowadr = np.asarray(model.flexedge_J_rowadr, dtype=np.int64)
+    rownnz = np.asarray(model.flexedge_J_rownnz, dtype=np.int64)
+    colind = np.asarray(model.flexedge_J_colind, dtype=np.int64)
+  except AttributeError as exc:
+    raise ValueError("compiled flex edge Jacobian CSR is required") from exc
+  if rowadr.shape != (nedge,) or rownnz.shape != (nedge,) or colind.ndim != 1:
+    raise ValueError("compiled flex edge Jacobian CSR has invalid shapes")
+  if np.any(rowadr < 0) or np.any(rownnz < 0) or np.any(rowadr + rownnz > len(colind)):
+    raise ValueError("compiled flex edge Jacobian CSR row exceeds colind")
+  for edge in range(nedge):
+    cols = colind[int(rowadr[edge]):int(rowadr[edge] + rownnz[edge])]
+    if np.any(cols < 0) or np.any(cols >= nv):
+      raise ValueError("compiled flex edge Jacobian column is outside nv")
+    if len(cols) > 1 and np.any(cols[1:] <= cols[:-1]):
+      raise ValueError("compiled flex edge Jacobian columns must be sorted unique")
+  return (_frozen(rowadr, np.int32), _frozen(rownnz, np.int32),
+          _frozen(colind, np.int32))
+
+
+def _interpolation_vertex_tables(descriptor):
+  """Lower pinned cellLookup/evalBasis maps from vertices to flex nodes."""
+  nvert = int(descriptor.nflexvert)
+  nnode = len(descriptor.nodebodyid)
+  indices = np.zeros((nvert, 27), dtype=np.int32)
+  weights = np.zeros((nvert, 27), dtype=np.float64)
+  enabled = np.zeros((nvert,), dtype=np.int32)
+  for flex in range(int(descriptor.nflex)):
+    interp = int(descriptor.interp[flex])
+    if interp == 0:
+      continue
+    order = abs(interp)
+    if order not in (1, 2):
+      raise NotImplementedError(
+          f"pinned flex interpolation order {order} is unsupported")
+    cells = np.asarray(descriptor.cellnum[flex], dtype=np.int64)
+    if np.any(cells <= 0):
+      raise ValueError("interpolated flex has an empty cell grid")
+    nxyz = cells * order + 1
+    nodeadr = int(descriptor.nodeadr[flex])
+    vertadr = int(descriptor.vertadr[flex])
+    for local_vertex in range(int(descriptor.vertnum[flex])):
+      vertex = vertadr + local_vertex
+      coord = np.asarray(descriptor.vert0[vertex], dtype=np.float64)
+      cell = np.floor(coord * cells).astype(np.int64)
+      cell = np.minimum(np.maximum(cell, 0), cells - 1)
+      local = np.clip(coord * cells - cell, 0.0, 1.0)
+      cursor = 0
+      for i in range(order + 1):
+        gi = int(cell[0] * order + i)
+        for j in range(order + 1):
+          gj = int(cell[1] * order + j)
+          for k in range(order + 1):
+            gk = int(cell[2] * order + k)
+            if order == 1:
+              basis = ((1.0-local[0]) if i == 0 else local[0])
+              basis *= ((1.0-local[1]) if j == 0 else local[1])
+              basis *= ((1.0-local[2]) if k == 0 else local[2])
+            else:
+              def phi(x, index):
+                return ((2*x*x - 3*x + 1) if index == 0 else
+                        (4*(x-x*x) if index == 1 else 2*x*x-x))
+              basis = phi(local[0], i) * phi(local[1], j) * phi(local[2], k)
+            node = nodeadr + gi * int(nxyz[1]*nxyz[2]) + gj * int(nxyz[2]) + gk
+            if (node < nodeadr
+                or node >= nodeadr + int(descriptor.nodenum[flex])
+                or node >= nnode):
+              raise ValueError("compiled interpolation node is outside its flex")
+            indices[vertex, cursor] = node
+            weights[vertex, cursor] = basis
+            cursor += 1
+      enabled[vertex] = 1
+  return indices, weights, enabled
+
+
+def _shell_node_tfi_tables(descriptor):
+  """Lower pinned mju_shellTrackInterior boundary weights per shell node."""
+  nnode = len(descriptor.nodebodyid)
+  indices = np.zeros((nnode, 26), dtype=np.int32)
+  weights = np.zeros((nnode, 26), dtype=np.float64)
+  enabled = np.zeros((nnode,), dtype=np.int32)
+  for flex in range(int(descriptor.nflex)):
+    if int(descriptor.interp[flex]) >= 0:
+      continue
+    order = -int(descriptor.interp[flex])
+    cells = np.asarray(descriptor.cellnum[flex], dtype=np.int64)
+    nx, ny, nz = (cells * order + 1).tolist()
+    if min(nx, ny, nz) < 3:
+      continue
+    nodeadr = int(descriptor.nodeadr[flex])
+    for i in range(1, nx-1):
+      s = i / (nx - 1)
+      for j in range(1, ny-1):
+        t = j / (ny - 1)
+        for k in range(1, nz-1):
+          u = k / (nz - 1)
+          target = nodeadr + i*ny*nz + j*nz + k
+          terms = (
+              ((0,j,k), 1-s), ((nx-1,j,k), s),
+              ((i,0,k), 1-t), ((i,ny-1,k), t),
+              ((i,j,0), 1-u), ((i,j,nz-1), u),
+              ((i,0,0), -(1-t)*(1-u)),
+              ((i,0,nz-1), -(1-t)*u),
+              ((i,ny-1,0), -t*(1-u)),
+              ((i,ny-1,nz-1), -t*u),
+              ((0,j,0), -(1-s)*(1-u)),
+              ((0,j,nz-1), -(1-s)*u),
+              ((nx-1,j,0), -s*(1-u)),
+              ((nx-1,j,nz-1), -s*u),
+              ((0,0,k), -(1-s)*(1-t)),
+              ((0,ny-1,k), -(1-s)*t),
+              ((nx-1,0,k), -s*(1-t)),
+              ((nx-1,ny-1,k), -s*t),
+              ((0,0,0), (1-s)*(1-t)*(1-u)),
+              ((0,0,nz-1), (1-s)*(1-t)*u),
+              ((0,ny-1,0), (1-s)*t*(1-u)),
+              ((0,ny-1,nz-1), (1-s)*t*u),
+              ((nx-1,0,0), s*(1-t)*(1-u)),
+              ((nx-1,0,nz-1), s*(1-t)*u),
+              ((nx-1,ny-1,0), s*t*(1-u)),
+              ((nx-1,ny-1,nz-1), s*t*u),
+          )
+          for index, ((ii, jj, kk), weight) in enumerate(terms):
+            indices[target, index] = nodeadr + ii*ny*nz + jj*nz + kk
+            weights[target, index] = weight
+          enabled[target] = 1
+  return indices, weights, enabled
 
 
 @dataclass(frozen=True)
@@ -42,14 +214,24 @@ class FlexDescriptor:
   njnt: int
   timestep: float
   dim: np.ndarray             # (nflex,) int32
+  vertadr: np.ndarray         # (nflex,) int32 vertex starts
+  vertnum: np.ndarray         # (nflex,) int32 vertex counts
   vert: np.ndarray            # (nflexvert, 3) float32
   vert0: np.ndarray           # (nflexvert, 3) float32
   vertbodyid: np.ndarray      # (nflexvert,) int32
+  vertmetric: np.ndarray      # (nflexvert, 4) float32 reference inverse metrics
+  vertedgeadr: np.ndarray     # (nflexvert,) int32 adjacency start
+  vertedgenum: np.ndarray     # (nflexvert,) int32 adjacency count
+  vertedge: np.ndarray        # (2*nflexedge,) int32 local edge IDs
+  size: np.ndarray            # (nflex, 3) float32 half extents
+  body_mass: np.ndarray       # (nbody,) float32 mass weights
+  body_invweight0: np.ndarray # (2*nbody,) float32 compiled equality weights
   edge: np.ndarray            # (nflexedge, 2) int32
   edgeflap: np.ndarray        # (nflexedge, 2) int32, local flap vertices
   edgeadr: np.ndarray         # (nflex,) int32
   edgenum: np.ndarray         # (nflex,) int32
   edgeequality: np.ndarray    # (nflex,) int32
+  edge_rigid: np.ndarray      # (nflexedge,) bool, omitted from mjEQ_FLEX rows
   edgestiffness: np.ndarray   # (nflex,) float32
   edgedamping: np.ndarray     # (nflex,) float32
   edge_length0: np.ndarray    # (nflexedge,) float32
@@ -87,6 +269,98 @@ class FlexDescriptor:
   poisson: np.ndarray         # (nflex,) float32; raw compiled metric is authoritative
   lame_lambda: np.ndarray     # (nflex,) float32; raw compiled metric is authoritative
   lame_mu: np.ndarray         # (nflex,) float32; raw compiled metric is authoritative
+  equality_row_ids_by_eqid: MappingProxyType
+  equality_row_counts: MappingProxyType
+
+
+def _lower_equality_row_inventory(model, descriptor):
+  """Return canonical flex-equality row identities without a device runtime.
+
+  CC construction happens before a ``MetalFlex`` exists, so these counts and
+  identities are derived solely from the compiled model.  Equality IDs are
+  visited in source order and remain separate even when they target one flex.
+  """
+  row_ids = {}
+  shell_offsets = {}
+  shell_face_count = 0
+  for f in range(descriptor.nflex):
+    signed_order = int(descriptor.interp[f])
+    kadr = int(descriptor.stiffnessadr[f])
+    if (signed_order < 0 and kadr >= 0 and not bool(model.flex_rigid[f])
+        and int(descriptor.dim[f]) != 1):
+      cx, cy, cz = map(int, descriptor.cellnum[f])
+      shell_offsets[f] = shell_face_count
+      shell_face_count += 2 * (cy * cz + cx * cz + cx * cy)
+
+  flex_type = int(mujoco.mjtEq.mjEQ_FLEX)
+  flexvert_type = int(mujoco.mjtEq.mjEQ_FLEXVERT)
+  flexstrain_type = int(mujoco.mjtEq.mjEQ_FLEXSTRAIN)
+  for eqid in range(int(model.neq)):
+    eq_type = int(model.eq_type[eqid])
+    if eq_type not in (flex_type, flexvert_type, flexstrain_type):
+      continue
+    f = int(model.eq_obj1id[eqid])
+    if f < 0 or f >= descriptor.nflex:
+      raise ValueError(f"compiled flex equality {eqid} has invalid flex ID")
+    if eq_type == flex_type:
+      start, count = int(descriptor.edgeadr[f]), int(descriptor.edgenum[f])
+      ids = [edge_id for edge_id in range(start, start + count)
+             if not bool(descriptor.edge_rigid[edge_id])]
+      row_ids[eqid] = _frozen(ids, np.int32)
+    elif eq_type == flexvert_type:
+      start = int(model.flex_vertadr[f])
+      count = int(model.flex_vertnum[f])
+      row_ids[eqid] = _frozen(np.arange(2 * start, 2 * (start + count)),
+                              np.int32)
+    else:
+      signed_order = int(descriptor.interp[f])
+      order = abs(signed_order)
+      kadr = int(descriptor.stiffnessadr[f])
+      nodenum = int(descriptor.nodenum[f])
+      # MuJoCo can retain an auto-generated flexstrain equality on a flex
+      # whose interpolation/material block was compiled away.  Such an
+      # equality has no solver rows; it is different from malformed active
+      # compiled data, which remains a fail-closed error.
+      if order == 0 or nodenum == 0 or kadr < 0:
+        row_ids[eqid] = _frozen([], np.int32)
+        continue
+      if order not in (1, 2):
+        raise NotImplementedError(
+            f"compiled flexstrain equality {eqid} has unsupported order {signed_order}")
+      shell = signed_order < 0
+      npe = (order + 1) ** (2 if shell else 3)
+      data = np.asarray(model.eq_data[eqid], dtype=np.float64)
+      if shell:
+        elem = int(data[0])
+        if f not in shell_offsets:
+          raise ValueError(
+              f"compiled flexstrain equality {eqid} has no shell element map")
+        elem += shell_offsets[f]
+      else:
+        ci, cj, ck = map(int, data[:3])
+        cx, cy, cz = map(int, descriptor.cellnum[f])
+        if not (0 <= ci < cx and 0 <= cj < cy and 0 <= ck < cz):
+          raise ValueError(
+              f"compiled flexstrain equality {eqid} has an invalid cell")
+        elem = ci * cy * cz + cj * cz + ck
+      ndof = 3 * npe
+      address = kadr + elem * ndof * ndof
+      if address < 0 or address >= descriptor.stiffness.size:
+        raise ValueError(
+            f"compiled flexstrain equality {eqid} stiffness address is invalid")
+      mode_count = int(descriptor.stiffness[address])
+      if mode_count == 0:
+        row_ids[eqid] = _frozen([], np.int32)
+        continue
+      if mode_count < 0 or mode_count > ndof:
+        raise ValueError(
+            f"compiled flexstrain equality {eqid} has invalid mode count")
+      if address + 1 + mode_count * ndof > descriptor.stiffness.size:
+        raise ValueError(
+            f"compiled flexstrain equality {eqid} eigenmode block is truncated")
+      row_ids[eqid] = _frozen(np.arange(mode_count), np.int32)
+  counts = {eqid: int(ids.size) for eqid, ids in row_ids.items()}
+  return MappingProxyType(row_ids), MappingProxyType(counts)
 
 
 def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
@@ -108,6 +382,15 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
   vert = _frozen(model.flex_vert, np.float32).reshape(nflexvert, 3)
   vert0 = _frozen(model.flex_vert0, np.float32).reshape(nflexvert, 3)
   vertbodyid = _frozen(model.flex_vertbodyid, np.int32)
+  vertmetric = _frozen(model.flex_vertmetric, np.float32).reshape(nflexvert, 4)
+  vertedgeadr = _frozen(model.flex_vertedgeadr, np.int32)
+  vertedgenum = _frozen(model.flex_vertedgenum, np.int32)
+  vertedge = _frozen(model.flex_vertedge, np.int32).reshape(-1)
+  vertadr = _frozen(model.flex_vertadr, np.int32)
+  vertnum = _frozen(model.flex_vertnum, np.int32)
+  size = _frozen(model.flex_size, np.float32).reshape(nflex, 3)
+  body_mass = _frozen(model.body_mass, np.float32)
+  body_invweight0 = _frozen(model.body_invweight0, np.float32).reshape(-1)
   edge = np.array(model.flex_edge, dtype=np.int32, order="C", copy=True).reshape(nflexedge, 2)
   edgeadr = _frozen(model.flex_edgeadr, np.int32)
   edgenum = _frozen(model.flex_edgenum, np.int32)
@@ -117,6 +400,7 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
     edge[start:start + count] += int(vertadr[f])
   edge = _frozen(edge, np.int32)
   edgeequality = _frozen(model.flex_edgeequality, np.int32)
+  edge_rigid = _frozen(model.flexedge_rigid, np.bool_)
   edgeflap = np.array(model.flex_edgeflap, dtype=np.int32, order="C", copy=True).reshape(nflexedge, 2)
   for f in range(nflex):
     start, count = int(edgeadr[f]), int(edgenum[f])
@@ -157,7 +441,7 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
   solref = _frozen(model.flex_solref, np.float32).reshape(nflex, 2)
   solimp = _frozen(model.flex_solimp, np.float32).reshape(nflex, 5)
 
-  return FlexDescriptor(
+  descriptor = FlexDescriptor(
       nflex=nflex,
       nflexvert=nflexvert,
       nflexedge=nflexedge,
@@ -168,14 +452,24 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
       njnt=njnt,
       timestep=timestep,
       dim=dim,
+      vertadr=vertadr,
+      vertnum=vertnum,
       vert=vert,
       vert0=vert0,
       vertbodyid=vertbodyid,
+      vertmetric=vertmetric,
+      vertedgeadr=vertedgeadr,
+      vertedgenum=vertedgenum,
+      vertedge=vertedge,
+      size=size,
+      body_mass=body_mass,
+      body_invweight0=body_invweight0,
       edge=edge,
       edgeflap=edgeflap,
       edgeadr=edgeadr,
       edgenum=edgenum,
       edgeequality=edgeequality,
+      edge_rigid=edge_rigid,
       edgestiffness=edgestiffness,
       edgedamping=edgedamping,
       edge_length0=edge_length0,
@@ -213,7 +507,14 @@ def lower_flex_descriptor(model: mujoco.MjModel) -> Optional[FlexDescriptor]:
       poisson=_frozen(np.zeros(nflex, dtype=np.float32), np.float32),
       lame_lambda=_frozen(np.zeros(nflex, dtype=np.float32), np.float32),
       lame_mu=_frozen(np.zeros(nflex, dtype=np.float32), np.float32),
+      equality_row_ids_by_eqid=MappingProxyType({}),
+      equality_row_counts=MappingProxyType({}),
   )
+  ids, counts = _lower_equality_row_inventory(model, descriptor)
+  # Frozen dataclass: construct the final immutable value with the inventory.
+  from dataclasses import replace
+  return replace(descriptor, equality_row_ids_by_eqid=ids,
+                 equality_row_counts=counts)
 
 
 class MetalFlex:
@@ -222,6 +523,8 @@ class MetalFlex:
   def __init__(self, model: mujoco.MjModel, batch_size: int = 1, device: str = "mps"):
     if not isinstance(model, mujoco.MjModel):
       raise TypeError("model must be a compiled mujoco.MjModel")
+    if torch is None:
+      raise RuntimeError("MetalFlex runtime requires PyTorch; model lowering is Torch-free")
     desc = lower_flex_descriptor(model)
     if desc is None:
       raise ValueError("model does not contain flex elements")
@@ -298,7 +601,9 @@ class MetalFlex:
     self._material_shader = (
         torch.mps.compile_shader(_MATERIAL_SHADER.read_text())
         if self._device.type == "mps" and (self._stretch_count or
-                                           np.any(d.interp != 0)) else None)
+                                           np.any(d.interp != 0) or
+                                           d.nflexedge or d.nflexvert or
+                                           len(d.nodebodyid)) else None)
 
     bend_vertex, bend_data, bend_damping = [], [], []
     bend_dofadr, bend_dofnum = [], []
@@ -337,6 +642,13 @@ class MetalFlex:
     self._bend_shader = (
         torch.mps.compile_shader(_MATERIAL_SHADER.read_text())
         if self._device.type == "mps" and self._bend_count else None)
+    self._edge_operator_shader = self._material_shader
+    if self._edge_operator_shader is None:
+      self._edge_operator_shader = self._bend_shader
+    if (self._edge_operator_shader is None and self._device.type == "mps"
+        and d.nflexedge):
+      self._edge_operator_shader = torch.mps.compile_shader(
+          _MATERIAL_SHADER.read_text())
 
     # Lower the full compiled interpolation element matrices and structured
     # node gather maps. These records are shared by order-1/order-2 volume
@@ -345,6 +657,7 @@ class MetalFlex:
     interp_nodes, interp_matrix, interp_grad, interp_npe, interp_axes = [], [], [], [], []
     interp_damping, interp_owner = [], []
     shell_face_nodes, shell_face_axes, shell_face_order = [], [], []
+    shell_face_offset_by_flex = {}
     shell_bend_records = []
     for f in range(d.nflex):
       signed_order = int(d.interp[f])
@@ -383,6 +696,7 @@ class MetalFlex:
           local_maps.append(ids)
           axes_maps.append((na0, na1, normal))
         face_offset = len(shell_face_nodes)
+        shell_face_offset_by_flex[f] = face_offset
         shell_face_nodes.extend(local_maps)
         shell_face_axes.extend(axes_maps)
         shell_face_order.extend([order] * nfe)
@@ -442,6 +756,12 @@ class MetalFlex:
     self._interp_nodes = static_tensor(
         [np.pad(row, (0, 27 - len(row)), constant_values=-1) for row in interp_nodes],
         (self._interp_count, 27), torch.int32)
+    # Static int64 gather indices avoid repeating a host-to-device metadata
+    # conversion inside each matrix-free CG matvec.
+    self._interp_nodes_long = tuple(
+        torch.as_tensor(np.array(row, dtype=np.int64, copy=True),
+                        dtype=torch.long, device=self._device)
+        for row in interp_nodes)
     self._interp_matrix = static_tensor(
         [np.pad(row, ((0, 81 - row.shape[0]), (0, 81 - row.shape[1])))
          for row in interp_matrix], (self._interp_count, 81, 81), torch.float32)
@@ -473,8 +793,22 @@ class MetalFlex:
 
     # Upload static descriptors to device MPS tensors
     self._vert_local = torch.tensor(d.vert, dtype=torch.float32, device=self._device)
+    vert_low = (np.asarray(model.flex_vert, dtype=np.float64).reshape(-1, 3)
+                - np.asarray(d.vert, dtype=np.float32).astype(np.float64))
+    vert_tail = (np.asarray(model.flex_vert, dtype=np.float64).reshape(-1, 3)
+                 - np.asarray(d.vert, dtype=np.float32).astype(np.float64)
+                 - np.asarray(vert_low, dtype=np.float32).astype(np.float64))
+    self._vert_local_low = torch.as_tensor(
+        np.array(vert_low, dtype=np.float32, copy=True), dtype=torch.float32,
+        device=self._device)
+    self._vert_local_tail = torch.as_tensor(
+        np.array(vert_tail, dtype=np.float32, copy=True), dtype=torch.float32,
+        device=self._device)
     self._vert0 = torch.tensor(d.vert0, dtype=torch.float32, device=self._device)
     self._vertbodyid = torch.tensor(d.vertbodyid, dtype=torch.int64, device=self._device)
+    self._vertbodyid32 = torch.as_tensor(
+        np.array(d.vertbodyid, dtype=np.int32, copy=True), dtype=torch.int32,
+        device=self._device)
     vert_centered = np.zeros(d.nflexvert, dtype=np.bool_)
     node_centered = np.zeros(len(d.nodebodyid), dtype=np.bool_)
     for f in range(d.nflex):
@@ -483,12 +817,19 @@ class MetalFlex:
       vert_centered[va:va + vn] = bool(d.centered[f])
       node_centered[na:na + nn] = bool(d.centered[f])
     self._vert_centered = torch.tensor(vert_centered, dtype=torch.bool, device=self._device)
+    self._vert_centered32 = torch.as_tensor(
+        np.array(vert_centered, dtype=np.int32, copy=True), dtype=torch.int32,
+        device=self._device)
     self._edge = torch.tensor(d.edge, dtype=torch.int64, device=self._device)
+    self._recovery_edge = torch.as_tensor(
+        np.asarray(d.edge, dtype=np.int32).copy(), dtype=torch.int32,
+        device=self._device)
     self._edge_length0 = torch.tensor(d.edge_length0, dtype=torch.float32, device=self._device)
     self._edge_invweight0 = torch.tensor(d.edge_invweight0, dtype=torch.float32, device=self._device)
     self._edgestiffness = torch.tensor(d.edgestiffness, dtype=torch.float32, device=self._device)
     self._edgedamping = torch.tensor(d.edgedamping, dtype=torch.float32, device=self._device)
     self._edgeequality = torch.tensor(d.edgeequality, dtype=torch.int32, device=self._device)
+    self._edge_rigid = torch.tensor(d.edge_rigid, dtype=torch.bool, device=self._device)
     self._radius = torch.tensor(d.radius, dtype=torch.float32, device=self._device)
 
     # Topology per-edge flex index
@@ -498,12 +839,63 @@ class MetalFlex:
       num = d.edgenum[f]
       edge_flexid[adr:adr + num] = f
     self._edge_flexid = torch.tensor(edge_flexid, dtype=torch.int64, device=self._device)
-    edge_operator_coeff = np.asarray(d.edgedamping, dtype=np.float32)[edge_flexid].copy()
+    (edge_j_rowadr, edge_j_rownnz,
+     edge_j_colind) = _lower_flexedge_jacobian_csr(model)
+    self._edge_j_rowadr_host = edge_j_rowadr
+    self._edge_j_rownnz_host = edge_j_rownnz
+    self._edge_j_colind_host = edge_j_colind
+    # These host-only index arrays feed Torch advanced indexing in the CPU
+    # fallback. Keep the independently allocated arrays writable so Torch
+    # does not wrap read-only NumPy storage at each kinematics update.
+    self._edge_j_unsupported_host = tuple(
+        np.setdiff1d(np.arange(d.nv, dtype=np.int32),
+                     edge_j_colind[int(edge_j_rowadr[e]):
+                                   int(edge_j_rowadr[e] + edge_j_rownnz[e])])
+        for e in range(d.nflexedge))
+    self._edge_j_rowadr = torch.tensor(
+        np.array(edge_j_rowadr, copy=True), dtype=torch.int32, device=self._device)
+    self._edge_j_rownnz = torch.tensor(
+        np.array(edge_j_rownnz, copy=True), dtype=torch.int32, device=self._device)
+    # Metal requires a physical binding even when the compiled matrix has no
+    # entries.  The logical count in dims[3] remains zero in that case.
+    edge_j_colind_binding = (np.array(edge_j_colind, copy=True)
+                             if len(edge_j_colind) else np.zeros(1, dtype=np.int32))
+    self._edge_j_colind = torch.tensor(
+        edge_j_colind_binding, dtype=torch.int32, device=self._device)
+    edge_has_jacobian = edge_j_rownnz > 0
+    edge_rigid = np.asarray(d.edge_rigid, dtype=np.bool_).copy()
     if hasattr(model, "flexedge_rigid"):
-      edge_operator_coeff[np.asarray(model.flexedge_rigid, dtype=bool)] = 0.0
-    edge_operator_coeff[np.asarray(model.flex_rigid, dtype=bool)[edge_flexid]] = 0.0
-    self._edge_operator_coeff = torch.as_tensor(
-        edge_operator_coeff, dtype=torch.float32, device=self._device)
+      edge_rigid |= np.asarray(model.flexedge_rigid, dtype=bool)
+    edge_rigid |= np.asarray(model.flex_rigid, dtype=bool)[edge_flexid]
+    edge_spring_coeff = np.asarray(d.edgestiffness, dtype=np.float32)[edge_flexid].copy()
+    edge_damping_coeff = np.asarray(d.edgedamping, dtype=np.float32)[edge_flexid].copy()
+    edge_spring_coeff[edge_rigid | ~edge_has_jacobian] = 0.0
+    edge_damping_coeff[edge_rigid | ~edge_has_jacobian] = 0.0
+    self._edge_spring_coeff_host = _frozen(edge_spring_coeff, np.float32)
+    self._edge_operator_coeff_host = _frozen(edge_damping_coeff, np.float32)
+    self._edge_spring_coeff = torch.tensor(
+        np.array(self._edge_spring_coeff_host, copy=True), dtype=torch.float32,
+        device=self._device)
+    self._edge_operator_coeff = torch.tensor(
+        np.array(self._edge_operator_coeff_host, copy=True), dtype=torch.float32,
+        device=self._device)
+    self._edge_j_mask_dims = torch.tensor(
+        [self.batch_size, d.nflexedge, d.nv, len(edge_j_colind)],
+        dtype=torch.int32, device=self._device)
+    self._edge_operator_coo_dims = torch.tensor(
+        [d.nv, d.nflexedge, 0, self.batch_size],
+        dtype=torch.int32, device=self._device)
+    self._edge_operator_coo_edge_count = None
+
+    # mjEQ_FLEX emits rows in edge order but omits rigid edges. Keep the
+    # compiled row-to-edge map immutable so replay and the coupled allocator
+    # never infer row identity from a per-step active count.
+    flex_rigid = np.asarray(model.flex_rigid, dtype=np.bool_)
+    edge_flexid_host = np.asarray(edge_flexid, dtype=np.int64)
+    self._equality_edge_ids = tuple(
+        _frozen(np.flatnonzero((edge_flexid_host == f) & ~d.edge_rigid
+                               & ~flex_rigid[edge_flexid_host]), np.int32)
+        for f in range(d.nflex))
 
     # Precomputed edge constraint parameters for run_equalities
     if d.nflexedge > 0:
@@ -513,16 +905,88 @@ class MetalFlex:
       self._edge_dampratio = torch.tensor(np.maximum(solref_edge[:, 1], 1e-4), dtype=torch.float32, device=self._device).unsqueeze(0)
       self._edge_dmin = torch.tensor(solimp_edge[:, 0], dtype=torch.float32, device=self._device).unsqueeze(0)
       self._edge_dmax = torch.tensor(solimp_edge[:, 1], dtype=torch.float32, device=self._device).unsqueeze(0)
-      self._edge_width = torch.tensor(np.maximum(solimp_edge[:, 2], 1e-6), dtype=torch.float32, device=self._device).unsqueeze(0)
+      self._edge_width = torch.tensor(np.maximum(solimp_edge[:, 2], 0.0), dtype=torch.float32, device=self._device).unsqueeze(0)
       self._edge_mid = torch.tensor(np.maximum(solimp_edge[:, 3], 1e-4), dtype=torch.float32, device=self._device).unsqueeze(0)
       self._edge_power = torch.tensor(solimp_edge[:, 4], dtype=torch.float32, device=self._device).unsqueeze(0)
-      self._edge_b0 = 2.0 / (self._edge_timeconst * self._edge_dampratio)
-      self._edge_k0 = 1.0 / (self._edge_timeconst * self._edge_timeconst * self._edge_dampratio * self._edge_dampratio)
+      ref0 = np.asarray(solref_edge[:, 0], dtype=np.float32).copy()
+      if not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)):
+        ref0 = np.where(ref0 > 0.0,
+                        np.maximum(ref0, 2.0 * float(model.opt.timestep)),
+                        ref0)
+      dwidth = np.maximum(np.asarray(solimp_edge[:, 1], dtype=np.float32), 0.0)
+      ref1 = np.asarray(solref_edge[:, 1], dtype=np.float32)
+      denom_b = np.maximum(dwidth * np.where(ref0 > 0.0, ref0, 1.0), 1e-15)
+      denom_k = np.maximum(dwidth * dwidth * np.where(ref0 > 0.0, ref0 * ref0, 1.0)
+                           * np.where(ref1 > 0.0, ref1 * ref1, 1.0), 1e-15)
+      b0 = np.where(ref1 > 0.0, 2.0 / denom_b,
+                    -ref1 / np.maximum(dwidth, 1e-15))
+      k0 = np.where(ref0 > 0.0, 1.0 / denom_k,
+                    -ref0 / np.maximum(dwidth * dwidth, 1e-15))
+      self._edge_b0 = torch.tensor(b0, dtype=torch.float32, device=self._device).unsqueeze(0)
+      self._edge_k0 = torch.tensor(k0, dtype=torch.float32, device=self._device).unsqueeze(0)
       self._edge_diag = torch.clamp(self._edge_invweight0.unsqueeze(0), min=1e-12)
     else:
       self._edge_b0 = torch.zeros((1, 0), dtype=torch.float32, device=self._device)
       self._edge_k0 = torch.zeros((1, 0), dtype=torch.float32, device=self._device)
       self._edge_diag = torch.zeros((1, 0), dtype=torch.float32, device=self._device)
+
+    # Explicit equality objects carry their own solref/solimp. Flexcomp's
+    # edge parameters are the defaults only; retaining eq-indexed compiled
+    # overrides is necessary when several mjEQ_FLEX rows target one flex.
+    self._equality_parameter_sets = {}
+    self._equality_flex_ids = {}
+    for eqid in range(int(model.neq)):
+      if int(model.eq_type[eqid]) != int(mujoco.mjtEq.mjEQ_FLEX):
+        continue
+      f = int(model.eq_obj1id[eqid])
+      if f < 0 or f >= d.nflex:
+        raise ValueError(f"compiled flex equality {eqid} has invalid flex ID")
+      dmin = np.zeros(d.nflexedge, dtype=np.float32)
+      dmax = np.zeros_like(dmin)
+      width = np.zeros_like(dmin)
+      mid = np.full_like(dmin, 0.5)
+      power = np.full_like(dmin, 2.0)
+      adr, count = int(d.edgeadr[f]), int(d.edgenum[f])
+      ref = np.asarray(model.eq_solref[eqid], dtype=np.float32)
+      imp = np.asarray(model.eq_solimp[eqid], dtype=np.float32)
+      if not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)):
+        ref = ref.copy()
+        if ref[0] > 0.0:
+          ref[0] = max(float(ref[0]), 2.0 * float(model.opt.timestep))
+      dmin[adr:adr + count] = imp[0]
+      dmax[adr:adr + count] = imp[1]
+      width[adr:adr + count] = max(float(imp[2]), 0.0)
+      mid[adr:adr + count] = max(float(imp[3]), 1e-4)
+      power[adr:adr + count] = imp[4]
+      diag = np.zeros(d.nflexedge, dtype=np.float32)
+      diag[adr:adr + count] = d.edge_invweight0[adr:adr + count]
+      as_tensor = lambda x: torch.as_tensor(
+          x[None], dtype=torch.float32, device=self._device)
+      dwidth = as_tensor(dmax)
+      ref0 = np.zeros_like(dmin)
+      ref1 = np.zeros_like(dmin)
+      ref0[adr:adr + count] = float(ref[0])
+      ref1[adr:adr + count] = float(ref[1])
+      r0, r1 = as_tensor(ref0), as_tensor(ref1)
+      denom_b = torch.clamp(dwidth * torch.where(r0 > 0.0, r0, 1.0), min=1e-15)
+      denom_k = torch.clamp(dwidth.square()
+          * torch.where(r0 > 0.0, r0.square(), 1.0)
+          * torch.where(r1 > 0.0, r1.square(), 1.0), min=1e-15)
+      self._equality_parameter_sets[eqid] = {
+          "dmin": as_tensor(dmin), "dmax": as_tensor(dmax),
+          "width": as_tensor(width), "mid": as_tensor(mid),
+          "power": as_tensor(power),
+          "solimp": torch.as_tensor(np.array(imp, copy=True),
+                                    dtype=torch.float32, device=self._device),
+          "solref": torch.as_tensor(np.array(ref, copy=True),
+                                    dtype=torch.float32, device=self._device),
+          "b0": torch.where(r1 > 0.0, 2.0 / denom_b,
+                            -r1 / torch.clamp(dwidth, min=1e-15)),
+          "k0": torch.where(r0 > 0.0, 1.0 / denom_k,
+                            -r0 / torch.clamp(dwidth.square(), min=1e-15)),
+          "diag": torch.clamp(as_tensor(diag), min=1e-12),
+      }
+      self._equality_flex_ids[eqid] = f
 
     # Topology per-vertex flex index
     vert_flexid = np.zeros(d.nflexvert, dtype=np.int64)
@@ -532,6 +996,233 @@ class MetalFlex:
       v_num = int(model.flex_vertnum[f])
       vert_flexid[v_start:v_start + v_num] = f
     self._vert_flexid = torch.tensor(vert_flexid, dtype=torch.int64, device=self._device)
+
+    b, nv = self.batch_size, d.nv
+    vertex_node_ids, vertex_node_weights, vertex_interp_enabled = (
+        _interpolation_vertex_tables(d))
+    shell_node_ids, shell_node_weights, shell_node_enabled = (
+        _shell_node_tfi_tables(d))
+    self._has_interpolated_vertices = bool(np.any(vertex_interp_enabled))
+    self._interpolated_vertex_ids_host = tuple(
+        int(value) for value in np.flatnonzero(vertex_interp_enabled))
+    self._has_shell_tfi_nodes = bool(np.any(shell_node_enabled))
+    self._vertex_interp_nodes = torch.as_tensor(
+        np.array(vertex_node_ids, copy=True), dtype=torch.int32,
+        device=self._device).contiguous()
+    vertex_weight_high = np.asarray(vertex_node_weights, dtype=np.float32)
+    vertex_weight_low = np.asarray(vertex_node_weights, dtype=np.float64) - \
+        vertex_weight_high.astype(np.float64)
+    vertex_weight_tail = vertex_weight_low - \
+        vertex_weight_low.astype(np.float32).astype(np.float64)
+    self._vertex_interp_weights_low = torch.as_tensor(
+        np.array(vertex_weight_low, dtype=np.float32, copy=True), dtype=torch.float32,
+        device=self._device).contiguous()
+    self._vertex_interp_weights_tail = torch.as_tensor(
+        np.array(vertex_weight_tail, dtype=np.float32, copy=True), dtype=torch.float32,
+        device=self._device).contiguous()
+    self._vertex_interp_weights = torch.as_tensor(
+        np.array(vertex_weight_high, copy=True), dtype=torch.float32,
+        device=self._device).contiguous()
+    self._vertex_interp_enabled = torch.as_tensor(
+        np.array(vertex_interp_enabled, copy=True), dtype=torch.int32,
+        device=self._device).contiguous()
+    self._vertex_interp_dims = torch.tensor(
+        [b, d.nflexvert, len(d.nodebodyid), nv] + [1] * b, dtype=torch.int32,
+        device=self._device)
+    self._paired_interp_dims = torch.tensor(
+        [b, 1, 1, 1] + [1] * b, dtype=torch.int32, device=self._device)
+    self._paired_point_dims = torch.tensor(
+        [b, 1, d.nbody] + [1] * b, dtype=torch.int32,
+        device=self._device)
+    self._shell_tfi_nodes = torch.as_tensor(
+        np.array(shell_node_ids, copy=True), dtype=torch.int32,
+        device=self._device).contiguous()
+    shell_weight_high = np.asarray(shell_node_weights, dtype=np.float32)
+    shell_weight_low = np.asarray(shell_node_weights, dtype=np.float64) - \
+        shell_weight_high.astype(np.float64)
+    shell_weight_tail = shell_weight_low - \
+        shell_weight_low.astype(np.float32).astype(np.float64)
+    self._shell_tfi_weights_low = torch.as_tensor(
+        np.array(shell_weight_low, dtype=np.float32, copy=True), dtype=torch.float32,
+        device=self._device).contiguous()
+    self._shell_tfi_weights_tail = torch.as_tensor(
+        np.array(shell_weight_tail, dtype=np.float32, copy=True), dtype=torch.float32,
+        device=self._device).contiguous()
+    self._shell_tfi_weights = torch.as_tensor(
+        np.array(shell_weight_high, copy=True), dtype=torch.float32,
+        device=self._device).contiguous()
+    self._shell_tfi_enabled = torch.as_tensor(
+        np.array(shell_node_enabled, copy=True), dtype=torch.int32,
+        device=self._device).contiguous()
+    self._shell_tfi_dims = torch.tensor(
+        [b, len(d.nodebodyid), nv] + [1] * b,
+        dtype=torch.int32, device=self._device)
+    # Compiled adjacency is packed by vertex but each adjacency entry is a
+    # local edge index within its owning flex. Freeze the exact endpoint,
+    # reference metric, half-size and MuJoCo mass weights for flexvert rows.
+    vertex_neighbors = []
+    for v in range(d.nflexvert):
+      f = int(vert_flexid[v])
+      local_edges = d.vertedge[int(d.vertedgeadr[v]):
+                               int(d.vertedgeadr[v] + d.vertedgenum[v])]
+      records = []
+      for local_edge in local_edges:
+        ge = int(d.edgeadr[f]) + int(local_edge)
+        v1, v2 = map(int, d.edge[ge])
+        if v not in (v1, v2):
+          raise ValueError("compiled flex vertex adjacency does not match its edge")
+        neighbor = v2 if v == v1 else v1
+        # MuJoCo's flexvert formulation is a 2D metric and passes the first
+        # two scaled rest-coordinate components to its 3x2 products.
+        dx = ((d.vert0[v2] - d.vert0[v1]) * (2.0 * d.size[f]))[:2]
+        body = int(d.vertbodyid[neighbor])
+        weight = max(float(d.body_mass[body]), 1e-15) if body >= 0 else 1.0
+        dx_tensor = torch.as_tensor(np.asarray(dx, dtype=np.float32),
+                                    dtype=torch.float32, device=self._device)
+        records.append((v1, v2, dx_tensor, weight))
+      vertex_neighbors.append(tuple(records))
+    self._vertex_neighbors_host = tuple(vertex_neighbors)
+    self._vertmetric = torch.as_tensor(
+        np.array(d.vertmetric, copy=True), dtype=torch.float32, device=self._device)
+    self._flexvert_eq_pos = torch.zeros(
+        (b, d.nflexvert, 2), dtype=torch.float32, device=self._device)
+    self._flexvert_eq_J = torch.zeros(
+        (b, d.nflexvert, 2, max(nv, 1)), dtype=torch.float32, device=self._device)
+    self._flexvert_eq_vel = torch.zeros(
+        (b, d.nflexvert, 2), dtype=torch.float32, device=self._device)
+    self._flexvert_eq_imp = torch.empty_like(self._flexvert_eq_pos)
+    self._flexvert_eq_aref = torch.empty_like(self._flexvert_eq_pos)
+    self._flexvert_eq_R = torch.empty_like(self._flexvert_eq_pos)
+    self._flexvert_eq_flexids = tuple(
+        int(model.eq_obj1id[eid]) for eid in range(model.neq)
+        if int(model.eq_type[eid]) == int(mujoco.mjtEq.mjEQ_FLEXVERT))
+    self._flexvert_eq_param_sets = {}
+    for eqid in range(int(model.neq)):
+      if int(model.eq_type[eqid]) != int(mujoco.mjtEq.mjEQ_FLEXVERT):
+        continue
+      f = int(model.eq_obj1id[eqid])
+      if f < 0 or f >= d.nflex:
+        raise ValueError(f"compiled flexvert equality {eqid} has invalid flex ID")
+      va, vn = int(model.flex_vertadr[f]), int(model.flex_vertnum[f])
+      bodies = np.asarray(d.vertbodyid[va:va + vn], dtype=np.int64)
+      diag = np.repeat(np.asarray(d.body_invweight0[2 * bodies],
+                                  dtype=np.float32), 2)
+      ref = np.asarray(model.eq_solref[eqid], dtype=np.float32).copy()
+      if not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)):
+        if ref[0] > 0.0:
+          ref[0] = max(float(ref[0]), 2.0 * float(model.opt.timestep))
+      imp = np.asarray(model.eq_solimp[eqid], dtype=np.float32)
+      dmax = max(float(imp[1]), 0.0)
+      b0 = (2.0 / max(dmax * float(ref[0]), 1e-15) if ref[1] > 0.0
+            else -float(ref[1]) / max(dmax, 1e-15))
+      k0 = (1.0 / max(dmax * dmax * float(ref[0]) ** 2
+                      * float(ref[1]) ** 2, 1e-15) if ref[0] > 0.0
+            else -float(ref[0]) / max(dmax * dmax, 1e-15))
+      self._flexvert_eq_param_sets[eqid] = {
+          "flex_id": f,
+          "solimp": torch.as_tensor(imp, dtype=torch.float32,
+                                    device=self._device),
+          "solref": torch.as_tensor(np.array(ref, copy=True),
+                                    dtype=torch.float32, device=self._device),
+          "b0": float(b0), "k0": float(k0),
+          "diag": torch.as_tensor(diag[None], dtype=torch.float32,
+                                  device=self._device),
+      }
+
+    # FLEXSTRAIN rows are compiled from one signed flex_interp element and
+    # the per-element eigenmodes stored at flex_stiffnessadr.  Keep only
+    # immutable identities and coefficients here; the execution routine
+    # below evaluates the corotated residual/J from the live flex-node state.
+    self._flexstrain_records = {}
+    for eqid in range(int(model.neq)):
+      if int(model.eq_type[eqid]) != int(mujoco.mjtEq.mjEQ_FLEXSTRAIN):
+        continue
+      f = int(model.eq_obj1id[eqid])
+      if f < 0 or f >= d.nflex:
+        raise ValueError(f"compiled flexstrain equality {eqid} has invalid flex ID")
+      signed_order = int(d.interp[f])
+      order = abs(signed_order)
+      shell = signed_order < 0
+      if d.equality_row_counts[eqid] == 0:
+        # Compiled auto-generated equality with no eigenmodes has no CC rows.
+        # Keep it out of the runtime record set, while its zero count remains
+        # visible to the model-lowering allocator.
+        continue
+      if order not in (1, 2) or int(d.nodenum[f]) == 0:
+        raise NotImplementedError(
+            f"compiled flexstrain equality {eqid} uses unsupported flex order "
+            f"{signed_order} or an empty node set")
+      npe = (order + 1) ** (2 if shell else 3)
+      data = np.asarray(model.eq_data[eqid], dtype=np.float64)
+      if shell:
+        elem = int(data[0])
+        face_index = shell_face_offset_by_flex.get(f, -1) + elem
+        if face_index < 0 or face_index >= len(self._shell_face_nodes_host):
+          raise ValueError(
+              f"compiled flexstrain equality {eqid} has invalid shell face {elem}")
+        node_ids = np.asarray(
+            self._shell_face_nodes_host[face_index], dtype=np.int32)
+        axes = tuple(map(int, self._shell_face_axes_host[face_index]))
+      else:
+        ci, cj, ck = (int(data[0]), int(data[1]), int(data[2]))
+        cx, cy, cz = map(int, d.cellnum[f])
+        if not (0 <= ci < cx and 0 <= cj < cy and 0 <= ck < cz):
+          raise ValueError(
+              f"compiled flexstrain equality {eqid} has invalid cell "
+              f"({ci}, {cj}, {ck}) for shape ({cx}, {cy}, {cz})")
+        elem = ci * cy * cz + cj * cz + ck
+        ny, nz = cy * order + 1, cz * order + 1
+        node_ids = np.asarray([
+            int(d.nodeadr[f]) + (ci * order + li) * ny * nz
+            + (cj * order + lj) * nz + ck * order + lk
+            for li in range(order + 1)
+            for lj in range(order + 1)
+            for lk in range(order + 1)], dtype=np.int32)
+        axes = (0, 1, 2)
+      if node_ids.size != npe:
+        raise ValueError("compiled flexstrain element node map is truncated")
+      kadr = int(d.stiffnessadr[f])
+      if kadr < 0:
+        raise ValueError(
+            f"compiled flexstrain equality {eqid} has no stiffness block")
+      ndof = 3 * npe
+      start = kadr + elem * ndof * ndof
+      neig = int(d.stiffness[start])
+      if neig <= 0 or neig > ndof:
+        raise ValueError(
+            f"compiled flexstrain equality {eqid} has invalid mode count "
+            f"{neig} for ndof={ndof}")
+      vectors = np.asarray(d.stiffness[start + 1:start + 1 + neig * ndof],
+                           dtype=np.float32)
+      if vectors.size != neig * ndof:
+        raise ValueError("compiled flexstrain eigenmode block is truncated")
+      bodies = np.asarray(d.nodebodyid[node_ids], dtype=np.int64)
+      diag = float(np.mean(d.body_invweight0[2 * bodies]))
+      self._flexstrain_records[eqid] = {
+          "flex_id": f, "order": order, "shell": shell,
+          "axes": axes, "node_ids": tuple(map(int, node_ids)),
+          "node_ids_t": torch.as_tensor(
+              np.array(node_ids, copy=True), dtype=torch.long,
+              device=self._device),
+          "shape_grad": torch.as_tensor(
+              self._interp_shape_gradient(order, shell=shell),
+              dtype=torch.float32, device=self._device),
+          "eigenvectors": torch.as_tensor(
+              np.array(vectors.reshape(neig, npe, 3), copy=True),
+              dtype=torch.float32,
+              device=self._device),
+          "diag": diag,
+          "solimp": torch.as_tensor(model.eq_solimp[eqid],
+                                    dtype=torch.float32, device=self._device),
+          "solref": torch.as_tensor(model.eq_solref[eqid],
+                                    dtype=torch.float32, device=self._device),
+      }
+
+    # Immutable logical row identities/counts for the coupled allocator.
+    # The source instantiates model equality IDs in increasing order; multiple
+    # equalities on one flex therefore remain distinct ordered blocks.
+    self.equality_row_ids_by_eqid = d.equality_row_ids_by_eqid
+    self.equality_row_counts = d.equality_row_counts
 
     self._has_2d = bool(np.any(d.dim == 2))
     self._has_3d = bool(np.any(d.dim == 3))
@@ -543,6 +1234,42 @@ class MetalFlex:
     self._jnt_type = np.asarray(model.jnt_type, dtype=np.int32)
     self._jnt_dofadr = np.asarray(model.jnt_dofadr, dtype=np.int32)
     self._jnt_bodyid = np.asarray(model.jnt_bodyid, dtype=np.int32)
+    self._recovery_body_parentid = torch.as_tensor(
+        self._body_parentid.copy(), dtype=torch.int32, device=self._device)
+    self._recovery_body_jntadr = torch.as_tensor(
+        self._body_jntadr.copy(), dtype=torch.int32, device=self._device)
+    self._recovery_body_jntnum = torch.as_tensor(
+        self._body_jntnum.copy(), dtype=torch.int32, device=self._device)
+    self._recovery_jnt_type = torch.as_tensor(
+        self._jnt_type.copy(), dtype=torch.int32, device=self._device)
+    self._recovery_jnt_dofadr = torch.as_tensor(
+        self._jnt_dofadr.copy(), dtype=torch.int32, device=self._device)
+    self._recovery_vert_bodyid = torch.as_tensor(
+        np.asarray(d.vertbodyid, dtype=np.int32).copy(),
+        dtype=torch.int32, device=self._device)
+    self._recovery_vert_local = torch.as_tensor(
+        np.asarray(d.vert, dtype=np.float32).copy(),
+        dtype=torch.float32, device=self._device)
+    self._recovery_vert_centered = torch.as_tensor(
+        vert_centered.astype(np.int32), dtype=torch.int32, device=self._device)
+    self._recovery_node_bodyid = torch.as_tensor(
+        np.asarray(d.nodebodyid, dtype=np.int32).copy(),
+        dtype=torch.int32, device=self._device)
+    self._recovery_node_local = torch.as_tensor(
+        np.asarray(d.node, dtype=np.float32).copy(),
+        dtype=torch.float32, device=self._device)
+    self._recovery_node_centered = torch.as_tensor(
+        node_centered.astype(np.int32), dtype=torch.int32, device=self._device)
+    self._recovery_point_dims = torch.empty(
+        (7 + self.batch_size,), dtype=torch.int32, device=self._device)
+    self._recovery_edge_dims = torch.empty(
+        (4 + self.batch_size,), dtype=torch.int32, device=self._device)
+    self._recovery_edge_force_dims = torch.empty(
+        (5,), dtype=torch.int32, device=self._device)
+    self._recovery_copy_dims = torch.empty(
+        (2 + self.batch_size,), dtype=torch.int32, device=self._device)
+    self._recovery_matvec_dims = torch.empty(
+        (3 + self.batch_size,), dtype=torch.int32, device=self._device)
     body_joints = []
     for body in range(d.nbody):
       ancestors = []
@@ -558,16 +1285,43 @@ class MetalFlex:
     b = self.batch_size
     nv = d.nv
     self._flexvert_xpos = torch.zeros((b, d.nflexvert, 3), dtype=torch.float32, device=self._device)
+    self._flexvert_xpos_low = torch.zeros_like(self._flexvert_xpos)
+    self._flexvert_xpos_tail = torch.zeros_like(self._flexvert_xpos)
+    self._zero_body_pos_low = torch.zeros(
+        (b, d.nbody, 3), dtype=torch.float32, device=self._device)
+    self._zero_body_pos_tail = torch.zeros_like(self._zero_body_pos_low)
     self._flexvert_xvel = torch.zeros((b, d.nflexvert, 3), dtype=torch.float32, device=self._device)
     self._flexedge_length = torch.zeros((b, d.nflexedge), dtype=torch.float32, device=self._device)
     self._flexedge_velocity = torch.zeros((b, d.nflexedge), dtype=torch.float32, device=self._device)
     self._flexedge_dir = torch.zeros((b, d.nflexedge, 3), dtype=torch.float32, device=self._device)
     self._flexvert_J = torch.zeros((b, d.nflexvert, 3, max(nv, 1)), dtype=torch.float32, device=self._device)
+    # Contact rows derive their point Jacobians from the compiled source
+    # body-weight/interpolation tables. Keep this legacy spatial-J API lazy so
+    # sparse contact profiles do not retain a dense vertex-by-DOF workspace.
+    self._flexvert_spatial_J = torch.empty(
+        (1,), dtype=torch.float32, device=self._device)
+    self._flexvert_spatial_J_allocated = False
     self._flexedge_J = torch.zeros((b, d.nflexedge, max(nv, 1)), dtype=torch.float32, device=self._device)
     self._node_local = torch.tensor(np.array(d.node, copy=True), dtype=torch.float32, device=self._device)
+    node_low = (np.asarray(model.flex_node, dtype=np.float64).reshape(-1, 3)
+                - np.asarray(d.node, dtype=np.float32).astype(np.float64))
+    node_tail = (node_low
+                 - node_low.astype(np.float32).astype(np.float64))
+    self._node_local_low = torch.as_tensor(
+        np.array(node_low, dtype=np.float32, copy=True), dtype=torch.float32,
+        device=self._device)
+    self._node_local_tail = torch.as_tensor(
+        np.array(node_tail, dtype=np.float32, copy=True), dtype=torch.float32,
+        device=self._device)
     self._node0 = torch.tensor(np.array(d.node0, copy=True), dtype=torch.float32, device=self._device)
     self._nodebodyid = torch.tensor(np.array(d.nodebodyid, copy=True), dtype=torch.int64, device=self._device)
+    self._nodebodyid32 = torch.as_tensor(
+        np.array(d.nodebodyid, dtype=np.int32, copy=True), dtype=torch.int32,
+        device=self._device)
     self._node_centered = torch.tensor(node_centered, dtype=torch.bool, device=self._device)
+    self._node_centered32 = torch.as_tensor(
+        np.array(node_centered, dtype=np.int32, copy=True), dtype=torch.int32,
+        device=self._device)
     self._node_direct_dof = []
     for f in range(d.nflex):
       start, count = int(d.nodeadr[f]), int(d.nodenum[f])
@@ -581,11 +1335,19 @@ class MetalFlex:
         self._node_direct_dof.append((direct, adr))
     self._node_direct_dof = tuple(self._node_direct_dof)
     self._node_xpos = torch.zeros((b, len(d.nodebodyid), 3), dtype=torch.float32, device=self._device)
+    self._node_xpos_low = torch.zeros_like(self._node_xpos)
+    self._node_xpos_tail = torch.zeros_like(self._node_xpos)
     self._node_xvel = torch.zeros_like(self._node_xpos)
     self._node_J = torch.zeros((b, len(d.nodebodyid), 3, max(nv, 1)), dtype=torch.float32, device=self._device)
     self._qfrc_passive = torch.zeros((b, max(nv, 1)), dtype=torch.float32, device=self._device)
     self._damping_tangent = torch.zeros((b, max(nv, 1), max(nv, 1)), dtype=torch.float32, device=self._device)
     self._stiffness_tangent = torch.zeros((b, max(nv, 1), max(nv, 1)), dtype=torch.float32, device=self._device)
+    # Recovery evaluates a selected subset without borrowing or clearing the
+    # accepted ordinary result buffers. These fixed-capacity buffers are only
+    # returned by the explicitly masked path.
+    self._recovery_qfrc_passive = torch.zeros_like(self._qfrc_passive)
+    self._recovery_damping_tangent = torch.zeros_like(self._damping_tangent)
+    self._recovery_stiffness_tangent = torch.zeros_like(self._stiffness_tangent)
     self._operator_names = (
         "interp_stiffness", "interp_damped_stiffness",
         "bend_stiffness", "bend_damped_stiffness",
@@ -593,6 +1355,60 @@ class MetalFlex:
     self._operator_workspace = {
         name: torch.zeros((b, nv, nv), dtype=torch.float32, device=self._device)
         for name in self._operator_names}
+    self._material_matvec_workspace = {
+        name: torch.zeros((b, nv), dtype=torch.float32, device=self._device)
+        for name in ("interp_stiffness", "interp_damped_stiffness",
+                     "bend_stiffness", "bend_damped_stiffness")}
+    # Borrowed output buffers for frozen-POS mjEQ_FLEX replay. The context
+    # stores source coefficients/residuals, not just aref, so another qvel
+    # stage can refresh the velocity-dependent part exactly.
+    self._eq_pos = torch.empty((b, d.nflexedge), dtype=torch.float32, device=self._device)
+    self._eq_imp = torch.empty_like(self._eq_pos)
+    self._eq_aref = torch.empty_like(self._eq_pos)
+    self._eq_R = torch.empty_like(self._eq_pos)
+    self._eq_raw_context = torch.empty(
+        (b, d.nflexedge, 5), dtype=torch.float32, device=self._device)
+    self._equality_position_context = {
+        "pos": self._eq_raw_context[..., 0],
+        "impedance": self._eq_raw_context[..., 1],
+        "b0": self._eq_raw_context[..., 2],
+        "k0": self._eq_raw_context[..., 3],
+        "diag": self._eq_raw_context[..., 4],
+        "edge_J": self._flexedge_J,
+        "edge_ids_by_flex": self._equality_edge_ids,
+    }
+    self._position_context_buffers = {
+        name: torch.empty_like(getattr(self, name))
+        for name in ("_flexvert_xpos", "_flexvert_xpos_low",
+                     "_flexvert_xpos_tail", "_flexvert_J",
+                     "_node_xpos", "_node_xpos_low", "_node_xpos_tail",
+                     "_node_J", "_flexedge_length",
+                     "_flexedge_dir", "_flexedge_J", "_flexvert_eq_pos",
+                     "_flexvert_eq_J")}
+    self._position_context_buffers["body_pos"] = torch.empty(
+        (b, d.nbody, 3), dtype=torch.float32, device=self._device)
+    self._position_context_buffers["body_pos_low"] = torch.empty(
+        (b, d.nbody, 3), dtype=torch.float32, device=self._device)
+    self._position_context_buffers["body_pos_tail"] = torch.empty(
+        (b, d.nbody, 3), dtype=torch.float32, device=self._device)
+    self._position_context_buffers["body_quat"] = torch.empty(
+        (b, d.nbody, 4), dtype=torch.float32, device=self._device)
+    self._position_context_buffers["joint_anchor"] = torch.zeros(
+        (b, d.njnt, 3), dtype=torch.float32, device=self._device)
+    self._position_context_buffers["joint_axis"] = torch.zeros(
+        (b, d.njnt, 3), dtype=torch.float32, device=self._device)
+    self._flexstrain_context_names = {}
+    for eqid, record in self._flexstrain_records.items():
+      name = f"flexstrain_{eqid}"
+      count = int(record["eigenvectors"].shape[0])
+      self._position_context_buffers[name + "_pos"] = torch.empty(
+          (b, count), dtype=torch.float32, device=self._device)
+      self._position_context_buffers[name + "_J"] = torch.empty(
+          (b, count, max(nv, 1)), dtype=torch.float32, device=self._device)
+      self._flexstrain_context_names[eqid] = name
+    self._kinematics_generation = 0
+    self._position_context_generation = 0
+    self._latest_position_context = None
 
   def _add_node_generalized_force(self, node_ids, cartesian_force):
     """Scatter nodal force using pinned flex direct-DOF/applyFT branches."""
@@ -653,7 +1469,7 @@ class MetalFlex:
         if bool(self.model.flex_rigid[owner]) or int(self.model.flex_edgeequality[owner]) == 3:
           continue
         npe = self._interp_npe_host[fe]
-        ids = torch.as_tensor(node_ids, dtype=torch.long, device=self._device)
+        ids = self._interp_nodes_long[fe]
         x = self._node_xpos[:, ids, :]
         shape_grad = self._interp_grad[fe, :npe]
         axes = self._interp_axes_host[fe]
@@ -708,6 +1524,155 @@ class MetalFlex:
                         self._flexedge_J))
     return out
 
+  def capture_material_operator_context(self, poses, cvel=None):
+    """Freeze current kinematics and corotated frames for matrix-free K*x.
+
+    The returned owner/generation token is valid only until the next call that
+    updates flex kinematics. It stores one 3x3 frame per interpolation element,
+    not a global stiffness matrix.
+    """
+    self.update_kinematics(poses, cvel)
+    rotations = []
+    for fe, node_ids in enumerate(self._interp_nodes_host):
+      owner = self._interp_owner_host[fe]
+      if (bool(self.model.flex_rigid[owner])
+          or int(self.model.flex_edgeequality[owner]) == 3):
+        rotations.append(None)
+        continue
+      ids = self._interp_nodes_long[fe]
+      x = self._node_xpos[:, ids, :]
+      shape_grad = self._interp_grad[fe, :self._interp_npe_host[fe]]
+      axes = self._interp_axes_host[fe]
+      Fparam = torch.einsum("bnd,nk->bdk", x, shape_grad)
+      F = torch.zeros_like(Fparam)
+      is_volume = (len(node_ids)
+                   == (abs(int(self.descriptor.interp[owner])) + 1) ** 3)
+      if is_volume:
+        F.copy_(Fparam)
+      else:
+        F[:, :, axes[0]] = Fparam[:, :, 0]
+        F[:, :, axes[1]] = Fparam[:, :, 1]
+        F[:, :, axes[2]] = torch.cross(
+            Fparam[:, :, 0], Fparam[:, :, 1], dim=-1)
+      qlocal = self._mat2rot_pinned(F).clone()
+      qlocal[:, 1:] *= -1
+      rotations.append(self._matrix_from_quaternion(qlocal))
+    return _FlexMaterialOperatorContext(
+        self, self._kinematics_generation, tuple(rotations))
+
+  def apply_material_operator_context_device(self, context, vector):
+    """Apply all pinned frozen flex K/Kd operators to one vector.
+
+    This matrix-free counterpart to :meth:`run_material_operators` is intended
+    for the separate 50-iteration ``flexInterp_cgsolve`` PCG. Interpolated
+    records use local ``J*x``, compiled element K, and ``J'`` products; ordinary
+    2-D bend records apply their compiled direct-DOF stencil. No `[B,nv,nv]`
+    backing is read or constructed. Returned `[B,nv]` vectors are borrowed and
+    overwritten by the next product call.
+    """
+    if (not isinstance(context, _FlexMaterialOperatorContext)
+        or context.owner is not self
+        or context.generation != self._kinematics_generation):
+      raise ValueError("flex material operator context is foreign or stale")
+    self._validate_position_tensor(
+        "material operator vector", vector,
+        (self.batch_size, self.descriptor.nv))
+    for output in self._material_matvec_workspace.values():
+      output.zero_()
+    out = self._material_matvec_workspace
+    b, nv = self.batch_size, self.descriptor.nv
+    if nv:
+      for fe, node_ids in enumerate(self._interp_nodes_host):
+        rotation = context.rotations[fe]
+        if rotation is None:
+          continue
+        npe = self._interp_npe_host[fe]
+        ids = self._interp_nodes_long[fe]
+        Jflat = self._node_J[:, ids, :, :].reshape(b, 3*npe, nv)
+        world_velocity = torch.bmm(
+            Jflat, vector.unsqueeze(-1)).reshape(b, npe, 3)
+        # Krot = R^T K R. Apply it without materializing Krot: first rotate
+        # J*x to the compiled material basis, multiply by K, then rotate the
+        # element force back before applying J'.
+        local_velocity = torch.einsum(
+            "bcd,bnd->bnc", rotation, world_velocity).reshape(b, 3*npe, 1)
+        K = self._interp_matrix[fe, :3*npe, :3*npe]
+        local_force = torch.bmm(
+            K.unsqueeze(0).expand(b, -1, -1), local_velocity
+        ).reshape(b, npe, 3)
+        world_force = torch.einsum(
+            "bcd,bnc->bnd", rotation, local_force).reshape(b, 3*npe, 1)
+        contribution = torch.bmm(Jflat.transpose(1, 2), world_force).squeeze(-1)
+        out["interp_stiffness"].add_(contribution)
+        out["interp_damped_stiffness"].add_(
+            self._interp_damping_host[fe] * contribution)
+
+      for e in range(self._bend_count):
+        matrix = self._bend_data[e, :16].reshape(4, 4)
+        damping = self._bend_damping_host[e]
+        for i, (adr_i, count_i) in enumerate(zip(
+              self._bend_dofadr_host[e], self._bend_dofnum_host[e])):
+          if not count_i:
+            continue
+          for j, (adr_j, count_j) in enumerate(zip(
+                self._bend_dofadr_host[e], self._bend_dofnum_host[e])):
+            count = min(count_i, count_j)
+            if not count:
+              continue
+            value = matrix[i, j]
+            source = vector[:, adr_j:adr_j + count]
+            out["bend_stiffness"][:, adr_i:adr_i + count].add_(
+                value * source)
+            out["bend_damped_stiffness"][:, adr_i:adr_i + count].add_(
+                damping * value * source)
+    return out
+
+  def run_edge_velocity_derivative_coo_device(self, poses, edge_writer,
+                                               cvel=None):
+    """Add flex-edge damping qDeriv directly to the shared compiled COO.
+
+    The pinned contribution is ``-Σ_e c[e] J[e]' J[e]``. One Metal thread
+    owns each (world, COO slot), reducing over compiled flex edges without
+    materializing a dense nv-by-nv derivative or reading device values back.
+    """
+    if self._device.type != "mps" or self._edge_operator_shader is None:
+      raise RuntimeError("native flex edge derivative requires the MPS backend")
+    if not isinstance(poses, dict):
+      raise ValueError("poses must be the current smooth-pose mapping")
+    nv = self.descriptor.nv
+    edge_count = int(getattr(edge_writer, "edge_count", -1))
+    expected_values = (self.batch_size, max(edge_count, 1))
+    if (getattr(edge_writer, "nv", None) != nv or edge_count < 0
+        or tuple(getattr(getattr(edge_writer, "values", None), "shape", ()))
+        != expected_values):
+      raise ValueError("edge_writer does not match flex compiled D COO layout")
+    for name in ("_edge_rows", "_edge_cols", "values"):
+      value = getattr(edge_writer, name, None)
+      if (not isinstance(value, torch.Tensor)
+          or value.device.type != "mps" or not value.is_contiguous()):
+        raise ValueError(f"edge_writer.{name} must be contiguous MPS storage")
+    for name, value in (("_edge_rows", edge_writer._edge_rows),
+                        ("_edge_cols", edge_writer._edge_cols)):
+      if value.dtype != torch.int32 or tuple(value.shape) != (max(edge_count, 1),):
+        raise ValueError(f"edge_writer.{name} must be MPS int32 [max(E,1)]")
+    if edge_writer.values.dtype != torch.float32:
+      raise ValueError("edge_writer.values must be MPS float32")
+    self.update_kinematics(poses, cvel)
+    if (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)
+        or nv == 0 or edge_count == 0 or self.descriptor.nflexedge == 0):
+      return edge_writer.values
+    if self._edge_operator_coo_edge_count is None:
+      self._edge_operator_coo_dims[2] = edge_count
+      self._edge_operator_coo_edge_count = edge_count
+    elif self._edge_operator_coo_edge_count != edge_count:
+      raise ValueError("flex edge COO writer capacity changed after binding")
+    self._edge_operator_shader.flex_edge_velocity_derivative_coo(
+        self._flexedge_J.reshape(-1), self._edge_operator_coeff,
+        edge_writer._edge_rows, edge_writer._edge_cols,
+        edge_writer.values.reshape(-1), self._edge_operator_coo_dims,
+        threads=(self.batch_size * edge_count,), group_size=(1,))
+    return edge_writer.values
+
   @property
   def flexvert_xpos(self) -> torch.Tensor:
     """Current world positions of all flex vertices (B, nflexvert, 3)."""
@@ -742,8 +1707,12 @@ class MetalFlex:
   def _quat_rotate(quat, vector):
     qv = quat[:, None, 1:]
     qw = quat[:, None, :1]
-    t = 2.0 * torch.cross(qv.expand_as(vector), vector, dim=-1)
-    return vector + qw * t + torch.cross(qv.expand_as(vector), t, dim=-1)
+    # Let torch.cross apply standard leading-dimension broadcasting. Interpolated
+    # shell records can have one shared reference vector while the quaternion
+    # batch contains several environments; expanding qv to vector's batch
+    # shape incorrectly rejects that valid B-by-1 input.
+    t = 2.0 * torch.cross(qv, vector, dim=-1)
+    return vector + qw * t + torch.cross(qv, t, dim=-1)
 
   @staticmethod
   def _mat2rot_pinned(matrix):
@@ -791,11 +1760,17 @@ class MetalFlex:
     """Jacobian rows of all flex edges (B, nflexedge, nv)."""
     return self._flexedge_J
 
-  def update_kinematics(self, poses: Dict[str, torch.Tensor], cvel: Optional[torch.Tensor] = None):
+  def update_kinematics(self, poses: Dict[str, torch.Tensor],
+                        cvel: Optional[torch.Tensor] = None,
+                        world_mask=None):
     """Compute forward vertex kinematics, velocities, and Jacobians entirely on device MPS."""
     body_pos = poses["body_pos"]    # (B, nbody, 3)
     body_quat = poses["body_quat"]  # (B, nbody, 4)
     b = body_pos.shape[0]
+
+    if world_mask is not None:
+      self._update_kinematics_masked(poses, cvel, world_mask)
+      return
 
     # 1. World vertex positions: x_v = body_pos[b] + R(body_quat[b]) * vert_local[v]
     b_ids = self._vertbodyid  # (nflexvert,)
@@ -810,6 +1785,13 @@ class MetalFlex:
     v_rot = v_loc + qw * t + torch.cross(qv, t, dim=-1)
     v_rot = torch.where(self._vert_centered[None, :, None], torch.zeros_like(v_rot), v_rot)
     self._flexvert_xpos.copy_(pos_b + v_rot)
+    body_pos_low = poses.get("body_pos_low", self._zero_body_pos_low)
+    body_pos_tail = poses.get("body_pos_tail", self._zero_body_pos_tail)
+    self._update_paired_point_position_low(
+        self._vert_local, self._vert_local_low, self._vert_local_tail,
+        self._vertbodyid32, self._vert_centered32, body_pos, body_pos_low,
+        body_pos_tail, body_quat, self._flexvert_xpos,
+        self._flexvert_xpos_low, self._flexvert_xpos_tail)
 
     # 2. World vertex velocities: v_v = v_lin[b] + omega[b] x (x_v - xpos[b])
     if cvel is not None and cvel.numel() > 0:
@@ -834,6 +1816,15 @@ class MetalFlex:
       nrot = nlocal + nqw * nt + torch.cross(nqv, nt, dim=-1)
       nrot = torch.where(self._node_centered[None, :, None], torch.zeros_like(nrot), nrot)
       self._node_xpos.copy_(body_pos[:, nbody_ids, :] + nrot)
+      self._update_paired_point_position_low(
+          self._node_local, self._node_local_low, self._node_local_tail,
+          self._nodebodyid32, self._node_centered32, body_pos, body_pos_low,
+          body_pos_tail, body_quat, self._node_xpos, self._node_xpos_low,
+          self._node_xpos_tail)
+      # update_kinematics may be called without velocities after a previous
+      # velocity-bearing stage (for example a position-only restore). Never
+      # let that leave stale nodal velocities for interpolated flex vertices.
+      self._node_xvel.zero_()
       if cvel is not None and cvel.numel() > 0:
         ncvel = cvel[:, nbody_ids, :]
         root_com = poses.get("root_com")
@@ -842,8 +1833,76 @@ class MetalFlex:
         nvel = ncvel[..., 3:] + torch.cross(
             ncvel[..., :3], self._node_xpos - center, dim=-1)
         self._node_xvel.copy_(nvel)
+    else:
+      self._node_xvel.zero_()
+
+    # MuJoCo first reconstructs shell interior nodes with TFI, then evaluates
+    # every interpolated flex vertex from its compiled Q1/Q2 cell basis.
+    if self._has_shell_tfi_nodes:
+      if self._device.type == "mps":
+        self._shell_tfi_dims[3:].fill_(1)
+        self._material_shader.flex_shell_tfi_vectors(
+            self._shell_tfi_enabled, self._shell_tfi_nodes,
+            self._shell_tfi_weights, self._node_xpos.reshape(-1),
+            self._node_xvel.reshape(-1), self._shell_tfi_dims,
+            threads=(b * len(self.descriptor.nodebodyid),), group_size=(128,))
+        self._update_paired_interpolated_position_low(
+            self._shell_tfi_enabled, self._shell_tfi_nodes,
+            self._shell_tfi_weights, self._shell_tfi_weights_low,
+            self._shell_tfi_weights_tail, self._node_xpos, self._node_xpos_low,
+            self._node_xpos_tail, self._shell_tfi_weights.shape[1],
+            self._node_xpos, self._node_xpos_low, self._node_xpos_tail,
+            world_mask)
       else:
-        self._node_xvel.zero_()
+        shell_x = (self._node_xpos[:, self._shell_tfi_nodes]
+                   * self._shell_tfi_weights[None, :, :, None]).sum(dim=2)
+        shell_v = (self._node_xvel[:, self._shell_tfi_nodes]
+                   * self._shell_tfi_weights[None, :, :, None]).sum(dim=2)
+        enabled = self._shell_tfi_enabled.bool()[None, :, None]
+        self._node_xpos.copy_(torch.where(enabled, shell_x, self._node_xpos))
+        self._node_xvel.copy_(torch.where(enabled, shell_v, self._node_xvel))
+        self._update_paired_interpolated_position_low(
+            self._shell_tfi_enabled, self._shell_tfi_nodes,
+            self._shell_tfi_weights, self._shell_tfi_weights_low,
+            self._shell_tfi_weights_tail, self._node_xpos, self._node_xpos_low,
+            self._node_xpos_tail, self._shell_tfi_weights.shape[1],
+            self._node_xpos, self._node_xpos_low, self._node_xpos_tail,
+            world_mask)
+    if self._has_interpolated_vertices:
+      if self._device.type == "mps":
+        self._vertex_interp_dims[4:].fill_(1)
+        self._material_shader.flex_interpolate_vertices(
+            self._vertex_interp_enabled, self._vertex_interp_nodes,
+            self._vertex_interp_weights, self._node_xpos.reshape(-1),
+            self._node_xvel.reshape(-1), self._vertex_interp_dims,
+            self._flexvert_xpos.reshape(-1), self._flexvert_xvel.reshape(-1),
+            threads=(b * self.descriptor.nflexvert,), group_size=(128,))
+        self._update_paired_interpolated_position_low(
+            self._vertex_interp_enabled, self._vertex_interp_nodes,
+            self._vertex_interp_weights, self._vertex_interp_weights_low,
+            self._vertex_interp_weights_tail, self._node_xpos,
+            self._node_xpos_low, self._node_xpos_tail,
+            self._vertex_interp_weights.shape[1],
+            self._flexvert_xpos, self._flexvert_xpos_low,
+            self._flexvert_xpos_tail, world_mask)
+      else:
+        interp_x = (self._node_xpos[:, self._vertex_interp_nodes]
+                    * self._vertex_interp_weights[None, :, :, None]).sum(dim=2)
+        interp_v = (self._node_xvel[:, self._vertex_interp_nodes]
+                    * self._vertex_interp_weights[None, :, :, None]).sum(dim=2)
+        enabled = self._vertex_interp_enabled.bool()[None, :, None]
+        self._flexvert_xpos.copy_(torch.where(
+            enabled, interp_x, self._flexvert_xpos))
+        self._flexvert_xvel.copy_(torch.where(
+            enabled, interp_v, self._flexvert_xvel))
+        self._update_paired_interpolated_position_low(
+            self._vertex_interp_enabled, self._vertex_interp_nodes,
+            self._vertex_interp_weights, self._vertex_interp_weights_low,
+            self._vertex_interp_weights_tail, self._node_xpos,
+            self._node_xpos_low, self._node_xpos_tail,
+            self._vertex_interp_weights.shape[1],
+            self._flexvert_xpos, self._flexvert_xpos_low,
+            self._flexvert_xpos_tail, world_mask)
 
     # 3. Edge lengths, deformation rates, and unit direction vectors
     e0 = self._edge[:, 0]
@@ -863,14 +1922,912 @@ class MetalFlex:
 
     # 4. Point Jacobians for vertices and Edge Jacobians
     self._compute_jacobians(poses)
+    self._last_kinematics_poses = poses
+    self._kinematics_generation += 1
+
+  def _update_paired_point_position_low(
+      self, local, local_low, local_tail, body_ids, centered, body_pos,
+      body_pos_low, body_pos_tail, body_quat, position_high, position_low,
+      position_tail, world_mask=None):
+    """Refresh both residual words from source coordinates and FK inputs."""
+    if position_high.shape[1] == 0:
+      return
+    if self._device.type == "mps":
+      dims = self._paired_point_dims
+      dims[0] = self.batch_size
+      dims[1] = int(position_high.shape[1])
+      dims[2] = self.descriptor.nbody
+      dims[3:].fill_(1)
+      if world_mask is not None:
+        dims[3:].copy_(world_mask)
+      self._material_shader.flex_paired_point_position_low(
+          body_pos.reshape(-1), body_pos_low.reshape(-1),
+          body_quat.reshape(-1), local.reshape(-1), local_low.reshape(-1),
+          body_pos_tail.reshape(-1), local_tail.reshape(-1), body_ids,
+          centered, dims, position_high.reshape(-1),
+          position_low.reshape(-1), position_tail.reshape(-1),
+          threads=(self.batch_size * int(position_high.shape[1]),),
+          group_size=(128,))
+      return
+    # CPU tensor execution is the exact-input source oracle for this producer.
+    pos = body_pos.detach().cpu().numpy().astype(np.float64)
+    low = body_pos_low.detach().cpu().numpy().astype(np.float64)
+    tail = body_pos_tail.detach().cpu().numpy().astype(np.float64)
+    quat = body_quat.detach().cpu().numpy().astype(np.float64)
+    loc = local.detach().cpu().numpy().astype(np.float64)
+    loc += local_low.detach().cpu().numpy().astype(np.float64)
+    loc += local_tail.detach().cpu().numpy().astype(np.float64)
+    ids = body_ids.detach().cpu().numpy().astype(np.int64)
+    center = centered.detach().cpu().numpy().astype(bool)
+    q = quat[:, ids]
+    v = np.broadcast_to(loc[None], (len(pos), *loc.shape)).copy()
+    qv, qw = q[..., 1:], q[..., :1]
+    t = 2.0 * np.cross(qv, v)
+    rotated = v + qw * t + np.cross(qv, t)
+    rotated[:, center] = 0.0
+    exact = pos[:, ids] + low[:, ids] + tail[:, ids] + rotated
+    high = position_high.detach().cpu().numpy().astype(np.float64)
+    low_residual = np.asarray(exact-high, dtype=np.float32)
+    tail_residual = np.asarray(exact-high-low_residual.astype(np.float64),
+                               dtype=np.float32)
+    position_low.copy_(torch.as_tensor(
+        low_residual, dtype=position_low.dtype,
+        device=position_low.device))
+    position_tail.copy_(torch.as_tensor(
+        tail_residual, dtype=position_tail.dtype,
+        device=position_tail.device))
+
+  def _update_paired_interpolated_position_low(
+      self, enabled, indices, weights, weights_low, weights_tail,
+      source_high, source_low, source_tail, nterm, target_high, target_low,
+      target_tail, world_mask=None):
+    """Apply one compiled TFI/Q1/Q2 position map to paired coordinates."""
+    ntarget = int(target_high.shape[1])
+    nsource = int(source_high.shape[1])
+    if ntarget == 0 or nsource == 0:
+      return
+    if self._device.type == "mps":
+      dims = self._paired_interp_dims
+      dims[0] = self.batch_size
+      dims[1] = ntarget
+      dims[2] = nsource
+      dims[3] = int(nterm)
+      dims[4:].fill_(1)
+      if world_mask is not None:
+        dims[4:].copy_(world_mask)
+      self._material_shader.flex_paired_interpolate_position_low(
+          enabled, indices, weights.reshape(-1), weights_low.reshape(-1),
+          weights_tail.reshape(-1), source_high.reshape(-1),
+          source_low.reshape(-1), source_tail.reshape(-1), dims,
+          target_high.reshape(-1), target_low.reshape(-1),
+          target_tail.reshape(-1),
+          threads=(self.batch_size * ntarget,), group_size=(128,))
+      return
+    x = (source_high.detach().cpu().numpy().astype(np.float64)
+         + source_low.detach().cpu().numpy().astype(np.float64)
+         + source_tail.detach().cpu().numpy().astype(np.float64))
+    idx = indices.detach().cpu().numpy().astype(np.int64)
+    w = (weights.detach().cpu().numpy().astype(np.float64)
+         + weights_low.detach().cpu().numpy().astype(np.float64)
+         + weights_tail.detach().cpu().numpy().astype(np.float64))
+    mask = enabled.detach().cpu().numpy().astype(bool)
+    exact = np.zeros((self.batch_size, ntarget, 3), dtype=np.float64)
+    for env in range(self.batch_size):
+      exact[env] = np.sum(x[env, idx] * w[:, :, None], axis=1)
+    target = target_high.detach().cpu().numpy().astype(np.float64)
+    delta = exact - target
+    old_low = target_low.detach().cpu().numpy().astype(np.float64)
+    old_tail = target_tail.detach().cpu().numpy().astype(np.float64)
+    delta[:, ~mask] = old_low[:, ~mask] + old_tail[:, ~mask]
+    low_residual = np.asarray(delta, dtype=np.float32)
+    tail_residual = np.asarray(delta-low_residual.astype(np.float64),
+                               dtype=np.float32)
+    low_residual[:, ~mask] = old_low[:, ~mask].astype(np.float32)
+    tail_residual[:, ~mask] = old_tail[:, ~mask].astype(np.float32)
+    target_low.copy_(torch.as_tensor(
+        low_residual, dtype=target_low.dtype,
+        device=target_low.device))
+    target_tail.copy_(torch.as_tensor(
+        tail_residual, dtype=target_tail.dtype, device=target_tail.device))
+
+  def _update_kinematics_masked(self, poses, cvel, world_mask):
+    """Refresh only selected flex rows using per-world guarded MSL kernels."""
+    if self._device.type != "mps":
+      # CPU tensor evaluation remains a source-comparison backend only.
+      self.update_kinematics(poses, cvel)
+      return
+    shader = self._material_shader or self._bend_shader
+    if shader is None:
+      raise RuntimeError("masked flex recovery requires the native material shader")
+    self._validate_world_mask(world_mask)
+    torch = __import__("torch")
+    body_pos, body_quat = poses["body_pos"], poses["body_quat"]
+    anchors = poses.get("joint_anchor")
+    axes = poses.get("joint_axis")
+    cvel_present = cvel is not None and cvel.numel() > 0
+    cvel_arg = cvel if cvel_present else self._material_dummy_f
+    root_com = poses.get("root_com")
+    root_arg = root_com if root_com is not None else body_pos
+    anchor_arg = anchors if anchors is not None else self._material_dummy_f
+    axis_arg = axes if axes is not None else self._material_dummy_f
+    spatial = self._flexvert_spatial_J_allocated
+
+    def update_points(local, body_ids, centered, xpos, xvel, jac, npoint,
+                      spatial_jac=None):
+      if npoint <= 0:
+        return
+      dims = self._recovery_point_dims
+      dims[0] = self.batch_size
+      dims[1] = npoint
+      dims[2] = self.descriptor.nv
+      dims[3] = self.descriptor.nbody
+      dims[4] = self.descriptor.njnt
+      dims[5] = int(spatial)
+      dims[6] = int(cvel_present)
+      dims[7:].copy_(world_mask)
+      spatial_arg = (spatial_jac if spatial_jac is not None
+                     else self._material_dummy_f)
+      count = self.batch_size * npoint
+      if count > (1 << 31) - 1:
+        raise ValueError("masked flex point dispatch exceeds signed int32 indexing")
+      shader.flex_recovery_update_points(
+          local.reshape(-1), body_ids, centered, body_pos.reshape(-1),
+          body_quat.reshape(-1), cvel_arg.reshape(-1), root_arg.reshape(-1),
+          anchor_arg.reshape(-1), axis_arg.reshape(-1),
+          self._recovery_body_jntadr, self._recovery_body_jntnum,
+          self._recovery_body_parentid,
+          (self._recovery_jnt_dofadr if self.descriptor.njnt
+           else self._material_dummy_i),
+          (self._recovery_jnt_type if self.descriptor.njnt
+           else self._material_dummy_i), world_mask, dims, xpos.reshape(-1),
+          xvel.reshape(-1), jac.reshape(-1), spatial_arg.reshape(-1),
+          threads=(count,), group_size=(128,))
+
+    update_points(self._recovery_vert_local, self._recovery_vert_bodyid,
+                  self._recovery_vert_centered, self._flexvert_xpos,
+                  self._flexvert_xvel, self._flexvert_J,
+                  self.descriptor.nflexvert, self._flexvert_spatial_J)
+    self._update_paired_point_position_low(
+        self._vert_local, self._vert_local_low, self._vert_local_tail,
+        self._vertbodyid32, self._vert_centered32, body_pos,
+        poses.get("body_pos_low", self._zero_body_pos_low),
+        poses.get("body_pos_tail", self._zero_body_pos_tail), body_quat,
+        self._flexvert_xpos, self._flexvert_xpos_low,
+        self._flexvert_xpos_tail, world_mask)
+    update_points(self._recovery_node_local, self._recovery_node_bodyid,
+                  self._recovery_node_centered, self._node_xpos,
+                  self._node_xvel, self._node_J,
+                  len(self.descriptor.nodebodyid))
+    self._update_paired_point_position_low(
+        self._node_local, self._node_local_low, self._node_local_tail,
+        self._nodebodyid32, self._node_centered32, body_pos,
+        poses.get("body_pos_low", self._zero_body_pos_low),
+        poses.get("body_pos_tail", self._zero_body_pos_tail), body_quat,
+        self._node_xpos, self._node_xpos_low, self._node_xpos_tail,
+        world_mask)
+
+    if self._has_shell_tfi_nodes:
+      self._shell_tfi_dims[3:].copy_(world_mask)
+      self._material_shader.flex_shell_tfi_vectors(
+          self._shell_tfi_enabled, self._shell_tfi_nodes,
+          self._shell_tfi_weights, self._node_xpos.reshape(-1),
+          self._node_xvel.reshape(-1), self._shell_tfi_dims,
+          threads=(self.batch_size * len(self.descriptor.nodebodyid),),
+          group_size=(128,))
+      self._update_paired_interpolated_position_low(
+          self._shell_tfi_enabled, self._shell_tfi_nodes,
+          self._shell_tfi_weights, self._shell_tfi_weights_low,
+          self._shell_tfi_weights_tail, self._node_xpos,
+          self._node_xpos_low, self._node_xpos_tail,
+          self._shell_tfi_weights.shape[1], self._node_xpos,
+          self._node_xpos_low, self._node_xpos_tail, world_mask)
+    if self._has_interpolated_vertices:
+      self._vertex_interp_dims[4:].copy_(world_mask)
+      self._material_shader.flex_interpolate_vertices(
+          self._vertex_interp_enabled, self._vertex_interp_nodes,
+          self._vertex_interp_weights, self._node_xpos.reshape(-1),
+          self._node_xvel.reshape(-1), self._vertex_interp_dims,
+          self._flexvert_xpos.reshape(-1), self._flexvert_xvel.reshape(-1),
+          threads=(self.batch_size * self.descriptor.nflexvert,),
+          group_size=(128,))
+      self._update_paired_interpolated_position_low(
+          self._vertex_interp_enabled, self._vertex_interp_nodes,
+          self._vertex_interp_weights, self._vertex_interp_weights_low,
+          self._vertex_interp_weights_tail, self._node_xpos,
+          self._node_xpos_low, self._node_xpos_tail,
+          self._vertex_interp_weights.shape[1], self._flexvert_xpos,
+          self._flexvert_xpos_low, self._flexvert_xpos_tail, world_mask)
+    if self._has_shell_tfi_nodes and self.descriptor.nv:
+      self._material_shader.flex_shell_tfi_jacobian(
+          self._shell_tfi_enabled, self._shell_tfi_nodes,
+          self._shell_tfi_weights, self._node_J.reshape(-1),
+          self._shell_tfi_dims,
+          threads=(self.batch_size * len(self.descriptor.nodebodyid) * 3
+                   * self.descriptor.nv,), group_size=(128,))
+    if self._has_interpolated_vertices and self.descriptor.nv:
+      self._material_shader.flex_interpolate_vertex_jacobian(
+          self._vertex_interp_enabled, self._vertex_interp_nodes,
+          self._vertex_interp_weights, self._node_J.reshape(-1),
+          self._vertex_interp_dims, self._flexvert_J.reshape(-1),
+          threads=(self.batch_size * self.descriptor.nflexvert * 3
+                   * self.descriptor.nv,), group_size=(128,))
+    if self._flexvert_spatial_J_allocated:
+      dims = self._recovery_edge_dims
+      dims[0] = self.batch_size
+      dims[1] = self.descriptor.nflexvert
+      dims[2] = self.descriptor.nv
+      dims[3] = self.descriptor.nflexedge
+      dims[4:].copy_(world_mask)
+      self._material_shader.flex_recovery_copy_linear_spatial(
+          world_mask, self._flexvert_J.reshape(-1),
+          self._flexvert_spatial_J.reshape(-1),
+          self._recovery_edge_dims, threads=(self.batch_size
+                                             * self.descriptor.nflexvert
+                                             * 3 * max(self.descriptor.nv, 1),),
+          group_size=(128,))
+    if self.descriptor.nflexedge:
+      dims = self._recovery_edge_dims
+      dims[0] = self.batch_size
+      dims[1] = self.descriptor.nflexedge
+      dims[2] = self.descriptor.nv
+      dims[3] = self.descriptor.nflexvert
+      dims[4:].copy_(world_mask)
+      edge_count = self.batch_size * self.descriptor.nflexedge
+      if edge_count > (1 << 31) - 1:
+        raise ValueError("masked flex edge dispatch exceeds signed int32 indexing")
+      shader.flex_recovery_update_edges(
+          self._recovery_edge.reshape(-1),
+          self._edge_j_rowadr, self._edge_j_rownnz, self._edge_j_colind,
+          self._flexvert_xpos.reshape(-1), self._flexvert_xvel.reshape(-1),
+          self._flexvert_J.reshape(-1), world_mask, dims,
+          self._flexedge_length.reshape(-1),
+          self._flexedge_velocity.reshape(-1), self._flexedge_dir.reshape(-1),
+          self._flexedge_J.reshape(-1), threads=(edge_count,),
+          group_size=(128,))
+
+  def capture_position_context(self):
+    """Capture frozen POS geometry/J buffers for later RK4 velocity stages.
+
+    The returned context is borrowed from this manager and is invalidated by a
+    newer capture.  It owns copies of every material position/J buffer plus
+    the body/joint pose fields used by articulated force derivatives.
+    """
+    if self._kinematics_generation == 0:
+      raise RuntimeError("flex kinematics must be updated before POS capture")
+    buffers = self._position_context_buffers
+    poses = self._last_kinematics_poses
+    expected = {"body_pos": (self.batch_size, self.descriptor.nbody, 3),
+                "body_quat": (self.batch_size, self.descriptor.nbody, 4)}
+    if self.descriptor.njnt:
+      expected.update({"joint_anchor":
+                       (self.batch_size, self.descriptor.njnt, 3),
+                       "joint_axis":
+                       (self.batch_size, self.descriptor.njnt, 3)})
+    for name, shape in expected.items():
+      value = poses.get(name)
+      if (not isinstance(value, torch.Tensor) or tuple(value.shape) != shape
+          or value.dtype != torch.float32
+          or not _same_torch_device(value.device, self._device)
+          or not value.is_contiguous()):
+        raise ValueError(
+            f"POS capture requires contiguous {name} on {self._device} with shape {shape}")
+    # A failed copy after this point may have partially overwritten buffers,
+    # so invalidate the previous token before beginning the first write.
+    self._latest_position_context = None
+    for name in ("_flexvert_xpos", "_flexvert_xpos_low",
+                 "_flexvert_xpos_tail", "_flexvert_J",
+                 "_node_xpos", "_node_xpos_low", "_node_xpos_tail",
+                 "_node_J", "_flexedge_length",
+                 "_flexedge_dir", "_flexedge_J"):
+      buffers[name].copy_(getattr(self, name))
+    self._compute_flexvert_equalities(
+        buffers["_flexvert_xpos"], buffers["_flexvert_J"])
+    buffers["_flexvert_eq_pos"].copy_(self._flexvert_eq_pos)
+    buffers["_flexvert_eq_J"].copy_(self._flexvert_eq_J)
+    for eqid, name in self._flexstrain_context_names.items():
+      pos, jac = self._flexstrain_pos_jac(self._flexstrain_records[eqid])
+      buffers[name + "_pos"].copy_(pos)
+      buffers[name + "_J"].copy_(jac)
+    # The last poses dictionary used by update_kinematics is retained only as
+    # an alias. Copying happens here so a later integration stage may replace
+    # its arrays without changing this position context.
+    buffers["body_pos"].copy_(poses["body_pos"])
+    buffers["body_pos_low"].copy_(
+        poses.get("body_pos_low", self._zero_body_pos_low))
+    buffers["body_pos_tail"].copy_(
+        poses.get("body_pos_tail", self._zero_body_pos_tail))
+    buffers["body_quat"].copy_(poses["body_quat"])
+    for name in ("joint_anchor", "joint_axis"):
+      value = poses.get(name)
+      if value is None:
+        if self.descriptor.njnt:
+          raise ValueError(f"POS capture requires joint pose field {name}")
+        buffers[name].zero_()
+      else:
+        buffers[name].copy_(value)
+    self._position_context_generation += 1
+    context = _FlexPositionContext(
+        self, self._position_context_generation, buffers)
+    self._latest_position_context = context
+    return context
+
+  def _masked_recovery_copy(self, source, target, world_mask):
+    """Copy a captured per-world POS row only where recovery is selected."""
+    b = self.batch_size
+    if source.shape != target.shape or source.shape[0] != b:
+      raise ValueError("flex recovery copy requires matching batched buffers")
+    width = source.numel() // b
+    if width == 0:
+      return
+    total = b * width
+    if total > (1 << 31) - 1:
+      raise ValueError("masked flex recovery copy exceeds signed int32 indexing")
+    dims = self._recovery_copy_dims
+    dims[0] = b
+    dims[1] = width
+    dims[2:].copy_(world_mask)
+    self._material_shader.flex_recovery_masked_copy(
+        source.reshape(-1), world_mask, dims, target.reshape(-1),
+        threads=(total,), group_size=(128,))
+
+  def _masked_recovery_matvec(self, jacobian, qvel, output, world_mask):
+    """Evaluate J*qvel for selected flex worlds without touching others."""
+    b, nv = self.batch_size, self.descriptor.nv
+    width = output.numel() // b
+    if width == 0:
+      return
+    total = b * width
+    if total > (1 << 31) - 1:
+      raise ValueError("masked flex recovery matvec exceeds signed int32 indexing")
+    dims = self._recovery_matvec_dims
+    dims[0] = b
+    dims[1] = width
+    dims[2] = nv
+    dims[3:].copy_(world_mask)
+    dummy = self._material_dummy_f
+    self._material_shader.flex_recovery_masked_matvec(
+        jacobian.reshape(-1) if nv else dummy,
+        qvel.reshape(-1) if nv else dummy,
+        world_mask, dims, output.reshape(-1), threads=(total,),
+        group_size=(128,))
+
+  def run_velocity_device(self, context, qpos, qvel, poses=None, cvel=None,
+                          world_mask=None):
+    """Re-evaluate passive flex forces at captured positions for new qvel.
+
+    No forward kinematics or collision/strain position update is performed.
+    Vertex/node velocities and edge rates are refreshed from the captured
+    point/edge Jacobians times the supplied generalized velocity. ``qpos``,
+    ``poses`` and ``cvel`` are accepted to match the integration hook; the
+    captured body/joint pose and positions are authoritative for this frozen
+    stage, and cvel is not used to reconstruct them.
+    """
+    if (not isinstance(context, _FlexPositionContext)
+        or context.owner is not self
+        or context is not self._latest_position_context
+        or context.generation != self._position_context_generation):
+      raise ValueError("flex POS context is foreign, stale, or invalidated")
+    b, nv = self.batch_size, self.descriptor.nv
+    self._validate_position_tensor("qpos", qpos, (b, self.descriptor.nq))
+    self._validate_position_tensor("qvel", qvel, (b, nv))
+    self._validate_world_mask(world_mask)
+    del poses, cvel
+    buffers = context.buffers
+    if world_mask is not None and self._device.type == "mps":
+      for name in ("_flexvert_xpos", "_flexvert_xpos_low", "_flexvert_J",
+                   "_flexvert_xpos_tail", "_node_xpos", "_node_xpos_low",
+                   "_node_xpos_tail", "_node_J", "_flexedge_length",
+                   "_flexedge_dir", "_flexedge_J", "_flexvert_eq_pos",
+                   "_flexvert_eq_J"):
+        self._masked_recovery_copy(
+            buffers[name], getattr(self, name), world_mask)
+    else:
+      for name in ("_flexvert_xpos", "_flexvert_xpos_low",
+                   "_flexvert_xpos_tail", "_flexvert_J",
+                   "_node_xpos", "_node_xpos_low", "_node_xpos_tail",
+                   "_node_J", "_flexedge_length",
+                   "_flexedge_dir", "_flexedge_J"):
+        getattr(self, name).copy_(buffers[name])
+      self._flexvert_eq_pos.copy_(buffers["_flexvert_eq_pos"])
+      self._flexvert_eq_J.copy_(buffers["_flexvert_eq_J"])
+      self._last_kinematics_poses = {
+        "body_pos": buffers["body_pos"],
+        "body_pos_low": buffers["body_pos_low"],
+        "body_pos_tail": buffers["body_pos_tail"],
+        "body_quat": buffers["body_quat"],
+        "joint_anchor": buffers["joint_anchor"],
+        "joint_axis": buffers["joint_axis"],
+      }
+    position_poses = {
+        "body_pos": buffers["body_pos"],
+        "body_pos_low": buffers["body_pos_low"],
+        "body_pos_tail": buffers["body_pos_tail"],
+        "body_quat": buffers["body_quat"],
+        "joint_anchor": buffers["joint_anchor"],
+        "joint_axis": buffers["joint_axis"],
+    }
+    if nv:
+      if world_mask is not None and self._device.type == "mps":
+        self._masked_recovery_matvec(
+            self._flexvert_J, qvel, self._flexvert_xvel, world_mask)
+        if len(self.descriptor.nodebodyid):
+          self._masked_recovery_matvec(
+              self._node_J, qvel, self._node_xvel, world_mask)
+        if self.descriptor.nflexedge:
+          self._masked_recovery_matvec(
+              self._flexedge_J, qvel, self._flexedge_velocity, world_mask)
+      else:
+        self._flexvert_xvel.copy_(torch.einsum(
+            "bvcn,bn->bvc", self._flexvert_J, qvel))
+        if len(self.descriptor.nodebodyid):
+          self._node_xvel.copy_(torch.einsum(
+              "bvcn,bn->bvc", self._node_J, qvel))
+        if self.descriptor.nflexedge:
+          self._flexedge_velocity.copy_(torch.einsum(
+              "ben,bn->be", self._flexedge_J, qvel))
+    else:
+      self._flexvert_xvel.zero_()
+      self._node_xvel.zero_()
+      self._flexedge_velocity.zero_()
+    result_buffers = (self._qfrc_passive, self._damping_tangent,
+                      self._stiffness_tangent)
+    try:
+      return self._compute_passive_from_current(
+          qvel, position_poses, world_mask=world_mask)
+    finally:
+      (self._qfrc_passive, self._damping_tangent,
+       self._stiffness_tangent) = result_buffers
+
+  def _validate_position_tensor(self, name, value, shape):
+    if (not isinstance(value, torch.Tensor) or tuple(value.shape) != shape
+        or value.dtype != torch.float32
+        or not _same_torch_device(value.device, self._device)
+        or not value.is_contiguous()):
+      raise ValueError(f"{name} must be contiguous float32 on {self._device} with shape {shape}")
+
+  def _validate_world_mask(self, world_mask):
+    """Validate the shared active-row ABI used by masked native recovery."""
+    if world_mask is None:
+      return
+    if (not isinstance(world_mask, torch.Tensor)
+        or world_mask.dtype != torch.int32
+        or tuple(world_mask.shape) != (self.batch_size,)
+        or not _same_torch_device(world_mask.device, self._device)
+        or not world_mask.is_contiguous()):
+      raise ValueError("world_mask must be contiguous int32[B] on the flex device")
+
+  def _compute_flexvert_equalities(self, xpos=None, point_jacobian=None):
+    """Compute pinned two-invariant cloth rows and their analytic Jacobian.
+
+    This is the ``mjEQ_FLEXVERT`` law from MuJoCo 3.10: each vertex averages
+    weighted neighbor-edge outer products, maps through its compiled 2x2
+    reference metric, then constrains ``tr(F'F)-2`` and ``det(F'F)-1``.
+    ``flexvert_J`` is formed by the pinned endpoint chain rule and mass scale.
+    Topology and all Python loop bounds are immutable lowering data.
+    """
+    xpos = self._flexvert_xpos if xpos is None else xpos
+    point_jacobian = self._flexvert_J if point_jacobian is None else point_jacobian
+    out_pos = self._flexvert_eq_pos
+    out_jac = self._flexvert_eq_J
+    out_pos.zero_()
+    out_jac.zero_()
+    nv = self.descriptor.nv
+    if nv == 0:
+      return out_pos, out_jac[..., :0]
+    for v, records in enumerate(self._vertex_neighbors_host):
+      if not records:
+        continue
+      A = torch.zeros((self.batch_size, 3, 2),
+                      dtype=torch.float32, device=self._device)
+      for v1, v2, dx, weight in records:
+        dy = xpos[:, v2, :] - xpos[:, v1, :]
+        A.add_(weight * dy.unsqueeze(-1) * dx.view(1, 1, 2))
+      metric = self._vertmetric[v].reshape(2, 2)
+      F = torch.matmul(A, metric)
+      f00, f01 = F[:, 0, 0], F[:, 0, 1]
+      f10, f11 = F[:, 1, 0], F[:, 1, 1]
+      f20, f21 = F[:, 2, 0], F[:, 2, 1]
+      c00 = f00.square() + f10.square() + f20.square()
+      c01 = f00 * f01 + f10 * f11 + f20 * f21
+      c10 = c01
+      c11 = f01.square() + f11.square() + f21.square()
+      body = int(self.descriptor.vertbodyid[v])
+      mass = float(self.descriptor.body_mass[body]) if body >= 0 else 0.0
+      scale = math.sqrt(mass) if mass > 1e-15 else 1.0
+      out_pos[:, v, 0].copy_((c00 + c11 - 2.0) * scale)
+      out_pos[:, v, 1].copy_((c00 * c11 - c01 * c10 - 1.0) * scale)
+      FB = torch.matmul(F, metric)
+      adj = torch.stack((c11, -c01, -c10, c00), dim=-1).reshape(-1, 2, 2)
+      FadjBinv = torch.matmul(torch.matmul(F, adj), metric)
+      for v1, v2, dx, weight in records:
+        dI1dy1 = -2.0 * weight * torch.matmul(FB, dx)
+        dI2dy1 = -2.0 * weight * torch.matmul(FadjBinv, dx)
+        J1 = point_jacobian[:, v1, :, :nv]
+        J2 = point_jacobian[:, v2, :, :nv]
+        out_jac[:, v, 0, :nv].add_(scale * torch.einsum(
+            "bd,bdn->bn", dI1dy1, J1 - J2))
+        out_jac[:, v, 1, :nv].add_(scale * torch.einsum(
+            "bd,bdn->bn", dI2dy1, J1 - J2))
+    return out_pos, out_jac[..., :nv]
+
+  def run_flexvert_equalities(self, context=None, qpos=None, qvel=None):
+    """Return all compiled ``mjEQ_FLEXVERT`` residual, velocity and J rows.
+
+    Rows use pinned order ``(vertex0 invariant0, vertex0 invariant1, ...)``.
+    Optional context selects frozen-POS replay; qvel refresh only evaluates
+    ``J*qvel``. Each flex's rows are selected by ``flexvert_row_ids``.
+    """
+    if context is not None:
+      if (not isinstance(context, _FlexPositionContext)
+          or context.owner is not self
+          or context is not self._latest_position_context
+          or context.generation != self._position_context_generation):
+        raise ValueError("flex POS context is foreign, stale, or invalidated")
+      self._flexvert_eq_pos.copy_(context.buffers["_flexvert_eq_pos"])
+      self._flexvert_eq_J.copy_(context.buffers["_flexvert_eq_J"])
+    else:
+      self._compute_flexvert_equalities()
+    pos = self._flexvert_eq_pos.reshape(self.batch_size, -1)
+    jac = self._flexvert_eq_J[..., :self.descriptor.nv].reshape(
+        self.batch_size, 2 * self.descriptor.nflexvert, self.descriptor.nv)
+    if qvel is None:
+      vel = self._flexvert_eq_vel.reshape(self.batch_size, -1)
+      vel.zero_()
+    else:
+      self._validate_position_tensor("qvel", qvel,
+                                     (self.batch_size, self.descriptor.nv))
+      self._flexvert_eq_vel.copy_(torch.einsum("brn,bn->br", jac, qvel).reshape(
+          self.batch_size, self.descriptor.nflexvert, 2))
+      vel = self._flexvert_eq_vel.reshape(self.batch_size, -1)
+    return {"pos": pos, "vel": vel, "J": jac,
+            "flex_ids": self._flexvert_eq_flexids}
+
+  def run_flexvert_equality_rows(self, equality_id, qvel, context=None):
+    """Produce one compiled ``mjEQ_FLEXVERT`` row block and solver refs.
+
+    Rows are the canonical two invariant constraints per vertex for the
+    equality's flex. The returned `pos`, `vel`, `J`, `R` and `aref` use the
+    exact pinned row order; row IDs map directly to the global all-flex
+    invariant arrays. The position context can refresh velocity without FK.
+    """
+    equality_id = int(equality_id)
+    params = self._flexvert_eq_param_sets.get(equality_id)
+    if params is None:
+      raise ValueError("equality_id is not a compiled mjEQ_FLEXVERT")
+    all_rows = self.run_flexvert_equalities(
+        context=context, qvel=qvel)
+    f = params["flex_id"]
+    vert_start = int(self.model.flex_vertadr[f])
+    vert_num = int(self.model.flex_vertnum[f])
+    row_start, row_stop = 2 * vert_start, 2 * (vert_start + vert_num)
+    pos = all_rows["pos"][:, row_start:row_stop]
+    vel = all_rows["vel"][:, row_start:row_stop]
+    jac = all_rows["J"][:, row_start:row_stop, :]
+    solimp = params["solimp"]
+    dmin, dmax = solimp[0], solimp[1]
+    width, mid, power = solimp[2], solimp[3], solimp[4]
+    abs_pos = torch.abs(pos)
+    y = abs_pos / torch.clamp(width, min=1e-15)
+    safe_mid = torch.clamp(mid, min=1e-15, max=1.0 - 1e-15)
+    low_scale = torch.pow(safe_mid, power - 1.0).reciprocal()
+    high_scale = torch.pow(torch.clamp(1.0 - mid, min=1e-15),
+                           power - 1.0).reciprocal()
+    curve = torch.where(y <= mid,
+        low_scale * torch.pow(torch.clamp(y, min=0.0), power),
+        1.0 - high_scale * torch.pow(torch.clamp(1.0 - y, min=0.0), power))
+    curve_imp = dmin + curve * (dmax - dmin)
+    imp = torch.where((width <= 1e-15) | (dmin == dmax),
+        0.5 * (dmin + dmax),
+        torch.where(y <= 0.0, dmin,
+        torch.where(y >= 1.0, dmax, curve_imp)))
+    imp = torch.clamp(imp, min=1e-4, max=0.9999)
+    diag = params["diag"]
+    target_shape = (self.batch_size, vert_num, 2)
+    imp_out = self._flexvert_eq_imp[:, vert_start:vert_start + vert_num, :]
+    aref_out = self._flexvert_eq_aref[:, vert_start:vert_start + vert_num, :]
+    R_out = self._flexvert_eq_R[:, vert_start:vert_start + vert_num, :]
+    imp_out.copy_(imp.reshape(target_shape))
+    aref_out.copy_((-(params["b0"] * vel
+                      + params["k0"] * imp * pos)).reshape(target_shape))
+    R_out.copy_(torch.clamp(
+        ((1.0 - imp) / imp * diag).reshape(target_shape), min=1e-15))
+    return {"pos": pos, "vel": vel, "J": jac,
+            "impedance": imp_out.reshape(self.batch_size, -1),
+            "R": R_out.reshape(self.batch_size, -1),
+            "aref": aref_out.reshape(self.batch_size, -1),
+            "diag": diag,
+            "solimp": solimp, "solref": params["solref"],
+            "b0": params["b0"], "k0": params["k0"],
+            "row_ids": self.flexvert_row_ids(f),
+            "flex_id": f, "equality_id": equality_id,
+            "jdot_included": False,
+            "jdot_policy": "pinned_zero_for_flex_equality"}
+
+  def flexvert_row_ids(self, flex_id: int) -> np.ndarray:
+    """Return immutable canonical two-row IDs for a flexvert equality."""
+    flex_id = int(flex_id)
+    if flex_id < 0 or flex_id >= self.descriptor.nflex:
+      raise IndexError("flex_id is outside the compiled model")
+    if flex_id not in self._flexvert_eq_flexids:
+      return _frozen([], np.int32)
+    vert_start = int(self.model.flex_vertadr[flex_id])
+    vert_num = int(self.model.flex_vertnum[flex_id])
+    return _frozen(np.arange(2 * vert_start, 2 * (vert_start + vert_num)),
+                   np.int32)
+
+  def flex_equality_position_context(self, context):
+    """Return a unified frozen-POS contract for compiled flex equalities.
+
+    Entries are keyed by compiled equality ID and carry canonical source row
+    identities, the captured residual/J, solver diagonal and source
+    solref/solimp.  Consumers refresh velocity-dependent ``aref`` from
+    ``J*qvel``; all three flex equality families have zero ``Jdot*v`` in the
+    pinned 3.10 ``mj_Jdotv`` implementation (that routine handles only
+    connect and weld rows).
+
+    The arrays and tensors are borrowed and valid until the next POS capture.
+    This is producer metadata only: it does not claim that an owning solver
+    has allocated or admitted these rows.
+    """
+    self._validate_flex_position_context(context)
+    out = {}
+    for eqid, flex_id in self._equality_flex_ids.items():
+      edge_ids = self.equality_edge_ids(flex_id)
+      params = self._equality_parameter_sets[eqid]
+      out[eqid] = {
+          "kind": "flex", "flex_id": flex_id,
+          "row_ids": edge_ids,
+          "pos": context.buffers["_flexedge_length"][:, edge_ids]
+                    - self._edge_length0[edge_ids].unsqueeze(0),
+          "J": context.buffers["_flexedge_J"][:, edge_ids, :self.descriptor.nv],
+          "diag": params["diag"][:, edge_ids],
+          "solimp": params["solimp"],
+          "solref": params["solref"],
+          "jdot_included": False,
+          "jdot_policy": "pinned_zero_for_flex_equality",
+      }
+    for eqid, params in self._flexvert_eq_param_sets.items():
+      flex_id = params["flex_id"]
+      start = int(self.model.flex_vertadr[flex_id])
+      count = int(self.model.flex_vertnum[flex_id])
+      row_ids = self.flexvert_row_ids(flex_id)
+      out[eqid] = {
+          "kind": "flexvert", "flex_id": flex_id, "row_ids": row_ids,
+          "pos": context.buffers["_flexvert_eq_pos"][:, start:start + count]
+                    .reshape(self.batch_size, -1),
+          "J": context.buffers["_flexvert_eq_J"][:, start:start + count]
+                    [..., :self.descriptor.nv].reshape(
+                        self.batch_size, len(row_ids), self.descriptor.nv),
+          "diag": params["diag"].expand(self.batch_size, -1).reshape(
+              self.batch_size, -1),
+          "solimp": params["solimp"],
+          "solref": params["solref"],
+          "jdot_included": False,
+          "jdot_policy": "pinned_zero_for_flex_equality",
+      }
+    for eqid, name in self._flexstrain_context_names.items():
+      rec = self._flexstrain_records[eqid]
+      count = int(rec["eigenvectors"].shape[0])
+      out[eqid] = {
+          "kind": "flexstrain", "flex_id": rec["flex_id"],
+          "row_ids": _frozen(np.arange(count, dtype=np.int32), np.int32),
+          "pos": context.buffers[name + "_pos"],
+          "J": context.buffers[name + "_J"][..., :self.descriptor.nv],
+          "diag": float(rec["diag"]),
+          "solimp": rec["solimp"], "solref": rec["solref"],
+          "jdot_included": False,
+          "jdot_policy": "pinned_zero_for_flex_equality",
+      }
+    return out
+
+  def _validate_flex_position_context(self, context):
+    if (not isinstance(context, _FlexPositionContext)
+        or context.owner is not self
+        or context is not self._latest_position_context
+        or context.generation != self._position_context_generation):
+      raise ValueError("flex POS context is foreign, stale, or invalidated")
+
+  def run_flex_equality_rows(self, equality_id, context, qpos, qvel):
+    """Dispatch one compiled flex equality through the common row contract.
+
+    ``row_ids`` are stable producer identities, not current efc addresses.
+    Solver allocation remains the coupled-constraint owner's responsibility.
+    """
+    equality_id = int(equality_id)
+    if equality_id in self._equality_flex_ids:
+      edge_ids = self.equality_edge_ids(self._equality_flex_ids[equality_id])
+      pos, aref, R, J = self.run_equalities_velocity(
+          context, qpos, qvel, equality_id=equality_id)
+      raw = self.equality_position_context
+      return {
+          "kind": "flex", "equality_id": equality_id,
+          "flex_id": self._equality_flex_ids[equality_id],
+          "row_ids": edge_ids, "pos": pos[:, edge_ids],
+          "vel": torch.einsum("ben,bn->be", J[:, edge_ids, :], qvel),
+          "J": J[:, edge_ids, :], "aref": aref[:, edge_ids],
+          "R": R[:, edge_ids],
+          "diag": raw["diag"][:, edge_ids],
+          "impedance": raw["impedance"][:, edge_ids],
+          "b0": raw["b0"][:, edge_ids], "k0": raw["k0"][:, edge_ids],
+          "jdot_included": False,
+          "jdot_policy": "pinned_zero_for_flex_equality",
+      }
+    if equality_id in self._flexvert_eq_param_sets:
+      out = self.run_flexvert_equality_rows(equality_id, qvel, context)
+    elif equality_id in self._flexstrain_records:
+      out = self.run_flexstrain_equality_rows(equality_id, qvel, context)
+    else:
+      raise ValueError("equality_id is not a compiled flex equality")
+    out = dict(out)
+    out["kind"] = "flexvert" if equality_id in self._flexvert_eq_param_sets else "flexstrain"
+    if "row_ids" not in out:
+      out["row_ids"] = out.get("row_ordinals")
+    out["jdot_included"] = False
+    out["jdot_policy"] = "pinned_zero_for_flex_equality"
+    return out
+
+  def flexstrain_position_context(self, context):
+    """Borrowed raw POS row/J terms keyed by compiled flexstrain equality."""
+    self._validate_flex_position_context(context)
+    out = {}
+    for eqid, name in self._flexstrain_context_names.items():
+      rec = self._flexstrain_records[eqid]
+      out[eqid] = {
+          "pos": context.buffers[name + "_pos"],
+          "J": context.buffers[name + "_J"][..., :self.descriptor.nv],
+          "diag": float(rec["diag"]),
+          "solimp": rec["solimp"], "solref": rec["solref"],
+          "row_ordinals": np.arange(rec["eigenvectors"].shape[0],
+                                     dtype=np.int32),
+      }
+    return out
+
+  def run_flexstrain_equality_rows(self, equality_id, qvel, context=None):
+    """Evaluate one compiled ``mjEQ_FLEXSTRAIN`` element's rows.
+
+    Row identities and eigenvectors are compiled model data. The corotated
+    residual and its source-defined frozen-frame Jacobian are evaluated from
+    the current flex-node positions/Jacobians. Pinned ``mj_Jdotv`` only adds
+    terms for connect/weld equalities and leaves flex rows unchanged, so no
+    ``Jdot*qvel`` term is added for this equality family.
+    """
+    record = self._flexstrain_records.get(int(equality_id))
+    if record is None:
+      raise ValueError("equality_id is not a compiled flexstrain element")
+    self._validate_position_tensor("qvel", qvel,
+                                   (self.batch_size, self.descriptor.nv))
+    if context is None:
+      pos, jac = self._flexstrain_pos_jac(record)
+    else:
+      if (not isinstance(context, _FlexPositionContext)
+          or context.owner is not self
+          or context is not self._latest_position_context
+          or context.generation != self._position_context_generation):
+        raise ValueError("flex POS context is foreign, stale, or invalidated")
+      name = self._flexstrain_context_names[int(equality_id)]
+      pos = context.buffers[name + "_pos"]
+      jac = context.buffers[name + "_J"][..., :self.descriptor.nv]
+    vel = (torch.einsum("brv,bv->br", jac, qvel)
+           if self.descriptor.nv else torch.zeros_like(pos))
+    solimp, solref = record["solimp"], record["solref"]
+    dmin, dmax = solimp[0], solimp[1]
+    width, mid, power = solimp[2], solimp[3], solimp[4]
+    safe_width = torch.clamp(width, min=1e-15)
+    y = torch.abs(pos) / safe_width
+    safe_mid = torch.clamp(mid, min=1e-15, max=1.0 - 1e-15)
+    low = torch.pow(safe_mid, power - 1.0).reciprocal() * torch.pow(
+        torch.clamp(y, min=0.0), power)
+    high = 1.0 - torch.pow(torch.clamp(1.0 - y, min=0.0), power) / torch.pow(
+        torch.clamp(1.0 - mid, min=1e-15), power - 1.0)
+    imp = dmin + torch.where(y <= mid, low, high) * (dmax - dmin)
+    imp = torch.where((width <= 1e-15) | (dmin == dmax),
+                      0.5 * (dmin + dmax),
+                      torch.where(y <= 0.0, dmin,
+                                  torch.where(y >= 1.0, dmax, imp)))
+    imp = imp.clamp(min=1e-4, max=0.9999)
+    ref0 = solref[0]
+    if not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE)):
+      ref0 = torch.where(ref0 > 0.0,
+                         torch.clamp(ref0, min=2.0*self.descriptor.timestep),
+                         ref0)
+    b0 = torch.where(solref[1] > 0.0,
+        2.0 / torch.clamp(dmax * torch.where(ref0 > 0.0, ref0, 1.0), min=1e-15),
+        -solref[1] / torch.clamp(dmax, min=1e-15))
+    k0 = torch.where(ref0 > 0.0,
+        1.0 / torch.clamp(dmax*dmax*ref0*ref0
+                          * torch.where(solref[1] > 0.0,
+                                        solref[1]*solref[1], 1.0), min=1e-15),
+        -ref0 / torch.clamp(dmax*dmax, min=1e-15))
+    diag = torch.full_like(pos, float(record["diag"]))
+    R = ((1.0 - imp) / imp * diag).clamp(min=1e-15)
+    aref = -(b0 * vel + k0 * imp * pos)
+    return {"pos": pos, "vel": vel, "J": jac, "impedance": imp,
+            "R": R, "aref": aref, "diag": diag,
+            "solimp": solimp, "solref": solref, "b0": b0, "k0": k0,
+            "equality_id": int(equality_id),
+            "row_ids": self.descriptor.equality_row_ids_by_eqid[
+                int(equality_id)],
+            "row_ordinals": self.descriptor.equality_row_ids_by_eqid[
+                int(equality_id)],
+            "jdot_included": False,
+            "jdot_policy": "pinned_zero_for_flex_equality"}
+
+  def _flexstrain_pos_jac(self, record):
+    ids = record["node_ids_t"]
+    x, Jnode = self._node_xpos[:, ids], self._node_J[:, ids]
+    order = record["order"]
+    if record["shell"]:
+      grad = record["shape_grad"]
+      tangents = torch.einsum("bnd,nk->bdk", x, grad[:, :2])
+      axes = record["axes"]
+      F = torch.zeros((self.batch_size, 3, 3), dtype=x.dtype,
+                      device=self._device)
+      F[:, :, axes[0]] = tangents[:, :, 0]
+      F[:, :, axes[1]] = tangents[:, :, 1]
+      F[:, :, axes[2]] = torch.cross(tangents[:, :, 0],
+                                      tangents[:, :, 1], dim=-1)
+    else:
+      grad = record["shape_grad"]
+      F = torch.einsum("bnd,nk->bdk", x, grad)
+    qlocal = self._mat2rot_pinned(F).clone()
+    qlocal[:, 1:] *= -1
+    displacement = (self._quat_rotate(qlocal, x)
+                    - self._node0[ids].unsqueeze(0))
+    eig = record["eigenvectors"]
+    pos = torch.einsum("enc,bnc->be", eig, displacement)
+    qworld = qlocal.clone()
+    qworld[:, 1:] *= -1
+    world_eig = self._quat_rotate(
+        qworld, eig.reshape(1, -1, 3).expand(self.batch_size, -1, -1))
+    world_eig = world_eig.reshape(
+        self.batch_size, eig.shape[0], eig.shape[1], 3)
+    jac = torch.einsum("benc,bncq->beq", world_eig, Jnode)
+    return pos, jac[..., :self.descriptor.nv]
 
   def _compute_jacobians(self, poses: Dict[str, torch.Tensor]):
     """Vectorized calculation of vertex and edge Jacobians on device MPS."""
     self._compute_point_jacobian(
         self._vertbodyid, self._flexvert_xpos, self._flexvert_J, poses)
+    if self._flexvert_spatial_J_allocated:
+      self._compute_point_angular_jacobian(self._flexvert_spatial_J, poses)
     if len(self.descriptor.nodebodyid):
       self._compute_point_jacobian(
           self._nodebodyid, self._node_xpos, self._node_J, poses)
+    if self._has_shell_tfi_nodes and self.descriptor.nv:
+      if self._device.type == "mps":
+        self._material_shader.flex_shell_tfi_jacobian(
+            self._shell_tfi_enabled, self._shell_tfi_nodes,
+            self._shell_tfi_weights, self._node_J.reshape(-1),
+            self._shell_tfi_dims,
+            threads=(self.batch_size * len(self.descriptor.nodebodyid) * 3
+                     * self.descriptor.nv,), group_size=(128,))
+      else:
+        shell_j = (self._node_J[:, self._shell_tfi_nodes]
+                   * self._shell_tfi_weights[None, :, :, None, None]).sum(dim=2)
+        enabled = self._shell_tfi_enabled.bool()[None, :, None, None]
+        self._node_J.copy_(torch.where(enabled, shell_j, self._node_J))
+    if self._has_interpolated_vertices and self.descriptor.nv:
+      if self._device.type == "mps":
+        self._material_shader.flex_interpolate_vertex_jacobian(
+            self._vertex_interp_enabled, self._vertex_interp_nodes,
+            self._vertex_interp_weights, self._node_J.reshape(-1),
+            self._vertex_interp_dims, self._flexvert_J.reshape(-1),
+            threads=(self.batch_size * self.descriptor.nflexvert * 3
+                     * self.descriptor.nv,), group_size=(128,))
+      else:
+        interp_j = (self._node_J[:, self._vertex_interp_nodes]
+                    * self._vertex_interp_weights[None, :, :, None, None]).sum(dim=2)
+        enabled = self._vertex_interp_enabled.bool()[None, :, None, None]
+        self._flexvert_J.copy_(torch.where(enabled, interp_j, self._flexvert_J))
+      # Interpolated flex vertices are not rigid attachments with one angular
+      # velocity. Source flex contact Jacobians use compiled node-body weights;
+      # keep the linear generalized Jacobian here exact and avoid presenting
+      # placeholder flex_vertbodyid angular rows as physical data.
+      if (self._flexvert_spatial_J_allocated
+          and self._interpolated_vertex_ids_host):
+        self._flexvert_spatial_J[:, self._interpolated_vertex_ids_host, 3:, :] = 0
+    if self._flexvert_spatial_J_allocated:
+      self._flexvert_spatial_J[:, :, :3, :].copy_(self._flexvert_J)
 
     # 5. Assemble edge Jacobians: J_e = u_e^T (J_v1 - J_v0)
     e0 = self._edge[:, 0]
@@ -880,6 +2837,23 @@ class MetalFlex:
     dJ = J1 - J0                         # (B, nflexedge, 3, nv)
     u_exp = self._flexedge_dir.unsqueeze(2)  # (B, nflexedge, 1, 3)
     self._flexedge_J.copy_(torch.matmul(u_exp, dJ).squeeze(2))
+    # Match engine_passive.c's compiled sparse projection exactly.  Geometric
+    # edge motion may depend on more coordinates than the compiled flexedge_J
+    # row exposes; those columns must not contribute force, velocity, or D.
+    if self.descriptor.nv and self.descriptor.nflexedge:
+      if self._device.type == "mps":
+        self._edge_operator_shader.flex_edge_jacobian_compiled_support(
+            self._edge_j_rowadr, self._edge_j_rownnz, self._edge_j_colind,
+            self._edge_j_mask_dims, self._flexedge_J.reshape(-1),
+            self._flexedge_velocity.reshape(-1),
+            threads=(self.batch_size * self.descriptor.nflexedge,),
+            group_size=(64,))
+      else:
+        for edge, unsupported in enumerate(self._edge_j_unsupported_host):
+          if len(unsupported):
+            self._flexedge_J[:, edge, unsupported] = 0.0
+          if int(self._edge_j_rownnz_host[edge]) == 0:
+            self._flexedge_velocity[:, edge] = 0.0
 
   def _compute_point_jacobian(self, body_ids, points, output, poses):
     b, nv = self.batch_size, self.descriptor.nv
@@ -924,6 +2898,122 @@ class MetalFlex:
               output[:, index, 1, da + 1] = 1.0
               output[:, index, 2, da + 2] = 1.0
         curr = int(self._body_parentid[curr])
+
+  def _compute_point_angular_jacobian(self, output, poses):
+    """Fill rotational point-Jacobian rows from compiled body joints."""
+    b, nv = self.batch_size, self.descriptor.nv
+    output.zero_()
+    if nv <= 0:
+      return
+    body_quat = poses["body_quat"]
+    axes = poses.get("joint_axis")
+    for index, body_value in enumerate(self.descriptor.vertbodyid):
+      curr = int(body_value)
+      while curr > 0 and curr < self.descriptor.nbody:
+        ja = int(self._body_jntadr[curr])
+        jn = int(self._body_jntnum[curr])
+        for joint in range(ja, ja + jn):
+          if joint < 0 or joint >= self.descriptor.njnt:
+            continue
+          dof = int(self._jnt_dofadr[joint])
+          joint_type = int(self._jnt_type[joint])
+          if joint_type == 3 and axes is not None:
+            output[:, index, 3:, dof] += axes[:, joint, :]
+          elif joint_type in (0, 1):
+            quat = body_quat[:, curr, :]
+            qw, qv = quat[:, :1], quat[:, 1:]
+            for rot_i in range(3):
+              unit = torch.zeros((b, 3), dtype=torch.float32,
+                                 device=self._device)
+              unit[:, rot_i] = 1.0
+              t = 2.0 * torch.cross(qv, unit, dim=-1)
+              axis = unit + qw * t + torch.cross(qv, t, dim=-1)
+              offset = 3 + rot_i if joint_type == 0 else rot_i
+              output[:, index, 3:, dof + offset] = axis
+        curr = int(self._body_parentid[curr])
+
+  def contact_spatial_jacobians(self):
+    """Return the borrowed `[B,nflexvert,6,nv]` point spatial Jacobians.
+
+    Call after `update_kinematics` with the current poses. The translational
+    and angular halves use the same body/ancestor DOF mapping.
+    """
+    if self._kinematics_generation == 0:
+      raise RuntimeError("flex kinematics must be updated before requesting contact Jacobians")
+    if not self._flexvert_spatial_J_allocated:
+      self._flexvert_spatial_J = torch.zeros(
+          (self.batch_size, self.descriptor.nflexvert, 6,
+           max(self.descriptor.nv, 1)), dtype=torch.float32,
+          device=self._device)
+      self._flexvert_spatial_J_allocated = True
+    self._compute_point_angular_jacobian(
+        self._flexvert_spatial_J, self._last_kinematics_poses)
+    if self._interpolated_vertex_ids_host:
+      self._flexvert_spatial_J[:, self._interpolated_vertex_ids_host, 3:, :] = 0
+    self._flexvert_spatial_J[:, :, :3, :].copy_(self._flexvert_J)
+    return self._flexvert_spatial_J
+
+  def run_native_contact_rows(self, poses, qvel, diagA_local=None, *, cvel=None,
+                              row_workspace=None, include_wake_links=True,
+                              packed_jacobian=None, canonical_row_offset=0,
+                              world_mask=None):
+    """Produce fixed flex-contact candidates, full-frame Jacobians and rows.
+
+    This is the owned flex-side seam for a coupled-constraint allocator.
+    ``diagA_local`` may provide the pinned source-derived approximation for
+    the immutable flex-contact row block, shaped ``[B, row_capacity]``. For
+    admitted plane/vertex slots it is derived on device when omitted. The
+    caller copies the returned local rows into its reserved global span; no
+    candidate compaction or device-active readback is required. The raw
+    replay context is ``[K, B, imp, pos, margin]`` with projected surface
+    velocity returned separately. No Jdot contribution is folded into this
+    context.
+
+    The detector retains its construction-time fail-closed admission guard:
+    this method does not make unsupported element/geometry routes public.
+    """
+    if self._device.type != "mps":
+      raise RuntimeError("native flex contact rows require MPS")
+    required = ("geom_pos", "geom_quat", "cdof", "root_com")
+    missing = [name for name in required if name not in poses]
+    if missing:
+      raise ValueError("contact row production requires pose fields: "
+                       + ", ".join(missing))
+    self._validate_world_mask(world_mask)
+    self.update_kinematics(poses, cvel, world_mask=world_mask)
+    program = getattr(self, "_contact_program", None)
+    sparse_rows = packed_jacobian is not None
+    if program is None:
+      from .flex_contact import FlexContactProgram
+      program = FlexContactProgram(
+          self.model, batch_size=self.batch_size, device=str(self._device),
+          sparse_rows=sparse_rows)
+      self._contact_program = program
+    elif bool(getattr(program, "sparse_rows", False)) != sparse_rows:
+      raise ValueError(
+          "flex contact Jacobian storage mode changed after workspace creation")
+    contact_result = program.run_device(
+        self._flexvert_xpos, poses["geom_pos"], poses["geom_quat"],
+        flexvert_xpos_low=self._flexvert_xpos_low,
+        flexvert_xpos_tail=self._flexvert_xpos_tail,
+        geom_pos_low=poses.get("geom_pos_low"),
+        geom_pos_tail=poses.get("geom_pos_tail"),
+        flexvert_spatial_jacobian=self._flexvert_spatial_J,
+        cdof=poses["cdof"], root_com=poses["root_com"], qvel=qvel,
+        diagA=diagA_local, include_wake_links=include_wake_links,
+        row_workspace=row_workspace, packed_jacobian=packed_jacobian,
+        canonical_row_offset=canonical_row_offset, world_mask=world_mask)
+    row_names = ("R", "aref", "lo", "hi", "row_active",
+                 "position_context", "surface_velocity", "row_owner",
+                 "row_local", "row_cone", "row_friction", "row_start",
+                 "row_span")
+    if "workspace_J" in contact_result:
+      row_names = ("workspace_J",) + row_names
+    if "jacobian_packed" in contact_result:
+      row_names += ("jacobian_packed", "canonical_row_offset")
+    rows = {("active" if name == "row_active" else name): contact_result[name]
+            for name in row_names}
+    return {"contact_result": contact_result, "rows": rows}
 
   def _add_attachment_tangent(self, body_ids, points, point_jacobian, point_force, poses):
     """Add d(J' f)/dq for rigidly attached force points.
@@ -1081,117 +3171,208 @@ class MetalFlex:
       qvel: torch.Tensor,
       poses: Dict[str, torch.Tensor],
       cvel: Optional[torch.Tensor] = None,
+      world_mask: Optional[torch.Tensor] = None,
   ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute passive internal strain forces and analytic derivatives on MPS.
 
     Returns:
       (qfrc_passive, damping_tangent, stiffness_tangent)
     """
-    self.update_kinematics(poses, cvel)
+    self._validate_world_mask(world_mask)
+    self.update_kinematics(poses, cvel, world_mask=world_mask)
+    result_buffers = (self._qfrc_passive, self._damping_tangent,
+                      self._stiffness_tangent)
+    try:
+      return self._compute_passive_from_current(
+          qvel, poses, world_mask=world_mask)
+    finally:
+      (self._qfrc_passive, self._damping_tangent,
+       self._stiffness_tangent) = result_buffers
+
+  def _compute_passive_from_current(self, qvel, poses, *, world_mask=None):
+    """Evaluate passive materials from already populated POS/velocity buffers."""
     b = self.batch_size
     nv = self.descriptor.nv
+    masked_native = world_mask is not None and self._device.type == "mps"
 
-    self._qfrc_passive.zero_()
-    self._damping_tangent.zero_()
-    self._stiffness_tangent.zero_()
+    # For recovery, use private result buffers so healthy rows of the ordinary
+    # flex workspaces (which can be borrowed by the accepted forward stage)
+    # are not cleared.  Element kernels below also receive the row predicate
+    # and return before loading world data for inactive rows.
+    if world_mask is None:
+      qfrc_passive = self._qfrc_passive
+      damping_tangent = self._damping_tangent
+      stiffness_tangent = self._stiffness_tangent
+      old_result_buffers = None
+    else:
+      qfrc_passive = self._recovery_qfrc_passive
+      damping_tangent = self._recovery_damping_tangent
+      stiffness_tangent = self._recovery_stiffness_tangent
+      old_result_buffers = (self._qfrc_passive, self._damping_tangent,
+                            self._stiffness_tangent)
+      self._qfrc_passive = qfrc_passive
+      self._damping_tangent = damping_tangent
+      self._stiffness_tangent = stiffness_tangent
+    qfrc_passive.zero_()
+    damping_tangent.zero_()
+    stiffness_tangent.zero_()
+
+    spring_enabled = not (
+        self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
+    damper_enabled = not (
+        self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
+    # Pinned mj_passive returns before mj_springdamper when both flags are
+    # disabled.  This matters for direct mj_flexPassiveStretch: that routine
+    # receives the enable booleans but its compiled squared-length path does
+    # not branch on either one, unlike the direct bend and interpolated paths.
+    if not spring_enabled and not damper_enabled:
+      if old_result_buffers is not None:
+        (self._qfrc_passive, self._damping_tangent,
+         self._stiffness_tangent) = old_result_buffers
+      return qfrc_passive, damping_tangent, stiffness_tangent
 
     if nv <= 0 or self.descriptor.nflexedge <= 0:
-      return self._qfrc_passive, self._damping_tangent, self._stiffness_tangent
+      if old_result_buffers is not None:
+        (self._qfrc_passive, self._damping_tangent,
+         self._stiffness_tangent) = old_result_buffers
+      return qfrc_passive, damping_tangent, stiffness_tangent
 
     # 1. 1D Mass-spring edge tension forces
-    k_edge = self._edgestiffness[self._edge_flexid].unsqueeze(0)  # (1, nflexedge)
-    c_edge = self._edgedamping[self._edge_flexid].unsqueeze(0)    # (1, nflexedge)
-    eq_edge = self._edgeequality[self._edge_flexid].unsqueeze(0)  # (1, nflexedge)
-
-    # Elastic forces apply to edges that are NOT pure bilateral equality constraints
-    # (or if stiffness is specified)
-    dL = self._flexedge_length - self._edge_length0.unsqueeze(0)
-    Ldot = self._flexedge_velocity
-    tension = k_edge * dL + c_edge * Ldot  # (B, nflexedge)
-
-    # Zero out edges reserved for equality solver
-    is_spring = (eq_edge == 0) | (k_edge > 0)
-    tension = torch.where(is_spring, tension, torch.zeros_like(tension))
+    if masked_native:
+      # The selected-row Metal force kernel computes tension after its early
+      # world-mask guard. Do not run batched Torch formulas over healthy state.
+      tension = None
+    else:
+      k_edge = self._edge_spring_coeff.unsqueeze(0)  # (1, nflexedge)
+      c_edge = self._edge_operator_coeff.unsqueeze(0)  # (1, nflexedge)
+      dL = self._flexedge_length - self._edge_length0.unsqueeze(0)
+      Ldot = self._flexedge_velocity
+      if spring_enabled and damper_enabled:
+        tension = k_edge * dL + c_edge * Ldot
+      elif spring_enabled:
+        tension = k_edge * dL
+      elif damper_enabled:
+        tension = c_edge * Ldot
+      else:
+        tension = torch.zeros_like(dL)
 
     # Generalized edge restoring force: qfrc = - sum_e (tension_e * J_e)
     # J_e shape: (B, nflexedge, nv)
-    qfrc_edges = -torch.sum(tension.unsqueeze(-1) * self._flexedge_J, dim=1)
-    self._qfrc_passive.add_(qfrc_edges)
+    if world_mask is not None and self._device.type == "mps":
+      dims = self._recovery_edge_force_dims
+      dims[0] = b
+      dims[1] = self.descriptor.nflexedge
+      dims[2] = nv
+      dims[3] = int(spring_enabled)
+      dims[4] = int(damper_enabled)
+      self._material_shader.flex_recovery_edge_force(
+          self._flexedge_length.reshape(-1),
+          self._flexedge_velocity.reshape(-1), self._edge_length0,
+          self._edge_spring_coeff, self._edge_operator_coeff,
+          self._flexedge_J.reshape(-1), world_mask, dims,
+          qfrc_passive.reshape(-1), threads=(b * max(nv, 1),),
+          group_size=(128,))
+    else:
+      qfrc_edges = -torch.sum(tension.unsqueeze(-1) * self._flexedge_J, dim=1)
+      if world_mask is None:
+        qfrc_passive.add_(qfrc_edges)
+      else:
+        selected1 = world_mask.to(dtype=torch.bool).reshape(b, 1)
+        qfrc_passive.copy_(torch.where(selected1, qfrc_edges,
+                                       torch.zeros_like(qfrc_passive)))
 
     # Exact edge spring/damper tangents for fixed point Jacobians. The first
     # term is the familiar projected outer product. A stretched edge also
     # contributes geometric stiffness from the changing unit direction; the
     # Rayleigh-rate derivative contributes its nonsymmetric qpos term.
-    c_eff = torch.where(is_spring, c_edge, torch.zeros_like(c_edge))
-    k_eff = torch.where(is_spring, k_edge, torch.zeros_like(k_edge))
-
-    # Batched outer-product accumulation: J_e (B, nflexedge, nv)
-    J_e = self._flexedge_J
-    damp_tang = -torch.einsum("be,ben,bem->bnm", c_eff, J_e, J_e)
-    stiff_tang = -torch.einsum("be,ben,bem->bnm", k_eff, J_e, J_e)
-    rel_jac = (
-        self._flexvert_J[:, self._edge[:, 1], :, :]
-        - self._flexvert_J[:, self._edge[:, 0], :, :])
-    eye = torch.eye(3, dtype=rel_jac.dtype, device=self._device)
-    projector = eye - self._flexedge_dir.unsqueeze(-1) * self._flexedge_dir.unsqueeze(-2)
-    geom = torch.einsum("bein,beij,bejm->benm", rel_jac, projector, rel_jac)
-    geom = geom / torch.clamp(self._flexedge_length[:, :, None, None], min=1e-10)
-    stiff_tang -= torch.einsum("be,benm->bnm", tension, geom)
-    if qvel is not None:
-      rate_gradient = torch.einsum("bn,benm->bem", qvel[:, :nv], geom)
-      point_vq = self._point_velocity_qpos_jacobian(
-          self.descriptor.vertbodyid, self._flexvert_xpos,
-          self._flexvert_J, qvel, poses)
-      relative_vq = (point_vq[:, self._edge[:, 1], :, :]
-                     - point_vq[:, self._edge[:, 0], :, :])
-      rate_gradient += torch.einsum("bei,bein->ben", self._flexedge_dir,
-                                    relative_vq)
-      stiff_tang -= torch.einsum("be,ben,bem->bnm", c_eff, J_e, rate_gradient)
-    self._damping_tangent.add_(damp_tang)
-    self._stiffness_tangent.add_(stiff_tang)
-    edge_force = torch.zeros_like(self._flexvert_xpos)
-    for edge_idx in range(self.descriptor.nflexedge):
-      v0, v1 = map(int, self.descriptor.edge[edge_idx])
-      axial = tension[:, edge_idx, None] * self._flexedge_dir[:, edge_idx, :]
-      edge_force[:, v0, :] += axial
-      edge_force[:, v1, :] -= axial
-    self._add_attachment_tangent(
-        self.descriptor.vertbodyid, self._flexvert_xpos, self._flexvert_J,
-        edge_force, poses)
+    if not masked_native:
+      c_eff = c_edge if damper_enabled else torch.zeros_like(c_edge)
+      k_eff = k_edge if spring_enabled else torch.zeros_like(k_edge)
+      J_e = self._flexedge_J
+      damp_tang = -torch.einsum("be,ben,bem->bnm", c_eff, J_e, J_e)
+      stiff_tang = -torch.einsum("be,ben,bem->bnm", k_eff, J_e, J_e)
+      rel_jac = (
+          self._flexvert_J[:, self._edge[:, 1], :, :]
+          - self._flexvert_J[:, self._edge[:, 0], :, :])
+      eye = torch.eye(3, dtype=rel_jac.dtype, device=self._device)
+      projector = eye - self._flexedge_dir.unsqueeze(-1) * self._flexedge_dir.unsqueeze(-2)
+      geom = torch.einsum("bein,beij,bejm->benm", rel_jac, projector, rel_jac)
+      geom = geom / torch.clamp(self._flexedge_length[:, :, None, None], min=1e-10)
+      stiff_tang -= torch.einsum("be,benm->bnm", tension, geom)
+      if qvel is not None:
+        rate_gradient = torch.einsum("bn,benm->bem", qvel[:, :nv], geom)
+        point_vq = self._point_velocity_qpos_jacobian(
+            self.descriptor.vertbodyid, self._flexvert_xpos,
+            self._flexvert_J, qvel, poses)
+        relative_vq = (point_vq[:, self._edge[:, 1], :, :]
+                       - point_vq[:, self._edge[:, 0], :, :])
+        rate_gradient += torch.einsum("bei,bein->ben", self._flexedge_dir,
+                                      relative_vq)
+        stiff_tang -= torch.einsum("be,ben,bem->bnm", c_eff, J_e, rate_gradient)
+      damping_tangent.add_(damp_tang)
+      stiffness_tangent.add_(stiff_tang)
+      edge_force = torch.zeros_like(self._flexvert_xpos)
+      for edge_idx in range(self.descriptor.nflexedge):
+        v0, v1 = map(int, self.descriptor.edge[edge_idx])
+        axial = tension[:, edge_idx, None] * self._flexedge_dir[:, edge_idx, :]
+        edge_force[:, v0, :] += axial
+        edge_force[:, v1, :] -= axial
+      self._add_attachment_tangent(
+          self.descriptor.vertbodyid, self._flexvert_xpos, self._flexvert_J,
+          edge_force, poses)
 
     # 2. Pinned 2D membrane and 3D tetrahedral material forces.
     if self._stretch_count:
-      self._compute_pinned_stretch(poses, qvel)
+      self._compute_pinned_stretch(poses, qvel, world_mask=world_mask)
     if self._bend_count:
-      self._compute_pinned_bend(qvel, poses)
+      self._compute_pinned_bend(qvel, poses, world_mask=world_mask)
     if self._interp_count or self._shell_bend_count:
       if self._interp_count and self._device.type == "mps":
-        self._compute_interpolated_mps(poses, qvel)
+        self._compute_interpolated_mps(poses, qvel, world_mask=world_mask)
       elif self._interp_count:
         self._compute_interpolated(poses, qvel)
       if self._shell_bend_count:
         if self._device.type == "mps":
-          self._compute_interpolated_shell_bend_mps(qvel, poses)
+          self._compute_interpolated_shell_bend_mps(
+              qvel, poses, world_mask=world_mask)
         else:
           self._compute_interpolated_shell_bend(qvel, poses)
 
-    return self._qfrc_passive, self._damping_tangent, self._stiffness_tangent
+    if world_mask is not None:
+      if not masked_native:
+        selected_qfrc = world_mask.to(dtype=torch.bool).reshape(b, 1)
+        selected_tangent = selected_qfrc.reshape(b, 1, 1)
+        qfrc_passive.copy_(torch.where(
+            selected_qfrc, qfrc_passive, torch.zeros_like(qfrc_passive)))
+        damping_tangent.copy_(torch.where(
+            selected_tangent, damping_tangent,
+            torch.zeros_like(damping_tangent)))
+        stiffness_tangent.copy_(torch.where(
+            selected_tangent, stiffness_tangent,
+            torch.zeros_like(stiffness_tangent)))
+      (self._qfrc_passive, self._damping_tangent,
+       self._stiffness_tangent) = old_result_buffers
+    return qfrc_passive, damping_tangent, stiffness_tangent
 
-  def _compute_interpolated_mps(self, poses, qvel):
+  def _compute_interpolated_mps(self, poses, qvel, *, world_mask=None):
     """Dispatch the compiled Q1/Q2 volume element force kernel on MPS."""
     if not self._interp_count:
       return
     b, nv = self.batch_size, self.descriptor.nv
     node_count = len(self.descriptor.nodebodyid)
-    elem_force = torch.empty(
+    elem_force = torch.zeros(
         (b, self._interp_count, nv), dtype=torch.float32, device=self._device)
-    elem_node_force = torch.empty(
+    elem_node_force = torch.zeros(
         (b, self._interp_count, 81), dtype=torch.float32, device=self._device)
     spring = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
     damper = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
-    dims = torch.tensor(
+    dims = torch.empty((6 + b,), dtype=torch.int32, device=self._device)
+    dims[:6].copy_(torch.tensor(
         [b, nv, self._interp_count, node_count, int(spring), int(damper)],
-        dtype=torch.int32, device=self._device)
+        dtype=torch.int32, device=self._device))
+    dims[6:].fill_(1)
+    if world_mask is not None:
+      dims[6:].copy_(world_mask)
     self._material_shader.flex_interp_force(
         self._node_xpos.reshape(-1), self._node_xvel.reshape(-1),
         self._node0, self._node_J.reshape(-1), self._interp_nodes.reshape(-1),
@@ -1213,20 +3394,25 @@ class MetalFlex:
         ids = np.asarray(node_ids, dtype=np.int32)
         node_force = elem_node_force[:, fe, :3*npe].reshape(b, npe, 3)
         self._add_node_generalized_force(ids, node_force)
-        self._compute_interpolated_tangent(fe, qvel, poses)
+        if world_mask is None:
+          self._compute_interpolated_tangent(fe, qvel, poses)
 
-  def _compute_interpolated_shell_bend_mps(self, qvel, poses):
+  def _compute_interpolated_shell_bend_mps(self, qvel, poses, *, world_mask=None):
     """Dispatch compiled Crouzeix-Raviart shell-bend forces on MPS."""
     b, nv = self.batch_size, self.descriptor.nv
-    elem_force = torch.empty(
+    elem_force = torch.zeros(
         (b, self._shell_bend_count, nv), dtype=torch.float32,
         device=self._device)
-    elem_node_force = torch.empty(
+    elem_node_force = torch.zeros(
         (b, self._shell_bend_count, 54), dtype=torch.float32,
         device=self._device)
-    dims = torch.tensor(
+    dims = torch.empty((4 + b,), dtype=torch.int32, device=self._device)
+    dims[:4].copy_(torch.tensor(
         [b, nv, self._shell_bend_count, len(self.descriptor.nodebodyid)],
-        dtype=torch.int32, device=self._device)
+        dtype=torch.int32, device=self._device))
+    dims[4:].fill_(1)
+    if world_mask is not None:
+      dims[4:].copy_(world_mask)
     spring = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
     records = self._shell_bend_records.clone()
     if not spring:
@@ -1251,7 +3437,7 @@ class MetalFlex:
           node_force = elem_node_force[:, bend, start:start + 3*npe].reshape(
               b, npe, 3)
           self._add_node_generalized_force(ids, node_force)
-      if spring:
+      if spring and world_mask is None:
         for record in self._shell_bend_records_host:
           self._compute_shell_bend_material_tangent(record, qvel, poses)
 
@@ -1707,15 +3893,19 @@ class MetalFlex:
     for record in self._shell_bend_records_host:
       self._compute_shell_bend_material_tangent(record, qvel, poses)
 
-  def _compute_pinned_stretch(self, poses, qvel):
+  def _compute_pinned_stretch(self, poses, qvel, *, world_mask=None):
     """Evaluate MuJoCo 3.10's compiled simplex stiffness representation."""
     b, nv = self.batch_size, self.descriptor.nv
     d = self.descriptor
     if self._device.type == "mps":
-      dims = torch.tensor(
+      dims = torch.empty((6 + b,), dtype=torch.int32, device=self._device)
+      dims[:6].copy_(torch.tensor(
           [b, nv, self._stretch_count, 4, d.nflexedge, d.nflexvert],
-          dtype=torch.int32, device=self._device)
-      elem_force = torch.empty(
+          dtype=torch.int32, device=self._device))
+      dims[6:].fill_(1)
+      if world_mask is not None:
+        dims[6:].copy_(world_mask)
+      elem_force = torch.zeros(
           (b, self._stretch_count, nv), dtype=torch.float32, device=self._device)
       self._material_shader.flex_stretch_force(
           self._flexvert_xpos.reshape(-1), self._flexedge_length.reshape(-1),
@@ -1762,6 +3952,10 @@ class MetalFlex:
     # directions. Flexcomp's per-vertex slide-DOF Jacobians are constant; for
     # rotational attachments their Jacobian derivative is outside this local
     # element matrix and is accounted for by the enclosing rigid-body stage.
+    if world_mask is not None and self._device.type == "mps":
+      # The selected-row recovery caller consumes only passive force; the
+      # normal forward path owns the implicit tangent workspaces.
+      return
     for e in range(self._stretch_count):
       ne = self._stretch_edge_count_host[e]
       nve = self._stretch_vertex_count_host[e]
@@ -1828,17 +4022,21 @@ class MetalFlex:
             "bjn,ij,bi,bim,bj->bnm", je, metric, weight, je, lengths)
         self._damping_tangent.add_(damp_tangent)
 
-  def _compute_pinned_bend(self, qvel, poses):
+  def _compute_pinned_bend(self, qvel, poses, *, world_mask=None):
     """Evaluate the compiled 17-scalar per-edge 2D shell bending record."""
     b, nv = self.batch_size, self.descriptor.nv
     d = self.descriptor
     spring = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_SPRING))
     damper = not (self._disableflags & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
     if self._device.type == "mps":
-      dims = torch.tensor(
+      dims = torch.empty((4 + b,), dtype=torch.int32, device=self._device)
+      dims[:4].copy_(torch.tensor(
           [b, nv, self._bend_count, d.nflexvert],
-          dtype=torch.int32, device=self._device)
-      element_force = torch.empty(
+          dtype=torch.int32, device=self._device))
+      dims[4:].fill_(1)
+      if world_mask is not None:
+        dims[4:].copy_(world_mask)
+      element_force = torch.zeros(
           (b, self._bend_count, nv), dtype=torch.float32, device=self._device)
       # Keep pinned spring/damper enable bits in the pre-lowered coefficients.
       values = self._bend_data.clone()
@@ -1888,7 +4086,7 @@ class MetalFlex:
             self._bend_dofadr_host[e], self._bend_dofnum_host[e])):
           if count:
             self._qfrc_passive[:, adr:adr + count].sub_(total[:, i, :count])
-    if nv:
+    if nv and not (world_mask is not None and self._device.type == "mps"):
       self._compute_pinned_bend_tangents(spring, damper)
 
   def _compute_pinned_bend_tangents(self, spring, damper):
@@ -1963,6 +4161,7 @@ class MetalFlex:
       poses: Dict[str, torch.Tensor],
       cvel: Optional[torch.Tensor] = None,
       eq_active: Optional[torch.Tensor] = None,
+      equality_id: Optional[int] = None,
   ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate bilateral distance equality constraint rows (mjEQ_FLEX).
 
@@ -1970,36 +4169,113 @@ class MetalFlex:
       (eq_pos, eq_aref, eq_R, eq_J)
     """
     self.update_kinematics(poses, cvel)
-    b = self.batch_size
-    nedge = self.descriptor.nflexedge
-    nv = self.descriptor.nv
+    return self._form_equality_rows(
+        self._flexedge_length, self._flexedge_velocity, self._flexedge_J,
+        self._parameters_for_equality(equality_id))
 
-    # Position error: pos = L - L0
-    pos = self._flexedge_length - self._edge_length0.unsqueeze(0)  # (B, nedge)
-    vel = self._flexedge_velocity                                 # (B, nedge)
+  def equality_edge_ids(self, flex_id: int) -> np.ndarray:
+    """Return immutable compiled edge IDs used by one ``mjEQ_FLEX``.
 
-    # MuJoCo mju_solimp evaluation
+    MuJoCo omits rigid edges from both equality row count and row emission.
+    The returned order is therefore the exact increasing compiled-edge order
+    that maps the equality's canonical ``eq_rowadr`` range to edge identity.
+    """
+    flex_id = int(flex_id)
+    if flex_id < 0 or flex_id >= self.descriptor.nflex:
+      raise IndexError("flex_id is outside the compiled model")
+    return self._equality_edge_ids[flex_id]
+
+  @property
+  def equality_position_context(self):
+    """Borrowed raw POS terms for refreshing flex equality rows at new qvel.
+
+    ``pos`` is ``length - length0``; ``impedance``, ``b0``, ``k0`` and
+    ``diag`` are the pinned solimp/solref/invweight terms. ``edge_J`` is the
+    captured full edge Jacobian. Rigid edges remain present in the arrays and
+    are excluded by ``edge_ids_by_flex`` when mapping to canonical rows.
+    """
+    return self._equality_position_context
+
+  def run_equalities_velocity(self, context, qpos, qvel, equality_id=None):
+    """Refresh ``mjEQ_FLEX`` velocity terms using captured POS geometry/J.
+
+    This implements the split ``mj_forwardSkip(mjSTAGE_POS)`` semantics:
+    the latest owned POS context supplies edge lengths and Jacobians while the
+    provided qvel supplies only ``J*qvel``. It does not run forward kinematics.
+    Returned arrays and ``equality_position_context`` are borrowed workspaces.
+    """
+    if (not isinstance(context, _FlexPositionContext)
+        or context.owner is not self
+        or context is not self._latest_position_context
+        or context.generation != self._position_context_generation):
+      raise ValueError("flex POS context is foreign, stale, or invalidated")
+    self._validate_position_tensor("qpos", qpos,
+                                   (self.batch_size, self.descriptor.nq))
+    self._validate_position_tensor("qvel", qvel,
+                                   (self.batch_size, self.descriptor.nv))
+    buffers = context.buffers
+    self._flexedge_length.copy_(buffers["_flexedge_length"])
+    self._flexedge_J.copy_(buffers["_flexedge_J"])
+    if self.descriptor.nv:
+      self._flexedge_velocity.copy_(torch.einsum(
+          "ben,bn->be", self._flexedge_J, qvel))
+    else:
+      self._flexedge_velocity.zero_()
+    return self._form_equality_rows(
+        self._flexedge_length, self._flexedge_velocity, self._flexedge_J,
+        self._parameters_for_equality(equality_id))
+
+  def _parameters_for_equality(self, equality_id):
+    if equality_id is None:
+      return None
+    equality_id = int(equality_id)
+    if equality_id not in self._equality_parameter_sets:
+      raise ValueError("equality_id is not a compiled mjEQ_FLEX for this model")
+    return self._equality_parameter_sets[equality_id]
+
+  def _form_equality_rows(self, lengths, velocity, jacobian, parameters=None):
+    params = parameters
+    dmin = self._edge_dmin if params is None else params["dmin"]
+    dmax = self._edge_dmax if params is None else params["dmax"]
+    width = self._edge_width if params is None else params["width"]
+    mid = self._edge_mid if params is None else params["mid"]
+    power = self._edge_power if params is None else params["power"]
+    b0 = self._edge_b0 if params is None else params["b0"]
+    k0 = self._edge_k0 if params is None else params["k0"]
+    diag = self._edge_diag if params is None else params["diag"]
+    pos = self._eq_pos
+    torch.sub(lengths, self._edge_length0.unsqueeze(0), out=pos)
     abs_pos = torch.abs(pos)
-    y = abs_pos / self._edge_width
-    one_minus_mid = torch.clamp(1.0 - self._edge_mid, min=1e-4)
-    y_scaled_low = torch.clamp(y / self._edge_mid, max=1.0)
-    y_scaled_high = torch.clamp((1.0 - y) / one_minus_mid, min=0.0)
-
-    imp_low = self._edge_dmin + 0.5 * (self._edge_dmax - self._edge_dmin) * torch.pow(y_scaled_low, self._edge_power)
-    imp_high = self._edge_dmax - 0.5 * (self._edge_dmax - self._edge_dmin) * torch.pow(y_scaled_high, self._edge_power)
-
-    imp = torch.where(abs_pos <= 0.0, self._edge_dmin,
-          torch.where(abs_pos >= self._edge_width, self._edge_dmax,
-          torch.where(y <= self._edge_mid, imp_low, imp_high)))
-    imp = torch.clamp(imp, min=1e-4, max=0.9999)
-
-    # Reference acceleration: aref = -(b0 * vel + k0 * pos) / imp
-    aref = -(self._edge_b0 * vel + self._edge_k0 * pos) / imp
-
-    # Exact compliance: R = (1 - imp) / imp * flexedge_invweight0
-    R = torch.clamp((1.0 - imp) / imp * self._edge_diag, min=1e-15)
-
-    return pos, aref, R, self._flexedge_J
+    safe_width = torch.clamp(width, min=1e-15)
+    y = abs_pos / safe_width
+    safe_mid = torch.clamp(mid, min=1e-15, max=1.0 - 1e-15)
+    one_minus_mid = torch.clamp(1.0 - mid, min=1e-15)
+    low_scale = torch.pow(safe_mid, power - 1.0).reciprocal()
+    high_scale = torch.pow(one_minus_mid, power - 1.0).reciprocal()
+    low_curve = low_scale * torch.pow(torch.clamp(y, min=0.0), power)
+    high_curve = 1.0 - high_scale * torch.pow(
+        torch.clamp(1.0 - y, min=0.0), power)
+    curve = torch.where(y <= mid, low_curve, high_curve)
+    curve_imp = dmin + curve * (dmax - dmin)
+    flat = (width <= 1e-15) | (dmin == dmax)
+    self._eq_imp.copy_(torch.where(flat, 0.5 * (dmin + dmax),
+        torch.where(y <= 0.0, dmin,
+        torch.where(y >= 1.0, dmax, curve_imp))))
+    self._eq_imp.clamp_(min=1e-4, max=0.9999)
+    # Pinned mj_referenceConstraint uses KBIP directly, not coefficients
+    # divided by impedance: aref = -B*vel - K*imp*(pos-margin). Flex
+    # equality rows have zero margin.
+    self._eq_aref.copy_(-(b0 * velocity + k0 * self._eq_imp * pos))
+    torch.mul((1.0 - self._eq_imp) / self._eq_imp,
+              diag, out=self._eq_R)
+    self._eq_R.clamp_(min=1e-15)
+    raw = self._eq_raw_context
+    raw[..., 0].copy_(pos)
+    raw[..., 1].copy_(self._eq_imp)
+    raw[..., 2].copy_(b0)
+    raw[..., 3].copy_(k0)
+    raw[..., 4].copy_(diag)
+    return pos, self._eq_aref, self._eq_R, jacobian
 
   def run_contacts(
       self,
@@ -2045,6 +4321,7 @@ class MetalFlex:
 
   def set_state(self, state: Dict[str, torch.Tensor], env_ids=None):
     """Restore flex state from snapshot."""
+    self._latest_position_context = None
     if env_ids is None:
       if "flexvert_xpos" in state:
         self._flexvert_xpos.copy_(state["flexvert_xpos"])

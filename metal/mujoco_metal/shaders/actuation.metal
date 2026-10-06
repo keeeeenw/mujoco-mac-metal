@@ -36,6 +36,7 @@ kernel void scalar_motor_force(
   int clampctrl_disabled = dims[4];
   int disableactuator = dims[5];
   if (world >= uint(batch)) return;
+  if (dims[6 + int(world)] == 0) return;
 
   uint force_offset = world * uint(nv);
   uint act_offset = world * uint(nu);
@@ -208,11 +209,19 @@ kernel void actuator_velocity_derivative(
     constant float* step_dt [[buffer(24)]],
     device float* derivative [[buffer(25)]],
     device const int* pattern [[buffer(26)]],
+    device const int* edge_rows [[buffer(27)]],
+    device const int* edge_cols [[buffer(28)]],
     uint tid [[thread_position_in_grid]]) {
   int nv=dims[0],nu=dims[1],na=dims[2],batch=dims[3];
-  if(tid>=uint(batch*nv*nv))return;
-  int world=int(tid)/(nv*nv),row=(int(tid)/nv)%nv,col=int(tid)%nv;
-  if(!pattern[row*nv+col]){derivative[tid]=0.0f;return;}
+  bool sparse=dims[6]!=0;
+  int edge_count=dims[7];
+  int stride=sparse?max(edge_count,1):nv*nv;
+  if(tid>=uint(batch*stride))return;
+  int world=int(tid)/stride,slot=int(tid)-world*stride;
+  if (dims[8 + world] == 0) return;
+  int row=sparse?edge_rows[slot]:slot/nv;
+  int col=sparse?edge_cols[slot]:slot%nv;
+  if(!sparse && !pattern[row*nv+col]){derivative[tid]=0.0f;return;}
   float result=0.0f;
   if(!dims[4])for(int i=0;i<nu;i++) {
     if((dims[5]&(1<<group[i]))!=0)continue;
@@ -252,7 +261,8 @@ kernel void actuator_velocity_derivative(
     int m=(world*max(nu,1)+i)*max(nv,1);
     result+=moment[m+row]*bias_vel*moment[m+col];
   }
-  derivative[tid]=result;
+  if (sparse) derivative[tid]+=result;
+  else derivative[tid]=result;
 }
 
 // Stage 1: clipped control copy + act_dot switch (pinned mj_fwdActuation).
@@ -278,6 +288,7 @@ kernel void actuator_act_dot(
   int act_disabled=dims[3], clamp_disabled=dims[4];
   float h=step_dt[0];
   if (world >= uint(batch)) return;
+  if (dims[5 + int(world)] == 0) return;
   uint ubase=world*uint(max(nu,1)), abase=world*uint(max(na,1));
   for (int j=0;j<na;++j) out_actdot[abase+uint(j)]=0.0f;
   for (int i=0;i<nu;++i) out_ctrl[ubase+uint(i)]=ctrl[ubase+uint(i)];
@@ -399,11 +410,16 @@ kernel void actuator_force(
     constant float* step_dt [[buffer(24)]],
     device float* out_force [[buffer(25)]],
     device float* out_ctrl [[buffer(26)]],
+    device const float* plugin_force [[buffer(27)]],
+    device const int* plugin_force_mask [[buffer(28)]],
+    device const float* user_gain [[buffer(29)]],
+    device const float* user_bias [[buffer(30)]],
     uint world [[thread_position_in_grid]]) {
   int nu=dims[0], na=dims[1], batch=dims[2];
   int act_disabled=dims[3], disableactuator=dims[4], ntendon=dims[5];
   float h=step_dt[0];
   if (world >= uint(batch)) return;
+  if (dims[7 + int(world)] == 0) return;
   uint ubase=world*uint(max(nu,1)), abase=world*uint(max(na,1));
   for (int i=0;i<nu;++i) { out_force[ubase+uint(i)]=0.0f; out_ctrl[ubase+uint(i)]=ctrl_used[ubase+uint(i)]; }
   if (act_disabled) return;
@@ -413,7 +429,15 @@ kernel void actuator_force(
   device float* f=out_force+ubase;
   for (int i=0;i<nu;++i) {
     int grp=actuator_group[i];
-    if ((disableactuator&(1<<grp))!=0) continue;
+    if ((disableactuator&(1<<grp))!=0) {
+      // MuJoCo invokes actuator-plugin Compute after the generic group-filtered
+      // force loop. Bundled PID rows therefore retain their plugin force even
+      // when their actuator group is disabled; global DSBL_ACTUATION still
+      // returns above before either path.
+      if (dims[6] != 0 && plugin_force_mask[i])
+        f[i] = plugin_force[ubase+uint(i)];
+      continue;
+    }
     int n=actnum[i], first=actadr[i], last=first+n-1;
     float len=length[ubase+uint(i)], vel=velocity[ubase+uint(i)];
     float uu=u[i];
@@ -422,6 +446,7 @@ kernel void actuator_force(
     float g=0.0f;
     if (gt==0) g=gainprm[10*i];
     else if (gt==1) g=gainprm[10*i]+gainprm[10*i+1]*len+gainprm[10*i+2]*vel;
+    else if (gt==4) g=user_gain[ubase+uint(i)];
     else if (gt==2) {
       float rng0=gainprm[10*i], rng1=gainprm[10*i+1];
       float force=gainprm[10*i+2], scale=gainprm[10*i+3];
@@ -485,7 +510,8 @@ kernel void actuator_force(
     }
     float b=0.0f;
     int bt=biastype[i];
-    if (bt==1) b=biasprm[10*i]+biasprm[10*i+1]*len+biasprm[10*i+2]*vel;
+    if (bt==4) b=user_bias[ubase+uint(i)];
+    else if (bt==1) b=biasprm[10*i]+biasprm[10*i+1]*len+biasprm[10*i+2]*vel;
     else if (bt==2) {
       float rng0=biasprm[10*i], rng1=biasprm[10*i+1];
       float force=biasprm[10*i+2], scale=biasprm[10*i+3];
@@ -503,7 +529,7 @@ kernel void actuator_force(
     } else if (bt==3) {
       if (dp0<=0.0f) b-=g*gainprm[10*i+1]*vel;
     }
-    f[i]=ff+b;
+    f[i]=ff+b+(dims[6] != 0 ? plugin_force[ubase+uint(i)] : 0.0f);
     u[i]=uu;
   }
   for (int i=0;i<nu;++i) out_ctrl[ubase+uint(i)]=u[i];
@@ -527,7 +553,11 @@ kernel void actuator_force(
   }
   for (int i=0;i<nu;++i) {
     int grp=actuator_group[i];
-    if ((disableactuator&(1<<grp))!=0) { f[i]=0.0f; continue; }
+    if ((disableactuator&(1<<grp))!=0 &&
+        !(dims[6] != 0 && plugin_force_mask[i])) {
+      f[i]=0.0f;
+      continue;
+    }
     if (forcelimited[i]) f[i]=clamp(f[i],forcerange[2*i],forcerange[2*i+1]);
   }
   for (int i=0;i<nu;++i) {
@@ -566,6 +596,7 @@ kernel void actuator_assemble_qfrc(
     uint world [[thread_position_in_grid]]) {
   int nv=dims[0], nu=dims[1], batch=dims[2], njnt=dims[3];
   if (world >= uint(batch)) return;
+  if (dims[4 + int(world)] == 0) return;
   uint vbase=world*uint(max(nv,1)), ubase=world*uint(max(nu,1));
   for (int d=0;d<nv;++d) {
     float s=0.0f;
@@ -590,6 +621,30 @@ kernel void actuator_assemble_qfrc(
       int dof=da+k;
       if (dof>=0&&dof<nv) out_qfrc[vbase+uint(dof)]=clamp(out_qfrc[vbase+uint(dof)],lo,hi);
     }
+  }
+}
+
+// Project typed actuator-plugin force rows through the already prepared
+// actuator moment. Unlike a batched Torch matmul, this returns before reading
+// either input or touching qfrc for a skipped recovery world.
+kernel void actuator_plugin_project_qfrc(
+    device const float* force [[buffer(0)]],
+    device const float* moment [[buffer(1)]],
+    constant int* dims [[buffer(2)]],
+    device float* qfrc [[buffer(3)]],
+    uint world [[thread_position_in_grid]]) {
+  int nv=dims[0], nu=dims[1], batch=dims[2];
+  if (int(world)>=batch || dims[3+int(world)]==0) return;
+  int qwidth=max(nv,1);
+  for (int dof=0; dof<qwidth; ++dof) {
+    float value=0.0f;
+    if (dof<nv) {
+      int fbase=int(world)*nu;
+      int mbase=int(world)*nu*nv;
+      for (int actuator=0; actuator<nu; ++actuator)
+        value += moment[mbase+actuator*nv+dof]*force[fbase+actuator];
+    }
+    qfrc[int(world)*qwidth+dof]=value;
   }
 }
 // Activation advance for MuJoCo 3.10.0 (007).

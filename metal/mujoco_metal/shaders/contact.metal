@@ -101,16 +101,29 @@ kernel void contact_normal(
     device float* row_data [[buffer(24)]], device float* frame [[buffer(25)]],
     device float* jacobian [[buffer(26)]],
     constant int* dims [[buffer(27)]],
+    device float* canonical_rows [[buffer(28)]],
+    constant float* solver_params [[buffer(29)]],
     uint tid [[thread_position_in_grid]]) {
   int nv = dims[0], nc = dims[1], batch = dims[2], nbody = dims[3], njnt = dims[4], ngeom=dims[5];
   int world = int(tid) / max(nc, 1), slot = int(tid) % max(nc, 1);
   if (uint(world) >= uint(batch) || slot >= nc) return;
+  if (dims[6 + world] == 0) return;
   int out = world * nc + slot;
   int jbase = out * 5 * nv;
   int rb=out*5*6, fb=out*12;
   for (int k=0;k<5*6;++k) row_data[rb+k]=0.0f;
   for (int k=0; k<5*nv; ++k) jacobian[jbase+k] = 0.0f;
   for (int k=0; k<12; ++k) frame[fb+k]=0.0f;
+  int canonical_base=out*5*(nv+5);
+  for (int row=0;row<5;++row) {
+    int base=canonical_base+row*(nv+5);
+    for (int k=0;k<nv;++k) canonical_rows[base+k]=0.0f;
+    canonical_rows[base+nv]=1.0f;
+    canonical_rows[base+nv+1]=0.0f;
+    canonical_rows[base+nv+2]=0.0f;
+    canonical_rows[base+nv+3]=0.0f;
+    canonical_rows[base+nv+4]=0.0f;
+  }
 
   int a=geom1[slot], b=geom2[slot];
   int go=world*ngeom;
@@ -225,6 +238,23 @@ kernel void contact_normal(
     frame[fb+k]=n[k]; frame[fb+3+k]=t1[k];
     frame[fb+6+k]=t2[k]; frame[fb+9+k]=point[k];
   }
+  for (int row=0;row<5;++row) {
+    int data_base=rb+row*6;
+    int base=canonical_base+row*(nv+5);
+    float impedance=clamp(row_data[data_base+4],1e-6f,0.999999f);
+    float diag_approx=max(row_data[data_base+5],1e-15f);
+    float normal_R=max(1e-15f,(1.0f-impedance)*diag_approx/impedance);
+    float mu0=friction[slot*2];
+    float edge_R=normal_R*(1.0f+mu0*mu0);
+    canonical_rows[base+nv]=(row%5)==0 ? normal_R :
+        2.0f*mu0*mu0/max(solver_params[0],1e-15f)*edge_R;
+    canonical_rows[base+nv+1]=row_data[data_base+3];
+    canonical_rows[base+nv+2]=0.0f;
+    canonical_rows[base+nv+3]=INFINITY;
+    canonical_rows[base+nv+4]=row_data[data_base]>=0.5f ? 1.0f : 0.0f;
+    for (int k=0;k<nv;++k)
+      canonical_rows[base+k]=jacobian[jbase+row*nv+k];
+  }
 }
 
 // Dense coupled projected solve for normal-only contacts. Each world factors
@@ -241,6 +271,7 @@ kernel void solve_normal_contacts(
     constant int* dims [[buffer(10)]], constant float* solver_params [[buffer(11)]],
     uint world [[thread_position_in_grid]]) {
   int nv=dims[0], nc=dims[1], batch=dims[2]; if (world>=uint(batch)) return;
+  if (dims[6 + int(world)] == 0) return;
   status[world]=0;
   diagnostics[world*2]=0.0f; diagnostics[world*2+1]=0.0f;
   int nr=nc*5, mb=world*nv*nv, jb=world*nr*nv;

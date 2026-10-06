@@ -21,10 +21,40 @@ import numpy as np
 from mujoco_metal.model import _validate_lowered
 from mujoco_metal.model import ModelDescriptor
 from mujoco_metal.model import snapshot_descriptor
+from mujoco_metal.capacity import _fk_auxiliary_words
 
 _SHADER = Path(__file__).parent / "shaders" / "kinematics.metal"
 _INT32_MAX = (1 << 31) - 1
 _UINT32_CAPACITY = 1 << 32
+_FK_INT_INPUTS = (
+    "body_parentid", "jnt_type", "jnt_qposadr", "jnt_bodyid",
+    "body_sameframe", "geom_bodyid", "geom_sameframe", "site_bodyid",
+    "site_sameframe",
+)
+_FK_FLOAT_INPUTS = (
+    "body_pos_pair", "body_quat_pair", "jnt_pos_pair", "jnt_axis_pair",
+    "qpos0_pair", "geom_pos_pair", "geom_quat_pair", "site_pos_pair",
+    "site_quat_pair", "body_ipos_pair", "body_iquat_pair",
+)
+_FK_OUTPUTS = (
+    ("body_pos", "nbody", 3), ("body_pos_low", "nbody", 3),
+    ("body_pos_tail", "nbody", 3), ("body_quat", "nbody", 4),
+    ("body_quat_low", "nbody", 4), ("body_quat_tail", "nbody", 4),
+    ("geom_pos", "ngeom", 3), ("geom_pos_low", "ngeom", 3),
+    ("geom_pos_tail", "ngeom", 3), ("geom_quat", "ngeom", 4),
+    ("geom_quat_low", "ngeom", 4), ("geom_quat_tail", "ngeom", 4),
+    ("geom_xmat", "ngeom", 9), ("geom_xmat_low", "ngeom", 9),
+    ("geom_xmat_tail", "ngeom", 9), ("site_pos", "nsite", 3),
+    ("site_pos_low", "nsite", 3), ("site_pos_tail", "nsite", 3),
+    ("site_quat", "nsite", 4), ("site_quat_low", "nsite", 4),
+    ("site_quat_tail", "nsite", 4),
+    ("inertial_pos", "nbody", 3), ("inertial_pos_low", "nbody", 3),
+    ("inertial_pos_tail", "nbody", 3),
+    ("inertial_quat", "nbody", 4),
+    ("inertial_quat_low", "nbody", 4),
+    ("inertial_quat_tail", "nbody", 4),
+    ("joint_anchor", "njnt", 3), ("joint_axis", "njnt", 3),
+)
 
 
 def _validate_workspace_index_capacity(batch_size, buffers, dimensions):
@@ -75,6 +105,7 @@ def _prepare_host_arrays(model: ModelDescriptor):
       "body_jntadr",
       "body_jntnum",
       "body_mocapid",
+      "body_sameframe",
       "body_pos",
       "body_quat",
       "body_ipos",
@@ -110,9 +141,11 @@ def _prepare_host_arrays(model: ModelDescriptor):
       "geom_size",
       "geom_pos",
       "geom_quat",
+      "geom_sameframe",
       "site_bodyid",
       "site_pos",
       "site_quat",
+      "site_sameframe",
   )
   values = {name: getattr(model, name) for name in names}
   _validate_lowered(counts, values)
@@ -125,6 +158,44 @@ def _prepare_host_arrays(model: ModelDescriptor):
     if name not in ("body_jntadr", "body_jntnum") and converted.size == 0:
       converted = np.zeros(1, dtype=dtype)
     host[name] = converted
+  # Keep two residual words alongside each float32 high word.  A single low
+  # float retains only about 48 effective bits; source-rounded CCD predicates
+  # can distinguish the remaining binary64 bits after repeated FK transforms.
+  for name in ("body_pos", "jnt_pos", "qpos0", "geom_pos",
+               "body_ipos", "site_pos"):
+    raw = np.asarray(values[name], dtype=np.float64).reshape(-1)
+    if raw.size:
+      high = host[name][:raw.size].astype(np.float64, copy=False)
+      low = (raw - high).astype(np.float32)
+      tail = (raw - high - low.astype(np.float64)).astype(np.float32)
+    else:
+      low = np.zeros(1, dtype=np.float32)
+      tail = np.zeros(1, dtype=np.float32)
+    host[name + "_low"] = np.array(low, dtype=np.float32, copy=True)
+    host[name + "_tail"] = np.array(tail, dtype=np.float32, copy=True)
+    high_words = np.array(host[name][:max(raw.size, 1)],
+                          dtype=np.float32, copy=True)
+    host[name + "_pair"] = np.concatenate(
+        (high_words, np.array(low, dtype=np.float32, copy=True),
+         np.array(tail, dtype=np.float32, copy=True)))
+  # Preserve compiled binary64 quaternion and axis constants across the
+  # float32 host/device boundary.  The three planes are high, residual, and
+  # residual-of-residual, each with the original flattened shape.
+  for name in ("body_quat", "body_iquat", "geom_quat", "site_quat",
+               "jnt_axis"):
+    raw = np.asarray(values[name], dtype=np.float64).reshape(-1)
+    high_words = np.array(host[name][:max(raw.size, 1)], dtype=np.float32,
+                          copy=True)
+    if raw.size:
+      high = high_words[:raw.size].astype(np.float64, copy=False)
+      low = (raw - high).astype(np.float32)
+      tail = (raw - high - low.astype(np.float64)).astype(np.float32)
+    else:
+      low = np.zeros(1, dtype=np.float32)
+      tail = np.zeros(1, dtype=np.float32)
+    host[name + "_pair"] = np.concatenate((
+        high_words, np.array(low, dtype=np.float32, copy=True),
+        np.array(tail, dtype=np.float32, copy=True)))
   for name in ("body_quat", "body_iquat", "geom_quat", "site_quat"):
     if np.asarray(values[name]).size == 0:
       continue
@@ -142,12 +213,44 @@ def _shape_output(buffer, batch, count, width):
   return buffer[: batch * count * width].reshape(batch, count, width)
 
 
+def _pack_fk_constants(host_arrays, names, dtype):
+  offsets = {}
+  pieces = []
+  offset = 0
+  for name in names:
+    part = np.asarray(host_arrays[name], dtype=dtype).reshape(-1)
+    if part.size == 0:
+      part = np.zeros(1, dtype=dtype)
+    offsets[name] = offset
+    pieces.append(part)
+    offset += int(part.size)
+  if offset > _INT32_MAX:
+    raise ValueError("packed FK constants exceed int32 offset capacity")
+  return np.concatenate(pieces), offsets
+
+
+def _fk_output_layout(model, batch_size):
+  """Return field offsets and physical words for the single FK output arena."""
+  _validate_workspace_index_capacity(batch_size, {}, {})
+  offsets = {}
+  cursor = 0
+  for name, count_name, width in _FK_OUTPUTS:
+    count = int(getattr(model, count_name))
+    if count < 0:
+      raise ValueError(f"{count_name} must be non-negative")
+    offsets[name] = cursor
+    cursor += max(batch_size * count * width, 1)
+    if cursor > _INT32_MAX:
+      raise ValueError("FK output arena exceeds the int32 offset capacity")
+  return offsets, cursor
+
+
 class MetalKinematics:
   """Batched native MSL forward kinematics; construction initializes MPS."""
 
   def __init__(self, model: ModelDescriptor, batch_size: int = 1):
-    host_arrays = _prepare_host_arrays(model)
     self.model = snapshot_descriptor(model)
+    host_arrays = _prepare_host_arrays(self.model)
     # Importing this module remains host-only; construction is the explicit
     # device capability boundary.
     import torch
@@ -160,31 +263,16 @@ class MetalKinematics:
     self._device = torch.device("mps")
     self._library = torch.mps.compile_shader(_SHADER.read_text())
     self._kernel = self._library.forward_kinematics
-    self._arrays = {}
-    for name, host in host_arrays.items():
-      if name in (
-          "body_jntadr",
-          "body_jntnum",
-          "body_rootid",
-          "body_dofadr",
-          "body_dofnum",
-          "body_subtreemass",
-          "dof_parentid",
-          "dof_bodyid",
-          "dof_jntid",
-          "gravity",
-          "jnt_dofadr",
-          "body_mass",
-          "body_inertia",
-          "dof_armature",
-          "dof_damping",
-          "actuator_armature",
-          "tendon_armature",
-          "geom_type",
-          "geom_size",
-      ):
-        continue
-      self._arrays[name] = torch.from_numpy(host).to(self._device)
+    self._prepare_rows_kernel = self._library.prepare_fk_rows
+    packed_i, offsets_i = _pack_fk_constants(
+        host_arrays, _FK_INT_INPUTS, np.int32)
+    packed_f, offsets_f = _pack_fk_constants(
+        host_arrays, _FK_FLOAT_INPUTS, np.float32)
+    self._arrays = {
+        "static_int": torch.from_numpy(packed_i).to(self._device),
+        "static_float": torch.from_numpy(packed_f).to(self._device),
+    }
+    self._static_offsets = {**offsets_i, **offsets_f}
     self._workspace = None
     self.prepare_workspace(batch_size)
 
@@ -202,15 +290,39 @@ class MetalKinematics:
         {
             "qpos": batch_size * m.nq,
             "body_pos": batch_size * m.nbody * 3,
+            "body_pos_low": batch_size * m.nbody * 3,
+            "body_pos_tail": batch_size * m.nbody * 3,
             "body_quat": batch_size * m.nbody * 4,
+            "body_quat_low": batch_size * m.nbody * 4,
+            "body_quat_tail": batch_size * m.nbody * 4,
             "geom_pos": batch_size * m.ngeom * 3,
+            "geom_pos_low": batch_size * m.ngeom * 3,
+            "geom_pos_tail": batch_size * m.ngeom * 3,
             "geom_quat": batch_size * m.ngeom * 4,
+            "geom_quat_low": batch_size * m.ngeom * 4,
+            "geom_quat_tail": batch_size * m.ngeom * 4,
+            "geom_xmat": batch_size * m.ngeom * 9,
+            "geom_xmat_low": batch_size * m.ngeom * 9,
+            "geom_xmat_tail": batch_size * m.ngeom * 9,
             "site_pos": batch_size * m.nsite * 3,
+            "site_pos_low": batch_size * m.nsite * 3,
+            "site_pos_tail": batch_size * m.nsite * 3,
             "site_quat": batch_size * m.nsite * 4,
+            "site_quat_low": batch_size * m.nsite * 4,
+            "site_quat_tail": batch_size * m.nsite * 4,
             "inertial_pos": batch_size * m.nbody * 3,
+            "inertial_pos_low": batch_size * m.nbody * 3,
+            "inertial_pos_tail": batch_size * m.nbody * 3,
             "inertial_quat": batch_size * m.nbody * 4,
+            "inertial_quat_low": batch_size * m.nbody * 4,
+            "inertial_quat_tail": batch_size * m.nbody * 4,
             "joint_anchor": batch_size * m.njnt * 3,
             "joint_axis": batch_size * m.njnt * 3,
+            "tree_awake": batch_size * max(
+                int(np.max(np.asarray(m.body_treeid), initial=-1)) + 1, 1),
+            "tree_awake_cast": batch_size * max(
+                int(np.max(np.asarray(m.body_treeid), initial=-1)) + 1, 1),
+            "all_world_mask": batch_size,
             "body_parentid": m.nbody,
             "geom_bodyid": m.ngeom,
             "site_bodyid": m.nsite,
@@ -223,53 +335,67 @@ class MetalKinematics:
             "nsite": m.nsite,
         },
     )
-    shapes = {
-        "body": m.nbody,
-        "geom": m.ngeom,
-        "site": m.nsite,
-        "inertial": m.nbody,
-    }
     outputs = {}
-    for name, count in shapes.items():
-      outputs[f"{name}_pos"] = torch.empty(
-          max(batch_size * count * 3, 1),
-          dtype=torch.float32,
-          device=self._device,
-      )
-      outputs[f"{name}_quat"] = torch.empty(
-          max(batch_size * count * 4, 1),
-          dtype=torch.float32,
-          device=self._device,
-      )
-    for name in ("joint_anchor", "joint_axis"):
-      outputs[name] = torch.empty(
-          max(batch_size * m.njnt * 3, 1),
-          dtype=torch.float32,
-          device=self._device,
-      )
-    outputs["qpos"] = torch.empty(
-        max(batch_size * m.nq, 1), dtype=torch.float32, device=self._device
-    )
+    out_offsets, out_cursor = _fk_output_layout(m, batch_size)
+    _validate_workspace_index_capacity(
+        batch_size, {"pose_output_arena": out_cursor},
+        {"pose_output_offset": out_cursor})
+    outputs["pose_output"] = torch.empty(
+        out_cursor, dtype=torch.float32, device=self._device)
+    for name, count_name, width in _FK_OUTPUTS:
+      count = int(getattr(m, count_name))
+      elements = max(batch_size * count * width, 1)
+      outputs[name] = outputs["pose_output"].narrow(
+          0, out_offsets[name], elements)
+
+    dims_values = [
+        m.nq, m.nbody, m.njnt, m.ngeom, m.nsite, batch_size, m.nmocap,
+        int(np.max(np.asarray(m.body_treeid), initial=-1)) + 1,
+        0, 0, 0, 0,
+    ]
+    dims_values.extend(self._static_offsets[name] for name in _FK_INT_INPUTS)
+    dims_values.extend(self._static_offsets[name] for name in _FK_FLOAT_INPUTS)
+    dims_values.extend(out_offsets[name] for name, _, _ in _FK_OUTPUTS)
+    if any(value < 0 or value > _INT32_MAX for value in dims_values):
+      raise ValueError("FK arena offset exceeds the int32 shader ABI")
     outputs["dims"] = torch.tensor(
-        [m.nq, m.nbody, m.njnt, m.ngeom, m.nsite, batch_size, m.nmocap,
-         int(np.max(np.asarray(m.body_treeid), initial=-1)) + 1],
-        dtype=torch.int32, device=self._device,
-    )
+        dims_values, dtype=torch.int32, device=self._device)
+
     ntree = int(np.max(np.asarray(m.body_treeid), initial=-1)) + 1
-    mocap_values = (batch_size * int(m.nmocap) * 7
-                    if int(m.nmocap) else 1)
+    mocap_values = batch_size * int(m.nmocap) * 7 if int(m.nmocap) else 1
     tree_offset = mocap_values
-    awake_offset = tree_offset + int(m.nbody)
+    mocap_id_offset = tree_offset + int(m.nbody)
+    awake_offset = mocap_id_offset + int(m.nbody)
     valid_offset = awake_offset + batch_size * max(ntree, 1)
+    mismatch_offset = valid_offset + batch_size
+    auxiliary_words = _fk_auxiliary_words(
+        batch_size, int(m.nmocap), int(m.nbody), ntree)
+    if auxiliary_words != max(mismatch_offset + batch_size * max(ntree, 1), 1):
+      raise RuntimeError("FK auxiliary layout disagrees with capacity helper")
+    _validate_workspace_index_capacity(
+        batch_size, {"auxiliary": auxiliary_words},
+        {"auxiliary_words": auxiliary_words})
     outputs["auxiliary"] = torch.zeros(
-        valid_offset + batch_size, dtype=torch.float32, device=self._device)
+        auxiliary_words, dtype=torch.float32, device=self._device)
+    outputs["qpos"] = torch.empty(
+        max(batch_size * m.nq, 1), dtype=torch.float32, device=self._device)
     if int(m.nbody):
-      outputs["auxiliary"][tree_offset:awake_offset].copy_(
+      outputs["auxiliary"][tree_offset:mocap_id_offset].copy_(
           torch.as_tensor(np.asarray(m.body_treeid, dtype=np.float32).copy(),
+                          dtype=torch.float32, device=self._device))
+      outputs["auxiliary"][mocap_id_offset:awake_offset].copy_(
+          torch.as_tensor(np.asarray(m.body_mocapid, dtype=np.float32).copy(),
                           dtype=torch.float32, device=self._device))
     outputs["tree_awake"] = torch.ones(
         (batch_size, max(ntree, 1)), dtype=torch.int32, device=self._device)
+    outputs["tree_awake_cast"] = torch.empty(
+        (batch_size, max(ntree, 1)), dtype=torch.int32, device=self._device)
+    outputs["all_world_mask"] = torch.ones(
+        (batch_size,), dtype=torch.int32, device=self._device)
     outputs["cache_valid"] = outputs["auxiliary"][valid_offset:valid_offset + batch_size]
+    outputs["pose_mismatch"] = outputs["auxiliary"][
+        mismatch_offset:mismatch_offset + batch_size * max(ntree, 1)].view(
+            batch_size, max(ntree, 1)).view(torch.int32)
     outputs["ntree"] = ntree
     self._workspace = {"batch_size": batch_size, "outputs": outputs}
 
@@ -305,7 +431,8 @@ class MetalKinematics:
     if not value.is_contiguous():
       raise ValueError(f"{name} must be contiguous")
 
-  def run_device(self, qpos, mocap_pos=None, mocap_quat=None, *, tree_awake=None):
+  def run_device(self, qpos, mocap_pos=None, mocap_quat=None, *, tree_awake=None,
+                 world_mask=None):
     """Run FK from a contiguous MPS float32 state without host readback.
 
     State values are trusted to be finite; free/ball quaternions must be
@@ -349,19 +476,20 @@ class MetalKinematics:
           "call prepare_workspace(batch_size) before using this batch size"
       )
     out = workspace["outputs"]
+    if world_mask is None:
+      world_mask = out["all_world_mask"]
+    elif (not isinstance(world_mask, torch.Tensor)
+          or tuple(world_mask.shape) != (batch,)
+          or world_mask.dtype != torch.int32
+          or world_mask.device.type != self._device.type
+          or not world_mask.is_contiguous()):
+      raise ValueError("world_mask must be contiguous int32 [batch] on MPS")
     auxiliary = out["auxiliary"]
-    mocap_values = batch * nmocap * 7 if nmocap else 1
-    if nmocap:
-      auxiliary[:batch * nmocap * 3].copy_(mocap_pos.reshape(-1))
-      auxiliary[batch * nmocap * 3:mocap_values].copy_(mocap_quat.reshape(-1))
-    else:
-      auxiliary[0] = 0.0
     ntree = out["ntree"]
     if tree_awake is None:
       # The public default remains a complete FK evaluation. Simulation passes
       # its authoritative device scheduler mask when sleep is enabled.
       awake = out["tree_awake"]
-      awake.fill_(1)
     else:
       # DeviceSleepScheduler owns int32 state, while the FK auxiliary ABI is
       # float32. Accept its native mask directly and cast during the copy into
@@ -378,40 +506,28 @@ class MetalKinematics:
       if not tree_awake.is_contiguous():
         raise ValueError("tree_awake must be contiguous")
       awake = tree_awake
+      if tree_awake.dtype == torch.float32:
+        out["tree_awake_cast"].copy_(tree_awake)
+        awake = out["tree_awake_cast"]
+    # Auxiliary inputs are copied on the device only for selected worlds.
+    # They share the exact same predicate as the subsequent FK producer.
+    zero = out["qpos"]
+    self._prepare_rows_kernel(
+        world_mask,
+        mocap_pos.reshape(-1) if nmocap else zero,
+        mocap_quat.reshape(-1) if nmocap else zero,
+        awake.reshape(-1), auxiliary, out["dims"],
+        threads=(batch,), group_size=(1,))
     # A reshape is a device view. For nq=0, the kernel reads the dummy element;
     # this copy keeps the ABI buffer valid without allocating CPU state.
     if self.model.nq:
       qbuf = qpos.reshape(-1)
     else:
       qbuf = out["qpos"]
-    arrays = self._arrays
-    args = [arrays[name] for name in (
-        "body_parentid", "body_pos", "body_quat", "jnt_type",
-        "jnt_qposadr", "jnt_bodyid", "jnt_pos", "jnt_axis", "qpos0",
-    )]
-    args.extend([qbuf, out["body_pos"], out["body_quat"]])
-    args.extend(
-        arrays[name] for name in ("geom_bodyid", "geom_pos", "geom_quat")
-    )
-    args.extend([out["geom_pos"], out["geom_quat"]])
-    args.extend(
-        arrays[name] for name in ("site_bodyid", "site_pos", "site_quat")
-    )
-    args.extend([out["site_pos"], out["site_quat"]])
-    args.extend([
-        arrays["body_ipos"],
-        arrays["body_iquat"],
-        out["inertial_pos"],
-        out["inertial_quat"],
-    ])
-    args.extend([out["dims"], out["joint_anchor"], out["joint_axis"]])
-    tree_offset = mocap_values
-    awake_offset = tree_offset + int(self.model.nbody)
-    awake_count = batch * max(ntree, 1)
-    auxiliary[awake_offset:awake_offset + awake_count].copy_(
-        awake.reshape(-1))
-    args.extend([self._arrays["body_mocapid"], auxiliary])
-    self._kernel(*args, threads=(batch,), group_size=(1,))
+    self._kernel(
+        self._arrays["static_int"], self._arrays["static_float"], qbuf,
+        out["pose_output"], world_mask, auxiliary, out["dims"],
+        threads=(batch,), group_size=(1,))
     result = {}
     for kind, count in (
         ("body", self.model.nbody),
@@ -423,9 +539,33 @@ class MetalKinematics:
       result[f"{kind}_quat"] = _shape_output(
           out[f"{kind}_quat"], batch, count, 4
       )
+      result[f"{kind}_quat_low"] = _shape_output(
+          out[f"{kind}_quat_low"], batch, count, 4)
+      result[f"{kind}_quat_tail"] = _shape_output(
+          out[f"{kind}_quat_tail"], batch, count, 4)
+      result[f"{kind}_pos_low"] = _shape_output(
+          out[f"{kind}_pos_low"], batch, count, 3)
+      result[f"{kind}_pos_tail"] = _shape_output(
+          out[f"{kind}_pos_tail"], batch, count, 3)
+    for name in ("geom_xmat", "geom_xmat_low", "geom_xmat_tail"):
+      result[name] = _shape_output(out[name], batch, self.model.ngeom, 9)
     for name in ("joint_anchor", "joint_axis"):
       result[name] = _shape_output(out[name], batch, self.model.njnt, 3)
+    result["body_pos_low"] = _shape_output(
+        out["body_pos_low"], batch, self.model.nbody, 3)
+    result["body_pos_tail"] = _shape_output(
+        out["body_pos_tail"], batch, self.model.nbody, 3)
+    result["geom_pos_low"] = _shape_output(
+        out["geom_pos_low"], batch, self.model.ngeom, 3)
+    result["geom_pos_tail"] = _shape_output(
+        out["geom_pos_tail"], batch, self.model.ngeom, 3)
     return result
+
+  def pose_mismatch(self):
+    """Return the borrowed device mismatch mask from the most recent FK."""
+    if self._workspace is None:
+      raise RuntimeError("prepare_workspace(batch_size) before reading FK status")
+    return self._workspace["outputs"]["pose_mismatch"]
 
   def run(self, qpos, mocap_pos=None, mocap_quat=None):
     """Compute full world poses for a CPU qpos batch; returns MPS tensors."""
@@ -483,103 +623,16 @@ class MetalKinematics:
             q[:, start : start + width].astype(np.float64) / norms[:, None]
         ).astype(np.float32)
     torch = self._torch
-    q_flat = q.reshape(-1)
-    if q_flat.size == 0:
-      q_flat = np.zeros(1, dtype=np.float32)
-    q_tensor = torch.from_numpy(q_flat).to(self._device)
-    shapes = {
-        "body": (self.model.nbody,),
-        "geom": (self.model.ngeom,),
-        "site": (self.model.nsite,),
-        "inertial": (self.model.nbody,),
-    }
-    outputs = {}
-    for name, shape in shapes.items():
-      count = source.shape[0] * shape[0]
-      outputs[f"{name}_pos"] = torch.empty(
-          max(count * 3, 1), dtype=torch.float32, device=self._device
-      )
-      outputs[f"{name}_quat"] = torch.empty(
-          max(count * 4, 1), dtype=torch.float32, device=self._device
-      )
-    outputs["joint_anchor"] = torch.empty(
-        max(source.shape[0] * self.model.njnt * 3, 1),
-        dtype=torch.float32,
-        device=self._device,
-    )
-    outputs["joint_axis"] = torch.empty(
-        max(source.shape[0] * self.model.njnt * 3, 1),
-        dtype=torch.float32,
-        device=self._device,
-    )
-    arrays = self._arrays
-    args = [
-        arrays[name]
-        for name in (
-            "body_parentid",
-            "body_pos",
-            "body_quat",
-            "jnt_type",
-            "jnt_qposadr",
-            "jnt_bodyid",
-            "jnt_pos",
-            "jnt_axis",
-            "qpos0",
-        )
-    ]
-    args.extend([q_tensor, outputs["body_pos"], outputs["body_quat"]])
-    args.extend(
-        arrays[name] for name in ("geom_bodyid", "geom_pos", "geom_quat")
-    )
-    args.extend([outputs["geom_pos"], outputs["geom_quat"]])
-    args.extend(
-        arrays[name] for name in ("site_bodyid", "site_pos", "site_quat")
-    )
-    args.extend([outputs["site_pos"], outputs["site_quat"]])
-    args.extend(
-        [
-            arrays["body_ipos"],
-            arrays["body_iquat"],
-            outputs["inertial_pos"],
-            outputs["inertial_quat"],
-        ]
-    )
-    dims = torch.tensor(
-        [
-            self.model.nq,
-            self.model.nbody,
-            self.model.njnt,
-            self.model.ngeom,
-            self.model.nsite,
-            source.shape[0],
-            self.model.nmocap,
-        ],
-        dtype=torch.int32,
-        device=self._device,
-    )
-    args.extend([dims, outputs["joint_anchor"], outputs["joint_axis"]])
-    args.extend([
-        self._arrays["body_mocapid"],
-        torch.from_numpy(mocap_flat_host).to(self._device),
-    ])
-    self._kernel(*args, threads=(source.shape[0],), group_size=(1,))
-    shaped = {}
-    for kind, count in (
-        ("body", self.model.nbody),
-        ("geom", self.model.ngeom),
-        ("site", self.model.nsite),
-        ("inertial", self.model.nbody),
-    ):
-      shaped[f"{kind}_pos"] = _shape_output(
-          outputs[f"{kind}_pos"], source.shape[0], count, 3
-      )
-      shaped[f"{kind}_quat"] = _shape_output(
-          outputs[f"{kind}_quat"], source.shape[0], count, 4
-      )
-    shaped["joint_anchor"] = _shape_output(
-        outputs["joint_anchor"], source.shape[0], self.model.njnt, 3
-    )
-    shaped["joint_axis"] = _shape_output(
-        outputs["joint_axis"], source.shape[0], self.model.njnt, 3
-    )
-    return shaped
+    self.prepare_workspace(batch)
+    q_tensor = torch.as_tensor(q, dtype=torch.float32, device=self._device).contiguous()
+    if nmocap:
+      mocap_pos_tensor = torch.as_tensor(
+          np.array(checked_pos, dtype=np.float32, copy=True),
+          dtype=torch.float32, device=self._device).contiguous()
+      mocap_quat_tensor = torch.as_tensor(
+          np.array(checked_quat, dtype=np.float32, copy=True),
+          dtype=torch.float32, device=self._device).contiguous()
+    else:
+      mocap_pos_tensor = None
+      mocap_quat_tensor = None
+    return self.run_device(q_tensor, mocap_pos_tensor, mocap_quat_tensor)

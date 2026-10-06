@@ -310,8 +310,7 @@ class MetalScalarMotorForce:
     self._force_limited = self._device_array(model.force_limited, torch.int32)
     self._force_range = self._device_array(model.force_range, torch.float32)
     self._groups = self._device_array(model.actuator_group, torch.int32)
-    self._dims = torch.tensor(
-        [
+    self._dims_base = [
             model.nu,
             model.nv,
             self._batch_size,
@@ -328,7 +327,9 @@ class MetalScalarMotorForce:
                 )
             ),
             model.disableactuator,
-        ],
+        ]
+    self._dims = torch.tensor(
+        self._dims_base + [1] * self._batch_size,
         dtype=torch.int32,
         device=self._device,
     )
@@ -350,7 +351,11 @@ class MetalScalarMotorForce:
         if self.model.nu == 0
         else None
     )
-    self._dims[2] = self._batch_size
+    if self._dims.numel() != 6 + self._batch_size:
+      self._dims_base[2] = self._batch_size
+      self._dims = self._torch.tensor(
+          self._dims_base + [1] * self._batch_size,
+          dtype=self._torch.int32, device=self._device)
 
   def _check_capacity(self, batch):
     maximum = (2**31 - 1) // max(1, self.model.nv, self.model.nu)
@@ -366,7 +371,7 @@ class MetalScalarMotorForce:
         self._device
     )
 
-  def run_device(self, ctrl):
+  def run_device(self, ctrl, *, world_mask=None):
     """Compute ``qfrc_actuator = moment.T @ actuator_force`` on MPS."""
     torch = self._torch
     if not isinstance(ctrl, torch.Tensor) or ctrl.ndim != 2:
@@ -383,6 +388,14 @@ class MetalScalarMotorForce:
     if ctrl.device.type != "mps":
       raise ValueError("ctrl must be on the MPS device")
     self._check_capacity(batch)
+    if world_mask is None:
+      self._dims[6:].fill_(1)
+    else:
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.dtype != torch.int32 or world_mask.device.type != "mps"
+          or tuple(world_mask.shape) != (batch,) or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 MPS with shape (batch,)")
+      self._dims[6:].copy_(world_mask)
     device_ctrl = self._empty_ctrl if self.model.nu == 0 else ctrl.reshape(-1)
     if self._force is None or tuple(self._force.shape) != (batch, max(self.model.nu, 1)):
       self._force = self._torch.empty((batch, max(self.model.nu, 1)), dtype=self._torch.float32, device=self._device)

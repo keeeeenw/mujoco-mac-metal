@@ -168,11 +168,15 @@ class FixedTendonModel:
 class MetalFixedTendonDynamics:
   """Native MPS fixed-tendon passive-force and rank-one dynamics stage."""
 
-  def __init__(self, model, batch_size=1, spatial_ok=False):
+  def __init__(self, model, batch_size=1, spatial_ok=False, *,
+               armature_storage="dense", velocity_derivative_layout=None):
     self._meta = FixedTendonModel(model, spatial_ok=spatial_ok)
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
       raise ValueError("batch_size must be a positive integer")
     self.batch_size = batch_size
+    if armature_storage not in ("dense", "external"):
+      raise ValueError("armature_storage must be 'dense' or 'external'")
+    self.armature_storage = armature_storage
     for value in (self._meta.nq, self._meta.nv, self._meta.ntendon, batch_size):
       if value > _INT32_MAX:
         raise ValueError("tendon dimensions exceed int32")
@@ -180,11 +184,14 @@ class MetalFixedTendonDynamics:
       raise ValueError("tendon workspace exceeds uint32 indexing")
     if batch_size * self._meta.nv * self._meta.nv > _UINT32_MAX:
       raise ValueError("tendon matrix workspace exceeds uint32 indexing")
+    if batch_size * max(self._meta.ntendon, 1) > _INT32_MAX:
+      raise ValueError("cached tendon lengths exceed int32 indexing")
     import torch
     self._torch = torch
     self._device = torch.device("mps")
     self._library = torch.mps.compile_shader(_SHADER.read_text())
     self._kernel = self._library.fixed_tendon_dynamics
+    self._coo_damping_kernel = self._library.fixed_tendon_damping_coo
     def tensor(value, dtype=torch.float32):
       npdtype = np.int32 if dtype == torch.int32 else np.float32
       array = np.array(value, dtype=npdtype, order="C", copy=True)
@@ -203,13 +210,41 @@ class MetalFixedTendonDynamics:
     self._spring_range = tensor(meta.spring_range.reshape(-1))
     self._armature = tensor(meta.armature)
     self._ancestor_mask = tensor(meta.ancestor_mask.reshape(-1))
-    self._dims = tensor([meta.nq, meta.nv, meta.ntendon, batch_size, int(meta.disable_spring), int(meta.disable_damper)], torch.int32)
+    self._dims = tensor([meta.nq, meta.nv, meta.ntendon, batch_size,
+                         int(meta.disable_spring), int(meta.disable_damper),
+                         int(armature_storage == "dense"), 0] +
+                        [1] * batch_size, torch.int32)
+    self._velocity_derivative_layout = velocity_derivative_layout
+    if velocity_derivative_layout is not None:
+      if int(velocity_derivative_layout.diagonal_slots.size) != meta.nv:
+        raise ValueError("velocity derivative layout nv does not match tendon model")
+      from mujoco_metal.metal_kinematics import _validate_workspace_index_capacity
+      _validate_workspace_index_capacity(
+          batch_size,
+          {"fixed_tendon.coo_dims": 5,
+           "fixed_tendon.coo_edges": max(int(velocity_derivative_layout.edge_count), 1)},
+          {"nv": meta.nv,
+           "edges": int(velocity_derivative_layout.edge_count)})
+      self._coo_damping_dims = tensor(
+          [meta.nv, meta.ntendon, batch_size,
+           int(velocity_derivative_layout.edge_count),
+           int(meta.disable_damper)], torch.int32)
+    else:
+      self._coo_damping_dims = None
+    self._velocity_dims = self._dims.clone()
+    self._velocity_dims[7] = 1
+    self._last_length = torch.zeros((batch_size, max(meta.ntendon, 1)),
+                                    dtype=torch.float32, device=self._device)
     self._qfrc = torch.empty((batch_size, meta.nv), dtype=torch.float32, device=self._device)
     self._damping_matrix = torch.empty((batch_size, meta.nv, meta.nv), dtype=torch.float32, device=self._device)
-    self._armature_matrix = torch.empty((batch_size, meta.nv, meta.nv), dtype=torch.float32, device=self._device)
+    self._armature_matrix = (
+        torch.empty((batch_size, meta.nv, meta.nv), dtype=torch.float32,
+                    device=self._device)
+        if armature_storage == "dense" else torch.zeros(1, dtype=torch.float32,
+                                                         device=self._device))
     self._dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
 
-  def run_device(self, qpos, qvel):
+  def run_device(self, qpos, qvel, *, length_override=None, world_mask=None):
     """Return borrowed `(qfrc, damping matrix, armature matrix)` MPS tensors."""
     torch, meta = self._torch, self._meta
     for name, value, shape in (
@@ -218,16 +253,78 @@ class MetalFixedTendonDynamics:
     ):
       if not isinstance(value, torch.Tensor) or value.device.type != "mps" or value.dtype != torch.float32 or tuple(value.shape) != shape or not value.is_contiguous():
         raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
+    if length_override is not None:
+      shape = (self.batch_size, max(meta.ntendon, 1))
+      if (not isinstance(length_override, torch.Tensor)
+          or tuple(length_override.shape) != shape
+          or length_override.dtype != torch.float32
+          or length_override.device.type != "mps"
+          or not length_override.is_contiguous()):
+        raise ValueError(f"cached tendon lengths must be contiguous float32 MPS {shape}")
+    if world_mask is not None:
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.dtype != torch.int32
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or world_mask.device.type != "mps" or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 MPS [batch_size]")
+      self._dims[8:8 + self.batch_size].copy_(world_mask)
+    else:
+      self._dims[8:8 + self.batch_size].fill_(1)
+    dims = self._dims if length_override is None else self._velocity_dims
     self._kernel(
         qpos.reshape(-1) if meta.nq else self._dummy,
         qvel.reshape(-1) if meta.nv else self._dummy,
         self._length_map, self._moment_map, self._stiffness,
         self._stiffnesspoly, self._damping, self._dampingpoly,
-        self._spring_range, self._armature, self._dims,
+        self._spring_range, self._armature, dims,
         self._qfrc.reshape(-1) if meta.nv else self._dummy,
         self._damping_matrix.reshape(-1) if meta.nv else self._dummy,
         self._armature_matrix.reshape(-1) if meta.nv else self._dummy,
         self._ancestor_mask,
+        length_override.reshape(-1) if length_override is not None else self._dummy,
+        self._last_length.reshape(-1),
         threads=(self.batch_size,), group_size=(1,),
     )
-    return self._qfrc, self._damping_matrix, self._armature_matrix
+    armature = (self._armature_matrix if self.armature_storage == "dense"
+                else None)
+    return self._qfrc, self._damping_matrix, armature
+
+  def run_damping_derivative_coo_device(self, qvel, edge_writer):
+    """Accumulate fixed-tendon qDeriv directly into compiled COO slots.
+
+    The physical damping matrix remains available from ``run_device`` for
+    legacy dense consumers. Sparse implicit assembly uses this producer and
+    avoids allocating or gathering a global nv-by-nv tendon derivative.
+    """
+    torch, meta = self._torch, self._meta
+    if self._velocity_derivative_layout is None:
+      raise ValueError("compiled velocity derivative layout is required for COO tendons")
+    expected = (self.batch_size, meta.nv)
+    if (not isinstance(qvel, torch.Tensor) or qvel.dtype != torch.float32
+        or qvel.device.type != "mps" or tuple(qvel.shape) != expected
+        or not qvel.is_contiguous()):
+      raise ValueError(f"qvel must be contiguous float32 MPS {expected}")
+    edge_count = int(self._velocity_derivative_layout.edge_count)
+    if (getattr(edge_writer, "nv", None) != meta.nv
+        or getattr(edge_writer, "edge_count", None) != edge_count
+        or tuple(edge_writer.values.shape) !=
+        (self.batch_size, max(edge_count, 1))):
+      raise ValueError("edge_writer does not match fixed-tendon compiled COO layout")
+    if edge_count:
+      self._coo_damping_kernel(
+          qvel.reshape(-1), self._moment_map, self._damping,
+          self._dampingpoly, edge_writer._edge_rows,
+          edge_writer._edge_cols, self._coo_damping_dims,
+          edge_writer.values.reshape(-1),
+          threads=(self.batch_size * edge_count,), group_size=(1,))
+    return edge_writer.values
+
+  @property
+  def fixed_jacobian_template(self):
+    """Borrow the immutable ``[ntendon,nv]`` fixed-tendon moment map.
+
+    Spatial tendon rows are zero in this table and are supplied by the spatial
+    kinematics stage. Callers building one canonical runtime ``tendon_J`` may
+    copy this map into each world before overlaying spatial rows.
+    """
+    return self._moment_map

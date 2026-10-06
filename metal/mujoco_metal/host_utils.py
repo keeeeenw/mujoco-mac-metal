@@ -18,7 +18,8 @@ These are thin validated wrappers around pinned CPU APIs (inverse
 dynamics, mass/Jacobian/object-velocity queries). They run on the HOST,
 never on the device, and must never be cited as native GPU evidence: a
 host compatibility result is recorded under host compatibility. Native
-ports remain separately tracked gaps.
+counterparts and their independent qualification are documented in API.md;
+the existence of these host wrappers neither proves nor rules out native support.
 """
 
 import mujoco

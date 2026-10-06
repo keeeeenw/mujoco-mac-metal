@@ -132,6 +132,8 @@ kernel void evaluate_sensors(
   uint nv=uint(dims[3]), batch=uint(dims[8]);
   if (index >= batch*nsensor || (dims[9] & 8192)) return;
   uint world=index/nsensor, i=index-world*nsensor;
+  if (stage_mask[1+batch*max(nsensor,1u)+world] == 0) return;
+  if (stage_mask[1+index] == 0) return;
   uint stage=uint(sensor_needstage[i]);
   if ((uint(stage_mask[0]) & (1u<<stage)) == 0) return;
   int typ0=sensor_type[i];
@@ -242,6 +244,7 @@ kernel void build_sensor_subtrees(
     uint world [[thread_position_in_grid]]) {
   uint nbody=uint(dims[5]);
   if (world>=uint(dims[8])) return;
+  if (dims[15+int(world)] == 0) return;
   device SensorSubtree* sub = reinterpret_cast<device SensorSubtree*>(runtime+4)+world*nbody;
     // Shared subtree pass (pinned mj_subtreeVel): per-body COM velocity
     // from com-based cvel, mass-weighted backward accumulation.
@@ -338,14 +341,18 @@ kernel void evaluate_state_sensors(
   // econst: gravity(3), magnetic(3), dis_spring, dis_damper, dis_gravity,
   //   nq, qpos_spring(nq), jnt_k(njnt), jnt_p0(njnt), jnt_p1(njnt).
   // dims (14 ints): nsensor, ndata, nq, nv, njnt, nbody, ngeom, nsite, batch,
-  //   disable, ntendon, nu, act_kind, has_mass.
+  //   disable, ntendon, nu, act_kind, has_mass, has_mass_product.
   uint nsensor=uint(dims[0]), ndata=uint(dims[1]), nq=uint(dims[2]);
   uint nv=uint(dims[3]), njnt=uint(dims[4]), nbody=uint(dims[5]);
   uint nsite=uint(dims[7]), batch=uint(dims[8]);
   uint nt=uint(dims[10]), nu=uint(dims[11]);
   uint act_kind=uint(dims[12]), has_mass=uint(dims[13]);
+  uint has_mass_product=uint(dims[14]);
   if (index >= batch*nsensor || (dims[9] & 8192)) return;
   uint world=index/nsensor, i=index-world*nsensor;
+  if (dims[15+int(world)] == 0) return;
+  uint awake_offset=4+batch*nbody*32;
+  if (runtime[awake_offset+index] == 0.0f) return;
   uint stage=uint(meta[i*10+2]);
   if ((uint(runtime[0]) & (1u<<stage)) == 0) return;
   int typ=meta[i*10+0], objid=meta[i*10+4];
@@ -542,7 +549,12 @@ kernel void evaluate_state_sensors(
       if (has_mass!=0) {
         for (uint r=0;r<nv;++r) {
           float s=0.0f;
-          for (uint c=0;c<nv;++c) s+=mass_matrix[(world*nv+r)*nv+c]*qvel[vb+c];
+          if (has_mass_product!=0) {
+            s=mass_matrix[vb+r];
+          } else {
+            for (uint c=0;c<nv;++c)
+              s+=mass_matrix[(world*nv+r)*nv+c]*qvel[vb+c];
+          }
           e+=0.5f*s*qvel[vb+r];
         }
       }

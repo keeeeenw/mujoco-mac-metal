@@ -3,6 +3,22 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline uint pcg32_next(thread ulong& state, thread ulong& inc) {
+  ulong oldstate=state;
+  state=oldstate*6364136223846793005ul+(inc|1ul);
+  uint xorshifted=uint(((oldstate>>18ul)^oldstate)>>27ul);
+  uint rot=uint(oldstate>>59ul);
+  return (xorshifted>>rot)|(xorshifted<<((-rot)&31u));
+}
+
+inline void shuffle_rows(thread int* rows, int count,
+                         thread ulong& state, thread ulong& inc) {
+  for (int i=count-1;i>0;--i) {
+    uint j=pcg32_next(state,inc)%uint(i+1);
+    int tmp=rows[i]; rows[i]=rows[j]; rows[j]=tmp;
+  }
+}
+
 inline float impedance_at(device const float* imp, int index, float pos, float margin) {
   float d0=imp[index*5], d1=imp[index*5+1], width=imp[index*5+2];
   float mid=imp[index*5+3], power=imp[index*5+4];
@@ -46,24 +62,48 @@ kernel void solve_joint_constraints(
     device const int* eq_obj1 [[buffer(17)]], device const int* eq_obj2 [[buffer(18)]],
     device const float* eq_data [[buffer(19)]], device const float* eq_solref [[buffer(20)]],
     device const float* eq_solimp [[buffer(21)]], constant int* dims [[buffer(22)]],
-    constant float* timestep [[buffer(23)]], device float* out_force [[buffer(24)]],
+    constant float* solver_params [[buffer(23)]], device float* out_force [[buffer(24)]],
     device float* out_acc [[buffer(25)]], device int* out_status [[buffer(26)]],
     device float* out_residual [[buffer(27)]], device int* out_iterations [[buffer(28)]],
+    device float* canonical_rows [[buffer(29)]],
+    device float* out_lambda [[buffer(30)]],
     uint world [[thread_position_in_grid]]) {
   int nq=dims[0], nv=dims[1], nj=dims[2], neq=dims[3], nr=dims[4], batch=dims[5];
   int flags=dims[6]; bool refsafe=dims[7]!=0; int maxiter=dims[8];
+  bool warmstart_enabled=dims[10]!=0;
   if (world>=uint(batch)) return;
+  if (dims[11 + int(world)] == 0) return;
   int mb=world*nv*nv, qb=world*nv, pb=world*nq;
   out_status[world]=0; out_residual[world]=0.0f; out_iterations[world]=0;
-  for (int i=0;i<nv;++i) { out_force[qb+i]=0.0f; out_acc[qb+i]=0.0f; }
+  for (int i=0;i<nv;++i) out_force[qb+i]=0.0f;
+  int canonical_base=world*nr*(nv+5);
+  for (int row=0;row<nr;++row) {
+    int base=canonical_base+row*(nv+5);
+    for (int k=0;k<nv;++k) canonical_rows[base+k]=0.0f;
+    canonical_rows[base+nv]=1.0f;
+    canonical_rows[base+nv+1]=0.0f;
+    canonical_rows[base+nv+2]=0.0f;
+    canonical_rows[base+nv+3]=0.0f;
+    canonical_rows[base+nv+4]=0.0f;
+  }
   if (nv==0) return;
   thread float L[24*24]; thread float J[32*24]; thread float Z[32*24];
   thread float R[32]; thread float ar[32]; thread float lo[32]; thread float hi[32];
   thread float lam[32]; thread float rhs[32]; thread float y[24]; thread float x[24];
+  thread float warm_qacc[24];
+  thread int blockstart[32]; thread int order[32];
   thread bool enabled[32];
   if (nv>24 || nr>32) { out_status[world]=2; return; }
+  for (int i=0;i<nv;++i) {
+    warm_qacc[i]=warmstart_enabled ? out_acc[qb+i] : 0.0f;
+    out_acc[qb+i]=0.0f;
+  }
   for (int i=0;i<nr*nv;++i) { J[i]=0.0f; Z[i]=0.0f; }
-  for (int i=0;i<nr;++i) { R[i]=1.0f; ar[i]=0.0f; lo[i]=0.0f; hi[i]=0.0f; lam[i]=0.0f; enabled[i]=false; }
+  for (int i=0;i<nr;++i) {
+    R[i]=1.0f; ar[i]=0.0f; lo[i]=0.0f; hi[i]=0.0f;
+    lam[i]=0.0f;
+    enabled[i]=false;
+  }
   if ((flags & 1)==0) {
     for (int e=0;e<neq;++e) {
       if ((flags&2)!=0 || eq_active[world*neq+e]==0) continue;
@@ -78,17 +118,17 @@ kernel void solve_joint_constraints(
         pos-=poly; J[e*nv+d1]=1.0f; J[e*nv+d2]=-deriv;
         vel-=deriv*qvel[qb+d2]; diag+=invweight[d2];
       } else J[e*nv+d1]=1.0f;
-      reference_params(eq_solref,eq_solimp,e,pos,0.0f,vel,diag,false,timestep[0],refsafe,R[e],ar[e]);
+      reference_params(eq_solref,eq_solimp,e,pos,0.0f,vel,diag,false,solver_params[0],refsafe,R[e],ar[e]);
       lo[e]=-INFINITY; hi[e]=INFINITY; enabled[e]=true;
     }
     for (int d=0;d<nv;++d) {
       int row=neq+d; float loss=frictionloss[d];
       if ((flags&4)!=0 || loss<=0.0f) continue;
       J[row*nv+d]=1.0f;
-      reference_params(dof_solref,dof_solimp,d,0.0f,0.0f,qvel[qb+d],invweight[d],true,timestep[0],refsafe,R[row],ar[row]);
+      reference_params(dof_solref,dof_solimp,d,0.0f,0.0f,qvel[qb+d],invweight[d],true,solver_params[0],refsafe,R[row],ar[row]);
       lo[row]=-loss; hi[row]=loss; enabled[row]=true;
     }
-    for (int j=0;j<nj;++j) {
+  for (int j=0;j<nj;++j) {
       if (joint_limited[j]==0) continue;
       int d=joint_dadr[j], q=joint_qadr[j];
       for (int s=0;s<2;++s) {
@@ -96,11 +136,26 @@ kernel void solve_joint_constraints(
         float value=qpos[pb+q], range=joint_range[j*2+s], dist=side*(range-value), margin=joint_margin[j];
         if ((flags&8)!=0 || dist>=margin) continue;
         J[row*nv+d]=-side;
-        reference_params(joint_solref,joint_solimp,j,dist,margin,J[row*nv+d]*qvel[qb+d],invweight[d],false,timestep[0],refsafe,R[row],ar[row]);
+        reference_params(joint_solref,joint_solimp,j,dist,margin,J[row*nv+d]*qvel[qb+d],invweight[d],false,solver_params[0],refsafe,R[row],ar[row]);
         lo[row]=0.0f; hi[row]=INFINITY; enabled[row]=true;
       }
     }
   }
+  for (int row=0;row<nr;++row) {
+    int base=canonical_base+row*(nv+5);
+    for (int k=0;k<nv;++k) canonical_rows[base+k]=J[row*nv+k];
+    canonical_rows[base+nv]=R[row];
+    canonical_rows[base+nv+1]=ar[row];
+    canonical_rows[base+nv+2]=lo[row];
+    canonical_rows[base+nv+3]=hi[row];
+    canonical_rows[base+nv+4]=enabled[row] ? 1.0f : 0.0f;
+  }
+  int nblocks=0;
+  for (int row=0;row<nr;++row) {
+    if (enabled[row]) blockstart[nblocks++]=row;
+    else lam[row]=0.0f;
+  }
+  if (dims[9]!=0) return;
   // Cholesky factorization of the dense generalized mass matrix.
   for (int i=0;i<nv;++i) for (int j=0;j<nv;++j) L[i*nv+j]=0.0f;
   for (int i=0;i<nv;++i) for (int j=0;j<=i;++j) {
@@ -122,17 +177,57 @@ kernel void solve_joint_constraints(
   for (int row=0;row<nr;++row) {
     float v=ar[row]; for(int i=0;i<nv;++i)v-=J[row*nv+i]*out_acc[qb+i]; rhs[row]=enabled[row]?v:0.0f;
   }
-  // Projected Gauss-Seidel on W = J M^-1 J' + diag(R).
-  float res=INFINITY;
+  // mj_constraintUpdate seeds scalar efc_force as -D*(J*qacc_warmstart-aref).
+  // The row compliance R is 1/D; bounds implement friction/limit projection.
+  for (int row=0;row<nr;++row) if (enabled[row]) {
+    float jar=-ar[row];
+    for (int i=0;i<nv;++i) jar+=J[row*nv+i]*warm_qacc[i];
+    lam[row]=clamp(-jar/R[row],lo[row],hi[row]);
+  }
+  // PGS warmstart retains the seeded force only when its current dual cost
+  // is non-positive. Otherwise MuJoCo coldstarts this solve from zero force.
+  float warmstart_cost=0.0f;
+  for (int row=0;row<nr;++row) if (enabled[row]) {
+    float grad=-rhs[row];
+    for (int col=0;col<nr;++col) if (enabled[col])
+      for (int i=0;i<nv;++i) grad+=J[row*nv+i]*Z[col*nv+i]*lam[col];
+    grad+=R[row]*lam[row];
+    warmstart_cost+=0.5f*lam[row]*(grad-rhs[row]);
+  }
+  if (!warmstart_enabled || warmstart_cost>0.0f) {
+    for (int row=0;row<nr;++row) lam[row]=0.0f;
+  }
+  // Projected Gauss-Seidel on W = J M^-1 J' + diag(R). Pinned solPGS
+  // stops on scaled accumulated objective improvement, not projected
+  // residual. A finite maxiter is an accepted iterate, not status failure.
+  float scale=1.0f/(max(solver_params[2],1e-30f)*max(1,nv));
+  ulong rng_state=0ul, rng_inc=1ul;
+  pcg32_next(rng_state,rng_inc);  // pinned solPGS seeds by one discarded draw
+  for (int block=0;block<nblocks;++block) order[block]=blockstart[block];
+  float res=0.0f;
   for (int it=0;it<maxiter;++it) {
-    for (int row=0;row<nr;++row) {
-      if (!enabled[row]) { lam[row]=0.0f; continue; }
+    float improvement=0.0f;
+    // solPGS shuffles blockstart in place, so each sweep starts from the
+    // previous sweep's permutation rather than restoring canonical order.
+    shuffle_rows(order,nblocks,rng_state,rng_inc);
+    for (int block=0;block<nblocks;++block) {
+      int row=order[block];
       float diag=R[row]; for(int i=0;i<nv;++i)diag+=J[row*nv+i]*Z[row*nv+i];
       if (!(diag>1e-12f)) { out_status[world]=2; return; }
-      float v=rhs[row];
-      for(int col=0;col<nr;++col) if(enabled[col] && col!=row)
-        for(int i=0;i<nv;++i)v-=J[row*nv+i]*Z[col*nv+i]*lam[col];
-      lam[row]=clamp(v/diag,lo[row],hi[row]);
+      float grad=-rhs[row];
+      for(int col=0;col<nr;++col) if(enabled[col])
+        for(int i=0;i<nv;++i)grad+=J[row*nv+i]*Z[col*nv+i]*lam[col];
+      grad+=R[row]*lam[row];
+      float old=lam[row];
+      float updated=clamp(old-grad/diag,lo[row],hi[row]);
+      float delta=updated-old;
+      float cost_change=0.5f*delta*delta*diag+delta*grad;
+      if (cost_change>1e-10f) {
+        updated=old;
+        cost_change=0.0f;
+      }
+      lam[row]=updated;
+      improvement-=cost_change;
     }
     res=0.0f;
     for(int row=0;row<nr;++row) if(enabled[row]) {
@@ -142,9 +237,13 @@ kernel void solve_joint_constraints(
       float diag=R[row]; for(int i=0;i<nv;++i)diag+=J[row*nv+i]*Z[row*nv+i];
       float proj=clamp(lam[row]-grad/diag,lo[row],hi[row]); res=max(res,abs(proj-lam[row]));
     }
-    out_iterations[world]=it+1; if(res<=2e-6f)break;
+    improvement*=scale;
+    out_iterations[world]=it+1;
+    if(improvement<solver_params[1])break;
   }
-  out_residual[world]=res; if(res>2e-6f)out_status[world]=1;
+  out_residual[world]=res;
+  for(int row=0;row<nr;++row)
+    out_lambda[world*max(nr,1)+row]=lam[row];
   for(int row=0;row<nr;++row) if(enabled[row]) for(int i=0;i<nv;++i)out_force[qb+i]+=J[row*nv+i]*lam[row];
   for(int i=0;i<nv;++i) {
     float v=out_force[qb+i]; for(int k=0;k<i;++k)v-=L[i*nv+k]*y[k]; y[i]=v/L[i*nv+i];

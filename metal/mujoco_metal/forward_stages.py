@@ -34,6 +34,8 @@ class ForwardStageRecord:
   mocap_quat: object
   input_tensors: dict = field(default_factory=dict)
   input_versions: dict = field(default_factory=dict)
+  row_epochs: object = None
+  row_valid: object = None
   stage: ForwardStage = ForwardStage.NONE
   values: dict = field(default_factory=dict)
 
@@ -70,6 +72,11 @@ class ForwardStageCoordinator:
         owner=self._owner, generation=int(generation), epoch=self._epoch,
         token=self._next_token, qpos=qpos, mocap_pos=mocap_pos,
         mocap_quat=mocap_quat)
+    state = getattr(self._owner, "_state", None)
+    if state is not None and getattr(state, "_row_reset_epoch", None) is not None:
+      record.row_epochs = state._row_reset_epoch.clone()
+      record.row_valid = state._torch.ones(
+          (state.batch_size,), dtype=state._torch.bool, device=state._device)
     self._record = record
     for name, value in (("qpos", qpos), ("mocap_pos", mocap_pos),
                         ("mocap_quat", mocap_quat)):
@@ -80,6 +87,25 @@ class ForwardStageCoordinator:
     if position is not None:
       self.publish(record, ForwardStage.POS, position)
     return record
+
+  def note_masked_reset(self, mask, row_epochs=None):
+    """Mark only selected rows stale without invalidating healthy stages.
+
+    Internal AUTORESET writes use this path; public reset/restore continue to
+    advance the global generation and invalidate the entire record.
+    """
+    record = self._record
+    if record is None or record.row_valid is None:
+      return
+    if (tuple(mask.shape) != tuple(record.row_valid.shape)
+        or mask.dtype != record.row_valid.dtype
+        or mask.device != record.row_valid.device):
+      raise ValueError("masked reset rows do not match the live stage record")
+    state = getattr(self._owner, "_state", None)
+    if state is not None and callable(getattr(state, "invalidate_bool_rows", None)):
+      state.invalidate_bool_rows(record.row_valid, mask)
+    else:
+      record.row_valid.logical_and_(~mask)
 
   def validate(self, record, *, generation, minimum=ForwardStage.POS):
     """Return the live record or raise for stale/foreign/out-of-order use."""
@@ -173,6 +199,12 @@ class ForwardStageCoordinator:
           minimum=prefix)
     if not isinstance(values, dict):
       raise TypeError("forward-stage values must be a dictionary")
+    if current.row_valid is not None:
+      # Consumers receive the per-world cache-validity mask alongside every
+      # borrowed stage. They must carry it into status/commit selection; a
+      # row invalidated by masked AUTORESET is never represented as valid
+      # merely because the batch-global generation still matches.
+      values.setdefault("row_valid", current.row_valid)
     # Bind a refreshed VEL input only after every validation that can reject
     # publication. This lets POS be reused with a new qvel while ensuring a
     # failed/out-of-order publish leaves the live record unchanged.
@@ -189,6 +221,22 @@ class ForwardStageCoordinator:
     current.values[stage] = values
     current.stage = stage
     return current
+
+  @staticmethod
+  def row_validity(record):
+    """Return the device mask that identifies reusable rows in ``record``."""
+    if record.row_valid is None:
+      return None
+    return record.row_valid
+
+  @staticmethod
+  def invalid_row_status(status, record, *, code=3):
+    """Promote stale cached rows to explicit per-world failure status."""
+    if record.row_valid is None or status is None:
+      return status
+    invalid = status.new_full(status.shape, int(code))
+    return (status * record.row_valid.to(status.dtype)
+            + invalid * (~record.row_valid).to(status.dtype))
 
   def consume(self, record, stage, *, generation):
     """Validate and return a previously published stage result."""

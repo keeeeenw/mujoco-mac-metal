@@ -409,7 +409,8 @@ _MAX_WRAP = 8
 class MetalSpatialTendonDynamics:
   """Native MPS spatial tendon kinematics + passive-force stage (milestone 008)."""
 
-  def __init__(self, model, batch_size=1):
+  def __init__(self, model, batch_size=1, *, armature_storage="dense",
+               velocity_derivative_layout=None):
     import torch
     from pathlib import Path as _Path
     self._torch = torch
@@ -417,15 +418,44 @@ class MetalSpatialTendonDynamics:
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
       raise ValueError("batch_size must be a positive integer")
     self.batch_size = batch_size
+    if armature_storage not in ("dense", "external"):
+      raise ValueError("armature_storage must be 'dense' or 'external'")
+    self.armature_storage = armature_storage
     meta = self._meta
     nq, nv, nt = meta.nq, meta.nv, meta.ntendon
-    if nv > 32:
-      raise ValueError("spatial tendon kinematics bounds nv to 32")
     self._device = torch.device("mps")
     lib = torch.mps.compile_shader(
         (_Path(__file__).parent / "shaders" / "tendons.metal").read_text())
     self._kin_kernel = lib.spatial_tendon_kinematics
+    self._velocity_kernel = lib.spatial_tendon_velocity
+    self._force_kernel = lib.spatial_tendon_forces
+    self._actuator_state_kernel = lib.spatial_tendon_actuator_state
     self._dots_kernel = lib.spatial_armature_dots
+    self._bias_kernel = lib.spatial_armature_bias
+    self._velocity_derivative_layout = velocity_derivative_layout
+    if velocity_derivative_layout is not None:
+      if int(velocity_derivative_layout.diagonal_slots.size) != nv:
+        raise ValueError("velocity derivative layout nv does not match spatial tendon model")
+      from mujoco_metal.metal_kinematics import _validate_workspace_index_capacity
+      _validate_workspace_index_capacity(
+          batch_size,
+          {"spatial_tendon.coo_damping_dims": 5,
+           "spatial_tendon.coo_edges": max(
+               int(velocity_derivative_layout.edge_count), 1)},
+          {"nv": nv, "edges": int(velocity_derivative_layout.edge_count)})
+      self._coo_damping_lib = torch.mps.compile_shader(
+          (_Path(__file__).parent / "shaders" /
+           "spatial_tendon_derivative.metal").read_text())
+      self._coo_damping_kernel = self._coo_damping_lib.spatial_tendon_damping_coo
+      self._coo_damping_dims = torch.tensor(
+          [nv, nt, batch_size, int(velocity_derivative_layout.edge_count),
+           int(bool(int(model.opt.disableflags)
+                    & int(mujoco.mjtDisableBit.mjDSBL_DAMPER)))],
+          dtype=torch.int32, device=self._device)
+    else:
+      self._coo_damping_lib = None
+      self._coo_damping_kernel = None
+      self._coo_damping_dims = None
 
     def tensor(values, dtype=torch.float32):
       arr = np.array(values, dtype=np.int32 if dtype == torch.int32 else np.float32,
@@ -469,9 +499,37 @@ class MetalSpatialTendonDynamics:
     self._body_parentid = tensor(model.body_parentid, torch.int32)
     self._body_jntadr = tensor(model.body_jntadr, torch.int32)
     self._body_jntnum = tensor(model.body_jntnum, torch.int32)
+    # Eight kinematic dimensions, one mask per world, then the force kernel's
+    # include-armature/spring-disable/damper-disable controls. Masked recovery
+    # writes those final three slots even when every world mask is zero.
     self._dims = tensor([nv, nt, meta.nsite, ngeom0(model), nbody, njnt, len(meta.flat_types),
-                         batch_size],
+                         batch_size] + [1] * batch_size + [0, 0, 0],
                         torch.int32)
+    # Static actuator -> spatial-tendon map used by the row-masked state
+    # sensor path.  The ordinary stage still uses the historical vectorized
+    # updates below; recovery updates run one selected world per MSL thread.
+    tendon_trn = int(mujoco.mjtTrn.mjTRN_TENDON)
+    actuator_rows = []
+    for actuator in range(int(model.nu)):
+      trnid = np.asarray(model.actuator_trnid[actuator], dtype=np.int32)
+      tendon = int(trnid[0])
+      if (int(model.actuator_trntype[actuator]) == tendon_trn
+          and 0 <= tendon < nt and meta.paths[tendon] is not None):
+        actuator_rows.append((actuator, tendon,
+                              float(model.actuator_gear[actuator, 0])))
+    self._actuator_state_row_count = len(actuator_rows)
+    row_map = np.zeros((max(len(actuator_rows), 1), 2), dtype=np.int32)
+    row_gear = np.zeros((max(len(actuator_rows), 1),), dtype=np.float32)
+    if actuator_rows:
+      row_map[:len(actuator_rows)] = np.asarray(
+          [(a, t) for a, t, _ in actuator_rows], dtype=np.int32)
+      row_gear[:len(actuator_rows)] = np.asarray(
+          [g for _, _, g in actuator_rows], dtype=np.float32)
+    self._actuator_state_map = tensor(row_map.reshape(-1), torch.int32)
+    self._actuator_state_gear = tensor(row_gear)
+    self._actuator_state_dims = tensor(
+        [batch_size, int(model.nu), max(nv, 1), len(actuator_rows), nt]
+        + [1] * batch_size, torch.int32)
     self._stiffness = tensor(meta.stiffness)
     self._stiffnesspoly = tensor(meta.stiffnesspoly.reshape(-1))
     self._damping = tensor(meta.damping)
@@ -497,7 +555,11 @@ class MetalSpatialTendonDynamics:
         "dots": torch.zeros(b * max(nt, 1), dtype=torch.float32, device=self._device),
         "qfrc": torch.zeros(b * max(nv, 1), dtype=torch.float32, device=self._device),
         "damping": torch.zeros(b * max(nv, 1) * max(nv, 1), dtype=torch.float32, device=self._device),
-        "armature": torch.zeros(b * max(nv, 1) * max(nv, 1), dtype=torch.float32, device=self._device),
+        "armature": (torch.zeros(b * max(nv, 1) * max(nv, 1),
+                                  dtype=torch.float32, device=self._device)
+                     if armature_storage == "dense"
+                     else torch.zeros(1, dtype=torch.float32,
+                                      device=self._device)),
     }
     self._dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
 
@@ -533,7 +595,8 @@ class MetalSpatialTendonDynamics:
       out[:, a, :] = gear * spatial_jac[:, tid, :nv]
     return out
 
-  def apply_spatial_tendon_state(self, actuator_meta, spatial_kin, kin):
+  def apply_spatial_tendon_state(self, actuator_meta, spatial_kin, kin,
+                                 *, world_mask=None):
     """Complete spatial-tendon actuator inputs (R1).
 
     Overwrites length/velocity rows and adds gear-scaled moment rows for
@@ -557,6 +620,31 @@ class MetalSpatialTendonDynamics:
       rows.append((a, tid, float(np.asarray(actuator_meta.gear)[a, 0])))
     if not rows:
       return False
+    if world_mask is not None:
+      torch = self._torch
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.dtype != torch.int32
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or world_mask.device.type != "mps"
+          or not world_mask.is_contiguous()):
+        raise ValueError(
+            "world_mask must be contiguous int32 MPS [batch_size]")
+      dims = self._actuator_state_dims
+      dims[0] = self.batch_size
+      dims[1] = int(actuator_meta.nu)
+      dims[2] = max(int(self._meta.nv), 1)
+      dims[3] = self._actuator_state_row_count
+      dims[4] = int(self._meta.ntendon)
+      dims[5:5 + self.batch_size].copy_(world_mask)
+      self._actuator_state_kernel(
+          spatial_kin["length"].reshape(-1),
+          spatial_kin["velocity"].reshape(-1),
+          spatial_kin["jacobian"].reshape(-1),
+          self._actuator_state_map, self._actuator_state_gear,
+          dims, kin["length"].reshape(-1),
+          kin["velocity"].reshape(-1), kin["moment"].reshape(-1),
+          threads=(self.batch_size,), group_size=(1,))
+      return True
     for a, tid, gear in rows:
       # Pinned mj_transmission scales tendon length by gear; velocity follows
       # the gear-scaled moment row.
@@ -573,11 +661,19 @@ class MetalSpatialTendonDynamics:
         or not value.is_contiguous()):
       raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
 
-  def run_kinematics(self, qvel, poses):
+  def run_kinematics(self, qvel, poses, *, world_mask=None):
     """Compute per-tendon length/velocity/dense Jacobian from FK poses."""
     torch = self._torch
     meta = self._meta
     b, nv, nt = self.batch_size, meta.nv, meta.ntendon
+    if world_mask is not None:
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.dtype != torch.int32 or tuple(world_mask.shape) != (b,)
+          or world_mask.device.type != "mps" or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 MPS [batch_size]")
+      self._dims[8:8 + b].copy_(world_mask)
+    else:
+      self._dims[8:8 + b].fill_(1)
     if nv:
       self._check(qvel, "qvel", (b, max(nv, 1)))
       qvel_flat = qvel.reshape(-1)
@@ -604,20 +700,73 @@ class MetalSpatialTendonDynamics:
             "velocity": w["velocity"].reshape(b, max(nt, 1)),
             "jacobian": w["jacobian"].reshape(b, max(nt, 1), max(nv, 1))}
 
-  def run_forces(self, kin):
+  def run_velocity_kinematics(self, position_kin, qvel, *, world_mask=None):
+    """Reuse cached tendon paths/Jacobians while updating their speeds."""
+    b, nt, nv = self.batch_size, self._meta.ntendon, self._meta.nv
+    self._check(qvel, "qvel", (b, nv))
+    self._check(position_kin["length"], "length", (b, max(nt, 1)))
+    self._check(position_kin["jacobian"], "jacobian",
+                (b, max(nt, 1), max(nv, 1)))
+    velocity = self._ws["velocity"].reshape(b, max(nt, 1))
+    if world_mask is not None:
+      if (not isinstance(world_mask, self._torch.Tensor)
+          or world_mask.dtype != self._torch.int32
+          or tuple(world_mask.shape) != (b,)
+          or world_mask.device.type != "mps" or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 MPS [batch_size]")
+      self._dims[8:8 + b].copy_(world_mask)
+      self._velocity_kernel(
+          qvel.reshape(-1) if nv else self._dummy,
+          position_kin["jacobian"].reshape(-1), self._dims,
+          velocity.reshape(-1), threads=(b,), group_size=(1,))
+    elif nv:
+      velocity.copy_((position_kin["jacobian"] * qvel[:, None, :]).sum(-1))
+    else:
+      velocity.zero_()
+    return {"length": position_kin["length"],
+            "jacobian": position_kin["jacobian"], "velocity": velocity}
+
+  def run_forces(self, kin, *, include_armature=None, world_mask=None):
     """Passive spring/damper forces + damping/armature matrices (torch ops)."""
     torch = self._torch
     meta = self._meta
     b, nv, nt = self.batch_size, meta.nv, meta.ntendon
     w = self._ws
     dev = self._device
+    if include_armature is None:
+      include_armature = self.armature_storage == "dense"
+    if include_armature and self.armature_storage != "dense":
+      raise ValueError("dense armature output was not allocated")
     L = kin["length"].reshape(b, max(nt, 1))
     V = kin["velocity"].reshape(b, max(nt, 1))
     J = kin["jacobian"].reshape(b, max(nt, 1), max(nv, 1))
+    if world_mask is not None:
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.dtype != torch.int32 or tuple(world_mask.shape) != (b,)
+          or world_mask.device.type != "mps" or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 MPS [batch_size]")
+      self._dims[8:8 + b].copy_(world_mask)
+      self._dims[8 + b] = int(bool(include_armature))
+      self._dims[9 + b] = int(self._spring_off)
+      self._dims[10 + b] = int(self._damper_off)
+      self._force_kernel(
+          L.reshape(-1), V.reshape(-1), J.reshape(-1),
+          self._stiffness.reshape(-1), self._stiffnesspoly.reshape(-1),
+          self._damping.reshape(-1), self._dampingpoly.reshape(-1),
+          self._spring_range.reshape(-1), self._armature.reshape(-1),
+          self._ancestor.reshape(-1), self._dims,
+          w["qfrc"].reshape(-1), w["damping"].reshape(-1),
+          w["armature"].reshape(-1) if include_armature else self._dummy,
+          threads=(b,), group_size=(1,))
+      return (w["qfrc"].reshape(b, max(nv, 1)),
+              w["damping"].reshape(b, max(nv, 1), max(nv, 1)),
+              (w["armature"].reshape(b, max(nv, 1), max(nv, 1))
+               if include_armature else None))
     if nt == 0 or nv == 0:
       w["qfrc"].zero_()
       w["damping"].zero_()
-      w["armature"].zero_()
+      if include_armature:
+        w["armature"].zero_()
       return w["qfrc"].reshape(b, max(nv, 1)), None, None
     lo = self._spring_range.reshape(max(nt, 1), 2)[:, 0]
     hi = self._spring_range.reshape(max(nt, 1), 2)[:, 1]
@@ -645,13 +794,51 @@ class MetalSpatialTendonDynamics:
     qfrc = (f * J).sum(dim=1)  # [B,V]
     w["qfrc"].copy_(qfrc.reshape(-1))
     damp_mat = (tangent.unsqueeze(-1) * J).transpose(1, 2) @ J  # [B,V,V]
-    arm_mat = ((self._armature.reshape(1, max(nt, 1), 1) * J).transpose(1, 2) @ J
-               * self._ancestor.reshape(1, max(nv, 1), max(nv, 1)))
     w["damping"].copy_(damp_mat.reshape(-1))
-    w["armature"].copy_(arm_mat.reshape(-1))
-    return w["qfrc"].reshape(b, nv), w["damping"].reshape(b, nv, nv), w["armature"].reshape(b, nv, nv)
+    if include_armature:
+      arm_mat = ((self._armature.reshape(1, max(nt, 1), 1) * J).transpose(1, 2) @ J
+                 * self._ancestor.reshape(1, max(nv, 1), max(nv, 1)))
+      w["armature"].copy_(arm_mat.reshape(-1))
+      armature = w["armature"].reshape(b, nv, nv)
+    else:
+      armature = None
+    return w["qfrc"].reshape(b, nv), w["damping"].reshape(b, nv, nv), armature
 
-  def run_armature_bias(self, kin, qvel, poses, cvel, root_com, cdof=None, cdof_dot=None):
+  def run_damping_derivative_coo_device(self, kin, edge_writer):
+    """Add spatial-tendon damping's signed qDeriv directly into compiled COO.
+
+    ``edge_writer`` owns the sorted compiled-D row/column maps and the shared
+    `[B,max(E,1)]` accumulation target. This method does not allocate a dense
+    derivative matrix or duplicate the COO values backing.
+    """
+    if self._velocity_derivative_layout is None:
+      raise ValueError(
+          "compiled velocity derivative layout is required for COO spatial tendons")
+    meta = self._meta
+    layout = self._velocity_derivative_layout
+    if (getattr(edge_writer, "nv", None) != meta.nv
+        or getattr(edge_writer, "edge_count", None) != int(layout.edge_count)
+        or tuple(edge_writer.values.shape) !=
+        (self.batch_size, max(int(layout.edge_count), 1))):
+      raise ValueError("edge_writer does not match spatial-tendon compiled COO layout")
+    if not isinstance(kin, dict):
+      raise ValueError("kin must be a spatial tendon kinematics mapping")
+    self._check(kin.get("velocity"), "kin.velocity",
+                (self.batch_size, max(meta.ntendon, 1)))
+    self._check(kin.get("jacobian"), "kin.jacobian",
+                (self.batch_size, max(meta.ntendon, 1), max(meta.nv, 1)))
+    edge_count = int(layout.edge_count)
+    if edge_count and meta.nv and meta.ntendon:
+      self._coo_damping_kernel(
+          kin["jacobian"].reshape(-1), kin["velocity"].reshape(-1),
+          self._damping, self._dampingpoly, self._count,
+          edge_writer._edge_rows, edge_writer._edge_cols,
+          self._coo_damping_dims, edge_writer.values.reshape(-1),
+          threads=(self.batch_size * edge_count,), group_size=(1,))
+    return edge_writer.values
+
+  def run_armature_bias(self, kin, qvel, poses, cvel, root_com, cdof=None,
+                        cdof_dot=None, *, world_mask=None):
     """Armature bias force for site-only spatial paths (F1/G1).
 
     Computes per-tendon dots = Jdot(qvel) (pinned mj_tendonDot) on device,
@@ -676,6 +863,12 @@ class MetalSpatialTendonDynamics:
             or not bool((np.asarray(meta.armature) > 0).any())):
       return (torch.zeros((b, max(nv, 1)), dtype=torch.float32, device=self._device),
               torch.zeros((b, max(nt, 1)), dtype=torch.float32, device=self._device))
+    if world_mask is not None:
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.dtype != torch.int32 or tuple(world_mask.shape) != (b,)
+          or world_mask.device.type != "mps" or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 MPS [batch_size]")
+      self._dims[8:8 + b].copy_(world_mask)
     site_pos = poses["site_pos"].reshape(-1) if meta.nsite else self._dummy
     self._dots_kernel(
         qvel.reshape(-1),
@@ -693,6 +886,11 @@ class MetalSpatialTendonDynamics:
         threads=(b,), group_size=(1,),
     )
     dots = w["dots"].reshape(b, max(nt, 1))
+    if world_mask is not None:
+      self._bias_kernel(
+          J.reshape(-1), dots.reshape(-1), self._armature.reshape(-1),
+          self._dims, w["qfrc"].reshape(-1), threads=(b,), group_size=(1,))
+      return w["qfrc"].reshape(b, max(nv, 1)), dots
     coef = self._armature.reshape(1, max(nt, 1)) * dots  # [B,T]
     bias = (coef.unsqueeze(-1) * J).sum(dim=1)  # [B,V]
     return bias.reshape(b, nv), dots

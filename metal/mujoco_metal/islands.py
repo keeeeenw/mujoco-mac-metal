@@ -52,48 +52,31 @@ class IslandPartition:
   dof_tree: np.ndarray     # [nv] -> tree index
   tree_dofs: list[list[int]] # list of dof indices per tree
   tree_bodies: list[list[int]] # list of body indices per tree
+  tree_dof_length: list[np.ndarray] # pinned MuJoCo weights per tree DOF
+  tree_sleep_policy: np.ndarray # [ntree], mjtSleepPolicy
 
 
 def build_island_partition(model: mujoco.MjModel) -> IslandPartition:
-  """Identify kinematic trees rooted at direct children of the worldbody."""
+  """Use MuJoCo's compiled kinematic tree, DOF, and policy maps."""
   nbody = int(model.nbody)
   nv = int(model.nv)
   body_tree = np.full(nbody, -1, dtype=np.int32)
   dof_tree = np.full(nv, -1, dtype=np.int32)
-
-  # Find root bodies (children of worldbody 0)
-  tree_roots = []
-  for b in range(1, nbody):
-    p = int(model.body_parentid[b])
-    if p == 0:
-      tree_roots.append(b)
-
-  ntree = len(tree_roots)
-  tree_bodies: list[list[int]] = [[] for _ in range(ntree)]
-  tree_dofs: list[list[int]] = [[] for _ in range(ntree)]
-
-  for tree_idx, root in enumerate(tree_roots):
-    # BFS/DFS to collect all descendant bodies
-    stack = [root]
-    while stack:
-      curr = stack.pop()
-      body_tree[curr] = tree_idx
-      tree_bodies[tree_idx].append(curr)
-      # Find DOFs belonging to joints of this body
-      jadr = int(model.body_jntadr[curr])
-      jnum = int(model.body_jntnum[curr])
-      for j in range(jadr, jadr + jnum):
-        dadr = int(model.jnt_dofadr[j])
-        jtype = int(model.jnt_type[j])
-        dof_cnt = 3 if jtype == int(mujoco.mjtJoint.mjJNT_BALL) else (
-            6 if jtype == int(mujoco.mjtJoint.mjJNT_FREE) else 1)
-        for d in range(dadr, dadr + dof_cnt):
-          dof_tree[d] = tree_idx
-          tree_dofs[tree_idx].append(d)
-      # Find child bodies
-      for b in range(1, nbody):
-        if int(model.body_parentid[b]) == curr:
-          stack.append(b)
+  ntree = int(model.ntree)
+  body_tree[:] = np.asarray(model.body_treeid, dtype=np.int32)
+  dof_tree[:] = np.asarray(model.dof_treeid, dtype=np.int32)
+  tree_bodies = []
+  tree_dofs = []
+  tree_dof_length = []
+  for tree in range(ntree):
+    body_adr = int(model.tree_bodyadr[tree])
+    body_count = int(model.tree_bodynum[tree])
+    dof_adr = int(model.tree_dofadr[tree])
+    dof_count = int(model.tree_dofnum[tree])
+    tree_bodies.append(list(range(body_adr, body_adr + body_count)))
+    tree_dofs.append(list(range(dof_adr, dof_adr + dof_count)))
+    tree_dof_length.append(
+        np.asarray(model.dof_length[dof_adr:dof_adr + dof_count], dtype=np.float32).copy())
 
   return IslandPartition(
       ntree=ntree,
@@ -101,6 +84,8 @@ def build_island_partition(model: mujoco.MjModel) -> IslandPartition:
       dof_tree=dof_tree,
       tree_dofs=tree_dofs,
       tree_bodies=tree_bodies,
+      tree_dof_length=tree_dof_length,
+      tree_sleep_policy=np.asarray(model.tree_sleep_policy, dtype=np.int32).copy(),
   )
 
 

@@ -84,6 +84,168 @@ def _clone_model(model):
   return copy(model)
 
 
+_FRAME_EPS = 1e-6  # MuJoCo 3.10.0 src/user/user_model.cc:kFrameEps
+
+
+def _is_null_pose(pos, quat):
+  return (_is_same_vector(pos, np.zeros(3)) and
+          _is_same_quaternion(quat, np.array([1., 0., 0., 0.])))
+
+
+def _is_same_vector(a, b):
+  return bool(np.all(np.abs(np.asarray(a) - np.asarray(b)) < _FRAME_EPS))
+
+
+def _is_same_quaternion(a, b):
+  a, b = np.asarray(a), np.asarray(b)
+  return bool(np.all(np.abs(a - b) < _FRAME_EPS) or
+              np.all(np.abs(a + b) < _FRAME_EPS))
+
+
+def _is_same_pose(pos_a, pos_b, quat_a, quat_b):
+  return (_is_same_vector(pos_a, pos_b) and
+          _is_same_quaternion(quat_a, quat_b))
+
+
+def _refresh_compiler_frame_flags(model):
+  """Refresh compile-time frame flags invalidated by frame/inertia edits.
+
+  ``mj_setConst`` recomputes dynamics constants, but it does not rerun the
+  compiler's ``body_sameframe``, ``body_simple``, ``geom_sameframe`` or
+  ``site_sameframe`` classification.  Those flags select optimized kinematics
+  paths, so stale classifications can make updated models use old transforms.
+  This follows MuJoCo 3.10.0 ``user_model.cc``'s sameframe classification.
+  """
+  body_code = mujoco.mjtSameFrame.mjSAMEFRAME_BODY.value
+  inertia_code = mujoco.mjtSameFrame.mjSAMEFRAME_INERTIA.value
+  bodyrot_code = mujoco.mjtSameFrame.mjSAMEFRAME_BODYROT.value
+  inertiarot_code = mujoco.mjtSameFrame.mjSAMEFRAME_INERTIAROT.value
+  none_code = mujoco.mjtSameFrame.mjSAMEFRAME_NONE.value
+
+  def classify_local(pos, quat, ipos, iquat):
+    if _is_null_pose(pos, quat):
+      return body_code
+    if _is_null_pose(np.zeros(3), quat):
+      return bodyrot_code
+    if _is_same_pose(pos, ipos, quat, iquat):
+      return inertia_code
+    if _is_same_quaternion(quat, iquat):
+      return inertiarot_code
+    return none_code
+
+  body_sameframe = np.empty(model.nbody, dtype=model.body_sameframe.dtype)
+  for body in range(model.nbody):
+    ipos = np.asarray(model.body_ipos[body])
+    iquat = np.asarray(model.body_iquat[body])
+    if _is_null_pose(ipos, iquat):
+      body_sameframe[body] = body_code
+    elif _is_null_pose(np.zeros(3), iquat):
+      body_sameframe[body] = bodyrot_code
+    else:
+      body_sameframe[body] = none_code
+  model.body_sameframe[:] = body_sameframe
+
+  # Reproduce user_model.cc's simple-body classification using compiled
+  # topology/joint arrays, including parent demotion and slide-only level 2.
+  simple = np.zeros(model.nbody, dtype=model.body_simple.dtype)
+  for body in range(model.nbody):
+    parent = int(model.body_parentid[body])
+    if body_sameframe[body] == body_code and (
+        int(model.body_rootid[body]) == body or
+        (int(model.body_parentid[parent]) == 0 and
+         int(model.body_dofnum[parent]) == 0)):
+      simple[body] = 1
+      first = int(model.body_jntadr[body])
+      count = int(model.body_jntnum[body])
+      rotfound = False
+      for joint in range(first, first + count):
+        jtype = model.jnt_type[joint]
+        jpos = model.jnt_pos[joint]
+        axis = model.jnt_axis[joint]
+        # MuJoCo 3.10.0 src/user/user_util.h:mjEPS.
+        axis_aligned = int(np.count_nonzero(np.abs(axis) > 1e-14)) == 1
+        if (rotfound or not _is_same_vector(jpos, np.zeros(3)) or
+            (jtype in (mujoco.mjtJoint.mjJNT_HINGE,
+                       mujoco.mjtJoint.mjJNT_SLIDE) and not axis_aligned)):
+          simple[body] = 0
+        if jtype in (mujoco.mjtJoint.mjJNT_BALL,
+                     mujoco.mjtJoint.mjJNT_HINGE):
+          rotfound = True
+      if simple[body] and int(model.body_dofnum[body]):
+        first = int(model.body_jntadr[body])
+        count = int(model.body_jntnum[body])
+        simple[body] = 2
+        if any(model.jnt_type[j] != mujoco.mjtJoint.mjJNT_SLIDE
+               for j in range(first, first + count)):
+          simple[body] = 1
+  for body in range(1, model.nbody):
+    parent = int(model.body_parentid[body])
+    if parent > 0:
+      simple[parent] = 0
+
+  # The compiler performs a final tendon-armature demotion after its initial
+  # body classification (user_model.cc:FinalizeSimple). Keep that rule in
+  # sync before considering sparse DOF structure.
+  wrap_site = mujoco.mjtWrap.mjWRAP_SITE.value
+  wrap_cylinder = mujoco.mjtWrap.mjWRAP_CYLINDER.value
+  wrap_sphere = mujoco.mjtWrap.mjWRAP_SPHERE.value
+  for tendon in range(model.ntendon):
+    if model.tendon_armature[tendon] == 0:
+      continue
+    begin = int(model.tendon_adr[tendon])
+    end = begin + int(model.tendon_num[tendon])
+    for item in range(begin, end):
+      kind = int(model.wrap_type[item])
+      object_id = int(model.wrap_objid[item])
+      if kind == wrap_site:
+        simple[int(model.site_bodyid[object_id])] = 0
+      elif kind in (wrap_cylinder, wrap_sphere):
+        simple[int(model.geom_bodyid[object_id])] = 0
+
+  # mjModel sparse buffers have compile-time allocation sizes. FinalizeSimple
+  # derives dof_simplenum after tendon demotion and checks nC against the
+  # earlier ComputeSparseSizes allocation. A lifecycle update cannot resize
+  # those arrays, so fail atomically whenever the required sparse pattern
+  # changes instead of leaving stale indices behind.
+  simplenum = np.zeros(model.nv, dtype=model.dof_simplenum.dtype)
+  count = 0
+  for dof in range(model.nv - 1, -1, -1):
+    body = int(model.dof_bodyid[dof])
+    if simple[body]:
+      count += 1
+    else:
+      count = 0
+    simplenum[dof] = count
+  n_offdiag = 0
+  for dof in range(model.nv):
+    if simplenum[dof] == 0:
+      ancestor = dof
+      while ancestor >= 0:
+        if ancestor != dof:
+          n_offdiag += 1
+        ancestor = int(model.dof_parentid[ancestor])
+  required_nC = n_offdiag + int(model.nv)
+  if required_nC != int(model.nC) or not np.array_equal(
+      simplenum, np.asarray(model.dof_simplenum)):
+    raise ValueError(
+        "model update changes the compiled sparse inertia layout; "
+        "recompile the model before applying this inertia/reference update")
+
+  model.body_simple[:] = simple
+  model.dof_simplenum[:] = simplenum
+
+  for geom in range(model.ngeom):
+    body = int(model.geom_bodyid[geom])
+    model.geom_sameframe[geom] = classify_local(
+        model.geom_pos[geom], model.geom_quat[geom],
+        model.body_ipos[body], model.body_iquat[body])
+  for site in range(model.nsite):
+    body = int(model.site_bodyid[site])
+    model.site_sameframe[site] = classify_local(
+        model.site_pos[site], model.site_quat[site],
+        model.body_ipos[body], model.body_iquat[body])
+
+
 def _compile_source(source):
   if isinstance(source, mujoco.MjModel):
     return _clone_model(source)
@@ -218,6 +380,165 @@ class ModelLifecycle:
     self.generation += 1
     return True
 
+  def update_reference_frames(
+      self, *, body_ids=None, body_pos=None, body_quat=None,
+      geom_ids=None, geom_pos=None, geom_quat=None,
+      site_ids=None, site_pos=None, site_quat=None):
+    """Update selected compiled body/geom/site reference frames atomically.
+
+    These are shared model parameters, not per-world state. Body ids name
+    non-world bodies; geom/site ids may include world-attached records. Each
+    supplied pose field must have its matching id vector and exact ``(n, 3)``
+    or ``(n, 4)`` shape. Quaternions are normalized in float32 before commit.
+    The candidate is passed through ``mj_setConst`` and model lowering before
+    replacing this lifecycle, so simulations can adopt it through
+    ``apply_lifecycle`` without stale transforms or derived constants. Updates
+    that alter the compiled ``dof_simplenum`` sparse pattern are rejected
+    atomically and require recompiling the model because ``mjModel`` sparse
+    buffers have fixed compile-time sizes.
+    """
+    plans = (
+        ("body", body_ids, body_pos, body_quat, self.descriptor.nbody, True),
+        ("geom", geom_ids, geom_pos, geom_quat, self.descriptor.ngeom, False),
+        ("site", site_ids, site_pos, site_quat, self.descriptor.nsite, False),
+    )
+    updates = []
+    for label, raw_ids, pos, quat, limit, body_records in plans:
+      if raw_ids is None:
+        if pos is not None or quat is not None:
+          raise ValueError(f"{label}_ids are required for pose updates")
+        continue
+      ids0 = np.asarray(raw_ids)
+      if ids0.dtype.kind not in "iu":
+        raise ValueError(f"{label}_ids must contain integers")
+      ids = ids0.astype(np.int64, copy=False)
+      if ids.ndim != 1 or ids.size == 0 or np.unique(ids).size != ids.size:
+        raise ValueError(f"{label}_ids must be a nonempty vector of unique indices")
+      if body_records and np.any(ids == 0):
+        raise ValueError("body reference updates cannot move the world body")
+      if np.any(ids < 0) or np.any(ids >= limit):
+        raise ValueError(f"{label}_ids out of range")
+      if pos is None and quat is None:
+        raise ValueError(f"{label} pose update must supply position or quaternion")
+      if pos is not None:
+        value = np.asarray(pos, dtype=np.float64)
+        if value.shape != (ids.size, 3) or not np.all(np.isfinite(value)):
+          raise ValueError(f"{label}_pos must be finite with shape ({ids.size}, 3)")
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+          value32 = np.asarray(value, dtype=np.float32)
+        if not np.all(np.isfinite(value32)):
+          raise ValueError(f"{label}_pos must be representable as finite float32")
+        updates.append((label, ids, "pos", value32))
+      if quat is not None:
+        value = np.asarray(quat, dtype=np.float64)
+        if value.shape != (ids.size, 4) or not np.all(np.isfinite(value)):
+          raise ValueError(f"{label}_quat must be finite with shape ({ids.size}, 4)")
+        norms = np.linalg.norm(value, axis=1)
+        if np.any(~np.isfinite(norms)) or np.any(norms <= np.finfo(np.float64).tiny):
+          raise ValueError(f"{label}_quat must be nonzero")
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+          value32 = np.asarray(value / norms[:, None], dtype=np.float32)
+        norms32 = np.linalg.norm(value32.astype(np.float64), axis=1)
+        if (not np.all(np.isfinite(value32)) or np.any(norms32 <= 0)
+            or np.any(~np.isfinite(norms32))):
+          raise ValueError(f"{label}_quat must remain finite and nonzero in float32")
+        value32 = np.asarray(value32 / norms32[:, None], dtype=np.float32)
+        updates.append((label, ids, "quat", value32))
+    if not updates:
+      raise ValueError("no reference frame updates given")
+
+    changed = False
+    for label, ids, field, value in updates:
+      current = getattr(self._model, f"{label}_{field}")[ids]
+      if not np.array_equal(np.asarray(current, dtype=np.float32), value):
+        changed = True
+        break
+    if not changed:
+      return False
+    candidate = _clone_model(self._model)
+    for label, ids, field, value in updates:
+      getattr(candidate, f"{label}_{field}")[ids] = value
+    _refresh_compiler_frame_flags(candidate)
+    mujoco.mj_setConst(candidate, mujoco.MjData(candidate))
+    descriptor = load_model(candidate)
+    self._model = candidate
+    self.descriptor = descriptor
+    self.generation += 1
+    return True
+
+  def recompute_body_inertias(self, body_ids, inertias, inertial_quats=None):
+    """Set principal inertias/optional inertial frames with `mj_setConst`.
+
+    Updates are shared by every environment using this model. Body IDs must
+    name non-world bodies; massless bodies must remain zero-inertia, while
+    positive-mass bodies require three finite positive principal moments.
+    An optional quaternion uses MuJoCo's ``wxyz`` convention and is
+    normalized before commit. Candidate mutation, constant recomputation and
+    descriptor lowering all finish before the lifecycle is replaced. An update
+    that changes the compiled sparse inertia layout is rejected atomically;
+    ``mj_setConst`` cannot resize the compiled mass-matrix buffers.
+    """
+    raw_ids = np.asarray(body_ids)
+    if raw_ids.dtype.kind not in "iu":
+      raise ValueError("body_ids must contain integers")
+    ids = raw_ids.astype(np.int64, copy=False)
+    values = np.asarray(inertias, dtype=np.float64)
+    if ids.ndim != 1 or values.shape != (ids.size, 3) or ids.size == 0:
+      raise ValueError("body_ids and inertias must have shapes (n,) and (n, 3)")
+    if np.unique(ids).size != ids.size:
+      raise ValueError("body_ids must be unique")
+    if np.any(ids <= 0) or np.any(ids >= self.descriptor.nbody):
+      raise ValueError("body_ids must refer to non-world bodies")
+    masses = np.asarray(self._model.body_mass)[ids]
+    if not np.all(np.isfinite(values)) or np.any(values < 0):
+      raise ValueError("inertias must be finite and nonnegative")
+    if np.any((masses > 0)[:, None] & (values <= 0)):
+      raise ValueError("positive-mass bodies require positive principal inertias")
+    if np.any((masses == 0)[:, None] & (values != 0)):
+      raise ValueError("massless bodies must retain zero principal inertias")
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+      inertia32 = np.asarray(values, dtype=np.float32)
+    if not np.all(np.isfinite(inertia32)):
+      raise ValueError("inertias must be representable as finite float32")
+    if np.any((masses > 0)[:, None] & (inertia32 <= 0)):
+      raise ValueError("positive principal inertias must remain positive in float32")
+
+    quat32 = None
+    if inertial_quats is not None:
+      quats = np.asarray(inertial_quats, dtype=np.float64)
+      if quats.shape != (ids.size, 4) or not np.all(np.isfinite(quats)):
+        raise ValueError("inertial_quats must be finite with shape (n, 4)")
+      norms = np.linalg.norm(quats, axis=1)
+      if np.any(norms <= np.finfo(np.float64).tiny):
+        raise ValueError("inertial_quats must be nonzero")
+      with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        quat32 = np.asarray(quats / norms[:, None], dtype=np.float32)
+      if not np.all(np.isfinite(quat32)):
+        raise ValueError("inertial_quats must be representable as finite float32")
+      quat_norms = np.linalg.norm(quat32.astype(np.float64), axis=1)
+      if np.any(quat_norms <= 0):
+        raise ValueError("inertial_quats must remain nonzero in float32")
+      quat32 = np.asarray(quat32 / quat_norms[:, None], dtype=np.float32)
+
+    same_inertia = np.array_equal(
+        np.asarray(self._model.body_inertia)[ids], inertia32)
+    same_quat = (quat32 is None or np.array_equal(
+        np.asarray(self._model.body_iquat)[ids], quat32))
+    if same_inertia and same_quat:
+      return False
+
+    candidate = _clone_model(self._model)
+    candidate.body_inertia[ids] = inertia32
+    if quat32 is not None:
+      candidate.body_iquat[ids] = quat32
+    _refresh_compiler_frame_flags(candidate)
+    mujoco.mj_setConst(candidate, mujoco.MjData(candidate))
+    descriptor = load_model(candidate)
+    self._model = candidate
+    self.descriptor = descriptor
+    self.generation += 1
+    return True
+
   def recompute_body_masses(self, body_ids, masses):
     """Set body masses, run `mj_setConst`, and commit only a valid candidate."""
     raw_ids = np.asarray(body_ids)
@@ -240,6 +561,15 @@ class ModelLifecycle:
       raise ValueError(
           "masses must preserve zero-mass fixed bodies and keep other masses positive"
       )
+    # Runtime passive/mass kernels consume float32 constants. Validate the
+    # representation before compiling or replacing the lifecycle so finite
+    # float64 values that overflow or underflow to zero cannot be admitted as
+    # a usable native model.
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+      mass32 = np.asarray(values, dtype=np.float32)
+    if (not np.all(np.isfinite(mass32))
+        or np.any((base_mass > 0) & (mass32 <= 0))):
+      raise ValueError("masses must remain positive and finite in float32")
     if np.array_equal(self.descriptor.body_mass[ids], values):
       return False
 

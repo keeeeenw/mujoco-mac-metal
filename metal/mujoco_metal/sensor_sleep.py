@@ -9,6 +9,31 @@ import numpy as np
 _SHADER = Path(__file__).parent / "shaders" / "sensor_sleep.metal"
 
 
+def sensor_sleep_workspace_sizes(model, batch_size, *, validate=True):
+  """Exact fixed-shape sensor sleep tensors, checked before device import."""
+  from mujoco_metal.metal_kinematics import _validate_workspace_index_capacity
+  if (isinstance(batch_size, (bool, np.bool_))
+      or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0):
+    raise ValueError("batch_size must be a positive integer")
+  b, nsensor, ntree = (int(batch_size), int(model.nsensor), int(model.ntree))
+  sizes = {
+      "sensor_sleep.treeids": nsensor * 4,
+      "sensor_sleep.counts": nsensor * 2,
+      "sensor_sleep.always": nsensor,
+      "sensor_sleep.sensor_refs": nsensor * 2,
+      "sensor_sleep.output": b * nsensor,
+      "sensor_sleep.dims": 3,
+  }
+  if validate:
+    _validate_workspace_index_capacity(
+        b, sizes, {"nsensor": nsensor, "ntree": ntree})
+    for name, elements in sizes.items():
+      if elements > (1 << 31) - 1:
+        raise ValueError(
+            f"{name} exceeds the Metal int32 address range ({elements})")
+  return sizes
+
+
 def _object_trees(model, objtype, objid, mujoco):
   """Resolve one sleepState object into at most two dynamic tree IDs.
 
@@ -269,14 +294,25 @@ class SensorSleepPolicy:
   """Fixed-shape MPS kernel producing per-world sensor awake flags."""
 
   def __init__(self, model, batch_size, device="mps"):
+    self._workspace_sizes = sensor_sleep_workspace_sizes(model, batch_size)
+    batch_size = int(batch_size)
     import torch
     if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
       raise RuntimeError("sensor sleep policy requires MPS compile_shader")
-    self.batch_size = int(batch_size)
+    self.batch_size = batch_size
     self.nsensor = int(model.nsensor)
     self.ntree = int(model.ntree)
     self.device = torch.device(device)
+    if self.device.type != "mps":
+      raise ValueError("SensorSleepPolicy requires an MPS device")
     treeids, counts, always, sensor_refs = lower_sensor_sleep_policy(model)
+    expected = ((self.nsensor, 2, 2), (self.nsensor, 2),
+                (self.nsensor,), (self.nsensor, 2))
+    actual = tuple(np.asarray(value).shape for value in
+                   (treeids, counts, always, sensor_refs))
+    if actual != expected:
+      raise ValueError(
+          f"lowered sensor sleep arrays have shapes {actual}, expected {expected}")
     self.treeids = torch.as_tensor(treeids, dtype=torch.int32, device=self.device)
     self.counts = torch.as_tensor(counts, dtype=torch.int32, device=self.device)
     self.always = torch.as_tensor(always, dtype=torch.int32, device=self.device)

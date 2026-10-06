@@ -1,0 +1,1026 @@
+{
+  "target_version": "3.10.0",
+  "source_revision": "28009f9105cd92784b7b0b30c0605a5e29107a77",
+  "scope": "All mjt enum declarations in pinned public headers and Python bindings; classification only, not implementation or qualification",
+  "groups": {
+    "mjtAlignFree": {
+      "source": "include/mujoco/mjspec.h:109",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjALIGNFREE_FALSE": 0,
+        "mjALIGNFREE_TRUE": 1,
+        "mjALIGNFREE_AUTO": 2
+      }
+    },
+    "mjtBias": {
+      "source": "include/mujoco/mjtype.h:262",
+      "domain": "actuation",
+      "owner": "007",
+      "members": {
+        "mjBIAS_NONE": 0,
+        "mjBIAS_AFFINE": 1,
+        "mjBIAS_MUSCLE": 2,
+        "mjBIAS_DCMOTOR": 3,
+        "mjBIAS_USER": 4
+      }
+    },
+    "mjtBuiltin": {
+      "source": "include/mujoco/mjspec.h:86",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjBUILTIN_NONE": 0,
+        "mjBUILTIN_GRADIENT": 1,
+        "mjBUILTIN_CHECKER": 2,
+        "mjBUILTIN_FLAT": 3
+      }
+    },
+    "mjtButton": {
+      "source": "include/mujoco/mjui.h:65",
+      "domain": "upstream_ui",
+      "owner": "out-of-scope",
+      "members": {
+        "mjBUTTON_NONE": 0,
+        "mjBUTTON_LEFT": 1,
+        "mjBUTTON_RIGHT": 2,
+        "mjBUTTON_MIDDLE": 3
+      }
+    },
+    "mjtCTimer": {
+      "source": "include/mujoco/mjspec.h:137",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjCTIMER_TOTAL": 0,
+        "mjCTIMER_ASSETS": 1,
+        "mjCTIMER_TEXTURE": 2,
+        "mjCTIMER_MESH_LOAD": 3,
+        "mjCTIMER_MESH_HULL": 4,
+        "mjCTIMER_MESH_POLYGON": 5,
+        "mjCTIMER_MESH_INERTIA": 6,
+        "mjCTIMER_MESH_BVH": 7,
+        "mjCTIMER_MESH_OCTREE": 8,
+        "mjNCTIMER": 9
+      }
+    },
+    "mjtCamLight": {
+      "source": "include/mujoco/mjtype.h:134",
+      "domain": "camera_pose_projection",
+      "owner": "019",
+      "members": {
+        "mjCAMLIGHT_FIXED": 0,
+        "mjCAMLIGHT_TRACK": 1,
+        "mjCAMLIGHT_TRACKCOM": 2,
+        "mjCAMLIGHT_TARGETBODY": 3,
+        "mjCAMLIGHT_TARGETBODYCOM": 4
+      }
+    },
+    "mjtCamOutBit": {
+      "source": "include/mujoco/mjtype.h:425",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjCAMOUT_RGB": 1,
+        "mjCAMOUT_DEPTH": 2,
+        "mjCAMOUT_DIST": 4,
+        "mjCAMOUT_NORMAL": 8,
+        "mjCAMOUT_SEG": 16,
+        "mjNCAMOUT": 5
+      }
+    },
+    "mjtCamera": {
+      "source": "include/mujoco/mjvisualize.h:59",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjCAMERA_FREE": 0,
+        "mjCAMERA_TRACKING": 1,
+        "mjCAMERA_FIXED": 2,
+        "mjCAMERA_USER": 3
+      }
+    },
+    "mjtCatBit": {
+      "source": "include/mujoco/mjvisualize.h:33",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjCAT_STATIC": 1,
+        "mjCAT_DYNAMIC": 2,
+        "mjCAT_DECOR": 4,
+        "mjCAT_ALL": 7
+      }
+    },
+    "mjtColorSpace": {
+      "source": "include/mujoco/mjtype.h:173",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjCOLORSPACE_AUTO": 0,
+        "mjCOLORSPACE_LINEAR": 1,
+        "mjCOLORSPACE_SRGB": 2
+      }
+    },
+    "mjtConDataField": {
+      "source": "include/mujoco/mjtype.h:400",
+      "domain": "sensor_query",
+      "owner": "019",
+      "members": {
+        "mjCONDATA_FOUND": 0,
+        "mjCONDATA_FORCE": 1,
+        "mjCONDATA_TORQUE": 2,
+        "mjCONDATA_DIST": 3,
+        "mjCONDATA_POS": 4,
+        "mjCONDATA_NORMAL": 5,
+        "mjCONDATA_TANGENT": 6,
+        "mjNCONDATA": 7
+      }
+    },
+    "mjtCone": {
+      "source": "include/mujoco/mjtype.h:188",
+      "domain": "constraint_solver",
+      "owner": "014",
+      "members": {
+        "mjCONE_PYRAMIDAL": 0,
+        "mjCONE_ELLIPTIC": 1
+      }
+    },
+    "mjtConflict": {
+      "source": "include/mujoco/mjspec.h:131",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjCONFLICT_WARNING": 0,
+        "mjCONFLICT_MERGE": 1,
+        "mjCONFLICT_ERROR": 2
+      }
+    },
+    "mjtConstraint": {
+      "source": "include/mujoco/mjtype.h:511",
+      "domain": "constraint_solver",
+      "owner": "014",
+      "members": {
+        "mjCNSTR_EQUALITY": 0,
+        "mjCNSTR_FRICTION_DOF": 1,
+        "mjCNSTR_FRICTION_TENDON": 2,
+        "mjCNSTR_LIMIT_JOINT": 3,
+        "mjCNSTR_LIMIT_TENDON": 4,
+        "mjCNSTR_CONTACT_FRICTIONLESS": 5,
+        "mjCNSTR_CONTACT_PYRAMIDAL": 6,
+        "mjCNSTR_CONTACT_ELLIPTIC": 7
+      }
+    },
+    "mjtConstraintState": {
+      "source": "include/mujoco/mjtype.h:523",
+      "domain": "constraint_solver",
+      "owner": "014",
+      "members": {
+        "mjCNSTRSTATE_SATISFIED": 0,
+        "mjCNSTRSTATE_QUADRATIC": 1,
+        "mjCNSTRSTATE_LINEARNEG": 2,
+        "mjCNSTRSTATE_LINEARPOS": 3,
+        "mjCNSTRSTATE_CONE": 4
+      }
+    },
+    "mjtDataType": {
+      "source": "include/mujoco/mjtype.h:392",
+      "domain": "sensor",
+      "owner": "016",
+      "members": {
+        "mjDATATYPE_REAL": 0,
+        "mjDATATYPE_POSITIVE": 1,
+        "mjDATATYPE_AXIS": 2,
+        "mjDATATYPE_QUATERNION": 3
+      }
+    },
+    "mjtDepthMap": {
+      "source": "include/mujoco/mjrender.h:49",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjDEPTH_ZERONEAR": 0,
+        "mjDEPTH_ZEROFAR": 1
+      }
+    },
+    "mjtDisableBit": {
+      "source": "include/mujoco/mjtype.h:53",
+      "domain": "runtime_stage_options",
+      "owner": "019",
+      "members": {
+        "mjDSBL_CONSTRAINT": 1,
+        "mjDSBL_EQUALITY": 2,
+        "mjDSBL_FRICTIONLOSS": 4,
+        "mjDSBL_LIMIT": 8,
+        "mjDSBL_CONTACT": 16,
+        "mjDSBL_SPRING": 32,
+        "mjDSBL_DAMPER": 64,
+        "mjDSBL_GRAVITY": 128,
+        "mjDSBL_CLAMPCTRL": 256,
+        "mjDSBL_WARMSTART": 512,
+        "mjDSBL_FILTERPARENT": 1024,
+        "mjDSBL_ACTUATION": 2048,
+        "mjDSBL_REFSAFE": 4096,
+        "mjDSBL_SENSOR": 8192,
+        "mjDSBL_MIDPHASE": 16384,
+        "mjDSBL_EULERDAMP": 32768,
+        "mjDSBL_AUTORESET": 65536,
+        "mjDSBL_NATIVECCD": 131072,
+        "mjDSBL_ISLAND": 262144,
+        "mjDSBL_MULTICCD": 524288,
+        "mjNDISABLE": 20
+      }
+    },
+    "mjtDyn": {
+      "source": "include/mujoco/mjtype.h:242",
+      "domain": "actuation",
+      "owner": "007",
+      "members": {
+        "mjDYN_NONE": 0,
+        "mjDYN_INTEGRATOR": 1,
+        "mjDYN_FILTER": 2,
+        "mjDYN_FILTEREXACT": 3,
+        "mjDYN_MUSCLE": 4,
+        "mjDYN_DCMOTOR": 5,
+        "mjDYN_USER": 6
+      }
+    },
+    "mjtEnableBit": {
+      "source": "include/mujoco/mjtype.h:79",
+      "domain": "runtime_stage_options",
+      "owner": "019",
+      "members": {
+        "mjENBL_OVERRIDE": 1,
+        "mjENBL_ENERGY": 2,
+        "mjENBL_FWDINV": 4,
+        "mjENBL_INVDISCRETE": 8,
+        "mjENBL_SLEEP": 16,
+        "mjENBL_DIAGEXACT": 32,
+        "mjNENABLE": 6
+      }
+    },
+    "mjtEq": {
+      "source": "include/mujoco/mjtype.h:208",
+      "domain": "equality",
+      "owner": "009",
+      "members": {
+        "mjEQ_CONNECT": 0,
+        "mjEQ_WELD": 1,
+        "mjEQ_JOINT": 2,
+        "mjEQ_TENDON": 3,
+        "mjEQ_FLEX": 4,
+        "mjEQ_FLEXVERT": 5,
+        "mjEQ_FLEXSTRAIN": 6,
+        "mjEQ_DISTANCE": 7
+      }
+    },
+    "mjtEvent": {
+      "source": "include/mujoco/mjui.h:73",
+      "domain": "upstream_ui",
+      "owner": "out-of-scope",
+      "members": {
+        "mjEVENT_NONE": 0,
+        "mjEVENT_MOVE": 1,
+        "mjEVENT_PRESS": 2,
+        "mjEVENT_RELEASE": 3,
+        "mjEVENT_SCROLL": 4,
+        "mjEVENT_KEY": 5,
+        "mjEVENT_RESIZE": 6,
+        "mjEVENT_REDRAW": 7,
+        "mjEVENT_FILESDROP": 8
+      }
+    },
+    "mjtFlexSelf": {
+      "source": "include/mujoco/mjtype.h:463",
+      "domain": "deformable_collision",
+      "owner": "018",
+      "members": {
+        "mjFLEXSELF_NONE": 0,
+        "mjFLEXSELF_NARROW": 1,
+        "mjFLEXSELF_BVH": 2,
+        "mjFLEXSELF_SAP": 3,
+        "mjFLEXSELF_AUTO": 4
+      }
+    },
+    "mjtFont": {
+      "source": "include/mujoco/mjrender.h:65",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjFONT_NORMAL": 0,
+        "mjFONT_SHADOW": 1,
+        "mjFONT_BIG": 2
+      }
+    },
+    "mjtFontScale": {
+      "source": "include/mujoco/mjrender.h:55",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjFONTSCALE_50": 50,
+        "mjFONTSCALE_100": 100,
+        "mjFONTSCALE_150": 150,
+        "mjFONTSCALE_200": 200,
+        "mjFONTSCALE_250": 250,
+        "mjFONTSCALE_300": 300
+      }
+    },
+    "mjtFrame": {
+      "source": "include/mujoco/mjvisualize.h:90",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjFRAME_NONE": 0,
+        "mjFRAME_BODY": 1,
+        "mjFRAME_GEOM": 2,
+        "mjFRAME_SITE": 3,
+        "mjFRAME_CAMERA": 4,
+        "mjFRAME_LIGHT": 5,
+        "mjFRAME_CONTACT": 6,
+        "mjFRAME_WORLD": 7,
+        "mjNFRAME": 8
+      }
+    },
+    "mjtFramebuffer": {
+      "source": "include/mujoco/mjrender.h:43",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjFB_WINDOW": 0,
+        "mjFB_OFFSCREEN": 1
+      }
+    },
+    "mjtGain": {
+      "source": "include/mujoco/mjtype.h:253",
+      "domain": "actuation",
+      "owner": "007",
+      "members": {
+        "mjGAIN_FIXED": 0,
+        "mjGAIN_AFFINE": 1,
+        "mjGAIN_MUSCLE": 2,
+        "mjGAIN_DCMOTOR": 3,
+        "mjGAIN_USER": 4
+      }
+    },
+    "mjtGeom": {
+      "source": "include/mujoco/mjtype.h:99",
+      "domain": "geometry",
+      "owner": "010",
+      "members": {
+        "mjGEOM_PLANE": 0,
+        "mjGEOM_HFIELD": 1,
+        "mjGEOM_SPHERE": 2,
+        "mjGEOM_CAPSULE": 3,
+        "mjGEOM_ELLIPSOID": 4,
+        "mjGEOM_CYLINDER": 5,
+        "mjGEOM_BOX": 6,
+        "mjGEOM_MESH": 7,
+        "mjGEOM_SDF": 8,
+        "mjNGEOMTYPES": 9,
+        "mjGEOM_ARROW": 100,
+        "mjGEOM_ARROW1": 101,
+        "mjGEOM_ARROW2": 102,
+        "mjGEOM_LINE": 103,
+        "mjGEOM_LINEBOX": 104,
+        "mjGEOM_FLEX": 105,
+        "mjGEOM_SKIN": 106,
+        "mjGEOM_LABEL": 107,
+        "mjGEOM_TRIANGLE": 108,
+        "mjGEOM_NONE": 1001
+      }
+    },
+    "mjtGeomInertia": {
+      "source": "include/mujoco/mjspec.h:60",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjINERTIA_VOLUME": 0,
+        "mjINERTIA_SHELL": 1
+      }
+    },
+    "mjtGridPos": {
+      "source": "include/mujoco/mjrender.h:31",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjGRID_TOPLEFT": 0,
+        "mjGRID_TOPRIGHT": 1,
+        "mjGRID_BOTTOMLEFT": 2,
+        "mjGRID_BOTTOMRIGHT": 3,
+        "mjGRID_TOP": 4,
+        "mjGRID_BOTTOM": 5,
+        "mjGRID_LEFT": 6,
+        "mjGRID_RIGHT": 7
+      }
+    },
+    "mjtInertiaFromGeom": {
+      "source": "include/mujoco/mjspec.h:116",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjINERTIAFROMGEOM_FALSE": 0,
+        "mjINERTIAFROMGEOM_TRUE": 1,
+        "mjINERTIAFROMGEOM_AUTO": 2
+      }
+    },
+    "mjtIntegrator": {
+      "source": "include/mujoco/mjtype.h:180",
+      "domain": "integration",
+      "owner": "015",
+      "members": {
+        "mjINT_EULER": 0,
+        "mjINT_RK4": 1,
+        "mjINT_IMPLICIT": 2,
+        "mjINT_IMPLICITFAST": 3
+      }
+    },
+    "mjtItem": {
+      "source": "include/mujoco/mjui.h:86",
+      "domain": "upstream_ui",
+      "owner": "out-of-scope",
+      "members": {
+        "mjITEM_END": -2,
+        "mjITEM_SECTION": -1,
+        "mjITEM_SEPARATOR": 0,
+        "mjITEM_STATIC": 1,
+        "mjITEM_BUTTON": 2,
+        "mjITEM_CHECKINT": 3,
+        "mjITEM_CHECKBYTE": 4,
+        "mjITEM_RADIO": 5,
+        "mjITEM_RADIOLINE": 6,
+        "mjITEM_SELECT": 7,
+        "mjITEM_SLIDERINT": 8,
+        "mjITEM_SLIDERNUM": 9,
+        "mjITEM_EDITINT": 10,
+        "mjITEM_EDITNUM": 11,
+        "mjITEM_EDITFLOAT": 12,
+        "mjITEM_EDITTXT": 13,
+        "mjNITEM": 14
+      }
+    },
+    "mjtJacobian": {
+      "source": "include/mujoco/mjtype.h:194",
+      "domain": "constraint_storage",
+      "owner": "017",
+      "members": {
+        "mjJAC_DENSE": 0,
+        "mjJAC_SPARSE": 1,
+        "mjJAC_AUTO": 2
+      }
+    },
+    "mjtJoint": {
+      "source": "include/mujoco/mjtype.h:91",
+      "domain": "rigid_model",
+      "owner": "baseline",
+      "members": {
+        "mjJNT_FREE": 0,
+        "mjJNT_BALL": 1,
+        "mjJNT_SLIDE": 2,
+        "mjJNT_HINGE": 3
+      }
+    },
+    "mjtLRMode": {
+      "source": "include/mujoco/mjtype.h:455",
+      "domain": "actuation",
+      "owner": "007",
+      "members": {
+        "mjLRMODE_NONE": 0,
+        "mjLRMODE_MUSCLE": 1,
+        "mjLRMODE_MUSCLEUSER": 2,
+        "mjLRMODE_ALL": 3
+      }
+    },
+    "mjtLabel": {
+      "source": "include/mujoco/mjvisualize.h:67",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjLABEL_NONE": 0,
+        "mjLABEL_BODY": 1,
+        "mjLABEL_JOINT": 2,
+        "mjLABEL_GEOM": 3,
+        "mjLABEL_SITE": 4,
+        "mjLABEL_CAMERA": 5,
+        "mjLABEL_LIGHT": 6,
+        "mjLABEL_TENDON": 7,
+        "mjLABEL_ACTUATOR": 8,
+        "mjLABEL_CONSTRAINT": 9,
+        "mjLABEL_FLEX": 10,
+        "mjLABEL_SKIN": 11,
+        "mjLABEL_SELECTION": 12,
+        "mjLABEL_SELPNT": 13,
+        "mjLABEL_CONTACTPOINT": 14,
+        "mjLABEL_CONTACTFORCE": 15,
+        "mjLABEL_ISLAND": 16,
+        "mjNLABEL": 17
+      }
+    },
+    "mjtLightType": {
+      "source": "include/mujoco/mjtype.h:143",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjLIGHT_SPOT": 0,
+        "mjLIGHT_DIRECTIONAL": 1,
+        "mjLIGHT_POINT": 2,
+        "mjLIGHT_IMAGE": 3
+      }
+    },
+    "mjtLimited": {
+      "source": "include/mujoco/mjspec.h:102",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjLIMITED_FALSE": 0,
+        "mjLIMITED_TRUE": 1,
+        "mjLIMITED_AUTO": 2
+      }
+    },
+    "mjtLogLevel": {
+      "source": "include/mujoco/mjtype.h:583",
+      "domain": "diagnostics",
+      "owner": "019",
+      "members": {
+        "mjLOG_DEBUG": 0,
+        "mjLOG_INFO": 1,
+        "mjLOG_WARNING": 2,
+        "mjLOG_ERROR": 3
+      }
+    },
+    "mjtLogTopic": {
+      "source": "include/mujoco/mjtype.h:590",
+      "domain": "diagnostics",
+      "owner": "019",
+      "members": {
+        "mjTOPIC_NONE": 0,
+        "mjTOPIC_TIME_STP": 1,
+        "mjTOPIC_TIME_CMP": 2,
+        "mjTOPIC_SLEEP": 3,
+        "mjNTOPIC": 3
+      }
+    },
+    "mjtMark": {
+      "source": "include/mujoco/mjspec.h:94",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjMARK_NONE": 0,
+        "mjMARK_EDGE": 1,
+        "mjMARK_CROSS": 2,
+        "mjMARK_RANDOM": 3
+      }
+    },
+    "mjtMeshBuiltin": {
+      "source": "include/mujoco/mjspec.h:74",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjMESH_BUILTIN_NONE": 0,
+        "mjMESH_BUILTIN_SPHERE": 1,
+        "mjMESH_BUILTIN_HEMISPHERE": 2,
+        "mjMESH_BUILTIN_CONE": 3,
+        "mjMESH_BUILTIN_SUPERSPHERE": 4,
+        "mjMESH_BUILTIN_SUPERTORUS": 5,
+        "mjMESH_BUILTIN_WEDGE": 6,
+        "mjMESH_BUILTIN_PLATE": 7
+      }
+    },
+    "mjtMeshInertia": {
+      "source": "include/mujoco/mjspec.h:66",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjMESH_INERTIA_CONVEX": 0,
+        "mjMESH_INERTIA_EXACT": 1,
+        "mjMESH_INERTIA_LEGACY": 2,
+        "mjMESH_INERTIA_SHELL": 3
+      }
+    },
+    "mjtMouse": {
+      "source": "include/mujoco/mjvisualize.h:41",
+      "domain": "upstream_ui",
+      "owner": "out-of-scope",
+      "members": {
+        "mjMOUSE_NONE": 0,
+        "mjMOUSE_ROTATE_V": 1,
+        "mjMOUSE_ROTATE_H": 2,
+        "mjMOUSE_MOVE_V": 3,
+        "mjMOUSE_MOVE_H": 4,
+        "mjMOUSE_ZOOM": 5,
+        "mjMOUSE_MOVE_V_REL": 6,
+        "mjMOUSE_MOVE_H_REL": 7
+      }
+    },
+    "mjtObj": {
+      "source": "include/mujoco/mjtype.h:271",
+      "domain": "sensor_query",
+      "owner": "019",
+      "members": {
+        "mjOBJ_UNKNOWN": 0,
+        "mjOBJ_BODY": 1,
+        "mjOBJ_XBODY": 2,
+        "mjOBJ_JOINT": 3,
+        "mjOBJ_DOF": 4,
+        "mjOBJ_GEOM": 5,
+        "mjOBJ_SITE": 6,
+        "mjOBJ_CAMERA": 7,
+        "mjOBJ_LIGHT": 8,
+        "mjOBJ_FLEX": 9,
+        "mjOBJ_MESH": 10,
+        "mjOBJ_SKIN": 11,
+        "mjOBJ_HFIELD": 12,
+        "mjOBJ_TEXTURE": 13,
+        "mjOBJ_MATERIAL": 14,
+        "mjOBJ_PAIR": 15,
+        "mjOBJ_EXCLUDE": 16,
+        "mjOBJ_EQUALITY": 17,
+        "mjOBJ_TENDON": 18,
+        "mjOBJ_ACTUATOR": 19,
+        "mjOBJ_SENSOR": 20,
+        "mjOBJ_NUMERIC": 21,
+        "mjOBJ_TEXT": 22,
+        "mjOBJ_TUPLE": 23,
+        "mjOBJ_KEY": 24,
+        "mjOBJ_PLUGIN": 25,
+        "mjNOBJECT": 26,
+        "mjOBJ_FRAME": 100,
+        "mjOBJ_DEFAULT": 101,
+        "mjOBJ_MODEL": 102
+      }
+    },
+    "mjtOrientation": {
+      "source": "include/mujoco/mjspec.h:123",
+      "domain": "upstream_compilation",
+      "owner": "005",
+      "members": {
+        "mjORIENTATION_QUAT": 0,
+        "mjORIENTATION_AXISANGLE": 1,
+        "mjORIENTATION_XYAXES": 2,
+        "mjORIENTATION_ZAXIS": 3,
+        "mjORIENTATION_EULER": 4
+      }
+    },
+    "mjtPertBit": {
+      "source": "include/mujoco/mjvisualize.h:53",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjPERT_TRANSLATE": 1,
+        "mjPERT_ROTATE": 2
+      }
+    },
+    "mjtPluginCapabilityBit": {
+      "source": "include/mujoco/mjplugin.h:110",
+      "domain": "extensions",
+      "owner": "019",
+      "members": {
+        "mjPLUGIN_ACTUATOR": 1,
+        "mjPLUGIN_SENSOR": 2,
+        "mjPLUGIN_PASSIVE": 4,
+        "mjPLUGIN_SDF": 8
+      }
+    },
+    "mjtProjection": {
+      "source": "include/mujoco/mjtype.h:128",
+      "domain": "camera_pose_projection",
+      "owner": "019",
+      "members": {
+        "mjPROJ_PERSPECTIVE": 0,
+        "mjPROJ_ORTHOGRAPHIC": 1
+      }
+    },
+    "mjtRayDataField": {
+      "source": "include/mujoco/mjtype.h:413",
+      "domain": "sensor_query",
+      "owner": "019",
+      "members": {
+        "mjRAYDATA_DIST": 0,
+        "mjRAYDATA_DIR": 1,
+        "mjRAYDATA_ORIGIN": 2,
+        "mjRAYDATA_POINT": 3,
+        "mjRAYDATA_NORMAL": 4,
+        "mjRAYDATA_DEPTH": 5,
+        "mjNRAYDATA": 6
+      }
+    },
+    "mjtRndFlag": {
+      "source": "include/mujoco/mjvisualize.h:141",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjRND_SHADOW": 0,
+        "mjRND_WIREFRAME": 1,
+        "mjRND_REFLECTION": 2,
+        "mjRND_ADDITIVE": 3,
+        "mjRND_SKYBOX": 4,
+        "mjRND_FOG": 5,
+        "mjRND_HAZE": 6,
+        "mjRND_DEPTH": 7,
+        "mjRND_SEGMENT": 8,
+        "mjRND_IDCOLOR": 9,
+        "mjRND_CULL_FACE": 10,
+        "mjNRNDFLAG": 11
+      }
+    },
+    "mjtSDFType": {
+      "source": "include/mujoco/mjtype.h:472",
+      "domain": "signed_distance",
+      "owner": "011",
+      "members": {
+        "mjSDFTYPE_SINGLE": 0,
+        "mjSDFTYPE_INTERSECTION": 1,
+        "mjSDFTYPE_MIDSURFACE": 2,
+        "mjSDFTYPE_COLLISION": 3
+      }
+    },
+    "mjtSameFrame": {
+      "source": "include/mujoco/mjtype.h:436",
+      "domain": "rigid_model",
+      "owner": "baseline",
+      "members": {
+        "mjSAMEFRAME_NONE": 0,
+        "mjSAMEFRAME_BODY": 1,
+        "mjSAMEFRAME_INERTIA": 2,
+        "mjSAMEFRAME_BODYROT": 3,
+        "mjSAMEFRAME_INERTIAROT": 4
+      }
+    },
+    "mjtSection": {
+      "source": "include/mujoco/mjui.h:110",
+      "domain": "upstream_ui",
+      "owner": "out-of-scope",
+      "members": {
+        "mjSECT_CLOSED": 0,
+        "mjSECT_OPEN": 1,
+        "mjSECT_FIXED": 2
+      }
+    },
+    "mjtSensor": {
+      "source": "include/mujoco/mjtype.h:308",
+      "domain": "sensor",
+      "owner": "016",
+      "members": {
+        "mjSENS_TOUCH": 0,
+        "mjSENS_ACCELEROMETER": 1,
+        "mjSENS_VELOCIMETER": 2,
+        "mjSENS_GYRO": 3,
+        "mjSENS_FORCE": 4,
+        "mjSENS_TORQUE": 5,
+        "mjSENS_MAGNETOMETER": 6,
+        "mjSENS_RANGEFINDER": 7,
+        "mjSENS_CAMPROJECTION": 8,
+        "mjSENS_JOINTPOS": 9,
+        "mjSENS_JOINTVEL": 10,
+        "mjSENS_TENDONPOS": 11,
+        "mjSENS_TENDONVEL": 12,
+        "mjSENS_ACTUATORPOS": 13,
+        "mjSENS_ACTUATORVEL": 14,
+        "mjSENS_ACTUATORFRC": 15,
+        "mjSENS_JOINTACTFRC": 16,
+        "mjSENS_TENDONACTFRC": 17,
+        "mjSENS_BALLQUAT": 18,
+        "mjSENS_BALLANGVEL": 19,
+        "mjSENS_JOINTLIMITPOS": 20,
+        "mjSENS_JOINTLIMITVEL": 21,
+        "mjSENS_JOINTLIMITFRC": 22,
+        "mjSENS_TENDONLIMITPOS": 23,
+        "mjSENS_TENDONLIMITVEL": 24,
+        "mjSENS_TENDONLIMITFRC": 25,
+        "mjSENS_FRAMEPOS": 26,
+        "mjSENS_FRAMEQUAT": 27,
+        "mjSENS_FRAMEXAXIS": 28,
+        "mjSENS_FRAMEYAXIS": 29,
+        "mjSENS_FRAMEZAXIS": 30,
+        "mjSENS_FRAMELINVEL": 31,
+        "mjSENS_FRAMEANGVEL": 32,
+        "mjSENS_FRAMELINACC": 33,
+        "mjSENS_FRAMEANGACC": 34,
+        "mjSENS_SUBTREECOM": 35,
+        "mjSENS_SUBTREELINVEL": 36,
+        "mjSENS_SUBTREEANGMOM": 37,
+        "mjSENS_INSIDESITE": 38,
+        "mjSENS_GEOMDIST": 39,
+        "mjSENS_GEOMNORMAL": 40,
+        "mjSENS_GEOMFROMTO": 41,
+        "mjSENS_CONTACT": 42,
+        "mjSENS_E_POTENTIAL": 43,
+        "mjSENS_E_KINETIC": 44,
+        "mjSENS_CLOCK": 45,
+        "mjSENS_TACTILE": 46,
+        "mjSENS_PLUGIN": 47,
+        "mjSENS_USER": 48
+      }
+    },
+    "mjtSleepPolicy": {
+      "source": "include/mujoco/mjtype.h:445",
+      "domain": "sleep",
+      "owner": "017",
+      "members": {
+        "mjSLEEP_AUTO": 0,
+        "mjSLEEP_AUTO_NEVER": 1,
+        "mjSLEEP_AUTO_ALLOWED": 2,
+        "mjSLEEP_NEVER": 3,
+        "mjSLEEP_ALLOWED": 4,
+        "mjSLEEP_INIT": 5
+      }
+    },
+    "mjtSleepState": {
+      "source": "include/mujoco/mjtype.h:573",
+      "domain": "sleep",
+      "owner": "017",
+      "members": {
+        "mjS_STATIC": -1,
+        "mjS_ASLEEP": 0,
+        "mjS_AWAKE": 1
+      }
+    },
+    "mjtSolver": {
+      "source": "include/mujoco/mjtype.h:201",
+      "domain": "constraint_solver",
+      "owner": "014",
+      "members": {
+        "mjSOL_PGS": 0,
+        "mjSOL_CG": 1,
+        "mjSOL_NEWTON": 2
+      }
+    },
+    "mjtStage": {
+      "source": "include/mujoco/mjtype.h:384",
+      "domain": "runtime_stage_options",
+      "owner": "019",
+      "members": {
+        "mjSTAGE_NONE": 0,
+        "mjSTAGE_POS": 1,
+        "mjSTAGE_VEL": 2,
+        "mjSTAGE_ACC": 3
+      }
+    },
+    "mjtState": {
+      "source": "include/mujoco/mjtype.h:483",
+      "domain": "state",
+      "owner": "006",
+      "members": {
+        "mjSTATE_TIME": 1,
+        "mjSTATE_QPOS": 2,
+        "mjSTATE_QVEL": 4,
+        "mjSTATE_ACT": 8,
+        "mjSTATE_HISTORY": 16,
+        "mjSTATE_WARMSTART": 32,
+        "mjSTATE_CTRL": 64,
+        "mjSTATE_QFRC_APPLIED": 128,
+        "mjSTATE_XFRC_APPLIED": 256,
+        "mjSTATE_EQ_ACTIVE": 512,
+        "mjSTATE_MOCAP_POS": 1024,
+        "mjSTATE_MOCAP_QUAT": 2048,
+        "mjSTATE_USERDATA": 4096,
+        "mjSTATE_PLUGIN": 8192,
+        "mjNSTATE": 14,
+        "mjSTATE_PHYSICS": 30,
+        "mjSTATE_FULLPHYSICS": 8223,
+        "mjSTATE_USER": 8128,
+        "mjSTATE_INTEGRATION": 16383
+      }
+    },
+    "mjtStereo": {
+      "source": "include/mujoco/mjvisualize.h:158",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjSTEREO_NONE": 0,
+        "mjSTEREO_QUADBUFFERED": 1,
+        "mjSTEREO_SIDEBYSIDE": 2
+      }
+    },
+    "mjtTexture": {
+      "source": "include/mujoco/mjtype.h:151",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjTEXTURE_2D": 0,
+        "mjTEXTURE_CUBE": 1,
+        "mjTEXTURE_SKYBOX": 2
+      }
+    },
+    "mjtTextureRole": {
+      "source": "include/mujoco/mjtype.h:158",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjTEXROLE_USER": 0,
+        "mjTEXROLE_RGB": 1,
+        "mjTEXROLE_OCCLUSION": 2,
+        "mjTEXROLE_ROUGHNESS": 3,
+        "mjTEXROLE_METALLIC": 4,
+        "mjTEXROLE_NORMAL": 5,
+        "mjTEXROLE_OPACITY": 6,
+        "mjTEXROLE_EMISSIVE": 7,
+        "mjTEXROLE_RGBA": 8,
+        "mjTEXROLE_ORM": 9,
+        "mjNTEXROLE": 10
+      }
+    },
+    "mjtTimer": {
+      "source": "include/mujoco/mjtype.h:545",
+      "domain": "diagnostics",
+      "owner": "019",
+      "members": {
+        "mjTIMER_STEP": 0,
+        "mjTIMER_FORWARD": 1,
+        "mjTIMER_INVERSE": 2,
+        "mjTIMER_POSITION": 3,
+        "mjTIMER_VELOCITY": 4,
+        "mjTIMER_ACTUATION": 5,
+        "mjTIMER_CONSTRAINT": 6,
+        "mjTIMER_ADVANCE": 7,
+        "mjTIMER_POS_KINEMATICS": 8,
+        "mjTIMER_POS_INERTIA": 9,
+        "mjTIMER_POS_COLLISION": 10,
+        "mjTIMER_POS_MAKE": 11,
+        "mjTIMER_POS_PROJECT": 12,
+        "mjTIMER_COL_BROAD": 13,
+        "mjTIMER_COL_NARROW": 14,
+        "mjNTIMER": 15
+      }
+    },
+    "mjtTrn": {
+      "source": "include/mujoco/mjtype.h:230",
+      "domain": "actuation",
+      "owner": "007",
+      "members": {
+        "mjTRN_JOINT": 0,
+        "mjTRN_JOINTINPARENT": 1,
+        "mjTRN_SLIDERCRANK": 2,
+        "mjTRN_TENDON": 3,
+        "mjTRN_SITE": 4,
+        "mjTRN_BODY": 5,
+        "mjTRN_UNDEFINED": 1000
+      }
+    },
+    "mjtVisFlag": {
+      "source": "include/mujoco/mjvisualize.h:104",
+      "domain": "upstream_rendering",
+      "owner": "out-of-scope",
+      "members": {
+        "mjVIS_CONVEXHULL": 0,
+        "mjVIS_TEXTURE": 1,
+        "mjVIS_JOINT": 2,
+        "mjVIS_CAMERA": 3,
+        "mjVIS_ACTUATOR": 4,
+        "mjVIS_ACTIVATION": 5,
+        "mjVIS_LIGHT": 6,
+        "mjVIS_TENDON": 7,
+        "mjVIS_RANGEFINDER": 8,
+        "mjVIS_CONSTRAINT": 9,
+        "mjVIS_INERTIA": 10,
+        "mjVIS_SCLINERTIA": 11,
+        "mjVIS_PERTFORCE": 12,
+        "mjVIS_PERTOBJ": 13,
+        "mjVIS_CONTACTPOINT": 14,
+        "mjVIS_ISLAND": 15,
+        "mjVIS_CONTACTFORCE": 16,
+        "mjVIS_CONTACTSPLIT": 17,
+        "mjVIS_TRANSPARENT": 18,
+        "mjVIS_AUTOCONNECT": 19,
+        "mjVIS_COM": 20,
+        "mjVIS_SELECT": 21,
+        "mjVIS_STATIC": 22,
+        "mjVIS_SKIN": 23,
+        "mjVIS_FLEXVERT": 24,
+        "mjVIS_FLEXEDGE": 25,
+        "mjVIS_FLEXFACE": 26,
+        "mjVIS_FLEXSKIN": 27,
+        "mjVIS_BODYBVH": 28,
+        "mjVIS_MESHBVH": 29,
+        "mjVIS_SDFITER": 30,
+        "mjNVISFLAG": 31
+      }
+    },
+    "mjtWarning": {
+      "source": "include/mujoco/mjtype.h:532",
+      "domain": "diagnostics",
+      "owner": "019",
+      "members": {
+        "mjWARN_INERTIA": 0,
+        "mjWARN_CONTACTFULL": 1,
+        "mjWARN_CNSTRFULL": 2,
+        "mjWARN_BADQPOS": 3,
+        "mjWARN_BADQVEL": 4,
+        "mjWARN_BADQACC": 5,
+        "mjWARN_BADCTRL": 6,
+        "mjNWARNING": 7
+      }
+    },
+    "mjtWrap": {
+      "source": "include/mujoco/mjtype.h:220",
+      "domain": "tendon",
+      "owner": "008",
+      "members": {
+        "mjWRAP_NONE": 0,
+        "mjWRAP_JOINT": 1,
+        "mjWRAP_PULLEY": 2,
+        "mjWRAP_SITE": 3,
+        "mjWRAP_SPHERE": 4,
+        "mjWRAP_CYLINDER": 5
+      }
+    }
+  }
+}

@@ -278,7 +278,9 @@ class MetalContact:
     ) or int(batch_size) <= 0:
       raise ValueError("batch_size must be positive")
     b, c, nv = int(batch_size), d.pair_count, d.nv
-    if b > (1 << 31) - 1 or b * max(c * 5, 1) * max(nv, 1) > (1 << 32):
+    if (b > (1 << 31) - 1
+        or b * max(c * 5, 1) * max(nv, 1) > (1 << 32)
+        or b * max(c * 5, 1) * max(nv + 5, 1) > (1 << 32)):
       raise ValueError("contact workspace exceeds Metal index capacity")
     self.batch_size = b
     def empty(size):
@@ -286,16 +288,26 @@ class MetalContact:
     self._workspace = {
         "row_data": empty(b * c * 5 * 6), "frame": empty(b * c * 12),
         "jacobian": empty(b * c * 5 * nv), "force": empty(b * c * 5),
+        "canonical_rows": empty(b * c * 5 * (nv + 5)),
         "qacc": empty(b * nv),
         "qfrc_contact": empty(b * nv),
         "status": torch.zeros(b, dtype=torch.int32, device=self._device),
         "solver_diagnostics": empty(b * 2),
-        "dims": torch.tensor([nv, c, b, d.nbody, d.njnt, d.ngeom], dtype=torch.int32, device=self._device),
+        # The trailing int32 words are a mutable row mask. Both kernels share
+        # this packed descriptor so unselected reset-recovery rows are not
+        # inspected or overwritten by either collision detection or solving.
+        "dims": torch.tensor(
+            [nv, c, b, d.nbody, d.njnt, d.ngeom] + [1] * b,
+            dtype=torch.int32, device=self._device),
+        "assembly_dims": torch.tensor(
+            [nv, c, b, d.nbody, d.njnt, d.ngeom] + [1] * b,
+            dtype=torch.int32, device=self._device),
         "solver_params": torch.tensor([d.impratio], dtype=torch.float32, device=self._device),
     }
     return self._workspace
 
-  def run_device(self, fk, mass, free_acceleration, qvel):
+  def run_device(self, fk, mass, free_acceleration, qvel, *, assemble_only=False,
+                 world_mask=None):
     """Detect contacts and solve normal forces entirely on MPS.
 
     ``fk`` is the dict returned by ``MetalKinematics.run_device``. ``mass`` is
@@ -306,6 +318,18 @@ class MetalContact:
     at most 64 contact-block active-set refinement sweeps).
     """
     w, torch, d = self._workspace, self._torch, self.descriptor
+    if world_mask is None:
+      w["dims"][6:].fill_(1)
+      w["assembly_dims"][6:].fill_(1)
+    else:
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.device.type != self._device.type
+          or world_mask.dtype != torch.int32
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 on the contact device with shape (batch_size,)")
+      w["dims"][6:].copy_(world_mask)
+      w["assembly_dims"][6:].copy_(world_mask)
     def check(tensor, name, shape):
       if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
@@ -318,8 +342,9 @@ class MetalContact:
       if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
     check(qvel, "qvel", (self.batch_size, d.nv))
-    check(free_acceleration, "free_acceleration", (self.batch_size, d.nv))
-    check(mass, "mass", (self.batch_size, d.nv, d.nv))
+    if not assemble_only:
+      check(free_acceleration, "free_acceleration", (self.batch_size, d.nv))
+      check(mass, "mass", (self.batch_size, d.nv, d.nv))
     for name, width, count in (
         ("geom_pos", 3, d.ngeom), ("geom_quat", 4, d.ngeom),
         ("body_pos", 3, d.nbody), ("body_quat", 4, d.nbody),
@@ -331,9 +356,15 @@ class MetalContact:
         fk["joint_anchor"], fk["joint_axis"], qvel.reshape(-1),
         *[self._constants[k] for k in ("geom1", "geom2", "radius1", "radius2", "margin", "gap", "solref", "solimp", "condim", "friction")],
         *[self._constants[k] for k in ("geom_bodyid", "body_parentid", "body_jntadr", "body_jntnum", "jnt_type", "jnt_dofadr", "body_invweight0")],
-        w["row_data"], w["frame"], w["jacobian"], w["dims"],
+        w["row_data"], w["frame"], w["jacobian"],
+        w["assembly_dims"] if assemble_only else w["dims"],
+        w["canonical_rows"], w["solver_params"],
         threads=(self.batch_size * max(d.pair_count, 1),), group_size=(1,),
     )
+    if assemble_only:
+      return {"canonical_rows": self.canonical_rows(),
+              "row_data": w["row_data"], "frame": w["frame"],
+              "jacobian": w["jacobian"]}
     self._solve_kernel(
         mass.reshape(-1), free_acceleration.reshape(-1), w["jacobian"],
         w["row_data"], self._constants["friction"], w["force"], w["qacc"],
@@ -350,6 +381,8 @@ class MetalContact:
     jacobian_rows = w["jacobian"][: self.batch_size * d.pair_count * 5 * d.nv].reshape(
         self.batch_size, d.pair_count, 5, d.nv
     )
+    canonical = w["canonical_rows"][:self.batch_size * d.pair_count * 5 * (d.nv + 5)].reshape(
+        self.batch_size, d.pair_count * 5, d.nv + 5)
     force_rows = w["force"][: self.batch_size * d.pair_count * 5].reshape(
         self.batch_size, d.pair_count, 5
     )
@@ -365,6 +398,14 @@ class MetalContact:
         "position": frames[:, :, 9:12],
         "jacobian": jacobian_rows[:, :, 0, :],
         "jacobian_rows": jacobian_rows,
+        "canonical_rows": {
+            "J": canonical[..., :d.nv],
+            "R": canonical[..., d.nv],
+            "ar": canonical[..., d.nv + 1],
+            "lo": canonical[..., d.nv + 2],
+            "hi": canonical[..., d.nv + 3],
+            "active": canonical[..., d.nv + 4],
+        },
         "force": force_rows[:, :, 0], "force_rows": force_rows,
         "qfrc_contact": w["qfrc_contact"][: self.batch_size * d.nv].reshape(
             self.batch_size, d.nv
@@ -374,4 +415,19 @@ class MetalContact:
         "solver_diagnostics": w["solver_diagnostics"][: self.batch_size * 2].reshape(
             self.batch_size, 2
         ),
+    }
+
+  def canonical_rows(self):
+    """Return the borrowed unilateral rows produced by the latest detection."""
+    d = self.descriptor
+    packed = self._workspace["canonical_rows"][:
+        self.batch_size * d.pair_count * 5 * (d.nv + 5)].reshape(
+            self.batch_size, d.pair_count * 5, d.nv + 5)
+    return {
+        "J": packed[..., :d.nv],
+        "R": packed[..., d.nv],
+        "ar": packed[..., d.nv + 1],
+        "lo": packed[..., d.nv + 2],
+        "hi": packed[..., d.nv + 3],
+        "active": packed[..., d.nv + 4],
     }

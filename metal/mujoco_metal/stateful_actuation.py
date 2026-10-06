@@ -1,9 +1,9 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
-"""Full built-in actuator lowering for MuJoCo 3.10.0 (milestone 007).
+"""Full actuator lowering for MuJoCo 3.10.0 (milestone 007/019).
 
-Admits every pinned actuator dynamics/gain/bias family except USER callbacks
-(owned by milestone 019) and every rigid transmission type except spatial
+Admits every pinned actuator dynamics/gain/bias family, including explicitly
+registered device-native USER callbacks, and every rigid transmission type except spatial
 tendons (owned by milestone 008): INTEGRATOR/FILTER/FILTEREXACT/MUSCLE/DCMOTOR
 dynamics, FIXED/AFFINE/MUSCLE/DCMOTOR gains and NONE/AFFINE/MUSCLE/DCMOTOR
 biases, JOINT/JOINTINPARENT/SLIDERCRANK/TENDON(fixed)/SITE/BODY transmissions
@@ -22,6 +22,7 @@ kept as rejection rationale).
 
 import mujoco
 import numpy as np
+import numbers
 
 _MJMINVAL = 1e-15
 _INT32_MAX = (1 << 31) - 1
@@ -400,7 +401,8 @@ class ActuatorModel:
   stage can be reused byte-identically.
   """
 
-  def __init__(self, model, allow_inherited=False):
+  def __init__(self, model, allow_inherited=False, bundled_plugins=None,
+               actuator_user_bindings=()):
     if mujoco.__version__ != "3.10.0":
       raise RuntimeError(f"actuator lowering requires MuJoCo 3.10.0; found {mujoco.__version__}")
     if not isinstance(model, mujoco.MjModel):
@@ -409,10 +411,20 @@ class ActuatorModel:
     na = int(model.na)
     if any(v < 0 or v > _INT32_MAX for v in (nq, nv, nu, na)):
       raise ValueError("actuator dimensions exceed int32")
-    if int(model.nplugin):
-      raise ValueError("actuator plugins are unsupported (owned by milestone 019)")
-    if np.any(np.asarray(model.actuator_plugin) >= 0):
-      raise ValueError("actuator plugins are unsupported (owned by milestone 019)")
+    plugin_actuator = np.asarray(model.actuator_plugin, dtype=np.int32).reshape(-1)
+    if plugin_actuator.shape != (nu,):
+      raise ValueError("actuator plugin map has an invalid shape")
+    if np.any(plugin_actuator >= 0):
+      if bundled_plugins is None:
+        raise ValueError(
+            "019: bundled actuator descriptors are required for plugin actuators")
+      from mujoco_metal.bundled_pid import lower_pid_actuators
+      pid_params, pid_flags, plugin_mask = lower_pid_actuators(
+          model, bundled_plugins)
+    else:
+      pid_params = np.zeros((max(nu, 1), 5), dtype=np.float32)
+      pid_flags = np.zeros((max(nu, 1), 2), dtype=np.int32)
+      plugin_mask = np.zeros((max(nu, 1),), dtype=np.int32)
     if not allow_inherited:
       if np.any(np.asarray(model.actuator_armature) != 0):
         raise ValueError("actuator armature is unsupported (owned by milestone 015)")
@@ -462,18 +474,76 @@ class ActuatorModel:
     gaintype = np.asarray(model.actuator_gaintype)
     biastype = np.asarray(model.actuator_biastype)
     trntype = np.asarray(model.actuator_trntype)
-    for i in range(nu):
-      if int(dyntype[i]) == dyn_user or int(gaintype[i]) == gain_user or int(biastype[i]) == bias_user:
-        raise ValueError(f"actuator {i}: user callbacks are unsupported (owned by milestone 019)")
-      if int(dyntype[i]) not in (dyn_none, dyn_int, dyn_filter, dyn_filter_exact, dyn_muscle, dyn_dcmotor):
-        raise ValueError(f"actuator {i}: unknown dynamics type")
-      if int(gaintype[i]) not in (gain_fixed, gain_affine, gain_muscle, gain_dcmotor):
-        raise ValueError(f"actuator {i}: unknown gain type")
-      if int(biastype[i]) not in (bias_none, bias_affine, bias_muscle, bias_dcmotor):
-        raise ValueError(f"actuator {i}: unknown bias type")
-
     actnum = np.asarray(model.actuator_actnum)
     actadr = np.asarray(model.actuator_actadr)
+    user_ids = {"dynamics": set(), "gain": set(), "bias": set()}
+    normalized_user_plugins = []
+    if not isinstance(actuator_user_bindings, (tuple, list)):
+      raise TypeError("actuator_user_bindings must be a sequence")
+    for entry in actuator_user_bindings:
+      if (not isinstance(entry, (tuple, list)) or len(entry) != 2
+          or not isinstance(entry[0], str)):
+        raise TypeError("actuator_user_bindings must contain (name, roles) pairs")
+      name, role_bindings = entry
+      if not isinstance(name, str) or not name:
+        raise ValueError("actuator USER plugin names must be nonempty")
+      if not isinstance(role_bindings, (tuple, list)):
+        raise TypeError("actuator USER roles must be a sequence of (role, IDs)")
+      normalized_roles = []
+      for binding in role_bindings:
+        if (not isinstance(binding, (tuple, list)) or len(binding) != 2
+            or not isinstance(binding[0], str)):
+          raise TypeError("actuator USER roles must contain (role, IDs) pairs")
+        role, values = binding
+        if role not in user_ids:
+          raise ValueError(f"actuator USER plugin {name!r} has unknown role {role!r}")
+        if not isinstance(values, (tuple, list)):
+          raise TypeError(f"actuator USER {role} IDs must be a sequence")
+        ids = []
+        for value in values:
+          if (isinstance(value, (bool, np.bool_))
+              or not isinstance(value, numbers.Integral)):
+            raise TypeError(
+                f"actuator USER {role} IDs must be integers, not coerced values")
+          actuator_id = int(value)
+          if actuator_id < 0 or actuator_id >= nu:
+            raise ValueError(
+                f"actuator USER plugin {name!r} binds out-of-range {role} ID")
+          ids.append(actuator_id)
+        normalized_roles.append((role, tuple(ids)))
+      normalized_roles = tuple(normalized_roles)
+      if len({role for role, _ in normalized_roles}) != len(normalized_roles):
+        raise ValueError("actuator USER plugin repeats a callback role")
+      normalized_user_plugins.append((name, normalized_roles))
+      for role, ids in normalized_roles:
+        for actuator_id in ids:
+          if actuator_id in user_ids[role]:
+            raise ValueError(
+                f"actuator {actuator_id} has multiple registered {role} callbacks")
+          user_ids[role].add(actuator_id)
+          if role == "dynamics" and int(actnum[actuator_id]) == 0:
+            raise ValueError(
+                f"actuator {actuator_id} has no activation slots for a dynamics callback")
+    for i in range(nu):
+      if int(dyntype[i]) not in (dyn_none, dyn_int, dyn_filter, dyn_filter_exact, dyn_muscle, dyn_dcmotor):
+        if int(dyntype[i]) != dyn_user:
+          raise ValueError(f"actuator {i}: unknown dynamics type")
+      if int(gaintype[i]) not in (gain_fixed, gain_affine, gain_muscle, gain_dcmotor):
+        if int(gaintype[i]) != gain_user:
+          raise ValueError(f"actuator {i}: unknown gain type")
+      if int(biastype[i]) not in (bias_none, bias_affine, bias_muscle, bias_dcmotor):
+        if int(biastype[i]) != bias_user:
+          raise ValueError(f"actuator {i}: unknown bias type")
+      if plugin_mask[i] and any(i in ids for ids in user_ids.values()):
+        raise ValueError(
+            f"actuator {i}: bundled plugin actuator cannot also bind a USER callback")
+      for role, tag in (("dynamics", int(dyntype[i]) == dyn_user),
+                        ("gain", int(gaintype[i]) == gain_user),
+                        ("bias", int(biastype[i]) == bias_user)):
+        if i in user_ids[role] and not tag:
+          raise ValueError(
+              f"actuator {i}: registered {role} callback requires the USER type")
+
     dynprm = np.asarray(model.actuator_dynprm, dtype=np.float64)
     gainprm = np.asarray(model.actuator_gainprm, dtype=np.float64)
     biasprm = np.asarray(model.actuator_biasprm, dtype=np.float64)
@@ -481,12 +551,20 @@ class ActuatorModel:
     cursor = 0
     for i in range(nu):
       dt = int(dyntype[i])
-      if dt == dyn_none:
+      if plugin_mask[i]:
+        # The bundled PID owns these activation slots.  Its pinned plugin
+        # constructor validated exact ActDim during model compilation and
+        # lower_pid_actuators repeats that contract for the native layout.
+        pass
+      elif dt == dyn_none:
         if int(actnum[i]) != 0:
           raise ValueError(f"actuator {i}: stateless dynamics must have actnum 0")
       elif dt in (dyn_int, dyn_filter, dyn_filter_exact, dyn_muscle):
         if int(actnum[i]) != 1:
           raise ValueError(f"actuator {i}: scalar dynamics must have actnum 1")
+      elif dt == dyn_user:
+        if int(actnum[i]) < 0:
+          raise ValueError(f"actuator {i}: USER dynamics actnum must be nonnegative")
       else:  # dcmotor
         slots = dcmotor_slots(dynprm[i], gainprm[i])
         if slots["num_slots"] != int(actnum[i]):
@@ -590,10 +668,46 @@ class ActuatorModel:
     self.cranklength = _frozen(crank, np.float32)
     self.dyntype = _frozen(dyntype, np.int32)
     self.dynprm = _frozen(dynprm, np.float32)
-    self.gaintype = _frozen(gaintype, np.int32)
-    self.gainprm = _frozen(gainprm, np.float32)
-    self.biastype = _frozen(biastype, np.int32)
-    self.biasprm = _frozen(biasprm, np.float32)
+    # Plugin actuator force is computed by its dedicated stage. Neutralize
+    # the builtin generic force path for those rows so it is added exactly
+    # once before the ordinary tendon and actuator force clamps.
+    native_gaintype = np.array(gaintype, dtype=np.int32, copy=True)
+    native_gainprm = np.array(gainprm, dtype=np.float32, copy=True)
+    native_biastype = np.array(biastype, dtype=np.int32, copy=True)
+    native_biasprm = np.array(biasprm, dtype=np.float32, copy=True)
+    native_gaintype[plugin_mask[:nu] != 0] = gain_fixed
+    native_gainprm[plugin_mask[:nu] != 0] = 0.0
+    native_biastype[plugin_mask[:nu] != 0] = bias_none
+    native_biasprm[plugin_mask[:nu] != 0] = 0.0
+    self.gaintype = _frozen(native_gaintype, np.int32)
+    self.gainprm = _frozen(native_gainprm, np.float32)
+    self.biastype = _frozen(native_biastype, np.int32)
+    self.biasprm = _frozen(native_biasprm, np.float32)
+    self.plugin_actuator_mask = _frozen(plugin_mask, np.int32)
+    self.user_dynamics_actuator_mask = _frozen(
+        np.asarray([int(i in user_ids["dynamics"]) for i in range(nu)],
+                   dtype=np.int32), np.int32)
+    self.user_gain_actuator_mask = _frozen(
+        np.asarray([int(i in user_ids["gain"]) for i in range(nu)],
+                   dtype=np.int32), np.int32)
+    self.user_bias_actuator_mask = _frozen(
+        np.asarray([int(i in user_ids["bias"]) for i in range(nu)],
+                   dtype=np.int32), np.int32)
+    user_dynamics_slot_mask = np.zeros(max(na, 1), dtype=np.int32)
+    for i in user_ids["dynamics"]:
+      first, count = int(actadr[i]), int(actnum[i])
+      if count:
+        user_dynamics_slot_mask[first:first + count] = 1
+    self.user_dynamics_slot_mask = _frozen(user_dynamics_slot_mask, np.int32)
+    self.user_actuator_bindings = tuple(
+        (role, tuple(sorted(ids))) for role, ids in user_ids.items())
+    self._user_plugin_bindings = tuple(normalized_user_plugins)
+    self.has_user_gain = bool(np.any(gaintype == gain_user))
+    self.has_user_bias = bool(np.any(biastype == bias_user))
+    self.has_user_callbacks = bool(
+        np.any(dyntype == dyn_user) or self.has_user_gain or self.has_user_bias)
+    self.pid_params = _frozen(pid_params, np.float32)
+    self.pid_flags = _frozen(pid_flags, np.int32)
     self.actadr = _frozen(actadr, np.int32)
     self.actnum = _frozen(actnum, np.int32)
     self.actearly = _frozen(model.actuator_actearly, np.uint8)
@@ -670,7 +784,7 @@ class ActuatorModel:
         (np.asarray(model.actuator_biastype) == int(mujoco.mjtBias.mjBIAS_DCMOTOR)))) if nu else False
 
 
-def act_dot_reference(meta, ctrl, act, length, velocity):
+def act_dot_reference(meta, ctrl, act, length, velocity, user_dynamics=None):
   """Independent numpy port of the pinned act_dot switch (one environment)."""
   dyn_none = 0  # mjDYN_NONE == 0 in the pinned enum order
   out = np.zeros(meta.na, dtype=np.float64)
@@ -739,11 +853,18 @@ def act_dot_reference(meta, ctrl, act, length, velocity):
         if dp[1] > 0:
           i_dot = _clip(i_dot, -dp[1], dp[1])
         out[last] = i_dot
+    elif dt == int(mujoco.mjtDyn.mjDYN_USER) and user_dynamics is not None:
+      if i in user_dynamics:
+        values = np.asarray(user_dynamics[i], dtype=np.float64).reshape(-1)
+        if values.size != n:
+          raise ValueError(f"USER dynamics callback {i} must provide {n} values")
+        out[first:first + n] = values
   return out
 
 
 def force_reference(meta, ctrl, act, length, velocity, moment, gravcomp=None,
-                    disableflags=0, disableactuator=0):
+                    disableflags=0, disableactuator=0, user_gain=None,
+                    user_bias=None, user_dynamics=None):
   """Independent numpy port of the pinned force path (one environment).
 
   Returns dict with actuator `force`, per-type `gain`/`bias`, clipped `ctrl`,
@@ -793,6 +914,9 @@ def force_reference(meta, ctrl, act, length, velocity, moment, gravcomp=None,
       g = muscle_gain(length[i], velocity[i],
                       np.asarray(meta.lengthrange[i], dtype=np.float64),
                       float(np.asarray(meta.acc0)[i]), gp)
+    elif gt == int(_mj.mjtGain.mjGAIN_USER):
+      g = (float(user_gain[i]) if user_gain is not None and i in user_gain
+           else 1.0)
     else:  # DCMOTOR
       r, k = gp[0], gp[1]
       slots = dcmotor_slots(dp, gp)
@@ -812,7 +936,8 @@ def force_reference(meta, ctrl, act, length, velocity, moment, gravcomp=None,
       adr = first + n - 1
       if bool(np.asarray(meta.actearly)[i]):
         a = advance_activation_reference(
-            meta, act, act_dot_reference(meta, ctrl, act, length, velocity),
+            meta, act, act_dot_reference(
+                meta, ctrl, act, length, velocity, user_dynamics),
             velocity, [False] * nu)[adr]
       else:
         a = act[adr]
@@ -825,6 +950,9 @@ def force_reference(meta, ctrl, act, length, velocity, moment, gravcomp=None,
     elif bt == 2:
       b = muscle_bias(length[i], np.asarray(meta.lengthrange[i], dtype=np.float64),
                       float(np.asarray(meta.acc0)[i]), bp)
+    elif bt == int(_mj.mjtBias.mjBIAS_USER):
+      b = (float(user_bias[i]) if user_bias is not None and i in user_bias
+           else 0.0)
     else:  # DCMOTOR back-EMF, stateless only
       b = 0.0
       if dp[0] <= 0:
@@ -962,19 +1090,30 @@ def advance_bristle_exact(act_z, act_dot_z, velocity, f_c, f_s, v_s, sigma0, h):
 class MetalActuators:
   """Native MPS full-family actuator kinematics + dynamics stage."""
 
-  def __init__(self, model, batch_size):
+  def __init__(self, model, batch_size, *, velocity_derivative_layout=None,
+               bundled_plugins=None, actuator_user_bindings=()):
     from pathlib import Path as _Path
     import torch as _torch
     self._torch = _torch
-    self._meta = ActuatorModel(model, allow_inherited=True)
+    self._meta = ActuatorModel(model, allow_inherited=True,
+                               bundled_plugins=bundled_plugins,
+                               actuator_user_bindings=actuator_user_bindings)
     self._device = _torch.device("mps")
     meta = self._meta
     if (isinstance(batch_size, (bool, np.bool_))
         or not isinstance(batch_size, (int, np.integer)) or batch_size <= 0):
       raise ValueError("batch_size must be a positive integer")
     b = int(batch_size)
+    edge_count = (int(velocity_derivative_layout.edge_count)
+                  if velocity_derivative_layout is not None else 0)
+    if (velocity_derivative_layout is not None
+        and int(velocity_derivative_layout.diagonal_slots.size) != meta.nv):
+      raise ValueError("velocity derivative layout nv does not match actuator model")
+    derivative_width = (max(edge_count, 1)
+                        if velocity_derivative_layout is not None
+                        else max(meta.nv, 1)**2)
     if max(b*max(meta.nv, 1)*max(meta.nu, 1),
-           b*max(meta.nv, 1)**2, b*max(meta.na, 1),
+           b*derivative_width, b*max(meta.na, 1),
            b*max(meta.nbody, 1)*6, meta.nu*10,
            meta.nu*meta.nq) > _INT32_MAX:
       raise ValueError("actuator workspace exceeds int32 shader indexing capacity")
@@ -984,9 +1123,11 @@ class MetalActuators:
         (_Path(__file__).parent / "shaders" / "actuation.metal").read_text())
     self._kin_kernel = tlib.general_actuator_kinematics
     self._body_kernel = tlib.body_adhesion_moment
+    self._cached_velocity_kernel = tlib.general_actuator_velocity_from_moment
     self._dot_kernel = alib.actuator_act_dot
     self._force_kernel = alib.actuator_force
     self._qfrc_kernel = alib.actuator_assemble_qfrc
+    self._plugin_qfrc_kernel = alib.actuator_plugin_project_qfrc
     self._adv_kernel = alib.advance_activations
     self._velocity_derivative_kernel = alib.actuator_velocity_derivative
 
@@ -1022,7 +1163,10 @@ class MetalActuators:
     self._dof_parentid = tensor(meta.dof_parentid if meta.nv else np.zeros(1, dtype=np.int32), _torch.int32)
     self._site_bodyid = tensor(meta.site_bodyid if meta.nsite else np.zeros(1, dtype=np.int32), _torch.int32)
     self._kin_dims = tensor([meta.nq, meta.nv, meta.nu, meta.nbody,
-                             max(meta.njnt, 0), meta.nsite, meta.ntendon, b], _torch.int32)
+                             max(meta.njnt, 0), meta.nsite, meta.ntendon, b]
+                            + [1] * b, _torch.int32)
+    self._cached_velocity_dims = tensor(
+        [meta.nv, meta.nu, b] + [1] * b, _torch.int32)
     self._dyntype = tensor(meta.dyntype, _torch.int32)
     self._dynprm = tensor(meta.dynprm.reshape(-1))
     self._gaintype = tensor(meta.gaintype, _torch.int32)
@@ -1054,24 +1198,49 @@ class MetalActuators:
                             _torch.int32)
     self._dot_dims = tensor([meta.nu, meta.na, b,
                              int(bool(meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_ACTUATION))),
-                             int(bool(meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_CLAMPCTRL)))],
+                             int(bool(meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_CLAMPCTRL)))]
+                            + [1] * b,
                             _torch.int32)
     self._force_dims = tensor([meta.nu, meta.na, b,
                                int(bool(meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_ACTUATION))),
-                               meta.disableactuator, meta.ntendon],
+                               meta.disableactuator, meta.ntendon,
+                               int(bool(np.any(meta.plugin_actuator_mask)))]
+                              + [1] * b,
                               _torch.int32)
-    self._qfrc_dims = tensor([meta.nv, meta.nu, b, meta.njnt], _torch.int32)
+    self._qfrc_dims = tensor([meta.nv, meta.nu, b, meta.njnt]
+                             + [1] * b, _torch.int32)
+    self._plugin_qfrc_dims = tensor([meta.nv, meta.nu, b] + [1] * b,
+                                    _torch.int32)
+    self._derivative_layout = velocity_derivative_layout
+    self._derivative_edge_count = edge_count
     self._derivative_dims = tensor([
         meta.nv, meta.nu, meta.na, b,
         int(bool(meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_ACTUATION))),
-        meta.disableactuator], _torch.int32)
+        meta.disableactuator,
+        int(velocity_derivative_layout is not None), edge_count]
+        + [1] * b, _torch.int32)
     # Pinned qDeriv retains the compiled D sparsity, even when a tendon
     # spans independent trees. Dense storage must preserve that approximation.
-    derivative_pattern = np.zeros((meta.nv, meta.nv), dtype=np.int32)
-    for row in range(meta.nv):
-      adr, count = int(model.D_rowadr[row]), int(model.D_rownnz[row])
-      derivative_pattern[row, model.D_colind[adr:adr+count]] = 1
-    self._derivative_pattern = tensor(derivative_pattern.reshape(-1), _torch.int32)
+    if velocity_derivative_layout is None:
+      derivative_pattern = np.zeros((meta.nv, meta.nv), dtype=np.int32)
+      for row in range(meta.nv):
+        adr, count = int(model.D_rowadr[row]), int(model.D_rownnz[row])
+        derivative_pattern[row, model.D_colind[adr:adr+count]] = 1
+      self._derivative_pattern = tensor(derivative_pattern.reshape(-1), _torch.int32)
+      edge_rows = np.zeros(1, dtype=np.int32)
+      edge_cols = np.zeros(1, dtype=np.int32)
+    else:
+      self._derivative_pattern = tensor(np.zeros(1, dtype=np.int32), _torch.int32)
+      # Compiled D metadata is immutable/read-only; make independent owned
+      # arrays for torch's CPU->MPS upload.
+      edge_rows = np.array(velocity_derivative_layout.edge_rows,
+                           dtype=np.int32, copy=True, order="C")
+      edge_cols = np.array(velocity_derivative_layout.edge_cols,
+                           dtype=np.int32, copy=True, order="C")
+      if edge_count == 0:
+        edge_rows = edge_cols = np.zeros(1, dtype=np.int32)
+    self._derivative_edge_rows = tensor(edge_rows, _torch.int32)
+    self._derivative_edge_cols = tensor(edge_cols, _torch.int32)
     self._adv_dims = tensor([meta.nu, meta.na, b, meta.disableactuator], _torch.int32)
     self._dt = tensor(np.array([meta.timestep], dtype=np.float32))
     self._dummy = _torch.zeros(1, dtype=_torch.float32, device=self._device)
@@ -1082,11 +1251,56 @@ class MetalActuators:
         "moment": _torch.zeros(b * nu * nv, dtype=_torch.float32, device=self._device),
         "act_dot": _torch.zeros(b * na, dtype=_torch.float32, device=self._device),
         "force": _torch.zeros(b * nu, dtype=_torch.float32, device=self._device),
+        # MuJoCo's no-callback USER defaults are gain=1 and bias=0. Registered
+        # callbacks overwrite only their declared actuator IDs each ACT eval.
+        "user_gain": (_torch.ones(b * nu, dtype=_torch.float32, device=self._device)
+                      if meta.has_user_callbacks else self._dummy),
+        "user_bias": (_torch.zeros(b * nu, dtype=_torch.float32, device=self._device)
+                      if meta.has_user_callbacks else self._dummy),
         "ctrl_used": _torch.zeros(b * nu, dtype=_torch.float32, device=self._device),
         "qfrc": _torch.zeros(b * nv, dtype=_torch.float32, device=self._device),
         "act_next": _torch.zeros(b * na, dtype=_torch.float32, device=self._device),
-        "velocity_derivative": _torch.zeros(b * nv * nv, dtype=_torch.float32, device=self._device),
+        "velocity_derivative": _torch.zeros(
+            b * derivative_width, dtype=_torch.float32, device=self._device),
     }
+    self._user_callback_plugins = ()
+    self._user_callback_bindings = {}
+    self._last_user_callback_outputs = {}
+    self._bundled_pid = None
+    if bool(np.any(meta.plugin_actuator_mask)):
+      from mujoco_metal.bundled_pid import MetalBundledPID
+      self._bundled_pid = MetalBundledPID(
+          model, bundled_plugins, batch_size=b, device=self._device,
+          actuator_device_data={
+              "actadr": self._actadr, "actnum": self._actnum,
+              "dyntype": self._dyntype, "actearly": self._actearly,
+              "actlimited": self._actlimited, "actrange": self._actrange,
+              "ctrllimited": self._ctrllimited, "ctrlrange": self._ctrlrange,
+              "dynprm": self._dynprm,
+          })
+
+  def bind_user_callback_plugins(self, plugins):
+    """Bind registry-owned USER callback plugins after native plugin init."""
+    torch = self._torch
+    plugins = tuple(plugins)
+    expected = {name: tuple((role, tuple(ids)) for role, ids in roles)
+                for name, roles in self._meta._user_plugin_bindings}
+    if len({plugin.name for plugin in plugins}) != len(plugins):
+      raise ValueError("actuator USER plugin names must be unique")
+    bindings = {}
+    for plugin in plugins:
+      if expected.get(plugin.name) != tuple(plugin.actuator_user_bindings):
+        raise ValueError(
+            f"actuator USER plugin {plugin.name!r} differs from constructor preflight")
+      bindings[plugin] = dict(plugin.actuator_user_bindings)
+    if set(expected) != {plugin.name for plugin in plugins}:
+      raise ValueError("all preflighted actuator USER plugins must be bound")
+    self._user_callback_plugins = plugins
+    self._user_callback_bindings = bindings
+
+  def last_user_callback_output(self, plugin):
+    """Return the last borrowed output for accepted-step advancement."""
+    return self._last_user_callback_outputs.get(plugin)
 
   @property
   def meta(self):
@@ -1101,11 +1315,12 @@ class MetalActuators:
     if value.dtype != torch.float32 or value.device.type != "mps" or not value.is_contiguous():
       raise ValueError(f"{name} must be contiguous float32 MPS")
 
-  def run_kinematics(self, qpos, qvel, poses, contacts=None):
+  def run_kinematics(self, qpos, qvel, poses, contacts=None, *, world_mask=None):
     """Compute length/velocity/dense-moment from borrowed device state."""
     torch = self._torch
     meta = self._meta
     b, nq, nv, nu = self.batch_size, meta.nq, meta.nv, meta.nu
+    self._copy_world_mask(self._kin_dims, 8, world_mask)
     if nq:
       self._check(qpos, "qpos", (b, nq))
     self._check(qvel, "qvel", (b, max(nv, 1)))
@@ -1131,6 +1346,7 @@ class MetalActuators:
     if meta.has_body_transmission:
       if contacts is None:
         raise ValueError("BODY transmissions require same-step candidate contacts")
+      self._copy_world_mask(contacts["dims"], 6, world_mask)
       self._body_kernel(
           w["moment"],
           contacts["frame"], contacts["jacobian"],
@@ -1139,22 +1355,39 @@ class MetalActuators:
           contacts["dims"],
           threads=(b,), group_size=(1,),
       )
-      # Velocity follows the completed moment rows (pinned: velocity = moment*qvel).
-      # Recompute host-side via a second kernel is wasteful; fold here on CPU? No:
-      # recompute in the force stage instead. Mark velocity stale for BODY rows.
-      # Simplest correct: recompute velocity rows for BODY actuators on device
-      # with a tiny inline loop is unavailable; instead the force kernel takes
-      # velocity as input, so refresh it here with torch ops (device, no readback).
-      with torch.no_grad():
-        mom = w["moment"].reshape(b, nu, max(nv, 1))
-        vel = w["velocity"].reshape(b, nu)
-        qv = qvel.reshape(b, max(nv, 1)) if nv else torch.zeros((b, 1), device=self._device)
-        vel.copy_((mom * qv.unsqueeze(1)).sum(-1))
+      # Velocity follows the completed moment rows. Keep the selected-world
+      # predicate in the kernel so stale rows are not read during recovery.
+      self.run_velocity_kinematics(
+          {"length": w["length"].reshape(b, nu),
+           "moment": w["moment"].reshape(b, nu, max(nv, 1))},
+          qvel, world_mask=world_mask)
     return {"length": w["length"].reshape(b, nu),
             "velocity": w["velocity"].reshape(b, nu),
             "moment": w["moment"].reshape(b, nu, max(nv, 1))}
 
-  def run_forces(self, ctrl, act, kin, gravcomp=None):
+  def run_velocity_kinematics(self, position_kin, qvel, *, world_mask=None):
+    """Update speed from cached POS moment rows without transmission work.
+
+    Length and moment retain the caller-owned final RK substage values.
+    Only speed changes, matching mj_fwdVelocity's actuator_moment*qvel.
+    """
+    b, nu, nv = self.batch_size, self._meta.nu, self._meta.nv
+    self._check(qvel, "qvel", (b, nv))
+    for name, shape in (("length", (b, nu)),
+                        ("moment", (b, nu, max(nv, 1)))):
+      self._check(position_kin[name], name, shape)
+    velocity = self._ws["velocity"].reshape(b, nu)
+    self._copy_world_mask(self._cached_velocity_dims, 3, world_mask)
+    self._cached_velocity_kernel(
+        qvel.reshape(-1) if nv else self._dummy,
+        position_kin["moment"].reshape(-1), self._cached_velocity_dims,
+        velocity.reshape(-1), threads=(b,), group_size=(1,))
+    return {"length": position_kin["length"],
+            "moment": position_kin["moment"], "velocity": velocity}
+
+  def run_forces(self, ctrl, act, kin, gravcomp=None, *, time=None,
+                 plugin_ctrl=None, world_mask=None, callback_state=None,
+                 callback_mask=None):
     """Compute act_dot/force/qfrc from held inputs and kinematics outputs."""
     torch = self._torch
     meta = self._meta
@@ -1166,6 +1399,10 @@ class MetalActuators:
     else:
       act_flat = self._dummy
     w = self._ws
+    self._copy_world_mask(self._dot_dims, 5, world_mask)
+    self._copy_world_mask(self._force_dims, 7, world_mask)
+    self._copy_world_mask(self._qfrc_dims, 4, world_mask)
+    self._copy_world_mask(self._derivative_dims, 8, world_mask)
     if gravcomp is None:
       grav = torch.zeros((b * max(nv, 1),), dtype=torch.float32, device=self._device)
     else:
@@ -1182,6 +1419,50 @@ class MetalActuators:
         w["act_dot"], w["ctrl_used"],
         threads=(b,), group_size=(1,),
     )
+    self._last_user_callback_outputs = {}
+    actuation_disabled = bool(
+        meta.disableflags & int(mujoco.mjtDisableBit.mjDSBL_ACTUATION))
+    if self._user_callback_plugins and not actuation_disabled:
+      if callback_state is None:
+        raise ValueError("actuator USER callbacks require the actual ACT-stage state")
+      for plugin in self._user_callback_plugins:
+        roles = self._user_callback_bindings[plugin]
+        output = plugin.run_user_actuator_device(
+            callback_state, control=plugin_ctrl if plugin_ctrl is not None else ctrl,
+            activation=act if na else self._dummy,
+            activation_derivative=w["act_dot"].reshape(b, max(na, 1)),
+            kinematics=kin, time=time, compute_mask=callback_mask,
+            out_activation_derivative=w["act_dot"].reshape(b, max(na, 1)),
+            out_gain=w["user_gain"].reshape(b, max(nu, 1)),
+            out_bias=w["user_bias"].reshape(b, max(nu, 1)),
+            dynamics_ids=roles.get("dynamics", ()),
+            gain_ids=roles.get("gain", ()),
+            bias_ids=roles.get("bias", ()))
+        if output is not None:
+          raise TypeError(
+              f"actuator USER plugin {plugin.name!r} writes borrowed output planes and must return None")
+        # Borrowed result views are valid through accepted-step plugin
+        # advancement. They are overwritten by the next ACT evaluation and
+        # are never owned or checkpointed by this plugin protocol.
+        self._last_user_callback_outputs[plugin] = {
+            "activation_derivative": w["act_dot"].reshape(b, max(na, 1)),
+            "gain": w["user_gain"].reshape(b, max(nu, 1)),
+            "bias": w["user_bias"].reshape(b, max(nu, 1)),
+            "dynamics_ids": roles.get("dynamics", ()),
+            "gain_ids": roles.get("gain", ()),
+            "bias_ids": roles.get("bias", ()),
+        }
+    plugin_force = self._dummy
+    if self._bundled_pid is not None:
+      if time is None:
+        raise ValueError("bundled PID force evaluation requires current time")
+      plugin_force = self._bundled_pid.run_device(
+          ctrl if plugin_ctrl is None else plugin_ctrl,
+          act if act is not None else self._dummy,
+          w["act_dot"].reshape(b, max(na, 1)), kin, time)
+      plugin_force_mask = self._bundled_pid.actuator_mask
+    else:
+      plugin_force_mask = self._actadr  # int32, shape-compatible inert mask
     self._force_kernel(
         w["ctrl_used"], act_flat, w["act_dot"], kin_len, kin_vel,
         self._gaintype, self._gainprm, self._biastype, self._biasprm,
@@ -1192,6 +1473,9 @@ class MetalActuators:
         self._group, self._lengthrange, self._acc0,
         self._force_dims, self._dt,
         w["force"], w["ctrl_used"],
+        plugin_force.reshape(-1),
+        plugin_force_mask,
+        w["user_gain"], w["user_bias"],
         threads=(b,), group_size=(1,),
     )
     self._qfrc_kernel(
@@ -1205,7 +1489,30 @@ class MetalActuators:
             "ctrl": w["ctrl_used"].reshape(b, nu),
             "qfrc": w["qfrc"].reshape(b, max(nv, 1))}
 
-  def run_velocity_derivative(self, ctrl, act, kin):
+  def project_plugin_force(self, force, moment, out, *, world_mask=None):
+    """Project a typed plug-in force through prepared moments by selected row."""
+    torch = self._torch
+    b, nu, nv = self.batch_size, self.meta.nu, self.meta.nv
+    self._check(force, "plugin force", (b, nu))
+    self._check(moment, "plugin moment", (b, nu, max(nv, 1)))
+    self._check(out, "plugin qfrc", (b, nv))
+    if world_mask is not None:
+      if (not isinstance(world_mask, torch.Tensor)
+          or world_mask.dtype != torch.int32
+          or tuple(world_mask.shape) != (b,)
+          or world_mask.device.type != "mps"
+          or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous int32 MPS [batch]")
+    if nv == 0:
+      return out
+    self._copy_world_mask(self._plugin_qfrc_dims, 3, world_mask)
+    self._plugin_qfrc_kernel(
+        force.reshape(-1), moment.reshape(-1), self._plugin_qfrc_dims,
+        out.reshape(-1), threads=(b,), group_size=(1,))
+    return out
+
+  def run_velocity_derivative(self, ctrl, act, kin, *, edge_values=None,
+                              world_mask=None):
     """Pinned analytical actuator block for the latest force-stage inputs.
 
     Call after ``run_forces`` with its control, activation and kinematics.
@@ -1213,6 +1520,7 @@ class MetalActuators:
     original control, as in ``mjd_actuator_vel``. Returned storage is borrowed.
     """
     meta, b, w = self._meta, self.batch_size, self._ws
+    self._copy_world_mask(self._derivative_dims, 8, world_mask)
     self._check(ctrl, "ctrl", (b, meta.nu))
     if meta.na:
       self._check(act, "act", (b, meta.na))
@@ -1220,6 +1528,17 @@ class MetalActuators:
                         ("moment", (b, meta.nu, max(meta.nv, 1)))):
       self._check(kin[name], name, shape)
     if meta.nv:
+      sparse = self._derivative_layout is not None
+      if edge_values is not None and not sparse:
+        raise ValueError("compiled velocity derivative layout is required for COO output")
+      width = max(self._derivative_edge_count, 1) if sparse else meta.nv * meta.nv
+      if edge_values is None:
+        derivative = w["velocity_derivative"][:b * width].reshape(b, width)
+        if sparse:
+          derivative.zero_()
+      else:
+        self._check(edge_values, "edge_values", (b, width))
+        derivative = edge_values
       self._velocity_derivative_kernel(
           ctrl.reshape(-1), act.reshape(-1) if meta.na else self._dummy,
           w["act_dot"], kin["length"].reshape(-1), kin["velocity"].reshape(-1),
@@ -1228,9 +1547,27 @@ class MetalActuators:
           self._dyntype, self._dynprm, self._actadr, self._actnum, self._actearly,
           self._actlimited, self._actrange, self._group, self._forcelimited,
           self._forcerange, self._lengthrange, self._acc0,
-          self._derivative_dims, self._dt, w["velocity_derivative"], self._derivative_pattern,
-          threads=(b*meta.nv*meta.nv,), group_size=(1,))
-    return w["velocity_derivative"][:b*meta.nv*meta.nv].reshape(b, meta.nv, meta.nv)
+          self._derivative_dims, self._dt, derivative.reshape(-1),
+          self._derivative_pattern, self._derivative_edge_rows,
+          self._derivative_edge_cols,
+          threads=(b * width,), group_size=(1,))
+      if sparse:
+        return derivative
+      return w["velocity_derivative"][:b*meta.nv*meta.nv].reshape(
+          b, meta.nv, meta.nv)
+
+  def _copy_world_mask(self, dims, offset, world_mask):
+    """Set a prepared per-world predicate suffix in an existing ABI tensor."""
+    if world_mask is None:
+      dims[offset:].fill_(1)
+      return
+    torch = self._torch
+    if (not isinstance(world_mask, torch.Tensor)
+        or world_mask.dtype != torch.int32 or world_mask.device.type != "mps"
+        or tuple(world_mask.shape) != (self.batch_size,)
+        or not world_mask.is_contiguous()):
+      raise ValueError("world_mask must be contiguous int32 MPS with shape (batch_size,)")
+    dims[offset:].copy_(world_mask)
 
   def advance(self, act, act_dot, velocity):
     """Integrate activations one Euler step with exact slot forms; returns borrowed view."""

@@ -68,8 +68,13 @@ def implicitfast_auto_servable(model):
     raise RuntimeError("implicitfast lowering requires MuJoCo 3.10.0")
   if int(model.nu) > 0:
     try:
+      bundled_plugins = None
+      if int(model.nplugin):
+        from mujoco_metal.bundled_pid import validate_pid_profile_plugins
+        bundled_plugins = validate_pid_profile_plugins(model)
       from mujoco_metal.stateful_actuation import ActuatorModel
-      ActuatorModel(model, allow_inherited=True)
+      ActuatorModel(model, allow_inherited=True,
+                    bundled_plugins=bundled_plugins)
     except ValueError:
       return False
   return True
@@ -153,10 +158,10 @@ def lower_implicitfast(model, *, external_derivative=False):
     raise RuntimeError("implicitfast lowering requires MuJoCo 3.10.0")
   if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST):
     raise ValueError("implicitfast stage requires MuJoCo's implicitfast integrator")
-  if model.nflex or model.nflexvert or model.nflexelem:
-    raise ValueError("implicitfast stage currently excludes flex dynamics")
+  bundled_plugins = None
   if model.nplugin:
-    raise ValueError("implicitfast native plugin derivatives require the extension derivative contract")
+    from mujoco_metal.bundled_pid import validate_pid_profile_plugins
+    bundled_plugins = validate_pid_profile_plugins(model)
   # Nonlinear velocity dependence (tendon damping, polynomial dampers)
   # Nonlinear velocity dependence (tendon damping, polynomial dampers, fluid)
   # is served by native automatic assembly when auto-servable; otherwise
@@ -170,13 +175,14 @@ def lower_implicitfast(model, *, external_derivative=False):
           "full qDeriv")
   if model.nu and not external_derivative:
     from mujoco_metal.stateful_actuation import ActuatorModel
-    ActuatorModel(model, allow_inherited=True)
+    ActuatorModel(model, allow_inherited=True,
+                  bundled_plugins=bundled_plugins)
   if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
     raise ValueError("implicitfast timestep must be finite and positive")
   # Native automatic assembly engages where the baseline is inexact
   # (tendon damping, polynomial dampers, or fluid drag present).
   auto = (implicitfast_auto_servable(model)
-          and (int(model.nu) > 0 or int(model.ntendon) > 0
+          and (int(model.nu) > 0 or int(model.ntendon) > 0 or int(model.nflex) > 0
                or bool(np.any(np.asarray(model.dof_dampingpoly) != 0))
                or bool(model.opt.density != 0 or model.opt.viscosity != 0)))
   return ImplicitFastDescriptor(
@@ -288,7 +294,8 @@ class ImplicitFastProgram:
     self._timestep = torch.tensor([self.descriptor.timestep], dtype=torch.float32, device=self._device)
 
   def run_device_auto(self, mass_matrix, qfrc_smooth, passive_diag, tendon_tangent=None,
-                      fluid_jacobian=None, actuator_jacobian=None):
+                      fluid_jacobian=None, actuator_jacobian=None,
+                      flex_edge_derivative=None):
     """Solve with natively assembled velocity derivatives (R06/D2).
 
     ``passive_diag`` is the device per-dof damping tangent magnitudes
@@ -331,6 +338,14 @@ class ImplicitFastProgram:
               or tuple(actuator_jacobian.shape) != (b, nv, nv) or not actuator_jacobian.is_contiguous()):
         raise ValueError(f"actuator_jacobian must be contiguous float32 MPS with shape ({b}, {nv}, {nv})")
       combined = combined + actuator_jacobian
+    if flex_edge_derivative is not None:
+      if (not isinstance(flex_edge_derivative, torch.Tensor)
+          or flex_edge_derivative.device.type != "mps"
+          or flex_edge_derivative.dtype != torch.float32
+          or tuple(flex_edge_derivative.shape) != (b, nv, nv)
+          or not flex_edge_derivative.is_contiguous()):
+        raise ValueError(f"flex_edge_derivative must be contiguous float32 MPS with shape ({b}, {nv}, {nv})")
+      combined = combined + flex_edge_derivative
     return self.run_device(mass_matrix, qfrc_smooth, combined)
 
   def run_device(self, mass_matrix, qfrc_smooth, force_velocity_derivative=None):
@@ -380,10 +395,10 @@ def lower_implicit(model, *, external_derivative=False):
     raise RuntimeError("implicit lowering requires MuJoCo 3.10.0")
   if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICIT):
     raise ValueError("implicit stage requires MuJoCo's implicit integrator")
-  if model.nflex or model.nflexvert or model.nflexelem:
-    raise ValueError("implicit stage currently excludes flex dynamics")
+  bundled_plugins = None
   if model.nplugin:
-    raise ValueError("implicit native plugin derivatives require the extension derivative contract")
+    from mujoco_metal.bundled_pid import validate_pid_profile_plugins
+    bundled_plugins = validate_pid_profile_plugins(model)
   if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
     raise ValueError("implicit timestep must be finite and positive")
   auto = True
@@ -473,6 +488,7 @@ class ImplicitProgram:
       fluid_jacobian=None,
       bias_derivative=None,
       actuator_jacobian=None,
+      flex_edge_derivative=None,
   ):
     torch, nv, b = self._torch, self.descriptor.nv, self.batch_size
     if passive_diag is None:
@@ -486,6 +502,14 @@ class ImplicitProgram:
       combined = combined + bias_derivative
     if actuator_jacobian is not None:
       combined = combined + actuator_jacobian
+    if flex_edge_derivative is not None:
+      if (not isinstance(flex_edge_derivative, torch.Tensor)
+          or flex_edge_derivative.device.type != "mps"
+          or flex_edge_derivative.dtype != torch.float32
+          or tuple(flex_edge_derivative.shape) != (b, nv, nv)
+          or not flex_edge_derivative.is_contiguous()):
+        raise ValueError(f"flex_edge_derivative must be contiguous float32 MPS with shape ({b}, {nv}, {nv})")
+      combined = combined + flex_edge_derivative
     return self.run_device(mass_matrix, qfrc_smooth, combined)
 
   def run_device(self, mass_matrix, qfrc_smooth, force_velocity_derivative=None):

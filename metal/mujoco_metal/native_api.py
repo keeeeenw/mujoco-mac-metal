@@ -14,8 +14,12 @@
 
 """Milestone 019: Native GPU split-stage, inverse dynamics, and state query APIs.
 
-Unlike host_utils.py, every function here executes NATIVELY ON DEVICE (MPS/Metal),
-preserving full batching, device memory residency, and zero CPU fallbacks.
+Simulation queries consume prepared MPS/Metal stages without a CPU physics
+fallback. Host arguments are validated and staged explicitly; compilation and
+visualization remain upstream host utilities. The mju_* tensor helpers retain
+their inputs' device and can also be used with CPU tensors. These backend APIs
+have their own documented signatures and are not universal replacements for the
+upstream C/Python bindings.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from __future__ import annotations
 import math
 from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
+from typing import Any
 import mujoco
 import numpy as np
 
@@ -158,13 +163,26 @@ def _inverse_query_workspaces(sim):
   """
   roots = ("_smooth", "_passive", "_fluid", "_tendons", "_spatial_tendons",
            "_flex", "_coupled_constraints", "_component_solver", "_forward_stages",
-           "_solver", "_implicit", "_implicitfast", "_actuators", "_transmissions",
+           "_solver", "_implicit", "_implicitfast", "_effective_implicit",
+           "_velocity_derivative_values", "_flex_implicit", "_sparse_flex_implicit",
+           "_actuators", "_transmissions",
            "_motor", "_sensors", "_state", "_sleep_schedule", "_contact",
-           "_joint_constraints")
+           "_joint_constraints", "_touch_grid", "_cable", "_history_program",
+           "_delay")
   seen, saved, memo = set(), [], {}
   stages = getattr(sim, "_forward_stages", None)
   record = getattr(stages, "_record", None)
   coherent_inputs = []
+  paired_versions = []
+  coupled = getattr(sim, "_last_coupled", None)
+  for value, version_name in (
+      (getattr(sim, "_last_sensor_qacc", None), "_last_sensor_qacc_version"),
+      (coupled.get("qacc") if isinstance(coupled, dict) else None,
+       "_last_coupled_qacc_version"),
+  ):
+    version = getattr(sim, version_name, None)
+    if isinstance(value, torch.Tensor) and isinstance(version, int):
+      paired_versions.append((value, version_name, int(value._version) == version))
   if record is not None:
     for name, value in record.input_tensors.items():
       expected = record.input_versions.get(name)
@@ -187,15 +205,23 @@ def _inverse_query_workspaces(sim):
     collect(getattr(sim, name, None))
   bookkeeping_names = ("_spatial_kin", "_spatial_cache_key", "_forward_position_epoch",
       "_accepted_step", "_last_actuation_kin", "_last_coupled",
-      "_last_coupled_generation", "_assembled_system_valid", "_step1_record")
+      "_last_coupled_generation", "_last_coupled_qacc_version",
+      "_last_sensor_qacc", "_last_sensor_qacc_low",
+      "_last_sensor_qacc_generation", "_last_sensor_qacc_version",
+      "_assembled_system_valid", "_step1_record",
+      "_last_native_actuator_outputs")
   bookkeeping = {name: _capture_query_storage(getattr(sim, name), memo)
                  for name in bookkeeping_names if hasattr(sim, name)}
   scratch_names = ("_component_solve_rhs", "_component_world_status",
                    "_component_solution_vector",
-                   "_component_tendon_J", "_component_damping_deriv", "_rhs",
+                   "_component_solution_low_vector",
+                   "_forward_position_buffers",
+                   "_component_tendon_J", "_component_damping_deriv", "_rhs", "_rhs_low",
                    "_act_dot", "_actuator_velocity_derivative", "_sensordata",
+                   "_act_vel", "_sen_act_force", "_sen_qfrc_act",
                    "_raw_sensordata", "_energy", "_sensor_plugin_status",
-                   "_legacy_canonical_rows", "_legacy_constraint_rhs")
+                   "_legacy_canonical_rows", "_legacy_constraint_rhs", "_control",
+                   "_native_actuator_force", "_native_actuator_qfrc")
   scratch_names += tuple(name for name in vars(sim)
                          if name.startswith(("_forward_stage_", "_sleep_")) and
                          isinstance(getattr(sim, name), torch.Tensor))
@@ -217,6 +243,11 @@ def _inverse_query_workspaces(sim):
     finally:
       _restore_query_workspaces(saved, bookkeeping_names, bookkeeping, component,
                                 sim, stages, record, coherent_inputs)
+      # Restoring a tensor increments its mutation counter. Preserve whether
+      # paired acceleration was coherent on entry, without reviving stale data.
+      for value, version_name, coherent in paired_versions:
+        if coherent:
+          setattr(sim, version_name, int(value._version))
   finally:
     if plugin_state is not None:
       failures = []
@@ -262,23 +293,22 @@ def _restore_query_workspaces(saved, bookkeeping_names, bookkeeping, component,
 
 def mj_inverse(sim, qpos=None, qvel=None, qacc=None,
                mocap_pos=None, mocap_quat=None) -> torch.Tensor:
-  """NATIVE GPU inverse dynamics: compute qfrc_inverse on MPS.
-  
-  qfrc_inverse = M(qpos) * qacc + qfrc_bias(qpos, qvel) - qfrc_passive(qpos, qvel)
-  Operates natively on device tensors without host roundtrips.
-  Returns an owned MPS tensor [batch, nv]. Temporary stage workspaces and
-  cached forward records are preserved on success and failure.
+  """Compute inverse force through all native inverse stages.
+
+  This is the NONE-skip entry point, including the model's INVDISCRETE
+  acceleration conversion. Returns owned [batch,nv] force and preserves
+  borrowed forward buffers/records on success and failure. Explicit input
+  validation may synchronize device tensors at this query boundary.
   """
-  with _inverse_query_workspaces(sim):
-    return _inverse_impl(sim, qpos, qvel, qacc, mocap_pos, mocap_quat)
+  return mj_inverseSkip(sim, qpos=qpos, qvel=qvel, qacc=qacc,
+                        mocap_pos=mocap_pos, mocap_quat=mocap_quat)
 
 
 def _inverse_impl(sim, qpos, qvel, qacc, mocap_pos, mocap_quat):
-  """NATIVE GPU inverse dynamics: compute qfrc_inverse on MPS.
-  
-  qfrc_inverse = M(qpos) * qacc + qfrc_bias(qpos, qvel) - qfrc_passive(qpos, qvel)
-  Operates natively on device tensors without host roundtrips.
-  Returns borrowed/owned MPS tensor [batch, nv].
+  """Internal stateless assembly reference; public queries use inverse stages.
+
+  Retained for isolated mass/constraint reduction checks while stage producers
+  are qualified. It does not implement integrator flags or cached skip stages.
   """
   if torch is None:
     raise RuntimeError("PyTorch with MPS is required")
@@ -294,20 +324,23 @@ def _inverse_impl(sim, qpos, qvel, qacc, mocap_pos, mocap_quat):
   mquat = _stage_tensor(sim, mocap_quat, (sim.batch_size, state._nmocap, 4), "mocap_quat") if mocap_quat is not None else getattr(state, "_mquat", None)
   if mquat is not None and not bool((torch.abs(torch.linalg.vector_norm(mquat, dim=-1) - 1) <= 1e-5).all()):
     raise ValueError("mocap_quat values must be unit quaternions")
-  dynamics = sim._smooth.run_device(qp, qv, mpos, mquat)
-  M = dynamics["mass_matrix"]       # [batch, nv, nv]
+  dynamics = _query_smooth(sim, qp, qv, mpos, mquat)
+  sparse = getattr(sim, "_component_mass_enabled", False)
+  M = None if sparse else dynamics["mass_matrix"]
   bias = dynamics["qfrc_bias"]      # [batch, nv]
   tendon_force = None
   if getattr(sim, "_tendons", None) is not None:
     tendon_force, _, tendon_armature = sim._tendons.run_device(qp, qv)
-    M = M + tendon_armature
+    if not sparse:
+      M = M + tendon_armature
   spatial_J = spatial_length = None
   if getattr(sim, "_spatial_tendons", None) is not None:
     kin = sim._spatial_jacobian(qv, dynamics["poses"])
     spatial_J = kin
     skin = sim._spatial_kin
-    sf, _, sa = sim._spatial_tendons.run_forces(skin)
-    M = M + sa.reshape(M.shape)
+    sf, _, sa = sim._spatial_tendons.run_forces(skin, include_armature=not sparse)
+    if not sparse:
+      M = M + sa.reshape(M.shape)
     tendon_force = sf.reshape((sim.batch_size, sim._mjmodel.nv)) if tendon_force is None else tendon_force + sf.reshape((sim.batch_size, sim._mjmodel.nv))
     sbias, _ = sim._spatial_tendons.run_armature_bias(
         skin, qv, dynamics["poses"], dynamics.get("cvel"),
@@ -316,7 +349,11 @@ def _inverse_impl(sim, qpos, qvel, qacc, mocap_pos, mocap_quat):
     bias = bias + sbias.reshape(bias.shape)
 
   # 2. Compute M * qacc on MPS
-  M_qacc = torch.bmm(M, qa.unsqueeze(-1)).squeeze(-1)
+  if sparse:
+    M_qacc = sim._smooth.mass_blocks_matvec_device(
+        dynamics["mass_blocks"], qa, dynamics.get("tendon_armature_blocks"))
+  else:
+    M_qacc = torch.bmm(M, qa.unsqueeze(-1)).squeeze(-1)
 
   # 3. Add bias forces
   qfrc_inv = M_qacc + bias
@@ -337,112 +374,41 @@ def _inverse_impl(sim, qpos, qvel, qacc, mocap_pos, mocap_quat):
   # 7. Subtract flex passive forces if active
   if getattr(sim, "_flex", None) is not None:
     flex_qfrc, _, _ = sim._flex.run_device(
-        qp, qv, dynamics["poses"], dynamics.get("cvel", None)
+        qp, qv, dict(dynamics["poses"], root_com=dynamics["root_com"]),
+        dynamics.get("cvel", None)
     )
     qfrc_inv = qfrc_inv - flex_qfrc
 
   # 8. Subtract constraint forces (mj_invConstraint)
   if getattr(sim, "_coupled_constraints", None) is not None:
     cc = sim._coupled_constraints
-    from mujoco_metal.simulation import _clone_system_dict, _restore_system_buffers
-    saved_workspace = _clone_system_dict(cc._workspace)
-    saved_last = getattr(sim, "_last_coupled", None)
-    saved_last_generation = getattr(sim, "_last_coupled_generation", None)
     eq_act = getattr(state, "_eq_active", None)
-    try:
-      _ten_J, _ten_L = sim._spatial_for_coupled(qv, dynamics["poses"]) if hasattr(sim, "_spatial_for_coupled") else (None, None)
-      constraint_result = cc.run_device(
-          dynamics["poses"], M, -bias, qp, qv,
-          eq_active=eq_act, cvel=dynamics.get("cvel", None),
-          tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
-          flex=getattr(sim, "_flex", None),
-      )
-      w = cc._workspace
-      b = sim.batch_size
-      nr = cc.descriptor.nr
-      nv = sim.model.nv
-      if nr > 0:
-        J = w["workspace_J"].view(b, nr, nv)
-        dbg = w["workspace_debug"].view(b, -1)
-        R = dbg[:, nr * nr : nr * nr + nr]
-        aref = dbg[:, nr * nr + nr : nr * nr + 2 * nr]
-        jar = torch.bmm(J, qa.unsqueeze(-1)).squeeze(-1) - aref
-        # MuJoCo's inverse constraint force is the gradient of the row cost.
-        # Bilateral rows are quadratic for either sign. Remaining scalar rows
-        # are bounded/unilateral; their bounds are assembled with the row.
-        raw_force = -jar / torch.clamp(R, min=1e-12)
-        n_eq = int(cc.descriptor.n_eq_rows)
-        lo = w["workspace_debug"].view(b, -1)[:, nr * nr + 4 * nr:nr * nr + 5 * nr]
-        hi = w["workspace_debug"].view(b, -1)[:, nr * nr + 5 * nr:nr * nr + 6 * nr]
-        bounded = torch.minimum(torch.maximum(raw_force, lo), hi)
-        if n_eq:
-          bounded[:, :n_eq] = raw_force[:, :n_eq]
-        force = torch.where(R > 0, bounded, torch.zeros_like(raw_force))
-        # Elliptic contacts use MuJoCo's group cone cost (mj_constraintUpdate),
-        # whose tangential gradient couples every row in a contact. Applying
-        # independent scalar bounds here is correct for pyramidal friction but
-        # gives a different force for the elliptic middle-cone region.
-        desc = cc.descriptor
-        if (int(desc.cone_type) == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
-            and int(desc.ncontacts_max) > 0):
-          packed = np.asarray(desc.contact_condim_packed, dtype=np.int32).reshape(-1, 3)
-          friction = cc._constants["contact_friction"].reshape(-1, 5)
-          contact_mask = constraint_result.get("contact_mask")
-          contact_base = int(desc.nr_joint)
-          for slot, (condim, offset, cone) in enumerate(packed.tolist()):
-            if cone != int(mujoco.mjtCone.mjCONE_ELLIPTIC) or condim <= 1:
-              continue
-            row0 = contact_base + int(offset)
-            if row0 + condim > nr:
-              raise RuntimeError("elliptic contact rows exceed the native row layout")
-            # `mj_makeImpedance` scales the regularized elliptic-cone slope
-            # by sqrt(R_tangent / R_normal), so it depends on the assembled
-            # soft-contact rows (and opt.impratio), not just material friction.
-            mu = friction[slot, 0] * torch.sqrt(
-                torch.clamp(R[:, row0 + 1], min=0.0) /
-                torch.clamp(R[:, row0], min=1e-12))
-            coeff = friction[slot, :condim - 1]
-            rows = slice(row0, row0 + condim)
-            local_jar = jar[:, rows]
-            U = torch.cat((local_jar[:, :1] * mu[:, None],
-                           local_jar[:, 1:] * coeff.reshape(1, -1)), dim=1)
-            N = U[:, 0]
-            T = torch.linalg.vector_norm(U[:, 1:], dim=1)
-            top = (N >= mu * T) | ((T <= 0) & (N >= 0))
-            bottom = (mu * N + T <= 0) | ((T <= 0) & (N < 0))
-            Dm = (1.0 / torch.clamp(R[:, row0], min=1e-12)) / torch.clamp(
-                mu * mu * (1.0 + mu * mu), min=1e-24)
-            middle_scale = -Dm * (N - mu * T) * mu
-            cone_force = torch.empty_like(local_jar)
-            cone_force[:, 0] = middle_scale
-            Tsafe = torch.clamp(T, min=1e-20)
-            for axis in range(1, condim):
-              cone_force[:, axis] = (
-                  -middle_scale / Tsafe * U[:, axis] * coeff[axis - 1])
-            quadratic_force = raw_force[:, rows]
-            cone_force = torch.where(top[:, None], torch.zeros_like(cone_force),
-                                     torch.where(bottom[:, None], quadratic_force,
-                                                 cone_force))
-            if contact_mask is not None:
-              active = contact_mask[:, slot] > 0.5
-              active &= R[:, row0] > 0
-              cone_force = torch.where(active[:, None], cone_force,
-                                       torch.zeros_like(cone_force))
-            force[:, rows] = cone_force
-        qfrc_constraint = torch.bmm(J.transpose(1, 2), force.unsqueeze(-1)).squeeze(-1)
-        qfrc_inv = qfrc_inv - qfrc_constraint
-    finally:
-      _restore_system_buffers(cc._workspace, saved_workspace)
-      sim._last_coupled = saved_last
-      sim._last_coupled_generation = saved_last_generation
-      if hasattr(sim, "_spatial_kin"):
-        sim._spatial_kin = saved_spatial_kin
-        sim._spatial_cache_key = saved_spatial_key
+    _ten_J, _ten_L = sim._spatial_for_coupled(qv, dynamics["poses"]) if hasattr(sim, "_spatial_for_coupled") else (None, None)
+    constraint_result = cc.assemble_device(
+        dict(dynamics["poses"], root_com=dynamics["root_com"]), qp, qv,
+        eq_active=eq_act, cvel=dynamics.get("cvel"),
+        cdof=dynamics.get("cdof"), cdof_dot=dynamics.get("cdof_dot"),
+        tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
+        flex=getattr(sim, "_flex", None))
+    from mujoco_metal.inverse_constraints import inverse_constraint_force
+    qfrc_inv = qfrc_inv - inverse_constraint_force(
+        constraint_result, qa, cc.descriptor)
 
   if hasattr(sim, "_spatial_kin"):
     sim._spatial_kin = saved_spatial_kin
     sim._spatial_cache_key = saved_spatial_key
   return qfrc_inv
+
+
+def _inverse_constraint_force_from_cached(sim, cc, qacc, record=None, *,
+                                          qacc_low=None, return_low=False):
+  """Reduce retained canonical rows; no POS/VEL assembly or optimizer call."""
+  if record is not None:
+    sim.validate_forward_stage_record(record, "VEL")
+  from mujoco_metal.inverse_constraints import inverse_constraint_force
+  return inverse_constraint_force(
+      cc._assembly_views(include_optimizer_outputs=False), qacc, cc.descriptor,
+      qacc_low=qacc_low, return_low=return_low)
 
 
 # -------------------------------------------------------------------------
@@ -502,10 +468,24 @@ def _stage_dynamics(sim, dynamics):
   if not isinstance(dynamics, dict):
     raise TypeError("dynamics must be a dynamics dictionary from mj_fwdVelocity")
   b, nv = sim.batch_size, int(sim._mjmodel.nv)
-  mass = dynamics.get("mass_matrix")
+  sparse = getattr(sim, "_component_mass_enabled", False)
+  if sparse:
+    mass = dynamics.get("mass_blocks")
+    expected_layout = sim._smooth.mass_block_layout
+    layout = dynamics.get("mass_block_layout")
+    if not isinstance(layout, dict):
+      raise ValueError("dynamics is missing the compiled mass_block_layout")
+    for key in ("ncomponent", "nnz", "component_dof_offsets", "component_dof_ids",
+                "component_dofnum", "component_mass_offsets", "dof_component", "dof_local_index"):
+      if key not in layout or not np.array_equal(layout[key], expected_layout[key]):
+        raise ValueError(f"dynamics.mass_block_layout.{key} does not match the model")
+    mass_name, mass_shape = "mass_blocks", (b, int(expected_layout["nnz"]))
+  else:
+    mass = dynamics.get("mass_matrix")
+    mass_name, mass_shape = "mass_matrix", (b, nv, nv)
   bias = dynamics.get("qfrc_bias")
-  if not isinstance(mass, torch.Tensor) or tuple(mass.shape) != (b, nv, nv):
-    raise ValueError("dynamics.mass_matrix has invalid shape")
+  if not isinstance(mass, torch.Tensor) or tuple(mass.shape) != mass_shape:
+    raise ValueError(f"dynamics.{mass_name} has invalid shape")
   if not isinstance(bias, torch.Tensor) or tuple(bias.shape) != (b, nv):
     raise ValueError("dynamics.qfrc_bias has invalid shape")
   def _same_device(value):
@@ -518,6 +498,15 @@ def _stage_dynamics(sim, dynamics):
     raise ValueError("dynamics tensors must be contiguous float32")
   if not bool(torch.isfinite(mass).all() and torch.isfinite(bias).all()):
     raise ValueError("dynamics contains nonfinite values")
+  if sparse:
+    armature = dynamics.get("tendon_armature_blocks")
+    if getattr(sim._smooth, "_has_tendon_armature", False) and armature is None:
+      raise ValueError("dynamics is missing tendon_armature_blocks")
+    if armature is not None and (
+        not isinstance(armature, torch.Tensor) or tuple(armature.shape) != mass_shape
+        or not _same_device(armature) or armature.dtype != torch.float32
+        or not armature.is_contiguous() or not bool(torch.isfinite(armature).all())):
+      raise ValueError("dynamics.tendon_armature_blocks has invalid native layout or values")
   if "poses" not in dynamics or not isinstance(dynamics["poses"], dict):
     raise ValueError("dynamics is missing the position-stage poses")
   from mujoco_metal.smooth_metal import validate_pose_dict
@@ -541,89 +530,553 @@ def _stage_dynamics(sim, dynamics):
       raise ValueError(f"dynamics.{name} contains nonfinite values")
   return dynamics
 
-def mj_fwdPosition(sim, qpos=None):
-  """NATIVE GPU position stage: kinematics, site/geom poses, spatial tendons."""
+
+def _query_smooth(sim, qpos, qvel, mocap_pos=None, mocap_quat=None, *, poses=None):
+  """Run the selected smooth layout with canonical tendon armature inputs.
+
+  Sparse armature projection consumes the position-stage tendon Jacobian.
+  Calling the smooth program directly omits that input for spatial tendons.
+  Query calls use all DOFs rather than stepping's asleep-tree lists.
+  """
+  if not getattr(sim, "_component_mass_enabled", False):
+    if poses is None:
+      return sim._smooth.run_device(qpos, qvel, mocap_pos, mocap_quat)
+    return sim._smooth.run_device(qpos, qvel, poses=poses)
+  if poses is None:
+    poses = sim._smooth._fk.run_device(qpos, mocap_pos=mocap_pos, mocap_quat=mocap_quat)
+  # Explicit inputs may reuse the same tensor object after an in-place write;
+  # never reuse a previous spatial Jacobian for an explicit query boundary.
+  sim._spatial_cache_key = None
+  tendon_J = sim._component_tendon_jacobian(qvel, poses)
+  return sim._smooth.run_device(qpos, qvel, poses=poses,
+      awake_lists=sim._smooth._workspace["all_awake_lists"], tendon_J=tendon_J)
+
+def _prepared_record(sim, minimum, record=None, *, qpos=None, qvel=None,
+                     poses=None, dynamics=None):
+  """Validate a published stage before allowing any downstream writes.
+
+  Device inputs identify the captured storage. Repeated host inputs are
+  accepted only after a value check at this explicit API boundary. Borrowed
+  pose/dynamics dictionaries must be the actual published objects; shape
+  compatibility alone cannot establish that their stages are coherent.
+  """
+  from mujoco_metal.forward_stages import ForwardStage
+  stages, generation = sim._forward_stages, sim.state.generation
+  if record is None:
+    record = stages.current(generation=generation, minimum=minimum)
+  record = sim.validate_forward_stage_record(record, minimum)
+  position = stages.consume(record, ForwardStage.POS, generation=generation)
+  if poses is not None and poses is not position["poses"]:
+    raise ValueError("poses must be the published position-stage record")
+  if qpos is not None:
+    _match_stage_input(sim, qpos, record.qpos, "qpos")
+  if qvel is not None or dynamics is not None:
+    velocity = stages.consume(record, ForwardStage.VEL, generation=generation)
+    if qvel is not None:
+      _match_stage_input(sim, qvel, velocity["qvel"], "qvel")
+    if dynamics is not None:
+      _stage_dynamics(sim, dynamics)
+      if dynamics is not velocity["dynamics"]:
+        raise ValueError("dynamics must be the published velocity-stage record")
+  return record
+
+
+def _match_stage_input(sim, value, captured, name):
+  if isinstance(value, torch.Tensor):
+    if value is not captured:
+      raise ValueError(f"{name} must identify the captured stage input tensor")
+    return captured
+  checked = _stage_tensor(sim, value, tuple(captured.shape), name)
+  if not bool(torch.equal(checked, captured)):
+    raise ValueError(f"{name} does not match the captured stage input")
+  return captured
+
+
+def mj_fwdPosition(sim, qpos=None, *, mocap_pos=None, mocap_quat=None,
+                   skipsensor=False, return_record=False):
+  """Compute only POS and publish its generation-scoped borrowed record.
+
+  Returns poses for compatibility; ``return_record=True`` returns the record
+  accepted explicitly by every subsequent stage. This call does not run RNE,
+  actuation, acceleration, or the constraint optimizer.
+  """
   state = sim.state
-  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
-  mpos = getattr(state, "_mpos", None)
-  mquat = getattr(state, "_mquat", None)
-  dynamics = sim._smooth.run_device(qp, state.qvel, mpos, mquat)
-  poses = dynamics["poses"]
-  if sim._spatial_tendons is not None:
-    sim._spatial_kin = sim._spatial_tendons.run_kinematics(state.qvel, poses)
-  return poses
+  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos")
+  mp = _stage_tensor(sim, mocap_pos, (sim.batch_size, state._nmocap, 3), "mocap_pos")
+  mq = _stage_tensor(sim, mocap_quat, (sim.batch_size, state._nmocap, 4), "mocap_quat")
+  record = sim.prepare_forward_position(qp, mocap_pos=mp, mocap_quat=mq,
+                                        skipsensor=skipsensor)
+  if return_record:
+    return record
+  from mujoco_metal.forward_stages import ForwardStage
+  return record.values[ForwardStage.POS]["poses"]
 
 
-def mj_fwdVelocity(sim, qpos=None, qvel=None, poses=None, dynamics=None):
-  """NATIVE GPU velocity stage: smooth Coriolis/centrifugal bias and mass matrix."""
-  state = sim.state
-  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
-  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel") if qvel is not None else state._qvel
-  supplied = _stage_dynamics(sim, dynamics)
-  if supplied is not None:
-    result = dict(supplied)
-  else:
-    result = sim._smooth.run_device(qp, qv,
-                                    state._mpos if poses is None else None,
-                                    state._mquat if poses is None else None,
-                                    poses=poses)
-  if poses is not None:
-    # run_device validated complete pose shape/device/dtype; when supplied
-    # dynamics were supplied too, preserve exact position-stage identity.
-    result["poses"] = poses
-  return result
+def mj_fwdVelocity(sim, qpos=None, qvel=None, poses=None, dynamics=None,
+                   *, record=None, skipsensor=False):
+  """Refresh VEL from the captured POS without recomputing geometry or mass.
+
+  Passing the current published ``dynamics`` requests its already computed
+  value. Foreign dictionaries are rejected before a producer can overwrite
+  borrowed buffers.
+  """
+  from mujoco_metal.forward_stages import ForwardStage
+  record = _prepared_record(sim, ForwardStage.POS, record, qpos=qpos,
+                            poses=poses, dynamics=dynamics)
+  if dynamics is not None:
+    if qvel is not None:
+      velocity = sim._forward_stages.consume(
+          record, ForwardStage.VEL, generation=sim.state.generation)
+      _match_stage_input(sim, qvel, velocity["qvel"], "qvel")
+    return dynamics
+  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel")
+  return sim.prepare_forward_velocity(record, qv, skipsensor=skipsensor)["dynamics"]
 
 
-def mj_fwdActuation(sim, qpos=None, qvel=None, poses=None, ctrl=None):
-  """NATIVE GPU actuation stage: actuator kinematics, transmission, and forces."""
-  state = sim.state
-  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
-  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel") if qvel is not None else state._qvel
-  p = poses if poses is not None else mj_fwdPosition(sim, qp)
-  if ctrl is not None:
-    checked = _stage_tensor(sim, ctrl, (sim.batch_size, sim._mjmodel.nu), "ctrl")
-    saved_control = sim._control.clone()
-    sim._control.copy_(checked)
-  else:
-    saved_control = None
-  try:
-    result = sim._state._torch.zeros((sim.batch_size, sim._mjmodel.nv),
-        dtype=sim._state._torch.float32, device=sim._state._device)
-    held_ctrl = sim._delayed_control(state._time)
-    if sim._transmissions is not None:
-      result = result + sim._transmissions.run_device(qp, qv, held_ctrl)
-    if sim._actuators is not None:
-      result = result + sim._actuation_force(qp, qv, p)
-    if sim._motor is not None:
-      result = result + sim._motor.run_device(held_ctrl)
-    return result
-  finally:
-    if saved_control is not None:
-      sim._control.copy_(saved_control)
+def mj_fwdActuation(sim, qpos=None, qvel=None, poses=None, ctrl=None, *, record=None):
+  """Compute ACT from prepared POS/VEL; a control override is temporary."""
+  from mujoco_metal.forward_stages import ForwardStage
+  record = _prepared_record(sim, ForwardStage.VEL, record, qpos=qpos,
+                            qvel=qvel, poses=poses)
+  control = _stage_tensor(sim, ctrl, (sim.batch_size, sim._mjmodel.nu), "ctrl")
+  return sim.prepare_forward_actuation(record, ctrl=control)["qfrc_actuator"]
 
 
-def mj_fwdAcceleration(sim, qpos=None, qvel=None, poses=None, dynamics=None, qfrc_applied=None):
-  """NATIVE GPU acceleration stage: unconstrained acceleration M a = sum(forces)."""
-  state = sim.state
-  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
-  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel") if qvel is not None else state._qvel
-  dyn = _stage_dynamics(sim, dynamics)
+def mj_fwdAcceleration(sim, qpos=None, qvel=None, poses=None, dynamics=None,
+                       qfrc_applied=None, *, record=None):
+  """Solve unconstrained ACC from captured forces, without rerunning POS/VEL.
+
+  If ACT has not yet been published, compute that missing prerequisite once
+  with current controls. Explicit applied force does not change simulation
+  input storage.
+  """
+  from mujoco_metal.forward_stages import ForwardStage
   force = _stage_tensor(sim, qfrc_applied, (sim.batch_size, sim._mjmodel.nv), "qfrc_applied")
-  acc, status, _ = sim._acceleration(qp, qv, constrained=False,
-      dynamics_override=dyn, poses_override=poses,
-      applied_force_override=force)
-  return acc, status
+  record = _prepared_record(sim, ForwardStage.VEL, record, qpos=qpos,
+                            qvel=qvel, poses=poses, dynamics=dynamics)
+  if record.stage < ForwardStage.ACT:
+    sim.prepare_forward_actuation(record)
+  result = sim.prepare_forward_acceleration(record, qfrc_applied=force)
+  return result["qacc_smooth"], result["status"]
 
 
-def mj_fwdConstraint(sim, qpos=None, qvel=None, poses=None, dynamics=None):
-  """NATIVE GPU constraint stage: solve contacts, limits, equalities."""
-  state = sim.state
-  qp = _stage_tensor(sim, qpos, (sim.batch_size, sim._mjmodel.nq), "qpos") if qpos is not None else state._qpos
-  qv = _stage_tensor(sim, qvel, (sim.batch_size, sim._mjmodel.nv), "qvel") if qvel is not None else state._qvel
-  dyn = _stage_dynamics(sim, dynamics)
-  acc, status, dyn = sim._acceleration(qp, qv, dynamics_override=dyn,
-                                      poses_override=poses)
-  return acc, status, dyn
+def mj_fwdConstraint(sim, qpos=None, qvel=None, poses=None, dynamics=None,
+                     *, record=None, skipsensor=False):
+  """Solve captured constraint rows using the published unconstrained ACC."""
+  from mujoco_metal.forward_stages import ForwardStage
+  record = _prepared_record(sim, ForwardStage.ACC, record, qpos=qpos,
+                            qvel=qvel, poses=poses, dynamics=dynamics)
+  result = sim.prepare_forward_constraint(record, skipsensor=skipsensor)
+  velocity = sim._forward_stages.consume(
+      record, ForwardStage.VEL, generation=sim.state.generation)
+  return result["qacc"], result["status"], velocity["dynamics"]
+
+
+def _constraint_jacobian_product(sim, vector, transpose, record):
+  """Consume a coherent prepared canonical row record without dispatching."""
+  from mujoco_metal.forward_stages import ForwardStage
+  record = _prepared_record(sim, ForwardStage.CONSTRAINT, record)
+  stage = sim._forward_stages.consume(
+      record, ForwardStage.CONSTRAINT, generation=sim.state.generation)
+  rows = stage.get("canonical_rows", stage)
+  b, nv = sim.batch_size, int(sim._mjmodel.nv)
+  active = None if rows is None else rows.get("active")
+  if active is None:
+    cc = getattr(sim, "_coupled_constraints", None)
+    if cc is not None and cc.descriptor.nr:
+      raise RuntimeError("constraint stage did not publish canonical row activity")
+    nr = 0
+  else:
+    if (not isinstance(active, torch.Tensor) or active.ndim != 2
+        or active.shape[0] != b or active.dtype != torch.float32
+        or active.device.type != sim.state._device.type):
+      raise ValueError("canonical row activity must be device float32 [B,nr]")
+    nr = int(active.shape[1])
+  if vector is None:
+    raise TypeError("vector is required")
+  vector = _stage_tensor(sim, vector, (b, nr if transpose else nv), "vector")
+  if nr == 0:
+    return torch.zeros((b, nv if transpose else 0),
+                       dtype=torch.float32, device=sim.state._device)
+  status = stage["status"]
+  live = (active > .5) & (status == 0)[:, None]
+  packed = rows.get("J_packed")
+  if packed is not None:
+    from mujoco_metal.constraint_jacobian import PACKED_J_CSR, PACKED_J_DENSE
+    from mujoco_metal.inverse_constraints import (
+        _packed_jacobian_matvec, _packed_jacobian_transpose_matvec)
+    layout, pattern = rows.get("jacobian_layout"), rows.get("jacobian_pattern")
+    if (layout is None or layout.nr != nr or layout.nv != nv
+        or not isinstance(packed, torch.Tensor) or packed.dtype != torch.float32
+        or packed.device != vector.device or packed.ndim != 1
+        or packed.numel() < b * layout.stride_words):
+      raise ValueError("canonical packed Jacobian has invalid layout")
+    if layout.mode == PACKED_J_CSR:
+      if (pattern is None or pattern.nr != nr or pattern.nv != nv
+          or pattern.nnz != layout.nnz):
+        raise ValueError("canonical sparse Jacobian requires its compiled pattern")
+      if transpose:
+        force = torch.where(live, vector, 0)
+        result = _packed_jacobian_transpose_matvec(packed, layout, pattern, force)
+      else:
+        result = _packed_jacobian_matvec(
+            packed, layout, pattern, vector, torch.zeros_like(active))
+        result = torch.where(live, result, 0)
+      return torch.where((status == 0)[:, None], result, 0).clone()
+    if layout.mode != PACKED_J_DENSE:
+      raise ValueError("unknown canonical Jacobian storage mode")
+    matrices = []
+    for world in range(b):
+      base = world * layout.stride_words + layout.values_offset
+      matrices.append(packed[base:base+nr*nv].reshape(nr, nv))
+    jacobian = torch.stack(matrices)
+  else:
+    jacobian = rows.get("J")
+  if (not isinstance(jacobian, torch.Tensor)
+      or jacobian.dtype != torch.float32 or jacobian.device != vector.device
+      or tuple(jacobian.shape) != (b, nr, nv)):
+    raise ValueError("canonical dense Jacobian has invalid layout")
+  jacobian = torch.where(live[:, :, None], jacobian, 0)
+  result = (torch.bmm(jacobian.transpose(1, 2),
+                      torch.where(live, vector, 0).unsqueeze(-1)).squeeze(-1)
+            if transpose else
+            torch.bmm(jacobian, vector.unsqueeze(-1)).squeeze(-1))
+  return torch.where((status == 0)[:, None], result, 0).clone()
+
+
+def mj_mulJacVec(sim, vector, *, record=None):
+  """Owned J*vector [B,nr] from a completed native constraint stage.
+
+  Rows use reserved canonical slots, with inactive/failed rows zeroed; CPU
+  MuJoCo instead exposes compact active rows. Sparse storage is consumed
+  directly without materializing a dense Jacobian or recomputing physics.
+  """
+  return _constraint_jacobian_product(sim, vector, False, record)
+
+
+def mj_mulJacTVec(sim, vector, *, record=None):
+  """Owned J.T*vector [B,nv] with reserved-row and record rules of mj_mulJacVec."""
+  return _constraint_jacobian_product(sim, vector, True, record)
+
+
+def mj_contactForce(sim, contact_id, *, record=None):
+  """Return owned ``[batch,6]`` force/torque in a native contact's frame.
+
+  ``contact_id`` is a native candidate slot, not the CPU engine's compact
+  contact index. Consume a completed, coherent forward record; this query
+  never detects contacts or runs a solver. Invalid slots, inactive contacts,
+  and failed worlds return zero, matching the source's absent-force behavior.
+  """
+  from numbers import Integral
+  from mujoco_metal.forward_stages import ForwardStage
+  if isinstance(contact_id, (bool, np.bool_)) or not isinstance(contact_id, Integral):
+    raise TypeError("contact_id must be an integer native contact slot")
+  record = _prepared_record(sim, ForwardStage.CONSTRAINT, record)
+  result = sim._forward_stages.consume(
+      record, ForwardStage.CONSTRAINT, generation=sim.state.generation)
+  wrench = result.get("contact_wrench")
+  mask = result.get("contact_mask")
+  if wrench is None:
+    legacy = result.get("contact_result")
+    if legacy is not None:
+      # The legacy profile admits condim 1/3 pyramidal contacts. Its five
+      # slots retain an unused normal row for condim3, then four edges.
+      rows = legacy["force_rows"]
+      friction = sim._contact._constants["friction"].reshape(-1, 2)
+      condim = sim._contact._constants["condim"].reshape(-1)
+      normal = torch.where(condim[None, :] == 3,
+                           rows[:, :, 1:5].sum(dim=-1), rows[:, :, 0])
+      tangent1 = friction[None, :, 0] * (rows[:, :, 1] - rows[:, :, 2])
+      tangent2 = friction[None, :, 1] * (rows[:, :, 3] - rows[:, :, 4])
+      zero = torch.zeros_like(normal)
+      wrench = torch.stack((normal, tangent1, tangent2, zero, zero, zero), dim=-1)
+      mask = legacy["mask"]
+  output = torch.zeros((sim.batch_size, 6), dtype=torch.float32,
+                       device=sim.state._device)
+  if wrench is None:
+    # A contact-free stage has no contact result; an admitted legacy contact
+    # path must publish its actual solver result rather than hide a gap.
+    if getattr(sim, "_contact", None) is not None:
+      raise RuntimeError("constraint stage did not publish contact forces")
+    return output
+  if not 0 <= int(contact_id) < wrench.shape[1]:
+    return output
+  active = (mask[:, int(contact_id)] > 0) & (result["status"] == 0)
+  output.copy_(torch.where(active[:, None], wrench[:, int(contact_id)], output))
+  return output
+
+
+def _skip_stage_inputs(sim, skipstage, skipsensor, record, qpos, qvel,
+                       mocap_pos, mocap_quat):
+  """Validate a shared forward/inverse prefix without producer writes."""
+  from mujoco_metal.forward_stages import ForwardStage
+  from numbers import Integral
+  if (isinstance(skipstage, (bool, np.bool_)) or
+      not isinstance(skipstage, (Integral, mujoco.mjtStage))):
+    raise TypeError("skipstage must be a MuJoCo stage integer")
+  skip = int(skipstage)
+  if skip not in tuple(int(value) for value in mujoco.mjtStage.__members__.values()):
+    raise ValueError(f"invalid skipstage {skip}")
+  if not isinstance(skipsensor, (bool, np.bool_)):
+    raise TypeError("skipsensor must be boolean")
+  state, model = sim.state, sim._mjmodel
+  if skip == int(mujoco.mjtStage.mjSTAGE_NONE):
+    qp = _stage_tensor(sim, qpos, (sim.batch_size, model.nq), "qpos")
+    qv = _stage_tensor(sim, qvel, (sim.batch_size, model.nv), "qvel")
+    mp = _stage_tensor(sim, mocap_pos, (sim.batch_size, state._nmocap, 3), "mocap_pos")
+    mq = _stage_tensor(sim, mocap_quat, (sim.batch_size, state._nmocap, 4), "mocap_quat")
+  else:
+    record = _prepared_record(sim, ForwardStage.POS if skip == 1 else ForwardStage.VEL,
+        record, qpos=qpos, qvel=qvel if skip > 1 else None)
+    qp, mp, mq = record.qpos, record.mocap_pos, record.mocap_quat
+    for name, value, captured in (("mocap_pos", mocap_pos, mp),
+                                  ("mocap_quat", mocap_quat, mq)):
+      if value is not None:
+        _match_stage_input(sim, value, captured, name)
+    qv = (_stage_tensor(sim, qvel, (sim.batch_size, model.nv), "qvel") if skip == 1
+          else record.values[ForwardStage.VEL]["qvel"])
+  return skip, record, qp, qv, mp, mq
+
+
+def mj_forwardSkip(sim, skipstage=mujoco.mjtStage.mjSTAGE_NONE,
+                   skipsensor=False, *, record=None, qpos=None, qvel=None,
+                   mocap_pos=None, mocap_quat=None, ctrl=None):
+  """Evaluate forward dynamics with an explicitly validated cached prefix.
+
+  Returns the full borrowed stage bundle. For POS/VEL/ACC skips, unchanged
+  host inputs are matched at this boundary and device inputs identify the
+  captured tensor. Skipping never guesses that arbitrary workspace contents
+  form a valid prefix.
+  """
+  skip, record, qp, qv, mp, mq = _skip_stage_inputs(
+      sim, skipstage, skipsensor, record, qpos, qvel, mocap_pos, mocap_quat)
+  control = _stage_tensor(sim, ctrl, (sim.batch_size, sim._mjmodel.nu), "ctrl")
+  return sim.forward_skip(skip, skipsensor, record=record, qpos=qp, qvel=qv,
+                          mocap_pos=mp, mocap_quat=mq, ctrl=control)
+
+
+def mj_forward(sim, **inputs):
+  """Compute all native forward stages; return their borrowed result bundle."""
+  return mj_forwardSkip(sim, mujoco.mjtStage.mjSTAGE_NONE, **inputs)
+
+
+def mj_step1(sim, *, control_callback=None):
+  """Prepare POS/VEL, sensors and energy without advancing simulation time.
+
+  An optional Python callback is an explicit host extension invoked after
+  those stages. The default has no callback. Its returned controls are
+  installed for step2; the callback is not represented as GPU-native code.
+  """
+  if control_callback is not None and not callable(control_callback):
+    raise TypeError("control_callback must be callable or None")
+  return sim.step1(control_callback=control_callback)
+
+
+def mj_step2(sim, *, ctrl=None, qfrc_applied=None, xfrc_applied=None):
+  """Finish a pending step1 with ACT/ACC/constraints and one time step.
+
+  Inputs use explicit batched shapes: ctrl [B,nu], qfrc_applied [B,nv],
+  and xfrc_applied [B,nbody,6]. All inputs are validated before any producer
+  writes. MuJoCo's split stepping uses Euler for RK4 models; implicit models
+  retain their implicit integrator.
+  """
+  from mujoco_metal.forward_stages import ForwardStage
+  record = getattr(sim, "_step1_record", None)
+  if record is None:
+    raise ValueError("step2 requires a successful step1 prefix")
+  _prepared_record(sim, ForwardStage.VEL, record)
+  model = sim._mjmodel
+  control = _stage_tensor(sim, ctrl, (sim.batch_size, model.nu), "ctrl")
+  force = _stage_tensor(sim, qfrc_applied, (sim.batch_size, model.nv),
+                        "qfrc_applied")
+  wrench = _stage_tensor(sim, xfrc_applied, (sim.batch_size, model.nbody, 6),
+                         "xfrc_applied")
+  return sim.step2(ctrl=control, qfrc_applied=force, xfrc_applied=wrench)
+
+
+def mj_inverseSkip(sim, skipstage=mujoco.mjtStage.mjSTAGE_NONE,
+                   skipsensor=False, *, record=None, qpos=None, qvel=None,
+                   qacc=None, mocap_pos=None, mocap_quat=None, return_details=False):
+  """Compute owned inverse force from a validated native POS/VEL prefix.
+
+  This explicit query preserves the simulation's borrowed stages and stored
+  sensors. ``return_details=True`` returns owned numerical outputs (including
+  status) rather than the transient query's record. INVDISCRETE is handled by
+  the simulation's pinned integrator-specific acceleration conversion.
+  """
+  if not isinstance(return_details, (bool, np.bool_)):
+    raise TypeError("return_details must be boolean")
+  skip, record, qp, qv, mp, mq = _skip_stage_inputs(
+      sim, skipstage, skipsensor, record, qpos, qvel, mocap_pos, mocap_quat)
+  qa = _stage_tensor(sim, qacc, (sim.batch_size, sim._mjmodel.nv), "qacc")
+  with _inverse_query_workspaces(sim):
+    result = sim.inverse_skip(skip, skipsensor, record=record, qpos=qp, qvel=qv,
+                             qacc=qa, mocap_pos=mp, mocap_quat=mq)
+    if return_details:
+      return {name: value.clone() if isinstance(value, torch.Tensor) else value
+              for name, value in result.items() if name != "record"}
+    return result["qfrc_inverse"].clone()
+
+
+def mj_invPosition(sim, qpos=None, *, mocap_pos=None, mocap_quat=None,
+                   return_record=False):
+  """Publish native inverse POS without evaluating sensors or later stages.
+
+  MuJoCo's inverse POS shares kinematics, mass, collision, constraint assembly
+  and transmissions with forward POS. This backend counterpart uses that
+  shared producer and returns borrowed poses, or its generation-scoped record
+  when ``return_record=True``. It does not advance state or run an optimizer.
+  Existing prepared records are replaced, as for :func:`mj_fwdPosition`.
+  """
+  if not isinstance(return_record, (bool, np.bool_)):
+    raise TypeError("return_record must be boolean")
+  return mj_fwdPosition(sim, qpos, mocap_pos=mocap_pos,
+      mocap_quat=mocap_quat, skipsensor=True, return_record=return_record)
+
+
+def mj_invVelocity(sim, qpos=None, qvel=None, poses=None, dynamics=None,
+                   *, record=None):
+  """Publish inverse VEL from native POS, without sensors or actuation.
+
+  The pinned engine's ``mj_invVelocity`` calls ``mj_fwdVelocity`` directly.
+  This counterpart has the same native prepared-stage reuse contract as
+  :func:`mj_fwdVelocity`; returned dynamics are borrowed until a producer
+  overwrites them. Foreign, invalidated or mutated prefixes are rejected.
+  """
+  return mj_fwdVelocity(sim, qpos, qvel, poses, dynamics,
+                        record=record, skipsensor=True)
+
+
+def mj_invConstraint(sim, qacc=None, *, record=None, return_details=False):
+  """Evaluate owned inverse constraint force from a prepared native VEL.
+
+  Applies the pinned constraint-cost gradient to ``J*qacc-aref`` and reduces
+  it with ``J.T``. No forward optimizer, ACT, mass solve, sensor evaluation or
+  INVDISCRETE acceleration conversion runs in this standalone primitive.
+  The full :func:`mj_inverse` applies that conversion before the constraint
+  stage. Query scratch is restored on success and failure, so prepared
+  forward/inverse views remain usable. ``return_details=True`` also returns
+  an owned stage status; default output is owned ``[batch,nv]`` force.
+  """
+  from mujoco_metal.forward_stages import ForwardStage
+  if not isinstance(return_details, (bool, np.bool_)):
+    raise TypeError("return_details must be boolean")
+  checked = _stage_tensor(sim, qacc, (sim.batch_size, sim._mjmodel.nv), "qacc")
+  record = _prepared_record(sim, ForwardStage.VEL, record)
+  velocity = sim._forward_stages.consume(
+      record, ForwardStage.VEL, generation=sim.state.generation)
+  acceleration = (sim.state._qacc if checked is None else checked).clone()
+  with _inverse_query_workspaces(sim):
+    if sim._coupled_constraints is not None:
+      force = _inverse_constraint_force_from_cached(
+          sim, sim._coupled_constraints, acceleration, record)
+    elif sim._contact is not None or sim._joint_constraints is not None:
+      rows, descriptor = sim._assemble_legacy_inverse_rows(record, velocity)
+      from mujoco_metal.inverse_constraints import inverse_constraint_force
+      force = inverse_constraint_force(rows, acceleration, descriptor)
+    else:
+      force = torch.zeros_like(acceleration)
+    if return_details:
+      return {"qfrc_constraint_inverse": force.clone(),
+              "status": velocity["status"].clone()}
+    return force.clone()
+
+
+def mj_compareFwdInv(sim, *, record=None, forward_result=None):
+  """Return owned [batch,2] forward/inverse residuals, preserving stage buffers."""
+  from mujoco_metal.forward_stages import ForwardStage
+  record = _prepared_record(sim, ForwardStage.CONSTRAINT, record)
+  with _inverse_query_workspaces(sim):
+    return sim.compare_forward_inverse(record, forward_result).clone()
+
+
+def _mass_query(sim, operation, vector=None, *, dynamics=None):
+  """Run an explicit mass query without invalidating borrowed forward views."""
+  from mujoco_metal.mass_queries import (
+      full_mass, mass_product, mass_factor_query, factor_mass)
+  checked = None
+  if vector is not None:
+    shape = tuple(vector.shape) if hasattr(vector, "shape") else np.asarray(vector).shape
+    if (len(shape) not in (2, 3) or shape[0] != sim.batch_size
+        or shape[-1] != sim._mjmodel.nv):
+      raise ValueError("vector must have shape [batch,nv] or [batch,nrhs,nv]")
+    checked = _stage_tensor(sim, vector, shape, "vector")
+  if dynamics is not None:
+    _stage_dynamics(sim, dynamics)
+  with _inverse_query_workspaces(sim):
+    if dynamics is None:
+      state = sim.state
+      stage = _query_smooth(sim, state._qpos, state._qvel,
+          getattr(state, "_mpos", None), getattr(state, "_mquat", None))
+      # Sparse smooth has already projected canonical tendon armature. Dense
+      # smooth intentionally returns rigid/joint mass; explicit mass queries
+      # add fixed/spatial tendon armature just once, as forward positioning does.
+      if not getattr(sim, "_component_mass_enabled", False):
+        stage = dict(stage)
+        mass = stage["mass_matrix"]
+        if getattr(sim, "_tendons", None) is not None:
+          _, _, armature = sim._tendons.run_device(state._qpos, state._qvel)
+          mass = mass + armature
+        if getattr(sim, "_spatial_tendons", None) is not None:
+          sim._spatial_jacobian(state._qvel, stage["poses"])
+          _, _, armature = sim._spatial_tendons.run_forces(
+              sim._spatial_kin, include_armature=True)
+          mass = mass + armature.reshape_as(mass)
+        stage["mass_matrix"] = mass
+    else:
+      stage = dynamics
+    if operation == "full":
+      return full_mass(stage)
+    if operation == "factor":
+      return factor_mass(stage)
+    if operation == "product":
+      return mass_product(stage, checked)
+    return mass_factor_query(stage, checked, operation)
+
+
+def mj_fullM(sim, *, dynamics=None):
+  """Return owned [batch,nv,nv] mass, including joint/tendon armature.
+
+  Sparse layouts are explicitly expanded for this query only. Stepping and
+  sparse solves never use this conversion as a dense solver fallback.
+  """
+  return _mass_query(sim, "full", dynamics=dynamics)
+
+
+def mj_factorM(sim, *, dynamics=None):
+  """Return owned device L' D L factors including joint/tendon armature.
+
+  The result has ``blocks`` (each with ``dof_ids``, unit lower ``L``, ``D``
+  and ``Dinv``), ``status`` (int32[batch], 0 success/2 failure), and ``nv``.
+  Component mass remains component-local; the query never changes prepared
+  factors or stages. Failed worlds return zero factors. This backend API
+  returns explicit factors rather than writing upstream ``MjData.qLD``.
+  """
+  return _mass_query(sim, "factor", dynamics=dynamics)
+
+
+def mj_mulM(sim, vector, *, dynamics=None):
+  """Apply mass on device to one or several RHS per world; return owned output."""
+  return _mass_query(sim, "product", vector, dynamics=dynamics)
+
+
+def mj_mulM2(sim, vector, *, dynamics=None):
+  """Return (sqrt(D)*L*vector, status), using pinned descending L' D L.
+
+  This is MuJoCo's triangular mass square-root factor, not the symmetric
+  principal square root. Status is [batch] int32; failed worlds return zero.
+  """
+  return _mass_query(sim, "sqrt", vector, dynamics=dynamics)
+
+
+def mj_solveM(sim, vector, *, dynamics=None):
+  """Return owned (inverse(M)*vector, status), preserving query workspace owners."""
+  return _mass_query(sim, "solve", vector, dynamics=dynamics)
+
+
+def mj_solveM2(sim, vector, *, dynamics=None):
+  """Return (sqrt(inverse(D))*inverse(L')*vector, status), with D from this mass."""
+  return _mass_query(sim, "half_solve", vector, dynamics=dynamics)
 
 
 def _spatial_query(sim, operation, dynamics=None):
@@ -637,7 +1090,7 @@ def _spatial_query(sim, operation, dynamics=None):
   if dynamics is not None:
     _validate_spatial_stage(sim, dynamics)
   with _inverse_query_workspaces(sim):
-    stage = dynamics if dynamics is not None else sim._smooth.run_device(
+    stage = dynamics if dynamics is not None else _query_smooth(sim,
         sim.state._qpos, sim.state._qvel,
         getattr(sim.state, "_mpos", None), getattr(sim.state, "_mquat", None))
     return operation(program, stage)
@@ -666,15 +1119,351 @@ def _validate_spatial_stage(sim, dynamics):
         or not value.is_contiguous() or not bool(torch.isfinite(value).all())):
       raise ValueError(f"dynamics.{name} has invalid native layout or values")
 
+
+def _ray_tensor(sim, value, shape, name):
+  if isinstance(value, torch.Tensor):
+    if (value.dtype != torch.float32 or value.device.type != sim.state._device.type
+        or tuple(value.shape) != tuple(shape) or not value.is_contiguous()):
+      raise ValueError(f"{name} must be contiguous float32 on the simulation device with shape {shape}")
+    return value
+  array = np.asarray(value, dtype=np.float32)
+  if tuple(array.shape) != tuple(shape):
+    raise ValueError(f"{name} must have shape {shape}")
+  return torch.as_tensor(array.copy(), device=sim.state._device)
+
+
+def _ray_query(sim, origins, vectors, *, dynamics=None, **filters):
+  from mujoco_metal.ray_queries import MetalRayQueries
+  program = getattr(sim, "_ray_queries", None)
+  if program is None or program.model is not sim.model or program.batch_size != sim.batch_size:
+    program = MetalRayQueries(sim.model, sim.batch_size,
+        memory_budget_bytes=getattr(sim.limits, "memory_budget_bytes", 1 << 30))
+    sim._ray_queries = program
+  if dynamics is not None:
+    _validate_spatial_stage(sim, dynamics)
+  with _inverse_query_workspaces(sim):
+    stage = dynamics if dynamics is not None else _query_smooth(sim,
+        sim.state._qpos, sim.state._qvel,
+        getattr(sim.state, "_mpos", None), getattr(sim.state, "_mquat", None))
+    return program.run_device(stage["poses"], origins, vectors, **filters)
+
+
+def mj_ray(sim, pnt, vec, geomgroup=None, flg_static=True, bodyexclude=-1,
+           *, dynamics=None):
+  """Query one ray per world; return owned distance/geom ID/normal/status.
+
+  Inputs have shape [B,3]. Directions need not be unit. Missing hits return
+  distance and geom ID -1; status distinguishes invalid rays/SDF arithmetic
+  from ordinary misses. Upstream model compilation and asset loading remain
+  host operations. This query preserves prepared simulation stages/state.
+  """
+  origin = _ray_tensor(sim, pnt, (sim.batch_size, 3), "pnt")[:, None, :]
+  vector = _ray_tensor(sim, vec, (sim.batch_size, 3), "vec")[:, None, :]
+  result = _ray_query(sim, origin, vector, geomgroup=geomgroup,
+      flg_static=flg_static, bodyexclude=bodyexclude, dynamics=dynamics)
+  return {name: value[:, 0] for name, value in result.items()}
+
+
+def mj_multiRay(sim, pnt, vec, geomgroup=None, flg_static=True,
+                bodyexclude=-1, cutoff=None, *, dynamics=None):
+  """Query [B,N,3] directions from [B,3] origins, with owned [B,N] hits.
+
+  Optional cutoff follows pinned bounding-sphere geom elimination rather than
+  clipping intersection distances. Directions with squared norm below mjMINVAL
+  and nonfinite directions fail only their own ray (status 1). Unlike upstream output pointers, results are returned in
+  a dictionary of device tensors and never overwrite caller storage.
+  """
+  shape = tuple(vec.shape) if hasattr(vec, "shape") else np.asarray(vec).shape
+  if len(shape) != 3 or shape[0] != sim.batch_size or shape[2] != 3:
+    raise ValueError("vec must have shape [B,N,3]")
+  vector = _ray_tensor(sim, vec, shape, "vec")
+  point = _ray_tensor(sim, pnt, (sim.batch_size, 3), "pnt")
+  origin = point[:, None, :].expand(shape).contiguous()
+  return _ray_query(sim, origin, vector, geomgroup=geomgroup,
+      flg_static=flg_static, bodyexclude=bodyexclude, cutoff=cutoff,
+      dynamics=dynamics, multiray=True)
+
+
+def _ray_asset(sim, geomid, kind, pnt, vec, dynamics):
+  from numbers import Integral
+  if (isinstance(geomid, (bool, np.bool_)) or not isinstance(geomid, Integral)
+      or not 0 <= geomid < sim.model.ngeom):
+    raise ValueError("geomid must identify a compiled geom")
+  if int(sim.model.geom_type[geomid]) != int(kind):
+    raise ValueError("geomid has the wrong asset geometry type")
+  origin = _ray_tensor(sim, pnt, (sim.batch_size, 3), "pnt")[:, None, :]
+  vector = _ray_tensor(sim, vec, (sim.batch_size, 3), "vec")[:, None, :]
+  result = _ray_query(sim, origin, vector, geomid=int(geomid), dynamics=dynamics)
+  return {name: value[:, 0] for name, value in result.items()}
+
+
+def mj_rayMesh(sim, geomid, pnt, vec, *, dynamics=None):
+  """Owned per-world mesh hits using every compiled face, independent of masks."""
+  return _ray_asset(sim, geomid, mujoco.mjtGeom.mjGEOM_MESH, pnt, vec, dynamics)
+
+
+def mj_rayHfield(sim, geomid, pnt, vec, *, dynamics=None):
+  """Owned per-world heightfield hits, independent of visual/group filters."""
+  return _ray_asset(sim, geomid, mujoco.mjtGeom.mjGEOM_HFIELD, pnt, vec, dynamics)
+
+
+def mju_rayGeom(sim, pos, mat, size, pnt, vec, geomtype):
+  """Owned per-world primitive ray distances/normals/status from explicit poses.
+
+  ``pos``, ``size``, ``pnt`` and ``vec`` are [B,3]; ``mat`` is row-major [B,3,3].
+  One analytic geom type applies to the batch. No scene, forward-stage storage
+  or accepted simulation state is evaluated or modified. Host inputs are staged
+  at this boundary; intersections execute on Metal.
+  """
+  from mujoco_metal.ray_queries import MetalRayPrimitives
+  program = getattr(sim, '_ray_primitives', None)
+  if program is None:
+    program = MetalRayPrimitives(sim.batch_size,
+        memory_budget_bytes=getattr(sim.limits, 'memory_budget_bytes', 1 << 30))
+    sim._ray_primitives = program
+  b = sim.batch_size
+  return program.run_device(_ray_tensor(sim,pos,(b,3),'pos'),
+      _ray_tensor(sim,mat,(b,3,3),'mat'), _ray_tensor(sim,size,(b,3),'size'),
+      _ray_tensor(sim,pnt,(b,3),'pnt'), _ray_tensor(sim,vec,(b,3),'vec'), geomtype)
+
+
+def mju_raySkin(sim, face, vert, pnt, vec):
+  """Ray intersection with explicit skin triangles and local nearest vertex.
+
+  ``face`` is immutable host integer[nface,3] topology; ``vert`` is current
+  float32[B,nvert,3] world positions. Counts are derived from these shapes.
+  Device outputs are distance/vertid/status plus an additional face normal;
+  upstream's pointer outputs are replaced by owned tensors. No simulation
+  state, compiled skin animation or OpenGL/Metal rendering is evaluated.
+  """
+  from mujoco_metal.ray_queries import lower_ray_skin, MetalRaySurface
+  shape = tuple(vert.shape) if hasattr(vert,'shape') else np.asarray(vert).shape
+  if len(shape) != 3 or shape[0] != sim.batch_size or shape[2] != 3:
+    raise ValueError('vert must have shape [B,nvert,3]')
+  surface = lower_ray_skin(shape[1],face)
+  cached = getattr(sim,'_ray_skin',None)
+  if (cached is None or cached.surface.nvert != surface.nvert
+      or not np.array_equal(cached.surface.faces,surface.faces)):
+    cached = MetalRaySurface(surface,sim.batch_size,
+        memory_budget_bytes=getattr(sim.limits,'memory_budget_bytes',1 << 30))
+    sim._ray_skin = cached
+  return cached.run_device(_ray_tensor(sim,vert,shape,'vert'),
+      _ray_tensor(sim,pnt,(sim.batch_size,3),'pnt'),
+      _ray_tensor(sim,vec,(sim.batch_size,3),'vec'))
+
+
+def mj_rayFlex(sim, flex_layer, flg_vert, flg_edge, flg_face, flg_skin,
+               flexid, pnt, vec, *, dynamics=None):
+  """Query compiled flex geometry at current state without advancing physics.
+
+  Source flags/layers control vertices, capsule edges and triangle/tetrahedron
+  faces. IDs are local to the selected flex. Current positions, intersections,
+  nearest-hit reduction and normals execute on device; this boundary preserves
+  prepared stages and accepted state. It is not a flex collision detector.
+  """
+  from mujoco_metal.ray_queries import lower_ray_flex, MetalRaySurface
+  surface = lower_ray_flex(sim.model,flexid)
+  if getattr(sim,'_flex',None) is None:
+    raise ValueError('simulation has no native flex position pipeline')
+  programs = getattr(sim,'_ray_flex',{})
+  if int(flexid) not in programs:
+    programs[int(flexid)] = MetalRaySurface(surface,sim.batch_size,
+        memory_budget_bytes=getattr(sim.limits,'memory_budget_bytes',1 << 30))
+    sim._ray_flex = programs
+  program = programs[int(flexid)]
+  if dynamics is not None:
+    _validate_spatial_stage(sim,dynamics)
+  origin = _ray_tensor(sim,pnt,(sim.batch_size,3),'pnt')
+  vector = _ray_tensor(sim,vec,(sim.batch_size,3),'vec')
+  with _inverse_query_workspaces(sim):
+    stage = dynamics if dynamics is not None else _query_smooth(sim,
+        sim.state._qpos,sim.state._qvel,
+        getattr(sim.state,'_mpos',None),getattr(sim.state,'_mquat',None))
+    sim._flex.update_kinematics(dict(stage['poses'],root_com=stage['root_com']),
+                               stage['cvel'])
+    va = int(sim.model.flex_vertadr[flexid])
+    vertices = sim._flex.flexvert_xpos[:,va:va+surface.nvert,:].contiguous()
+    return program.run_device(vertices,origin,vector,flex_layer=flex_layer,
+        flg_vert=flg_vert,flg_edge=flg_edge,flg_face=flg_face,flg_skin=flg_skin)
+
+
+def _position_query_program(sim):
+  from mujoco_metal.position_queries import MetalPositionQueries, lower_position_topology
+  program = getattr(sim, '_position_queries', None)
+  topology = lower_position_topology(sim.model)
+  if (program is None or program.batch_size != sim.batch_size
+      or program.nq != topology.nq or program.nv != topology.nv
+      or not np.array_equal(program.topology.joints, topology.joints)):
+    program = MetalPositionQueries(sim.model, sim.batch_size,
+        memory_budget_bytes=getattr(sim.limits, 'memory_budget_bytes', 1 << 30))
+    sim._position_queries = program
+  return program
+
+
+def mj_integratePos(sim, qpos, qvel, dt):
+  """Owned integrated [B,nq] position and status; does not update sim state.
+
+  Finite dt may be negative or zero. Host inputs are staged explicitly. Joint
+  quaternion normalization and right multiplication follow pinned MuJoCo.
+  """
+  program = _position_query_program(sim)
+  return program.integrate(_ray_tensor(sim, qpos, (sim.batch_size, sim.model.nq), 'qpos'),
+      _ray_tensor(sim, qvel, (sim.batch_size, sim.model.nv), 'qvel'), dt)
+
+
+def mj_differentiatePos(sim, qpos1, qpos2, dt):
+  """Owned [B,nv] tangent velocity between two [B,nq] positions and status.
+
+  Quaternion subtraction uses the shortest signed rotation in local joint
+  coordinates. A finite nonzero dt is required; accepted state is unchanged.
+  """
+  program = _position_query_program(sim)
+  return program.differentiate(
+      _ray_tensor(sim, qpos1, (sim.batch_size, sim.model.nq), 'qpos1'),
+      _ray_tensor(sim, qpos2, (sim.batch_size, sim.model.nq), 'qpos2'), dt)
+
+
+def mj_normalizeQuat(sim, qpos):
+  """Owned [B,nq] positions with joint quaternions normalized, plus status.
+
+  Scalar/translation fields are retained and zero quaternions become identity;
+  caller inputs and simulation state are never overwritten.
+  """
+  return _position_query_program(sim).normalize(
+      _ray_tensor(sim, qpos, (sim.batch_size, sim.model.nq), 'qpos'))
+
+
+def mjd_subQuat(qa, qb, *, memory_budget_bytes=1 << 30):
+  """Owned Da/Db[B,3,3] in local tangent coordinates, plus status[B].
+
+  Inputs must be contiguous float32 MPS quaternions [B,4]. The matrices are
+  derivatives with respect to three-dimensional rotational perturbations,
+  following the pinned function rather than four quaternion components.
+  """
+  from mujoco_metal.quaternion_derivatives import MetalQuaternionDerivatives
+  _quaternion_derivative_input(qa, 4, 'qa')
+  _quaternion_derivative_input(qb, 4, 'qb', batch=qa.shape[0])
+  program = MetalQuaternionDerivatives(qa.shape[0],
+                                       memory_budget_bytes=memory_budget_bytes)
+  return program.sub_quat(qa, qb)
+
+
+def mjd_quatIntegrate(vel, scale, *, memory_budget_bytes=1 << 30):
+  """Owned Dquat/Dvel[B,3,3], Dscale[B,3] and status[B] on MPS.
+
+  vel is contiguous float32[B,3]. Pinned Dvel is the derivative with respect
+  to scaled velocity; multiply it by scale to differentiate unscaled vel.
+  These analytical utilities do not step physics or mutate any inputs.
+  """
+  from mujoco_metal.quaternion_derivatives import MetalQuaternionDerivatives
+  _quaternion_derivative_input(vel, 3, 'vel')
+  from mujoco_metal.quaternion_derivatives import validate_scale
+  validate_scale(scale)
+  program = MetalQuaternionDerivatives(vel.shape[0],
+                                       memory_budget_bytes=memory_budget_bytes)
+  return program.quat_integrate(vel, scale)
+
+
+def _quaternion_derivative_input(value, width, name, *, batch=None):
+  """Reject malformed public inputs before compiling or allocating on MPS."""
+  if (torch is None or not isinstance(value, torch.Tensor)
+      or value.ndim != 2 or value.shape[0] <= 0 or value.shape[1] != width
+      or value.dtype != torch.float32 or value.device.type != 'mps'
+      or not value.is_contiguous()
+      or (batch is not None and value.shape[0] != batch)):
+    raise ValueError(f'{name} must be contiguous MPS float32 [B,{width}]')
+
+
+def _owned_stage_query(sim, operation, dynamics=None):
+  """Admit conservative additional storage before an owned stage query.
+
+  Resident simulation buffers and earlier retained outputs are separate. This
+  bound includes the rollback snapshot, lazy spatial metadata and the maximum
+  simultaneous output/scratch storage of the three Cartesian stage queries.
+  """
+  from mujoco_metal.finite_difference import estimate_transaction_bytes
+  model, b = sim.model, int(sim.batch_size)
+  nb, nv, ng, ns, nj = (int(getattr(model, name)) for name in
+                        ("nbody", "nv", "ngeom", "nsite", "njnt"))
+  counts = (nb * max(nv, 1), b * (128*nb + 24*nv + 48*ng + 48*ns + 12*nj),
+            12*nb + 3 + 24*int(model.ncam))
+  if any(count < 0 or count > (1 << 31)-1 for count in counts):
+    raise ValueError("Cartesian stage query exceeds int32 address capacity")
+  required = estimate_transaction_bytes(sim) + 4*sum(counts)
+  budget = int(getattr(getattr(sim, "limits", None),
+                       "memory_budget_bytes", 1 << 30))
+  if required > budget:
+    raise ValueError(f"Cartesian stage query needs {required} bytes; budget is {budget}")
+  return _spatial_query(sim, operation, dynamics)
+
+
+def mj_kinematics(sim, *, dynamics=None):
+  """Owned current-state Cartesian body/inertia/geom/site/joint fields.
+
+  Positions are [B,N,3], rotations [B,N,3,3], and xquat [B,nbody,4].
+  This evaluates all bodies without updating sleep caches or simulation state.
+  XML compilation and model metadata preparation remain host operations.
+  """
+  return _owned_stage_query(sim, lambda program, stage: program.kinematics(stage), dynamics)
+
+
+def mj_comPos(sim, *, dynamics=None):
+  """Owned subtree_com[B,nbody,3], cinert[B,nbody,10], cdof[B,nv,6].
+
+  Inertia and motion use each root subtree COM as in pinned mj_comPos. The
+  world inertia is zero and a zero-mass subtree falls back to its inertial
+  position. This full-state query does not mutate persistent sleep caches.
+  """
+  return _owned_stage_query(sim, lambda program, stage:
+      program.center_of_mass_position(stage), dynamics)
+
+
+def mj_comVel(sim, *, dynamics=None):
+  """Owned cvel[B,nbody,6] and cdof_dot[B,nv,6] in rot:lin convention.
+
+  The complete native motion stage is evaluated without stepping or updating
+  persistent sleep caches. A supplied validated smooth stage is also accepted.
+  """
+  return _owned_stage_query(sim, lambda program, stage:
+      program.center_of_mass_velocity(stage), dynamics)
+
+
+def mj_local2Global(sim, pos, quat, body, sameframe=0, *, dynamics=None):
+  """Return owned world (position [B,3], rotation [B,3,3]) without stepping.
+
+  All five pinned mjtSameFrame values are supported. A None position or
+  quaternion omits that output. Batched local inputs are not broadcast or
+  normalized; aligned outputs ignore their values as in the pinned source.
+  """
+  pos = None if pos is None else _stage_tensor(sim, pos, (sim.batch_size, 3), "pos")
+  quat = None if quat is None else _stage_tensor(sim, quat, (sim.batch_size, 4), "quat")
+  return _spatial_query(sim, lambda program, stage:
+      program.local_to_global(stage, pos, quat, body, sameframe), dynamics)
+
+
 def mj_jac(sim, point, body, *, dynamics=None):
   """Owned world point translation/rotation Jacobians [batch,3,nv]."""
   point = _stage_tensor(sim, point, (sim.batch_size, 3), "point")
   return _spatial_query(sim, lambda program, stage: program.jac(stage, point, body), dynamics)
 
+
 def mj_jacDot(sim, point, body, *, dynamics=None):
   """Owned world time derivatives of the point/rotation Jacobians."""
   point = _stage_tensor(sim, point, (sim.batch_size, 3), "point")
   return _spatial_query(sim, lambda program, stage: program.jac_dot(stage, point, body), dynamics)
+
+
+def mj_jacPointAxis(sim, point, axis, body, *, dynamics=None):
+  """Owned world point and axis Jacobians [batch,3,nv].
+
+  ``axis`` is a world vector; its magnitude is preserved. The axis result
+  measures the vector's derivative, rather than the angular velocity itself.
+  """
+  point = _stage_tensor(sim, point, (sim.batch_size, 3), "point")
+  axis = _stage_tensor(sim, axis, (sim.batch_size, 3), "axis")
+  return _spatial_query(sim, lambda program, stage:
+      program.jac_point_axis(stage, point, axis, body), dynamics)
+
 
 def _object_jac(sim, objtype, objid, dynamics):
   def query(program, stage):
@@ -682,32 +1471,108 @@ def _object_jac(sim, objtype, objid, dynamics):
     return program.jac(stage, point, body)
   return _spatial_query(sim, query, dynamics)
 
+
 def mj_jacBody(sim, body, *, dynamics=None):
   """World Jacobians at the regular body origin (not its inertial COM)."""
   return _object_jac(sim, mujoco.mjtObj.mjOBJ_XBODY, body, dynamics)
 
+
 def mj_jacBodyCom(sim, body, *, dynamics=None):
   return _object_jac(sim, mujoco.mjtObj.mjOBJ_BODY, body, dynamics)
+
 
 def mj_jacGeom(sim, geom, *, dynamics=None):
   return _object_jac(sim, mujoco.mjtObj.mjOBJ_GEOM, geom, dynamics)
 
+
 def mj_jacSite(sim, site, *, dynamics=None):
   return _object_jac(sim, mujoco.mjtObj.mjOBJ_SITE, site, dynamics)
 
+
 def mj_jacSubtreeCom(sim, body, *, dynamics=None):
   return _spatial_query(sim, lambda program, stage: program.jac_subtree_com(stage, body), dynamics)
+
+
+def mj_angmomMat(sim, body, *, dynamics=None):
+  """Owned [batch,3,nv] angular-momentum matrix about a body's subtree COM.
+
+  Rows use world axes; multiplying by generalized velocity returns the
+  subtree's angular momentum in kg m²/s. The optional smooth stage has the
+  same validated device layout as other spatial queries. No step is taken.
+  """
+  return _spatial_query(sim, lambda program, stage:
+      program.angmom_matrix(stage, body), dynamics)
+
+
+def mj_subtreeVel(sim, *, dynamics=None):
+  """Owned current-state subtree motion, each [batch,nbody,3].
+
+  Returns ``subtree_linvel`` in m/s and ``subtree_angmom`` in kg m²/s,
+  both in world axes and referenced to each subtree's center of mass.
+  Evaluates all bodies without changing stored sensors, sleep scheduling
+  or upstream's ``flg_subtreevel`` cache; it does not advance physics.
+  """
+  return _spatial_query(sim, lambda program, stage:
+      program.subtree_velocity(stage), dynamics)
+
+
+def mj_rne(sim, flg_acc=1, *, dynamics=None, qvel=None, qacc=None):
+  """Owned [batch,nv] full-state recursive Newton–Euler generalized force.
+
+  Includes rigid-body inertial, Coriolis and gravity terms, with the pinned
+  gravity-disable convention. flg_acc=0 omits qacc. Joint/tendon armature,
+  passive, actuation, applied and constraint forces are excluded, as in
+  upstream mj_rne. All bodies are evaluated without mutating sleep caches.
+  """
+  if not isinstance(flg_acc, (bool, int, np.integer)) or int(flg_acc) not in (0, 1):
+    raise ValueError("flg_acc must be 0 or 1")
+  shape = (sim.batch_size, int(sim.model.nv))
+  velocity = _stage_tensor(sim, sim.state._qvel if qvel is None else qvel,
+                           shape, "qvel")
+  acceleration = _stage_tensor(sim, sim.state._qacc if qacc is None else qacc,
+                               shape, "qacc")
+  return _spatial_query(sim, lambda program, stage:
+      program.recursive_newton_euler(stage, velocity, acceleration, bool(flg_acc)),
+      dynamics)
+
 
 def _local_flag(value):
   if not isinstance(value, (bool, int, np.integer)) or int(value) not in (0, 1):
     raise ValueError("flg_local must be 0 or 1")
   return bool(value)
 
+
+def mj_rnePostConstraint(sim, *, forward_result=None, qacc=None):
+  """Owned cacc/cfrc_ext/cfrc_int/subtree_com/qacc/status from native RNE.
+
+  A coherent complete forward bundle may be supplied; otherwise the native
+  forward stages are evaluated inside a rollback transaction. A qacc override
+  uses its exact float32 values rather than a solver residual side-channel.
+  Applied body wrenches, geom contacts and connect/weld equalities contribute
+  to cfrc_ext. Pinned source skips flex contacts and other equality families
+  there; their dynamical effects remain represented in qacc/internal forces.
+  Full forward-solver composition qualification remains in progress.
+  """
+  from mujoco_metal.rne_post_constraint import mj_rnePostConstraint as query
+  return query(sim, forward_result=forward_result, qacc=qacc)
+
+
+def mj_transmission(sim):
+  """Owned native actuator lengths and dense transmission moment rows.
+
+  Results have shapes [B,nu], [B,nu,nv] and per-world status [B]. This is a
+  current-position query; actuator velocities belong to the VEL stage.
+  """
+  from mujoco_metal.transmission_query import mj_transmission as query
+  return query(sim)
+
+
 def mj_objectVelocity(sim, objtype, objid, flg_local=0, *, dynamics=None):
   """Owned [batch,6] rot:lin object-centered velocity, world/local axes."""
   local = _local_flag(flg_local)
   return _spatial_query(sim, lambda program, stage:
       program.object_velocity(stage, objtype, objid, local), dynamics)
+
 
 def mj_objectAcceleration(sim, objtype, objid, flg_local=0, *, dynamics=None, qvel=None, qacc=None):
   """Pinned object acceleration from current qvel and supplied/owned qacc.
@@ -723,6 +1588,7 @@ def mj_objectAcceleration(sim, objtype, objid, flg_local=0, *, dynamics=None, qv
   return _spatial_query(sim, lambda program, stage: program.object_acceleration(
       stage, qv, qa, objtype, objid, local), dynamics)
 
+
 def mj_applyFT(sim, force, torque, point, body, *, dynamics=None):
   """Owned generalized wrench contribution, without mutating held inputs."""
   def tensor(value, name):
@@ -733,6 +1599,7 @@ def mj_applyFT(sim, force, torque, point, body, *, dynamics=None):
   point = _stage_tensor(sim, point, (sim.batch_size, 3), "point")
   return _spatial_query(sim, lambda program, stage:
       program.apply_ft(stage, force, torque, point, body), dynamics)
+
 
 # -------------------------------------------------------------------------
 # Native State Selector APIs (mj_getState / mj_setState)
@@ -749,6 +1616,26 @@ class StateSpec:
   FULLPHYSICS = TIME | PHYSICS | PLUGIN
   INTEGRATION = TIME | PHYSICS | WARMSTART | CTRL | QFRC_APPLIED | XFRC_APPLIED | EQ_ACTIVE | MOCAP_POS | MOCAP_QUAT | USERDATA | PLUGIN
   ALL = INTEGRATION
+
+
+def mj_stateSize(model, sig):
+  """Pinned vector width from host model metadata and an upstream mjtState mask.
+
+  This describes upstream flat state vectors. mj_getState/mj_setState expose
+  the separately documented backend dictionary interface and StateSpec mask.
+  """
+  from mujoco_metal.state_vector import state_vector_layout
+  return state_vector_layout(model, sig)[1]
+
+
+def mj_extractState(model, source, srcsig, dstsig):
+  """Owned batched device subvector with the exact upstream mjtState ordering.
+
+  srcsig/dstsig are upstream mjtState masks, distinct from backend StateSpec.
+  The destination mask must be a subset; source has shape [batch,stateSize].
+  """
+  from mujoco_metal.state_vector import extract_state_vector
+  return extract_state_vector(model, source, srcsig, dstsig)
 
 
 _STATE_FIELDS = {
@@ -774,7 +1661,11 @@ def _selected_ids(sim, env_ids):
   if env_ids is None:
     return None, b
   raw = np.asarray(env_ids)
-  if raw.ndim != 1 or raw.dtype.kind not in "iu":
+  if raw.ndim != 1:
+    raise TypeError("env_ids must be a one-dimensional integer selection")
+  if raw.size == 0:
+    raise ValueError("env_ids must select at least one world")
+  if raw.dtype.kind not in "iu":
     raise TypeError("env_ids must be a one-dimensional integer selection")
   ids = raw.astype(np.int64, copy=True)
   if np.any(ids < 0) or np.any(ids >= b):
@@ -961,3 +1852,39 @@ def mj_setState(sim, values: dict[str, Any], env_ids=None):
     if "history" in staged:
       sim._sync_delay_from_history(None if ids_t is None else ids_t)
     sim._invalidate_after_state_write(staged)
+
+
+def mjd_stepFD(sim, eps=1e-6, flg_centered=False):
+  """Owned native finite differences of one step, transposed by input.
+
+  Returns ``DyDq/DyDv/DyDa/DyDu`` with shapes ``[B,nv|na|nu,2*nv+na]``,
+  ``DsDq/DsDv/DsDa/DsDu`` with shapes ``[B,nv|na|nu,nsensordata]``, and
+  ``status[B]``. Device stepping and differencing remain on the simulation's
+  MPS device. Pinned MuJoCo's RK4 behavior and control-bound one-sided stencil
+  are preserved. Models with actuator history are rejected by the source API.
+  """
+  from mujoco_metal.finite_difference import mjd_stepFD as implementation
+  return implementation(sim, eps, flg_centered)
+
+
+def mjd_transitionFD(sim, eps=1e-6, flg_centered=False):
+  """Owned control-theory transition, control, observation and sensor matrices.
+
+  Returns ``A[B,nx,nx]``, ``B[B,nx,nu]``, ``C[B,nsensordata,nx]``,
+  ``D[B,nsensordata,nu]`` and ``status[B]``. Pinned source gates continue to
+  reject RK4 and actuator history.
+  """
+  from mujoco_metal.finite_difference import mjd_transitionFD as implementation
+  return implementation(sim, eps, flg_centered)
+
+
+def mjd_inverseFD(sim, eps=1e-6, flg_actuation=False):
+  """Owned native inverse-dynamics finite differences.
+
+  Returns transposed ``DfDq/DfDv/DfDa[B,nv,nv]``, sensor derivatives
+  ``DsDq/DsDv/DsDa[B,nv,nsensordata]``, packed lower sparse-mass derivative
+  ``DmDq[B,nv,nM]`` and ``status[B]``. RK4 and noslip retain their pinned
+  MuJoCo 3.10 source restrictions.
+  """
+  from mujoco_metal.finite_difference import mjd_inverseFD as implementation
+  return implementation(sim, eps, flg_actuation)

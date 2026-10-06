@@ -67,6 +67,7 @@ class MetalDenseSolve:
     self.nrhs = nrhs
     self._library = torch.mps.compile_shader(_SHADER.read_text())
     self._kernel = self._library.dense_spd_solve
+    self._pair_kernel = self._library.dense_spd_solve_pair
     self._awake_kernel = self._library.dense_awake_solve
     self._awake_work = torch.empty(
         max(batch_size * nv * nrhs, 1), dtype=torch.float32, device=self._device
@@ -80,9 +81,21 @@ class MetalDenseSolve:
     self._solution = torch.empty(
         max(batch_size * nv * nrhs, 1), dtype=torch.float32, device=self._device
     )
+    self._solution_low = torch.empty(
+        max(batch_size * nv, 1), dtype=torch.float32, device=self._device)
+    self._zero_pair_low = torch.zeros(
+        max(batch_size * nv, 1), dtype=torch.float32, device=self._device)
+    self._pair_work = torch.empty(
+        max(batch_size * 6 * max(nv, 1), 1), dtype=torch.float32,
+        device=self._device)
+    self._pair_dims = torch.tensor(
+        [nv, batch_size, 0, 0], dtype=torch.int32, device=self._device)
+    self._empty_int = torch.zeros(1, dtype=torch.int32, device=self._device)
     self._status = torch.empty(
         batch_size, dtype=torch.int32, device=self._device
     )
+    self._all_world_mask = torch.ones(
+        (batch_size,), dtype=torch.int32, device=self._device)
     self._empty_input = torch.zeros(1, dtype=torch.float32, device=self._device)
     self._dims = torch.tensor(
         [nv, batch_size, nrhs], dtype=torch.int32, device=self._device
@@ -103,7 +116,8 @@ class MetalDenseSolve:
     if not tensor.is_contiguous():
       raise ValueError(f"{name} must be contiguous")
 
-  def run_device(self, mass, rhs, *, awake_lists=None, retained=None):
+  def run_device(self, mass, rhs, *, awake_lists=None, retained=None,
+                 world_mask=None):
     """Solve ``mass @ solution = rhs`` for all fixed-capacity batch rows.
 
     ``mass`` is ``[B,nv,nv]``. ``rhs`` is ``[B,nv]`` when ``nrhs==1`` and
@@ -117,6 +131,14 @@ class MetalDenseSolve:
         else (self.batch_size, self.nv, self.nrhs)
     )
     self._validate_tensor(rhs, "rhs", rhs_shape)
+    if world_mask is None:
+      world_mask = self._all_world_mask
+    elif (not isinstance(world_mask, self._torch.Tensor)
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or world_mask.dtype != self._torch.int32
+          or world_mask.device.type != "mps"
+          or not world_mask.is_contiguous()):
+      raise ValueError("world_mask must be contiguous MPS int32 [batch]")
 
     if awake_lists is not None:
       if not isinstance(awake_lists, dict):
@@ -144,7 +166,7 @@ class MetalDenseSolve:
           rhs.reshape(-1) if self.nv else self._empty_input, ids, counts,
           retained.reshape(-1) if retained is not None and self.nv else self._empty_input,
           self._factor, self._awake_work, self._solution, self._status,
-          self._awake_dims, flags,
+          self._awake_dims, flags, world_mask,
           threads=(self.batch_size,), group_size=(1,))
       shape = ((self.batch_size, self.nv) if self.nrhs == 1
                else (self.batch_size, self.nv, self.nrhs))
@@ -163,6 +185,7 @@ class MetalDenseSolve:
         self._solution,
         self._status,
         self._dims,
+        world_mask,
         threads=(self.batch_size,),
         group_size=(1,),
     )
@@ -175,6 +198,69 @@ class MetalDenseSolve:
           : self.batch_size * self.nv * self.nrhs
       ].reshape(self.batch_size, self.nv, self.nrhs)
     return solution, self._status
+
+  def run_pair_device(self, mass, rhs_hi, rhs_low, *, awake_lists=None,
+                      retained=None, retained_low=None, world_mask=None):
+    """Solve a dense SPD system while retaining a two-word result.
+
+    The shader factors the represented mass once, solves both RHS words with
+    paired triangular arithmetic, then applies one true residual correction
+    formed against the original mass. Returned high/low views are borrowed
+    until the next call on this solver.
+    """
+    self._validate_tensor(mass, "mass", (self.batch_size, self.nv, self.nv))
+    self._validate_tensor(rhs_hi, "rhs_hi", (self.batch_size, self.nv))
+    self._validate_tensor(rhs_low, "rhs_low", (self.batch_size, self.nv))
+    if world_mask is None:
+      world_mask = self._all_world_mask
+    elif (not isinstance(world_mask, self._torch.Tensor)
+          or tuple(world_mask.shape) != (self.batch_size,)
+          or world_mask.dtype != self._torch.int32
+          or world_mask.device.type != "mps" or not world_mask.is_contiguous()):
+      raise ValueError("world_mask must be contiguous MPS int32 [batch]")
+    packed_ids = awake_lists is not None
+    if packed_ids:
+      if not isinstance(awake_lists, dict):
+        raise TypeError("awake_lists must be a mapping")
+      ids, counts = awake_lists.get("dof_ids"), awake_lists.get("counts")
+      if (not isinstance(ids, self._torch.Tensor)
+          or tuple(ids.shape) != (self.batch_size, max(self.nv, 1))
+          or ids.dtype != self._torch.int32 or ids.device.type != "mps"
+          or not ids.is_contiguous()):
+        raise ValueError("awake_lists.dof_ids must be contiguous MPS int32")
+      if (not isinstance(counts, self._torch.Tensor)
+          or tuple(counts.shape) != (self.batch_size, 3)
+          or counts.dtype != self._torch.int32 or counts.device.type != "mps"
+          or not counts.is_contiguous()):
+        raise ValueError("awake_lists.counts must be contiguous MPS int32 [batch,3]")
+      if retained is not None:
+        self._validate_tensor(retained, "retained", (self.batch_size, self.nv))
+      if retained_low is not None:
+        if retained is None:
+          raise ValueError("retained_low requires retained high values")
+        self._validate_tensor(retained_low, "retained_low",
+                              (self.batch_size, self.nv))
+      ids_arg, counts_arg = ids, counts
+      retained_arg = (self._empty_input if retained is None else retained.reshape(-1))
+      retained_low_arg = (self._zero_pair_low if retained_low is None
+                          else retained_low.reshape(-1))
+    else:
+      ids_arg = counts_arg = self._empty_int
+      retained_arg = retained_low_arg = self._empty_input
+    self._pair_dims[2].fill_(int(packed_ids))
+    self._pair_dims[3].fill_(int(retained is not None))
+    self._pair_kernel(
+        mass.reshape(-1) if self.nv else self._empty_input,
+        rhs_hi.reshape(-1) if self.nv else self._empty_input,
+        rhs_low.reshape(-1) if self.nv else self._empty_input,
+        ids_arg, counts_arg, retained_arg, retained_low_arg,
+        self._factor, self._pair_work,
+        self._solution, self._solution_low, self._status, self._pair_dims,
+        world_mask, threads=(self.batch_size,), group_size=(1,))
+    count = self.batch_size * self.nv
+    return (self._solution[:count].reshape(self.batch_size, self.nv),
+            self._solution_low[:count].reshape(self.batch_size, self.nv),
+            self._status)
 
 
 class MetalGeneralDenseSolve(MetalDenseSolve):
@@ -219,10 +305,12 @@ class MetalSymmetricLDLSolve(MetalDenseSolve):
     self._default_awake = {"dof_ids": self._default_dof_ids,
                            "counts": self._default_counts}
 
-  def run_device(self, mass, rhs, *, awake_lists=None, retained=None):
+  def run_device(self, mass, rhs, *, awake_lists=None, retained=None,
+                 world_mask=None):
     return super().run_device(
         mass, rhs, awake_lists=(self._default_awake if awake_lists is None
-                               else awake_lists), retained=retained)
+                               else awake_lists), retained=retained,
+        world_mask=world_mask)
 
 
 def factored_workspace_elements(nv, batch_size, nrhs=1):

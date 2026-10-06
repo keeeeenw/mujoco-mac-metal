@@ -17,11 +17,27 @@
 from dataclasses import dataclass
 import hashlib
 import math
+from pathlib import Path
 
 import mujoco
 import numpy as np
 
 from mujoco_metal.lifecycle import _fingerprint
+
+
+def _device_matches(actual, expected):
+  """Compare canonical devices while honoring explicit device indices.
+
+  Runtime tensor validators compare against the actual owned tensor device.
+  This helper remains for metadata-only validation and rejects conflicting
+  explicit indices while allowing an unindexed backend alias.
+  """
+  actual_type = getattr(actual, "type", None)
+  expected_type = getattr(expected, "type", None)
+  if actual_type is None or expected_type is None or actual_type != expected_type:
+    return False
+  expected_index = getattr(expected, "index", None)
+  return expected_index is None or getattr(actual, "index", None) == expected_index
 from mujoco_metal.model import ModelDescriptor
 from mujoco_metal.model import load_model
 from mujoco_metal.model import snapshot_descriptor
@@ -91,9 +107,15 @@ class StateSnapshot:
   # (cold start on restore); a finite 2D array restores seeds. Validated
   # below; never silently fabricated.
   warmstart_multiplier: np.ndarray | None = None
+  # MuJoCo warning statistics, stored as [batch, mjNWARNING] int32 arrays.
+  # Schemas 1-4 predate this field and restore with zero warning history.
+  warning_number: np.ndarray | None = None
+  warning_lastinfo: np.ndarray | None = None
+  # Internal selected-row reset epochs used by borrowed stage records.
+  row_reset_epoch: np.ndarray | None = None
 
   def __post_init__(self):
-    if self.schema_version not in (1, 2, 3, 4):
+    if self.schema_version not in (1, 2, 3, 4, 5, 6):
       raise ValueError("unsupported state snapshot schema")
     if self.batch_size <= 0 or self.nq < 0 or self.nv < 0 or self.neq < 0:
       raise ValueError("invalid state snapshot dimensions")
@@ -224,6 +246,41 @@ class StateSnapshot:
           self, "warmstart_multiplier",
           _freeze_float32(raw_warm, raw_warm.shape, "warmstart_multiplier"),
       )
+    if self.schema_version < 5:
+      # dataclasses.replace(old_snapshot, schema_version=...) forwards every
+      # field. Downgrading a v5 object to a legacy wire schema intentionally
+      # drops these newly introduced statistics.
+      object.__setattr__(self, "warning_number", None)
+      object.__setattr__(self, "warning_lastinfo", None)
+    else:
+      nwarn = int(mujoco.mjtWarning.mjNWARNING)
+      for name in ("warning_number", "warning_lastinfo"):
+        raw = getattr(self, name)
+        if raw is None:
+          raise ValueError(f"schema 5+ snapshots must carry {name}")
+        value = np.asarray(raw)
+        if value.shape != (batch, nwarn) or value.dtype.kind not in "iu":
+          raise ValueError(f"{name} must be int32-compatible with shape ({batch}, {nwarn})")
+        if np.any(value < np.iinfo(np.int32).min) or np.any(
+            value > np.iinfo(np.int32).max):
+          raise ValueError(f"{name} values must fit in int32")
+        frozen_value = np.asarray(value, dtype=np.int32, order="C")
+        object.__setattr__(
+            self, name,
+            np.frombuffer(frozen_value.tobytes(), dtype=np.int32).reshape(
+                (batch, nwarn)),
+        )
+    if self.schema_version < 6:
+      object.__setattr__(self, "row_reset_epoch", None)
+    else:
+      raw_epoch = np.asarray(self.row_reset_epoch)
+      if (raw_epoch.shape != (batch,) or raw_epoch.dtype.kind not in "iu"
+          or np.any(raw_epoch < 0) or np.any(raw_epoch > np.iinfo(np.int32).max)):
+        raise ValueError("row_reset_epoch must be nonnegative int32 [batch]")
+      object.__setattr__(
+          self, "row_reset_epoch",
+          np.frombuffer(np.asarray(raw_epoch, dtype=np.int32, order="C").tobytes(),
+                        dtype=np.int32).reshape((batch,)))
 
 
 class DeviceState:
@@ -244,6 +301,7 @@ class DeviceState:
       qpos=None,
       qvel=None,
       device="mps",
+      limits=None,
   ):
     if isinstance(batch_size, (bool, np.bool_)) or not isinstance(
         batch_size, (int, np.integer)
@@ -256,8 +314,13 @@ class DeviceState:
           f"requires MuJoCo {TARGET_MUJOCO_VERSION}; found {mujoco.__version__}"
       )
     if isinstance(model, mujoco.MjModel):
+      if limits is None and profile.name == "integrated_scalable_v1":
+        from mujoco_metal.capacity import CapacityLimits
+        limits = CapacityLimits(
+            max_nv=max(int(model.nv), 1), max_pairs=64, max_slots=64,
+            max_rows=256)
       validated = validate_stepping_profile(
-          model, profile.timestep, profile=profile.name
+          model, profile.timestep, profile=profile.name, limits=limits
       )
       descriptor = load_model(model)
       if validated != profile:
@@ -371,6 +434,11 @@ class DeviceState:
     self._status = torch.zeros(
         (self.batch_size,), dtype=torch.int32, device=self._device
     )
+    nwarn = int(mujoco.mjtWarning.mjNWARNING)
+    self._warning_number = torch.zeros(
+        (self.batch_size, nwarn), dtype=torch.int32, device=self._device
+    )
+    self._warning_lastinfo = torch.zeros_like(self._warning_number)
     if self._neq > 0:
       init_eq = np.broadcast_to(self._eq_active0, (self.batch_size, self._neq)).copy()
       self._eq_active = torch.as_tensor(init_eq, dtype=torch.int32, device=self._device).clone()
@@ -417,6 +485,75 @@ class DeviceState:
     self._userdata = torch.as_tensor(np.broadcast_to(self._userdata0, (self.batch_size, self._nuserdata)).copy(), dtype=torch.float32, device=self._device)
     self._plugin_state = torch.as_tensor(np.broadcast_to(self._plugin_state0, (self.batch_size, self._npluginstate)).copy(), dtype=torch.float32, device=self._device)
     self._generation = 0
+    self._row_reset_epoch = torch.zeros(
+        (self.batch_size,), dtype=torch.int32, device=self._device)
+    self._reset_shader = None
+    self._clear_rows_shader = None
+    self._clear_int_rows_shader = None
+    self._update_float_rows_shader = None
+    self._copy_int_rows_shader = None
+    self._warning_rows_shader = None
+    self._invalidate_bool_rows_shader = None
+    self._copy_strided_float_rows_shader = None
+    self._add_scaled_float_rows_shader = None
+    self._copy_masked_packed_rows_shader = None
+    self._update_rows_dims = None
+    self._clear_rows_dims = None
+    self._warning_rows_dims = None
+    if self._device.type == "mps":
+      source = Path(__file__).with_name("shaders").joinpath(
+          "state_reset.metal").read_text()
+      library = torch.mps.compile_shader(source)
+      self._reset_shader = library.reset_state_rows
+      self._clear_rows_shader = library.clear_float_rows
+      self._clear_int_rows_shader = library.clear_int_rows
+      self._update_float_rows_shader = library.update_float_rows
+      self._copy_int_rows_shader = library.copy_int_rows
+      self._warning_rows_shader = library.record_warning_rows
+      self._invalidate_bool_rows_shader = library.invalidate_bool_rows
+      self._copy_strided_float_rows_shader = library.copy_strided_float_rows
+      self._add_scaled_float_rows_shader = library.add_scaled_float_rows
+      self._copy_masked_packed_rows_shader = library.copy_masked_packed_rows
+      self._clear_rows_dims = torch.zeros((3,), dtype=torch.int32,
+                                          device=self._device)
+      self._strided_copy_dims = torch.zeros((4,), dtype=torch.int32,
+                                            device=self._device)
+      self._copy_packed_dims = torch.zeros((6,), dtype=torch.int32,
+                                           device=self._device)
+      self._update_rows_dims = torch.zeros((4,), dtype=torch.int32,
+                                           device=self._device)
+      self._reset_dims = torch.tensor(
+          [self.batch_size, descriptor.nq, descriptor.nv, self._neq,
+           self._nmocap, self._na, self._nhistory, self._nuserdata,
+           self._npluginstate, nwarn], dtype=torch.int32, device=self._device)
+      self._warning_rows_dims = torch.zeros((4,), dtype=torch.int32,
+                                            device=self._device)
+      self._reset_mask_i32 = torch.zeros(
+          (self.batch_size,), dtype=torch.int32, device=self._device)
+      # Row-operation kernels use a separate conversion buffer so they never
+      # overwrite the persistent physics recovery selector consumed by stages.
+      self._row_operation_mask_i32 = torch.zeros(
+          (self.batch_size,), dtype=torch.int32, device=self._device)
+      self._reset_dummy_float = torch.zeros((1,), dtype=torch.float32,
+                                            device=self._device)
+      self._reset_dummy_int = torch.zeros((1,), dtype=torch.int32,
+                                          device=self._device)
+      self._reset_defaults = {
+          "qpos0": torch.as_tensor(np.asarray(descriptor.qpos0).copy(),
+                                   dtype=torch.float32, device=self._device),
+          "eq0": torch.as_tensor(self._eq_active0.copy(), dtype=torch.int32,
+                                 device=self._device),
+          "mpos0": torch.as_tensor(self._mpos0.copy(), dtype=torch.float32,
+                                   device=self._device),
+          "mquat0": torch.as_tensor(self._mquat0.copy(), dtype=torch.float32,
+                                    device=self._device),
+          "history0": torch.as_tensor(self._history0.copy(), dtype=torch.float32,
+                                      device=self._device),
+          "userdata0": torch.as_tensor(self._userdata0.copy(), dtype=torch.float32,
+                                       device=self._device),
+          "plugin0": torch.as_tensor(self._plugin_state0.copy(), dtype=torch.float32,
+                                     device=self._device),
+      }
 
   @property
   def na(self):
@@ -495,21 +632,71 @@ class DeviceState:
     (qpos/qvel/qacc/time/status/activity/poses/act) are preserved untouched.
     Raises before mutating on any shape mismatch.
     """
-    if (self._neq, self._nmocap, self._na) != (other._neq, other._nmocap, other._na):
-      raise ValueError("descriptor state shapes (neq/nmocap/na) do not match")
+    if ((self._neq, self._nmocap, self._na, self._nhistory,
+         self._nuserdata, self._npluginstate)
+        != (other._neq, other._nmocap, other._na, other._nhistory,
+            other._nuserdata, other._npluginstate)):
+      raise ValueError(
+          "descriptor state shapes (neq/nmocap/na/nhistory/nuserdata/"
+          "npluginstate) do not match")
     if (self._model.nq, self._model.nv) != (other._model.nq, other._model.nv):
       raise ValueError("descriptor dimensions (nq/nv) do not match")
     if self.batch_size != other.batch_size:
       raise ValueError("batch sizes do not match")
     self._model = other._model
     self.profile = other.profile
+    # The model owns the default contents/layout for these compiled state
+    # planes. Live values remain untouched here; lifecycle callers may reset
+    # model-owned history separately after replacing the history program.
+    self._history0 = other._history0.copy()
+    self._userdata0 = other._userdata0.copy()
+    self._plugin_state0 = other._plugin_state0.copy()
     self._model_fingerprint = other._model_fingerprint
     self._profile_fingerprint = other._profile_fingerprint
     self._eq_active0 = other._eq_active0
     self._mpos0 = other._mpos0
     self._mquat0 = other._mquat0
+    if self._reset_shader is not None:
+      for name, host in (
+          ("qpos0", other._model.qpos0),
+          ("eq0", other._eq_active0),
+          ("mpos0", other._mpos0),
+          ("mquat0", other._mquat0),
+          ("history0", other._history0),
+          ("userdata0", other._userdata0),
+          ("plugin0", other._plugin_state0),
+      ):
+        value = self._reset_defaults[name]
+        if value.numel():
+          value.copy_(self._torch.as_tensor(
+              np.asarray(host).copy(), dtype=value.dtype, device=self._device))
     self._generation += 1
     return self._generation
+
+  def reset_model_history(self, fresh_state):
+    """Reset only compiled history storage from a newly built model state.
+
+    Sensor/actuator delay buffers encode model-specific addresses and timing.
+    A lifecycle model replacement starts these rings at the new model's exact
+    MuJoCo ``MjData.history`` template while preserving qpos, qvel and user
+    state. Both states must have already passed descriptor compatibility.
+    """
+    if (self._nhistory != fresh_state._nhistory
+        or tuple(self._history.shape) != tuple(fresh_state._history.shape)
+        or self._history.dtype != fresh_state._history.dtype
+        or self._history.device != fresh_state._history.device):
+      raise ValueError("compiled history state shapes or devices do not match")
+    defaults = getattr(self, "_reset_defaults", {})
+    fresh_defaults = getattr(fresh_state, "_reset_defaults", {})
+    target = defaults.get("history0")
+    fresh_default = fresh_defaults.get("history0")
+    if (target is not None and fresh_default is not None
+        and target.shape != fresh_default.shape):
+      raise ValueError("compiled history reset templates do not match")
+    self._history.copy_(fresh_state._history)
+    self._history0 = fresh_state._history0.copy()
+    if target is not None and fresh_default is not None:
+      target.copy_(fresh_default)
 
   @property
   def qpos(self):
@@ -626,6 +813,8 @@ class DeviceState:
     next_eq.index_copy_(0, index, value_tensor)
     self._eq_active = next_eq
     self._generation += 1
+    if hasattr(self, "_on_eq_active_change") and callable(self._on_eq_active_change):
+      self._on_eq_active_change(env_ids=ids)
     return self._generation
 
   def _checked_mocap_pair(self, pos, quat, count):
@@ -739,6 +928,8 @@ class DeviceState:
     next_quat.index_copy_(0, index, quat_tensor)
     self._mpos, self._mquat = next_pos, next_quat
     self._generation += 1
+    if hasattr(self, "_on_mocap_change") and callable(self._on_mocap_change):
+      self._on_mocap_change(env_ids=ids)
     return self._generation
 
   def copy_environment(self, src, dst):
@@ -751,13 +942,14 @@ class DeviceState:
     for index in (src_i, dst_i):
       if not 0 <= index < self.batch_size:
         raise ValueError("environment index out of range")
-    for tensor_name in ("_qpos", "_qvel", "_qacc", "_time", "_status", "_history", "_qacc_warmstart", "_userdata", "_plugin_state"):
+    for tensor_name in ("_qpos", "_qvel", "_qacc", "_time", "_status", "_warning_number", "_warning_lastinfo", "_history", "_qacc_warmstart", "_userdata", "_plugin_state"):
       current = getattr(self, tensor_name)
       if current.numel() == 0:
         continue
       tensor = current.clone()
       tensor[dst_i] = current[src_i]
       setattr(self, tensor_name, tensor)
+    self._row_reset_epoch[dst_i] = self._row_reset_epoch[src_i]
     if self._eq_active is not None:
       tensor = self._eq_active.clone()
       tensor[dst_i] = self._eq_active[src_i]
@@ -773,6 +965,8 @@ class DeviceState:
       act_t[dst_i] = self._act[src_i]
       self._act = act_t
     self._generation += 1
+    if hasattr(self, "_on_environment_copy") and callable(self._on_environment_copy):
+      self._on_environment_copy(src=src_i, dst=dst_i)
     return self._generation
 
   def prepare_reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
@@ -897,8 +1091,14 @@ class DeviceState:
     next_qacc.index_copy_(0, index, zero_acc)
     next_time.index_copy_(0, index, zero_time)
     next_status.index_copy_(0, index, zero_status)
+    next_warning_number = self._warning_number.clone()
+    next_warning_lastinfo = self._warning_lastinfo.clone()
+    next_warning_number.index_fill_(0, index, 0)
+    next_warning_lastinfo.index_fill_(0, index, 0)
     self._qpos, self._qvel = next_qpos, next_qvel
     self._qacc, self._time, self._status = next_qacc, next_time, next_status
+    self._warning_number = next_warning_number
+    self._warning_lastinfo = next_warning_lastinfo
     if self._neq > 0:
       next_eq = self._eq_active.clone()
       eq_tensor = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)
@@ -933,9 +1133,414 @@ class DeviceState:
           tensor.index_copy_(0, index, self._torch.as_tensor(init, dtype=self._torch.float32, device=self._device))
       setattr(self, tensor_name, tensor)
     self._generation += 1
+    self._row_reset_epoch[index] += 1
     if hasattr(self, "_on_reset") and callable(self._on_reset):
       self._on_reset(env_ids=ids)
     return self._generation
+
+  def reset_mask(self, mask):
+    """Reset rows selected by a device boolean mask without host readback.
+
+    This is the autorecovery boundary used by native check-state operations.
+    It applies the persistent ``mj_resetData`` defaults; the owning
+    simulation's ``_on_masked_reset`` hook resets its device workspaces and
+    stateful plugins with the same mask.
+    """
+    torch = self._torch
+    if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
+        or tuple(mask.shape) != (self.batch_size,)
+        or mask.device != self._qvel.device
+        or not mask.is_contiguous()):
+      raise ValueError("mask must be contiguous bool[batch_size] on the state device")
+
+    if self._reset_shader is not None:
+      # Raw MSL writes avoid changing Torch's tensor mutation counters. The
+      # shader itself predicates every store and advances only selected row
+      # epochs, so healthy cached stage inputs remain live.
+      self._reset_mask_i32.copy_(mask)
+      defaults = self._reset_defaults
+      dummy_f, dummy_i = self._reset_dummy_float, self._reset_dummy_int
+
+      def device_buffer(value, dummy):
+        return value.reshape(-1) if value is not None and value.numel() else dummy
+
+      self._reset_shader(
+          self._reset_mask_i32,
+          device_buffer(self._qpos, dummy_f), device_buffer(defaults["qpos0"], dummy_f),
+          device_buffer(self._qvel, dummy_f), device_buffer(self._qacc, dummy_f),
+          self._time, self._status, self._warning_number.reshape(-1),
+          self._warning_lastinfo.reshape(-1),
+          device_buffer(self._eq_active, dummy_i), device_buffer(defaults["eq0"], dummy_i),
+          device_buffer(self._mpos, dummy_f), device_buffer(defaults["mpos0"], dummy_f),
+          device_buffer(self._mquat, dummy_f), device_buffer(defaults["mquat0"], dummy_f),
+          device_buffer(self._act, dummy_f), device_buffer(self._history, dummy_f),
+          device_buffer(defaults["history0"], dummy_f), self._qacc_warmstart.reshape(-1),
+          device_buffer(self._userdata, dummy_f), device_buffer(defaults["userdata0"], dummy_f),
+          device_buffer(self._plugin_state, dummy_f), device_buffer(defaults["plugin0"], dummy_f),
+          self._row_reset_epoch, self._reset_dims,
+          threads=(self.batch_size,), group_size=(min(self.batch_size, 128),))
+      if hasattr(self, "_on_masked_reset") and callable(self._on_masked_reset):
+        self._on_masked_reset(mask=mask)
+      return self._generation
+
+    row = mask.reshape(self.batch_size, 1)
+
+    def select(current, default):
+      if current is None:
+        return None
+      if current.ndim == 1:
+        shaped = mask
+      else:
+        shaped = row.reshape(self.batch_size, *([1] * (current.ndim - 1)))
+      # Match the predicated MSL path: keep each persistent tensor's backing
+      # identity and update only rows selected by the recovery mask.
+      current.copy_(torch.where(shaped, default, current))
+      return current
+
+    pos0 = torch.as_tensor(np.asarray(self._model.qpos0).copy(), dtype=torch.float32,
+                           device=self._device).expand_as(self._qpos)
+    self._qpos = select(self._qpos, pos0)
+    self._qvel = select(self._qvel, torch.zeros_like(self._qvel))
+    self._qacc = select(self._qacc, torch.zeros_like(self._qacc))
+    self._time = select(self._time, torch.zeros_like(self._time))
+    self._status = select(self._status, torch.zeros_like(self._status))
+    self._warning_number = select(
+        self._warning_number, torch.zeros_like(self._warning_number))
+    self._warning_lastinfo = select(
+        self._warning_lastinfo, torch.zeros_like(self._warning_lastinfo))
+    for name, default in (
+        ("_eq_active", self._eq_active0),
+        ("_mpos", self._mpos0),
+        ("_mquat", self._mquat0),
+        ("_act", np.zeros(self._na, dtype=np.float32)),
+        ("_history", self._history0),
+        ("_qacc_warmstart", None),
+        ("_userdata", self._userdata0),
+        ("_plugin_state", self._plugin_state0),
+    ):
+      current = getattr(self, name)
+      if current is None:
+        continue
+      if default is None:
+        default_tensor = torch.zeros_like(current)
+      else:
+        default_np = np.asarray(default)
+        default_tensor = torch.as_tensor(
+            np.broadcast_to(default_np, tuple(current.shape)).copy(),
+            dtype=current.dtype, device=self._device)
+      setattr(self, name, select(current, default_tensor))
+    self._row_reset_epoch.copy_(self._row_reset_epoch + mask.to(torch.int32))
+    if hasattr(self, "_on_masked_reset") and callable(self._on_masked_reset):
+      self._on_masked_reset(mask=mask)
+    return self._generation
+
+  def clear_masked_rows(self, value, mask, *, invert=False):
+    """Zero selected leading-batch rows without touching healthy rows.
+
+    Native MPS uses predicated MSL writes so healthy storage and mutation
+    counters remain unchanged. CPU state is only a test adapter.
+    """
+    torch = self._torch
+    if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
+        or tuple(mask.shape) != (self.batch_size,)
+        or mask.device != self._qvel.device
+        or not mask.is_contiguous()):
+      raise ValueError("mask must be contiguous bool[batch_size] on the state device")
+    if (not isinstance(value, torch.Tensor)
+        or value.device != self._qvel.device
+        or value.dtype not in (torch.float32, torch.int32) or value.ndim < 1
+        or value.shape[0] != self.batch_size or not value.is_contiguous()):
+      raise ValueError("value must be contiguous float32 with leading batch dimension")
+    width = value.numel() // self.batch_size
+    if width == 0:
+      return
+    if self._clear_rows_shader is not None:
+      if self.batch_size * width > (1 << 31) - 1:
+        raise ValueError("masked clear exceeds signed int32 kernel indexing")
+      self._row_operation_mask_i32.copy_(mask)
+      self._clear_rows_dims[0] = self.batch_size
+      self._clear_rows_dims[1] = width
+      self._clear_rows_dims[2] = int(bool(invert))
+      count = self.batch_size * width
+      kernel = (self._clear_rows_shader if value.dtype == torch.float32
+                else self._clear_int_rows_shader)
+      kernel(
+          self._row_operation_mask_i32, value.reshape(-1), self._clear_rows_dims,
+          threads=(count,), group_size=(min(count, 256),))
+      return
+    selected = ~mask if invert else mask
+    expanded = selected.reshape(self.batch_size, *([1] * (value.ndim - 1)))
+    value.copy_(torch.where(expanded, torch.zeros_like(value), value))
+
+  def update_masked_rows(self, target, source, mask, *, add=True, sign=1):
+    """Selected-row float32 add/assignment with no healthy-row writes."""
+    torch = self._torch
+    if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
+        or tuple(mask.shape) != (self.batch_size,)
+        or mask.device != self._qvel.device
+        or not mask.is_contiguous()):
+      raise ValueError("mask must be contiguous bool[batch_size] on the state device")
+    for name, value in (("target", target), ("source", source)):
+      if (not isinstance(value, torch.Tensor)
+          or value.device != self._qvel.device
+          or value.dtype != torch.float32 or value.ndim < 1
+          or value.shape[0] != self.batch_size or not value.is_contiguous()):
+        raise ValueError(f"{name} must be contiguous float32 with leading batch dimension")
+    if target.shape != source.shape:
+      raise ValueError("target and source must have matching shapes")
+    width = target.numel() // self.batch_size
+    if width == 0:
+      return
+    if isinstance(sign, bool) or sign not in (-1, 1):
+      raise ValueError("sign must be -1 or 1")
+    if self._update_float_rows_shader is not None:
+      count = self.batch_size * width
+      if count > (1 << 31) - 1:
+        raise ValueError("masked update exceeds signed int32 kernel indexing")
+      # This fixed conversion buffer is shared by all row-mask helpers. Every
+      # kernel call must publish its own selector; an earlier reset/clear may
+      # have left a different mask here.
+      self._row_operation_mask_i32.copy_(mask)
+      self._update_rows_dims[0] = self.batch_size
+      self._update_rows_dims[1] = width
+      self._update_rows_dims[2] = 0 if add else 1
+      self._update_rows_dims[3] = sign
+      self._update_float_rows_shader(
+          self._row_operation_mask_i32, target.reshape(-1), source.reshape(-1),
+          self._update_rows_dims, threads=(count,),
+          group_size=(min(count, 256),))
+      return
+    expanded = mask.reshape(self.batch_size, *([1] * (target.ndim - 1)))
+    selected = target + sign * source if add else sign * source
+    target.copy_(torch.where(expanded, selected, target))
+
+  def add_masked_scaled_rows(self, target, source, scale, mask, *, sign=-1):
+    """Add selected rows of ``source * scale[dof]`` without touching others."""
+    torch = self._torch
+    if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
+        or tuple(mask.shape) != (self.batch_size,)
+        or mask.device != self._qvel.device
+        or not mask.is_contiguous()):
+      raise ValueError("mask must be contiguous bool[batch_size] on the state device")
+    for name, value in (("target", target), ("source", source)):
+      if (not isinstance(value, torch.Tensor)
+          or value.device != self._qvel.device
+          or value.dtype != torch.float32 or value.ndim < 1
+          or value.shape[0] != self.batch_size or not value.is_contiguous()):
+        raise ValueError(
+            f"{name} must be contiguous float32 with leading batch dimension")
+    width = target.numel() // self.batch_size
+    if target.shape != source.shape:
+      raise ValueError("target and source must have matching shapes")
+    if (not isinstance(scale, torch.Tensor)
+        or scale.device != self._qvel.device
+        or scale.dtype != torch.float32 or tuple(scale.shape) != (width,)
+        or not scale.is_contiguous()):
+      raise ValueError("scale must be contiguous float32 with one value per row element")
+    if width == 0:
+      return
+    if sign not in (-1, 1) or isinstance(sign, bool):
+      raise ValueError("sign must be -1 or 1")
+    count = self.batch_size * width
+    if count > (1 << 31) - 1:
+      raise ValueError("masked scaled update exceeds signed int32 indexing")
+    if self._add_scaled_float_rows_shader is not None:
+      self._row_operation_mask_i32.copy_(mask)
+      self._update_rows_dims[0] = self.batch_size
+      self._update_rows_dims[1] = width
+      self._update_rows_dims[2] = sign
+      self._add_scaled_float_rows_shader(
+          self._row_operation_mask_i32, target.reshape(-1), source.reshape(-1),
+          scale.reshape(-1), self._update_rows_dims, threads=(count,),
+          group_size=(min(count, 256),))
+      return
+    expanded = mask.reshape(self.batch_size, *([1] * (target.ndim - 1)))
+    selected = target + sign * source * scale.reshape(
+        1, *([1] * (target.ndim - 1)))
+    target.copy_(torch.where(expanded, selected, target))
+
+  def copy_masked_rows(self, target, source, mask):
+    """Copy selected rows while leaving unselected storage untouched on MPS."""
+    torch = self._torch
+    if target.dtype == torch.float32 and source.dtype == torch.float32:
+      return self.update_masked_rows(target, source, mask, add=False)
+    if target.dtype != torch.int32 or source.dtype != torch.int32:
+      raise ValueError("masked row copy supports float32 or int32 tensors")
+    if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
+        or tuple(mask.shape) != (self.batch_size,)
+        or mask.device != self._qvel.device
+        or not mask.is_contiguous()):
+      raise ValueError("mask must be contiguous bool[batch_size] on the state device")
+    for name, value in (("target", target), ("source", source)):
+      if (not isinstance(value, torch.Tensor)
+          or value.device != self._qvel.device
+          or value.dtype != torch.int32 or value.ndim < 1
+          or value.shape[0] != self.batch_size or not value.is_contiguous()):
+        raise ValueError(f"{name} must be contiguous int32 with leading batch dimension")
+    if target.shape != source.shape:
+      raise ValueError("target and source must have matching shapes")
+    width = target.numel() // self.batch_size
+    if width == 0:
+      return
+    if self._copy_int_rows_shader is not None:
+      count = self.batch_size * width
+      if count > (1 << 31) - 1:
+        raise ValueError("masked copy exceeds signed int32 kernel indexing")
+      # Keep this local even when the caller previously used another helper:
+      # all helpers reuse the same fixed mask buffer.
+      self._row_operation_mask_i32.copy_(mask)
+      self._update_rows_dims[0] = self.batch_size
+      self._update_rows_dims[1] = width
+      self._copy_int_rows_shader(
+          self._row_operation_mask_i32, target.reshape(-1), source.reshape(-1),
+          self._update_rows_dims, threads=(count,),
+          group_size=(min(count, 256),))
+      return
+    expanded = mask.reshape(self.batch_size, *([1] * (target.ndim - 1)))
+    target.copy_(torch.where(expanded, source, target))
+
+  def record_warning_rows(self, mask, first_bad, warning, *, autoreset):
+    """Update one warning entry in selected rows without touching healthy rows."""
+    torch = self._torch
+    if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
+        or tuple(mask.shape) != (self.batch_size,)
+        or mask.device != self._qvel.device
+        or not mask.is_contiguous()):
+      raise ValueError("warning mask must be contiguous bool[batch_size]")
+    if (not isinstance(first_bad, torch.Tensor) or first_bad.dtype != torch.int32
+        or tuple(first_bad.shape) != (self.batch_size,)
+        or first_bad.device != self._qvel.device
+        or not first_bad.is_contiguous()):
+      raise ValueError("first_bad must be contiguous int32[batch_size]")
+    if isinstance(warning, bool) or not isinstance(warning, int) or not 0 <= warning < self._warning_number.shape[1]:
+      raise ValueError("warning index is out of range")
+    if self._warning_rows_shader is not None:
+      self._row_operation_mask_i32.copy_(mask)
+      self._warning_rows_dims[0] = self.batch_size
+      self._warning_rows_dims[1] = self._warning_number.shape[1]
+      self._warning_rows_dims[2] = warning
+      self._warning_rows_dims[3] = int(bool(autoreset))
+      self._warning_rows_shader(
+          self._row_operation_mask_i32, first_bad, self._warning_number.reshape(-1),
+          self._warning_lastinfo.reshape(-1), self._warning_rows_dims,
+          threads=(self.batch_size,), group_size=(min(self.batch_size, 128),))
+      return
+    rows = torch.arange(self.batch_size, device=self._device)[mask]
+    if rows.numel():
+      if autoreset:
+        self._warning_number[rows, warning] = 1
+      else:
+        self._warning_number[rows, warning] += 2
+      self._warning_lastinfo[rows, warning] = first_bad[rows]
+
+  def invalidate_bool_rows(self, values, mask):
+    """Clear selected bool rows with raw writes, preserving record versions."""
+    torch = self._torch
+    if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
+        or tuple(mask.shape) != (self.batch_size,)
+        or mask.device != self._qvel.device
+        or not mask.is_contiguous()):
+      raise ValueError("mask must be contiguous bool[batch_size]")
+    if (not isinstance(values, torch.Tensor) or values.dtype != torch.bool
+        or tuple(values.shape) != (self.batch_size,)
+        or values.device != self._qvel.device
+        or not values.is_contiguous()):
+      raise ValueError("values must be contiguous bool[batch_size]")
+    if self._invalidate_bool_rows_shader is not None:
+      self._row_operation_mask_i32.copy_(mask)
+      self._clear_rows_dims[0] = self.batch_size
+      self._clear_rows_dims[1] = 1
+      self._invalidate_bool_rows_shader(
+          self._row_operation_mask_i32, values, self._clear_rows_dims,
+          threads=(self.batch_size,), group_size=(min(self.batch_size, 128),))
+    else:
+      values.copy_(torch.where(mask, torch.zeros_like(values), values))
+
+  def copy_masked_strided_rows(self, target, source, mask, *, offset):
+    """Copy contiguous per-row values into a fixed offset of a wider target."""
+    torch = self._torch
+    if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
+        or tuple(mask.shape) != (self.batch_size,)
+        or mask.device != self._qvel.device
+        or not mask.is_contiguous()):
+      raise ValueError("mask must be contiguous bool[batch_size]")
+    if (not isinstance(target, torch.Tensor) or target.dtype != torch.float32
+        or target.ndim != 2 or target.shape[0] != self.batch_size
+        or target.device != self._qvel.device
+        or not target.is_contiguous()):
+      raise ValueError("target must be contiguous float32 [B,width]")
+    if (not isinstance(source, torch.Tensor) or source.dtype != torch.float32
+        or source.ndim != 2 or source.shape[0] != self.batch_size
+        or source.device != self._qvel.device
+        or not source.is_contiguous()):
+      raise ValueError("source must be contiguous float32 [B,width]")
+    width, target_width = int(source.shape[1]), int(target.shape[1])
+    if (isinstance(offset, bool) or not isinstance(offset, int)
+        or offset < 0 or offset + width > target_width):
+      raise ValueError("strided row copy offset is out of range")
+    if width == 0:
+      return
+    if self._copy_strided_float_rows_shader is not None:
+      self._row_operation_mask_i32.copy_(mask)
+      self._strided_copy_dims[0] = self.batch_size
+      self._strided_copy_dims[1] = target_width
+      self._strided_copy_dims[2] = width
+      self._strided_copy_dims[3] = offset
+      count = self.batch_size * width
+      if count > (1 << 31) - 1:
+        raise ValueError("strided row copy exceeds int32 kernel indexing")
+      self._copy_strided_float_rows_shader(
+          self._row_operation_mask_i32, target.reshape(-1), source.reshape(-1),
+          self._strided_copy_dims, threads=(count,),
+          group_size=(min(count, 256),))
+      return
+    target[:, offset:offset + width].copy_(torch.where(
+        mask[:, None], source, target[:, offset:offset + width]))
+
+  def copy_masked_packed_rows(self, target, source, mask, *, row_offset):
+    """Copy selected worlds of packed `[B, rows, width]` row families."""
+    torch = self._torch
+    if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
+        or tuple(mask.shape) != (self.batch_size,)
+        or mask.device != self._qvel.device
+        or not mask.is_contiguous()):
+      raise ValueError("mask must be contiguous bool[batch_size] on the state device")
+    for name, value in (("target", target), ("source", source)):
+      if (not isinstance(value, torch.Tensor)
+          or value.device != self._qvel.device
+          or value.dtype != torch.float32 or value.ndim != 3
+          or value.shape[0] != self.batch_size or not value.is_contiguous()):
+        raise ValueError(f"{name} must be contiguous float32 [batch, rows, width]")
+    if source.shape[2] != target.shape[2]:
+      raise ValueError("packed row widths must match")
+    if (isinstance(row_offset, bool) or not isinstance(row_offset, int)
+        or row_offset < 0
+        or row_offset + int(source.shape[1]) > int(target.shape[1])):
+      raise ValueError("packed row destination is outside the target")
+    batch = self.batch_size
+    rows, width = int(source.shape[1]), int(source.shape[2])
+    source_count = batch * rows * width
+    target_count = batch * int(target.shape[1]) * width
+    if max(source_count, target_count) > (1 << 31) - 1:
+      raise ValueError("packed masked copy exceeds signed int32 indexing")
+    if rows == 0 or width == 0:
+      return
+    if self._copy_masked_packed_rows_shader is not None:
+      self._row_operation_mask_i32.copy_(mask)
+      dims = self._copy_packed_dims
+      dims[0] = batch
+      dims[1] = rows
+      dims[2] = width
+      dims[3] = int(source.shape[1])
+      dims[4] = int(target.shape[1])
+      dims[5] = row_offset
+      self._copy_masked_packed_rows_shader(
+          self._row_operation_mask_i32, target.reshape(-1), source.reshape(-1), dims,
+          threads=(source_count,), group_size=(min(source_count, 256),))
+      return
+    target[:, row_offset:row_offset + rows].copy_(torch.where(
+        mask[:, None, None], source,
+        target[:, row_offset:row_offset + rows]))
 
   def snapshot(self):
     """Copy kinematic/equality/mocap/activation rows to a host checkpoint.
@@ -944,8 +1549,7 @@ class DeviceState:
     per-call inputs and stored sensor samples are NOT included. Use
     :meth:`MetalSimulation.snapshot` for full replayable checkpoints (R03).
     """
-    if self._neq == 0 and self._nmocap == 0 and self._na == 0:
-      snap = StateSnapshot(
+    snap = StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
         timestep=self.profile.timestep,
@@ -957,78 +1561,54 @@ class DeviceState:
         qacc=self._qacc.detach().cpu().numpy(),
         time=self._time.detach().cpu().numpy(),
         status=self._status.detach().cpu().numpy(),
-        schema_version=1,
-        neq=0,
-        eq_active=None,
-      )
-    elif self._nmocap == 0 and self._na == 0:
-      snap = StateSnapshot(
-        model_fingerprint=self._model_fingerprint,
-        profile_fingerprint=self._profile_fingerprint,
-        timestep=self.profile.timestep,
-        nq=self._model.nq,
-        nv=self._model.nv,
-        batch_size=self.batch_size,
-        qpos=self._qpos.detach().cpu().numpy(),
-        qvel=self._qvel.detach().cpu().numpy(),
-        qacc=self._qacc.detach().cpu().numpy(),
-        time=self._time.detach().cpu().numpy(),
-        status=self._status.detach().cpu().numpy(),
-        schema_version=2,
-        neq=self._neq,
-        eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
-      )
-    elif self._na == 0:
-      snap = StateSnapshot(
-        model_fingerprint=self._model_fingerprint,
-        profile_fingerprint=self._profile_fingerprint,
-        timestep=self.profile.timestep,
-        nq=self._model.nq,
-        nv=self._model.nv,
-        batch_size=self.batch_size,
-        qpos=self._qpos.detach().cpu().numpy(),
-        qvel=self._qvel.detach().cpu().numpy(),
-        qacc=self._qacc.detach().cpu().numpy(),
-        time=self._time.detach().cpu().numpy(),
-        status=self._status.detach().cpu().numpy(),
-        schema_version=3,
-        neq=self._neq,
-        eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
-        nmocap=self._nmocap,
-        mpos=self._mpos.detach().cpu().numpy(),
-        mquat=self._mquat.detach().cpu().numpy(),
-      )
-    else:
-      snap = StateSnapshot(
-        model_fingerprint=self._model_fingerprint,
-        profile_fingerprint=self._profile_fingerprint,
-        timestep=self.profile.timestep,
-        nq=self._model.nq,
-        nv=self._model.nv,
-        batch_size=self.batch_size,
-        qpos=self._qpos.detach().cpu().numpy(),
-        qvel=self._qvel.detach().cpu().numpy(),
-        qacc=self._qacc.detach().cpu().numpy(),
-        time=self._time.detach().cpu().numpy(),
-        status=self._status.detach().cpu().numpy(),
-        schema_version=4,
+        schema_version=6,
         neq=self._neq,
         eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
         nmocap=self._nmocap,
         mpos=self._mpos.detach().cpu().numpy() if self._nmocap else None,
         mquat=self._mquat.detach().cpu().numpy() if self._nmocap else None,
         nact=self._na,
-        act=self._act.detach().cpu().numpy(),
-      )
+        act=self._act.detach().cpu().numpy() if self._na else None,
+        warning_number=self._warning_number.detach().cpu().numpy(),
+        warning_lastinfo=self._warning_lastinfo.detach().cpu().numpy(),
+        row_reset_epoch=self._row_reset_epoch.detach().cpu().numpy(),
+    )
     if hasattr(self, "_on_snapshot") and callable(self._on_snapshot):
       self._on_snapshot(snap)
     return snap
+
+  def validate_snapshot(self, snapshot, env_ids=None):
+    """Preflight a restore without touching this state's tensors or hooks.
+
+    Full simulation restore uses this before invoking stateful extension
+    callbacks. A shallow probe with empty CPU tensor backings runs the exact
+    StateSnapshot validators and shape/selection logic while avoiding device
+    readbacks or writes to the live state.
+    """
+    import copy
+    import torch
+
+    probe = copy.copy(self)
+    probe._device = torch.device("cpu")
+    for name, value in vars(self).items():
+      if isinstance(value, torch.Tensor):
+        setattr(probe, name, torch.empty(
+            tuple(value.shape), dtype=value.dtype, device="cpu"))
+      elif name.startswith("_on_"):
+        # The owning Simulation separately preflights its coupled seed and
+        # plugin payloads. Never call hooks during the validation probe.
+        try:
+          delattr(probe, name)
+        except AttributeError:
+          pass
+    probe.restore(snapshot, env_ids=env_ids)
+    return True
 
   def restore(self, snapshot, env_ids=None):
     """Restore a matching checkpoint only after validating every field."""
     if not isinstance(snapshot, StateSnapshot):
       raise TypeError("snapshot must be a StateSnapshot")
-    if snapshot.schema_version not in (1, 2, 3, 4):
+    if snapshot.schema_version not in (1, 2, 3, 4, 5, 6):
       raise ValueError("unsupported state snapshot schema")
     if (
         snapshot.model_fingerprint != self._model_fingerprint
@@ -1117,6 +1697,30 @@ class DeviceState:
         status > np.iinfo(np.int32).max
     ):
       raise ValueError("snapshot status values must fit in int32")
+    nwarn = int(mujoco.mjtWarning.mjNWARNING)
+    if snapshot.schema_version >= 5:
+      warning_values = []
+      for name in ("warning_number", "warning_lastinfo"):
+        raw = getattr(snapshot, name)
+        value = np.asarray(raw)
+        if value.shape != (self.batch_size, nwarn) or value.dtype.kind not in "iu":
+          raise ValueError(f"snapshot {name} has an invalid shape or dtype")
+        if np.any(value < np.iinfo(np.int32).min) or np.any(
+            value > np.iinfo(np.int32).max):
+          raise ValueError(f"snapshot {name} values must fit in int32")
+        warning_values.append(np.asarray(value, dtype=np.int32, order="C"))
+    else:
+      warning_values = [np.zeros((self.batch_size, nwarn), dtype=np.int32)
+                        for _ in range(2)]
+    if snapshot.schema_version >= 6:
+      row_epoch = np.asarray(snapshot.row_reset_epoch)
+      if (row_epoch.shape != (self.batch_size,) or row_epoch.dtype.kind not in "iu"
+          or np.any(row_epoch < 0)
+          or np.any(row_epoch > np.iinfo(np.int32).max)):
+        raise ValueError("snapshot row_reset_epoch has an invalid shape or value")
+      row_epoch = np.asarray(row_epoch, dtype=np.int32, order="C")
+    else:
+      row_epoch = np.zeros((self.batch_size,), dtype=np.int32)
 
     tensors = (
         self._torch.as_tensor(qpos, dtype=self._torch.float32, device=self._device),
@@ -1128,9 +1732,16 @@ class DeviceState:
             dtype=self._torch.int32,
             device=self._device,
         ),
+        self._torch.as_tensor(warning_values[0].copy(), dtype=self._torch.int32,
+                              device=self._device),
+        self._torch.as_tensor(warning_values[1].copy(), dtype=self._torch.int32,
+                              device=self._device),
     )
     if ids is None:
-      self._qpos, self._qvel, self._qacc, self._time, self._status = tensors
+      (self._qpos, self._qvel, self._qacc, self._time, self._status,
+       self._warning_number, self._warning_lastinfo) = tensors
+      self._row_reset_epoch = self._torch.as_tensor(
+          row_epoch.copy(), dtype=self._torch.int32, device=self._device)
       if self._neq > 0:
         self._eq_active = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)
       if self._nmocap > 0:
@@ -1145,6 +1756,10 @@ class DeviceState:
       self._qacc[index] = tensors[2][index]
       self._time[index] = tensors[3][index]
       self._status[index] = tensors[4][index]
+      self._warning_number[index] = tensors[5][index]
+      self._warning_lastinfo[index] = tensors[6][index]
+      self._row_reset_epoch[index] = self._torch.as_tensor(
+          row_epoch.copy(), dtype=self._torch.int32, device=self._device)[index]
       if self._neq > 0:
         self._eq_active[index] = self._torch.as_tensor(eq_checked, dtype=self._torch.int32, device=self._device)[index]
       if self._nmocap > 0:

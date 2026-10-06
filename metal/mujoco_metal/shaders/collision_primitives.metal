@@ -118,6 +118,44 @@ inline int collide_sphere_sphere(
   return 1;
 }
 
+// Pinned mjraw_SphereSphere semantics used by raw capsule routines.
+inline int collide_sphere_sphere_raw(
+    float3 p1, float4 q1, float3 sz1,
+    float3 p2, float4 q2, float3 sz2,
+    float margin, thread ContactGeom* con) {
+  float3 dif=p1-p2;
+  float cdist_sqr=dot(dif,dif);
+  float min_dist=margin+sz1.x+sz2.x;
+  if (cdist_sqr>min_dist*min_dist) return 0;
+  con[0].dist=sqrt(cdist_sqr)-sz1.x-sz2.x;
+  float3 normal=p2-p1;
+  float len=length(normal);
+  if (len>0.0f) normal/=len;
+  if (len<1e-15f) {
+    float3 axis1=rotate_q(q1,float3(0,0,1));
+    float3 axis2=rotate_q(q2,float3(0,0,1));
+    normal=cross(axis1,axis2);
+    float nlen=length(normal);
+    if (nlen>0.0f) normal/=nlen;
+  }
+  con[0].normal=normal;
+  con[0].pos=p1+normal*(sz1.x+con[0].dist*0.5f);
+  con[0].t1=float3(0.0f);
+  make_frame(con[0].normal,con[0].t1,con[0].t2);
+  return 1;
+}
+
+inline int collide_sphere_capsule_raw(
+    float3 p1, float4 q1, float3 sz1,
+    float3 p2, float4 q2, float3 sz2,
+    float margin, thread ContactGeom* con) {
+  float3 axis=rotate_q(q2,float3(0,0,1));
+  float x=clamp(dot(axis,p1-p2),-sz2.y,sz2.y);
+  float3 nearest=p2+axis*x;
+  return collide_sphere_sphere_raw(p1,q1,sz1,nearest,q2,
+                                   float3(sz2.x,0,0),margin,con);
+}
+
 // 3. Plane - Capsule
 inline int collide_plane_capsule(
     float3 p1, float4 q1, float3 sz1,
@@ -213,6 +251,44 @@ inline int collide_capsule_capsule(
                                   p2 - axis2, q2, float3(sz2.x, 0, 0), margin, con + n1 + n2 + n3);
     return n1 + n2 + n3 + n4;
   }
+}
+
+// Pinned mjraw_CapsuleCapsule branch order and absolute det threshold. This
+// emits every raw witness (up to four), which filterFlexContacts may later
+// prune at the body/flex or individual-geom group level.
+inline int collide_capsule_capsule_raw(
+    float3 p1, float4 q1, float3 sz1,
+    float3 p2, float4 q2, float3 sz2,
+    float margin, thread ContactGeom* con) {
+  float3 axis1=rotate_q(q1,float3(0,0,1))*sz1.y;
+  float3 axis2=rotate_q(q2,float3(0,0,1))*sz2.y;
+  float3 dif=p1-p2;
+  float ma=dot(axis1,axis1), mb=-dot(axis1,axis2), mc=dot(axis2,axis2);
+  float u=-dot(axis1,dif), v=dot(axis2,dif);
+  float det=ma*mc-mb*mb;
+  if (abs(det) >= 1e-15f) {
+    float x1=(mc*u-mb*v)/det;
+    float x2=(ma*v-mb*u)/det;
+    if (x1>1.0f) { x1=1.0f; x2=(v-mb)/mc; }
+    else if (x1< -1.0f) { x1=-1.0f; x2=(v+mb)/mc; }
+    if (x2>1.0f) { x2=1.0f; x1=clamp((u-mb)/ma,-1.0f,1.0f); }
+    else if (x2< -1.0f) { x2=-1.0f; x1=clamp((u+mb)/ma,-1.0f,1.0f); }
+    return collide_sphere_sphere_raw(p1+axis1*x1,q1,float3(sz1.x,0,0),
+        p2+axis2*x2,q2,float3(sz2.x,0,0),margin,con);
+  }
+  int n1=collide_sphere_sphere_raw(p1+axis1,q1,float3(sz1.x,0,0),
+      p2+axis2*clamp((v-mb)/mc,-1.0f,1.0f),q2,float3(sz2.x,0,0),margin,con);
+  int n2=collide_sphere_sphere_raw(p1-axis1,q1,float3(sz1.x,0,0),
+      p2+axis2*clamp((v+mb)/mc,-1.0f,1.0f),q2,float3(sz2.x,0,0),margin,con+n1);
+  if (n1+n2>=2) return n1+n2;
+  int n3=collide_sphere_sphere_raw(
+      p1+axis1*clamp((u-mb)/ma,-1.0f,1.0f),q1,float3(sz1.x,0,0),
+      p2+axis2,q2,float3(sz2.x,0,0),margin,con+n1+n2);
+  if (n1+n2+n3>=2) return n1+n2+n3;
+  int n4=collide_sphere_sphere_raw(
+      p1+axis1*clamp((u+mb)/ma,-1.0f,1.0f),q1,float3(sz1.x,0,0),
+      p2-axis2,q2,float3(sz2.x,0,0),margin,con+n1+n2+n3);
+  return n1+n2+n3+n4;
 }
 
 // 6. Plane - Box
@@ -1329,7 +1405,8 @@ inline int collide_hfield(
     int t2, float3 po, float4 qo, float3 szo, float rbo,
     float margin, float gap, int maxn, thread ContactGeom* con,
     int gih, int gio,
-    device const float* hull, device const int* hull_info);
+    device const float* hull, device const int* hull_info,
+    thread const float3* flex_vertices, int flex_count, float flex_radius);
 
 // Milestone 013 SDF: Halton-seeded gradient-descent contacts vs analytic
 // geoms and SDF-vs-SDF (pinned mjc_SDF). SDF side second (canonical t2).
@@ -1338,8 +1415,155 @@ inline int collide_sdf(
     float3 p2, float4 q2,
     int gi1, int gi2, int maxn, thread ContactGeom* con,
     device const float* hull, device const int* hull_info);
+inline int collide_sdf_cached(
+    int t1, float3 p1, float4 q1, float3 sz1,
+    float3 p2, float4 q2,
+    int gi1, int gi2, int seed_index, int record_base,
+    device float* contact_records,
+    device const float* hull, device const int* hull_info);
+inline int collide_mesh_sdf(
+    int gi_mesh, int gi_sdf, float3 pmesh, float4 qmesh,
+    float3 psdf, float4 qsdf, thread ContactGeom* con,
+    device const float* hull, device const int* hull_info);
+inline int collide_mesh_sdf_cached(
+    int gi_mesh, int gi_sdf, float3 pmesh, float4 qmesh,
+    float3 psdf, float4 qsdf, int maxn, int record_base,
+    device float* records, int scratch_base, device float* scratch,
+    device const float* hull, device const int* hull_info);
 
 // Unified Pair Dispatcher
+
+// Narrow SDF-only dispatcher. Keeping this entrypoint separate from
+// collide_pair_without_sdf prevents the generic contact producer from having
+// any statically reachable plugin-SDF descent helpers.
+inline int collide_pair_sdf_cached(
+    int type1, float3 p1, float4 q1, float3 sz1,
+    int type2, float3 p2, float4 q2, float3 sz2,
+    int gia, int gib, int seed_index, int record_base,
+    device float* contact_records,
+    device const float* hull, device const int* hull_info) {
+  bool swapped=(type1>type2);
+  int t1=swapped?type2:type1, t2=swapped?type1:type2;
+  float3 pos1=swapped?p2:p1, pos2=swapped?p1:p2;
+  float4 quat1=swapped?q2:q1, quat2=swapped?q1:q2;
+  float3 size1=swapped?sz2:sz1;
+  int gi1=swapped?gib:gia, gi2=swapped?gia:gib;
+  int n=0;
+  if ((t1==2||t1==3||t1==4||t1==5||t1==6)&&t2==8) {
+    n=collide_sdf_cached(t1,pos1,quat1,size1,pos2,quat2,gi1,gi2,
+                         seed_index,record_base,contact_records,hull,hull_info);
+  } else if (t1==8&&t2==8) {
+    n=collide_sdf_cached(t1,pos1,quat1,size1,pos2,quat2,gi1,gi2,
+                         seed_index,record_base,contact_records,hull,hull_info);
+  }
+  if (swapped) {
+    for (int k=0;k<n;++k) {
+      int base=(record_base+k)*25+12;
+      float3 normal=-float3(contact_records[base+4],contact_records[base+5],
+                             contact_records[base+6]);
+      float3 t1v=-float3(contact_records[base+7],contact_records[base+8],
+                          contact_records[base+9]);
+      float3 t2v=cross(normal,t1v);
+      contact_records[base+4]=normal.x; contact_records[base+5]=normal.y;
+      contact_records[base+6]=normal.z;
+      contact_records[base+7]=t1v.x; contact_records[base+8]=t1v.y;
+      contact_records[base+9]=t1v.z;
+      contact_records[base+10]=t2v.x; contact_records[base+11]=t2v.y;
+      contact_records[base+12]=t2v.z;
+    }
+  }
+  return n;
+}
+
+inline int collide_pair_mesh_sdf_cached(
+    int type1, float3 p1, float4 q1,
+    int type2, float3 p2, float4 q2,
+    int gia, int gib, int maxn, int record_base, device float* records,
+    int scratch_base, device float* scratch,
+    device const float* hull, device const int* hull_info) {
+  bool swapped=(type1>type2);
+  int t1=swapped?type2:type1, t2=swapped?type1:type2;
+  float3 pos1=swapped?p2:p1, pos2=swapped?p1:p2;
+  float4 quat1=swapped?q2:q1, quat2=swapped?q1:q2;
+  int gi1=swapped?gib:gia, gi2=swapped?gia:gib;
+  int n=0;
+  if (t1==7 && t2==8)
+    n=collide_mesh_sdf_cached(gi1,gi2,pos1,quat1,pos2,quat2,
+                              maxn,record_base,records,scratch_base,scratch,
+                              hull,hull_info);
+  if (swapped) {
+    for (int k=0;k<n;++k) {
+      int base=(record_base+k)*25+12;
+      float3 normal=-float3(records[base+4],records[base+5],records[base+6]);
+      float3 t1v=-float3(records[base+7],records[base+8],records[base+9]);
+      float3 t2v=cross(normal,t1v);
+      records[base+4]=normal.x; records[base+5]=normal.y; records[base+6]=normal.z;
+      records[base+7]=t1v.x; records[base+8]=t1v.y; records[base+9]=t1v.z;
+      records[base+10]=t2v.x; records[base+11]=t2v.y; records[base+12]=t2v.z;
+    }
+  }
+  return n;
+}
+
+inline int collide_pair_mesh_sdf(
+    int type1, float3 p1, float4 q1,
+    int type2, float3 p2, float4 q2,
+    int gia, int gib, thread ContactGeom* con,
+    device const float* hull, device const int* hull_info) {
+  bool swapped=(type1>type2);
+  int t1=swapped?type2:type1, t2=swapped?type1:type2;
+  float3 pos1=swapped?p2:p1, pos2=swapped?p1:p2;
+  float4 quat1=swapped?q2:q1, quat2=swapped?q1:q2;
+  int gi1=swapped?gib:gia, gi2=swapped?gia:gib;
+  int n=0;
+  if (t1==7 && t2==8)
+    n=collide_mesh_sdf(gi1,gi2,pos1,quat1,pos2,quat2,con,hull,hull_info);
+  if (swapped) {
+    for (int k=0;k<n;++k) {
+      con[k].normal=-con[k].normal;
+      con[k].t1=-con[k].t1;
+      con[k].t2=cross(con[k].normal,con[k].t1);
+    }
+  }
+  return n;
+}
+
+inline int collide_pair_sdf(
+    int type1, float3 p1, float4 q1, float3 sz1,
+    int type2, float3 p2, float4 q2, float3 sz2,
+    thread ContactGeom* con, int gia, int gib,
+    device const float* hull, device const int* hull_info, int maxn) {
+  bool swapped = (type1 > type2);
+  int t1 = swapped ? type2 : type1;
+  int t2 = swapped ? type1 : type2;
+  float3 pos1 = swapped ? p2 : p1;
+  float4 quat1 = swapped ? q2 : q1;
+  float3 size1 = swapped ? sz2 : sz1;
+  float3 pos2 = swapped ? p1 : p2;
+  float4 quat2 = swapped ? q1 : q2;
+  int gi1 = swapped ? gib : gia;
+  int gi2 = swapped ? gia : gib;
+  int n = 0;
+  if (t1 == 7 && t2 == 8) {
+    n = collide_mesh_sdf(gi1, gi2, pos1, quat1, pos2, quat2,
+                         con, hull, hull_info);
+  } else if ((t1 == 2 || t1 == 3 || t1 == 4 || t1 == 5 || t1 == 6) && t2 == 8) {
+    n = collide_sdf(t1, pos1, quat1, size1, pos2, quat2,
+                    gi1, gi2, maxn, con, hull, hull_info);
+  } else if (t1 == 8 && t2 == 8) {
+    n = collide_sdf(t1, pos1, quat1, size1, pos2, quat2,
+                    gi1, gi2, maxn, con, hull, hull_info);
+  }
+  if (swapped) {
+    for (int k = 0; k < n; ++k) {
+      con[k].normal = -con[k].normal;
+      con[k].t1 = -con[k].t1;
+      con[k].t2 = cross(con[k].normal, con[k].t1);
+    }
+  }
+  return n;
+}
+
 inline int collide_pair(
     int type1, float3 p1, float4 q1, float3 sz1, float rb1,
     int type2, float3 p2, float4 q2, float3 sz2, float rb2,
@@ -1425,12 +1649,14 @@ inline int collide_pair(
     // this arm is unreachable defense.
     n = 0;
   } else if (t1 == 1 && (t2 == 2 || t2 == 3 || t2 == 4 || t2 == 5 || t2 == 6 || t2 == 7)) {
-    // Milestone 012: per-prism terrain collision (pinned mjc_ConvexHField).
+    // Milestone 012: per-prism terrain collision (pinned mjc_ConvexHField);
+    // convex meshes use the same precompiled hull-support interface.
     // Hfield is canonical t1; maxn is this pair's contact-slot budget.
     // Margin/gap travel separately (R05-2: margin raises/shifts, gap is
     // detection range only).
     n = collide_hfield(pos1, quat1, t2, pos2, quat2, size2, r2,
-                       margin, gap, maxn, con, gi1, gi2, hull, hull_info);
+                       margin, gap, maxn, con, gi1, gi2, hull, hull_info,
+                       nullptr, 0, 0.0f);
   } else if (t1 == 0 && t2 == 8) {
     // Milestone 013: plane-SDF pairs yield no contacts (pinned driver).
     n = 0;
@@ -1438,16 +1664,128 @@ inline int collide_pair(
     // Milestone 013: heightfield-SDF is unsupported upstream (warns and
     // returns 0); lowering reserves zero slots for these pairs.
     n = 0;
+  } else if (t1 == 7 && t2 == 8) {
+    // Pinned mjc_MeshSDF traverses mesh BVH faces, samples each intersecting
+    // triangle with Halton points, minimizes with Frank-Wolfe, and keeps at
+    // most mjMAXCONPAIR candidates.
+    n = collide_mesh_sdf(gi1, gi2, pos1, quat1, pos2, quat2,
+                         con, hull, hull_info);
   } else if ((t1 == 2 || t1 == 3 || t1 == 4 || t1 == 5 || t1 == 6) && t2 == 8) {
     // Milestone 013: SDF vs analytic via Halton/descent (pinned mjc_SDF).
-    // Mesh-SDF is rejected at lowering (BVH+FPS follow-up); maxn carries
-    // the pair's seed budget (== opt.sdf_initpoints here).
+    // maxn carries this pair's seed budget (== opt.sdf_initpoints here).
     n = collide_sdf(t1, pos1, quat1, size1, pos2, quat2,
                     gi1, gi2, maxn, con, hull, hull_info);
   } else if (t1 == 8 && t2 == 8) {
     // Milestone 013: SDF-vs-SDF uses the same descent path.
     n = collide_sdf(t1, pos1, quat1, size1, pos2, quat2,
                     gi1, gi2, maxn, con, hull, hull_info);
+  }
+
+  // If order was swapped, normal points from pos1 to pos2, which is from original geom2 to geom1.
+  // Negate normal to point from original geom1 to geom2!
+  if (swapped) {
+    for (int k = 0; k < n; ++k) {
+      con[k].normal = -con[k].normal;
+      con[k].t1 = -con[k].t1;
+      con[k].t2 = cross(con[k].normal, con[k].t1);
+    }
+  }
+  return n;
+}
+
+inline int collide_pair_without_sdf(
+    int type1, float3 p1, float4 q1, float3 sz1, float rb1,
+    int type2, float3 p2, float4 q2, float3 sz2, float rb2,
+    float margin, float gap, int disable_multiccd, thread ContactGeom* con,
+    int gia, int gib,
+    device const float* hull, device const int* hull_info,
+    int maxn) {
+  // Types: 0 = plane, 1 = hfield, 2 = sphere, 3 = capsule, 4 = ellipsoid, 5 = cylinder, 6 = box, 7 = mesh
+  bool swapped = (type1 > type2);
+  int t1 = swapped ? type2 : type1;
+  int t2 = swapped ? type1 : type2;
+  float3 pos1 = swapped ? p2 : p1;
+  float4 quat1 = swapped ? q2 : q1;
+  float3 size1 = swapped ? sz2 : sz1;
+  float r1 = swapped ? rb2 : rb1;
+  float3 pos2 = swapped ? p1 : p2;
+  float4 quat2 = swapped ? q1 : q2;
+  float3 size2 = swapped ? sz1 : sz2;
+  float r2 = swapped ? rb1 : rb2;
+  int gi1 = swapped ? gib : gia;
+  int gi2 = swapped ? gia : gib;
+  float mg = margin + gap;
+
+  int n = 0;
+  if (t1 == 0 && t2 == 2) {
+    n = collide_plane_sphere(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 2 && t2 == 2) {
+    n = collide_sphere_sphere(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 0 && t2 == 3) {
+    n = collide_plane_capsule(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 2 && t2 == 3) {
+    n = collide_sphere_capsule(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 3 && t2 == 3) {
+    n = collide_capsule_capsule(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 0 && t2 == 6) {
+    n = collide_plane_box(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 2 && t2 == 6) {
+    n = collide_sphere_box(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 3 && t2 == 6) {
+    n = collide_capsule_box(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 6 && t2 == 6) {
+    n = collide_box_box(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 0 && t2 == 5) {
+    n = collide_plane_cylinder(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 2 && t2 == 5) {
+    n = collide_sphere_cylinder(pos1, quat1, size1, pos2, quat2, size2, mg, con);
+  } else if (t1 == 0 && t2 == 4) {
+    n = collide_plane_convex(pos1, quat1, t2, pos2, quat2, size2, mg, con,
+                             gi1, gi2, hull, hull_info, nullptr);
+  } else if ((t1 == 2 && t2 == 4) || (t1 == 3 && t2 == 4) || (t1 == 4 && t2 == 4)
+             || (t1 == 4 && t2 == 5) || (t1 == 4 && t2 == 6)) {
+    n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, mg, con,
+                              gi1, gi2, hull, hull_info, nullptr);
+  } else if ((t1 == 3 && t2 == 5) || (t1 == 5 && t2 == 5) || (t1 == 5 && t2 == 6)) {
+    n = collide_convex_multi(t1, pos1, quat1, size1, t2, pos2, quat2, size2,
+                             mg, 5, r1, r2, disable_multiccd, con,
+                             gi1, gi2, hull, hull_info, nullptr);
+  } else if (t1 == 0 && t2 == 7) {
+    // R05-1 mesh-plane face manifold (bounded face-clip expansion, host
+    // budget 4, sorted identity).
+    n = collide_mesh_plane_manifold(pos1, quat1, t2, pos2, quat2, size2,
+                             mg, maxn, con,
+                             gi1, gi2, hull, hull_info);
+  } else if ((t1 == 2 && t2 == 7) || (t1 == 3 && t2 == 7) || (t1 == 4 && t2 == 7)
+             || (t1 == 5 && t2 == 7) || (t1 == 6 && t2 == 7) || (t1 == 7 && t2 == 7)) {
+    // R05-1: sphere/ellipsoid-involved mesh pairs stay single (pinned
+    // rule); box/cylinder/capsule/mesh-vs-mesh use the bounded multiCCD
+    // manifold with the pair slot budget.
+    if (t1 == 2 || t2 == 2 || t1 == 4 || t2 == 4) {
+      n = collide_convex_single(t1, pos1, quat1, size1, t2, pos2, quat2, size2, mg, con,
+                                gi1, gi2, hull, hull_info, nullptr);
+    } else {
+      n = collide_convex_multi(t1, pos1, quat1, size1, t2, pos2, quat2, size2,
+                               mg, maxn, r1, r2, disable_multiccd, con,
+                               gi1, gi2, hull, hull_info, nullptr);
+    }
+  } else if (t1 == 0 && t2 == 1) {
+    // Milestone 012: plane-heightfield pairs yield no contacts (pinned
+    // static-static skip; lowering reserves zero slots for them).
+    n = 0;
+  } else if (t1 == 1 && t2 == 1) {
+    // Milestone 012: heightfield-heightfield is rejected at lowering;
+    // this arm is unreachable defense.
+    n = 0;
+  } else if (t1 == 1 && (t2 == 2 || t2 == 3 || t2 == 4 || t2 == 5 || t2 == 6 || t2 == 7)) {
+    // Milestone 012: per-prism terrain collision (pinned mjc_ConvexHField);
+    // convex meshes use the same precompiled hull-support interface.
+    // Hfield is canonical t1; maxn is this pair's contact-slot budget.
+    // Margin/gap travel separately (R05-2: margin raises/shifts, gap is
+    // detection range only).
+    n = collide_hfield(pos1, quat1, t2, pos2, quat2, size2, r2,
+                       margin, gap, maxn, con, gi1, gi2, hull, hull_info,
+                       nullptr, 0, 0.0f);
   }
 
   // If order was swapped, normal points from pos1 to pos2, which is from original geom2 to geom1.

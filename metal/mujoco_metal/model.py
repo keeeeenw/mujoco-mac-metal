@@ -144,6 +144,65 @@ def _quat_mul(a, b):
   )
 
 
+_SAMEFRAME_EPS = 1e-6
+
+
+def _same_vec(a, b):
+  return bool(np.all(np.abs(np.asarray(a) - np.asarray(b)) < _SAMEFRAME_EPS))
+
+
+def _same_quat(a, b):
+  a = np.asarray(a)
+  b = np.asarray(b)
+  return bool(
+      np.all(np.abs(a - b) < _SAMEFRAME_EPS)
+      or np.all(np.abs(a + b) < _SAMEFRAME_EPS)
+  )
+
+
+def _null_pose(pos, quat):
+  return _same_vec(pos, np.zeros(3)) and _same_quat(quat, np.array([1., 0., 0., 0.]))
+
+
+def _source_sameframe_codes(model):
+  """Recompute compiler SAMEFRAME classifications after metadata mutation.
+
+  This mirrors MuJoCo 3.10 `user_model.cc`'s `IsNullPose`/`IsSamePose`
+  ordering and strict 1e-6 element-wise comparisons. The flags are static
+  compiled metadata, so refresh them whenever a descriptor snapshot is made.
+  """
+  body = np.empty(model.nbody, dtype=np.int32)
+  geom = np.empty(model.ngeom, dtype=np.int32)
+  site = np.empty(model.nsite, dtype=np.int32)
+  for b in range(model.nbody):
+    if _null_pose(model.body_ipos[b], model.body_iquat[b]):
+      body[b] = 1  # mjSAMEFRAME_BODY
+    elif _same_quat(model.body_iquat[b], [1., 0., 0., 0.]):
+      body[b] = 3  # mjSAMEFRAME_BODYROT
+    else:
+      body[b] = 0  # mjSAMEFRAME_NONE
+  for bodyids, positions, quaternions, out in (
+      (model.geom_bodyid, model.geom_pos, model.geom_quat, geom),
+      (model.site_bodyid, model.site_pos, model.site_quat, site),
+  ):
+    for i, b in enumerate(bodyids):
+      b = int(b)
+      pos, quat = positions[i], quaternions[i]
+      if _null_pose(pos, quat):
+        out[i] = 1  # mjSAMEFRAME_BODY
+      elif _same_quat(quat, [1., 0., 0., 0.]):
+        out[i] = 3  # mjSAMEFRAME_BODYROT
+      elif _same_vec(pos, model.body_ipos[b]) and _same_quat(
+          quat, model.body_iquat[b]):
+        out[i] = 2  # mjSAMEFRAME_INERTIA
+      elif _same_quat(quat, model.body_iquat[b]):
+        out[i] = 4  # mjSAMEFRAME_INERTIAROT
+      else:
+        out[i] = 0  # mjSAMEFRAME_NONE
+  return {"body_sameframe": body, "geom_sameframe": geom,
+          "site_sameframe": site}
+
+
 def _rotate(q, v):
   p = np.array([0.0, *v])
   return _quat_mul(_quat_mul(q, p), q * np.array([1.0, -1.0, -1.0, -1.0]))[1:]
@@ -235,6 +294,9 @@ class ModelDescriptor:
   site_bodyid: np.ndarray
   site_pos: np.ndarray
   site_quat: np.ndarray
+  body_sameframe: np.ndarray
+  geom_sameframe: np.ndarray
+  site_sameframe: np.ndarray
 
   def _checked_mocap(self, mocap_pos, mocap_quat):
     """Validate prescribed mocap poses, defaulting to compiled reference frames."""
@@ -371,12 +433,19 @@ def snapshot_descriptor(model):
       for field in fields(ModelDescriptor)
       if isinstance(getattr(model, field.name), np.ndarray)
   }
+  # ModelLifecycle can replace compiled reference poses/inertia values.
+  # Rebuild the optimization codes from those current arrays before taking a
+  # descriptor snapshot; carrying stale SAMEFRAME flags changes FK semantics.
+  sameframes = _source_sameframe_codes(model)
+  values.update(sameframes)
   _validate_lowered(counts, values)
   arrays = {
       field.name: _frozen(getattr(model, field.name))
       for field in fields(ModelDescriptor)
       if isinstance(getattr(model, field.name), np.ndarray)
   }
+  arrays.update({name: _frozen(value, np.int32)
+                 for name, value in sameframes.items()})
   return replace(model, **arrays)
 
 
@@ -443,6 +512,9 @@ def _validate_lowered(counts, values):
       "site_bodyid": (counts["nsite"],),
       "site_pos": (counts["nsite"], 3),
       "site_quat": (counts["nsite"], 4),
+      "body_sameframe": (nb,),
+      "geom_sameframe": (counts["ngeom"],),
+      "site_sameframe": (counts["nsite"],),
   }
   for name, shape in array_shapes.items():
     if name not in values:
@@ -455,6 +527,14 @@ def _validate_lowered(counts, values):
         np.isfinite(values[name])
     ):
       raise ValueError(f"nonfinite values in {name}")
+  for name in ("body_sameframe", "geom_sameframe", "site_sameframe"):
+    if np.any(values[name] < 0) or np.any(values[name] > 4):
+      raise ValueError(f"invalid same-frame code in {name}")
+  # body_sameframe describes the body's inertial frame relative to its body
+  # frame. MuJoCo 3.10's compiler emits NONE, BODY, or BODYROT here; INERTIA
+  # and INERTIAROT are meaningful only for attached geom/site frames.
+  if np.any(~np.isin(values["body_sameframe"], (0, 1, 3))):
+    raise ValueError("invalid MuJoCo 3.10 body_sameframe code")
   for name in ("body_quat", "body_iquat", "geom_quat", "site_quat"):
     norms = np.linalg.norm(values[name], axis=1)
     if np.any(np.abs(norms - 1.0) > 1e-6):
@@ -677,6 +757,9 @@ def load_model(source):
       "site_bodyid",
       "site_pos",
       "site_quat",
+      "body_sameframe",
+      "geom_sameframe",
+      "site_sameframe",
   ):
     source_value = m.opt.gravity if name == "gravity" else getattr(m, name)
     values[name] = _frozen(source_value)

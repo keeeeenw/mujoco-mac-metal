@@ -47,8 +47,11 @@ class MetalEulerIntegration:
   The velocity update is ``qvel += dt*qacc``. Position integration follows
   MuJoCo 3.10 for hinge, slide, ball and free joints, using the updated
   velocity, or an explicit ``position_velocity`` for midpoint integration.
-  An optional ``next_velocity`` supplies the candidate velocity directly. Both
-  overrides receive the same finite-value and per-row commit checks.
+  An optional ``next_velocity`` supplies the candidate velocity directly. An
+  optional ``awake_lists`` applies MuJoCo's pre-integration sleep ownership:
+  only listed DOFs and joints advance, while asleep qpos is retained and asleep
+  qvel is zero. Both velocity overrides receive the same finite-value and
+  per-row commit checks.
   Construction validates and snapshots model constants, initializes
   MPS, and compiles the shader. It does not read state values back to the host.
   """
@@ -91,10 +94,11 @@ class MetalEulerIntegration:
     self.nq = self.model.nq
     self.nv = self.model.nv
     self.njnt = self.model.njnt
+    self.nbody = self.model.nbody
     max_index = (1 << 32) - 1
     if any(
         value > (1 << 31) - 1
-        for value in (self.nq, self.nv, self.njnt, batch_size)
+        for value in (self.nq, self.nv, self.njnt, self.nbody, batch_size)
     ):
       raise ValueError("dimensions must fit the shader's signed 32-bit ABI")
     if batch_size * max(self.nq, self.nv) > max_index:
@@ -113,8 +117,10 @@ class MetalEulerIntegration:
     self._joint_type = self._device_array(self.model.jnt_type)
     self._joint_qposadr = self._device_array(self.model.jnt_qposadr)
     self._joint_dofadr = self._device_array(self.model.jnt_dofadr)
+    self._body_jntadr = self._device_array(self.model.body_jntadr)
+    self._body_jntnum = self._device_array(self.model.body_jntnum)
     self._dims = torch.tensor(
-        [self.nq, self.nv, self.njnt, batch_size],
+        [self.nq, self.nv, self.njnt, batch_size, self.nbody],
         dtype=torch.int32,
         device=self._device,
     )
@@ -123,6 +129,8 @@ class MetalEulerIntegration:
         torch.tensor([mode], dtype=torch.int32, device=self._device)
         for mode in range(4)
     )
+    self._sleep_filter = torch.zeros(1, dtype=torch.int32, device=self._device)
+    self._dummy_int = torch.zeros(1, dtype=torch.int32, device=self._device)
     self._empty_input = torch.zeros(1, dtype=torch.float32, device=self._device)
     self._candidate_qpos = torch.empty(
         max(batch_size * self.nq, 1), dtype=torch.float32, device=self._device
@@ -173,8 +181,14 @@ class MetalEulerIntegration:
       *,
       next_velocity=None,
       position_velocity=None,
+      awake_lists=None,
   ):
-    """Return candidate states, preserving any row that fails validation."""
+    """Return candidate states, optionally restricted to current awake lists.
+
+    For a pinned sleep step, update the scheduler from pre-integration qvel
+    first, zero qacc entries for trees newly put to sleep, and pass its current
+    awake lists here. A row that fails validation preserves its input state.
+    """
     batch = self.batch_size
     self._validate_tensor(qpos, "qpos", (batch, self.nq), self._torch.float32)
     self._validate_tensor(qvel, "qvel", (batch, self.nv), self._torch.float32)
@@ -195,6 +209,33 @@ class MetalEulerIntegration:
     mode = int(next_velocity is not None) + 2 * int(
         position_velocity is not None
     )
+    sleep_filter = awake_lists is not None
+    if sleep_filter:
+      if not isinstance(awake_lists, dict):
+        raise TypeError("awake_lists must be a dictionary")
+      required = ("body_ids", "dof_ids", "counts")
+      if any(name not in awake_lists for name in required):
+        raise ValueError("awake_lists must contain body_ids, dof_ids, counts")
+      expected_shapes = {
+          "body_ids": (batch, max(self.nbody, 1)),
+          "dof_ids": (batch, max(self.nv, 1)),
+          "counts": (batch, 3),
+      }
+      for name, shape in expected_shapes.items():
+        value = awake_lists[name]
+        if (not isinstance(value, self._torch.Tensor)
+            or tuple(value.shape) != shape
+            or value.dtype != self._torch.int32
+            or value.device.type != "mps"
+            or not value.is_contiguous()):
+          raise ValueError(
+              f"awake_lists.{name} must be contiguous MPS int32 {shape}")
+      body_ids = awake_lists["body_ids"]
+      dof_ids = awake_lists["dof_ids"]
+      counts = awake_lists["counts"]
+    else:
+      body_ids = dof_ids = counts = self._dummy_int
+    self._sleep_filter.fill_(int(sleep_filter))
     next_buffer = (
         next_velocity.reshape(-1)
         if next_velocity is not None and self.nv
@@ -230,6 +271,12 @@ class MetalEulerIntegration:
         next_buffer,
         position_buffer,
         self._velocity_modes[mode],
+        self._body_jntadr,
+        self._body_jntnum,
+        body_ids.reshape(-1) if sleep_filter else self._dummy_int,
+        dof_ids.reshape(-1) if sleep_filter else self._dummy_int,
+        counts,
+        self._sleep_filter,
         threads=(batch,),
         group_size=(1,),
     )

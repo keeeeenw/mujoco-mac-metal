@@ -35,6 +35,7 @@ kernel void inertia_box_fluid(
     uint world [[thread_position_in_grid]]) {
   int nv=dims[0], nbody=dims[1], njnt=dims[2], batch=dims[3], disabled=dims[4];
   if (world>=uint(batch)) return;
+  if (dims[6 + int(world)] == 0) return;
   uint forcebase=world*uint(nv), jointbase=world*uint(njnt);
   for (int d=0;d<nv;++d) qfrc[forcebase+uint(d)]=0.0f;
   if (disabled || (fluid[0]<=0.0f && fluid[1]<=0.0f)) return;
@@ -144,6 +145,7 @@ kernel void ellipsoid_geom_fluid(
   int nv=dims[0], nbody=dims[1], njnt=dims[2], batch=dims[3], ngeom=dims[5];
   int disabled=dims[4];
   if (world>=uint(batch)) return;
+  if (dims[6 + int(world)] == 0) return;
   uint forcebase=world*uint(nv), jointbase=world*uint(njnt);
   if (disabled || (fluid[0]<=0.0f && fluid[1]<=0.0f)) return;
   uint body6=world*uint(nbody*6), body3=world*uint(nbody*3), body4=world*uint(nbody*4);

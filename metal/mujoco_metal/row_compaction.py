@@ -79,10 +79,10 @@ class CompactionWorkspace:
     self.block_sum = torch.zeros((self.batch, blocks), dtype=torch.int32, device=self.device)
     self.block_offset = torch.zeros((self.batch, blocks), dtype=torch.int32, device=self.device)
     self.dims = torch.tensor(
-        (self.logical_count, self.capacity, self.batch, blocks),
-        dtype=torch.int32, device=self.device)
+        (self.logical_count, self.capacity, self.batch, blocks)
+        + (1,) * self.batch, dtype=torch.int32, device=self.device)
 
-  def run(self, flags):
+  def run(self, flags, world_mask=None):
     import torch
     if flags.ndim == 1:
       flags = flags.reshape(1, -1)
@@ -92,12 +92,21 @@ class CompactionWorkspace:
           f"({self.batch}, {self.logical_count}); got {tuple(flags.shape)}")
     if flags.device.type != "mps":
       raise ValueError("native compaction flags must be on MPS")
+    if world_mask is None:
+      self.dims[4:].fill_(1)
+    else:
+      if (not isinstance(world_mask, torch.Tensor)
+          or tuple(world_mask.shape) != (self.batch,)
+          or world_mask.dtype != torch.int32
+          or world_mask.device != self.output.packed_to_logical.device
+          or not world_mask.is_contiguous()):
+        raise ValueError("world_mask must be contiguous MPS int32 [batch]")
+      self.dims[4:].copy_(world_mask)
     if not flags.is_contiguous():
       flags = flags.contiguous()
     flags = flags.to(dtype=torch.float32).contiguous()
-    self.output.packed_to_logical.fill_(-1)
-    self.output.logical_to_packed.fill_(-1)
-    _launch_compaction_kernel(flags, self, torch)
+    masked = world_mask is not None
+    _launch_compaction_kernel(flags, self, torch, masked=masked)
     return self.output
 
 
@@ -183,7 +192,7 @@ def _compact_flags_metal(flags, capacity, torch):
   return workspace.run(flags)
 
 
-def _launch_compaction_kernel(flags, workspace, torch):
+def _launch_compaction_kernel(flags, workspace, torch, *, masked=False):
   global _METAL_LIBRARY
   if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
     raise RuntimeError("native row compaction requires PyTorch MPS compile_shader")
@@ -192,6 +201,15 @@ def _launch_compaction_kernel(flags, workspace, torch):
   batch, logical_count = workspace.batch, workspace.logical_count
   output = workspace.output
   blocks = int(workspace.block_sum.shape[1])
+  if masked:
+    _METAL_LIBRARY.clear_compaction_maps_masked(
+        output.packed_to_logical, output.logical_to_packed,
+        output.active_count, output.overflow, workspace.dims,
+        threads=(batch * max(workspace.capacity, logical_count, 1),),
+        group_size=(128,))
+  else:
+    output.packed_to_logical.fill_(-1)
+    output.logical_to_packed.fill_(-1)
   _METAL_LIBRARY.compact_flag_blocks(
       flags, workspace.local_prefix, workspace.block_sum, workspace.dims,
       threads=(batch * blocks * _SCAN_BLOCK_SIZE,),

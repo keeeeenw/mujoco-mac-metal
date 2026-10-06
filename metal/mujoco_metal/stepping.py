@@ -108,6 +108,33 @@ class SteppingProfile:
   execution_plan: object = None
 
 
+def _implicit_execution_plan(plan, profile):
+  """Replace Euler damping with the actual derivative/total-force solve."""
+  if plan is None:
+    return None
+  constrained = plan.is_stage_enabled("coupled_constraints")
+  dependency = "coupled_constraints" if constrained else "unconstrained_solve"
+  stages = []
+  for stage in plan.stages:
+    if stage.name == "euler_damping":
+      stages.append(replace(stage, enabled=False))
+    elif stage.name == "euler_integration":
+      stages.append(PipelineStageSpec(
+          name="implicit_velocity", subsystem="implicit_solve", enabled=True,
+          dependencies=(dependency,),
+          inputs=("effective_mass", "qfrc_smooth", "qpos", "qvel", "ctrl")
+          + (("qfrc_constraint",) if constrained else ()),
+          outputs=("integration_acceleration", "implicit_status"),
+          buffer_lifetimes=("scratch: complete force-velocity derivative and implicit effective mass",)))
+      stages.append(replace(stage, dependencies=("implicit_velocity",),
+                            inputs=("qpos", "qvel", "integration_acceleration", "time", "status")))
+    else:
+      stages.append(stage)
+  result = replace(plan, profile_name=profile, stages=tuple(stages))
+  result.validate_dependencies()
+  return result
+
+
 _SUPPORTED = (
     "rigid hinge, slide, free, and ball joints",
     "gravity (including the MuJoCo gravity disable flag)",
@@ -119,7 +146,6 @@ _SUPPORTED = (
 
 _IRRELEVANT = (
     "constraint-solver options because this profile has no constraints",
-    "energy diagnostics flag; stepping does not produce energy diagnostics",
     "visual, rendering, naming, keyframe, and user-data metadata",
     "disable flags for absent or rejected subsystems",
 )
@@ -320,7 +346,8 @@ def _build_integrated_execution_plan(
     coupled_debug_stride = (
         coupled_desc.nr * coupled_desc.nr + 7 * coupled_desc.nr
         + primal_scratch_floats(
-            model.nv, coupled_desc.nr, coupled_desc.solver_type))
+            model.nv, coupled_desc.nr, coupled_desc.solver_type,
+            model.ntree, model.nbody))
   if euler_damping_enabled:
     audit.append({"name": "effective_mass", "residency": "MPS device-resident", "lifetime": "scratch/step", "shape": f"(batch, {model.nv}, {model.nv})", "dtype": "float32"})
   if coupled_constraints_enabled:
@@ -392,16 +419,26 @@ def validate_stepping_profile(
     if not math.isfinite(float(opt.timestep)) or opt.timestep <= 0:
       raise ValueError("compiled model timestep must be finite and positive")
 
-    max_nv = 64 if profile == "integrated_scalable_v1" else 32
-    if model.nv > max_nv:
-      raise ValueError(f"{profile} bounds nv to {max_nv}; found {model.nv}")
+    # The scalable profile's admitted dimension is governed by its explicit
+    # CapacityLimits and per-allocation signed-index/memory preflight below.
+    # Keep the historical small dense profile's kernel-local bound only.
+    if profile == "integrated_euler_v1" and model.nv > 32:
+      raise ValueError(
+          f"{profile} bounds nv to 32; found {model.nv}")
 
     enable = int(opt.enableflags)
     sleep = int(mujoco.mjtEnableBit.mjENBL_SLEEP)
     if enable & sleep and profile != "integrated_scalable_v1":
       raise ValueError("sleep mode is unsupported by integrated_euler_v1")
     energy = int(mujoco.mjtEnableBit.mjENBL_ENERGY)
-    unknown_enable = enable & ~(energy | sleep)
+    inv_discrete = int(mujoco.mjtEnableBit.mjENBL_INVDISCRETE)
+    fwdinv = int(mujoco.mjtEnableBit.mjENBL_FWDINV)
+    diag_exact = int(mujoco.mjtEnableBit.mjENBL_DIAGEXACT)
+    contact_override = int(mujoco.mjtEnableBit.mjENBL_OVERRIDE)
+    known_enable = energy | sleep | inv_discrete | fwdinv
+    if profile in ("integrated_scalable_v1", "integrated_euler_v1"):
+      known_enable |= diag_exact | contact_override
+    unknown_enable = enable & ~known_enable
     if unknown_enable:
       raise ValueError(f"unsupported enable flags: 0x{unknown_enable:x}")
 
@@ -427,20 +464,73 @@ def validate_stepping_profile(
         "semi-implicit Euler integration",
         "gravity compensation and MuJoCo disable flags",
     ]
+    if int(opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY):
+      supported_list.append("pinned potential and kinetic energy stage diagnostics")
+    if int(opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_OVERRIDE):
+      supported_list.append(
+          "pinned global contact overrides for margin, solref, solimp, and friction")
     if hasattr(model, "nflex") and model.nflex > 0:
       supported_list.append("native flex/deformable bodies, constitutive models, and constraints")
     if model.nmocap > 0:
       supported_list.append("native per-environment mocap bodies and inputs")
 
+    bundled_plugins = None
+    if int(model.nplugin):
+      from mujoco_metal.bundled_plugins import lower_bundled_plugins
+      bundled_plugins = lower_bundled_plugins(model)
+      bundled_names = {instance.name for instance in bundled_plugins.instances}
+      # These five 3.10.0 bundled SDF classes are pure, immutable shape
+      # descriptors consumed by the native rigid collision kernel.  Keep the
+      # allowlist exact: generic and third-party plugins still fail closed.
+      sdf_classes = {
+          "mujoco.sdf.bolt", "mujoco.sdf.bowl", "mujoco.sdf.gear",
+          "mujoco.sdf.nut", "mujoco.sdf.torus",
+      }
+      supported_bundled = {"mujoco.pid", "mujoco.sensor.touch_grid",
+                           "mujoco.elasticity.cable"} | sdf_classes
+      unsupported_bundled = bundled_names - supported_bundled
+      if unsupported_bundled:
+        raise ValueError(
+            "integrated bundled plugin classes are not supported by this "
+            f"profile: {sorted(unsupported_bundled)}")
+      if "mujoco.pid" in bundled_names:
+        from mujoco_metal.bundled_pid import lower_pid_actuators
+        lower_pid_actuators(model, bundled_plugins)
+        supported_list.append(
+            "MuJoCo 3.10 bundled PID actuator force and activation callbacks")
+      if "mujoco.sensor.touch_grid" in bundled_names:
+        from mujoco_metal.bundled_touch_grid import lower_touch_grid_sensors
+        touch_sensors = lower_touch_grid_sensors(model, bundled_plugins)
+        if not touch_sensors:
+          raise ValueError("touch_grid plugin has no lowered plugin sensor")
+        supported_list.append(
+            "MuJoCo 3.10 bundled touch_grid ACC sensors from native contacts")
+      if "mujoco.elasticity.cable" in bundled_names:
+        from mujoco_metal.bundled_cable import lower_cable
+        cable = lower_cable(model, bundled_plugins)
+        if not cable["body_ids"].size:
+          raise ValueError("cable plugin has no participating bodies")
+        supported_list.append(
+            "MuJoCo 3.10 bundled elasticity.cable passive torque force")
+      if bundled_names & sdf_classes:
+        supported_list.append(
+            "MuJoCo 3.10 bundled bolt/bowl/gear/nut/torus SDF geom collision")
+
     if model.nu > 0:
       from mujoco_metal.stateful_actuation import ActuatorModel
-      actuator_model = ActuatorModel(model, allow_inherited=True)
+      actuator_model = ActuatorModel(
+          model, allow_inherited=True, bundled_plugins=bundled_plugins)
       if actuator_model.needs_general_path:
         supported_list.append(
             "full-family actuators: stateful activation, muscle/DC-motor, "
             "non-scalar gears, slider-crank/site/body transmissions, limits, gravcomp routing")
       else:
         supported_list.append("stateless scalar actuators and transmissions")
+      if (np.any(model.actuator_dyntype == int(mujoco.mjtDyn.mjDYN_USER))
+          or np.any(model.actuator_gaintype == int(mujoco.mjtGain.mjGAIN_USER))
+          or np.any(model.actuator_biastype == int(mujoco.mjtBias.mjBIAS_USER))):
+        supported_list.append(
+            "USER actuator source defaults with registered native extensions")
       from mujoco_metal.stateful_actuation import actuator_delay_config as _dcfg
       _ns, _ip, _dl = _dcfg(model)
       if bool(np.any(_ns > 0)):
@@ -472,8 +562,13 @@ def validate_stepping_profile(
     lim = limits
     if lim is None and profile == "integrated_scalable_v1":
       from mujoco_metal.capacity import CapacityLimits
-      lim = CapacityLimits(max_nv=64, max_pairs=64, max_slots=64, max_rows=256)
-    coupled_desc = lower_coupled_constraints(model, limits=lim)
+      lim = CapacityLimits(
+          max_nv=max(int(model.nv), 1), max_pairs=64, max_slots=64,
+          max_rows=256)
+    coupled_mass_storage = (
+        "block_sparse" if profile == "integrated_scalable_v1" else "dense")
+    coupled_desc = lower_coupled_constraints(
+        model, limits=lim, mass_storage=coupled_mass_storage)
     if coupled_desc.nc > 0 or coupled_desc.nr_joint > 0:
       supported_list.append("coupled constraint solve for contacts (plane, sphere, capsule, box, cylinder, ellipsoid, convex mesh, heightfield, SDF), joint limits, dry friction, and joint/connect/weld equalities")
 
@@ -494,16 +589,14 @@ def validate_stepping_profile(
         joint_types=joint_types,
         supported=tuple(supported_list),
         irrelevant=(
-            "energy diagnostics flag; stepping does not produce energy diagnostics",
             "visual, rendering, naming, keyframe, and user-data metadata",
-            "warmstart disable flag",
         ),
         rejected=(
-            "MuJoCo plugins",
-            "spatial/wrapping tendons, tendon limits, and tendon frictionloss",
-            "user-callback actuators (owned by milestone 019)",
-            "SDF collision geoms with third-party plugins, mesh-SDF pairs, heightfield-heightfield pairs, non-convex or oversize mesh/heightfield assets, SDF models with sdf_initpoints above the per-pair budget (supported: plugin-free SDF vs analytic/SDF-SDF within oct/node/initpoint caps)",
-            "sleep mode",
+            *( ("bundled plugin classes outside native PID/touch_grid/cable and analytic SDF support",)
+               if bundled_plugins is not None else ("MuJoCo plugins",) ),
+            "host Python actuator numerical callbacks (device USER defaults and registered native extensions are admitted)",
+            "SDF geoms with third-party plugin classes, heightfield-heightfield pairs, non-convex or oversize mesh/heightfield assets, and SDF models with sdf_initpoints above the per-pair budget (supported: plugin-free SDF, the five pinned bundled analytic SDF classes, mesh-SDF, and SDF-SDF within node/initpoint caps)",
+            *(("sleep mode",) if profile != "integrated_scalable_v1" else ()),
             "non-Euler integrators",
             "global callbacks",
         ),
@@ -512,19 +605,24 @@ def validate_stepping_profile(
         execution_plan=execution_plan,
     )
 
-  if profile == "contact_free_implicitfast_v1":
+  if profile in ("contact_free_implicitfast_v1", "integrated_implicitfast_v1"):
     from mujoco_metal.implicit import lower_implicitfast
 
     lower_implicitfast(model)
     reference = copy.copy(model)
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
+    reference.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
     base_name = (
         "contact_free_fluid_euler_v1"
         if (model.opt.density != 0 or model.opt.viscosity != 0 or np.any(model.opt.wind))
         else ("contact_free_transmission_euler_v1" if model.ntendon else "contact_free_passive_euler_v1")
     )
+    if profile == "integrated_implicitfast_v1":
+      base_name = ("integrated_scalable_v1"
+                   if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+                   else "integrated_euler_v1")
     base = validate_stepping_profile(
-        reference, timestep, base_name
+        reference, timestep, base_name, limits=limits,
     )
     return replace(
         base,
@@ -532,6 +630,7 @@ def validate_stepping_profile(
         model_fingerprint=_fingerprint(model),
         descriptor_fingerprint=_fingerprint(load_model(model)),
         implicit_euler_damping=False,
+        execution_plan=_implicit_execution_plan(base.execution_plan, profile),
         supported=base.supported
         + (
             "bounded implicitfast velocity solve and eligible free-body midpoint",
@@ -539,7 +638,7 @@ def validate_stepping_profile(
         rejected=tuple(
             item for item in base.rejected if item != "non-Euler integrators"
         )
-        + ("full implicit integrator, nonconstant velocity derivatives",),
+        + ("full implicit integrator",),
     )
   if profile in ("contact_free_implicit_v1", "integrated_implicit_v1"):
     from mujoco_metal.implicit import lower_implicit
@@ -547,9 +646,13 @@ def validate_stepping_profile(
     lower_implicit(model)
     reference = copy.copy(model)
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
+    reference.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
     if profile == "integrated_implicit_v1":
+      base_name = ("integrated_scalable_v1"
+                   if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+                   else "integrated_euler_v1")
       base = validate_stepping_profile(
-          reference, timestep, "integrated_euler_v1", limits=limits
+          reference, timestep, base_name, limits=limits
       )
     else:
       base_name = (
@@ -566,6 +669,7 @@ def validate_stepping_profile(
         model_fingerprint=_fingerprint(model),
         descriptor_fingerprint=_fingerprint(load_model(model)),
         implicit_euler_damping=False,
+        execution_plan=_implicit_execution_plan(base.execution_plan, profile),
         supported=base.supported
         + (
             "nonsymmetric implicit velocity solve with automatic force derivatives",
@@ -627,11 +731,21 @@ def validate_stepping_profile(
       raise TypeError("model must be a compiled mujoco.MjModel")
     if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_RK4):
       raise ValueError(f"{profile} requires the RK4 integrator")
+    if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_INVDISCRETE):
+      raise ValueError(
+          "discrete inverse dynamics is unsupported by the RK4 integrator")
     # R06/D3: native RK4 integrates activation state and stage-correct delayed control at every stage.
     reference = copy.copy(model)
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
+    sleep_enabled = bool(
+        int(model.opt.enableflags)
+        & int(mujoco.mjtEnableBit.mjENBL_SLEEP))
+    base_profile = (
+        "integrated_scalable_v1"
+        if profile == "integrated_rk4_v1" and sleep_enabled
+        else profile.replace("rk4", "euler"))
     result = validate_stepping_profile(
-        reference, timestep, profile.replace("rk4", "euler")
+        reference, timestep, base_profile, limits=limits
     )
     return replace(
         result,
@@ -774,7 +888,8 @@ def validate_stepping_profile(
     raise ValueError(f"unsupported disable flags: 0x{unknown_disable:x}")
 
   energy = int(mujoco.mjtEnableBit.mjENBL_ENERGY)
-  known_enable = energy
+  known_enable = (energy | int(mujoco.mjtEnableBit.mjENBL_INVDISCRETE)
+                  | int(mujoco.mjtEnableBit.mjENBL_FWDINV))
   sleep = int(mujoco.mjtEnableBit.mjENBL_SLEEP)
   if enable & sleep:
     raise ValueError(f"sleep mode is unsupported by {profile}")
@@ -818,7 +933,7 @@ def validate_stepping_profile(
       TransmissionModel(model)
       from mujoco_metal.tendons import FixedTendonModel
 
-      FixedTendonModel(model)
+      FixedTendonModel(model, spatial_ok=True)
     else:
       ScalarMotorModel.from_model(model)
     motor_supported = (
@@ -918,6 +1033,9 @@ def validate_stepping_profile(
       joint_types=joint_types,
       supported=(
           _SUPPORTED
+          + (("pinned potential and kinetic energy stage diagnostics",)
+             if int(model.opt.enableflags)
+             & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else ())
           + (
               ("per-call applied generalized forces", "linear joint damping")
               if profile
