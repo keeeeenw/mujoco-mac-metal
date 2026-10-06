@@ -82,6 +82,25 @@ test collection, so the two totals are not directly additive.
 
 ## Local distribution build
 
+Current unreleased `main` source also bundles demo
+scripts, their XML models and documentation in locally built wheels. From an
+installation of that development wheel, demos can be listed and run without a
+repository checkout:
+
+```sh
+mujoco-metal demo --list
+mujoco-metal demo haptic_calligraphy --mode cpu --headless --steps 120
+PYTORCH_ENABLE_MPS_FALLBACK=0 mujoco-metal demo haptic_calligraphy --mode metal --headless --steps 120 --check
+```
+
+These commands are development features and are not in the published 0.4.0
+wheel. The haptic check compares native dynamics and world-frame sensors against
+the pinned CPU engine; it does not qualify arbitrary models. Interactive viewers
+still use upstream OpenGL and must be launched through `mjpython` on macOS,
+for example `mjpython -m mujoco_metal demo haptic_calligraphy --mode metal`.
+Recordings require a working OpenGL context and the recording dependencies
+listed by each demo.
+
 From the repository root, build the current source version into a fresh
 output directory and install that exact wheel in an isolated environment:
 

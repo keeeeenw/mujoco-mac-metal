@@ -24,8 +24,8 @@ available alongside the optional package.
   spatial tendons with wrapping and site-only armature bias, and ball-joint limits.
   These features extend the bounded integrated Euler profile; they do not imply
   full MuJoCo compatibility.
-- **Qualification:** **518 native GPU tests passed** in the recorded physics
-  qualification, and **215 CPU tests passed** in the final publication check
+- **Earlier baseline qualification:** **518 native GPU tests passed** in the recorded physics
+  qualification, and **215 CPU tests passed** in its publication check
   (304 GPU-dependent checks skipped in the no-Torch environment). See the
   [validation results and limits](metal/QUALIFICATION.md) for test scope,
   reproducibility and outstanding checks.
@@ -54,6 +54,24 @@ available alongside the optional package.
 These contributions implement and qualify existing dynamics and numerical
 methods on Metal; MuJoCo's physics methods and PPO/RL algorithms are not our
 inventions. See [LICENSE](LICENSE) and [Metal attribution](metal/NOTICE).
+
+### Development coverage expansion
+
+Current `main` includes the experimental development backend: component mass
+factorization, scalable constraint workspaces, expanded forward/inverse and
+state APIs, native extensions, additional collision families, and deformable
+material/contact paths. It also includes source-precision and transactional
+cache corrections, with regression tests preserving the original physics bounds.
+The pinned catalogue covers 70 enum groups, 809 runtime binding fields and 317
+free-function bindings; a matching inventory does not prove native execution.
+
+**Full-coverage milestones 005–020 remain open: 0 of 16 are signed off as
+complete.** Earlier bounded capabilities and selected development fixtures are
+usable and have passing native checks. This count uses the full feature-combination,
+lifecycle, demo and distribution requirements; it does not discard that evidence.
+See the [milestone status](metal/STATUS.md) and
+[qualification record](metal/QUALIFICATION.md) for the tested scope and known failures.
+The development source has not been released to PyPI.
 
 ## Measured performance on M1 Max
 
@@ -98,6 +116,16 @@ execution speed. Rendering uses MuJoCo OpenGL. Most examples offer headless
 checks and GIF recording; interactive viewing is documented where available.
 The [compact gallery](metal/examples/demo_gallery.md) maps each demo to its
 physics capability.
+
+### [Haptic calligraphy](metal/examples/haptic_calligraphy.md)
+
+A two-link arm draws a moving loop through a native Cartesian feedback force,
+with measured world position, velocity and force shown in the scene. This
+development demo exercises a FORCE extension and Jacobian-transpose projection.
+Selected 120-step tests cover two worlds, checkpoint replay and partial reset;
+the clip shows a separate 5,000-step native rollout with OpenGL rendering.
+
+![Haptic calligraphy: native Metal physics](metal/examples/assets/haptic_calligraphy.gif)
 
 ### [Muscle-powered gripper](metal/examples/muscle_gripper.md)
 
@@ -222,6 +250,55 @@ Three craft chase moving markers under host controls, applied forces and damping
 
 ![Spacecraft approach: native Metal beside CPU MuJoCo](metal/examples/assets/space_docking.gif)
 
+### [Gravity assembly puzzle](metal/examples/assembly_puzzle.md)
+
+Procedural convex pieces tumble into a divided tray, exercising mesh contact.
+The guide records the fixture and its numerical limits.
+
+![Gravity assembly puzzle: recorded simulation](metal/examples/assets/assembly_puzzle.gif)
+
+### [Rock-garden axle cart](metal/examples/terrain_rover.md)
+
+A passive cart rolls over a heightfield garden and settles near a berm.
+The guide records the fixture and its numerical limits.
+
+![Rock-garden axle cart: recorded simulation](metal/examples/assets/terrain_rover.gif)
+
+### [SDF screw chute](metal/examples/sdf_chute.md)
+
+Marbles follow a helical implicit surface, illustrating the experimental SDF collision path.
+The guide records the fixture and its numerical limits.
+
+![SDF screw chute: recorded simulation](metal/examples/assets/sdf_chute.gif)
+
+### [Friction carousel](metal/examples/friction_carousel.md)
+
+A turntable carries a grippy box stack while a slippery sphere rolls away.
+The guide records the fixture and its numerical limits.
+
+![Friction carousel: recorded simulation](metal/examples/assets/friction_carousel.gif)
+
+### [Tide jellyfish](metal/examples/tide_jellyfish.md)
+
+Actuated fins flap in a modeled current, exercising stateful controls and fluid forces.
+The guide records the fixture and its numerical limits.
+
+![Tide jellyfish: recorded simulation](metal/examples/assets/tide_jellyfish.gif)
+
+### [Pinball inspection table](metal/examples/pinball_table.md)
+
+Flippers and falling balls produce live touch, acceleration and range measurements.
+The guide records the fixture and its numerical limits.
+
+![Pinball inspection table: recorded simulation](metal/examples/assets/pinball_table.gif)
+
+### [Marble plinko](metal/examples/marble_plinko.md)
+
+A cascade of marbles exercises contact capacity and candidate workspaces.
+The guide records the fixture and its numerical limits.
+
+![Marble plinko: recorded simulation](metal/examples/assets/marble_plinko.gif)
+
 ### [Chaotic pendulum](metal/examples/README.md)
 
 Four connected arms swing and tumble. This recorded clip uses **Metal mass/bias
@@ -234,39 +311,31 @@ qualification with an active macOS display.
 
 ## Current limits and next steps
 
-The optional package targets Python 3.12, MuJoCo **3.10.0** and Torch **2.9.1**;
-use its isolated installation instructions rather than treating the newer
-surrounding MuJoCo source version as the qualified runtime.
+The optional package targets Python **3.12**, MuJoCo **3.10.0** and Torch
+**2.9.1** on Apple Silicon, using custom Metal shaders through PyTorch MPS.
+Rendering uses upstream MuJoCo OpenGL. The published **0.4.0** wheel contains
+earlier bounded profiles; the expanded backend and demos require current source.
+This update does not publish a new wheel.
 
-Version **0.4.0** contains earlier bounded profiles. Current `main` additionally
-includes integrated primitive contact/friction, connect/weld and tendon
-constraints, equality activation, mocap/keyframe support, stateful actuation,
-spatial tendon wrapping, site-only tendon armature and ball-joint limits.
-These additions require a source installation and have not been released to PyPI.
+The legacy `integrated_euler_v1` profile retains its explicit model/workspace
+bounds. The opt-in `integrated_scalable_v1` path allocates larger workspaces with
+model-derived capacity and memory guards; it does not promise unlimited sizes or
+every feature combination. Additional cylinder/ellipsoid, mesh, heightfield,
+SDF, flex, solver, integrator, sensor and API paths are implemented in development,
+with different qualification levels documented in the [coverage contract](metal/COVERAGE.md).
 
-Integrated stepping remains bounded to **32 velocities, 16 candidate pairs,
-24 contact slots and 96 constraint rows**. Contacts cover planes, spheres,
-capsules and boxes. Cylinder and ellipsoid **collision support is still in
-progress and is not included on main**; cylinder tendon wrapping is a
-separate supported operation. Mesh, heightfield and SDF contacts, flex/deformables,
-no-slip solving, full implicit integration, and remaining sensor/model/API
-features still need implementation or qualification. Wrapped tendon armature
-remains unsupported. Sensor queries do not reproduce every stored step-stage
-sensor timing behavior.
+Known correctness gaps include the original mesh-SDF witness gate and bundled
+bowl/torus acceleration or trajectory comparisons. SDF arithmetic, contact-force
+precision, full feature composition and representation admission need further
+qualification. Full native regression, current wheel installation and complete
+demo requalification remain open. Historical clips demonstrate the configurations
+recorded in their guides; they do not qualify every current configuration.
 
-The closeout has source-level shader inventory checks; built-wheel content
-validation for these new features is still pending. Interactive viewer validation
-requires a display and remains a separate qualification step. Native rendering,
-RL training integration, robot deployment, Linux/CUDA integration and broad Mac
-hardware/OS validation remain outside this qualification. Per-environment model
-randomization is not connected to native stepping. No new speedup is claimed.
-
-Next work completes collision geometry, solver/integrator coverage, sensors,
-model/API behavior and scalable workspaces. See the
-[development coverage](metal/DEVELOPMENT.md) and
-[pinned support inventory](metal/COVERAGE.md) for exact feature boundaries.
-See the [API contracts](metal/API.md) and [Apple Silicon FAQ](metal/FAQ.md)
-for usage details and common questions.
+Per-environment model randomization is not connected to native stepping. Native
+rendering, RL integration, robot deployment, Linux/CUDA integration and broader
+Mac hardware/OS validation remain outside this qualification. No new speedup is
+claimed. See [milestone status](metal/STATUS.md), [development coverage](metal/DEVELOPMENT.md),
+[API contracts](metal/API.md) and the [Apple Silicon FAQ](metal/FAQ.md).
 
 ## Contribute
 

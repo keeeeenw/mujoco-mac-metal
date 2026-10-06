@@ -9,6 +9,66 @@ The numerical reference remains MuJoCo **3.10.0**, Python **3.12**, Torch
 **2.9.1**, MPS float32, with CPU fallback disabled. These are bounded feature
 increments, not full MuJoCo compatibility or new performance results.
 
+## Experimental development on main
+
+Current `main` extends the earlier source with
+component mass solves, prepared stage/query APIs, sparse velocity-derivative
+operators, and integrated implicit profiles. Qualification is ongoing; the
+historical full-suite counts below do not cover this development work.
+
+Focused native checks now pass the original 130-DOF PGS/CG/Newton fixtures,
+36 elliptic-contact warm-start cases, and selected implicit trajectories,
+checkpoint replay, and inverse-query restoration. Separate native tests pass
+joint/connect/weld row assembly above the former 32-DOF/96-row limits and
+matrix-free flex material products. Each result covers its test fixtures,
+not all combinations of those capabilities.
+
+Selected implicit/implicitfast flex trajectories now pass 25-step CPU comparisons
+and exact checkpoint replay. Selected integrated RK4 sleep/wake lifecycle tests
+also pass. These results do not close the full material/contact/integrator or
+sleep composition matrix.
+
+Independent API checks pass 41 native forward/inverse/split-stage cases. A
+separate mass/spatial/operator query batch passes 15 device tests and 28 CPU
+contracts. The native Cartesian magnetic-force example also passes its two-world
+trajectory and exact replay checks. See [API details and tests](API.md).
+
+Direct sparse constraint-Jacobian producers now pass selected rigid-contact
+fixtures for both cone types and two-world flex plane/sphere cases. This is
+separate from component mass storage and sparse velocity derivatives; complete
+sparse solver and feature composition qualification remains open.
+
+Native transmission queries pass the admitted integrated families and the
+legacy scalar motor profile, including reset/restore and query rollback.
+Static accelerometers and zero-DOF stepping/checkpoint replay pass Euler, RK4,
+implicitfast and implicit fixtures. A body-anchor precision correction passes
+the original focused post-constraint force cases. Correcting remaining packed
+Jacobian consumers also passes the original sensor/trajectory and sparse
+constraint correction batch (65 tests, including CPU contracts and native
+execution). Independently tested isolated development compositions subsequently
+pass the complete solver regression file (73 tests), coupled-contact and
+impedance batch (101 tests), and inverse/split-stage batch (115 tests). The final
+retained-output solver certificate is distinct from optimizer stopping history;
+configured iteration budgets and original physics comparison bounds are retained.
+
+The rich three-world derivative fixture passes its original transition-matrix
+comparisons after a paired RNE precision correction, but its later inverse-force
+finite differences still fail the original bounds. The original interpolated-flex detector matrix now
+passes all 16 cases, plus three trace/comparator checks, after correcting EPA
+ordering of represented expansion scalars. A separate full-size public Q1 volume
+sphere-contact fixture passes assembled contacts, nonzero passive forces,
+four-step force/state comparisons, exact checkpoint replay and reset. Other
+interpolation/geometry variants and wider deformable combinations remain open.
+
+These results cover preserved source compositions, not the entire current
+checkout. See [publication qualification](QUALIFICATION.md) and [milestone status](STATUS.md). Native warning/autoreset semantics, final native
+regression, complete installed-wheel qualification, and demo visual checks remain
+open. The [support inventory](COVERAGE.md)
+separates implementation from qualification; no new performance result is
+claimed.
+
+## Earlier source qualification
+
 At source revision `18acd8cab`, the full suite passed **402 tests with native MPS execution enabled** and
 fallback disabled. An isolated environment with Torch removed passed **175 tests**
 and skipped **224 GPU-dependent tests**. These results describe this source
@@ -23,7 +83,7 @@ benchmark has not been rerun for the additional profiles.
 
 ## Current source capabilities
 
-Current source adds connect/weld activation, mocap/keyframe lifecycle,
+The earlier bounded source added connect/weld activation, mocap/keyframe lifecycle,
 stateful actuation, spatial tendon wrapping and site-only armature bias, tendon
 constraint rows and ball-joint limits.
 
@@ -32,7 +92,7 @@ gripper and drawbridge headless checks. The final no-Torch publication check
 passed **215 tests, 304 skipped**. The GPU suite was not repeated for the
 publication check, and no new performance measurements were taken.
 [Validation results and reproducibility](QUALIFICATION.md) describe the scope
-of these results. Cylinder/ellipsoid collision support remains in development.
+of these results. Cylinder/ellipsoid collision paths are now implemented experimentally; their full qualification remains open.
 
 ## Qualified increments
 
@@ -85,12 +145,29 @@ The pipeline consists of ten sequential integration stages plus an explicit on-d
 On-demand queries:
 - `sensor_query`: Explicit stateless current-state forward sensor evaluations (`sim.sensor_values()`) on MPS.
 
-The coupled solver enforces an explicit, validated convergence contract:
-- Iteration settings: Bound to $[1, 2048]$ (values $\le 0$ or $> 2048$ raise `ValueError`).
-- Tolerance settings: Must be finite and positive; floored at single-precision float32 hardware precision floor $10^{-6}$.
-- Contract exposure: Both requested and effective iterations/tolerances, maximum refinement sweeps (256), and convergence metric (`max_normalized_projected_gradient`) are explicitly exposed on `CoupledSolverSettings` via `sim.solver_settings`.
-- Convergence metric: $\max_i |\text{proj}_i - \lambda_i| \cdot D_{ii} / s_i \le \text{tolerance}$.
-- Solver status codes: 0 = converged, 2 = non-finite / divergence, 3 = iteration exhaustion / non-convergence. If any world fails to converge, its state stickily rolls back to its previous valid state without advancing, while healthy worlds continue. Recovery is achieved via selective per-world reset (`sim.state.reset(env_ids, qpos=..., qvel=...)`).
+The development coupled solver exposes configuration and retained-output
+diagnostics separately. Its complete numerical qualification remains open:
+
+- Iteration settings: bound to $[0, 2048]$; zero is a valid configured budget.
+  The native solver honors the requested outer budget. No adaptive outer
+  extension or refinement sweeps are added (`max_refinement_sweeps=0`).
+- Tolerance settings: finite and positive. The requested tolerance controls
+  stopping. `CoupledSolverSettings.effective_tolerance` retains the diagnostic
+  float32 certification floor of $10^{-6}$; that metadata does not replace a
+  tighter requested stopping tolerance.
+- Algorithm selection: PGS uses the dual constraint formulation; CG and Newton
+  use the primal acceleration formulation with the configured line-search
+  budget. The optional no-slip post-solver has its own iteration and tolerance
+  settings. These paths require their corresponding composition gates.
+- Diagnostics: the dual path reports a normalized projected residual; the
+  primal path reports its scaled gradient measure. An independent retained
+  row/force/acceleration check is still needed to establish physical parity.
+  The public metric label is retained for compatibility and does not establish
+  equivalence between those measures.
+- Status: 0 means a finite accepted result, including a finite iterate returned
+  at the configured budget; it does not by itself prove convergence. Numerical
+  failure statuses trigger per-world rollback while healthy neighbors continue.
+  Recovery uses selective reset (`sim.state.reset(env_ids, qpos=..., qvel=...)`).
 - Device residency & buffer audit: Hot path physics execute on MPS with preallocated workspace buffers (`workspace_J`, `workspace_debug`, `contact_row_data`, `contact_jacobian`, `out_force`, `out_acc`, etc.) and persistent preallocated default equality state, avoiding CPU physics and host-device state synchronization. Intermediate PyTorch MPS operations (e.g. status mask selection) execute within device memory. Buffer specifications are grounded in real allocations via `sim.buffer_audit()`. On the 100-step coupled verification fixture, native Metal matches CPU MuJoCo with maximum position error `1.50e-7`, velocity error `1.67e-6`, and sensor error `1.07e-6`.
 - Full assembled system qualification: Tested via `test_integrated_simulation_assembled_system_matches_cpu` across both deterministic mixed 3D fixture (nontrivial 3D rotational and tangential Jacobians with non-axial hinge axes) and axis-aligned fixture. Compares complete active $J$ (max error $< 10^{-6}$), effective $M$ with tendon armature ($< 10^{-6}$), regularizer $R$ ($< 10^{-6}$), $a_r$ ($< 10^{-3}$), $\text{rhs}$ ($< 10^{-3}$), assembled Delassus $W = J M^{-1} J^T + R$ ($< 10^{-6}$), nonzero cross-coupling blocks ($W_{cj}$ norm $0.5902$), zero inactive rows, and host KKT projected residual ($< 10^{-4}$).
 - Capacity boundaries vs. admission guards: Distinguishes admission guards (CPU lowering and overflow rejection: $nv=33, npairs=17, ncontacts=25, nr=97$ rejected with `ValueError`) from GPU capacity execution ($nv=32, npairs=16, ncontacts=24, nr=96$ executed on GPU with status 0, isolated worlds, finite float32 outputs, slot 15 exercised for pairs, slot 23 for contacts, row 95 for constraint rows, and verified against CPU MuJoCo references).
@@ -98,7 +175,20 @@ The coupled solver enforces an explicit, validated convergence contract:
 
 ## Contact-friction qualification
 
-This is an independently qualified source result, run on an **M1 Max with 32 GB
+The measurements in this section describe earlier source qualification. They
+are retained as regression targets, not evidence that every current development
+solver path passes. The current requested-tolerance gate still has numerical
+failures and iteration mismatches under correction.
+
+A subsequent isolated no-slip correction passes 37 original native tests,
+including analytic joint/tendon dry friction, both contact cones and the
+regularizer-removal matrix. It restores acceleration from the final constraint
+forces after the no-slip pass for all three solver families. Both stopping-count
+checks also pass when compared with pinned MuJoCo's actual early-stop behavior;
+the original trajectory bounds remain unchanged. Full solver,
+deformable-collision and recovery composition remains unqualified.
+
+This earlier independently qualified source result ran on an **M1 Max with 32 GB
 unified memory**, MuJoCo 3.10.0, Python 3.12 and Torch 2.9.1. `PYTORCH_ENABLE_MPS_FALLBACK=0`
 was set for native checks. The eight cone/condim cases use a transformed plane
 and sphere, nonzero sliding/angular velocities, asserted contact engagement,
@@ -156,11 +246,11 @@ against CPU references. A targeted reset, cleared diagnostics and replay are
 also checked. The successful peer validates active-contact isolation, not
 high-dimensional moments.
 
-A review-discovered four-contact elliptic box case now checks projected
+A review-discovered four-contact elliptic box case checks projected
 stationarity at the retained global multipliers after every coupled iteration.
 This replaces the previous convergence check, which re-optimized temporary
 contact blocks and could report success for a different point. Elliptic systems
-now use globally coupled cone-projected FISTA with an adaptive restart; the
+in that earlier implementation used globally coupled cone-projected FISTA with an adaptive restart; the
 pyramidal PGS update path is preserved. On the saved four-contact box fixture,
 elliptic condim 3/4/6 converges in 31/118/136 iterations, respectively;
 host-projected residual maxima across the four contacts are `2.48e-6`,
@@ -168,13 +258,10 @@ host-projected residual maxima across the four contacts are `2.48e-6`,
 `1.27e-3`, `2.90e-3`, and `2.90e-3`. These are bounded float32 fixture results.
 No speedup has been measured for this solver change.
 
-The separate MuJoCo no-slip post-solver remains unsupported. Models with
-nonzero `noslip_iterations` are rejected during lowering; `noslip_tolerance`
-has no effect while the no-slip solver is disabled. `solver="CG"` is rejected;
-the native profile chooses its own projected algorithms (pyramidal PGS or
-elliptic global FISTA), regardless of the accepted default Newton or PGS CPU
-selector. `iterations` and `tolerance` feed the native coupled solver, and the
-effective float32 tolerance floor is exposed through `CoupledSolverSettings`.
+The development implementation now includes CG/Newton primal solving and the
+configured no-slip post-solver, so the earlier FISTA-only algorithm restrictions
+do not describe current development. See the configuration contract above and
+[the coverage matrix](COVERAGE.md) for implementation versus qualification status.
 
 The [Spin-and-Grip guide](examples/spin_and_grip.md) records a 400-step matched
 native/CPU run: max qpos difference `4.75e-6`, max qvel difference `3.37e-4`,
@@ -230,14 +317,15 @@ These measured errors describe the fixtures, not universal tolerances.
 
 ## Still required for full coverage
 
-Remaining work includes cylinder/ellipsoid, mesh, heightfield and SDF collision,
-additional solver settings and warm starting/no-slip, geom-level fluid/lift,
-full implicit integration and wider velocity derivatives, remaining sensors and
-exact stage/history semantics, flex, plugins and broader model/API behavior.
-Integrated source now includes stateful/muscle actuation, mocap and the bounded
-spatial-tendon features described above; their unimplemented combinations remain
-explicitly guarded (including wrapped tendon armature). The support inventory
-identifies the admitted families without claiming arbitrary combinations.
+The [milestone status](STATUS.md) records the full 005–020 acceptance boundary.
+Additional collision, solver, integrator, fluid, sensor, flex, plugin and API
+paths are implemented; none should be inferred universally qualified from a
+feature name or historical fixture. Original rigid-SDF mesh/bowl/torus gates,
+complete feature/integrator/solver combinations, lifecycle and representation
+boundaries, final native regression, all current demos and clean-wheel install
+remain open. Wrapped tendon armature combinations rejected by pinned MuJoCo's
+compiler are not admitted by this port either.
 
-RL integration and validation on other Mac hardware are deferred. No new
-speedup claim follows from the feature checks here.
+RL integration and broader Mac hardware validation are deferred. No new speedup
+claim follows from these feature checks. The published 0.4.0 wheel remains the
+earlier release; the development backend requires a source installation.

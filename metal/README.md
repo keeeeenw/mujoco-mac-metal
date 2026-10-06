@@ -4,6 +4,8 @@ The [main project README](../README.md) covers current source and the **0.4.0** 
 contributions, installation, all demo GIFs, measured performance and limitations.
 This directory contains the optional experimental package and its technical guides.
 
+- [Milestone status](STATUS.md): accepted scope, partial capabilities and known gaps.
+- [Qualification record](QUALIFICATION.md): current publication checks and historical native evidence.
 - [Install and diagnose](INSTALL.md): dependencies, PyPI and source setup, GPU checks.
 - [Supported profiles and qualification](DEVELOPMENT.md): precise physics coverage,
   CPU-reference evidence and remaining feature gaps.
