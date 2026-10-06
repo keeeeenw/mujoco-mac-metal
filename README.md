@@ -71,7 +71,9 @@ usable and have passing native checks. This count uses the full feature-combinat
 lifecycle, demo and distribution requirements; it does not discard that evidence.
 See the [milestone status](metal/STATUS.md) and
 [qualification record](metal/QUALIFICATION.md) for the tested scope and known failures.
-The development source has not been released to PyPI.
+The host publication check passed **2,163 tests, with 1,615 native-dependent
+tests skipped**. This is not a full GPU qualification. The development source
+has not been released to PyPI.
 
 ## Measured performance on M1 Max
 

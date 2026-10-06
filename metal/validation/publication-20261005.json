@@ -1,0 +1,34 @@
+{
+  "kind": "host-publication-regression",
+  "date": "2026-10-05",
+  "producing_revision": "61e415e8b2e9e71670b3cb134e92ff34cbce4ab0",
+  "scope": "Host contracts, lowering, reference algorithms and collection; native-dependent cases skipped.",
+  "runtime": {
+    "python": "3.12.10",
+    "mujoco": "3.10.0",
+    "torch": "2.9.1",
+    "platform": "darwin",
+    "machine": "arm64"
+  },
+  "environment": {
+    "MUJOCO_METAL_RUN_GPU": "0",
+    "PYTORCH_ENABLE_MPS_FALLBACK": "0"
+  },
+  "test_availability_guard": "torch.backends.mps.is_available = lambda: False",
+  "pytest_args": [
+    "metal/tests",
+    "-q",
+    "-p",
+    "no:cacheprovider"
+  ],
+  "exit_code": 0,
+  "passed": 2163,
+  "skipped": 1615,
+  "failed": 0,
+  "wall_seconds": 94.6,
+  "tracked_source_unchanged": true,
+  "ordered_metal_file_content_sha256": "a84a35ed1198ab3d62cea7ba1c5d8408b8812da16536d72c88eb75f8a33778dd",
+  "native_physics_qualified_by_this_run": false,
+  "fully_accepted_milestones_005_through_020": 0,
+  "subsequent_publication_changes": "Documentation links and this evidence record; no runtime or test changes."
+}

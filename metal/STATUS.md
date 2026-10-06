@@ -26,6 +26,10 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
+The current host publication check passed **2,163 tests, 1,615 skipped**.
+The skipped native cases remain unqualified by this run; see
+[the recorded scope](QUALIFICATION.md).
+
 Selected source compositions passed 94 Newton regression checks (including the
 original 300-step slope fixture), 69 contact-override checks and 11 retained
 SDF arithmetic/source-trace checks. These are distinct regression groups, not a

@@ -7,6 +7,13 @@ their recorded evidence. This is source publication, not a new PyPI release.
 
 ## Publication scope
 
+The host publication suite passed **2,163 tests, with 1,615 native-dependent
+tests skipped, in 94.60 seconds** at source revision `61e415e8b` (exit 0).
+Tracked source was verified unchanged before and after execution. Subsequent
+publication edits record this result and correct documentation links only.
+See the [machine-readable record](validation/publication-20261005.json).
+This result does not establish native correctness for the skipped cases.
+
 The source contains coherent dynamics, lifecycle, collision, solver, deformable
 and API changes plus their original regression fixtures. It also corrects an
 undefined mask in public spatial-armature assembly. Final native replay and
