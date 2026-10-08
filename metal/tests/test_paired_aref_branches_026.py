@@ -501,9 +501,10 @@ def test_override_lifecycle_rebuild_gpu(which):
     m.opt.o_solimp[:] = (0.85, 0.9, 0.002, 0.4, 3.0)
   with pytest.raises(ValueError, match="apply_lifecycle"):
     sim.assembled_system(recompute=True)
-  # Fail-before-write covers all state, not just qpos: positions,
-  # velocities, status and retained warmstart are untouched by the
-  # rejected call.
+  # Fail-before-write covers positions, velocities, status and retained
+  # warmstart (the state touched by a solve entry point); it does not
+  # cover sensor samples or delay rings (untouched by assembly). Listed
+  # buffers are asserted unchanged below, not "all state" in general.
   np.testing.assert_array_equal(
       np.asarray(sim.state._qpos[0].cpu().numpy()), qpos_before)
   np.testing.assert_array_equal(
