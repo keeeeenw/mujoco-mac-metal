@@ -984,6 +984,70 @@ def test_site_armature_qacc_and_trajectory_gpu():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_site_armature_assembled_system_bias_force_mass_replay_gpu():
+  # Public-assembly composition: with a transmitting nonzero-armature tendon,
+  # assembled_system must include the Jdot armature bias (not omit it) and the
+  # J'AJ armature mass, match the CPU oracle qacc, and replay exactly.
+  from mujoco_metal import MetalSimulation
+  m = mujoco.MjModel.from_xml_string(ARM2_XML.replace("ARM", "0.5"))
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qp = np.array([0.4, -0.5])
+  qv = np.array([1.5, -2.0])
+  sim.reset(qpos=np.asarray(qp, dtype=np.float32).reshape(1, -1),
+            qvel=np.asarray(qv, dtype=np.float32).reshape(1, -1))
+  # Bias actually transmits: native dots/bias are nonzero at this state.
+  # Capture them before assembly (borrowed views are recomputed inside).
+  dynamics = sim._smooth.run_device(sim.state._qpos, sim.state._qvel, None, None)
+  kin = sim._spatial_tendons.run_kinematics(sim.state._qvel, dynamics["poses"])
+  bias, dots = sim._spatial_tendons.run_armature_bias(
+      kin, sim.state._qvel, dynamics["poses"], dynamics.get("cvel", None),
+      dynamics.get("root_com", None), dynamics.get("cdof", None),
+      dynamics.get("cdof_dot", None))
+  assert float(np.max(np.abs(dots.cpu().numpy()))) > 1e-3
+  assert float(np.max(np.abs(bias.cpu().numpy()))) > 1e-6
+  asm = sim.assembled_system(recompute=True)
+  native_qacc = asm["qacc"].cpu().numpy()[0]
+  native_mass = np.asarray(asm["mass_matrix"].cpu().numpy()[0])
+  # CPU oracle at the represented state, plus a zero-armature control model.
+  rep_qpos = sim.state._qpos.cpu().numpy()[0].astype(np.float64)
+  rep_qvel = sim.state._qvel.cpu().numpy()[0].astype(np.float64)
+  cpu = mujoco.MjData(m)
+  cpu.qpos[:] = rep_qpos
+  cpu.qvel[:] = rep_qvel
+  mujoco.mj_forward(m, cpu)
+  np.testing.assert_allclose(native_qacc[:2], np.asarray(cpu.qacc)[:2], atol=1e-4)
+  m_noarm = mujoco.MjModel.from_xml_string(ARM2_XML.replace("ARM", "0.0"))
+  cpu0 = mujoco.MjData(m_noarm)
+  cpu0.qpos[:] = rep_qpos
+  cpu0.qvel[:] = rep_qvel
+  mujoco.mj_forward(m_noarm, cpu0)
+  assert float(np.max(np.abs(np.asarray(cpu.qacc) - np.asarray(cpu0.qacc)))) > 1e-3
+  # Armature mass is in the public assembly: it differs from the
+  # zero-armature assembly at the same state.
+  sim0 = MetalSimulation(m_noarm, batch_size=1, profile="integrated_euler_v1")
+  sim0.reset(qpos=np.asarray(qp, dtype=np.float32).reshape(1, -1),
+             qvel=np.asarray(qv, dtype=np.float32).reshape(1, -1))
+  mass0 = np.asarray(sim0.assembled_system(recompute=True)["mass_matrix"].cpu().numpy()[0])
+  assert float(np.max(np.abs(native_mass - mass0))) > 1e-6
+  # Replay: recompute and snapshot/restore reproduce the assembly exactly.
+  again = sim.assembled_system(recompute=True)
+  np.testing.assert_array_equal(again["qacc"].cpu().numpy(),
+                                asm["qacc"].cpu().numpy())
+  np.testing.assert_array_equal(again["mass_matrix"].cpu().numpy(),
+                                asm["mass_matrix"].cpu().numpy())
+  snap = sim.snapshot()
+  stepped = []
+  for _ in range(5):
+    sim.step(1)
+    stepped.append(sim.state.qpos.cpu().numpy()[0].copy())
+  sim.restore(snap)
+  for expected in stepped:
+    sim.step(1)
+    np.testing.assert_array_equal(sim.state.qpos.cpu().numpy()[0], expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_site_armature_pulley_divisor_gpu():
   # F1: pulley divisor scales the Jdot bias like the Jacobian.
   from mujoco_metal import MetalSimulation
