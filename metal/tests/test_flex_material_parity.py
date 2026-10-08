@@ -2199,6 +2199,18 @@ def test_public_integrators_step_compiled_flex_material(profile, count, dof, ela
   cpu = mujoco.MjData(model)
   cpu.qpos[:], cpu.qvel[:] = qpos, qvel
   mujoco.mj_forward(model, cpu)
+  if profile == "integrated_euler_v1" and model.nv > 32:
+    # Documented small-dense capacity: the Euler profile bounds nv to 32
+    # (see validate_stepping_profile); the 81-DoF quadratic fixture exceeds
+    # it, so construction must fail closed with the documented error while
+    # the scalable profile below carries the physics parity below.
+    with pytest.raises(ValueError, match="bounds nv to 32"):
+      MetalSimulation(
+          model, batch_size=1, qpos=qpos[None].astype(np.float32),
+          qvel=qvel[None].astype(np.float32), profile=profile)
+    # Rejection asserted above; physics parity for this fixture lives in
+    # the scalable-profile case. Return (pass), do not skip-silence.
+    return
   sim = MetalSimulation(
       model, batch_size=1, qpos=qpos[None].astype(np.float32),
       qvel=qvel[None].astype(np.float32), profile=profile)
