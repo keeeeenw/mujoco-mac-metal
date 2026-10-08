@@ -131,3 +131,128 @@ def test_box_press_first_divergence_packet_gpu():
         f"cpu_nrm={cpu_nrm.tolist()} nat_nrm={nat_nrm.tolist()} "
         f"cpu_pos={cpu_pos.tolist()} nat_pos={nat_pos.tolist()} "
         f"seed1_terms={terms[-3:]}", flush=True)
+
+
+
+def _trace_build_paths():
+  import os
+  root = os.path.dirname(
+      os.path.dirname(
+          os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+  helper = os.path.join(root, "project", "metal", "trace_sdf.py")
+  lib = os.path.join(root, ".upstream", "mujoco-trace", "build-fixed",
+                     "lib", "libmujoco.dylib")
+  return helper, lib
+
+
+@_needs_gpu()
+def test_box_seed_source_indexed_comparison_gpu(tmp_path):
+  # Executable same-input, source-indexed CPU/native comparison at the
+  # exact press pose (mjc_SDF octree-versus-analytic route, NOT per-face
+  # Frank-Wolfe). CPU raw binary64 words come from a live trace-build run
+  # (pinned binary truth, not a replay approximation; explicit skip names
+  # the missing artifact when the trace build is absent); native raw words
+  # come from staged triples and hull constants. Stages, in producer order:
+  #   1. input anchoring (hull AABB triple sums vs model f64),
+  #   2. seed values per seed/coordinate (raw hex, ulp distances),
+  #   3. decisive INTERSECTION gradpick operands/side,
+  #   4. precontact admission.
+  # Methodology is asserted; magnitudes are reported. The seed-stage ulp
+  # gap (stage 2) localizes the earliest observable mismatch; input
+  # anchoring (stage 1) holds bit-exactly, so divergence enters in seed
+  # arithmetic (bounds/Halton/lerp/maps chain), not in inputs.
+  import json
+  import os
+  import subprocess
+  import sys
+  sys.path.insert(0, "metal/tests")
+  import mujoco
+  from test_sdf_seed_source_trace_013 import (
+      _capture_staged_workspace, _STAGE, _STATE_WORDS)
+  from mujoco_metal.simulation import MetalSimulation
+  helper, lib = _trace_build_paths()
+  if not os.path.exists(lib):
+    pytest.skip("trace build absent: " + lib)
+  m = _gate_model()
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  sim.reset(qpos=_GATE_QP.reshape(1, -1),
+            qvel=np.zeros((1, m.nv), dtype=np.float32))
+  epochs, _ = _capture_staged_workspace(sim)
+  s = sim.assembled_system(recompute=True)
+  assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[0]) == 0
+  assert len(epochs) == 1
+  # Stage 1: input anchoring bit-exact (hull triple sums == model f64).
+  # The low plane alone does not suffice (float32 residual rounding);
+  # the tail plane completes the expansion: hi+lo+tail reproduces the
+  # pinned entry bitwise (center tail at +0, half tail at +6).
+  cc = sim._coupled_constraints
+  hull = cc._constants["mesh_hull"].cpu().numpy().astype(np.float64)
+  info = cc._constants["mesh_hull_info"].cpu().numpy().astype(np.int64)
+  info = info.reshape(-1, 9)
+  ga = np.asarray(m.geom_aabb, dtype=np.float64).reshape(-1)
+  base = int(info[0, 3])
+  tbase = int(info[0, 6])
+  assert base >= 0 and tbase >= 0
+  for g in (0, 1):
+    triple = (hull[base + 18 * g:base + 18 * g + 6]
+              + hull[base + 18 * g + 6:base + 18 * g + 12]
+              + np.concatenate([hull[tbase + 15 * g:tbase + 15 * g + 3],
+                                hull[tbase + 15 * g + 6:tbase + 15 * g + 9]]))
+    np.testing.assert_array_equal(triple, ga[6 * g:6 * g + 6])
+  # Live CPU trace at gate-baked XML.
+  zf = repr(float(np.float32(float(_GATE_QP[2]))))
+  xml_text = f"""<mujoco>
+<asset><mesh name="b" vertex="-0.05 -0.05 -0.04  0.05 -0.05 -0.04 0.05 0.05 -0.04  -0.05 0.05 -0.04  -0.05 -0.05 0.04  0.05 -0.05 0.04  0.05 0.05 0.04  -0.05 0.05 0.04"/></asset>
+<option timestep="0.002" integrator="Euler" iterations="100" tolerance="1e-8" gravity="0 0 0" sdf_initpoints="4"/>
+<worldbody>
+<geom name="sdf" type="sdf" mesh="b" contype="1" conaffinity="1"/>
+<body pos="0 0 {zf}"><freejoint/><geom name="o" type="box" size="0.04 0.04 0.03" contype="1" conaffinity="1"/></body>
+</worldbody>
+</mujoco>"""
+  p = tmp_path / "box_gate.xml"
+  p.write_text(xml_text)
+  env = dict(os.environ, MUJOCO_SDF_TRACE="1")
+  proc = subprocess.run(
+      [sys.executable, helper, str(p)], capture_output=True, text=True,
+      env=env, timeout=120)
+  assert proc.returncode == 0, proc.stderr[-2000:]
+  numbers = json.loads(proc.stdout)
+  assert numbers["ncon"] == 2
+  tlines = [ln for ln in proc.stderr.splitlines() if "MJCSDFTRACE" in ln]
+  cpu_seeds = {}
+  for ln in tlines:
+    if "MJCSDFTRACE seed" in ln:
+      i = int(ln.split("i=")[1].split()[0])
+      cpu_seeds[i] = tuple(float(v) for v in ln.split("x=")[1].split())
+  assert sorted(cpu_seeds) == [0, 1, 2, 3]
+  # Stage 2: raw-word seed comparison; ulp distances localize the
+  # earliest observable mismatch (seed triple; inputs anchored above).
+  import math
+  st = epochs[-1][0][2].cpu().numpy().reshape(-1, _STATE_WORDS)
+  max_ulp, loc = 0, None
+  for seed in range(4):
+    nat_hi = st[seed, 0:3].astype(np.float64)
+    assert all(np.isfinite(nat_hi))
+    for axis in range(3):
+      a, b = float(nat_hi[axis]), float(cpu_seeds[seed][axis])
+      if a == b:
+        continue
+      ai = int(np.float64(a).tobytes().hex(), 16)
+      bi = int(np.float64(b).tobytes().hex(), 16)
+      gap = 10**18 if (ai >> 63) != (bi >> 63) else abs(ai - bi)
+      if gap > max_ulp:
+        max_ulp, loc = gap, (seed, axis)
+  print(f"SEEDCOMPARE max_ulp={max_ulp} at={loc}", flush=True)
+  assert max_ulp > 0
+  # Stage 3: press-seed INTERSECTION pick is decisive on the CPU side
+  # (analytic side wins by a margin no rounding can flip).
+  picks = [ln for ln in tlines if "gradpick" in ln]
+  assert len(picks) == 4
+  a = float(picks[1].split("a=")[1].split()[0])
+  b = float(picks[1].split("b=")[1].split()[0])
+  side = int(picks[1].split("side=")[1].split()[0])
+  assert side == 1 and (a - b) < -1e-3, (a, b, side)
+  # Stage 4: two admissions, no spurious rejects at this pose.
+  decisions = [ln.split("decision=")[1].split()[0]
+               for ln in tlines if "precontact" in ln]
+  assert decisions.count("admit") == 2

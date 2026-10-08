@@ -21,6 +21,12 @@ device state (no new kernels, no hot-path readback beyond the test):
 - loose-tolerance, cost-improvement and exhausted-budget paths keep
   pinned finite-iterate behavior with honest (possibly uncertified)
   diagnostics and oracle agreement at documented tiers.
+
+Scope limit (explicitly open, not claimed): the paired checks above pair
+multipliers (and J in the force balance) on the stored operator; a
+complete effective-operator projected/cone residual certificate covering
+reference (aref-low) and regulator operator terms is future work. The
+high-only diagnostic stays clearly separate and correctly named.
 """
 
 import os

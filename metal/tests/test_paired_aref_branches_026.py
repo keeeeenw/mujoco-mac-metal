@@ -501,8 +501,17 @@ def test_override_lifecycle_rebuild_gpu(which):
     m.opt.o_solimp[:] = (0.85, 0.9, 0.002, 0.4, 3.0)
   with pytest.raises(ValueError, match="apply_lifecycle"):
     sim.assembled_system(recompute=True)
+  # Fail-before-write covers all state, not just qpos: positions,
+  # velocities, status and retained warmstart are untouched by the
+  # rejected call.
   np.testing.assert_array_equal(
       np.asarray(sim.state._qpos[0].cpu().numpy()), qpos_before)
+  np.testing.assert_array_equal(
+      np.asarray(sim.state._qvel[0].cpu().numpy()),
+      np.zeros((m.nv,), dtype=np.float32))
+  assert int(np.asarray(
+      sim.state.status.cpu().numpy()).ravel()[0]) == 0
+  assert float(np.linalg.norm(sim.get_warmstart())) == 0.0
   # Documented rebuild consumes the mutated values.
   sim.apply_lifecycle(m)
   desc = sim._coupled_constraints.descriptor
@@ -565,6 +574,63 @@ def test_elliptic_friction_rows_mapped_with_moving_state_gpu():
   s = sim.assembled_system(recompute=True)
   lam = np.asarray(s["lambda"][0].cpu().numpy(), dtype=np.float64)
   desc = sim._coupled_constraints.descriptor
+  packed = np.asarray(desc.contact_condim_packed, dtype=np.int32).reshape(-1, 3)
+  mask = np.asarray(s["contact_mask"][0].cpu().numpy())
+  npos = np.asarray(s["contact_position"][0].cpu().numpy())
+  assignment = _unique_native_slots(contacts, mask, npos)
+  fric_vel, fric_lam = 0.0, 0.0
+  for ci, contact in enumerate(contacts):
+    slot, _ = assignment[ci]
+    gpu_base = int(desc.nr_joint) + int(packed[slot, 1])
+    rows = np.arange(gpu_base, gpu_base + len(contact["rows"]))
+    fric_vel = max(fric_vel, float(np.max(np.abs(
+        np.asarray(cpu_data.efc_vel, dtype=np.float64)[contact["rows"][1:]]))))
+    fric_lam = max(fric_lam, float(np.max(np.abs(lam[rows[1:]]))))
+  assert fric_vel > 1e-6, fric_vel
+  assert fric_lam > 0.0, fric_lam
+
+
+@_needs_gpu()
+def test_elliptic_distinct_reference_coefficients_mapped_gpu():
+  # Distinct independently chosen normal/friction reference coefficients
+  # via explicit pair attributes (solref vs solreffriction differ, not
+  # override-coupled): elliptic cone with nonzero tangent/spin velocity
+  # exercises friction_B from solreffriction while K/B come from solref.
+  # Row-mapped against the oracle with nonzero friction asserts.
+  import mujoco
+  import sys
+  sys.path.insert(0, "metal/tests")
+  from test_bundled_sdf_rigid_oracle_019 import (
+      _cpu_contacts, _assert_contact_system_matches_cpu,
+      _unique_native_slots)
+  from mujoco_metal.simulation import MetalSimulation
+  from mujoco_metal.coupled_constraints import lower_coupled_constraints
+  m = mujoco.MjModel.from_xml_string(_torus_xml(
+      condim="3", opt='cone="elliptic"',
+      pair_extra='solref="0.03 1.5" solreffriction="0.04 1.2"'))
+  desc = lower_coupled_constraints(m)
+  assert int(desc.npairs) >= 1
+  np.testing.assert_array_equal(
+      np.asarray(desc.solref).reshape(-1, 2)[0],
+      np.array([0.03, 1.5], dtype=np.float32))
+  np.testing.assert_array_equal(
+      np.asarray(desc.solreffriction).reshape(-1, 2)[0],
+      np.array([0.04, 1.2], dtype=np.float32))
+  assert not np.allclose(np.asarray(desc.solref).reshape(-1, 2)[0],
+                         np.asarray(desc.solreffriction).reshape(-1, 2)[0])
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qpos = np.asarray(
+      sim.state._qpos[0].cpu().numpy(), dtype=np.float64).copy()
+  qvel = np.array([0.2, 0.3, -0.1, 0.5, 0.0, -0.7])
+  qvel32 = qvel.astype(np.float32).astype(np.float64)
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=qvel.astype(np.float32).reshape(1, -1))
+  cpu_data, cpu_J, contacts = _cpu_contacts(m, qpos, qvel32)
+  assert len(contacts) == 8
+  assert all(len(c["rows"]) > 1 for c in contacts)
+  _assert_contact_system_matches_cpu(m, sim, cpu_data, cpu_J, contacts)
+  s = sim.assembled_system(recompute=True)
+  lam = np.asarray(s["lambda"][0].cpu().numpy(), dtype=np.float64)
   packed = np.asarray(desc.contact_condim_packed, dtype=np.int32).reshape(-1, 3)
   mask = np.asarray(s["contact_mask"][0].cpu().numpy())
   npos = np.asarray(s["contact_position"][0].cpu().numpy())
