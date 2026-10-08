@@ -1283,6 +1283,10 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
       ("contact_frame", _bytes(guarded(b * nc * 12))),
       ("contact_jacobian", _bytes(guarded(contact_jacobian_words))),
       ("pair_mask", _bytes(guarded(b * max(int(npairs), 1)))),
+      # Double-precision constant residuals for paired aref, per pair
+      # [solref(2), solimp(5), margin/gap(2), solreffriction(2)] = 11 words
+      # shared across worlds (batch-independent); 11-word sentinel at zero.
+      ("pair_const_lo", _bytes(max(int(npairs) * 11, 11))),
       ("workspace_J", _bytes(guarded(b * jacobian_words))),
       ("position_context_zero", _bytes(guarded(b * int(nr)))),
       ("position_context", _bytes(guarded(b * int(nr) * 5))),

@@ -2261,10 +2261,11 @@ kernel void contact_jacobian_low(
   float lpower = pair_solimp[pair_idx * 5 + 4];
   float lmargin = pair_margin_gap[pair_idx * 2 + 0];
   // Double-precision constant residuals, layout per pair [solref_lo(2),
-  // solimp_lo(5), margin_lo(2)]: lo = f64 TRUE - f32 stored hi, so hi+lo
-  // recovers the pinned CPU constants. Friction/mu stay float32
+  // solimp_lo(5), margin_lo(2), solreffriction_lo(2)]: lo = clamped f64
+  // TRUE - f32 stored hi (pinned preprocessing mirrored on host), so hi+lo
+  // recovers the pinned CPU constants. Tangent mu stays float32
   // (documented sub-budget residual: mu enters only via tangent combos).
-  int clo = pair_idx * 9;
+  int clo = pair_idx * 11;
   PrimalFloatPair pK, pB;
   if (lr0 > 0.0f) {
     PrimalFloatPair r0p = {lr0, pair_const_lo[clo + 0]};
@@ -2299,12 +2300,14 @@ kernel void contact_jacobian_low(
     float fr0 = pair_solreffriction[pair_idx * 2];
     float fr1 = pair_solreffriction[pair_idx * 2 + 1];
     PrimalFloatPair d1p = {ld1, pair_const_lo[clo + 3]};
+    PrimalFloatPair fr0p = {fr0, pair_const_lo[clo + 9]};
     if (fr1 > 0.0f) {
-      PrimalFloatPair denom = primal_pair_product(d1p, {fr0, 0.0f});
+      PrimalFloatPair denom = primal_pair_product(d1p, fr0p);
       if (!(denom.hi > 1e-15f)) denom = {1e-15f, 0.0f};
       pFrictionB = primal_pair_divide({2.0f, 0.0f}, denom);
     } else {
-      pFrictionB = primal_pair_divide({-fr1, 0.0f}, d1p);
+      PrimalFloatPair fr1p = {fr1, pair_const_lo[clo + 10]};
+      pFrictionB = primal_pair_divide(primal_pair_multiply(fr1p, -1.0f), d1p);
     }
   }
   device float* jacobian_record = jacobian_paired;
@@ -2565,7 +2568,7 @@ kernel void contact_jacobian_low(
             pimp = d0p;
           } else if (fh_x >= 1.0f) {
             pimp = d1p;
-          } else if (lpower == 1.0f) {
+          } else if (lpower + pair_const_lo[clo + 6] == 1.0f) {
             // Recompute y in pair from the pair distance for coherence
             // (branch decided by the float x above, matching hot).
             PrimalFloatPair mp = {lmargin, pair_const_lo[clo + 7]};

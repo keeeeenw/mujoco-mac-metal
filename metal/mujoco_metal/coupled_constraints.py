@@ -1349,24 +1349,53 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     g2 = np.array([p[1] for p in pairs], dtype=np.int32)
     sr = np.array([p[2] for p in pairs], dtype=np.float32).reshape(-1, 2)
     si = np.array([p[3] for p in pairs], dtype=np.float32).reshape(-1, 5)
-    # Double-precision constant residuals for paired aref: lo = f64 - f32,
-    # layout per pair [solref_lo(2), solimp_lo(5), margin_lo(2)].
-    def _clo64(values, n):
-      f64 = np.asarray(values, dtype=np.float64).reshape(-1)
-      f32 = f64.astype(np.float32).astype(np.float64)
-      return (f64 - f32).astype(np.float32)
-    sr_lo = np.array([_clo64(p[2], 2) for p in pairs],
-                     dtype=np.float32).reshape(-1, 2)
-    si_lo = np.array([_clo64(p[3], 5) for p in pairs],
-                     dtype=np.float32).reshape(-1, 5)
-    mar_lo = np.array([[_clo64(p[7], 1)[0], _clo64(p[8], 1)[0]]
-                       for p in pairs], dtype=np.float32)
-    pair_const_lo = np.concatenate([sr_lo, si_lo, mar_lo], axis=1)
-    cd = np.array([p[4] for p in pairs], dtype=np.int32)
-    fr = np.array([p[5] for p in pairs], dtype=np.float32).reshape(-1, 5)
     srfr = np.array([p[6] for p in pairs], dtype=np.float32).reshape(-1, 2)
     margin = np.array([p[7] for p in pairs], dtype=np.float32)
     gap = np.array([p[8] for p in pairs], dtype=np.float32)
+    # Double-precision constant residuals with pinned CPU preprocessing
+    # mirrored (engine_core_constraint.c assignRef): mixed solref format
+    # already resolved to o_solref above; refsafe imposes r0/fr0 >= 2*dt;
+    # solimp ranges clamp to [1e-4, 0.9999] (d0/d1/mid), width >= 0,
+    # power >= 1. lo = clamped f64 TRUE - f32 stored hi, layout per pair
+    # [solref_lo(2), solimp_lo(5), margin_lo(2), solreffriction_lo(2)].
+    # The device pair (hi, lo) then sums to the clamped CPU value, so the
+    # hot float path (raw, unclamped) keeps bitwise history while E matches.
+    _dt = float(model.opt.timestep)
+    _refsafe = not bool(int(model.opt.disableflags)
+                        & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE))
+
+    def _clamp64(values, kind):
+      f64 = np.asarray(values, dtype=np.float64).reshape(-1).copy()
+      if kind in ("solref", "solreffriction") and _refsafe and f64[0] > 0:
+        f64[0] = max(f64[0], 2 * _dt)
+      if kind == "solimp":
+        f64[0] = min(0.9999, max(0.0001, f64[0]))
+        f64[1] = min(0.9999, max(0.0001, f64[1]))
+        f64[2] = max(0.0, f64[2])
+        f64[3] = min(0.9999, max(0.0001, f64[3]))
+        f64[4] = max(1.0, f64[4])
+      return f64
+
+    if pairs:
+      _clo_rows = []
+      for _k, _p in enumerate(pairs):
+        _raw = (np.asarray(_p[2], dtype=np.float64).reshape(-1),
+                np.asarray(_p[3], dtype=np.float64).reshape(-1),
+                np.asarray([_p[7], _p[8]], dtype=np.float64),
+                np.asarray(_p[6], dtype=np.float64).reshape(-1))
+        _clo = []
+        for _vals, _kind, _hi in (
+            (_raw[0], "solref", sr[_k]), (_raw[1], "solimp", si[_k]),
+            (_raw[2], "margin",
+             np.asarray([margin[_k], gap[_k]], dtype=np.float64)),
+            (_raw[3], "solreffriction", srfr[_k])):
+          _clo.append(_clamp64(_vals, _kind) - _hi.astype(np.float64))
+        _clo_rows.append(np.concatenate(_clo).astype(np.float32))
+      pair_const_lo = np.stack(_clo_rows).reshape(-1, 11)
+    else:
+      pair_const_lo = np.empty((0, 11), dtype=np.float32)
+    cd = np.array([p[4] for p in pairs], dtype=np.int32)
+    fr = np.array([p[5] for p in pairs], dtype=np.float32).reshape(-1, 5)
     r1 = np.where(geoms[g1] == _PLANE, -1.0, model.geom_size[g1, 0]).astype(np.float32)
     r2 = np.where(geoms[g2] == _PLANE, -1.0, model.geom_size[g2, 0]).astype(np.float32)
     p_offset = np.array(pair_contact_offset, dtype=np.int32)
@@ -1379,7 +1408,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     g1 = g2 = np.empty(0, dtype=np.int32)
     sr = np.empty((0, 2), dtype=np.float32)
     si = np.empty((0, 5), dtype=np.float32)
-    pair_const_lo = np.empty((0, 9), dtype=np.float32)
+    pair_const_lo = np.empty((0, 11), dtype=np.float32)
     cd = np.empty(0, dtype=np.int32)
     fr = np.empty((0, 5), dtype=np.float32)
     srfr = np.empty((0, 2), dtype=np.float32)
@@ -2453,7 +2482,7 @@ class MetalCoupledConstraints:
         "pair_const_lo": self._tensor(
             np.asarray(getattr(d, "pair_const_lo", None)).reshape(-1)
             if (d.npairs and getattr(d, "pair_const_lo", None) is not None)
-            else np.zeros(9, dtype=np.float32)),
+            else np.zeros(11, dtype=np.float32)),
         "pair_condim": self._tensor(d.condim if d.npairs else np.zeros(1, dtype=np.int32)),
         "pair_friction": self._tensor(d.friction.reshape(-1) if d.npairs else np.zeros(5, dtype=np.float32)),
         "pair_solreffriction": self._tensor(d.solreffriction.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
