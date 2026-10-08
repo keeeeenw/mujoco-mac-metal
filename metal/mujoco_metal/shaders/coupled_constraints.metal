@@ -771,7 +771,10 @@ inline void contact_cache_store(
   records[base+12]=contact.t2.z;
   // Analytic producers carry no residuals: the low/tail planes are exact
   // zeros, so compensated readers reproduce the float path bit-identically.
+  // The distance low word (record-relative [9], used by paired aref) is
+  // likewise zero; [10..11] remain scratch.
   int res=record*37;
+  records[res+9]=0.0f; records[res+10]=0.0f; records[res+11]=0.0f;
   for (int i=0;i<12;i++) records[res+25+i]=0.0f;
 }
 

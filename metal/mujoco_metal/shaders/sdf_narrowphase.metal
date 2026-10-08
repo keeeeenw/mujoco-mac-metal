@@ -2314,9 +2314,10 @@ inline void sdf_stage_publish(int swapped, float3 p2, float4 q2,
   }
   sdf_stage_store_point(state, state_base + SDF_STAGE_X, x);
   // Wide contact record (37 words): [0..8] seed local-point triple,
-  // [9..11] producer scratch (unread), [12] dist, [13..15] world point hi,
-  // [16..18] world normal hi, [19..21] t1, [22..24] t2, [25..27] world
-  // point lo, [28..30] world normal lo, [31..33] world point tail,
+  // [9] signed-distance low word (dist_hi + dist_lo = wide dist;
+  // [10..11] producer scratch, unread), [12] dist, [13..15] world point
+  // hi, [16..18] world normal hi, [19..21] t1, [22..24] t2, [25..27]
+  // world point lo, [28..30] world normal lo, [31..33] world point tail,
   // [34..36] world normal tail. Stride is unrelated to Metal's 31-buffer
   // ABI limit.
   //
@@ -2355,7 +2356,12 @@ inline void sdf_stage_publish(int swapped, float3 p2, float4 q2,
   records[out + 4] = x.lo.y; records[out + 5] = x.lo.z;
   records[out + 6] = x.tail.x; records[out + 7] = x.tail.y;
   records[out + 8] = x.tail.z;
-  records[out + 12] = sw_float32(dist);
+  // Coherent distance split (same convention as point/normal above):
+  // dist_lo is (wide TRUE - stored float32 hi), so hi + lo recovers the
+  // wide descent distance. Distance is swap-independent (no negation).
+  float dist_hi = sw_float32(dist);
+  records[out + 12] = dist_hi;
+  records[out + 9] = sw_sub(dist, sw(dist_hi)).hi;
   records[out + 13] = point.x; records[out + 14] = point.y;
   records[out + 15] = point.z; records[out + 16] = contact_normal.x;
   records[out + 17] = contact_normal.y; records[out + 18] = contact_normal.z;
