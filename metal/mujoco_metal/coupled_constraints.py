@@ -4781,6 +4781,10 @@ class MetalCoupledConstraints:
           body_base + max(self._solver_island_nbody, 1)
           + self._solver_island_ntree]
     nc = int(d.ncontacts_max)
+    result.update({
+        "contact_friction": self._constants["contact_friction"][:nc * 5].reshape(nc, 5),
+        "contact_condim": self._constants["contact_condim"][:nc * 3],
+    })
     if nc:
       contact_rows = w["contact_row_data"][:b * nc * 42].reshape(b, nc, 6, 7)
       contact_frames = w["contact_frame"][:b * nc * 12].reshape(b, nc, 12)
@@ -5570,6 +5574,10 @@ class MetalCoupledConstraints:
         result["jacobian_layout"] = self._jacobian_layout
         result["jacobian_pattern"] = self._jacobian_pattern
 
+    result.update({
+        "contact_friction": self._constants["contact_friction"][:nc * 5].reshape(nc, 5),
+        "contact_condim": self._constants["contact_condim"][:nc * 3],
+    })
     if nc > 0:
       contact_rows = w["contact_row_data"][: b * nc * 6 * 7].reshape(b, nc, 6, 7)
       contact_frames = w["contact_frame"][: b * nc * 12].reshape(b, nc, 12)
@@ -5877,6 +5885,10 @@ class MetalCoupledConstraints:
         result["J"] = self.materialize_jacobian()
       elif materialize_jacobian:
         result["J"] = self.materialize_jacobian()
+    result.update({
+        "contact_friction": self._constants["contact_friction"][:nc * 5].reshape(nc, 5),
+        "contact_condim": self._constants["contact_condim"][:nc * 3],
+    })
     if nc:
       rows = w["contact_row_data"][:b * nc * 42].reshape(b, nc, 6, 7)
       frames = w["contact_frame"][:b * nc * 12].reshape(b, nc, 12)
@@ -5890,8 +5902,6 @@ class MetalCoupledConstraints:
           "contact_tangent1": frames[:, :, 3:6],
           "contact_tangent2": frames[:, :, 6:9],
           "contact_position": frames[:, :, 9:12],
-          "contact_friction": self._constants["contact_friction"][:nc * 5].reshape(nc, 5),
-          "contact_condim": self._constants["contact_condim"][:nc * 3],
       })
       if getattr(getattr(self, "_jacobian_layout", None), "mode", 0) == 0:
         result["contact_jacobian"] = w["contact_jacobian"][:b * nc * 6 * nv].reshape(

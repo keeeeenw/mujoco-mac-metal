@@ -370,6 +370,11 @@ def test_common_mjc_convex_rotated_friction_pair_lifecycle_gpu(pair, cone):
     np.testing.assert_allclose(
         sim._last_coupled["qfrc_constraint"][0].detach().cpu().numpy(),
         cpu.qfrc_constraint, rtol=2e-3, atol=2e-3)
+    torch = sim.state._torch
+    torch.testing.assert_close(sim._last_coupled["contact_friction"],
+                               native["contact_friction"], rtol=0, atol=0)
+    torch.testing.assert_close(sim._last_coupled["contact_condim"],
+                               native["contact_condim"], rtol=0, atol=0)
     expected.append((sim.state.qpos.clone(), sim.state.qvel.clone()))
   sim.restore(checkpoint)
   for qpos, qvel in expected:
