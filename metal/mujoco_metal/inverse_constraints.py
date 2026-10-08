@@ -42,6 +42,7 @@ def inverse_constraint_force(rows, qacc, descriptor, *, qacc_low=None,
   layout = rows.get("jacobian_layout")
   pattern = rows.get("jacobian_pattern")
   J = rows.get("J")
+  J_low = None
   if packed is None:
     if (not isinstance(J, torch.Tensor) or J.dtype != torch.float32
         or J.device != qacc.device or tuple(J.shape) != (b, nr, nv)):
@@ -58,6 +59,11 @@ def inverse_constraint_force(rows, qacc, descriptor, *, qacc_low=None,
     if layout.mode == PACKED_J_DENSE:
       J = materialize_packed_jacobian_torch(
           torch, packed, b, layout, pattern)
+      if layout.paired:
+        offset = layout.lo_values_offset()
+        J_low = packed.reshape(-1)[:b * layout.stride_words].reshape(
+            b, layout.stride_words)[:, offset:offset + layout.nnz].reshape(
+                b, nr, nv)
     elif layout.mode != PACKED_J_CSR or pattern is None:
       raise ValueError("sparse query rows require their compiled CSR pattern")
     elif (pattern.nr != nr or pattern.nv != nv
@@ -85,9 +91,9 @@ def inverse_constraint_force(rows, qacc, descriptor, *, qacc_low=None,
           packed, layout, pattern, qacc_low)
       dot_hi, dot_low = _pair_add(dot_hi, dot_low, low_hi, low_lo)
   else:
-    dot_hi, dot_low = _dense_jacobian_pair_matvec(J, qacc)
+    dot_hi, dot_low = _dense_jacobian_pair_matvec(J, qacc, J_low)
     if qacc_low is not None:
-      low_hi, low_lo = _dense_jacobian_pair_matvec(J, qacc_low)
+      low_hi, low_lo = _dense_jacobian_pair_matvec(J, qacc_low, J_low)
       dot_hi, dot_low = _pair_add(dot_hi, dot_low, low_hi, low_lo)
   jar, jar_low = _pair_add(dot_hi, dot_low, -rows["ar"], -ar_low)
   safe_R = torch.where(live, R, torch.ones_like(R))
@@ -198,8 +204,10 @@ def inverse_constraint_force(rows, qacc, descriptor, *, qacc_low=None,
         packed, layout, pattern, force, force_low, live)
   else:
     J = torch.where(live[:, :, None], J, torch.zeros_like(J))
+    if J_low is not None:
+      J_low = torch.where(live[:, :, None], J_low, torch.zeros_like(J_low))
     out_hi, out_low = _dense_jacobian_transpose_pair_matvec(
-        J, force, force_low)
+        J, force, force_low, J_low)
   return (out_hi, out_low) if return_low else out_hi
 
 
@@ -247,13 +255,16 @@ def _two_prod(a, b):
   return product, error
 
 
-def _dense_jacobian_pair_matvec(J, qacc):
+def _dense_jacobian_pair_matvec(J, qacc, J_low=None):
   batch, nr, nv = J.shape
   hi = torch.zeros((batch, nr), dtype=qacc.dtype, device=qacc.device)
   low = torch.zeros_like(hi)
   for dof in range(nv):
     product, product_low = _two_prod(J[:, :, dof], qacc[:, dof:dof+1])
     hi, low = _pair_add(hi, low, product, product_low)
+    if J_low is not None:
+      product, product_low = _two_prod(J_low[:, :, dof], qacc[:, dof:dof+1])
+      hi, low = _pair_add(hi, low, product, product_low)
   return hi, low
 
 
@@ -292,11 +303,15 @@ def _packed_jacobian_pair_matvec(packed, layout, pattern, qacc):
       for k, col in enumerate(columns.tolist()):
         p, e = _two_prod(values[k], qacc[world, int(col)])
         acc_hi, acc_low = _pair_add(acc_hi, acc_low, p, e)
+        if layout.paired:
+          low_base = world * layout.stride_words + layout.lo_values_offset()
+          p, e = _two_prod(packed[low_base + begin + k], qacc[world, int(col)])
+          acc_hi, acc_low = _pair_add(acc_hi, acc_low, p, e)
       hi[world, row], low[world, row] = acc_hi, acc_low
   return hi, low
 
 
-def _dense_jacobian_transpose_pair_matvec(J, force_hi, force_low):
+def _dense_jacobian_transpose_pair_matvec(J, force_hi, force_low, J_low=None):
   batch, nr, nv = J.shape
   hi = torch.zeros((batch, nv), dtype=force_hi.dtype, device=force_hi.device)
   low = torch.zeros_like(hi)
@@ -305,6 +320,11 @@ def _dense_jacobian_transpose_pair_matvec(J, force_hi, force_low):
     pl, ple = _two_prod(J[:, row, :], force_low[:, row:row+1])
     hi, low = _pair_add(hi, low, p, pe)
     hi, low = _pair_add(hi, low, pl, ple)
+    if J_low is not None:
+      p, pe = _two_prod(J_low[:, row, :], force_hi[:, row:row+1])
+      pl, ple = _two_prod(J_low[:, row, :], force_low[:, row:row+1])
+      hi, low = _pair_add(hi, low, p, pe)
+      hi, low = _pair_add(hi, low, pl, ple)
   return hi, low
 
 
@@ -334,6 +354,14 @@ def _packed_jacobian_transpose_pair_matvec(packed, layout, pattern,
         lh, ll = _two_prod(j, force_low[world, row])
         sum_hi, sum_low = _pair_add(hi[world, col], low[world, col], ph, pl)
         hi[world, col], low[world, col] = _pair_add(sum_hi, sum_low, lh, ll)
+        if layout.paired:
+          low_base = world * layout.stride_words + layout.lo_values_offset()
+          j_low = torch.where(live[world, row], packed[low_base + begin + k],
+                              torch.zeros_like(j))
+          ph, pl = _two_prod(j_low, force_hi[world, row])
+          lh, ll = _two_prod(j_low, force_low[world, row])
+          sum_hi, sum_low = _pair_add(hi[world, col], low[world, col], ph, pl)
+          hi[world, col], low[world, col] = _pair_add(sum_hi, sum_low, lh, ll)
   return hi, low
 
 
