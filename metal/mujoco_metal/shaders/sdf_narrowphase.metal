@@ -1035,7 +1035,7 @@ inline int collide_mesh_sdf_cached(int gi_mesh, int gi_sdf, float3 pmesh,
         float3(scratch[candidate_base+6],scratch[candidate_base+7],scratch[candidate_base+8])};
     bool known=false;
     for(int j=0;j<ncon;++j) {
-      int accepted_base=(record_base+j)*25;
+      int accepted_base=(record_base+j)*37;
       SdfPointPair accepted={
           float3(records[accepted_base+0],records[accepted_base+1],records[accepted_base+2]),
           float3(records[accepted_base+3],records[accepted_base+4],records[accepted_base+5]),
@@ -1056,7 +1056,7 @@ inline int collide_mesh_sdf_cached(int gi_mesh, int gi_sdf, float3 pmesh,
         sw_neg(sw_mul(sw(0.5f),SdfWide{scratch[candidate_base+9],
                                            scratch[candidate_base+10],
                                            scratch[candidate_base+11]})));
-    int accepted_base=(record_base+ncon)*25;
+    int accepted_base=(record_base+ncon)*37;
     records[accepted_base+0]=x.hi.x; records[accepted_base+1]=x.hi.y;
     records[accepted_base+2]=x.hi.z; records[accepted_base+3]=x.lo.x;
     records[accepted_base+4]=x.lo.y; records[accepted_base+5]=x.lo.z;
@@ -1075,6 +1075,18 @@ inline int collide_mesh_sdf_cached(int gi_mesh, int gi_sdf, float3 pmesh,
     records[output_base+7]=t1.x; records[output_base+8]=t1.y;
     records[output_base+9]=t1.z; records[output_base+10]=t2.x;
     records[output_base+11]=t2.y; records[output_base+12]=t2.z;
+    records[output_base+13]=world_point.lo.x;
+    records[output_base+14]=world_point.lo.y;
+    records[output_base+15]=world_point.lo.z;
+    records[output_base+16]=world_normal.lo.x;
+    records[output_base+17]=world_normal.lo.y;
+    records[output_base+18]=world_normal.lo.z;
+    records[output_base+19]=world_point.tail.x;
+    records[output_base+20]=world_point.tail.y;
+    records[output_base+21]=world_point.tail.z;
+    records[output_base+22]=world_normal.tail.x;
+    records[output_base+23]=world_normal.tail.y;
+    records[output_base+24]=world_normal.tail.z;
     ++ncon;
   }
   return ncon;
@@ -1968,7 +1980,15 @@ inline void sdf_stage_publish(int swapped, float3 p2, float4 q2,
     t2 = cross(contact_normal, t1);
   }
   sdf_stage_store_point(state, state_base + SDF_STAGE_X, x);
-  int out = record_base * 25;
+  // Wide contact record (37 words): [0..8] seed local-point triple,
+  // [9..11] producer scratch (unread), [12] dist, [13..15] world point hi,
+  // [16..18] world normal hi, [19..21] t1, [22..24] t2, [25..27] world
+  // point lo, [28..30] world normal lo, [31..33] world point tail,
+  // [34..36] world normal tail. Stride is unrelated to Metal's 31-buffer
+  // ABI limit. Swap negation mirrors the hi flip below on every residual.
+  float3 normal_lo = swapped ? -world_normal.lo : world_normal.lo;
+  float3 normal_tail = swapped ? -world_normal.tail : world_normal.tail;
+  int out = record_base * 37;
   records[out + 0] = x.hi.x; records[out + 1] = x.hi.y;
   records[out + 2] = x.hi.z; records[out + 3] = x.lo.x;
   records[out + 4] = x.lo.y; records[out + 5] = x.lo.z;
@@ -1980,6 +2000,13 @@ inline void sdf_stage_publish(int swapped, float3 p2, float4 q2,
   records[out + 17] = contact_normal.y; records[out + 18] = contact_normal.z;
   records[out + 19] = t1.x; records[out + 20] = t1.y; records[out + 21] = t1.z;
   records[out + 22] = t2.x; records[out + 23] = t2.y; records[out + 24] = t2.z;
+  records[out + 25] = world_point.lo.x; records[out + 26] = world_point.lo.y;
+  records[out + 27] = world_point.lo.z; records[out + 28] = normal_lo.x;
+  records[out + 29] = normal_lo.y; records[out + 30] = normal_lo.z;
+  records[out + 31] = world_point.tail.x;
+  records[out + 32] = world_point.tail.y;
+  records[out + 33] = world_point.tail.z; records[out + 34] = normal_tail.x;
+  records[out + 35] = normal_tail.y; records[out + 36] = normal_tail.z;
 }
 
 inline int collide_sdf_cached(
@@ -2087,7 +2114,7 @@ inline int collide_sdf_cached(
     // g_pair before normalization can erase represented transform/SDF terms
     // precisely when the two normalized side gradients nearly cancel.
     SdfVectorPair n_pair = sdf_vector_normalize(g_pair);
-    int candidate_base=record_base*25;
+    int candidate_base=record_base*37;
     contact_records[candidate_base+0]=x.hi.x;
     contact_records[candidate_base+1]=x.hi.y;
     contact_records[candidate_base+2]=x.hi.z;
@@ -2127,6 +2154,18 @@ inline int collide_sdf_cached(
     contact_records[output_base+10]=t2.x;
     contact_records[output_base+11]=t2.y;
     contact_records[output_base+12]=t2.z;
+    contact_records[output_base+13]=world_point.lo.x;
+    contact_records[output_base+14]=world_point.lo.y;
+    contact_records[output_base+15]=world_point.lo.z;
+    contact_records[output_base+16]=world_normal.lo.x;
+    contact_records[output_base+17]=world_normal.lo.y;
+    contact_records[output_base+18]=world_normal.lo.z;
+    contact_records[output_base+19]=world_point.tail.x;
+    contact_records[output_base+20]=world_point.tail.y;
+    contact_records[output_base+21]=world_point.tail.z;
+    contact_records[output_base+22]=world_normal.tail.x;
+    contact_records[output_base+23]=world_normal.tail.y;
+    contact_records[output_base+24]=world_normal.tail.z;
     ++ncon;
   }
   return ncon;

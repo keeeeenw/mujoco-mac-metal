@@ -324,7 +324,7 @@ def _capture_staged_workspace(sim):
       state = workspace["contact_sdf_seed_state"][:8 * _STATE_WORDS]
       ctrl = workspace["contact_sdf_seed_ctrl"][:8]
       valid = workspace["contact_sdf_seed_valid"][:8]
-      records = workspace["contact_sdf_seed_records"][:8 * 25]
+      records = workspace["contact_sdf_seed_records"][:8 * 37]
       if current is None:
         raise AssertionError(f"SDF stage outside producer epoch: {_name}")
       current.append((_name, dims, state.clone(), ctrl.clone(), valid.clone(),
@@ -495,7 +495,7 @@ def _compare_trace(name, reference, captures, native_contacts, input_digest):
   publish = by_key.get(("_contact_sdf_publish_contact", 0, 0, 0,
                         min(32, len(reference))))
   assert publish is not None, (name, "missing contact publication capture")
-  seed_records = publish[3].reshape(-1, 25)
+  seed_records = publish[3].reshape(-1, 37)
   for seed in reference:
     index = int(seed["seed"])
     expected = seed["contact"]

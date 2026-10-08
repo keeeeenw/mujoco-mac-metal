@@ -152,7 +152,7 @@ def test_sdf_candidate_order_and_strict_normalization_remain_in_source():
   # staged path iterates all source seeds in bounded tiles.
   assert "SdfPointPair accepted_points[50]" not in analytic_cached
   assert "int j = seed_index;" in analytic_cached
-  assert "int candidate_base=record_base*25;" in analytic_cached
+  assert "int candidate_base=record_base*37;" in analytic_cached
   assert "contact_records[candidate_base+8]=x.tail.z;" in analytic_cached
   assert "contact_records[output_base+12]=t2.z;" in analytic_cached
   assert "sdf_source_gradient_invalid(grad)" in descent
@@ -227,7 +227,8 @@ def test_native_tiny_generic_producer_pipeline_selector():
   stage = MetalCoupledConstraints(model, batch_size=1)
   assert stage._contact_generic_producer is not None
   assert stage._contact_kernel is not None
-  assert stage._contact_sdf_producer is None
+  assert stage._contact_sdf_seed_init is None
+  assert stage._contact_sdf_finalize_producer is None
 
 
 def test_native_tiny_mesh_sdf_producer_pipeline_selector():
@@ -250,9 +251,9 @@ def test_contact_cache_capacity_matches_exact_allocations():
     # Each plane is a separate float32 or int32 allocation. Empty planes keep
     # one-word sentinels; the reusable dispatch-parameter plane has five ints.
     count = max(batch * npairs, 1)
-    records = max(batch * ncontacts * 25, 1)
+    records = max(batch * ncontacts * 37, 1)
     mesh_candidates = max(batch * npairs * 50 * 12, 1)
-    seed_records = max(batch * npairs * tile * 25, 1)
+    seed_records = max(batch * npairs * tile * 37, 1)
     seed_valid = max(batch * npairs * tile, 1)
     seed_state = max(batch * npairs * tile * 159, 1)
     seed_control = max(batch * npairs * tile, 1)
@@ -260,9 +261,9 @@ def test_contact_cache_capacity_matches_exact_allocations():
     return 4 * (count + records + mesh_candidates + seed_records + seed_valid
                 + seed_state + seed_control + stage_dims)
 
-  assert _pair_contact_cache_bytes(1, 8, 2) == independently_summed_bytes(1, 8, 2, 0) == 5644
-  assert _pair_contact_cache_bytes(3, 11, 5) == independently_summed_bytes(3, 11, 5, 0) == 39396
-  assert _pair_contact_cache_bytes(1, 50, 1, 32) == independently_summed_bytes(1, 50, 1, 32) == 31232
+  assert _pair_contact_cache_bytes(1, 8, 2) == independently_summed_bytes(1, 8, 2, 0) == 6028
+  assert _pair_contact_cache_bytes(3, 11, 5) == independently_summed_bytes(3, 11, 5, 0) == 40980
+  assert _pair_contact_cache_bytes(1, 50, 1, 32) == independently_summed_bytes(1, 50, 1, 32) == 35168
   assert _pair_contact_cache_bytes(1, 0, 0) == independently_summed_bytes(1, 0, 0, 0) == 48
   host = (ROOT / "mujoco_metal" / "coupled_constraints.py").read_text()
   assert '"contact_pair_scratch": empty(max(b * d.npairs * 50 * 12, 1))' in host

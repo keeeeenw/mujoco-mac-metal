@@ -92,16 +92,18 @@ def _pair_contact_cache_bytes(
     batch: int, ncontacts: int, npairs: int, sdf_seed_tile: int = 0) -> int:
   """Exact device storage for output, mesh-SDF, and analytic-SDF scratch."""
   count_words = max(int(batch) * int(npairs), 1)
-  record_words = max(int(batch) * int(ncontacts) * 25, 1)
+  record_words = max(int(batch) * int(ncontacts) * 37, 1)
   # Preserve the pinned mesh-SDF candidate order without putting candidates
   # into output slots before deduplication. Each of 50 candidates has a
   # three-word point residual and three-word depth.
   candidate_words = max(int(batch) * int(npairs) * 50 * 12, 1)
   # Analytic/SDF pairs reuse a fixed per-start tile across the complete source
-  # initpoint budget. Each tile slot stores a 25-word result, 159 words of
-  # three-float staged descent state, and two int control/validity words.
+  # initpoint budget. Each tile slot stores a 37-word result (13-word
+  # geometric header plus two 6-word residual planes for world
+  # position/normal), 159 words of three-float staged descent state, and
+  # two int control/validity words.
   sdf_seed_words = (int(batch) * int(npairs) * int(sdf_seed_tile)
-                    * (25 + _SDF_STAGE_STATE_WORDS + 2)
+                    * (37 + _SDF_STAGE_STATE_WORDS + 2)
                     if sdf_seed_tile else 4)
   # Five int32 stage dimensions are allocated even for models with no SDF;
   # all four per-seed arrays also retain one-element dummies in that case.
@@ -2901,13 +2903,13 @@ class MetalCoupledConstraints:
         "contact_frame": empty(b * nc * 12),
         "contact_pair_count": torch.zeros(
             max(b * d.npairs, 1), dtype=torch.int32, device=self._device),
-        "contact_pair_records": empty(b * nc * 25),
+        "contact_pair_records": empty(b * nc * 37),
         "contact_pair_scratch": empty(max(b * d.npairs * 50 * 12, 1)),
         # Reused source-order tile of per-seed exact contact records. The
         # host loops over all source seeds; tile width is only a storage bound.
         "contact_sdf_seed_records": empty(
             max(b * (d.npairs if self._has_analytic_sdf_pairs else 0)
-                * self._sdf_seed_tile * 25, 1)),
+                * self._sdf_seed_tile * 37, 1)),
         "contact_sdf_seed_valid": torch.zeros(
             max(b * (d.npairs if self._has_analytic_sdf_pairs else 0)
                 * self._sdf_seed_tile, 1),

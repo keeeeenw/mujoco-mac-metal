@@ -757,7 +757,7 @@ inline float solve_contact_block_iterative(
 // Geometric contact detection and Jacobian generation for all 9 primitive pairs
 inline void contact_cache_store(
     device float* records, int record, thread const ContactGeom& contact) {
-  int base=record*25+12;
+  int base=record*37+12;
   records[base+0]=contact.dist;
   records[base+1]=contact.pos.x; records[base+2]=contact.pos.y;
   records[base+3]=contact.pos.z;
@@ -767,6 +767,10 @@ inline void contact_cache_store(
   records[base+9]=contact.t1.z;
   records[base+10]=contact.t2.x; records[base+11]=contact.t2.y;
   records[base+12]=contact.t2.z;
+  // Analytic producers carry no residuals: the low/tail planes are exact
+  // zeros, so compensated readers reproduce the float path bit-identically.
+  int res=record*37;
+  for (int i=0;i<12;i++) records[res+25+i]=0.0f;
 }
 
 // Generic contacts are produced in their own entry point. The dispatcher
@@ -1212,7 +1216,7 @@ kernel void contact_finalize_sdf(
   int ncon=contact_count[count_index];
   SdfPointPair accepted[50];
   for (int k=0;k<ncon;k++) {
-    int outbase=(world*ncontacts_max+offset+k)*25;
+    int outbase=(world*ncontacts_max+offset+k)*37;
     accepted[k]={
       float3(contact_records[outbase],contact_records[outbase+1],contact_records[outbase+2]),
       float3(contact_records[outbase+3],contact_records[outbase+4],contact_records[outbase+5]),
@@ -1221,7 +1225,7 @@ kernel void contact_finalize_sdf(
   for (int i=0;i<tile_count;i++) {
     int local=(world*npairs+pair_idx)*capacity+i;
     if (seed_valid[local]==0) continue;
-    int inbase=local*25;
+    int inbase=local*37;
     SdfPointPair x={
       float3(seed_records[inbase],seed_records[inbase+1],seed_records[inbase+2]),
       float3(seed_records[inbase+3],seed_records[inbase+4],seed_records[inbase+5]),
@@ -1238,8 +1242,8 @@ kernel void contact_finalize_sdf(
       contact_count[count_index]=-1;
       return;
     }
-    int outbase=(world*ncontacts_max+offset+ncon)*25;
-    for (int k=0;k<25;k++) contact_records[outbase+k]=seed_records[inbase+k];
+    int outbase=(world*ncontacts_max+offset+ncon)*37;
+    for (int k=0;k<37;k++) contact_records[outbase+k]=seed_records[inbase+k];
     accepted[ncon]=x;
     ncon++;
   }
@@ -1414,7 +1418,7 @@ kernel void contact_normal(
     int fb = out * 12;
     int row_start = pair_contact_offsets_dims[slot_rows_base + slot];
 
-    int contact_base=(world*ncontacts_max+slot)*25+12;
+    int contact_base=(world*ncontacts_max+slot)*37+12;
     float d=contact_records[contact_base+0];
     float3 n=float3(contact_records[contact_base+4],
                      contact_records[contact_base+5],

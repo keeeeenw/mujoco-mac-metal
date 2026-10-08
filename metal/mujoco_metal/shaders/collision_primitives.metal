@@ -1458,7 +1458,10 @@ inline int collide_pair_sdf_cached(
   }
   if (swapped) {
     for (int k=0;k<n;++k) {
-      int base=(record_base+k)*25+12;
+      // Swap negation mirrors the hi flip on the residual planes; the
+      // contact point is orientation-independent and stays untouched.
+      int base=(record_base+k)*37+12;
+      int res=(record_base+k)*37;
       float3 normal=-float3(contact_records[base+4],contact_records[base+5],
                              contact_records[base+6]);
       float3 t1v=-float3(contact_records[base+7],contact_records[base+8],
@@ -1470,6 +1473,12 @@ inline int collide_pair_sdf_cached(
       contact_records[base+9]=t1v.z;
       contact_records[base+10]=t2v.x; contact_records[base+11]=t2v.y;
       contact_records[base+12]=t2v.z;
+      contact_records[res+28]=-contact_records[res+28];
+      contact_records[res+29]=-contact_records[res+29];
+      contact_records[res+30]=-contact_records[res+30];
+      contact_records[res+34]=-contact_records[res+34];
+      contact_records[res+35]=-contact_records[res+35];
+      contact_records[res+36]=-contact_records[res+36];
     }
   }
   return n;
@@ -1493,13 +1502,17 @@ inline int collide_pair_mesh_sdf_cached(
                               hull,hull_info);
   if (swapped) {
     for (int k=0;k<n;++k) {
-      int base=(record_base+k)*25+12;
+      int base=(record_base+k)*37+12;
+      int res=(record_base+k)*37;
       float3 normal=-float3(records[base+4],records[base+5],records[base+6]);
       float3 t1v=-float3(records[base+7],records[base+8],records[base+9]);
       float3 t2v=cross(normal,t1v);
       records[base+4]=normal.x; records[base+5]=normal.y; records[base+6]=normal.z;
       records[base+7]=t1v.x; records[base+8]=t1v.y; records[base+9]=t1v.z;
       records[base+10]=t2v.x; records[base+11]=t2v.y; records[base+12]=t2v.z;
+      records[res+28]=-records[res+28]; records[res+29]=-records[res+29];
+      records[res+30]=-records[res+30]; records[res+34]=-records[res+34];
+      records[res+35]=-records[res+35]; records[res+36]=-records[res+36];
     }
   }
   return n;
