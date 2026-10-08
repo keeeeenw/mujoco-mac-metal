@@ -120,6 +120,8 @@ def _check_variant(xml, qpos=None, qvel=None, batch=1, etier=5e-9,
     "mixed-analytic-sdf",
     "moving-state",
     "batch-2",
+    "clamp-equal-d0d1",
+    "clamp-low-bound",
 ])
 def test_paired_aref_branch_variants_gpu(variant):
   import mujoco
@@ -193,11 +195,30 @@ def test_paired_aref_branch_variants_gpu(variant):
                    etier=1e-5)
   elif variant == "batch-2":
     _check_variant(_torus_xml(), batch=2, etier=5e-9)
+  elif variant == "clamp-equal-d0d1":
+    # Distinct out-of-range raw d0/d1 clamp to the SAME value (0.9999):
+    # the flat (d0==d1) branch must be taken. Pre-canonicalization the raw
+    # predicates (10.0 != 20.0) took the lerp branch with unclamped
+    # impedances; the paired E must match the clamped CPU oracle tightly.
+    m = mujoco.MjModel.from_xml_string(_torus_xml())
+    m.opt.enableflags |= flag
+    m.opt.o_solimp[:] = (10.0, 20.0, 0.001, 0.5, 2.0)
+    _check_variant_xml(m, 5e-9)
+  elif variant == "clamp-low-bound":
+    # All-below-range raw values clamp to lower bounds (d0/d1/mid to
+    # 1e-4, width to 0, power to 1): flat branch with zero width. K ~ 1e8
+    # at the 1e-4 impedance bound amplifies float32 input rounding, so
+    # the tier documents the K-scaled bound (still far below branch-error
+    # scale, which measured ~2e3 pre-canonicalization on the equal-clamp).
+    m = mujoco.MjModel.from_xml_string(_torus_xml())
+    m.opt.enableflags |= flag
+    m.opt.o_solimp[:] = (-5.0, -2.0, -0.001, -1.0, 0.5)
+    _check_variant_xml(m, 1e-8)
   else:
     raise AssertionError(variant)
 
 
-def _check_variant_xml(model, etier):
+def _check_variant_xml(model, etier, ftier=1e-4):
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
@@ -232,6 +253,15 @@ def _check_variant_xml(model, etier):
     worst = max(worst, abs(
         float(rd[i, 0, 3]) + float(rd[i, 0, 6]) - cpu[c][2]))
   assert worst < etier, worst
+  # Publication consumes the same canonical constants: mapped force and
+  # acceleration agree with the pinned oracle (no sorting; DOF-indexed).
+  nat = np.asarray(s["qfrc_constraint"][0].cpu().numpy(), dtype=np.float64)
+  cpu_f = np.asarray(d.qfrc_constraint, dtype=np.float64)
+  scale = max(1.0, float(np.max(np.abs(cpu_f))))
+  assert float(np.max(np.abs(nat - cpu_f))) / scale < ftier
+  np.testing.assert_allclose(
+      np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qacc, dtype=np.float64), rtol=1e-3, atol=1e-3)
 
 
 def _check_shallow(model, etier):

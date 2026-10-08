@@ -1352,14 +1352,17 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     srfr = np.array([p[6] for p in pairs], dtype=np.float32).reshape(-1, 2)
     margin = np.array([p[7] for p in pairs], dtype=np.float32)
     gap = np.array([p[8] for p in pairs], dtype=np.float32)
-    # Double-precision constant residuals with pinned CPU preprocessing
-    # mirrored (engine_core_constraint.c assignRef): mixed solref format
+    # Canonical pinned-CPU preprocessing, applied coherently before packing
+    # every consumer (engine_core_constraint.c assignRef): mixed solref format
     # already resolved to o_solref above; refsafe imposes r0/fr0 >= 2*dt;
     # solimp ranges clamp to [1e-4, 0.9999] (d0/d1/mid), width >= 0,
-    # power >= 1. lo = clamped f64 TRUE - f32 stored hi, layout per pair
+    # power >= 1. Stored hi words ARE the clamped values (float32); lo =
+    # clamped f64 TRUE - f32 stored hi, layout per pair
     # [solref_lo(2), solimp_lo(5), margin_lo(2), solreffriction_lo(2)].
-    # The device pair (hi, lo) then sums to the clamped CPU value, so the
-    # hot float path (raw, unclamped) keeps bitwise history while E matches.
+    # The device pair (hi, lo) sums to the clamped CPU value without
+    # catastrophic cancellation, and the hot float path consumes the same
+    # clamped constants the CPU uses (no raw/unclamped bitwise history).
+    # Margin/gap carry no clamp; their lo words hold float32 rounding only.
     _dt = float(model.opt.timestep)
     _refsafe = not bool(int(model.opt.disableflags)
                         & int(mujoco.mjtDisableBit.mjDSBL_REFSAFE))
@@ -1384,12 +1387,23 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
                 np.asarray([_p[7], _p[8]], dtype=np.float64),
                 np.asarray(_p[6], dtype=np.float64).reshape(-1))
         _clo = []
-        for _vals, _kind, _hi in (
-            (_raw[0], "solref", sr[_k]), (_raw[1], "solimp", si[_k]),
-            (_raw[2], "margin",
-             np.asarray([margin[_k], gap[_k]], dtype=np.float64)),
-            (_raw[3], "solreffriction", srfr[_k])):
-          _clo.append(_clamp64(_vals, _kind) - _hi.astype(np.float64))
+        for _vals, _kind, _key in (
+            (_raw[0], "solref", "sr"), (_raw[1], "solimp", "si"),
+            (_raw[2], "margin", "mg"),
+            (_raw[3], "solreffriction", "srfr")):
+          _true = _clamp64(_vals, _kind)
+          if _key == "sr":
+            sr[_k] = _true.astype(np.float32)
+            _clo.append((_true - sr[_k].astype(np.float64)).astype(np.float32))
+          elif _key == "si":
+            si[_k] = _true.astype(np.float32)
+            _clo.append((_true - si[_k].astype(np.float64)).astype(np.float32))
+          elif _key == "srfr":
+            srfr[_k] = _true.astype(np.float32)
+            _clo.append((_true - srfr[_k].astype(np.float64)).astype(np.float32))
+          else:
+            _clo.append((_true - np.asarray(
+                [margin[_k], gap[_k]], dtype=np.float64)).astype(np.float32))
         _clo_rows.append(np.concatenate(_clo).astype(np.float32))
       pair_const_lo = np.stack(_clo_rows).reshape(-1, 11)
     else:
