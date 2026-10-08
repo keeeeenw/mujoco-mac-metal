@@ -397,3 +397,43 @@ def test_common_ccd_failed_world_mask_is_folded_before_candidate_compaction():
   remap = host.index("pair_maps = self._pair_compaction.run(", fold)
   contact = host.index("self._contact_kernel(", remap)
   assert prepass < fold < remap < contact
+
+
+def test_restart_upload_retains_source_sizes_bounds_and_disjoint_output():
+  model = _convex_pair_model()
+  # Non-float32 compiled values must survive lowering, including mesh bounds
+  # whose value follows the compiled hull rather than a primitive formula.
+  old_hull = np.zeros(15, np.float32)
+  old_info = np.zeros(9 * model.ngeom, np.int32)
+  hull, info, layout = build_common_ccd_model_upload(model, old_hull, old_info)
+  bounds = hull[layout["rbound_base"]:layout["rbound_base"] + 3*model.ngeom]
+  sizes = hull[layout["size_base"]:layout["size_base"] + 9*model.ngeom]
+  np.testing.assert_array_equal(bounds.reshape(-1, 3).astype(np.float64).sum(1),
+                                 model.geom_rbound)
+  np.testing.assert_array_equal(sizes.reshape(-1, 3).astype(np.float64).sum(1),
+                                 model.geom_size.reshape(-1))
+  assert np.count_nonzero(bounds.reshape(-1, 3)[:, 1:]) > 0
+  assert np.count_nonzero(sizes.reshape(-1, 3)[:, 1:]) > 0
+  assert int(info[layout["header_base"] + 33]) == layout["rbound_base"]
+  assert int(info[layout["header_base"] + 34]) == layout["size_base"]
+  assert layout["geom_base"] == layout["header_base"] + 35
+  for batch in (1, 3):
+    final_hull, final_info, final_layout = append_production_workspace(
+        model, old_hull, old_info, batch, 2)
+    predicted = estimate_production_upload_bytes(model, old_hull, old_info, batch, 2)
+    assert predicted == final_hull.nbytes + final_info.nbytes
+    # The five published records finish at82. Five 9-word positions and one
+    # normal occupy82..135, strictly inside the existing per-query record.
+    assert final_layout["output_words_per_query"] >= 136
+
+
+def test_restart_capacity_covers_all_five_convex_witnesses():
+  from mujoco_metal.coupled_constraints import pair_max_contacts
+  geom = mujoco.mjtGeom
+  for first in (geom.mjGEOM_CAPSULE, geom.mjGEOM_CYLINDER,
+                geom.mjGEOM_BOX, geom.mjGEOM_MESH):
+    assert pair_max_contacts(int(first), int(geom.mjGEOM_MESH)) == 5
+    assert pair_max_contacts(int(geom.mjGEOM_MESH), int(first)) == 5
+  assert pair_max_contacts(int(geom.mjGEOM_PLANE), int(geom.mjGEOM_MESH)) == 4
+  assert pair_max_contacts(int(geom.mjGEOM_SPHERE), int(geom.mjGEOM_MESH)) == 1
+  assert pair_max_contacts(int(geom.mjGEOM_ELLIPSOID), int(geom.mjGEOM_MESH)) == 1

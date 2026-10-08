@@ -1065,7 +1065,9 @@ static inline bool flex_project_origin_plane_dd(
 
 static inline void flex_epa_write_witness_dd(
     const thread FlexEpaFace& face, device const FlexDDVertex* vertices,
-    thread ContactGeom& contact) {
+    thread ContactGeom& contact,
+    thread FlexDD3* source_position=nullptr,
+    thread FlexDD3* source_normal=nullptr) {
   FlexDD3 s1=vertices[face.a].m, s2=vertices[face.b].m;
   FlexDD3 s3=vertices[face.c].m, p=face.v_dd;
   FlexDD m14=flex_dd_add(
@@ -1121,12 +1123,15 @@ static inline void flex_epa_write_witness_dd(
                    flex_dd3_scale(vertices[face.c].b,w)));
   FlexDD3 witness_delta=flex_dd3_sub(xa,xb);
   FlexDD witness_norm=flex_dd_sqrt(flex_dd3_dot(witness_delta,witness_delta));
-  contact.normal=flex_dd_compare(witness_norm,flex_dd(0.0f))>0
-      ? flex_dd3_high(flex_dd3_div(witness_delta,witness_norm))
-      : float3(0.0f);
+  FlexDD3 normal=flex_dd_compare(witness_norm,flex_dd(0.0f))>0
+      ? flex_dd3_div(witness_delta,witness_norm) : flex_dd3(float3(0.0f));
+  contact.normal=flex_dd3_high(normal);
   FlexDD distance=flex_dd_sqrt(face.dist2_dd);
   contact.dist=-((distance.hi+distance.lo)+distance.tail);
-  contact.pos=flex_dd3_high(flex_dd3_scale(flex_dd3_add(xa,xb),flex_dd(0.5f)));
+  FlexDD3 position=flex_dd3_scale(flex_dd3_add(xa,xb),flex_dd(0.5f));
+  contact.pos=flex_dd3_high(position);
+  if (source_position!=nullptr) *source_position=position;
+  if (source_normal!=nullptr) *source_normal=normal;
   contact.t1=float3(0.0f);
   make_frame(contact.normal,contact.t1,contact.t2);
 }

@@ -6,7 +6,7 @@
 
 #define COMMON_CCD_PRODUCTION_MAGIC 1128487732
 #define COMMON_CCD_GEOM_INFO_WORDS 9
-#define COMMON_CCD_HEADER_WORDS 33
+#define COMMON_CCD_HEADER_WORDS 35
 #define COMMON_CCD_OUTPUT_WORDS 802
 #define COMMON_CCD_DIAG_PRODUCTION_CONTEXT_OFFSET 7330
 #define COMMON_CCD_DIAG_PRODUCTION_CONTEXT_WORDS 232
@@ -373,7 +373,9 @@ static inline int common_ccd_production_one_rigid_pair(
     device FlexHorizonFrame* epa_stack,
     int vertex_capacity, int face_capacity, int horizon_capacity,
     int stack_capacity, thread ContactGeom& contact,
-    thread int2* out_face_ids, thread int3& out_face_vertices) {
+    thread int2* out_face_ids, thread int3& out_face_vertices,
+    thread FlexDD3* source_position=nullptr,
+    thread FlexDD3* source_normal=nullptr) {
   out_face_vertices=int3(-1);
   CommonCCDSupportObject solve_a=a, solve_b=b;
   bool shrink_a=(a.geom_type==2 || a.geom_type==3);
@@ -419,11 +421,14 @@ static inline int common_ccd_production_one_rigid_pair(
       FlexDD3 normal_delta=flex_dd3_sub(wa,wb);
       FlexDD normal_norm=flex_dd_sqrt(flex_dd3_dot(normal_delta,normal_delta));
       if (flex_dd_compare_exact(normal_norm,flex_dd(1.0e-30f))<=0) return -2;
-      contact.normal=flex_dd3_high(flex_dd3_div(normal_delta,normal_norm));
+      FlexDD3 wide_normal=flex_dd3_div(normal_delta,normal_norm);
+      contact.normal=flex_dd3_high(wide_normal);
       contact.dist=(distance.hi+distance.lo+distance.tail)
           +(margin.hi+margin.lo+margin.tail);
-      contact.pos=flex_dd3_high(flex_dd3_scale(
-          flex_dd3_add(wa,wb),flex_dd(0.5f)));
+      FlexDD3 wide_position=flex_dd3_scale(flex_dd3_add(wa,wb),flex_dd(0.5f));
+      contact.pos=flex_dd3_high(wide_position);
+      if (source_position!=nullptr) *source_position=wide_position;
+      if (source_normal!=nullptr) *source_normal=wide_normal;
       contact.t1=float3(0.0f); make_frame(contact.normal,contact.t1,contact.t2);
       return 1;
     }
@@ -451,6 +456,8 @@ static inline int common_ccd_production_one_rigid_pair(
       stack_capacity,contact,nullptr,nullptr,
       ignored_epa_support_count,ignored_epa_face_count);
   if (epa.status!=0) return -10-epa.status;
+  if (source_position!=nullptr) *source_position=epa.position;
+  if (source_normal!=nullptr) *source_normal=epa.normal;
   out_face_vertices=epa.face_vertices;
   if (out_face_ids!=nullptr) {
     int3 fv=epa.face_vertices;
@@ -1310,9 +1317,87 @@ static inline int common_ccd_multicontact_faces(
   return min(count,4);
 }
 
+// Rigid pairs emit at most five witnesses, leaving the remainder of the
+// shared 50-contact output record available for source-precision restart
+// state. These words are never interpreted as published contacts.
+#define COMMON_CCD_RIGID_WIDE_BASE 82
+#define COMMON_CCD_RIGID_NORMAL_BASE 127
+static inline void common_ccd_store_wide3(device float* values,int base,FlexDD3 value) {
+  values[base]=value.x.hi;values[base+1]=value.x.lo;values[base+2]=value.x.tail;
+  values[base+3]=value.y.hi;values[base+4]=value.y.lo;values[base+5]=value.y.tail;
+  values[base+6]=value.z.hi;values[base+7]=value.z.lo;values[base+8]=value.z.tail;
+}
+static inline FlexDD3 common_ccd_load_wide3(device const float* values,int base) {
+  return FlexDD3{FlexDD{values[base],values[base+1],values[base+2]},
+                 FlexDD{values[base+3],values[base+4],values[base+5]},
+                 FlexDD{values[base+6],values[base+7],values[base+8]}};
+}
+
+// Pinned mjc_Convex's restart frame. Keep the initial witness in source
+// precision: rounding its origin or normal before rotation changes GJK ties.
+static inline void common_ccd_restart_axes(
+    FlexDD3 normal, thread FlexDD3* axes) {
+  FlexDD3 x=flex_dd3_normalize(normal);
+  FlexDD3 y=(flex_dd_compare_exact(x.y,flex_dd(-0.5f))>0 &&
+              flex_dd_compare_exact(x.y,flex_dd(0.5f))<0)
+      ? flex_dd3(float3(0,1,0)) : flex_dd3(float3(0,0,1));
+  y=flex_dd3_source_sub(y,flex_dd3_scale(x,flex_dd3_dot(x,y)));
+  axes[0]=flex_dd3_normalize(y);
+  axes[1]=flex_dd3_cross(x,axes[0]);
+}
+
+static inline void common_ccd_restart_matrix(
+    FlexDD3 axis, bool positive, thread FlexDD* matrix) {
+  // Binary64 sin/cos of +/- 0.001/2, split into three float words.
+  FlexDD sine=FlexDD{0.00049999996554106474f,
+                    1.3625602382494328e-11f,-2.1684043449710089e-19f};
+  if (!positive) sine=flex_dd_neg(sine);
+  FlexDD cosine=FlexDD{0.99999988079071045f,
+                      -5.7907079131780392e-09f,1.1102230246251565e-16f};
+  FlexDD q[4]={cosine,flex_dd_source_mul(axis.x,sine),
+              flex_dd_source_mul(axis.y,sine),flex_dd_source_mul(axis.z,sine)};
+  FlexDD q00=flex_dd_source_mul(q[0],q[0]);
+  FlexDD q01=flex_dd_source_mul(q[0],q[1]);
+  FlexDD q02=flex_dd_source_mul(q[0],q[2]);
+  FlexDD q03=flex_dd_source_mul(q[0],q[3]);
+  FlexDD q11=flex_dd_source_mul(q[1],q[1]);
+  FlexDD q12=flex_dd_source_mul(q[1],q[2]);
+  FlexDD q13=flex_dd_source_mul(q[1],q[3]);
+  FlexDD q22=flex_dd_source_mul(q[2],q[2]);
+  FlexDD q23=flex_dd_source_mul(q[2],q[3]);
+  FlexDD q33=flex_dd_source_mul(q[3],q[3]);
+  FlexDD two=flex_dd(2.0f);
+  matrix[0]=flex_dd_source_sub(flex_dd_source_sub(flex_dd_source_add(q00,q11),q22),q33);
+  matrix[1]=flex_dd_source_mul(two,flex_dd_source_sub(q12,q03));
+  matrix[2]=flex_dd_source_mul(two,flex_dd_source_add(q13,q02));
+  matrix[3]=flex_dd_source_mul(two,flex_dd_source_add(q12,q03));
+  matrix[4]=flex_dd_source_sub(flex_dd_source_add(flex_dd_source_sub(q00,q11),q22),q33);
+  matrix[5]=flex_dd_source_mul(two,flex_dd_source_sub(q23,q01));
+  matrix[6]=flex_dd_source_mul(two,flex_dd_source_sub(q13,q02));
+  matrix[7]=flex_dd_source_mul(two,flex_dd_source_add(q23,q01));
+  matrix[8]=flex_dd_source_add(flex_dd_source_sub(flex_dd_source_sub(q00,q11),q22),q33);
+}
+
+static inline CommonCCDSupportObject common_ccd_restart_object(
+    thread const CommonCCDSupportObject& original, FlexDD3 origin,
+    thread const FlexDD* rotation) {
+  CommonCCDSupportObject result=original;
+  for (int column=0;column<3;column++) {
+    FlexDD3 value=common_ccd_matrix_vector(rotation,
+        FlexDD3{original.mat[column],original.mat[3+column],original.mat[6+column]});
+    result.mat[column]=value.x;result.mat[3+column]=value.y;result.mat[6+column]=value.z;
+  }
+  FlexDD3 oldpos=FlexDD3{original.pos[0],original.pos[1],original.pos[2]};
+  FlexDD3 relative=flex_dd3_source_sub(origin,oldpos);
+  FlexDD3 displacement=flex_dd3_source_sub(common_ccd_matrix_vector(rotation,relative),relative);
+  FlexDD3 position=flex_dd3_source_sub(oldpos,displacement);
+  result.pos[0]=position.x;result.pos[1]=position.y;result.pos[2]=position.z;
+  return result;
+}
+
 // Production source-GJK/EPA route for every pinned mjc_Convex dispatch entry.
-// The current kernel emits the primary native witness; contact_normal consumes
-// it before row/Jacobian assembly. Dedicated plane/HField/SDF and analytic
+// Single-pass box/mesh manifolds and rotated convex restart witnesses are
+// consumed by contact_normal before row/Jacobian assembly. Dedicated plane/HField/SDF and analytic
 // callbacks do not enter this kernel.
 kernel void common_ccd_rigid_convex_candidates(
     device const float* geom_pos [[buffer(0)]],
@@ -1331,6 +1416,7 @@ kernel void common_ccd_rigid_convex_candidates(
     device float* mesh_hull [[buffer(13)]],
     device int* mesh_hull_info [[buffer(14)]],
     device atomic_int* world_status [[buffer(15)]],
+    constant long& restart_pass [[buffer(16)]],
     uint tid [[thread_position_in_grid]]) {
   int batch=pair_dims[3], npairs=pair_dims[1], ngeom=pair_dims[6];
   if (npairs<=0 || uint(tid)>=uint(batch*npairs)) return;
@@ -1365,7 +1451,10 @@ kernel void common_ccd_rigid_convex_candidates(
   }
   int query=world*npairs+pair;
   int out=output_base+query*output_stride;
-  mesh_hull[out]=0.0f; mesh_hull[out+1]=0.0f;
+  int phase=int(restart_pass);
+  if (phase<0 || phase>4) { common_ccd_production_fail(world_status,world);return; }
+  if (phase==0) { mesh_hull[out]=0.0f;mesh_hull[out+1]=0.0f; }
+  else if (mesh_hull[out]<1.0f || mesh_hull[out+1]!=0.0f) return;
   int scratch=scratch_base+query*scratch_stride;
   int go=world*ngeom;
   FlexDD3 pa=common_ccd_load_geom_position(geom_pos,geom_pos_low,
@@ -1411,6 +1500,16 @@ kernel void common_ccd_rigid_convex_candidates(
     mesh_hull[out+1]=3.0f;
     common_ccd_production_fail(world_status,world); return;
   }
+  int source_size_base=mesh_hull_info[header+34];
+  if (source_size_base<0) {
+    mesh_hull[out+1]=3.0f;common_ccd_production_fail(world_status,world);return;
+  }
+  for (int coordinate=0;coordinate<3;coordinate++) {
+    int ia=source_size_base+9*a+3*coordinate;
+    int ib=source_size_base+9*b+3*coordinate;
+    object_a.size[coordinate]=FlexDD{mesh_hull[ia],mesh_hull[ia+1],mesh_hull[ia+2]};
+    object_b.size[coordinate]=FlexDD{mesh_hull[ib],mesh_hull[ib+1],mesh_hull[ib+2]};
+  }
   int vertex_words=29*vertex_capacity;
   int face_words=20*face_capacity;
   int map_words=face_capacity;
@@ -1432,11 +1531,27 @@ kernel void common_ccd_rigid_convex_candidates(
   FlexDD tolerance=FlexDD{mesh_hull[tolerance_base],
                           mesh_hull[tolerance_base+1],
                           mesh_hull[tolerance_base+2]};
-  FlexDD3 center_a=pa;
-  FlexDD3 center_b=pb;
+  bool source_multicontact=margin_value==0.0f && pair_dims[8]==0 &&
+      (geom_type[a]==6 || geom_type[a]==7) && (geom_type[b]==6 || geom_type[b]==7);
+  if (phase>0) {
+    if (source_multicontact || pair_dims[8]!=0 ||
+        geom_type[a]==2 || geom_type[a]==4 || geom_type[b]==2 || geom_type[b]==4) return;
+    FlexDD3 origin=common_ccd_load_wide3(mesh_hull,out+COMMON_CCD_RIGID_WIDE_BASE);
+    FlexDD3 initial_normal=common_ccd_load_wide3(mesh_hull,out+COMMON_CCD_RIGID_NORMAL_BASE);
+    FlexDD3 axes[2];common_ccd_restart_axes(initial_normal,axes);
+    FlexDD rotation[9],inverse[9];
+    common_ccd_restart_matrix(axes[(phase-1)/2],((phase-1)%2)==1,rotation);
+    for (int row=0;row<3;row++) for (int column=0;column<3;column++)
+      inverse[3*row+column]=rotation[3*column+row];
+    object_a=common_ccd_restart_object(object_a,origin,rotation);
+    object_b=common_ccd_restart_object(object_b,origin,inverse);
+  }
+  FlexDD3 center_a=FlexDD3{object_a.pos[0],object_a.pos[1],object_a.pos[2]};
+  FlexDD3 center_b=FlexDD3{object_b.pos[0],object_b.pos[1],object_b.pos[2]};
   ContactGeom contact;
   contact.dist=3.402823466e+38f; contact.pos=float3(0);
   contact.normal=float3(0); contact.t1=float3(0); contact.t2=float3(0);
+  FlexDD3 contact_position,contact_normal;
   int2 face_ids[3];
   int3 face_slots=int3(-1);
   int found=common_ccd_production_one_rigid_pair(
@@ -1444,28 +1559,50 @@ kernel void common_ccd_rigid_convex_candidates(
       FlexDD{margin_value,0.0f,0.0f},iterations,tolerance,
       mesh_hull,mesh_hull_info,epa_vertices,epa_vertex_ids,epa_faces,epa_face_map,
       epa_horizon,epa_stack,vertex_capacity,face_capacity,horizon_capacity,
-      stack_capacity,contact,face_ids,face_slots);
+      stack_capacity,contact,face_ids,face_slots,&contact_position,&contact_normal);
   if (found<0) {
     mesh_hull[out+1]=float(-found);
     common_ccd_production_fail(world_status,world); return;
   }
-  if (found>0) {
-    ContactGeom contacts[4];
-    contacts[0]=contact;
+  if (found<=0) return;
+  if (phase==0) {
+    ContactGeom contacts[5];contacts[0]=contact;
     int contact_count=1;
-    bool source_multicontact = margin_value==0.0f && pair_dims[8]==0 &&
-        (geom_type[a]==6 || geom_type[a]==7) &&
-        (geom_type[b]==6 || geom_type[b]==7);
-    if (source_multicontact && face_slots.x>=0 &&
-        face_slots.y>=0 && face_slots.z>=0) {
+    if (source_multicontact && face_slots.x>=0 && face_slots.y>=0 && face_slots.z>=0) {
       contact_count=common_ccd_multicontact_faces(
           geom_type[a],geom_type[b],rec_a,rec_b,header,mesh_hull_info,
           mesh_hull,object_a,object_b,face_ids,face_slots,epa_vertices,contact.normal,
           max(0.0f,-contact.dist),contacts);
-      contact_count=min(contact_count,4);
     }
-    for (int k=0;k<contact_count;k++)
-      common_ccd_production_store_contact(mesh_hull,out,k,contacts[k]);
+    for (int slot=0;slot<contact_count;slot++)
+      common_ccd_production_store_contact(mesh_hull,out,slot,contacts[slot]);
+    common_ccd_store_wide3(mesh_hull,out+COMMON_CCD_RIGID_WIDE_BASE,contact_position);
+    common_ccd_store_wide3(mesh_hull,out+COMMON_CCD_RIGID_NORMAL_BASE,contact_normal);
     mesh_hull[out]=float(contact_count);
+    return;
   }
+  int count=int(mesh_hull[out]);
+  if (count<1 || count>=5) {
+    mesh_hull[out+1]=3.0f;common_ccd_production_fail(world_status,world);return;
+  }
+  int bound_base=mesh_hull_info[header+33];
+  if (bound_base<0) {
+    mesh_hull[out+1]=3.0f;common_ccd_production_fail(world_status,world);return;
+  }
+  FlexDD bound_a=FlexDD{mesh_hull[bound_base+3*a],mesh_hull[bound_base+3*a+1],mesh_hull[bound_base+3*a+2]};
+  FlexDD bound_b=FlexDD{mesh_hull[bound_base+3*b],mesh_hull[bound_base+3*b+1],mesh_hull[bound_base+3*b+2]};
+  FlexDD relative=FlexDD{0.0010000000474974513f,-4.7497450417210985e-11f,-8.6736173798840355e-19f};
+  FlexDD distinct_tolerance=flex_dd_source_mul(relative,
+      flex_dd_compare_exact(bound_a,bound_b)<0?bound_a:bound_b);
+  for (int previous=0;previous<count;previous++) {
+    FlexDD3 delta=flex_dd3_source_sub(
+        common_ccd_load_wide3(mesh_hull,out+COMMON_CCD_RIGID_WIDE_BASE+9*previous),contact_position);
+    if (flex_dd_compare_exact(flex_dd_source_sqrt(flex_dd3_dot(delta,delta)),distinct_tolerance)<=0) return;
+  }
+  // Every extra point has the primary physical penetration depth; its
+  // position and normal remain those found by the rotated source query.
+  contact.dist=mesh_hull[out+2];
+  common_ccd_production_store_contact(mesh_hull,out,count,contact);
+  common_ccd_store_wide3(mesh_hull,out+COMMON_CCD_RIGID_WIDE_BASE+9*count,contact_position);
+  mesh_hull[out]=float(count+1);
 }

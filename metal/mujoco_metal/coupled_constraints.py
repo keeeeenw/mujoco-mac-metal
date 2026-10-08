@@ -628,11 +628,11 @@ def pair_max_contacts(t1: int, t2: int, sdf_initpoints: int = 40) -> int:
     # before the multi-contact rules below, matching mj_maxContact order.
     return 1
   if _MESH in (t_min, t_max):
-    # R05-1 bounded mesh manifolds: convex mesh pairs yield up to 4 native
-    # witnesses (face-clip expansion on planes, perturbed-restart multiCCD
-    # on box/cylinder/capsule/mesh). Sphere/ellipsoid involvement returns
-    # above (pinned single). Deterministic slot identity via spatial sort.
-    return 4
+    # Native box/mesh face clipping yields four contacts, but margins and
+    # capsule/cylinder-mesh pairs use mjc_Convex's initial witness plus four
+    # perturbation searches. Reserve all five rather than silently truncating
+    # that valid source path. Plane-mesh keeps its separate four-point bound.
+    return 4 if t_min == _PLANE else 5
   if (t_min, t_max) in (
       (_PLANE, _CAPSULE),
       (_CAPSULE, _CAPSULE),
@@ -3319,17 +3319,22 @@ class MetalCoupledConstraints:
             self._constants["mesh_hull"], self._constants["mesh_hull_info"],
             w["out_status"], threads=(b * d.npairs,), group_size=(1,))
       if self._common_ccd_rigid_kernel is not None:
-        self._common_ccd_rigid_kernel(
-            poses["geom_pos"], poses["geom_quat"],
-            poses["geom_pos_low"], poses["geom_pos_tail"],
-            poses["geom_xmat"], poses["geom_xmat_low"],
-            poses["geom_xmat_tail"],
-            self._constants["geom_size"], self._constants["geom_type"],
-            self._constants["pair_geoms"], self._constants["pair_margin_gap"],
-            self._constants["pair_contact_offsets_dims"],
-            pair_maps.logical_to_packed.reshape(-1),
-            self._constants["mesh_hull"], self._constants["mesh_hull_info"],
-            w["out_status"], threads=(b * d.npairs,), group_size=(1,))
+        # Source order: initial query, then two angles about each tangent.
+        # Separate dispatches reuse the persistent per-pair arena and keep
+        # one GJK/EPA query per invocation within Apple GPU stack limits.
+        for restart_pass in range(5):
+          self._common_ccd_rigid_kernel(
+              poses["geom_pos"], poses["geom_quat"],
+              poses["geom_pos_low"], poses["geom_pos_tail"],
+              poses["geom_xmat"], poses["geom_xmat_low"],
+              poses["geom_xmat_tail"],
+              self._constants["geom_size"], self._constants["geom_type"],
+              self._constants["pair_geoms"], self._constants["pair_margin_gap"],
+              self._constants["pair_contact_offsets_dims"],
+              pair_maps.logical_to_packed.reshape(-1),
+              self._constants["mesh_hull"], self._constants["mesh_hull_info"],
+              w["out_status"], restart_pass,
+              threads=(b * d.npairs,), group_size=(1,))
       if (self._common_ccd_hfield_mesh_kernel is not None
           or self._common_ccd_rigid_kernel is not None):
         self._mask_failed_candidate_worlds_kernel(

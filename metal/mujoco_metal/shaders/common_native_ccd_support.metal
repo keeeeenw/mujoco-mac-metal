@@ -940,6 +940,8 @@ struct CommonCCDEpaResult {
   FlexDD distance;
   int status;
   int3 face_vertices;
+  FlexDD3 position;
+  FlexDD3 normal;
 };
 
 static inline FlexDDVertex common_ccd_flex_vertex(CommonCCDVertex value) {
@@ -1493,7 +1495,7 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
     out.status=2; return out;
   }
   FlexEpaFace nearest=faces[best_face];
-  flex_epa_write_witness_dd(nearest,vertices,contact);
+  flex_epa_write_witness_dd(nearest,vertices,contact,&out.position,&out.normal);
   out.face_vertices=int3(nearest.a,nearest.b,nearest.c);
   out.distance=flex_dd_sqrt(nearest.dist2_dd);
   out.status=0;

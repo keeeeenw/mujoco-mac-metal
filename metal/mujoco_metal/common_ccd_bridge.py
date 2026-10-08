@@ -246,7 +246,7 @@ def estimate_production_upload_bytes(model, legacy_vertices, legacy_info,
                      for g in range(ngeom))
   # Four source-double HField dimensions each occupy three float words.
   static_hull_words = (padded_old_words + source_vertex_words
-                       + 12 * hfield_count + normal_words + 3)
+                       + 12 * hfield_count + normal_words + 3 + 12 * ngeom)
   static_info_words = (old_info_words + _COMMON_HEADER_WORDS + 9 * ngeom
                        + graph_words + table_words)
   work = production_ccd_layout(batch_size, pair_count,
@@ -304,6 +304,7 @@ def build_common_ccd_model_upload(model, legacy_vertices, legacy_info):
       int(model.opt.ccd_iterations), -1, -1, 0, 0, 0,
       -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
       -1, -1, -1, -1, -1, -1,
+      -1, -1,
   ], dtype=np.int32)
   for geom in range(ngeom):
     rec = geom_base + 9 * geom
@@ -378,13 +379,34 @@ def build_common_ccd_model_upload(model, legacy_vertices, legacy_info):
   mesh_hull = np.concatenate((mesh_hull, np.asarray(
       [high, middle, tail], dtype=np.float32)))
   info[header_base + 10] = tolerance_base
+  # mjc_Convex uses the compiled bound for its distinct-contact threshold,
+  # including transformed meshes. Reconstructing it from rounded sizes is
+  # not equivalent to the pinned compiler's bound.
+  bounds = np.asarray(model.geom_rbound, dtype=np.float64)
+  bound_hi = bounds.astype(np.float32)
+  bound_rem = bounds - bound_hi.astype(np.float64)
+  bound_mid = bound_rem.astype(np.float32)
+  bound_tail = (bound_rem - bound_mid.astype(np.float64)).astype(np.float32)
+  bound_base = int(mesh_hull.size)
+  mesh_hull = np.concatenate((mesh_hull,
+      np.stack((bound_hi, bound_mid, bound_tail), axis=-1).reshape(-1)))
+  info[header_base + 33] = bound_base
+  sizes = np.asarray(model.geom_size, dtype=np.float64)
+  size_hi = sizes.astype(np.float32)
+  size_rem = sizes - size_hi.astype(np.float64)
+  size_mid = size_rem.astype(np.float32)
+  size_tail = (size_rem - size_mid.astype(np.float64)).astype(np.float32)
+  size_base = int(mesh_hull.size)
+  mesh_hull = np.concatenate((mesh_hull,
+      np.stack((size_hi, size_mid, size_tail), axis=-1).reshape(-1)))
+  info[header_base + 34] = size_base
   return (np.ascontiguousarray(mesh_hull), np.ascontiguousarray(info),
           {"header_base": header_base, "geom_base": geom_base,
            "base_info_words": int(info.size),
            "graph_base": graph_base,
            "source_vertex_base": vertex_base_float // 3,
            "source_vertex_count": source_vertices.size // 3,
-           "tolerance_base": tolerance_base})
+           "tolerance_base": tolerance_base, "rbound_base": bound_base, "size_base": size_base})
 
 
 def _mesh_type():
@@ -398,7 +420,7 @@ def _hfield_type():
 
 
 _COMMON_MAGIC = 1128487732
-_COMMON_HEADER_WORDS = 33
+_COMMON_HEADER_WORDS = 35
 _MESH_HILLCLIMB_MIN = 10  # pinned mjMESH_HILLCLIMB_MIN, engine_collision_convex.h
 
 
