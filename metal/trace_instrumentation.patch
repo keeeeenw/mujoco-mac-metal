@@ -1,5 +1,5 @@
 --- .upstream/mujoco-3.10.0/src/engine/engine_collision_sdf.c	2026-06-22 07:22:23
-+++ .upstream/mujoco-trace/src/engine/engine_collision_sdf.c	2026-10-07 13:42:10
++++ .upstream/mujoco-trace/src/engine/engine_collision_sdf.c	2026-10-08 00:12:33
 @@ -16,6 +16,7 @@
  
  #include <math.h>
@@ -8,7 +8,77 @@
  
  #include <mujoco/mjdata.h>
  #include <mujoco/mjmodel.h>
-@@ -612,6 +613,23 @@
+@@ -26,6 +27,10 @@
+ #include "engine/engine_util_errmem.h"
+ #include "engine/engine_util_misc.h"
+ #include "engine/engine_util_spatial.h"
++
++// Forward declaration: the env-gated trace switch is defined alongside
++// stepGradient below; contact admission above needs it.
++static int mjc_sdf_trace_on(void);
+ 
+ 
+ 
+@@ -460,6 +465,16 @@
+     mju_addTo3(y, s->relpos);
+     int i = geomDistance(m, d, s->plugin[0], s->id[0], x, s->geomtype[0]) >
+             geomDistance(m, d, s->plugin[1], s->id[1], y, s->geomtype[1]) ? 0 : 1;
++    if (mjc_sdf_trace_on()) {
++      // Trace-only re-evaluation of the two side distances above (pure
++      // reads; the selection statement itself is untouched).
++      mjtNum da = geomDistance(m, d, s->plugin[0], s->id[0], x, s->geomtype[0]);
++      mjtNum db = geomDistance(m, d, s->plugin[1], s->id[1], y, s->geomtype[1]);
++      fprintf(stderr,
++          "MJCSDFTRACE gradpick type=INTERSECTION a=%.17g b=%.17g "
++          "diff=%.17g side=%d\n",
++          da, db, da - db, i);
++    }
+     geomGradient(gradient, m, d, s->plugin[i], s->id[i], point[i], s->geomtype[i]);
+     if (i == 1) {
+       mju_mulMatTVec3(gradient, s->relmat, gradient);
+@@ -548,6 +563,13 @@
+                          int flipNormal) {
+   // check if there is a collision
+   if (dist > 0 || isknown(points, x, cnt)) {
++    if (mjc_sdf_trace_on()) {
++      fprintf(stderr,
++          "MJCSDFTRACE precontact x=%.17g %.17g %.17g dist=%.17g "
++          "decision=%s cnt=%d\n",
++          x[0], x[1], x[2], dist,
++          dist > 0 ? "reject-separation" : "reject-duplicate", cnt);
++    }
+     return cnt;
+   } else {
+     mju_copy3(points+3*cnt, x);
+@@ -560,6 +582,12 @@
+   // validate normal - skip if gradient is degenerate (zero or near-zero)
+   mjtNum norm_len = mju_normalize3(norm);
+   if (norm_len < mjMINVAL) {
++    if (mjc_sdf_trace_on()) {
++      fprintf(stderr,
++          "MJCSDFTRACE precontact x=%.17g %.17g %.17g dist=%.17g "
++          "decision=reject-degenerate cnt=%d\n",
++          x[0], x[1], x[2], dist, cnt);
++    }
+     return cnt;  // degenerate gradient, skip this contact
+   }
+ 
+@@ -576,6 +604,14 @@
+   mju_zero3(con->tangent);
+   mju_addTo3(con->pos, pos2);
+   mju_addTo3(con->pos, vec);
++
++  if (mjc_sdf_trace_on()) {
++    fprintf(stderr,
++        "MJCSDFTRACE precontact x=%.17g %.17g %.17g dist=%.17g "
++        "decision=admit normal=%.17g %.17g %.17g cnt=%d\n",
++        x[0], x[1], x[2], dist, con->normal[0], con->normal[1],
++        con->normal[2], cnt + 1);
++  }
+ 
+   return cnt + 1;
+ }
+@@ -612,6 +648,23 @@
  }
  
  // finds minimum using gradient descent
@@ -32,7 +102,7 @@
  static mjtNum stepGradient(mjtNum x[3], const mjModel* m, const mjSDF* s,
                             const mjData* d, int niter) {
    const mjtNum c = .1;       // reduction factor for the target decrease in the objective function
-@@ -641,14 +659,37 @@
+@@ -641,13 +694,41 @@
      mjtNum dist0 = mjc_distance(m, d, s, x0);
      mjtNum wolfe = - c * alpha * mju_dot3(grad, grad);
  
@@ -50,15 +120,20 @@
        wolfe *= rho;
        mju_addScl3(x, x0, grad, -alpha);
        dist = mjc_distance(m, d, s, x);
++      // backtrack=1 means the WHILE-loop continuation predicate
++      // (alpha > amin && dist-dist0 > wolfe) holds, so backtracking
++      // continues with a halved alpha: this trial was REJECTED. The final
++      // trial of each step has backtrack=0 and is the ACCEPTED point
++      // (loop exits via Wolfe satisfaction or the alpha floor).
++      int backtrack = (alpha > amin && dist - dist0 > wolfe) ? 1 : 0;
 +      if (mjc_sdf_trace_on()) {
 +        fprintf(stderr,
 +            "MJCSDFTRACE trial niter=%d step=%d alpha=%.17g dist=%.17g "
-+            "decrease=%.17g wolfe=%.17g accept=%d\n",
-+            niter, step, alpha, dist, dist - dist0, wolfe,
-+            (alpha > amin && dist - dist0 > wolfe) ? 1 : 0);
++            "decrease=%.17g wolfe=%.17g backtrack=%d\n",
++            niter, step, alpha, dist, dist - dist0, wolfe, backtrack);
 +      }
      } while (alpha > amin && dist - dist0 > wolfe);
- 
++
 +    if (mjc_sdf_trace_on()) {
 +      fprintf(stderr,
 +          "MJCSDFTRACE terminal niter=%d step=%d x=%.17g %.17g %.17g "
@@ -66,23 +141,68 @@
 +          niter, step, x[0], x[1], x[2], dist, dist0,
 +          (dist0 < dist) ? 0 : 1);
 +    }
-+
+ 
      // if no improvement, early stop
      if (dist0 < dist) {
-       return dist;
-@@ -1154,16 +1195,37 @@
-     // start counters
-     if (sdf_ptr[0]) {
-       sdf_ptr[0]->compute(m, d, instance[0], mjPLUGIN_SDF);
+@@ -811,6 +892,14 @@
+   mjtNum x[3], depth;
+ 
+   // stricter culling using triangle circumsphere
++  if (mjc_sdf_trace_on()) {
++    int culled = !triangleIntersect(corners, m, sdf, d);
++    fprintf(stderr,
++        "MJCSDFTRACE meshface corners=%.17g %.17g %.17g %.17g %.17g %.17g "
++        "%.17g %.17g %.17g culled=%d\n",
++        corners[0], corners[1], corners[2], corners[3], corners[4],
++        corners[5], corners[6], corners[7], corners[8], culled);
++  }
+   if (!triangleIntersect(corners, m, sdf, d)) {
+     return;
+   }
+@@ -838,6 +927,12 @@
+     depth = stepFrankWolfe(x, corners, 3, m, sdf, d);
+ 
+     // store candidate if penetration
++    if (mjc_sdf_trace_on()) {
++      fprintf(stderr,
++          "MJCSDFTRACE meshseed sp=%d b=%.17g %.17g %.17g "
++          "x=%.17g %.17g %.17g depth=%.17g admitted=%d\n",
++          sp, b0, b1, b2, x[0], x[1], x[2], depth, (depth < 0));
 +    }
+     if (depth < 0) {
+       int nc = *ncandidate;
+       mju_copy3(candidate + 3*nc, x);
+@@ -1025,6 +1120,19 @@
+   // farthest point sampling (FPS) for spatial coverage
+   int selected_indices[mjMAXCONPAIR];
+   int nselected = selectFPS(candidate, dist2, ncandidate, selected_indices, mjMAXCONPAIR);
 +
++  if (mjc_sdf_trace_on()) {
++    fprintf(stderr, "MJCSDFTRACE fps ncandidate=%d nselected=%d\n",
++            ncandidate, nselected);
++    for (int i = 0; i < nselected; i++) {
++      int idx = selected_indices[i];
++      fprintf(stderr,
++          "MJCSDFTRACE fps-pick order=%d idx=%d x=%.17g %.17g %.17g "
++          "dist=%.17g\n",
++          i, idx, candidate[3*idx], candidate[3*idx+1],
++          candidate[3*idx+2], dist2[idx]);
++    }
++  }
+ 
+   // add selected contacts
+   for (int i = 0; i < nselected; i++) {
+@@ -1156,14 +1264,35 @@
+       sdf_ptr[0]->compute(m, d, instance[0], mjPLUGIN_SDF);
+     }
+ 
 +    if (mjc_sdf_trace_on()) {
 +      fprintf(stderr,
 +          "MJCSDFTRACE seed i=%d halton=%d g1=%d g2=%d "
 +          "x=%.17g %.17g %.17g\n",
 +          i - 1, j - 1, g1, g2, x[0], x[1], x[2]);
-     }
- 
++    }
++
      // gradient descent - we use a special function of the two SDF as objective
      sdf.type = mjSDFTYPE_COLLISION;
      dist2 = stepGradient(x, m, &sdf, d, m->opt.sdf_iterations);

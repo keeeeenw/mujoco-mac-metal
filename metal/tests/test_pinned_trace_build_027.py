@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 _ROOT = os.path.dirname(
@@ -108,7 +109,18 @@ def test_trace_source_diff_is_guarded_output_only():
   # the enablement helper; no branch predicate, tolerance, seed selection,
   # iteration count or dynamics line is altered.
   assert "MUJOCO_SDF_TRACE" in trace
-  assert trace.count('"MJCSDFTRACE ') == 6
+  # Every added line is a guarded fprintf of existing locals: the pinned
+  # computation statements are untouched. Required record kinds (format
+  # strings `"MJCSDFTRACE <kind> ..."`): plugin-descent steps/trials/
+  # terminals/seeds/stages, gradient side picks, mesh face/seed records,
+  # precontact admission, FPS picks.
+  kinds = set()
+  for match in __import__("re").finditer(r'"MJCSDFTRACE ([A-Za-z-]+)',
+                                         trace):
+    kinds.add(match.group(1))
+  for kind in ("step", "trial", "terminal", "seed", "stage", "gradpick",
+               "meshface", "meshseed", "precontact", "fps", "fps-pick"):
+    assert kind in kinds, kind
   for marker in ("amin = 1e-4", "dist - dist0 > wolfe", "sdf_initpoints",
                  "mju_Halton(j, 2)"):
     assert marker in trace and marker in pristine
@@ -171,3 +183,159 @@ def test_trace_env_emits_ordered_per_seed_lines_without_changing_numbers(
   assert any("type=INTERSECTION" in ln for ln in stages)
   trials = [ln for ln in lines if "MJCSDFTRACE trial" in ln]
   assert trials
+
+
+@_needs_trace_build()
+def test_trial_backtrack_field_semantics_gpu_free(tmp_path):
+  # `backtrack=1` means the WHILE continuation predicate holds, so another
+  # trial follows with halved alpha; the final trial of each step has
+  # `backtrack=0` (accepted via Wolfe satisfaction or the alpha floor).
+  # Rejection, acceptance, alpha floor and no-improvement returns are all
+  # exercised on the committed torus trace: some step descends through
+  # multiple rejected trials, and the INTERSECTION pass terminates at the
+  # alpha floor in at least one seed.
+  xml = _write_xml(tmp_path)
+  _, on_err = _run(xml, trace=True)
+  lines = [ln for ln in on_err.splitlines() if "MJCSDFTRACE trial" in ln]
+  # Group by (seed, niter, step): the trace interleaves seeds, and steps
+  # repeat across seeds, so the seed index scopes each group.
+  groups = {}
+  seed = None
+  for ln in on_err.splitlines():
+    if "MJCSDFTRACE seed" in ln:
+      seed = ln.split("i=")[1].split()[0]
+    elif "MJCSDFTRACE trial" in ln:
+      tag = ln.split("niter=")[1].split(" alpha=")[0]
+      groups.setdefault((seed, tag), []).append(ln)
+  multi = [v for v in groups.values() if len(v) > 1]
+  assert multi
+  for trials in multi:
+    for ln in trials[:-1]:
+      assert "backtrack=1" in ln
+    assert "backtrack=0" in trials[-1]
+  alphas = [float(ln.split("alpha=")[1].split()[0]) for trials in multi
+            for ln in trials]
+  assert min(alphas) <= 1e-4 + 1e-12
+  terminals = [ln for ln in on_err.splitlines()
+               if "MJCSDFTRACE terminal" in ln]
+  assert any("improved=0" in ln for ln in terminals)
+  assert any("improved=1" in ln for ln in terminals)
+
+
+@_needs_trace_build()
+def test_trace_box_gate_pose_equivalence_and_records(tmp_path):
+  # Box-press gate pose through the plugin-descent route (the mesh-octree
+  # SDF field is descended by mjc_SDF stepGradient, not per-face
+  # Frank-Wolfe): the trace build reproduces the installed oracle
+  # bit-identically with empty stderr unset; set, it emits ordered
+  # seed/stage/trial/terminal/gradpick/precontact records with identical
+  # numbers. Body placement is baked into the XML so qpos0 equals the
+  # gate float32 qp (representative-state injection, not XML default).
+  import mujoco
+  import numpy as np
+  zf = repr(float(np.float32(0.060999923706054296)))
+  xml_text = f"""<mujoco>
+<asset><mesh name="b" vertex="-0.05 -0.05 -0.04  0.05 -0.05 -0.04 0.05 0.05 -0.04  -0.05 0.05 -0.04  -0.05 -0.05 0.04  0.05 -0.05 0.04  0.05 0.05 0.04  -0.05 0.05 0.04"/></asset>
+<option timestep="0.002" integrator="Euler" iterations="100" tolerance="1e-8" gravity="0 0 0" sdf_initpoints="4"/>
+<worldbody>
+<geom name="sdf" type="sdf" mesh="b" contype="1" conaffinity="1"/>
+<body pos="0 0 {zf}"><freejoint/><geom name="o" type="box" size="0.04 0.04 0.03" contype="1" conaffinity="1"/></body>
+</worldbody>
+</mujoco>"""
+  p = tmp_path / "box_gate.xml"
+  p.write_text(xml_text)
+  xml = str(p)
+  gate_qp = np.array([0.0, 0.0, 0.060999923706054296, 1.0, 0.0, 0.0, 0.0],
+                     dtype=np.float32)
+  model = mujoco.MjModel.from_xml_string(xml_text)
+  np.testing.assert_array_equal(
+      np.asarray(model.qpos0, dtype=np.float64),
+      np.asarray(gate_qp, dtype=np.float64))
+  off, off_err = _run(xml, trace=False)
+  assert off_err == ""
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  assert off["ncon"] == int(data.ncon) == 2
+  np.testing.assert_array_equal(
+      np.asarray(off["qacc"], dtype=np.float64),
+      np.asarray(data.qacc, dtype=np.float64))
+  for tc, c in zip(off["contacts"], range(data.ncon)):
+    assert tc["dist"] == float(data.contact[c].dist)
+    np.testing.assert_array_equal(
+        np.asarray(tc["pos"], dtype=np.float64),
+        np.asarray(data.contact[c].pos, dtype=np.float64))
+    np.testing.assert_array_equal(
+        np.asarray(tc["normal"], dtype=np.float64),
+        np.asarray(data.contact[c].frame[:3], dtype=np.float64))
+  on, on_err = _run(xml, trace=True)
+  assert on == off
+  lines = [ln for ln in on_err.splitlines() if "MJCSDFTRACE" in ln]
+  kinds = {ln.split()[1] for ln in lines}
+  for kind in ("seed", "stage", "step", "trial", "terminal", "gradpick",
+               "precontact"):
+    assert kind in kinds, kind
+  seeds = [ln for ln in lines if "MJCSDFTRACE seed" in ln]
+  assert len(seeds) == 4
+  for k, ln in enumerate(seeds):
+    assert f"i={k} halton={k}" in ln
+  decisions = [ln.split("decision=")[1].split()[0]
+               for ln in lines if "precontact" in ln]
+  assert "admit" in decisions
+
+
+@_needs_trace_build()
+def test_trace_mesh_face_route_records_and_equivalence(tmp_path):
+  # Mesh-geom vs plugin-SDF fixture exercises the per-face route
+  # (BVH faces, Halton barycentric seeds, Frank-Wolfe depths, precontact
+  # admission): meshface/meshseed records appear with stable seed order,
+  # and numbers are inert (identical on/off) and bit-identical to the
+  # installed oracle.
+  import mujoco
+  import sys
+  sys.path.insert(0, "metal/tests")
+  from test_bundled_sdf_rigid_oracle_019 import _BOX_VERTS, _BOX_FACES
+  xml_text = f"""
+    <mujoco>
+      <option timestep="0.002" integrator="Euler" gravity="0 0 0"
+              iterations="100" tolerance="1e-8" sdf_initpoints="50"/>
+      <extension><plugin plugin="mujoco.sdf.torus">
+        <instance name="shape"/>
+      </plugin></extension>
+      <asset>
+        <mesh name="shape_mesh"><plugin instance="shape"/></mesh>
+        <mesh name="probe_mesh" vertex="{_BOX_VERTS}" face="{_BOX_FACES}"/>
+      </asset>
+      <worldbody>
+        <geom name="plugin_sdf" type="sdf" mesh="shape_mesh">
+          <plugin instance="shape"/>
+        </geom>
+        <body name="probe" pos="0.45 0 0">
+          <freejoint/><geom name="probe_mesh_geom" type="mesh" mesh="probe_mesh"/>
+        </body>
+      </worldbody>
+      <contact><pair geom1="probe_mesh_geom" geom2="plugin_sdf" condim="1"/></contact>
+    </mujoco>
+  """
+  p = tmp_path / "mesh_gate.xml"
+  p.write_text(xml_text)
+  xml = str(p)
+  model = mujoco.MjModel.from_xml_string(xml_text)
+  off, off_err = _run(xml, trace=False)
+  assert off_err == ""
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  assert off["ncon"] == int(data.ncon) > 0
+  np.testing.assert_array_equal(
+      np.asarray(off["qacc"], dtype=np.float64),
+      np.asarray(data.qacc, dtype=np.float64))
+  for tc, c in zip(off["contacts"], range(data.ncon)):
+    assert tc["dist"] == float(data.contact[c].dist)
+    np.testing.assert_array_equal(
+        np.asarray(tc["pos"], dtype=np.float64),
+        np.asarray(data.contact[c].pos, dtype=np.float64))
+  on, on_err = _run(xml, trace=True)
+  assert on == off
+  lines = [ln for ln in on_err.splitlines() if "MJCSDFTRACE" in ln]
+  kinds = {ln.split()[1] for ln in lines}
+  assert "meshface" in kinds and "meshseed" in kinds
+  assert "precontact" in kinds

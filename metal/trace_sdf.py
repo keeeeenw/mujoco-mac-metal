@@ -13,6 +13,9 @@ computation changes: every trace statement is a guarded read of existing
 locals, and production physics never enables this path.
 
 Usage: trace_sdf.py <model-xml>
+
+Gate poses are baked into the XML (body placement), so the model-default
+forward runs at the exact represented gate state.
 """
 
 import ctypes
