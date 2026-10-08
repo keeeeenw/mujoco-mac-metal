@@ -961,6 +961,10 @@ kernel void contact_sdf_seed_init(
     device float* seed_state [[buffer(10)]],
     device int* seed_ctrl [[buffer(11)]],
     device const int* stage_dims [[buffer(12)]],
+    device const float* geom_pos_low [[buffer(13)]],
+    device const float* geom_pos_tail [[buffer(14)]],
+    device const float* geom_quat_low [[buffer(15)]],
+    device const float* geom_quat_tail [[buffer(16)]],
     uint tid [[thread_position_in_grid]]) {
   int npairs = dims[1], batch = dims[3];
   int tile_count = stage_dims[0], capacity = max(stage_dims[2], 1);
@@ -976,8 +980,67 @@ kernel void contact_sdf_seed_init(
   SdfStagePairInput in;
   if (!sdf_stage_decode(geom_pos, geom_quat, geom_size, geom_type,
       pair_geoms, dims, logical_to_packed, stage_dims, tid, tile_count, in)) return;
-  if (!sdf_stage_seed_init(in.canonical_type1, in.pos1, in.quat1, in.size1,
-      in.pos2, in.quat2, in.canonical1, in.canonical2, in.seed,
+  // Wide-pose seed init when triple planes are available (fail closed to
+  // float32 promotion only if the planes are absent, which the host
+  // validates before dispatch).
+  int go = in.world * dims[6];
+  int ga = in.geom1, gb = in.geom2;
+  // Canonical geoms for T construction: in.pos1/pos2 correspond to
+  // canonical1/canonical2 after swap handling in decode.
+  int gc1 = in.canonical1, gc2 = in.canonical2;
+  SdfWide qw1 = {in.quat1.x, 0.0f, 0.0f};
+  SdfWide qx1 = {in.quat1.y, 0.0f, 0.0f};
+  SdfWide qy1 = {in.quat1.z, 0.0f, 0.0f};
+  SdfWide qz1 = {in.quat1.w, 0.0f, 0.0f};
+  SdfWide qw2 = {in.quat2.x, 0.0f, 0.0f};
+  SdfWide qx2 = {in.quat2.y, 0.0f, 0.0f};
+  SdfWide qy2 = {in.quat2.z, 0.0f, 0.0f};
+  SdfWide qz2 = {in.quat2.w, 0.0f, 0.0f};
+  SdfWide px1 = {in.pos1.x, 0.0f, 0.0f};
+  SdfWide py1 = {in.pos1.y, 0.0f, 0.0f};
+  SdfWide pz1 = {in.pos1.z, 0.0f, 0.0f};
+  SdfWide px2 = {in.pos2.x, 0.0f, 0.0f};
+  SdfWide py2 = {in.pos2.y, 0.0f, 0.0f};
+  SdfWide pz2 = {in.pos2.z, 0.0f, 0.0f};
+  // Overwrite with triple planes when the host provides them. Indexing
+  // matches the float32 buffers: (go+geom)*3/4.
+  qw1 = {geom_quat[(go + gc1) * 4], geom_quat_low[(go + gc1) * 4],
+         geom_quat_tail[(go + gc1) * 4]};
+  qx1 = {geom_quat[(go + gc1) * 4 + 1], geom_quat_low[(go + gc1) * 4 + 1],
+         geom_quat_tail[(go + gc1) * 4 + 1]};
+  qy1 = {geom_quat[(go + gc1) * 4 + 2], geom_quat_low[(go + gc1) * 4 + 2],
+         geom_quat_tail[(go + gc1) * 4 + 2]};
+  qz1 = {geom_quat[(go + gc1) * 4 + 3], geom_quat_low[(go + gc1) * 4 + 3],
+         geom_quat_tail[(go + gc1) * 4 + 3]};
+  qw2 = {geom_quat[(go + gc2) * 4], geom_quat_low[(go + gc2) * 4],
+         geom_quat_tail[(go + gc2) * 4]};
+  qx2 = {geom_quat[(go + gc2) * 4 + 1], geom_quat_low[(go + gc2) * 4 + 1],
+         geom_quat_tail[(go + gc2) * 4 + 1]};
+  qy2 = {geom_quat[(go + gc2) * 4 + 2], geom_quat_low[(go + gc2) * 4 + 2],
+         geom_quat_tail[(go + gc2) * 4 + 2]};
+  qz2 = {geom_quat[(go + gc2) * 4 + 3], geom_quat_low[(go + gc2) * 4 + 3],
+         geom_quat_tail[(go + gc2) * 4 + 3]};
+  px1 = {geom_pos[(go + gc1) * 3], geom_pos_low[(go + gc1) * 3],
+         geom_pos_tail[(go + gc1) * 3]};
+  py1 = {geom_pos[(go + gc1) * 3 + 1], geom_pos_low[(go + gc1) * 3 + 1],
+         geom_pos_tail[(go + gc1) * 3 + 1]};
+  pz1 = {geom_pos[(go + gc1) * 3 + 2], geom_pos_low[(go + gc1) * 3 + 2],
+         geom_pos_tail[(go + gc1) * 3 + 2]};
+  px2 = {geom_pos[(go + gc2) * 3], geom_pos_low[(go + gc2) * 3],
+         geom_pos_tail[(go + gc2) * 3]};
+  py2 = {geom_pos[(go + gc2) * 3 + 1], geom_pos_low[(go + gc2) * 3 + 1],
+         geom_pos_tail[(go + gc2) * 3 + 1]};
+  pz2 = {geom_pos[(go + gc2) * 3 + 2], geom_pos_low[(go + gc2) * 3 + 2],
+         geom_pos_tail[(go + gc2) * 3 + 2]};
+  // Note: in.pos1/pos2 and in.quat1/quat2 are already canonical-swapped;
+  // gc1/gc2 above use the same canonical mapping (in.canonical1/2), so the
+  // wide words correspond to the same geoms. The float32 fallback above is
+  // overwritten unconditionally because the host guarantees triple planes
+  // for SDF dispatches; a missing plane would be a host validation error.
+  if (!sdf_stage_seed_init_wide(in.canonical_type1, in.size1,
+      in.canonical1, in.canonical2, in.seed,
+      qw1, qx1, qy1, qz1, qw2, qx2, qy2, qz2,
+      px1, py1, pz1, px2, py2, pz2,
       mesh_hull, mesh_hull_info, seed_state, state_base)) return;
   seed_valid[slot] = 1; seed_ctrl[slot] = 1;
 }

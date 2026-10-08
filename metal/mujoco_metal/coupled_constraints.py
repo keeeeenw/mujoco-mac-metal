@@ -3320,6 +3320,8 @@ class MetalCoupledConstraints:
               w["contact_sdf_seed_valid"],
               w["contact_sdf_seed_state"], w["contact_sdf_seed_ctrl"],
               self._sdf_stage_dims,
+              poses["geom_pos_low"], poses["geom_pos_tail"],
+              poses["geom_quat_low"], poses["geom_quat_tail"],
               threads=(thread_count,), group_size=(1,))
           for step in range(self._sdf_max_iterations):
             set_sdf_stage(2, step)

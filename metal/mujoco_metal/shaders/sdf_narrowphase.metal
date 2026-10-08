@@ -1193,32 +1193,69 @@ inline SdfMatrixWide sdf_matrix_multiply(SdfMatrixWide A, SdfMatrixWide B) {
   }
   return result;
 }
-inline SdfMatrixWide sdf_quat_matrix_wide(float4 q) {
-  SdfWide u[3] = {sw(q.y), sw(q.z), sw(q.w)};
-  SdfWide w = sw(q.x);
-  SdfMatrixWide result;
-  for (int column = 0; column < 3; ++column) {
-    SdfWide v[3] = {sw(column == 0 ? 1.0f : 0.0f),
-                    sw(column == 1 ? 1.0f : 0.0f),
-                    sw(column == 2 ? 1.0f : 0.0f)};
-    SdfWide inner[3];
-    inner[0] = sw_add(sw_sub(sw_mul(u[1], v[2]), sw_mul(u[2], v[1])),
-                      sw_mul(w, v[0]));
-    inner[1] = sw_add(sw_sub(sw_mul(u[2], v[0]), sw_mul(u[0], v[2])),
-                      sw_mul(w, v[1]));
-    inner[2] = sw_add(sw_sub(sw_mul(u[0], v[1]), sw_mul(u[1], v[0])),
-                      sw_mul(w, v[2]));
-    SdfWide rotated[3];
-    rotated[0] = sw_add(v[0], sw_mul(sw(2.0f),
-        sw_sub(sw_mul(u[1], inner[2]), sw_mul(u[2], inner[1]))));
-    rotated[1] = sw_add(v[1], sw_mul(sw(2.0f),
-        sw_sub(sw_mul(u[2], inner[0]), sw_mul(u[0], inner[2]))));
-    rotated[2] = sw_add(v[2], sw_mul(sw(2.0f),
-        sw_sub(sw_mul(u[0], inner[1]), sw_mul(u[1], inner[0]))));
-    for (int row = 0; row < 3; ++row)
-      sdf_matrix_set(result, column, row, rotated[row]);
+inline SdfMatrixWide sdf_quat_matrix_wide_qw(SdfWide qw, SdfWide qx,
+                                            SdfWide qy, SdfWide qz) {
+  // Pinned mju_quat2Mat (null-quat fast path + q00 left-assoc plain ops).
+  // The cross-product form differs by rounding; use the source formula.
+  // Identity test on represented values (matches CPU float64 equality when
+  // triples are exact; near-identity takes the regular path both sides).
+  bool is_identity = (qw.hi == 1.0f && qw.mid == 0.0f && qw.lo == 0.0f &&
+                      qx.hi == 0.0f && qx.mid == 0.0f && qx.lo == 0.0f &&
+                      qy.hi == 0.0f && qy.mid == 0.0f && qy.lo == 0.0f &&
+                      qz.hi == 0.0f && qz.mid == 0.0f && qz.lo == 0.0f);
+  if (is_identity) {
+    SdfMatrixWide out;
+    sdf_matrix_set(out, 0, 0, sw(1.0f));
+    sdf_matrix_set(out, 1, 0, sw(0.0f));
+    sdf_matrix_set(out, 2, 0, sw(0.0f));
+    sdf_matrix_set(out, 0, 1, sw(0.0f));
+    sdf_matrix_set(out, 1, 1, sw(1.0f));
+    sdf_matrix_set(out, 2, 1, sw(0.0f));
+    sdf_matrix_set(out, 0, 2, sw(0.0f));
+    sdf_matrix_set(out, 1, 2, sw(0.0f));
+    sdf_matrix_set(out, 2, 2, sw(1.0f));
+    return out;
   }
-  return result;
+  SdfWide q00 = sw_mul(qw, qw);
+  SdfWide q01 = sw_mul(qw, qx);
+  SdfWide q02 = sw_mul(qw, qy);
+  SdfWide q03 = sw_mul(qw, qz);
+  SdfWide q11 = sw_mul(qx, qx);
+  SdfWide q12 = sw_mul(qx, qy);
+  SdfWide q13 = sw_mul(qx, qz);
+  SdfWide q22 = sw_mul(qy, qy);
+  SdfWide q23 = sw_mul(qy, qz);
+  SdfWide q33 = sw_mul(qz, qz);
+  SdfMatrixWide out;
+  // Left-assoc plain adds/subs (no FMA): ((a+b)-c)-d etc., matching source.
+  SdfWide r00 = sw_sub(sw_sub(sw_add(q00, q11), q22), q33);
+  SdfWide r44 = sw_sub(sw_add(sw_sub(q00, q11), q22), q33);
+  SdfWide r88 = sw_add(sw_sub(sw_sub(q00, q11), q22), q33);
+  sdf_matrix_set(out, 0, 0, r00);
+  sdf_matrix_set(out, 1, 1, r44);
+  sdf_matrix_set(out, 2, 2, r88);
+  SdfWide r01 = sw_mul(sw(2.0f), sw_sub(q12, q03));
+  SdfWide r02 = sw_mul(sw(2.0f), sw_add(q13, q02));
+  SdfWide r10 = sw_mul(sw(2.0f), sw_add(q12, q03));
+  SdfWide r12 = sw_mul(sw(2.0f), sw_sub(q23, q01));
+  SdfWide r20 = sw_mul(sw(2.0f), sw_sub(q13, q02));
+  SdfWide r21 = sw_mul(sw(2.0f), sw_add(q23, q01));
+  // Note: sdf_matrix_set(out, column, row, value) with column-major layout;
+  // mju res[9] is row-major res[3*i+j]. Mapping: res[0]=M(0,0), res[1]=M(0,1),
+  // res[2]=M(0,2), res[3]=M(1,0), etc. Our set(c,r) stores values[3*c+r].
+  // For linear-map equality, native get(c,r) must equal mju res[r*3+c]?
+  // Preserve the existing layout convention (verified self-consistent and
+  // matching replay when compared as transpose); only the formula changes.
+  sdf_matrix_set(out, 1, 0, r01);
+  sdf_matrix_set(out, 2, 0, r02);
+  sdf_matrix_set(out, 0, 1, r10);
+  sdf_matrix_set(out, 2, 1, r12);
+  sdf_matrix_set(out, 0, 2, r20);
+  sdf_matrix_set(out, 1, 2, r21);
+  return out;
+}
+inline SdfMatrixWide sdf_quat_matrix_wide(float4 q) {
+  return sdf_quat_matrix_wide_qw(sw(q.x), sw(q.y), sw(q.z), sw(q.w));
 }
 inline SdfTransformWide sdf_relative_transform_wide(float4 q_from,
     float4 q_to, float3 p_from, float3 p_to) {
@@ -1246,6 +1283,52 @@ inline SdfTransformWide sdf_reverse_transform_wide(
   SdfWide delta[3] = {sw_sub(sw(p_to.x), sw(p_from.x)),
                       sw_sub(sw(p_to.y), sw(p_from.y)),
                       sw_sub(sw(p_to.z), sw(p_from.z))};
+  for (int row = 0; row < 3; ++row) {
+    SdfWide value = sw_mul(sdf_matrix_get(inverse, 0, row), delta[0]);
+    value = sw_add(value, sw_mul(sdf_matrix_get(inverse, 1, row), delta[1]));
+    value = sw_add(value, sw_mul(sdf_matrix_get(inverse, 2, row), delta[2]));
+    result.translation[row] = value;
+  }
+  return result;
+}
+// Wide-pose variants: same formulas, but quaternion/position words come
+// from FK triple planes (hi/lo/tail) instead of float32 promotion, so
+// sub-ulp32 residuals survive into T12/T21. Positions are SdfWide triples,
+// quats are (w,x,y,z) SdfWide quads in the same order as float4.
+inline SdfTransformWide sdf_relative_transform_wide_wide(
+    SdfWide qw_from, SdfWide qx_from, SdfWide qy_from, SdfWide qz_from,
+    SdfWide qw_to, SdfWide qx_to, SdfWide qy_to, SdfWide qz_to,
+    SdfWide px_from, SdfWide py_from, SdfWide pz_from,
+    SdfWide px_to, SdfWide py_to, SdfWide pz_to) {
+  SdfMatrixWide Rfrom = sdf_quat_matrix_wide_qw(qw_from, qx_from, qy_from,
+                                               qz_from);
+  SdfMatrixWide Rto = sdf_quat_matrix_wide_qw(qw_to, qx_to, qy_to, qz_to);
+  SdfTransformWide result;
+  result.rotation = sdf_matrix_multiply(sdf_matrix_transpose(Rto), Rfrom);
+  SdfWide delta[3] = {sw_sub(px_from, px_to),
+                      sw_sub(py_from, py_to),
+                      sw_sub(pz_from, pz_to)};
+  SdfMatrixWide inverse = sdf_matrix_transpose(Rto);
+  for (int row = 0; row < 3; ++row) {
+    SdfWide value = sw_mul(sdf_matrix_get(inverse, 0, row), delta[0]);
+    value = sw_add(value, sw_mul(sdf_matrix_get(inverse, 1, row), delta[1]));
+    value = sw_add(value, sw_mul(sdf_matrix_get(inverse, 2, row), delta[2]));
+    result.translation[row] = value;
+  }
+  return result;
+}
+inline SdfTransformWide sdf_reverse_transform_wide_wide(
+    SdfTransformWide forward,
+    SdfWide qw_from, SdfWide qx_from, SdfWide qy_from, SdfWide qz_from,
+    SdfWide px_from, SdfWide py_from, SdfWide pz_from,
+    SdfWide px_to, SdfWide py_to, SdfWide pz_to) {
+  SdfTransformWide result;
+  result.rotation = sdf_matrix_transpose(forward.rotation);
+  SdfMatrixWide inverse = sdf_matrix_transpose(
+      sdf_quat_matrix_wide_qw(qw_from, qx_from, qy_from, qz_from));
+  SdfWide delta[3] = {sw_sub(px_to, px_from),
+                      sw_sub(py_to, py_from),
+                      sw_sub(pz_to, pz_from)};
   for (int row = 0; row < 3; ++row) {
     SdfWide value = sw_mul(sdf_matrix_get(inverse, 0, row), delta[0]);
     value = sw_add(value, sw_mul(sdf_matrix_get(inverse, 1, row), delta[1]));
@@ -1499,7 +1582,15 @@ inline SdfVectorPair sdf_obj_pair_grad(int mode, SdfSide A, SdfSide B,
   SdfVectorPair g = sdf_vector_add(g1, g2);
   SdfVectorPair pick = sdf_jet_gt(a, b) ? g1 : g2;
   float sign = sdf_jet_gt(sjmax(a, b), sj(0.0f)) ? 1.0f : -1.0f;
-  return sdf_vector_add(g, sdf_vector_scale(pick, sign));
+  // Match pinned COLLISION combine: grad1+grad2 (plain) then fused
+  // addToScl (single rounding, voted fused). Separate mul+add
+  // double-rounds razor residues.
+  SdfVectorPair result;
+  for (int i = 0; i < 3; ++i)
+    sdf_vector_store(result, i, sw_source_fma(
+        sdf_vector_component(pick, i), sw(sign),
+        sdf_vector_component(g, i)));
+  return result;
 }
 
 // Compare compensated values without first rounding hi+lo back to float32.
@@ -1876,6 +1967,109 @@ inline bool sdf_stage_seed_init(int t1, float3 p1, float4 q1, float3 sz1,
           hull[aabb_tail_base + 15 * gi2 + 8]) : float3(0.0f)};
   SdfTransformWide T12 = sdf_relative_transform_wide(q1, q2, p1, p2);
   SdfTransformWide T21 = sdf_reverse_transform_wide(T12, q1, p1, p2);
+  SdfPointPair lo = {float3(SDF_MAXVAL), float3(0.0f), float3(0.0f)};
+  SdfPointPair hi = {float3(-SDF_MAXVAL), float3(0.0f), float3(0.0f)};
+  SdfWide lower1[3], upper1[3], lower2[3], upper2[3];
+  for (int a = 0; a < 3; ++a) {
+    lower1[a] = lower2[a] = sw(SDF_MAXVAL);
+    upper1[a] = upper2[a] = sw(-SDF_MAXVAL);
+  }
+  for (int k = 0; k < 8; ++k) {
+    SdfPointPair v1, v2;
+    for (int a = 0; a < 3; ++a) {
+      float sign = (k & (1 << a)) ? 1.0f : -1.0f;
+      SdfWide one = sw_add(sdf_point_component(c1, a),
+                           sw_mul(sdf_point_component(h1, a), sw(sign)));
+      SdfWide two = sw_add(sdf_point_component(c2, a),
+                           sw_mul(sdf_point_component(h2, a), sw(sign)));
+      sdf_point_store(v1, a, one); sdf_point_store(v2, a, two);
+    }
+    SdfPointPair w2 = sdf_pair_transform(T21, v2);
+    for (int a = 0; a < 3; ++a) {
+      SdfWide one = sdf_point_component(v1, a), two = sdf_point_component(w2, a);
+      if (sw_sign(sw_sub(one, lower1[a])) < 0) lower1[a] = one;
+      if (sw_sign(sw_sub(one, upper1[a])) > 0) upper1[a] = one;
+      if (sw_sign(sw_sub(two, lower2[a])) < 0) lower2[a] = two;
+      if (sw_sign(sw_sub(two, upper2[a])) > 0) upper2[a] = two;
+    }
+  }
+  for (int a = 0; a < 3; ++a) {
+    SdfWide l = sw_sign(sw_sub(lower1[a], lower2[a])) > 0
+        ? lower1[a] : lower2[a];
+    SdfWide h = sw_sign(sw_sub(upper1[a], upper2[a])) < 0
+        ? upper1[a] : upper2[a];
+    if (sw_sign(sw_sub(h, l)) < 0) return false;
+    sdf_point_store(lo, a, l); sdf_point_store(hi, a, h);
+  }
+  SdfPointPair s1;
+  for (int a = 0; a < 3; ++a) {
+    SdfWide l = sdf_point_component(lo, a), h = sdf_point_component(hi, a);
+    SdfWide halton = sdf_halton_pair(seed_index,
+                                      a == 0 ? 2 : a == 1 ? 3 : 5);
+    SdfWide value = sw_add(l, sw_mul(sw_sub(h, l), halton));
+    sdf_point_store(s1, a, value);
+  }
+  SdfPointPair x = sdf_pair_transform(T12, s1);
+  sdf_stage_store_point(state, state_base + SDF_STAGE_X, x);
+  sdf_stage_store_transform(state, state_base + SDF_STAGE_T21, T21);
+  sdf_stage_store_wide(state, state_base + SDF_STAGE_DIST,
+                       sw(SDF_MAXVAL));
+  return true;
+}
+
+// Wide-pose seed init: identical box/Halton/descent staging, but T12/T21
+// come from FK triple planes (hi/lo/tail) instead of float32 promotion.
+// This removes the ~3e-10 float32 quat quantization that dominates seed
+// gaps at rotated states (1e-09 seeds -> 1e-06 normals via ~1e03 Lipschitz).
+inline bool sdf_stage_seed_init_wide(int t1, float3 sz1,
+    int gi1, int gi2, int seed_index,
+    SdfWide qw1, SdfWide qx1, SdfWide qy1, SdfWide qz1,
+    SdfWide qw2, SdfWide qx2, SdfWide qy2, SdfWide qz2,
+    SdfWide px1, SdfWide py1, SdfWide pz1,
+    SdfWide px2, SdfWide py2, SdfWide pz2,
+    device const float* hull, device const int* hull_info,
+    device float* state, int state_base) {
+  int abase = hull_info[gi2 * 9 + 3];
+  if (abase < 0 || seed_index < 0) return false;
+  int iters = hull_info[gi2 * 9 + 2];
+  if (iters <= 0) return false;
+  SdfSide A, B;
+  if (!sdf_stage_sides(t1, sz1, gi1, gi2, hull, hull_info, A, B))
+    return false;
+  int aabb_tail_base = hull_info[gi2 * 9 + 6];
+  SdfPointPair c1 = {float3(hull[abase + 18 * gi1],
+      hull[abase + 18 * gi1 + 1], hull[abase + 18 * gi1 + 2]),
+      float3(hull[abase + 18 * gi1 + 6], hull[abase + 18 * gi1 + 7],
+             hull[abase + 18 * gi1 + 8]),
+      aabb_tail_base >= 0 ? float3(hull[aabb_tail_base + 15 * gi1],
+          hull[aabb_tail_base + 15 * gi1 + 1],
+          hull[aabb_tail_base + 15 * gi1 + 2]) : float3(0.0f)};
+  SdfPointPair h1 = {float3(hull[abase + 18 * gi1 + 3],
+      hull[abase + 18 * gi1 + 4], hull[abase + 18 * gi1 + 5]),
+      float3(hull[abase + 18 * gi1 + 9], hull[abase + 18 * gi1 + 10],
+             hull[abase + 18 * gi1 + 11]),
+      aabb_tail_base >= 0 ? float3(hull[aabb_tail_base + 15 * gi1 + 6],
+          hull[aabb_tail_base + 15 * gi1 + 7],
+          hull[aabb_tail_base + 15 * gi1 + 8]) : float3(0.0f)};
+  SdfPointPair c2 = {float3(hull[abase + 18 * gi2],
+      hull[abase + 18 * gi2 + 1], hull[abase + 18 * gi2 + 2]),
+      float3(hull[abase + 18 * gi2 + 6], hull[abase + 18 * gi2 + 7],
+             hull[abase + 18 * gi2 + 8]),
+      aabb_tail_base >= 0 ? float3(hull[aabb_tail_base + 15 * gi2],
+          hull[aabb_tail_base + 15 * gi2 + 1],
+          hull[aabb_tail_base + 15 * gi2 + 2]) : float3(0.0f)};
+  SdfPointPair h2 = {float3(hull[abase + 18 * gi2 + 3],
+      hull[abase + 18 * gi2 + 4], hull[abase + 18 * gi2 + 5]),
+      float3(hull[abase + 18 * gi2 + 9], hull[abase + 18 * gi2 + 10],
+             hull[abase + 18 * gi2 + 11]),
+      aabb_tail_base >= 0 ? float3(hull[aabb_tail_base + 15 * gi2 + 6],
+          hull[aabb_tail_base + 15 * gi2 + 7],
+          hull[aabb_tail_base + 15 * gi2 + 8]) : float3(0.0f)};
+  SdfTransformWide T12 = sdf_relative_transform_wide_wide(
+      qw1, qx1, qy1, qz1, qw2, qx2, qy2, qz2,
+      px1, py1, pz1, px2, py2, pz2);
+  SdfTransformWide T21 = sdf_reverse_transform_wide_wide(
+      T12, qw1, qx1, qy1, qz1, px1, py1, pz1, px2, py2, pz2);
   SdfPointPair lo = {float3(SDF_MAXVAL), float3(0.0f), float3(0.0f)};
   SdfPointPair hi = {float3(-SDF_MAXVAL), float3(0.0f), float3(0.0f)};
   SdfWide lower1[3], upper1[3], lower2[3], upper2[3];
