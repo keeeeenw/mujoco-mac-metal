@@ -1,0 +1,110 @@
+--- .upstream/mujoco-3.10.0/src/engine/engine_collision_sdf.c	2026-06-22 07:22:23
++++ .upstream/mujoco-trace/src/engine/engine_collision_sdf.c	2026-10-07 13:42:10
+@@ -16,6 +16,7 @@
+ 
+ #include <math.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ #include <mujoco/mjdata.h>
+ #include <mujoco/mjmodel.h>
+@@ -612,6 +613,23 @@
+ }
+ 
+ // finds minimum using gradient descent
++//
++// Inert per-seed descent trace (diagnostic only): when the
++// MUJOCO_SDF_TRACE environment variable is set to a non-empty value, each
++// seed's gradient-descent trajectory (gradient, line-search trials with
++// alpha/dist/Wolfe operands, terminal criterion) is written to stderr with
++// an MJCSDFTRACE prefix. When unset, no output is produced and no
++// computation changes: every trace statement is a guarded read of existing
++// locals. Production physics never enables this path.
++static int mjc_sdf_trace_on(void) {
++  static int state = -1;
++  if (state < 0) {
++    const char* env = getenv("MUJOCO_SDF_TRACE");
++    state = (env && env[0] != '\0') ? 1 : 0;
++  }
++  return state;
++}
++
+ static mjtNum stepGradient(mjtNum x[3], const mjModel* m, const mjSDF* s,
+                            const mjData* d, int niter) {
+   const mjtNum c = .1;       // reduction factor for the target decrease in the objective function
+@@ -641,14 +659,37 @@
+     mjtNum dist0 = mjc_distance(m, d, s, x0);
+     mjtNum wolfe = - c * alpha * mju_dot3(grad, grad);
+ 
++    if (mjc_sdf_trace_on()) {
++      fprintf(stderr,
++          "MJCSDFTRACE step niter=%d step=%d grad=%.17g %.17g %.17g "
++          "x0=%.17g %.17g %.17g dist0=%.17g wolfe0=%.17g\n",
++          niter, step, grad[0], grad[1], grad[2],
++          x0[0], x0[1], x0[2], dist0, wolfe);
++    }
++
+     // backtracking line search
+     do {
+       alpha *= rho;
+       wolfe *= rho;
+       mju_addScl3(x, x0, grad, -alpha);
+       dist = mjc_distance(m, d, s, x);
++      if (mjc_sdf_trace_on()) {
++        fprintf(stderr,
++            "MJCSDFTRACE trial niter=%d step=%d alpha=%.17g dist=%.17g "
++            "decrease=%.17g wolfe=%.17g accept=%d\n",
++            niter, step, alpha, dist, dist - dist0, wolfe,
++            (alpha > amin && dist - dist0 > wolfe) ? 1 : 0);
++      }
+     } while (alpha > amin && dist - dist0 > wolfe);
+ 
++    if (mjc_sdf_trace_on()) {
++      fprintf(stderr,
++          "MJCSDFTRACE terminal niter=%d step=%d x=%.17g %.17g %.17g "
++          "dist=%.17g dist0=%.17g improved=%d\n",
++          niter, step, x[0], x[1], x[2], dist, dist0,
++          (dist0 < dist) ? 0 : 1);
++    }
++
+     // if no improvement, early stop
+     if (dist0 < dist) {
+       return dist;
+@@ -1154,16 +1195,37 @@
+     // start counters
+     if (sdf_ptr[0]) {
+       sdf_ptr[0]->compute(m, d, instance[0], mjPLUGIN_SDF);
++    }
++
++    if (mjc_sdf_trace_on()) {
++      fprintf(stderr,
++          "MJCSDFTRACE seed i=%d halton=%d g1=%d g2=%d "
++          "x=%.17g %.17g %.17g\n",
++          i - 1, j - 1, g1, g2, x[0], x[1], x[2]);
+     }
+ 
+     // gradient descent - we use a special function of the two SDF as objective
+     sdf.type = mjSDFTYPE_COLLISION;
+     dist2 = stepGradient(x, m, &sdf, d, m->opt.sdf_iterations);
+ 
++    if (mjc_sdf_trace_on()) {
++      fprintf(stderr,
++          "MJCSDFTRACE stage i=%d type=COLLISION niter=%d dist2=%.17g "
++          "x=%.17g %.17g %.17g\n",
++          i - 1, m->opt.sdf_iterations, dist2, x[0], x[1], x[2]);
++    }
++
+     // inexact SDFs can yield spurious collisions, filter them by projecting on the midsurface
+     sdf.type = mjSDFTYPE_INTERSECTION;
+     dist2 = stepGradient(x, m, &sdf, d, 1);
+ 
++    if (mjc_sdf_trace_on()) {
++      fprintf(stderr,
++          "MJCSDFTRACE stage i=%d type=INTERSECTION niter=1 dist2=%.17g "
++          "x=%.17g %.17g %.17g\n",
++          i - 1, dist2, x[0], x[1], x[2]);
++    }
++
+     // contact point and normal - we use the midsurface where SDF1=SDF2 as zero level set
+     sdf.type = mjSDFTYPE_MIDSURFACE;
+     cnt = addPreContact(contacts, con + cnt, x, pos2, quat2, dist2, cnt, m, &sdf, d, 0);
