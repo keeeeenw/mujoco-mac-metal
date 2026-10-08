@@ -45,6 +45,7 @@ mujoco_metal = ["shaders/*.metal", "pinned_enums.json", "pinned_surface.json"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["--import-mode=importlib"]
+pythonpath = [".", "tests"]
 markers = ["gpu: requires explicit opt-in and an idle Apple GPU"]
 
 [tool.pyink]

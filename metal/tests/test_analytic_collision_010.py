@@ -286,26 +286,15 @@ def _check_exact_contacts(tag, cfg, swap, cpu, nat):
   else:
     nat_tol_pos, nat_tol_nrm = 1e-6, 1e-6
   assert len(nat) == len(cpu), (tag, cfg, swap, len(nat), len(cpu))
-  # Ellipsoid-ellipsoid configs preserving the x-axis (all but grazing,
-  # which yaws): analytic symmetry forces the witness normal onto the
-  # center axis (roll about X preserves it). The CPU EPA facet normal is
-  # deterministically tilted (measured stable 2-3 degrees across
-  # micro-perturbations and dx sweeps) so the oracle is not the frame
-  # reference; depth/positions still compare against it, and solved-force
-  # parity covers physics.
-  use_symmetry_normal = (
-      tag == "ellipsoid-ellipsoid" and cfg != "grazing")
+  # Match the pinned EPA witness normal, including its deterministic facet
+  # tilt. An analytic center-axis normal is not the engine's output.
   for (dc, nc, pc), (dn, nn, pn) in zip(_sorted_contacts(cpu),
                                         _sorted_contacts(nat)):
     np.testing.assert_allclose(
         dn, dc, atol=1e-4 if tag == "ellipsoid-ellipsoid" else 1e-6,
         err_msg=f"{tag}/{cfg}/swap={swap} dist")
-    if use_symmetry_normal:
-      np.testing.assert_allclose(np.abs(nn), [1.0, 0.0, 0.0], atol=1e-6,
-                                 err_msg=f"{tag}/{cfg}/swap={swap} normal")
-    else:
-      np.testing.assert_allclose(nn, nc, atol=nat_tol_nrm,
-                                 err_msg=f"{tag}/{cfg}/swap={swap} normal")
+    np.testing.assert_allclose(nn, nc, atol=nat_tol_nrm,
+                               err_msg=f"{tag}/{cfg}/swap={swap} normal")
     np.testing.assert_allclose(pn, pc, atol=nat_tol_pos,
                                err_msg=f"{tag}/{cfg}/swap={swap} pos")
 
@@ -374,7 +363,10 @@ def test_pair_matrix_cylinder_ellipsoid_gpu():
         sim = simM if margin > 0 else sim0
         try:
           d = mujoco.MjData(m)
-          d.qpos[:] = qpos
+          # The device state is float32. Compare the CPU at that identical
+          # represented pose: a 1e-9 offset can flip a symmetric EPA facet.
+          # Geom sizes retain their compiled precision on both backends.
+          d.qpos[:] = qpos.astype(np.float32)
           mujoco.mj_forward(m, d)
           sim.state._qpos.copy_(sim.state._torch.as_tensor(
               qpos.astype(np.float32).reshape(1, -1),
@@ -525,3 +517,22 @@ def test_roller_sorting_trajectory_gpu():
   # Both bodies moved downhill (+x tilt): roller sorting direction holds.
   gq = sim.state.qpos.cpu().numpy()[0]
   assert float(gq[0]) > -0.3 and float(gq[7]) > 0.3
+
+
+def test_contact_matrix_comparison_accepts_actual_pinned_cpu_normals():
+  # The oracle's converged EPA normal need not be the analytic symmetry axis.
+  # Comparing the engine with itself catches invented expected normals before
+  # a native implementation is incorrectly blamed for reproducing the source.
+  for tag, ta, sa, xa, tb, sb, xb in _PAIRS_010:
+    if tag != "ellipsoid-ellipsoid":
+      continue
+    for cfg, swap, margin, qpos in _matrix_cases(xa, xb):
+      model = mujoco.MjModel.from_xml_string(
+          _pair_xml(ta, sa, tb, sb, swap=swap, margin=margin))
+      data = mujoco.MjData(model)
+      data.qpos[:] = qpos
+      mujoco.mj_forward(model, data)
+      contacts = [(float(c.dist), np.array(c.frame[:3]), np.array(c.pos))
+                  for c in data.contact[:data.ncon]]
+      if contacts:
+        _check_exact_contacts(tag, cfg, swap, contacts, contacts)
