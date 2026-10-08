@@ -1614,6 +1614,14 @@ kernel void contact_normal(
       int r = rb + row * 7;
       row_data[r] = d < m ? 1.0f : 0.0f;      row_data[r + 1] = d;
       row_data[r + 2] = vel;
+      // Row 0 and condim-3 pyramidal edge rows carry the full reference
+      // (-B*vel - K*impedance*(d-m)) directly: condim-3 edges are
+      // pre-combined here (edge velocity plus the single penetration term).
+      // Higher-condim pyramidal rows retain axis source values (tangent rows
+      // velocity-only); the solver assembly combines them into edges as
+      // normal + sign*mu*tangent, which recovers the full pinned
+      // mj_referenceConstraint value (-B*v_edge - K*I*(d-m)) exactly once.
+      // Elliptic-cone rows are velocity-only (K = 0, friction_B).
       row_data[r + 3] = (row == 0 || (dim == 3 && cone < 0.5f))
           ? -B * vel - K * impedance * (d - m)
           : -((cone > 0.5f) ? friction_B : B) * vel;
@@ -2587,6 +2595,11 @@ kernel void contact_jacobian_low(
           float imp_hi = contact_row_data[rr + 4];
           PrimalFloatPair impP = imp_paired ? pimp : PrimalFloatPair{imp_hi, 0.0f};
           PrimalFloatPair eAref;
+          // Mirror of the hot row formula above: condim-3 pyramidal edges
+          // are pre-combined (full edge reference); higher condims keep
+          // axis source values here (tangent rows velocity-only) and the
+          // solver assembly combines hi and lo identically into edges, so
+          // the pair correction lands on the same once-counted stiffness.
           if (row == 0 || (dim == 3 && cone < 0.5f)) {
             PrimalFloatPair mp = {lmargin, pair_const_lo[clo + 7]};
             PrimalFloatPair dm = primal_pair_add({d_hi, d_lo},

@@ -416,3 +416,83 @@ def _check_shallow(model, etier):
     worst = max(worst, abs(
         float(rd[i, 0, 3]) + float(rd[i, 0, 6]) - cpu[c][2]))
   assert worst < etier, worst
+
+
+@_needs_gpu()
+@pytest.mark.parametrize("condim", ["3", "4", "6"], ids=["c3", "c4", "c6"])
+def test_friction_rows_mapped_with_moving_state_gpu(condim):
+  # Position-matched ALL-ROW comparison with nonzero tangent/spin/rolling
+  # velocity: the 019 row-mapped oracle (J/R/ar/rhs/W per contact row plus
+  # qacc/qfrc) runs on pyramidal condim 3/4/6 SDF fixtures with moving
+  # states, so friction-row velocities, references and forces are
+  # genuinely exercised (static presses leave them at zero). Nonzero
+  # friction-row velocities and multipliers are asserted so the test
+  # cannot pass on normal-row-only coverage.
+  import mujoco
+  import sys
+  sys.path.insert(0, "metal/tests")
+  from test_bundled_sdf_rigid_oracle_019 import (
+      _cpu_contacts, _assert_contact_system_matches_cpu)
+  from mujoco_metal.simulation import MetalSimulation
+  model = mujoco.MjModel.from_xml_string(_torus_xml(condim=condim))
+  sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  qpos = np.asarray(
+      sim.state._qpos[0].cpu().numpy(), dtype=np.float64).copy()
+  qvel = np.array([0.15, -0.4, 0.1, 0.0, 0.0, 1.5])
+  qvel32 = qvel.astype(np.float32).astype(np.float64)
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=qvel.astype(np.float32).reshape(1, -1))
+  cpu_data, cpu_J, contacts = _cpu_contacts(model, qpos, qvel32)
+  assert len(contacts) == 8
+  assert all(len(c["rows"]) > 1 for c in contacts)
+  _assert_contact_system_matches_cpu(model, sim, cpu_data, cpu_J, contacts)
+  s = sim.assembled_system(recompute=True)
+  lam = np.asarray(s["lambda"][0].cpu().numpy(), dtype=np.float64)
+  desc = sim._coupled_constraints.descriptor
+  packed = np.asarray(desc.contact_condim_packed, dtype=np.int32).reshape(-1, 3)
+  mask = np.asarray(s["contact_mask"][0].cpu().numpy())
+  npos = np.asarray(s["contact_position"][0].cpu().numpy())
+  from test_bundled_sdf_rigid_oracle_019 import _unique_native_slots
+  assignment = _unique_native_slots(contacts, mask, npos)
+  fric_vel, fric_lam = 0.0, 0.0
+  for ci, contact in enumerate(contacts):
+    slot, _ = assignment[ci]
+    gpu_base = int(desc.nr_joint) + int(packed[slot, 1])
+    rows = np.arange(gpu_base, gpu_base + len(contact["rows"]))
+    fric_vel = max(fric_vel, float(np.max(np.abs(
+        np.asarray(cpu_data.efc_vel, dtype=np.float64)[contact["rows"][1:]]))))
+    fric_lam = max(fric_lam, float(np.max(np.abs(lam[rows[1:]]))))
+  assert fric_vel > 1e-6, fric_vel
+  assert fric_lam > 0.0, fric_lam
+
+
+@_needs_gpu()
+@pytest.mark.parametrize("which", ["solref", "solimp"],
+                         ids=["iref", "iimp"])
+def test_override_settings_consumed_at_use_time_gpu(which):
+  # Mutable override settings are verified at use time (post-construction
+  # solve), not only at lowering: the lowered descriptor carries the
+  # mutated values, and the paired reference plus publication match the
+  # oracle built from the same mutated model.
+  import mujoco
+  import sys
+  sys.path.insert(0, "metal/tests")
+  from mujoco_metal.coupled_constraints import lower_coupled_constraints
+  flag = int(mujoco.mjtEnableBit.mjENBL_OVERRIDE)
+  m = mujoco.MjModel.from_xml_string(_torus_xml())
+  m.opt.enableflags |= flag
+  if which == "solref":
+    m.opt.o_solref[:] = (0.05, 2.0)
+  else:
+    m.opt.o_solimp[:] = (0.85, 0.9, 0.002, 0.4, 3.0)
+  desc = lower_coupled_constraints(m)
+  assert int(desc.npairs) >= 1
+  if which == "solref":
+    np.testing.assert_array_equal(
+        np.asarray(desc.solref).reshape(-1, 2)[0],
+        np.asarray(m.opt.o_solref, dtype=np.float32))
+  else:
+    np.testing.assert_array_equal(
+        np.asarray(desc.solimp).reshape(-1, 5)[0],
+        np.asarray(m.opt.o_solimp, dtype=np.float32))
+  _check_variant_xml(m, 5e-9)
