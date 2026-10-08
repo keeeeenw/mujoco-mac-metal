@@ -628,6 +628,19 @@ inline SdfPointPair sdf_mesh_pair_add_scaled(SdfPointPair p,
         sw_mul(sdf_point_component(v,i),scale)));
   return result;
 }
+// Fused pointwise update matching pinned mju_addToScl3 contraction
+// (x += s*alpha evaluates as one fused multiply-add per component, like the
+// pinned Frank-Wolfe update and the seed barycentric nest). Separate
+// add(mul()) double-rounds razor vertex-selection residues.
+inline SdfPointPair sdf_mesh_pair_fma_scaled(SdfPointPair p,
+                                            SdfPointPair v,
+                                            SdfWide scale) {
+  SdfPointPair result;
+  for (int i=0;i<3;i++)
+    sdf_point_store(result,i,sw_source_fma(scale,
+        sdf_point_component(v,i),sdf_point_component(p,i)));
+  return result;
+}
 inline SdfJet sdf_mesh_frank_wolfe(thread SdfPointPair& x,
                                    SdfPointPair a,SdfPointPair b,SdfPointPair c,
                                    SdfSide sdf,device const float* hull,
@@ -640,9 +653,11 @@ inline SdfJet sdf_mesh_frank_wolfe(thread SdfPointPair& x,
     if(sw_sign(sw_sub(fb,best))<0){best=fb;selected=b;}
     if(sw_sign(sw_sub(sdf_mesh_pair_dot(c,grad),best))<0)selected=c;
     // Pinned mju_subFrom3(s,x), then mju_addToScl3(x,s,2/(step+2)).
+    // The installed library fuses the second update (single rounding);
+    // keep it fused here as well.
     SdfPointPair delta=sdf_mesh_pair_difference(selected,x);
     SdfWide alpha=sw_div(sw(2.0f),sw(float(step+2)));
-    x=sdf_mesh_pair_add_scaled(x,delta,alpha);
+    x=sdf_mesh_pair_fma_scaled(x,delta,alpha);
   }
   return sdf_side_pair_jet(sdf,hull,x);
 }
@@ -677,10 +692,12 @@ inline void sdf_mesh_face_candidates(int face_id,float3x3 R,float3 t,
       u=sw_sub(sw(1.0f),u);v=sw_sub(sw(1.0f),v);
     }
     SdfWide b0=sw_sub(sw_sub(sw(1.0f),u),v);
-    SdfPointPair x=sdf_mesh_pair_add_scaled(
+    // Pinned seed nest fuses left-to-right (FMA form); the installed
+    // trajectory sends sp7 to the x2 basin only under this association.
+    SdfPointPair t1=sdf_mesh_pair_add_scaled(
         SdfPointPair{float3(0),float3(0),float3(0)},a,b0);
-    x=sdf_mesh_pair_add_scaled(x,b,u);
-    x=sdf_mesh_pair_add_scaled(x,c,v);
+    SdfPointPair t2=sdf_mesh_pair_fma_scaled(t1,b,u);
+    SdfPointPair x=sdf_mesh_pair_fma_scaled(t2,c,v);
     SdfJet depth=sdf_mesh_frank_wolfe(x,a,b,c,sdf,hull,iterations);
     if(sjcompare(depth,sj(0))<0){
       candidates[ncandidate]=x;distances[ncandidate]=depth;++ncandidate;
@@ -715,10 +732,10 @@ inline void sdf_mesh_face_candidates_cached(int face_id,float3x3 R,float3 t,
       u=sw_sub(sw(1.0f),u);v=sw_sub(sw(1.0f),v);
     }
     SdfWide b0=sw_sub(sw_sub(sw(1.0f),u),v);
-    SdfPointPair x=sdf_mesh_pair_add_scaled(
+    SdfPointPair t1=sdf_mesh_pair_add_scaled(
         SdfPointPair{float3(0),float3(0),float3(0)},a,b0);
-    x=sdf_mesh_pair_add_scaled(x,b,u);
-    x=sdf_mesh_pair_add_scaled(x,c,v);
+    SdfPointPair t2=sdf_mesh_pair_fma_scaled(t1,b,u);
+    SdfPointPair x=sdf_mesh_pair_fma_scaled(t2,c,v);
     SdfJet depth=sdf_mesh_frank_wolfe(x,a,b,c,sdf,hull,iterations);
     if(sjcompare(depth,sj(0))<0){
       int base=(scratch_base+ncandidate)*12;
@@ -1338,46 +1355,34 @@ inline SdfVectorPair sdf_side_pair_grad(SdfSide side,
       int node = sdf_findoct_pair(weights, coord, span, hull,
                                   side.co, side.nn, inside_point);
       if (node < 0) return {float3(0.0f), float3(0.0f)};
-      // Pinned disassembly uses sequential FMA accumulation here; that
-      // reproduces only three witnesses on the razor-symmetric fixture
-      // (the fourth vertex selection needs a differently-rounded residue).
-      // This 4-lane FMA reduction ([0,4],[1,5],[2,6],[3,7]) recovers all
-      // four CPU basins and is pinned by the 4-witness regression gate;
-      // lane order is load-bearing, do not "simplify". Residual D-vs-x2
-      // normal-tier difference is documented as a binary-rounding razor
-      // tie (see qualification notes), not a field error.
-      SdfJet lane[4][3];
-      for (int L = 0; L < 4; ++L)
-        for (int k = 0; k < 3; ++k) lane[L][k] = sj(0.0f);
-      int fb = side.co + 14 * side.nn;
-      for (int L = 0; L < 4; ++L) {
-        for (int kk = 0; kk < 2; ++kk) {
-          int i = L + 4 * kk;
-          SdfJet wx = (i & 1) ? coord[0] : sjsub(sj(1.0f), coord[0]);
-          SdfJet wy = (i & 2) ? coord[1] : sjsub(sj(1.0f), coord[1]);
-          SdfJet wz = (i & 4) ? coord[2] : sjsub(sj(1.0f), coord[2]);
-          SdfJet sign_x = sj((i & 1) ? 1.0f : -1.0f);
-          SdfJet sign_y = sj((i & 2) ? 1.0f : -1.0f);
-          SdfJet sign_z = sj((i & 4) ? 1.0f : -1.0f);
-          // Pinned findOct/oct_gradient uses derivatives with respect to
-          // normalized leaf coordinates; it does not divide these weights by
-          // the physical leaf span. Preserve that source convention here too.
-          SdfJet dx = sjmul(sjmul(sign_x, wy), wz);
-          SdfJet dy = sjmul(sjmul(wx, sign_y), wz);
-          SdfJet dz = sjmul(sjmul(wx, wy), sign_z);
-          SdfJet coeff = sjwide(SdfWide{
-              hull[fb + 8 * node + i],
-              hull[side.co + 28 * side.nn + 8 * node + i],
-              hull[side.co + 42 * side.nn + 8 * node + i]});
-          lane[L][0] = sjfma(dx, coeff, lane[L][0]);
-          lane[L][1] = sjfma(dy, coeff, lane[L][1]);
-          lane[L][2] = sjfma(dz, coeff, lane[L][2]);
-        }
-      }
+      // Pinned oct_gradient accumulates grad[k] += dw*coeff in source index
+      // order with one fused multiply-add per term (see pinned ARM
+      // disassembly and the installed-oracle per-step verification). Keep
+      // this sequential FMA chain exactly; lane/block reorderings change
+      // razor vertex-selection residues and break CPU basin agreement.
       SdfJet gradient[3] = {sj(0.0f), sj(0.0f), sj(0.0f)};
-      for (int L = 0; L < 4; ++L)
-        for (int k = 0; k < 3; ++k)
-          gradient[k] = sjadd(gradient[k], lane[L][k]);
+      int fb = side.co + 14 * side.nn;
+      for (int i = 0; i < 8; ++i) {
+        SdfJet wx = (i & 1) ? coord[0] : sjsub(sj(1.0f), coord[0]);
+        SdfJet wy = (i & 2) ? coord[1] : sjsub(sj(1.0f), coord[1]);
+        SdfJet wz = (i & 4) ? coord[2] : sjsub(sj(1.0f), coord[2]);
+        SdfJet sign_x = sj((i & 1) ? 1.0f : -1.0f);
+        SdfJet sign_y = sj((i & 2) ? 1.0f : -1.0f);
+        SdfJet sign_z = sj((i & 4) ? 1.0f : -1.0f);
+        // Pinned findOct/oct_gradient uses derivatives with respect to
+        // normalized leaf coordinates; it does not divide these weights by
+        // the physical leaf span. Preserve that source convention here too.
+        SdfJet dx = sjmul(sjmul(sign_x, wy), wz);
+        SdfJet dy = sjmul(sjmul(wx, sign_y), wz);
+        SdfJet dz = sjmul(sjmul(wx, wy), sign_z);
+        SdfJet coeff = sjwide(SdfWide{
+            hull[fb + 8 * node + i],
+            hull[side.co + 28 * side.nn + 8 * node + i],
+            hull[side.co + 42 * side.nn + 8 * node + i]});
+        gradient[0] = sjfma(dx, coeff, gradient[0]);
+        gradient[1] = sjfma(dy, coeff, gradient[1]);
+        gradient[2] = sjfma(dz, coeff, gradient[2]);
+      }
       return {float3(gradient[0].v, gradient[1].v, gradient[2].v),
               float3(gradient[0].e, gradient[1].e, gradient[2].e),
               float3(gradient[0].tail,gradient[1].tail,gradient[2].tail)};
