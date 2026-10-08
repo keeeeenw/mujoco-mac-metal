@@ -987,15 +987,16 @@ def test_site_armature_qacc_and_trajectory_gpu():
 def test_site_armature_assembled_system_bias_force_mass_replay_gpu():
   # Public-assembly composition: with a transmitting nonzero-armature tendon,
   # assembled_system must include the Jdot armature bias (not omit it) and the
-  # J'AJ armature mass, match the CPU oracle qacc, and replay exactly.
+  # J'AJ armature mass, match the CPU oracle mass/bias/qacc per world, and
+  # replay exactly across a real state mutation and restore.
   from mujoco_metal import MetalSimulation
   m = mujoco.MjModel.from_xml_string(ARM2_XML.replace("ARM", "0.5"))
-  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
-  qp = np.array([0.4, -0.5])
-  qv = np.array([1.5, -2.0])
-  sim.reset(qpos=np.asarray(qp, dtype=np.float32).reshape(1, -1),
-            qvel=np.asarray(qv, dtype=np.float32).reshape(1, -1))
-  # Bias actually transmits: native dots/bias are nonzero at this state.
+  m_noarm = mujoco.MjModel.from_xml_string(ARM2_XML.replace("ARM", "0.0"))
+  sim = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
+  qp = np.array([[0.4, -0.5], [-0.3, 0.7]], dtype=np.float32)
+  qv = np.array([[1.5, -2.0], [-2.5, 1.0]], dtype=np.float32)
+  sim.reset(qpos=qp, qvel=qv)
+  # Bias actually transmits in both worlds: native dots/bias are nonzero.
   # Capture them before assembly (borrowed views are recomputed inside).
   dynamics = sim._smooth.run_device(sim.state._qpos, sim.state._qvel, None, None)
   kin = sim._spatial_tendons.run_kinematics(sim.state._qvel, dynamics["poses"])
@@ -1003,47 +1004,66 @@ def test_site_armature_assembled_system_bias_force_mass_replay_gpu():
       kin, sim.state._qvel, dynamics["poses"], dynamics.get("cvel", None),
       dynamics.get("root_com", None), dynamics.get("cdof", None),
       dynamics.get("cdof_dot", None))
-  assert float(np.max(np.abs(dots.cpu().numpy()))) > 1e-3
-  assert float(np.max(np.abs(bias.cpu().numpy()))) > 1e-6
+  native_dots = dots.cpu().numpy()
+  native_bias = bias.cpu().numpy()
+  for w in range(2):
+    assert abs(float(native_dots[w, 0])) > 1e-3
+    assert float(np.max(np.abs(native_bias[w]))) > 1e-6
   asm = sim.assembled_system(recompute=True)
-  native_qacc = asm["qacc"].cpu().numpy()[0]
-  native_mass = np.asarray(asm["mass_matrix"].cpu().numpy()[0])
-  # CPU oracle at the represented state, plus a zero-armature control model.
-  rep_qpos = sim.state._qpos.cpu().numpy()[0].astype(np.float64)
-  rep_qvel = sim.state._qvel.cpu().numpy()[0].astype(np.float64)
-  cpu = mujoco.MjData(m)
-  cpu.qpos[:] = rep_qpos
-  cpu.qvel[:] = rep_qvel
-  mujoco.mj_forward(m, cpu)
-  np.testing.assert_allclose(native_qacc[:2], np.asarray(cpu.qacc)[:2], atol=1e-4)
-  m_noarm = mujoco.MjModel.from_xml_string(ARM2_XML.replace("ARM", "0.0"))
-  cpu0 = mujoco.MjData(m_noarm)
-  cpu0.qpos[:] = rep_qpos
-  cpu0.qvel[:] = rep_qvel
-  mujoco.mj_forward(m_noarm, cpu0)
-  assert float(np.max(np.abs(np.asarray(cpu.qacc) - np.asarray(cpu0.qacc)))) > 1e-3
-  # Armature mass is in the public assembly: it differs from the
-  # zero-armature assembly at the same state.
-  sim0 = MetalSimulation(m_noarm, batch_size=1, profile="integrated_euler_v1")
-  sim0.reset(qpos=np.asarray(qp, dtype=np.float32).reshape(1, -1),
-             qvel=np.asarray(qv, dtype=np.float32).reshape(1, -1))
-  mass0 = np.asarray(sim0.assembled_system(recompute=True)["mass_matrix"].cpu().numpy()[0])
-  assert float(np.max(np.abs(native_mass - mass0))) > 1e-6
-  # Replay: recompute and snapshot/restore reproduce the assembly exactly.
-  again = sim.assembled_system(recompute=True)
-  np.testing.assert_array_equal(again["qacc"].cpu().numpy(),
-                                asm["qacc"].cpu().numpy())
-  np.testing.assert_array_equal(again["mass_matrix"].cpu().numpy(),
-                                asm["mass_matrix"].cpu().numpy())
+  # Independent snapshots: the assembly returns borrowed workspace views, so
+  # later recomputation overwrites them; only detached copies are evidence.
+  qacc_snap = asm["qacc"].detach().clone().cpu().numpy()
+  mass_snap = asm["mass_matrix"].detach().clone().cpu().numpy()
+  # Independent represented-state CPU oracles per world.
+  rep_qpos = sim.state._qpos.cpu().numpy().astype(np.float64)
+  rep_qvel = sim.state._qvel.cpu().numpy().astype(np.float64)
+  for w in range(2):
+    cpu = mujoco.MjData(m)
+    cpu.qpos[:] = rep_qpos[w]
+    cpu.qvel[:] = rep_qvel[w]
+    mujoco.mj_forward(m, cpu)
+    cpu0 = mujoco.MjData(m_noarm)
+    cpu0.qpos[:] = rep_qpos[w]
+    cpu0.qvel[:] = rep_qvel[w]
+    mujoco.mj_forward(m_noarm, cpu0)
+    # Actual native mass matches CPU mj_fullM (which carries tendon armature).
+    cpu_mass = np.zeros((m.nv, m.nv))
+    mujoco.mj_fullM(m, cpu, cpu_mass)
+    np.testing.assert_allclose(mass_snap[w], cpu_mass, rtol=2e-5, atol=1e-6)
+    # Native armature bias matches the CPU armature-vs-zero-armature
+    # qfrc_bias difference (identical smooth parts cancel).
+    cpu_bias_effect = (np.asarray(cpu.qfrc_bias) - np.asarray(cpu0.qfrc_bias))
+    assert float(np.max(np.abs(cpu_bias_effect))) > 1e-3
+    np.testing.assert_allclose(native_bias[w, :m.nv], cpu_bias_effect, atol=1e-5)
+    # Complete qacc matches the independent CPU oracle (bias + mass combined).
+    np.testing.assert_allclose(qacc_snap[w], np.asarray(cpu.qacc), atol=1e-4)
+    assert float(np.max(np.abs(np.asarray(cpu.qacc) - np.asarray(cpu0.qacc)))) > 1e-3
+  # Armature mass is in the public assembly, not just the oracle: it differs
+  # from the zero-armature assembly at the same state.
+  sim0 = MetalSimulation(m_noarm, batch_size=2, profile="integrated_euler_v1")
+  sim0.reset(qpos=qp, qvel=qv)
+  mass0 = sim0.assembled_system(recompute=True)["mass_matrix"].detach().clone().cpu().numpy()
+  assert float(np.max(np.abs(mass_snap - mass0))) > 1e-6
+  # Real state mutation changes the assembly; restore reproduces the exact
+  # snapshots (recompute alone is not replay evidence: reverse the mutation
+  # through snapshot/restore, not through aliasing the same workspace).
   snap = sim.snapshot()
+  sim.reset(qpos=np.zeros_like(qp), qvel=np.zeros_like(qv))
+  moved = sim.assembled_system(recompute=True)
+  assert float(np.max(np.abs(moved["qacc"].cpu().numpy() - qacc_snap))) > 1e-3
+  sim.restore(snap)
+  back = sim.assembled_system(recompute=True)
+  np.testing.assert_array_equal(back["qacc"].cpu().numpy(), qacc_snap)
+  np.testing.assert_array_equal(back["mass_matrix"].cpu().numpy(), mass_snap)
+  # Step-trajectory replay after restore is bitwise exact per world.
   stepped = []
   for _ in range(5):
     sim.step(1)
-    stepped.append(sim.state.qpos.cpu().numpy()[0].copy())
+    stepped.append(sim.state.qpos.cpu().numpy().copy())
   sim.restore(snap)
   for expected in stepped:
     sim.step(1)
-    np.testing.assert_array_equal(sim.state.qpos.cpu().numpy()[0], expected)
+    np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), expected)
 
 
 @pytest.mark.gpu
