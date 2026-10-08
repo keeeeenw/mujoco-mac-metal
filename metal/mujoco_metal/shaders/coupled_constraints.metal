@@ -5963,8 +5963,13 @@ inline int solve_primal_accel_scalar(device const float* mass,
     direction[i] = candidate[i] = mass_scratch[i] = 0.0f;
     generalized_force[i] = rhs_dof[i] = solved[i] = 0.0f;
   }
+  // Per-island ownership: clear only this island's rows. A full-plane
+  // clear here would erase earlier islands' retained low words (this
+  // plane aliases the published multiplier-low plane), leaving stale or
+  // zeroed lows for rows solved earlier. Disabled rows keep the caller's
+  // zeros; the solver never reads them.
   for (int row = 0; row < nr; ++row)
-    row_residual_low[row] = row_force_low[row] = 0.0f;
+    if (enabled[row]) row_residual_low[row] = row_force_low[row] = 0.0f;
   // Pinned warmstart selection compares qacc_warmstart against the cold
   // qacc_smooth point. Retained row multipliers are not an independent input
   // to CG/Newton and must not perturb that cost comparison.
@@ -8320,6 +8325,10 @@ kernel void solve_coupled_constraints(
   bool converged = false;
   bool primal_acceleration_output = false;
   float max_res = 0.0f;
+  // Total Newton/CG island iterations this solve; gates post-solve polish
+  // (refinement and qacc reconstruction run only on early stops, never on
+  // budget-exhausted iterates).
+  int solver_used = 0;
   // Convergence history: 7 coarse main-sweep samples + final main-sweep
   // residual (refinement afterwards is a separate exact phase; the retained
   // diagnostics[0] is post-refinement). Unfilled slots repeat the final.
@@ -8457,6 +8466,11 @@ kernel void solve_coupled_constraints(
     for (int row = 0; row < total_nr; ++row)
       enabled[row] = solver_row_island[row] >= 0;
     // 8b. Projected dual refinement (Newton/CG, dense only).
+    // Runs only when the solver stopped early (used < maxiter): it polishes
+    // converged solutions and never extends an explicit iteration budget.
+    // Budget-exhausted iterates (including the entire 0/1/2-iteration
+    // contract) are published raw, exactly as the primal solver left them.
+    // The primal iterate minimizes the working-precision objective; small
     // The primal iterate minimizes the working-precision objective; small
     // inertias can leave the dual residual of the accepted multipliers
     // several ulps off zero against the EFFECTIVE operator (paired J,
@@ -8475,11 +8489,29 @@ kernel void solve_coupled_constraints(
     // reconstruction for all solvers on this path, so sub-ulp corrections
     // survive in the published force/acceleration; certificates,
     // reconstruction and published lambda share one coherent value. Skipped bit-identically
-    // without low-word corrections; elliptic-cone rows keep primal values
-    // (box projection is wrong for SOC), equality rows keep primal values
-    // (separate paired aref plane in equality assembly); component stages
-    // (-2/-3, no dense L) keep the hi-only system.
-    if ((solver_type == 1 || solver_type == 2) && dims[20] >= 0) {
+    // without low-word corrections, and entire mixed systems (any
+    // equality row with its separate paired aref, any elliptic-cone row
+    // needing cone projections, any symmetric-bounded friction row with
+    // Huber semantics): partial moves would shift skipped rows'
+    // optimality, so mixed systems keep primal values untouched.
+    // Component stages (-2/-3, no dense L) keep the hi-only system.
+    if ((solver_type == 1 || solver_type == 2) && dims[20] >= 0
+        && used < maxiter) {
+      // Uniform scalar-contact systems only: moving a subset of rows
+      // would shift skipped rows' optimality (equality rows own a
+      // separate paired aref; elliptic blocks need cone projections;
+      // symmetric-bounded friction rows follow Huber, not box, semantics).
+      // Mixed systems keep primal values untouched (coherent by the primal
+      // solver's own construction). Contact-normal/limit rows ([0,inf))
+      // share unilateral semantics, including tendon limits whose TRUE low
+      // word is defined as zero (never paired anywhere).
+      bool uniform_scalar = true;
+      for (int row = 0; row < total_nr && uniform_scalar; ++row)
+        if (enabled[row]) {
+          if (row < n_eq_rows || elliptic_member[row]
+              || !(lo[row] == 0.0f && hi[row] == INFINITY))
+            uniform_scalar = false;
+        }
       bool refine_any_jlo = false;
       for (int row = 0; row < total_nr && !refine_any_jlo; ++row)
         if (enabled[row]) {
@@ -8491,8 +8523,11 @@ kernel void solve_coupled_constraints(
         }
       bool refine_any_row = false;
       for (int row = 0; row < total_nr; ++row)
-        if (enabled[row] && !elliptic_member[row]) { refine_any_row = true; break; }
-      if (refine_any_jlo && refine_any_row) {
+        if (enabled[row] && !elliptic_member[row] && row >= n_eq_rows
+            && lo[row] == 0.0f && hi[row] == INFINITY) {
+          refine_any_row = true; break;
+        }
+      if (uniform_scalar && refine_any_jlo && refine_any_row) {
         // Lifetimes: y/x hold dead stage-5 Z solves. The Newton scratch
         // region (dead after the island loop above) supplies pair words:
         // v in y/vlo, u in x, Minv temp pair in tlo/tlo2 (3nv words of a
@@ -8599,6 +8634,7 @@ kernel void solve_coupled_constraints(
     }
     primal_acceleration_output = true;
     max_res = primal_residual;
+    solver_used = used;
     converged = max_res <= tol;
     out_diagnostics[world * 10] = max_res;
     out_diagnostics[world * 10 + 1] = float(used);
@@ -9137,20 +9173,23 @@ kernel void solve_coupled_constraints(
   }
 
   // Reconstruct qacc from the corrected force on Newton/CG primal paths.
-  // The Newton primal iterate minimizes the high-word-J objective; when
-  // 2e-8 Jacobian rounding is amplified by small inertias its minimum can
-  // sit 1e-2 off the CPU minimum even while multipliers are accurate
-  // (force-balance evidence). The published acceleration must satisfy the
-  // force-balance identity M qacc = qfrc_smooth + qfrc_constraint with the
-  // same effective Jacobian used for force reconstruction; mirror that
-  // identity here with a full mass solve using the retained Cholesky
-  // factor L (exact for dense mass, any nv, no diagonal cutoff).
-  // Skipped bit-identically when no low-word Jacobian corrections exist,
+  // Runs only when the solver stopped early (used < maxiter): at
+  // budget-exhausted iterates (including the 0/1/2-iteration contract)
+  // the finite primal qacc is published as-is; force balance at
+  // convergence is not permission to replace it with a more converged
+  // dual result. The Newton primal iterate minimizes the high-word-J
+  // objective; when 2e-8 Jacobian rounding is amplified by small inertias
+  // its minimum can sit 1e-2 off the CPU minimum even while multipliers
+  // are accurate (force-balance evidence). The published acceleration
+  // then satisfies M qacc = qfrc_smooth + qfrc_constraint with the same
+  // effective Jacobian used for force reconstruction, via a full mass
+  // solve using the retained Cholesky factor L (working precision
+  // for dense mass, any nv, no diagonal cutoff; not claimed exact).
   // so non-SDF behavior is unchanged. Sleeping DOFs keep the Newton
   // values. Component modes (-2/-3, no dense L) use high-only force
   // (consistent hi-only system, J_lo correction gated to dense mass).
   if (primal_acceleration_output && (solver_type == 1 || solver_type == 2)
-      && dims[20] >= 0) {
+      && dims[20] >= 0 && solver_used < maxiter) {
     bool need_recon = false;
     for (int row = 0; row < nr && !need_recon; ++row)
       for (int i = 0; i < nv; ++i) {
@@ -9160,6 +9199,44 @@ kernel void solve_coupled_constraints(
       }
     if (need_recon) {
       device const float* mass_world = mass + mb;
+      // Verify in the real operator before publishing: pair residuals of
+      // the primal iterate (r_pre) and the candidate (r_post) against
+      // M qacc = smooth + force with real mass entries. Publish the
+      // candidate only when its residual is finite and no worse; this
+      // checks the mass-inverse residual after correction instead of
+      // assuming the float L solve exact. Sleeping DOFs keep Newton values.
+      float res_pre = 0.0f, res_post = 0.0f;
+      for (int i = 0; i < nv; ++i) {
+        if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
+        PrimalFloatPair tpair;
+        if (provided_qacc_smooth) {
+          tpair = {out_force[qb + i], pgs_pair_tail[i]};
+          for (int k = 0; k < nv; ++k) {
+            if (!solver_dof_awake(dims, solver_awake_tree, k)) continue;
+            float mik = solver_mass_entry(mass_world, dbg_pre, dims,
+                solver_awake_tree, world, nv, i, k);
+            float qk = qfrc[qb + k] + (paired_qfrc_input
+                ? qfrc[batch * nv + qb + k] : 0.0f);
+            tpair = primal_pair_add(tpair, primal_pair_product(
+                {mik, 0.0f}, {qk, 0.0f}));
+          }
+        } else {
+          PrimalFloatPair smooth = {qfrc[qb + i], paired_qfrc_input
+              ? qfrc[batch * nv + qb + i] : 0.0f};
+          tpair = primal_pair_add(
+              smooth, {out_force[qb + i], pgs_pair_tail[i]});
+        }
+        PrimalFloatPair rpi = tpair;
+        for (int k = 0; k < nv; ++k) {
+          if (!solver_dof_awake(dims, solver_awake_tree, k)) continue;
+          float mik = solver_mass_entry(mass_world, dbg_pre, dims,
+              solver_awake_tree, world, nv, i, k);
+          rpi = primal_pair_add(rpi, primal_pair_product(
+              {mik, 0.0f}, {-out_acc[qb + k], -out_acc[batch * nv + qb + k]}));
+        }
+        float m = abs(rpi.hi) + abs(rpi.lo);
+        res_pre = m > res_pre ? m : res_pre;
+      }
       for (int i = 0; i < nv; ++i) {
         if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
         PrimalFloatPair smooth = {qfrc[qb + i], paired_qfrc_input
@@ -9186,10 +9263,47 @@ kernel void solve_coupled_constraints(
         for (int k = i + 1; k < nv; ++k) v -= L[k * nv + i] * x[k];
         x[i] = v / L[i * nv + i];
       }
+      // Publish only on verified improvement (finite, no worse than the
+      // primal iterate in the real operator); otherwise keep primal.
       for (int i = 0; i < nv; ++i) {
         if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
-        out_acc[qb + i] = x[i];
-        out_acc[batch * nv + qb + i] = 0.0f;
+        PrimalFloatPair tpair;
+        if (provided_qacc_smooth) {
+          tpair = {out_force[qb + i], pgs_pair_tail[i]};
+          for (int k = 0; k < nv; ++k) {
+            if (!solver_dof_awake(dims, solver_awake_tree, k)) continue;
+            float mik = solver_mass_entry(mass_world, dbg_pre, dims,
+                solver_awake_tree, world, nv, i, k);
+            float qk = qfrc[qb + k] + (paired_qfrc_input
+                ? qfrc[batch * nv + qb + k] : 0.0f);
+            tpair = primal_pair_add(tpair, primal_pair_product(
+                {mik, 0.0f}, {qk, 0.0f}));
+          }
+        } else {
+          PrimalFloatPair smooth = {qfrc[qb + i], paired_qfrc_input
+              ? qfrc[batch * nv + qb + i] : 0.0f};
+          tpair = primal_pair_add(
+              smooth, {out_force[qb + i], pgs_pair_tail[i]});
+        }
+        PrimalFloatPair rpi = tpair;
+        for (int k = 0; k < nv; ++k) {
+          if (!solver_dof_awake(dims, solver_awake_tree, k)) continue;
+          float mik = solver_mass_entry(mass_world, dbg_pre, dims,
+              solver_awake_tree, world, nv, i, k);
+          rpi = primal_pair_add(rpi, primal_pair_product(
+              {mik, 0.0f}, {-x[k], 0.0f}));
+        }
+        float m = abs(rpi.hi) + abs(rpi.lo);
+        res_post = m > res_post ? m : res_post;
+      }
+      bool recon_finite = isfinite(res_pre) && isfinite(res_post);
+      bool recon_accept = recon_finite && res_post <= res_pre;
+      for (int i = 0; i < nv; ++i) {
+        if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
+        if (recon_accept) {
+          out_acc[qb + i] = x[i];
+          out_acc[batch * nv + qb + i] = 0.0f;
+        }
       }
     }
   }
