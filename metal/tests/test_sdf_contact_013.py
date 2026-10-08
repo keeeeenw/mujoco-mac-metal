@@ -396,6 +396,32 @@ def test_sdf_stage_step_gradient_preserves_source_checks_and_trial_value():
   assert "SdfWide dist = sjwide_value(accepted_dist);" in staged_step
 
 
+def test_mesh_frank_wolfe_preserves_source_order_cpu():
+  # The 4-witness razor fixture is decided by sub-ulp vertex-selection
+  # residues: seeds, gradient accumulation, and the update must all use the
+  # pinned source order with fused multiply-adds (verified against the
+  # installed-oracle per-step trace). Lane/block reorderings or separate
+  # add(mul()) updates change razor basins and break CPU agreement.
+  from pathlib import Path
+
+  shader = (Path(__file__).resolve().parents[1] / "mujoco_metal" / "shaders"
+            / "sdf_narrowphase.metal").read_text()
+  fw = shader.split("inline SdfJet sdf_mesh_frank_wolfe(", 1)[1].split(
+      "\n}\n", 1)[0]
+  assert "sdf_mesh_pair_fma_scaled(x,delta,alpha)" in fw
+  assert "sdf_mesh_pair_add_scaled(x,delta,alpha)" not in fw
+  grad = shader.split("SdfJet gradient[3] = {sj(0.0f), sj(0.0f), sj(0.0f)};",
+                      1)[1].split("return {float3(gradient[0].v", 1)[0]
+  assert "for (int i = 0; i < 8; ++i)" in grad
+  assert "gradient[0] = sjfma(dx, coeff, gradient[0]);" in grad
+  assert "lane[" not in grad
+  for tag in ("sdf_mesh_face_candidates(",
+              "sdf_mesh_face_candidates_cached("):
+      body = shader.split("inline void " + tag, 1)[1].split("\n}\n", 1)[0]
+      assert "sdf_mesh_pair_fma_scaled(t1,b,u)" in body
+      assert "sdf_mesh_pair_fma_scaled(t2,c,v)" in body
+
+
 def test_sdf_formulas_cpu():
   # Independent closed-form checks of the ported analytic SDF math
   # (mirrors the device formulas; MuJoCo-agnostic ground truth).
