@@ -807,17 +807,25 @@ static inline bool sw_exact_piece(uint m, int e, thread float* out) {
   return true;
 }
 
-// Normalize one 20-limb unsigned magnitude (see the exact rounder below).
-// Returns the carry out of the top limb; the proven window bounds make a
-// nonzero carry impossible, and callers treat it as a legacy fallback.
-static inline uint sw_limbs_normalize(thread uint* limbs) {
-  uint carry=0u;
-  for (int i=0;i<20;i++) {
-    ulong total=(ulong)limbs[i]+(ulong)carry;
-    limbs[i]=uint(total&0xffffffffUL);
-    carry=uint(total>>32);
+// Add one power of two (2^k, k in [0,31]) into a 20-limb magnitude with
+// ripple-carry propagation. Returns false on carry out of the top limb.
+// Every addition is value-exact in 64-bit arithmetic (`limb + 2^k + carry`
+// stays below 2^33), so limbs remain normalized (< 2^32) after each call
+// and no pre-normalization wrapping is possible. The top carry is
+// impossible by the window value bound in the exact rounder below (the
+// total stays below 2^T over a 640-bit window); a false return is a
+// defensive fail-closed legacy fallback that cannot trigger on valid
+// finite-word inputs.
+static inline bool sw_limbs_add_pow2(thread uint* limbs, int limb, uint k) {
+  ulong t=(ulong)limbs[limb]+(1UL<<k);
+  limbs[limb]=uint(t&0xffffffffUL);
+  ulong carry=t>>32;
+  for (int i=limb+1; carry!=0UL && i<20; i++) {
+    t=(ulong)limbs[i]+carry;
+    limbs[i]=uint(t&0xffffffffUL);
+    carry=t>>32;
   }
-  return carry;
+  return carry==0UL;
 }
 
 // Exact 53-bit rounding of an exact float32-word expansion.
@@ -837,12 +845,14 @@ static inline uint sw_limbs_normalize(thread uint* limbs) {
 // Range proof. Every finite float32 word is s*m*2^e with m < 2^24 and bit
 // span [e, e+24) inside [-149, 128]. emax <= 128, so with T = emax+8 and
 // B = T-639 the window [B, T] always covers [-149, 128]: every set bit
-// lands in-window, rel = p-B stays in [0, 639], and limb indices plus
-// 1u<< shifts are safe. Per-limb sums stay far below 2^32 (at most 24
-// words contribute, each placing at most 24 one-bits), so uint limbs with
-// a uint carry normalize exactly; the top carry is zero because the
-// summed magnitude stays below 2^(emax+5) < 2^T. Subtraction borrows stay
-// 0/1 because normalized limbs are below 2^32.
+// lands in-window and rel = p-B stays in [0, 639], so limb indices and
+// 1u<< shifts are safe. Each set bit is added value-exactly with
+// ripple-carry propagation (see above), so duplicate and overlapping
+// words can never wrap a limb: counting one-bits does not bound the
+// weighted sum, but every addition is individually exact in 64-bit
+// arithmetic. The accumulated total stays below 2^(emax+5) < 2^T, hence
+// the top carry is impossible; subtraction borrows stay 0/1 because
+// normalized limbs are below 2^32.
 static __attribute__((noinline)) bool sw_expansion_round53_exact(
     thread const float* expansion, int count, thread SdfProjection53* out) {
   uint pos_limbs[20];
@@ -885,12 +895,12 @@ static __attribute__((noinline)) bool sw_expansion_round53_exact(
       if (p<B) { sticky=1u; continue; }
       int rel=p-B;
       if (rel>=640) return false;
-      if (negative) neg_limbs[rel/32]+=1u<<uint(rel%32);
-      else pos_limbs[rel/32]+=1u<<uint(rel%32);
+      bool added=negative
+          ? sw_limbs_add_pow2(neg_limbs,rel/32,uint(rel%32))
+          : sw_limbs_add_pow2(pos_limbs,rel/32,uint(rel%32));
+      if (!added) return false;
     }
   }
-  if (sw_limbs_normalize(pos_limbs)!=0u) return false;
-  if (sw_limbs_normalize(neg_limbs)!=0u) return false;
   int sign=0;
   for (int i=19;i>=0;i--) {
     if (pos_limbs[i]!=neg_limbs[i]) {
