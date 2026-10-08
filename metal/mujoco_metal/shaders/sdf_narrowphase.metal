@@ -279,10 +279,14 @@ inline SdfVectorPair sdf_vector_scale(SdfVectorPair a, float scale) {
 inline SdfVectorPair sdf_vector_transform(float3x3 R, SdfVectorPair a) {
   SdfVectorPair r;
   for (int column = 0; column < 3; ++column) {
-    SdfWide x = sw_mul(sw(R[0][column]), sdf_vector_component(a, 0));
-    SdfWide y = sw_mul(sw(R[1][column]), sdf_vector_component(a, 1));
-    SdfWide z = sw_mul(sw(R[2][column]), sdf_vector_component(a, 2));
-    sdf_vector_store(r, column, sw_add(sw_add(x, y), z));
+    // Match mju_mulMatVec3: y-first fused dot (voted against the pinned
+    // dylib), not left-associated multiply-then-adds.
+    SdfWide v = sw_source_dot3(sw(R[0][column]), sw(R[1][column]),
+                               sw(R[2][column]),
+                               sdf_vector_component(a, 0),
+                               sdf_vector_component(a, 1),
+                               sdf_vector_component(a, 2));
+    sdf_vector_store(r, column, v);
   }
   return r;
 }
@@ -303,10 +307,14 @@ inline SdfVectorPair sdf_vector_normalize(SdfVectorPair a) {
   // Match mju_normalize3: below mjMINVAL the output is the x unit vector.
   if (sw_sign(sw_sub(norm, sw_source_minval())) < 0)
     return {float3(1.0f, 0.0f, 0.0f), float3(0.0f), float3(0.0f)};
+  // Match mju_normalize3 exactly: multiply by the reciprocal (two
+  // roundings), not a single-rounding true division. Verified against the
+  // pinned dylib (reciprocal-multiply wins every discriminating case).
+  SdfWide ninv = sw_div(sw(1.0f), norm);
   SdfVectorPair result;
   for (int i = 0; i < 3; ++i)
     sdf_vector_store(result, i,
-                     sw_div(sdf_vector_component(a, i), norm));
+                     sw_mul(sdf_vector_component(a, i), ninv));
   return result;
 }
 inline SdfPointPair sdf_pair_add(SdfPointPair p, float3 v) {
@@ -803,8 +811,26 @@ inline SdfVectorPair sdf_analytic_pair_source_grad(int type, float3 size,
   if (type == SDF_PLANE) {
     return {float3(0.0f, 0.0f, 1.0f), float3(0.0f)};
   } else if (type == SDF_SPHERE) {
-    SdfJet norm = sjlength3(x, y, z);
-    gx = sjdiv(x, norm); gy = sjdiv(y, norm); gz = sjdiv(z, norm);
+    // Mirror _primitive_gradient/mju_normalize3 exactly: y-first fused dot,
+    // sqrt, then multiply by the reciprocal (two roundings), not a
+    // single-rounding true division. Jet derivatives are unused downstream
+    // (only value words are extracted), so pure value computation here.
+    // Below mjMINVAL the output is the x unit vector, as pinned.
+    SdfWide xv = sdf_point_component(point, 0);
+    SdfWide yv = sdf_point_component(point, 1);
+    SdfWide zv = sdf_point_component(point, 2);
+    SdfWide t1 = sw_mul(yv, yv);
+    SdfWide t2 = sw_source_fma(xv, xv, t1);
+    SdfWide t3 = sw_source_fma(zv, zv, t2);
+    SdfWide n = sw_sqrt(t3);
+    if (sw_sign(sw_sub(n, sw_source_minval())) < 0) {
+      gx = sj(1.0f); gy = sj(0.0f); gz = sj(0.0f);
+    } else {
+      SdfWide ninv = sw_div(sw(1.0f), n);
+      gx = sjwide(sw_mul(xv, ninv));
+      gy = sjwide(sw_mul(yv, ninv));
+      gz = sjwide(sw_mul(zv, ninv));
+    }
   } else if (type == SDF_BOX) {
     SdfJet a[3] = {sjsub(sjabs(x), sx),
                    sjsub(sjabs(y), sy),
@@ -1075,18 +1101,20 @@ inline int collide_mesh_sdf_cached(int gi_mesh, int gi_sdf, float3 pmesh,
     records[output_base+7]=t1.x; records[output_base+8]=t1.y;
     records[output_base+9]=t1.z; records[output_base+10]=t2.x;
     records[output_base+11]=t2.y; records[output_base+12]=t2.z;
-    records[output_base+13]=world_point.lo.x;
-    records[output_base+14]=world_point.lo.y;
-    records[output_base+15]=world_point.lo.z;
-    records[output_base+16]=world_normal.lo.x;
-    records[output_base+17]=world_normal.lo.y;
-    records[output_base+18]=world_normal.lo.z;
-    records[output_base+19]=world_point.tail.x;
-    records[output_base+20]=world_point.tail.y;
-    records[output_base+21]=world_point.tail.z;
-    records[output_base+22]=world_normal.tail.x;
-    records[output_base+23]=world_normal.tail.y;
-    records[output_base+24]=world_normal.tail.z;
+    // Coherent residuals (see staged publish): exact split of
+    // (wide TRUE - stored float32 hi) per component.
+    float _nch[3] = {normal.x, normal.y, normal.z};
+    float _pth[3] = {point.x, point.y, point.z};
+    for (int _i = 0; _i < 3; ++_i) {
+      SdfWide _dn = sw_sub(sdf_vector_component(world_normal, _i),
+                           sw(_nch[_i]));
+      SdfWide _dp = sw_sub(sdf_point_component(world_point, _i),
+                           sw(_pth[_i]));
+      records[output_base + 13 + _i] = _dp.hi;
+      records[output_base + 16 + _i] = _dn.hi;
+      records[output_base + 19 + _i] = _dp.mid;
+      records[output_base + 22 + _i] = _dn.mid;
+    }
     ++ncon;
   }
   return ncon;
@@ -1125,10 +1153,13 @@ inline SdfPointPair sdf_pair_from(float3 p) {
 inline SdfPointPair sdf_pair_transform(float3x3 R, SdfPointPair p, float3 t) {
   SdfPointPair result;
   for (int column = 0; column < 3; ++column) {
-    SdfWide x = sw_mul(sw(R[0][column]), sdf_point_component(p, 0));
-    SdfWide y = sw_mul(sw(R[1][column]), sdf_point_component(p, 1));
-    SdfWide z = sw_mul(sw(R[2][column]), sdf_point_component(p, 2));
-    SdfWide value = sw_add(sw_add(sw_add(x, y), z), sw(t[column]));
+    // Match mju_mulMatVec3: y-first fused dot plus one add (voted).
+    SdfWide value = sw_source_dot3(sw(R[0][column]), sw(R[1][column]),
+                                   sw(R[2][column]),
+                                   sdf_point_component(p, 0),
+                                   sdf_point_component(p, 1),
+                                   sdf_point_component(p, 2));
+    value = sw_add(value, sw(t[column]));
     sdf_point_store(result, column, value);
   }
   return result;
@@ -1233,12 +1264,13 @@ inline SdfVectorPair sdf_vector_transform(SdfMatrixWide R,
                                          SdfVectorPair a) {
   SdfVectorPair result;
   for (int row = 0; row < 3; ++row) {
-    SdfWide value = sw_mul(sdf_matrix_get(R, 0, row),
-                           sdf_vector_component(a, 0));
-    value = sw_add(value, sw_mul(sdf_matrix_get(R, 1, row),
-                                 sdf_vector_component(a, 1)));
-    value = sw_add(value, sw_mul(sdf_matrix_get(R, 2, row),
-                                 sdf_vector_component(a, 2)));
+    // Match mju_mulMatVec3: y-first fused dot (voted).
+    SdfWide value = sw_source_dot3(sdf_matrix_get(R, 0, row),
+                                   sdf_matrix_get(R, 1, row),
+                                   sdf_matrix_get(R, 2, row),
+                                   sdf_vector_component(a, 0),
+                                   sdf_vector_component(a, 1),
+                                   sdf_vector_component(a, 2));
     sdf_vector_store(result, row, value);
   }
   return result;
@@ -1246,30 +1278,37 @@ inline SdfVectorPair sdf_vector_transform(SdfMatrixWide R,
 inline SdfPointPair sdf_pair_transform(SdfTransformWide T, SdfPointPair p) {
   SdfPointPair result;
   for (int row = 0; row < 3; ++row) {
-    SdfWide value = sw_mul(sdf_matrix_get(T.rotation, 0, row),
-                           sdf_point_component(p, 0));
-    value = sw_add(value, sw_mul(sdf_matrix_get(T.rotation, 1, row),
-                                 sdf_point_component(p, 1)));
-    value = sw_add(value, sw_mul(sdf_matrix_get(T.rotation, 2, row),
-                                 sdf_point_component(p, 2)));
+    // Match mju_mulMatVec3 plus offset add (voted y-first dot).
+    SdfWide value = sw_source_dot3(sdf_matrix_get(T.rotation, 0, row),
+                                   sdf_matrix_get(T.rotation, 1, row),
+                                   sdf_matrix_get(T.rotation, 2, row),
+                                   sdf_point_component(p, 0),
+                                   sdf_point_component(p, 1),
+                                   sdf_point_component(p, 2));
     value = sw_add(value, T.translation[row]);
     sdf_point_store(result, row, value);
   }
   return result;
 }
 inline SdfPointPair sdf_pair_step(SdfPointPair p, float3 grad, float alpha) {
+  // Mirror mju_addScl3 exactly: single-rounding fused multiply-add, not a
+  // separately rounded multiply followed by a subtract. Verified against
+  // the pinned dylib (fused wins every discriminating case).
+  SdfWide neg_alpha = sw_neg(sw(alpha));
   SdfPointPair result;
   for (int i = 0; i < 3; ++i)
-    sdf_point_store(result, i, sw_sub(sdf_point_component(p, i),
-        sw_mul(sw(grad[i]), sw(alpha))));
+    sdf_point_store(result, i, sw_source_fma(neg_alpha, sw(grad[i]),
+                                             sdf_point_component(p, i)));
   return result;
 }
 inline SdfPointPair sdf_pair_step(SdfPointPair p, SdfVectorPair grad,
                                   SdfWide alpha) {
+  // Mirror mju_addScl3 exactly: single-rounding fused multiply-add.
+  SdfWide neg_alpha = sw_neg(alpha);
   SdfPointPair result;
   for (int i = 0; i < 3; ++i)
-    sdf_point_store(result, i, sw_sub(sdf_point_component(p, i),
-        sw_mul(sdf_vector_component(grad, i), alpha)));
+    sdf_point_store(result, i, sw_source_fma(neg_alpha,
+        sdf_vector_component(grad, i), sdf_point_component(p, i)));
   return result;
 }
 inline SdfJet sdf_analytic_pair_jet_values(int type, float3 size,
@@ -1985,9 +2024,37 @@ inline void sdf_stage_publish(int swapped, float3 p2, float4 q2,
   // [16..18] world normal hi, [19..21] t1, [22..24] t2, [25..27] world
   // point lo, [28..30] world normal lo, [31..33] world point tail,
   // [34..36] world normal tail. Stride is unrelated to Metal's 31-buffer
-  // ABI limit. Swap negation mirrors the hi flip below on every residual.
-  float3 normal_lo = swapped ? -world_normal.lo : world_normal.lo;
-  float3 normal_tail = swapped ? -world_normal.tail : world_normal.tail;
+  // ABI limit.
+  //
+  // Coherent residuals: the lo/tail planes are the exact split of
+  // (wide TRUE - stored float32 hi), so every record triple sums to the
+  // wide value it was rounded from. Storing the wide triple's own low
+  // planes instead would mix grids: the 53-bit hi and the float32 hi can
+  // sit on opposite sides of a rounding boundary (up to half-ulp32
+  // incoherence), which the coherent-J correction would then faithfully
+  // reproduce as force error. Swap negation applies to hi and residuals
+  // uniformly (negation is exact).
+  float cn[3] = {contact_normal.x, contact_normal.y, contact_normal.z};
+  float pt[3] = {point.x, point.y, point.z};
+  float3 point_lo = float3(0.0f), point_tail = float3(0.0f);
+  float3 normal_lo = float3(0.0f), normal_tail = float3(0.0f);
+  for (int i = 0; i < 3; ++i) {
+    SdfWide nt = sdf_vector_component(world_normal, i);
+    if (swapped) nt = sw_neg(nt);
+    SdfWide dn = sw_sub(nt, sw(cn[i]));
+    SdfWide pt_w = sdf_point_component(world_point, i);
+    SdfWide dp = sw_sub(pt_w, sw(pt[i]));
+    if (i == 0) {
+      normal_lo.x = dn.hi; normal_tail.x = dn.mid;
+      point_lo.x = dp.hi; point_tail.x = dp.mid;
+    } else if (i == 1) {
+      normal_lo.y = dn.hi; normal_tail.y = dn.mid;
+      point_lo.y = dp.hi; point_tail.y = dp.mid;
+    } else {
+      normal_lo.z = dn.hi; normal_tail.z = dn.mid;
+      point_lo.z = dp.hi; point_tail.z = dp.mid;
+    }
+  }
   int out = record_base * 37;
   records[out + 0] = x.hi.x; records[out + 1] = x.hi.y;
   records[out + 2] = x.hi.z; records[out + 3] = x.lo.x;
@@ -2000,12 +2067,12 @@ inline void sdf_stage_publish(int swapped, float3 p2, float4 q2,
   records[out + 17] = contact_normal.y; records[out + 18] = contact_normal.z;
   records[out + 19] = t1.x; records[out + 20] = t1.y; records[out + 21] = t1.z;
   records[out + 22] = t2.x; records[out + 23] = t2.y; records[out + 24] = t2.z;
-  records[out + 25] = world_point.lo.x; records[out + 26] = world_point.lo.y;
-  records[out + 27] = world_point.lo.z; records[out + 28] = normal_lo.x;
+  records[out + 25] = point_lo.x; records[out + 26] = point_lo.y;
+  records[out + 27] = point_lo.z; records[out + 28] = normal_lo.x;
   records[out + 29] = normal_lo.y; records[out + 30] = normal_lo.z;
-  records[out + 31] = world_point.tail.x;
-  records[out + 32] = world_point.tail.y;
-  records[out + 33] = world_point.tail.z; records[out + 34] = normal_tail.x;
+  records[out + 31] = point_tail.x;
+  records[out + 32] = point_tail.y;
+  records[out + 33] = point_tail.z; records[out + 34] = normal_tail.x;
   records[out + 35] = normal_tail.y; records[out + 36] = normal_tail.z;
 }
 
@@ -2154,18 +2221,20 @@ inline int collide_sdf_cached(
     contact_records[output_base+10]=t2.x;
     contact_records[output_base+11]=t2.y;
     contact_records[output_base+12]=t2.z;
-    contact_records[output_base+13]=world_point.lo.x;
-    contact_records[output_base+14]=world_point.lo.y;
-    contact_records[output_base+15]=world_point.lo.z;
-    contact_records[output_base+16]=world_normal.lo.x;
-    contact_records[output_base+17]=world_normal.lo.y;
-    contact_records[output_base+18]=world_normal.lo.z;
-    contact_records[output_base+19]=world_point.tail.x;
-    contact_records[output_base+20]=world_point.tail.y;
-    contact_records[output_base+21]=world_point.tail.z;
-    contact_records[output_base+22]=world_normal.tail.x;
-    contact_records[output_base+23]=world_normal.tail.y;
-    contact_records[output_base+24]=world_normal.tail.z;
+    // Coherent residuals (see staged publish): exact split of
+    // (wide TRUE - stored float32 hi) per component.
+    float _cnh[3] = {normal.x, normal.y, normal.z};
+    float _pth[3] = {point.x, point.y, point.z};
+    for (int _i = 0; _i < 3; ++_i) {
+      SdfWide _dn = sw_sub(sdf_vector_component(world_normal, _i),
+                           sw(_cnh[_i]));
+      SdfWide _dp = sw_sub(sdf_point_component(world_point, _i),
+                           sw(_pth[_i]));
+      contact_records[output_base + 13 + _i] = _dp.hi;
+      contact_records[output_base + 16 + _i] = _dn.hi;
+      contact_records[output_base + 19 + _i] = _dp.mid;
+      contact_records[output_base + 22 + _i] = _dn.mid;
+    }
     ++ncon;
   }
   return ncon;
