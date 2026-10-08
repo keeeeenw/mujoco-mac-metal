@@ -1335,14 +1335,20 @@ static inline FlexDD3 common_ccd_load_wide3(device const float* values,int base)
 
 // Pinned mjc_Convex's restart frame. Keep the initial witness in source
 // precision: rounding its origin or normal before rotation changes GJK ties.
+static inline FlexDD3 common_ccd_restart_normalize(FlexDD3 value) {
+  FlexDD length=flex_dd_source_sqrt(flex_dd3_dot(value,value));
+  FlexDD reciprocal=flex_dd_source_div(flex_dd(1.0f),length);
+  return flex_dd3_scale(value,reciprocal);
+}
+
 static inline void common_ccd_restart_axes(
     FlexDD3 normal, thread FlexDD3* axes) {
-  FlexDD3 x=flex_dd3_normalize(normal);
+  FlexDD3 x=common_ccd_restart_normalize(normal);
   FlexDD3 y=(flex_dd_compare_exact(x.y,flex_dd(-0.5f))>0 &&
               flex_dd_compare_exact(x.y,flex_dd(0.5f))<0)
       ? flex_dd3(float3(0,1,0)) : flex_dd3(float3(0,0,1));
   y=flex_dd3_source_sub(y,flex_dd3_scale(x,flex_dd3_dot(x,y)));
-  axes[0]=flex_dd3_normalize(y);
+  axes[0]=common_ccd_restart_normalize(y);
   axes[1]=flex_dd3_cross(x,axes[0]);
 }
 

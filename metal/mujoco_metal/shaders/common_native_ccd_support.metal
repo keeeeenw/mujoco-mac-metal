@@ -48,33 +48,33 @@ struct CommonCCDSupportResult {
 
 static inline FlexDD3 common_ccd_matrix_vector(
     thread const FlexDD* matrix, FlexDD3 vector) {
-  // mji_mulMatVec3's lexical row/column order. Preserve the first product as
-  // the rounded accumulator and contract each following product-plus-sum.
+  // Pinned arm64 matvec contracts x into the rounded y product, then z.
+  // The compiled mju_mulMatVec3 oracle distinguishes this from starting
+  // with the x product. Tiny differences change strict support/face ties.
   return FlexDD3{
       flex_dd_source_fma(matrix[2],vector.z,
-          flex_dd_source_fma(matrix[1],vector.y,
-              flex_dd_source_mul(matrix[0],vector.x))),
+          flex_dd_source_fma(matrix[0],vector.x,
+              flex_dd_source_mul(matrix[1],vector.y))),
       flex_dd_source_fma(matrix[5],vector.z,
-          flex_dd_source_fma(matrix[4],vector.y,
-              flex_dd_source_mul(matrix[3],vector.x))),
+          flex_dd_source_fma(matrix[3],vector.x,
+              flex_dd_source_mul(matrix[4],vector.y))),
       flex_dd_source_fma(matrix[8],vector.z,
-          flex_dd_source_fma(matrix[7],vector.y,
-              flex_dd_source_mul(matrix[6],vector.x)))};
+          flex_dd_source_fma(matrix[6],vector.x,
+              flex_dd_source_mul(matrix[7],vector.y)))};
 }
 
 static inline FlexDD3 common_ccd_matrix_transpose_vector(
     thread const FlexDD* matrix, FlexDD3 vector) {
-  // mji_mulMatTVec3 source order: matrix rows are strided by three.
   return FlexDD3{
       flex_dd_source_fma(matrix[6],vector.z,
-          flex_dd_source_fma(matrix[3],vector.y,
-              flex_dd_source_mul(matrix[0],vector.x))),
+          flex_dd_source_fma(matrix[0],vector.x,
+              flex_dd_source_mul(matrix[3],vector.y))),
       flex_dd_source_fma(matrix[7],vector.z,
-          flex_dd_source_fma(matrix[4],vector.y,
-              flex_dd_source_mul(matrix[1],vector.x))),
+          flex_dd_source_fma(matrix[1],vector.x,
+              flex_dd_source_mul(matrix[4],vector.y))),
       flex_dd_source_fma(matrix[8],vector.z,
-          flex_dd_source_fma(matrix[5],vector.y,
-              flex_dd_source_mul(matrix[2],vector.x)))};
+          flex_dd_source_fma(matrix[2],vector.x,
+              flex_dd_source_mul(matrix[5],vector.y)))};
 }
 
 static inline FlexDD3 common_ccd_local_to_world(
