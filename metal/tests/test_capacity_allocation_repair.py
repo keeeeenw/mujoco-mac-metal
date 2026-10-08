@@ -374,17 +374,62 @@ def test_runtime_paired_buffers_match_estimates_gpu():
       cc0._workspace["workspace_J"].numel())
 
 
-def test_pair_const_lo_envelope_matches_inventory_cpu():
-  # The per-pair constant residuals (11 words: solref/solimp/margin-gap/
-  # solreffriction lows) are batch-independent with an 11-word sentinel;
-  # the estimate must equal the owned constant inventory exactly, and a
-  # budget below the full envelope must reject before allocation.
+def test_pair_const_lo_envelope_host_cpu():
+  # Host-only envelope proof (no device): lowering owns the per-pair
+  # constant residuals (11 words: solref/solimp/margin-gap/solreffriction
+  # lows); the estimate must count exactly max(npairs*11, 11) words with
+  # an 11-word sentinel at zero pairs, batch-independently, and a budget
+  # below the full envelope must reject before allocation.
+  import sys
+  sys.path.insert(0, "metal/tests")
+  from test_bundled_sdf_rigid_oracle_019 import _plugin_sphere_model
+  from mujoco_metal.coupled_constraints import lower_coupled_constraints
+  from mujoco_metal.capacity import (
+      CapacityLimits, check_capacity, estimate_capacity, estimate_workspace)
+  for name in ("bowl", "torus"):
+    model = _plugin_sphere_model(name)
+    desc = lower_coupled_constraints(model)
+    assert desc.pair_const_lo is not None
+    assert desc.pair_const_lo.shape == (int(desc.npairs), 11)
+    assert desc.pair_const_lo.dtype == np.float32
+    for batch in (1, 2):
+      est = estimate_capacity(
+          model, batch, desc.npairs, desc.ncontacts_max, desc.nr)
+      by_name = dict(est.memory_breakdown)
+      assert by_name["pair_const_lo"] == max(
+          int(desc.npairs) * 11, 11) * 4
+      parts, _ = estimate_workspace(
+          nv=6, npairs=int(desc.npairs), nslots=8, nr=16,
+          nr_joint=8, neq=0, batch=batch)
+      assert dict(parts)["pair_const_lo"] == by_name["pair_const_lo"]
+  # Zero-pair sentinel (floor-only model lowers with no pairs).
+  m = mujoco.MjModel.from_xml_string(
+      "<mujoco><worldbody><geom name='floor' type='plane' size='5 5 0.1'/>"
+      "</worldbody></mujoco>")
+  desc0 = lower_coupled_constraints(m)
+  assert desc0.npairs == 0
+  assert desc0.pair_const_lo.shape == (0, 11)
+  est0 = estimate_capacity(m, 1, 0, 0, 0)
+  assert dict(est0.memory_breakdown)["pair_const_lo"] == 44
+  # Budget below full envelope rejects (covers the new words).
+  full = est0.memory_bytes
+  with pytest.raises(CapacityOverflow, match="memory"):
+    check_capacity(est0, CapacityLimits(memory_budget_bytes=full - 1))
+  check_capacity(est0, CapacityLimits(memory_budget_bytes=full))
+
+
+@_needs_gpu()
+def test_pair_const_lo_runtime_inventory_matches_estimates_gpu():
+  # GPU-gated inventory proof: runtime-owned pair_const_lo allocation
+  # equals the pre-allocation estimate (11 words per pair, 11-word
+  # sentinel), batch-independently.
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
   import sys
   sys.path.insert(0, "metal/tests")
   from test_bundled_sdf_rigid_oracle_019 import _plugin_sphere_model
   from mujoco_metal.coupled_constraints import MetalCoupledConstraints
-  from mujoco_metal.capacity import (
-      CapacityLimits, check_capacity, estimate_capacity, estimate_workspace)
+  from mujoco_metal.capacity import estimate_capacity
   for name in ("bowl", "torus"):
     model = _plugin_sphere_model(name)
     for batch in (1, 2):
@@ -396,18 +441,9 @@ def test_pair_const_lo_envelope_matches_inventory_cpu():
       actual = cc._constants["pair_const_lo"].numel() * 4
       assert by_name["pair_const_lo"] == actual == max(
           int(cc.descriptor.npairs) * 11, 11) * 4
-      parts, _ = estimate_workspace(
-          nv=6, npairs=int(cc.descriptor.npairs), nslots=8, nr=16,
-          nr_joint=8, neq=0, batch=batch)
-      assert dict(parts)["pair_const_lo"] == by_name["pair_const_lo"]
-  # Zero-pair sentinel.
-  m = _model()
+  # Zero-pair sentinel runtime padding.
+  m = mujoco.MjModel.from_xml_string(
+      "<mujoco><worldbody><geom name='floor' type='plane' size='5 5 0.1'/>"
+      "</worldbody></mujoco>")
   cc0 = MetalCoupledConstraints(m, batch_size=1)
   assert cc0._constants["pair_const_lo"].numel() == 11
-  est0 = estimate_capacity(m, 1, 0, 0, 0)
-  assert dict(est0.memory_breakdown)["pair_const_lo"] == 44
-  # Budget below full envelope rejects (covers the new words).
-  full = est0.memory_bytes
-  with pytest.raises(CapacityOverflow, match="memory"):
-    check_capacity(est0, CapacityLimits(memory_budget_bytes=full - 1))
-  check_capacity(est0, CapacityLimits(memory_budget_bytes=full))
