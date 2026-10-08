@@ -698,23 +698,29 @@ def _validate_lowered(counts, values):
     raise ValueError("invalid or nonfinite qpos0")
 
 
-# Smallest magnitude admitted to triple-float32 upload. Successive
-# Sterbenz remainders of a normal binary64 value need roughly 54 bits below
-# the leading exponent; float32 subnormal granularity ends at 2**-149, so
-# magnitudes below 2**-90 cannot keep an exact hi+lo+tail split. Zeros are
-# exact and always admitted.
-_TRIPLE_WORD_MIN_MAGNITUDE = 2.0 ** -90
-
-
+# Triple-float32 upload keeps, for each binary64 source value v, the direct
+# binary64-to-float32 rounding hi plus two float32 residuals lo and tail
+# with hi + lo + tail == v as exact reals. Whether such an exact split
+# exists is a per-value property, not a magnitude cutoff: 2**-100 is
+# exactly its float32 head with zero residuals, while 1e-100 needs more
+# than three words. The check below proves exactness per value instead of
+# rejecting everything below a conservative exponent.
 def require_triple_word_domain(values, *, what):
   """Enforce the exact-split admission contract for triple-word upload.
 
   Accepted values satisfy, as exact reals, ``hi + lo + tail == source``
   with ``hi`` the direct binary64-to-float32 rounding: every value must be
-  finite, within float32 range, and either zero or of magnitude at least
-  2**-90. Anything else (non-finite, overflowing, or subnormal-magnitude)
-  raises instead of truncating silently, because downstream razor
-  vertex-selection ties require bitwise field reconstruction.
+  finite, within float32 head range, and exactly reconstructible from its
+  canonical three-word split. Anything else raises instead of truncating
+  silently, because downstream razor vertex-selection ties require
+  bitwise field reconstruction.
+
+  Each remainder is exact in binary64 by Sterbenz: every subtrahend is
+  either zero or the correctly-rounded float32 of its minuend, hence
+  within a factor of two of it. A zero final remainder therefore proves
+  the split exact with no false admits or rejects. Zero signs are carried
+  by the high word. Representability here is separate from the device
+  arithmetic/output domain, which has its own documented limits.
   """
   arr = np.asarray(values, dtype=np.float64).reshape(-1)
   if arr.size == 0:
@@ -728,11 +734,15 @@ def require_triple_word_domain(values, *, what):
     raise ValueError(
         f"{what} exceeds float32 range for triple-word upload; "
         "overflowing entries cannot be represented")
-  tiny = (magnitude != 0.0) & (magnitude < _TRIPLE_WORD_MIN_MAGNITUDE)
-  if np.any(tiny):
+  high = arr.astype(np.float32).astype(np.float64)
+  first = arr - high
+  low = first.astype(np.float32).astype(np.float64)
+  second = first - low
+  tail = second.astype(np.float32).astype(np.float64)
+  if not np.all(second - tail == 0.0):
     raise ValueError(
-        f"{what} has nonzero entries below 2**-90 for triple-word upload; "
-        "subnormal-magnitude entries cannot keep an exact hi+lo+tail split")
+        f"{what} cannot keep an exact hi+lo+tail split for triple-word "
+        "upload; unrepresentable entries cannot be uploaded exactly")
   return arr
 
 

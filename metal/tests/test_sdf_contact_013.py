@@ -343,23 +343,55 @@ def test_triple_word_domain_contract_cpu():
 
   Triple-float32 words cannot preserve every finite binary64 value, so the
   packing paths validate the domain instead of truncating silently:
-  non-finite, float32-overflowing, and subnormal-magnitude entries are
-  rejected with explicit errors; zeros and in-range normals are admitted.
+  non-finite, float32-overflowing, and inexactly-splittable entries are
+  rejected with explicit errors. Exactly representable values are admitted
+  per value, including small powers such as 2**-100 and -2**-120 whose
+  float32 head is exact with zero residuals. Every accepted triple is
+  verified against an independent exact-rational reconstruction.
   """
+  from fractions import Fraction
+
   from mujoco_metal.model import require_triple_word_domain
-  out = require_triple_word_domain([0.0, 1.0, -0.02, 3.4e38, 2.0 ** -90],
-                                   what="probe")
-  assert out.shape == (5,)
+
+  def _reconstruct(values):
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    high = arr.astype(np.float32)
+    low = (arr - high.astype(np.float64)).astype(np.float32)
+    tail = (arr - high.astype(np.float64)
+            - low.astype(np.float64)).astype(np.float32)
+    for v, h, l, t in zip(arr.tolist(), high.tolist(), low.tolist(),
+                           tail.tolist()):
+      assert (Fraction(h) + Fraction(l) + Fraction(t)
+              == Fraction(v)), (v, h, l, t)
+    return high, low, tail
+
+  out = require_triple_word_domain(
+      [0.0, -0.0, 1.0, -0.02, 3.4e38, 2.0 ** -90, 2.0 ** -100,
+       -2.0 ** -120, 2.0 ** -126, 1.0 + 2.0 ** -30],
+      what="probe")
+  assert out.shape == (10,)
+  _reconstruct(out)
+  # Boundary/nextafter cases around the float32 subnormal edge: exact
+  # powers admit, values with residual bits below float32 granularity fail.
+  require_triple_word_domain([2.0 ** -149, -2.0 ** -149], what="probe")
+  _reconstruct([2.0 ** -149, -2.0 ** -149])
   require_triple_word_domain([], what="probe")
   for bad, match in (([float("nan")], "finite"),
                      ([float("inf")], "finite"),
                      ([1e300], "exceeds float32 range"),
                      ([-4e38], "exceeds float32 range"),
-                     ([1e-100], "below 2\\*\\*-90"),
-                     ([-2.0 ** -120], "below 2\\*\\*-90"),
+                     ([1e-100], "exact hi\\+lo\\+tail split"),
+                     ([float.fromhex("0x1.fffffffffffffp-110")],
+                      "exact hi\\+lo\\+tail split"),
+                     ([float.fromhex("0x1.0000000000001p-100")],
+                      "exact hi\\+lo\\+tail split"),
                      ([0.0, 1.0, float("nan")], "finite")):
     with pytest.raises(ValueError, match=match):
       require_triple_word_domain(bad, what="probe")
+  # Signed zero is admitted with its sign carried by the high word.
+  zeros = require_triple_word_domain([-0.0, 0.0], what="probe")
+  high = zeros.astype(np.float32)
+  assert np.signbit(high[0]) and not np.signbit(high[1])
 
 
 def test_triple_word_domain_enforced_at_packing_sites_cpu():
@@ -376,7 +408,72 @@ def test_triple_word_domain_enforced_at_packing_sites_cpu():
   plugins = (root / "bundled_plugins.py").read_text()
   assert "require_triple_word_domain(" in plugins
   model_src = (root / "model.py").read_text()
-  assert "_TRIPLE_WORD_MIN_MAGNITUDE = 2.0 ** -90" in model_src
+  assert "second - tail == 0.0" in model_src
+  assert "_TRIPLE_WORD_MIN_MAGNITUDE" not in model_src
+
+
+def test_triple_word_packing_paths_execute_success_and_rejection_cpu():
+  """Execute real packing paths: exact values upload, others fail closed.
+
+  A compiled hinge-body model with body position (2**-100, 0, 0) passes
+  load_model but previously failed _prepare_host_arrays at body_pos under
+  the magnitude heuristic; the per-value contract admits it with exact
+  reconstruction. Genuinely unrepresentable entries still raise, and the
+  failing call returns nothing (no partial public state is published).
+  """
+  import mujoco as _mujoco
+
+  from mujoco_metal.metal_kinematics import _prepare_host_arrays
+  from mujoco_metal.model import load_model
+
+  tiny_xml = ('<mujoco><worldbody><body name="b" pos="1e-30 0 0">'
+              '<joint name="h" type="hinge" axis="0 0 1"/>'
+              '<geom name="g" type="sphere" size="0.05"/>'
+              '</body></worldbody></mujoco>')
+  tiny_model = load_model(tiny_xml)
+  tiny_host = _prepare_host_arrays(tiny_model)
+  body = tiny_host["body_pos"][3:6]
+  assert body.dtype == np.float32
+  from fractions import Fraction as _Fraction
+  low = tiny_host["body_pos_low"][3:6]
+  tail = tiny_host["body_pos_tail"][3:6]
+  for v, h, l, t in zip((1e-30, 0.0, 0.0), body.tolist(), low.tolist(),
+                         tail.tolist()):
+    assert (_Fraction(h) + _Fraction(l) + _Fraction(t)
+            == _Fraction(v)), (v, h, l, t)
+  small_xml = ('<mujoco><worldbody><body name="b" pos="1e-30 0 0">'
+               '<joint name="h" type="hinge" axis="0 0 1"/>'
+               '<geom name="g" type="sphere" size="0.05"/>'
+               '</body></worldbody></mujoco>').replace("1e-30", str(2.0 ** -100))
+  small_model = load_model(small_xml)
+  small_host = _prepare_host_arrays(small_model)
+  assert float(small_host["body_pos"][3]) == 2.0 ** -100
+  assert float(small_host["body_pos_low"][3]) == 0.0
+  assert float(small_host["body_pos_tail"][3]) == 0.0
+  bad_xml = ('<mujoco><worldbody><body name="b" pos="1e-100 0 0">'
+             '<joint name="h" type="hinge" axis="0 0 1"/>'
+             '<geom name="g" type="sphere" size="0.05"/>'
+             '</body></worldbody></mujoco>')
+  bad_model = load_model(bad_xml)
+  with pytest.raises(ValueError, match="exact hi\\+lo\\+tail split"):
+    _prepare_host_arrays(bad_model)
+  # Attribute packing: exact small values pass, inexact values fail closed.
+  from mujoco_metal.bundled_plugins import (
+      _sdf_attribute_pair,
+      BundledPluginError,
+  )
+  config = {"radius": str(2.0 ** -100), "height": "0.32",
+            "thickness": "0.05"}
+  high, low_words, tail_words = _sdf_attribute_pair("mujoco.sdf.bowl",
+                                                    config)
+  assert float(high[1]) == 2.0 ** -100
+  assert float(low_words[1]) == 0.0 and float(tail_words[1]) == 0.0
+  with pytest.raises(BundledPluginError,
+                     match="exact hi\\+lo\\+tail split"):
+    _sdf_attribute_pair("mujoco.sdf.bowl",
+                        {"radius": "1e-100", "height": "0.32",
+                         "thickness": "0.05"})
+  assert _mujoco.__version__ == "3.10.0"
 
 
 def test_pinned_step_gradient_accepts_improvement_and_exits_on_increase_cpu():
