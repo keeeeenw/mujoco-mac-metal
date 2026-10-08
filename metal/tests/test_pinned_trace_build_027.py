@@ -100,6 +100,43 @@ def test_trace_lib_reports_pinned_version():
 
 
 @_needs_trace_build()
+def test_trace_provenance_files_and_hashes():
+  # Provenance: pristine vs modified source identity (sha256 reported,
+  # differing exactly by the guarded instrumentation), built library and
+  # plugin presence, and the pinned Release build flags on record. Hash
+  # values are reported, not hard-asserted, so a deliberate rebuild does
+  # not break the contract; the version + equivalence tests above carry
+  # the identity.
+  import hashlib
+  trace_lib = os.path.join(
+      _ROOT, ".upstream", "mujoco-trace", "build-fixed", "lib",
+      "libmujoco.dylib")
+  trace_plugin = os.path.join(
+      _ROOT, ".upstream", "mujoco-trace", "build-fixed", "lib",
+      "libsdf_plugin.dylib")
+  assert os.path.exists(trace_lib), trace_lib
+  assert os.path.exists(trace_plugin), trace_plugin
+  with open(_PRISTINE_SRC, "rb") as f:
+    pristine_hash = hashlib.sha256(f.read()).hexdigest()
+  with open(_TRACE_SRC, "rb") as f:
+    trace_hash = hashlib.sha256(f.read()).hexdigest()
+  assert pristine_hash != trace_hash
+  with open(trace_lib, "rb") as f:
+    lib_hash = hashlib.sha256(f.read()).hexdigest()
+  with open(trace_plugin, "rb") as f:
+    plugin_hash = hashlib.sha256(f.read()).hexdigest()
+  cache = os.path.join(
+      _ROOT, ".upstream", "mujoco-trace", "build-fixed", "CMakeCache.txt")
+  assert os.path.exists(cache)
+  flags = open(cache).read()
+  assert "CMAKE_BUILD_TYPE:STRING=Release" in flags
+  assert "CMAKE_C_COMPILER:STRING=/usr/bin/cc" in flags
+  assert "CMAKE_CXX_COMPILER:STRING=/usr/bin/c++" in flags
+  print(f"PROVENANCE pristine={pristine_hash} trace={trace_hash} "
+        f"lib={lib_hash} plugin={plugin_hash}", flush=True)
+
+
+@_needs_trace_build()
 def test_trace_source_diff_is_guarded_output_only():
   with open(_TRACE_SRC) as f:
     trace = f.read()
