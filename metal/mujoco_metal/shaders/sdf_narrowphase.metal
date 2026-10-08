@@ -1195,64 +1195,35 @@ inline SdfMatrixWide sdf_matrix_multiply(SdfMatrixWide A, SdfMatrixWide B) {
 }
 inline SdfMatrixWide sdf_quat_matrix_wide_qw(SdfWide qw, SdfWide qx,
                                             SdfWide qy, SdfWide qz) {
-  // Pinned mju_quat2Mat (null-quat fast path + q00 left-assoc plain ops).
-  // The cross-product form differs by rounding; use the source formula.
-  // Identity test on represented values (matches CPU float64 equality when
-  // triples are exact; near-identity takes the regular path both sides).
-  bool is_identity = (qw.hi == 1.0f && qw.mid == 0.0f && qw.lo == 0.0f &&
-                      qx.hi == 0.0f && qx.mid == 0.0f && qx.lo == 0.0f &&
-                      qy.hi == 0.0f && qy.mid == 0.0f && qy.lo == 0.0f &&
-                      qz.hi == 0.0f && qz.mid == 0.0f && qz.lo == 0.0f);
-  if (is_identity) {
-    SdfMatrixWide out;
-    sdf_matrix_set(out, 0, 0, sw(1.0f));
-    sdf_matrix_set(out, 1, 0, sw(0.0f));
-    sdf_matrix_set(out, 2, 0, sw(0.0f));
-    sdf_matrix_set(out, 0, 1, sw(0.0f));
-    sdf_matrix_set(out, 1, 1, sw(1.0f));
-    sdf_matrix_set(out, 2, 1, sw(0.0f));
-    sdf_matrix_set(out, 0, 2, sw(0.0f));
-    sdf_matrix_set(out, 1, 2, sw(0.0f));
-    sdf_matrix_set(out, 2, 2, sw(1.0f));
-    return out;
+  // Cross-product form with wide quaternion words (sub-ulp32 FK residuals
+  // survive). Verified against all 013 orientations (including general
+  // rotations); the q00/transpose variants flip general rotations in this
+  // column-major layout while masking near-identity inputs.
+  SdfWide u[3] = {qx, qy, qz};
+  SdfWide w = qw;
+  SdfMatrixWide result;
+  for (int column = 0; column < 3; ++column) {
+    SdfWide v[3] = {sw(column == 0 ? 1.0f : 0.0f),
+                    sw(column == 1 ? 1.0f : 0.0f),
+                    sw(column == 2 ? 1.0f : 0.0f)};
+    SdfWide inner[3];
+    inner[0] = sw_add(sw_sub(sw_mul(u[1], v[2]), sw_mul(u[2], v[1])),
+                      sw_mul(w, v[0]));
+    inner[1] = sw_add(sw_sub(sw_mul(u[2], v[0]), sw_mul(u[0], v[2])),
+                      sw_mul(w, v[1]));
+    inner[2] = sw_add(sw_sub(sw_mul(u[0], v[1]), sw_mul(u[1], v[0])),
+                      sw_mul(w, v[2]));
+    SdfWide rotated[3];
+    rotated[0] = sw_add(v[0], sw_mul(sw(2.0f),
+        sw_sub(sw_mul(u[1], inner[2]), sw_mul(u[2], inner[1]))));
+    rotated[1] = sw_add(v[1], sw_mul(sw(2.0f),
+        sw_sub(sw_mul(u[2], inner[0]), sw_mul(u[0], inner[2]))));
+    rotated[2] = sw_add(v[2], sw_mul(sw(2.0f),
+        sw_sub(sw_mul(u[0], inner[1]), sw_mul(u[1], inner[0]))));
+    for (int row = 0; row < 3; ++row)
+      sdf_matrix_set(result, column, row, rotated[row]);
   }
-  SdfWide q00 = sw_mul(qw, qw);
-  SdfWide q01 = sw_mul(qw, qx);
-  SdfWide q02 = sw_mul(qw, qy);
-  SdfWide q03 = sw_mul(qw, qz);
-  SdfWide q11 = sw_mul(qx, qx);
-  SdfWide q12 = sw_mul(qx, qy);
-  SdfWide q13 = sw_mul(qx, qz);
-  SdfWide q22 = sw_mul(qy, qy);
-  SdfWide q23 = sw_mul(qy, qz);
-  SdfWide q33 = sw_mul(qz, qz);
-  SdfMatrixWide out;
-  // Left-assoc plain adds/subs (no FMA): ((a+b)-c)-d etc., matching source.
-  SdfWide r00 = sw_sub(sw_sub(sw_add(q00, q11), q22), q33);
-  SdfWide r44 = sw_sub(sw_add(sw_sub(q00, q11), q22), q33);
-  SdfWide r88 = sw_add(sw_sub(sw_sub(q00, q11), q22), q33);
-  sdf_matrix_set(out, 0, 0, r00);
-  sdf_matrix_set(out, 1, 1, r44);
-  sdf_matrix_set(out, 2, 2, r88);
-  SdfWide r01 = sw_mul(sw(2.0f), sw_sub(q12, q03));
-  SdfWide r02 = sw_mul(sw(2.0f), sw_add(q13, q02));
-  SdfWide r10 = sw_mul(sw(2.0f), sw_add(q12, q03));
-  SdfWide r12 = sw_mul(sw(2.0f), sw_sub(q23, q01));
-  SdfWide r20 = sw_mul(sw(2.0f), sw_sub(q13, q02));
-  SdfWide r21 = sw_mul(sw(2.0f), sw_add(q23, q01));
-  // Note: sdf_matrix_set(out, column, row, value) with column-major layout;
-  // mju res[9] is row-major res[3*i+j]. Mapping: res[0]=M(0,0), res[1]=M(0,1),
-  // res[2]=M(0,2), res[3]=M(1,0), etc. Our set(c,r) stores values[3*c+r].
-  // For linear-map equality, native get(c,r) must equal mju res[r*3+c]?
-  // Preserve the existing layout convention (verified self-consistent and
-  // matching replay when compared as transpose); only the formula changes.
-  sdf_matrix_set(out, 1, 0, r01);
-  sdf_matrix_set(out, 2, 0, r02);
-  sdf_matrix_set(out, 0, 1, r10);
-  sdf_matrix_set(out, 2, 1, r12);
-  sdf_matrix_set(out, 0, 2, r20);
-  sdf_matrix_set(out, 1, 2, r21);
-  return out;
+  return result;
 }
 // Pinned quaternion helpers (mji_/mju_ spatial ops) in wide arithmetic.
 // Used for mapPose-equivalent T construction; fusion choices match voted

@@ -42,8 +42,9 @@ def test_sdf_and_generic_dispatch_graphs_are_separate():
   assert "collide_pair_without_sdf(" in generic_producer
   assert "collide_pair_sdf(" not in generic_producer
   # Analytic SDF pairs now run through per-seed kernels and a serial,
-  # source-order finalizer instead of a one-shot pair producer.
-  assert "sdf_stage_seed_init(" in sdf_seed_init
+  # source-order finalizer instead of a one-shot pair producer. Seeds use
+  # wide FK triples (mapPose) for sub-ulp32 residuals.
+  assert "sdf_stage_seed_init_wide(" in sdf_seed_init
   assert "sdf_stage_prepare_step(" in sdf_descent
   assert "sdf_stage_line_search(" in sdf_line_search
   assert "sdf_vector_normalize(grad)" in sdf_publish_normal
