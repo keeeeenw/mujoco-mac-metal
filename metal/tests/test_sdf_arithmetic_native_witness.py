@@ -273,6 +273,13 @@ def _cases():
       (2.0 - 2.0 ** -23, 1.0, 2.0 ** -23),
       (2.0 - 2.0 ** -23, 1.0, 2.0 ** -23 - 2.0 ** -53),
       (2.0 - 2.0 ** -23, 1.0, 2.0 ** -23 + 2.0 ** -52),
+      # Box-gate mat2Quat operands (Shepperd branch roots and quotient
+      # pairs): division must round the near-dyadic quotients and sqrt the
+      # exact powers exactly as the pinned binary does.
+      (1.0, 1.0, 0.0),
+      (4.0, 1.0, 0.0),
+      (float.fromhex("0x1.000000000000cp-2"), 0.5, 0.0),
+      (float.fromhex("-0x1.000000000000cp-2"), 0.5, 0.0),
   ]
 
 
