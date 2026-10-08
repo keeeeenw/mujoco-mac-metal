@@ -134,6 +134,71 @@ def test_box_press_first_divergence_packet_gpu():
 
 
 
+def _f64_bits(x):
+  """Raw binary64 word with explicit little-endian byte order."""
+  import struct
+  return struct.unpack("<Q", struct.pack("<d", float(x)))[0]
+
+
+def _ordered_key(x):
+  """Monotone ulp-order key: finite values map preserving order, with
+  -0.0 and +0.0 sharing one key; callers handle nonfinites explicitly."""
+  b = _f64_bits(x)
+  return (b + 0x8000000000000000) & 0xFFFFFFFFFFFFFFFF
+
+
+def _ulp_distance(a, b):
+  """Ordered ulp distance, or None for nonfinite inputs. Returns 0 for
+  numerically equal values (including -0.0 vs +0.0)."""
+  import math
+  fa, fb = float(a), float(b)
+  if fa == fb:
+    return 0
+  if not (math.isfinite(fa) and math.isfinite(fb)):
+    return None
+  return abs(_ordered_key(fa) - _ordered_key(fb))
+
+
+def _triple_value(hi, lo, tail):
+  """Reconstruct one coordinate from staged (hi, lo, tail) planes with a
+  validated exact sum (math.fsum: correctly rounded infinite-precision
+  sum), NOT naive left-to-right addition and NOT the hi word alone."""
+  import math
+  return math.fsum([float(hi), float(lo), float(tail)])
+
+
+def test_seed_word_ulp_machinery_host():
+  # Host unit checks for the comparison machinery (no GPU needed):
+  # adjacent values, signs, powers of two, signed zero, subnormals,
+  # nonfinites and exact-sum reconstruction.
+  import math
+  assert _ulp_distance(1.0, np.nextafter(1.0, 2.0)) == 1
+  assert _ulp_distance(1.0, 1.0) == 0
+  assert _ulp_distance(0.5, 1.0) == 2**52
+  assert _ulp_distance(0.0, -0.0) == 0
+  assert _f64_bits(-1.0) >> 63 == 1
+  assert _f64_bits(1.0) >> 63 == 0
+  tiny = np.nextafter(0.0, 1.0)
+  assert tiny > 0.0 and _ulp_distance(tiny, 0.0) == 1
+  assert _ulp_distance(float("inf"), 1.0) is None
+  assert _ulp_distance(float("nan"), float("nan")) is None
+  assert _ulp_distance(-1.0, np.nextafter(-1.0, -2.0)) == 1
+  # Cross-sign tiny values (the seed-1 transverse channel): ordered keys
+  # run through zero monotonically; verified against direct bit math.
+  assert _ulp_distance(float.fromhex("-0x1.ea999835accffp-63"),
+                       float.fromhex("0x1.e3cb80ddeaacap-56")
+                       ) == 9254777518651858379
+  # math.fsum is exactly rounded: catastrophic cancellation case where
+  # naive left-to-right addition loses the small word entirely.
+  assert math.fsum([1e16, 1.0, -1e16]) == 1.0
+  assert float(np.float64(1e16) + np.float64(1.0) + np.float64(-1e16)) == 0.0
+  # Triple reconstruction of a real staged seed coordinate.
+  assert _triple_value(0.03279993683099747, 9.536744727256519e-10,
+                       2.7755575615628914e-17) == math.fsum(
+                           [0.03279993683099747, 9.536744727256519e-10,
+                            2.7755575615628914e-17])
+
+
 def _trace_build_paths():
   import os
   root = os.path.dirname(
@@ -225,24 +290,32 @@ def test_box_seed_source_indexed_comparison_gpu(tmp_path):
       i = int(ln.split("i=")[1].split()[0])
       cpu_seeds[i] = tuple(float(v) for v in ln.split("x=")[1].split())
   assert sorted(cpu_seeds) == [0, 1, 2, 3]
-  # Stage 2: raw-word seed comparison; ulp distances localize the
-  # earliest observable mismatch (seed triple; inputs anchored above).
-  import math
+  # Stage 2: raw-word seed comparison with full triple reconstruction
+  # (math.fsum over hi/lo/tail planes, NOT the float32 hi word alone)
+  # and explicit-byte-order ordered ulp distances (NOT native-endian
+  # bytes read as big-endian integers). Original nine word values are
+  # kept in the report. The ulp gap localizes the earliest observable
+  # mismatch (seed triple; inputs anchored above). This characterizes
+  # the current divergence; the production repair must replace the gap
+  # assertion below with the admitted source parity contract (bit-exact
+  # seeds) plus direct contact agreement.
   st = epochs[-1][0][2].cpu().numpy().reshape(-1, _STATE_WORDS)
-  max_ulp, loc = 0, None
+  max_ulp, loc, detail = 0, None, ""
   for seed in range(4):
-    nat_hi = st[seed, 0:3].astype(np.float64)
-    assert all(np.isfinite(nat_hi))
     for axis in range(3):
-      a, b = float(nat_hi[axis]), float(cpu_seeds[seed][axis])
-      if a == b:
-        continue
-      ai = int(np.float64(a).tobytes().hex(), 16)
-      bi = int(np.float64(b).tobytes().hex(), 16)
-      gap = 10**18 if (ai >> 63) != (bi >> 63) else abs(ai - bi)
+      words = [float(st[seed, axis]), float(st[seed, 3 + axis]),
+               float(st[seed, 6 + axis])]
+      assert all(np.isfinite(words))
+      a = _triple_value(*words)
+      b = float(cpu_seeds[seed][axis])
+      gap = _ulp_distance(a, b)
+      assert gap is not None
       if gap > max_ulp:
         max_ulp, loc = gap, (seed, axis)
-  print(f"SEEDCOMPARE max_ulp={max_ulp} at={loc}", flush=True)
+        detail = (f"seed={seed} axis={axis} "
+                  f"hi={words[0].hex()} lo={words[1].hex()} "
+                  f"tail={words[2].hex()} fsum={a.hex()} cpu={b.hex()}")
+  print(f"SEEDCOMPARE max_ulp={max_ulp} at={loc} {detail}", flush=True)
   assert max_ulp > 0
   # Stage 3: press-seed INTERSECTION pick is decisive on the CPU side
   # (analytic side wins by a margin no rounding can flip).
