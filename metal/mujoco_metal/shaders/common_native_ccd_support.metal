@@ -562,7 +562,9 @@ static inline FlexDD common_ccd_signed_face(
   if (flex_dd_compare_exact(n2,flex_dd(1.0e-30f))>0 &&
       flex_dd_compare_exact(n2,flex_dd(1.0e30f))<0) {
     FlexDD n=flex_dd_sqrt(n2);
-    normal=flex_dd3_div(normal,n);
+    // Pinned signedDistance rounds the reciprocal once, then multiplies
+    // all three components; separate divisions choose different facets.
+    normal=flex_dd3_scale(normal,flex_dd_source_div(flex_dd(1.0f),n));
     return common_ccd_dot3(normal,a.minkowski);
   }
   return flex_dd(3.402823466e+38f);
@@ -731,8 +733,11 @@ static inline CommonCCDGjkResult common_ccd_source_gjk(
       break;
     }
     x_norm=flex_dd_sqrt(norm2);
-    FlexDD3 direction=flex_dd3_div(x,x_norm);
-    direction=flex_dd3_neg(direction);
+    // gjkSupport first rounds 1/x_norm, then scales x and negates it.
+    // Component-wise division is mathematically equivalent but not the
+    // source operation sequence at symmetric support/face ties.
+    FlexDD inverse_norm=flex_dd_source_div(flex_dd(1.0f),x_norm);
+    FlexDD3 direction=flex_dd3_neg(flex_dd3_scale(x,inverse_norm));
     int support_status=common_ccd_support_pair(
         a,b,direction,mesh_vertices,mesh_graph,simplex[count]);
     if (support_status) { out.status=2; out.iterations=k; return out; }
