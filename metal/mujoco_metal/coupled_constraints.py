@@ -843,6 +843,9 @@ class CoupledConstraintDescriptor:
   # leave this unset; sparse models compile and retain the pinned row layout.
   jacobian_kind: str = "dense"
   jacobian_pattern: object = None
+  # Double-precision constant residuals for paired aref, per pair
+  # [solref_lo(2), solimp_lo(5), margin_lo(2)]: lo = f64 TRUE - f32 hi.
+  pair_const_lo: np.ndarray = None
 
 
 def _mix_contact_parameters(model, g1, g2):
@@ -1346,6 +1349,19 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     g2 = np.array([p[1] for p in pairs], dtype=np.int32)
     sr = np.array([p[2] for p in pairs], dtype=np.float32).reshape(-1, 2)
     si = np.array([p[3] for p in pairs], dtype=np.float32).reshape(-1, 5)
+    # Double-precision constant residuals for paired aref: lo = f64 - f32,
+    # layout per pair [solref_lo(2), solimp_lo(5), margin_lo(2)].
+    def _clo64(values, n):
+      f64 = np.asarray(values, dtype=np.float64).reshape(-1)
+      f32 = f64.astype(np.float32).astype(np.float64)
+      return (f64 - f32).astype(np.float32)
+    sr_lo = np.array([_clo64(p[2], 2) for p in pairs],
+                     dtype=np.float32).reshape(-1, 2)
+    si_lo = np.array([_clo64(p[3], 5) for p in pairs],
+                     dtype=np.float32).reshape(-1, 5)
+    mar_lo = np.array([[_clo64(p[7], 1)[0], _clo64(p[8], 1)[0]]
+                       for p in pairs], dtype=np.float32)
+    pair_const_lo = np.concatenate([sr_lo, si_lo, mar_lo], axis=1)
     cd = np.array([p[4] for p in pairs], dtype=np.int32)
     fr = np.array([p[5] for p in pairs], dtype=np.float32).reshape(-1, 5)
     srfr = np.array([p[6] for p in pairs], dtype=np.float32).reshape(-1, 2)
@@ -1363,6 +1379,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     g1 = g2 = np.empty(0, dtype=np.int32)
     sr = np.empty((0, 2), dtype=np.float32)
     si = np.empty((0, 5), dtype=np.float32)
+    pair_const_lo = np.empty((0, 9), dtype=np.float32)
     cd = np.empty(0, dtype=np.int32)
     fr = np.empty((0, 5), dtype=np.float32)
     srfr = np.empty((0, 2), dtype=np.float32)
@@ -1876,6 +1893,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
       gap=_frozen(gap, np.float32),
       solref=_frozen(sr, np.float32),
       solimp=_frozen(si, np.float32),
+      pair_const_lo=_frozen(pair_const_lo, np.float32),
       condim=_frozen(cd, np.int32),
       friction=_frozen(fr, np.float32),
       solreffriction=_frozen(srfr, np.float32),
@@ -2432,6 +2450,10 @@ class MetalCoupledConstraints:
         "pair_margin_gap": self._tensor(pair_margin_gap),
         "pair_solref": self._tensor(d.solref.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
         "pair_solimp": self._tensor(d.solimp.reshape(-1) if d.npairs else np.zeros(5, dtype=np.float32)),
+        "pair_const_lo": self._tensor(
+            np.asarray(getattr(d, "pair_const_lo", None)).reshape(-1)
+            if (d.npairs and getattr(d, "pair_const_lo", None) is not None)
+            else np.zeros(9, dtype=np.float32)),
         "pair_condim": self._tensor(d.condim if d.npairs else np.zeros(1, dtype=np.int32)),
         "pair_friction": self._tensor(d.friction.reshape(-1) if d.npairs else np.zeros(5, dtype=np.float32)),
         "pair_solreffriction": self._tensor(d.solreffriction.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
@@ -3210,7 +3232,7 @@ class MetalCoupledConstraints:
         self._library.clear_contact_candidate_workspace(
             w["contact_row_data"], w["contact_frame"],
             self._constants["pair_contact_offsets_dims"],
-            threads=(b * max(nc, 1) * 36,), group_size=(128,))
+            threads=(b * max(nc, 1) * 42,), group_size=(128,))
         if self._jacobian_layout.mode == 0:
           contact_width = int(nc) * 6 * int(d.nv)
           if contact_width:
@@ -3430,11 +3452,16 @@ class MetalCoupledConstraints:
           w["contact_pair_count"], w["contact_pair_records"],
           threads=(b * d.npairs,), group_size=(1,),
       )
-      if self._has_analytic_sdf_pairs:
-        # Low-word Jacobian corrections only where SDF residual planes
-        # exist. Models without SDF pairs skip this dispatch entirely, so
-        # their behavior cannot change. Triple FK poses are required;
-        # a missing plane fails closed instead of silently degrading.
+      if (self._has_analytic_sdf_pairs
+          and self._component_mass_storage == "dense"
+          and bool(getattr(self.descriptor, "dense_path", True))):
+        # Low-word Jacobian/aref corrections only on the coherent dense
+        # route (paired records, dense mass solve). Models without SDF
+        # pairs skip this dispatch entirely, so their behavior cannot
+        # change. Component/block routes keep exact-zero low planes and a
+        # consistently high-only operator (see capacity notes). Triple FK
+        # poses are required; a missing plane fails closed instead of
+        # silently degrading.
         for pose_name in ("body_pos_low", "body_pos_tail",
                           "body_quat_low", "body_quat_tail"):
           pose_value = poses.get(pose_name)
@@ -3466,9 +3493,14 @@ class MetalCoupledConstraints:
             w["contact_pair_count"],
             pair_maps.logical_to_packed.reshape(-1),
             w["contact_row_data"],
+            qvel.reshape(-1),
+            self._constants["pair_solref"], self._constants["pair_solimp"],
+            self._constants["pair_margin_gap"],
+            self._constants["pair_solreffriction"],
+            self._constants["pair_const_lo"],
             threads=(b * d.npairs,), group_size=(1,),
         )
-      slot_flags = w["contact_row_data"][:b * nc * 36].reshape(b, nc, 36)[:, :, 0]
+      slot_flags = w["contact_row_data"][:b * nc * 42].reshape(b, nc, 42)[:, :, 0]
       slot_maps = self._slot_compaction.run(slot_flags,
                                              world_mask=candidate_world_mask)
       w["slot_maps"] = slot_maps

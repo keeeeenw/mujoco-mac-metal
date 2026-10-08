@@ -2209,7 +2209,13 @@ kernel void contact_jacobian_low(
     device float* jacobian_paired [[buffer(20)]],
     device const int* contact_count [[buffer(21)]],
     device const int* logical_pair_to_packed [[buffer(22)]],
-    device const float* contact_row_data [[buffer(23)]],
+    device float* contact_row_data [[buffer(23)]],
+    device const float* qvel [[buffer(24)]],
+    device const float* pair_solref [[buffer(25)]],
+    device const float* pair_solimp [[buffer(26)]],
+    device const float* pair_margin_gap [[buffer(27)]],
+    device const float* pair_solreffriction [[buffer(28)]],
+    device const float* pair_const_lo [[buffer(29)]],
     uint tid [[thread_position_in_grid]]) {
   int nv = pair_contact_offsets_dims[0];
   int npairs = pair_contact_offsets_dims[1];
@@ -2240,6 +2246,63 @@ kernel void contact_jacobian_low(
   int bb = geom_bodyid[b];
   int bo = world * nbody;
   int jo = world * njnt;
+  // Paired solref/solimp constants for the aref correction below. Branches
+  // match the hot kernel on the same float inputs bit-identically; only the
+  // arithmetic is paired (two-quotient divides, no exact-reciprocal claim).
+  float lr0 = pair_solref[pair_idx * 2 + 0];
+  float lr1 = pair_solref[pair_idx * 2 + 1];
+  float ld0 = pair_solimp[pair_idx * 5 + 0];
+  float ld1 = pair_solimp[pair_idx * 5 + 1];
+  float lwidth = pair_solimp[pair_idx * 5 + 2];
+  float lpower = pair_solimp[pair_idx * 5 + 4];
+  float lmargin = pair_margin_gap[pair_idx * 2 + 0];
+  // Double-precision constant residuals, layout per pair [solref_lo(2),
+  // solimp_lo(5), margin_lo(2)]: lo = f64 TRUE - f32 stored hi, so hi+lo
+  // recovers the pinned CPU constants. Friction/mu stay float32
+  // (documented sub-budget residual: mu enters only via tangent combos).
+  int clo = pair_idx * 9;
+  PrimalFloatPair pK, pB;
+  if (lr0 > 0.0f) {
+    PrimalFloatPair r0p = {lr0, pair_const_lo[clo + 0]};
+    PrimalFloatPair r1p = {lr1, pair_const_lo[clo + 1]};
+    PrimalFloatPair d1p = {ld1, pair_const_lo[clo + 3]};
+    PrimalFloatPair denom = primal_pair_product(
+        primal_pair_product(d1p, d1p),
+        primal_pair_product(
+            primal_pair_product(r0p, r0p),
+            primal_pair_product(r1p, r1p)));
+    if (!(denom.hi > 1e-15f)) denom = {1e-15f, 0.0f};
+    pK = primal_pair_divide({1.0f, 0.0f}, denom);
+  } else {
+    PrimalFloatPair d1p = {ld1, pair_const_lo[clo + 3]};
+    PrimalFloatPair denom = primal_pair_product(d1p, d1p);
+    if (!(denom.hi > 1e-15f)) denom = {1e-15f, 0.0f};
+    pK = primal_pair_divide({-lr0, -pair_const_lo[clo + 0]}, denom);
+  }
+  if (lr1 > 0.0f) {
+    PrimalFloatPair d1p = {ld1, pair_const_lo[clo + 3]};
+    PrimalFloatPair r0p = {lr0, pair_const_lo[clo + 0]};
+    PrimalFloatPair denom = primal_pair_product(d1p, r0p);
+    if (!(denom.hi > 1e-15f)) denom = {1e-15f, 0.0f};
+    pB = primal_pair_divide({2.0f, 0.0f}, denom);
+  } else {
+    PrimalFloatPair d1p = {ld1, pair_const_lo[clo + 3]};
+    pB = primal_pair_divide({-lr1, -pair_const_lo[clo + 1]}, d1p);
+  }
+  PrimalFloatPair pFrictionB = pB;
+  if (cone > 0.5f &&
+      (pair_solreffriction[pair_idx * 2] != 0.0f || pair_solreffriction[pair_idx * 2 + 1] != 0.0f)) {
+    float fr0 = pair_solreffriction[pair_idx * 2];
+    float fr1 = pair_solreffriction[pair_idx * 2 + 1];
+    PrimalFloatPair d1p = {ld1, pair_const_lo[clo + 3]};
+    if (fr1 > 0.0f) {
+      PrimalFloatPair denom = primal_pair_product(d1p, {fr0, 0.0f});
+      if (!(denom.hi > 1e-15f)) denom = {1e-15f, 0.0f};
+      pFrictionB = primal_pair_divide({2.0f, 0.0f}, denom);
+    } else {
+      pFrictionB = primal_pair_divide({-fr1, 0.0f}, d1p);
+    }
+  }
   device float* jacobian_record = jacobian_paired;
   {
     // World record base for low-plane writes in both packed and dense
@@ -2273,6 +2336,10 @@ kernel void contact_jacobian_low(
     PrimalFloat3Pair N = p3_pair(normal_hi,
         float3(contact_records[res + 28], contact_records[res + 29],
                contact_records[res + 30]));
+    // Direct pair axis-velocity accumulators (zeroed per slot; combined
+    // into per-row velocities after the dof loop below).
+    PrimalFloatPair axv[6];
+    for (int a = 0; a < 6; ++a) axv[a] = {0.0f, 0.0f};
     for (int dof_outer = 0; dof_outer < nv; ++dof_outer) {
       PrimalFloatPair E[6] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f},
                               {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
@@ -2377,6 +2444,10 @@ kernel void contact_jacobian_low(
       }
       if (!visited) continue;
       for (int axis = 0; axis < 6; ++axis) {
+        // Direct pair axis-velocity accumulator (mirrors the hot kernel's
+        // axis_velocity); row combinations are formed after the dof loop.
+        axv[axis] = primal_pair_add(axv[axis], primal_pair_product(
+            E[axis], {qvel[world * nv + dof_outer], 0.0f}));
         float Jlo = 0.0f;
         if (packed_rows) {
           int row = -1;
@@ -2412,7 +2483,7 @@ kernel void contact_jacobian_low(
           // (slot row starts shared with the assembly table by
           // construction), gated by the same row-activity flags. J_hi
           // comes from the hot kernel's unpacked blocks.
-          int crbase = (world * ncontacts_max + slot) * 36;
+          int crbase = (world * ncontacts_max + slot) * 42;
           if (contact_row_data[crbase] > 0.5f) {
             if (dim == 1) {
               float Jhi = jacobian[jbase + 0 * nv + dof_outer];
@@ -2447,6 +2518,85 @@ kernel void contact_jacobian_low(
             }
           }
         }
+      }
+    }
+    // Paired aref correction for this slot's six rows (mirrors the hot
+    // kernel's row formulas exactly; hi words above are untouched).
+    // E_vel comes from the pair axis accumulators; E_d uses the stored
+    // distance low word (record-relative [9], zero for non-SDF). Writes
+    // row_data[...+6] = E_aref - aref_hi; canonical assembly carries it
+    // into the aref_low plane. Nonfinite hi (overflow slots) writes 0.
+    {
+      int slotbase42 = (world * ncontacts_max + slot) * 42;
+      float d_hi = contact_records[contact_base + 0];
+      float d_lo = contact_records[res + 9];
+      for (int row = 0; row < 6; ++row) {
+        int rr = slotbase42 + row * 7;
+        float aref_hi = contact_row_data[rr + 3];
+        float alo = 0.0f;
+        if (isnan(aref_hi) || !isfinite(aref_hi)) alo = 0.0f;
+        else {
+          PrimalFloatPair velE;
+          if (dim == 3 && cone < 0.5f && row >= 1 && row <= 4) {
+            int ax = (row - 1) / 2 + 1;
+            float sgn = ((row - 1) & 1) == 0 ? 1.0f : -1.0f;
+            float mu = pair_friction[pair_idx * 5 + ax - 1];
+            velE = primal_pair_add(axv[0], primal_pair_multiply(
+                axv[ax], sgn * mu));
+          } else {
+            velE = axv[row];
+          }
+          // Impedance in pair where pow-free (mirror hot branches on the
+          // same float inputs); pow path keeps hi-only (lo=0).
+          float fh_x = lwidth > 1e-15f
+              ? abs((d_hi - lmargin) / lwidth) : 1.0f;
+          PrimalFloatPair pimp = {0.0f, 0.0f};
+          bool imp_paired = true;
+          PrimalFloatPair d0p = {ld0, pair_const_lo[clo + 2]};
+          PrimalFloatPair d1p = {ld1, pair_const_lo[clo + 3]};
+          if (ld0 == ld1 || lwidth <= 1e-15f) {
+            pimp = primal_pair_multiply(
+                primal_pair_add(d0p, d1p), 0.5f);
+          } else if (fh_x <= 0.0f) {
+            pimp = d0p;
+          } else if (fh_x >= 1.0f) {
+            pimp = d1p;
+          } else if (lpower == 1.0f) {
+            // Recompute y in pair from the pair distance for coherence
+            // (branch decided by the float x above, matching hot).
+            PrimalFloatPair mp = {lmargin, pair_const_lo[clo + 7]};
+            PrimalFloatPair wp = {lwidth, pair_const_lo[clo + 4]};
+            PrimalFloatPair xd = primal_pair_divide(
+                primal_pair_add({d_hi, d_lo},
+                    primal_pair_multiply(mp, -1.0f)),
+                wp);
+            if (xd.hi < 0.0f) xd = primal_pair_multiply(xd, -1.0f);
+            PrimalFloatPair dspan = primal_pair_add(d1p,
+                primal_pair_multiply(d0p, -1.0f));
+            pimp = primal_pair_add(d0p, primal_pair_product(xd, dspan));
+          } else {
+            imp_paired = false;
+          }
+          float imp_hi = contact_row_data[rr + 4];
+          PrimalFloatPair impP = imp_paired ? pimp : PrimalFloatPair{imp_hi, 0.0f};
+          PrimalFloatPair eAref;
+          if (row == 0 || (dim == 3 && cone < 0.5f)) {
+            PrimalFloatPair mp = {lmargin, pair_const_lo[clo + 7]};
+            PrimalFloatPair dm = primal_pair_add({d_hi, d_lo},
+                primal_pair_multiply(mp, -1.0f));
+            eAref = primal_pair_add(
+                primal_pair_multiply(primal_pair_product(pB, velE), -1.0f),
+                primal_pair_multiply(primal_pair_product(
+                    primal_pair_product(pK, impP), dm), -1.0f));
+          } else {
+            PrimalFloatPair Bf = (cone > 0.5f) ? pFrictionB : pB;
+            eAref = primal_pair_multiply(
+                primal_pair_product(Bf, velE), -1.0f);
+          }
+          alo = (eAref.hi - aref_hi) + eAref.lo;
+          alo = alo + 0.0f;
+        }
+        contact_row_data[rr + 6] = alo;
       }
     }
   }
