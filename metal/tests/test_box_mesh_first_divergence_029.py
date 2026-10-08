@@ -264,6 +264,59 @@ def test_box_seed_source_indexed_comparison_gpu(tmp_path):
               + np.concatenate([hull[tbase + 15 * g:tbase + 15 * g + 3],
                                 hull[tbase + 15 * g + 6:tbase + 15 * g + 9]]))
     np.testing.assert_array_equal(triple, ga[6 * g:6 * g + 6])
+  # Stage 1b: relative-transform comparison (staged T21 vs pip mapPose).
+  # Direction is identified by the offset: it equals o21 bit-exactly
+  # (not o12, which differs macroscopically), so T21 is the SDF-frame
+  # relative transform. Rotation matches only to ~1e-15 (tilts), while
+  # the offset matches bit-exactly: the divergence enters through the
+  # quaternion/rotation chain, not positions. Reported, not asserted
+  # equal (repair target: bit-exact T21).
+  import math as _math
+  from test_sdf_seed_source_trace_013 import _pose_map
+  d_pose = mujoco.MjData(m)
+  d_pose.qpos[:] = np.asarray(_GATE_QP, dtype=np.float64)
+  d_pose.qvel[:] = np.zeros(m.nv)
+  mujoco.mj_forward(m, d_pose)
+  o21, R21 = _pose_map(d_pose, 0, 1)
+  o12, R12 = _pose_map(d_pose, 1, 0)
+  R21 = np.asarray(R21).reshape(3, 3)
+  st0 = epochs[-1][0][2].cpu().numpy().reshape(-1, _STATE_WORDS)
+  w0 = st0[1].astype(np.float64)
+  nat_R = np.empty((3, 3))
+  nat_o = np.empty(3)
+  for _c in range(3):
+    for _r in range(3):
+      _k = 42 + 9 * _c + 3 * _r
+      nat_R[_r, _c] = _math.fsum(
+          [float(w0[_k]), float(w0[_k + 1]), float(w0[_k + 2])])
+    _k = 69 + 3 * _c
+    nat_o[_c] = _math.fsum(
+        [float(w0[_k]), float(w0[_k + 1]), float(w0[_k + 2])])
+  np.testing.assert_array_equal(nat_o, np.asarray(o21))
+  # The other direction is macroscopically different, proving the
+  # identification above (not a near-miss between close candidates).
+  assert float(np.max(np.abs(nat_o - np.asarray(o12)))) > 1e-3
+  rot_gap = float(np.max(np.abs(nat_R - R21)))
+  assert 0.0 < rot_gap < 1e-12, rot_gap
+  print(f"TRANSFORM off==o21 exact; rot maxabsdiff={rot_gap:.2e}", flush=True)
+  # Stage 1c: FK quaternion inputs vs pinned mat2Quat consumption.
+  # Native FK quats preserve model values; the pinned SDF path
+  # re-derives quats via mju_mat2Quat(FK matrices), which rounds
+  # differently (measured 1.67e-15 here). Reported; the
+  # repair must route bit-exact mat2Quat quats into the seed path.
+  fk = sim._smooth._fk
+  fws = fk._workspace["outputs"]
+  qh = np.asarray(fws["geom_quat"].cpu().numpy(), dtype=np.float64)
+  ql = np.asarray(fws["geom_quat_low"].cpu().numpy(), dtype=np.float64)
+  qt = np.asarray(fws["geom_quat_tail"].cpu().numpy(), dtype=np.float64)
+  for _g in (0, 1):
+    nq = [_math.fsum([float(qh[4 * _g + i]), float(ql[4 * _g + i]),
+                      float(qt[4 * _g + i])]) for i in range(4)]
+    cq = np.zeros(4)
+    mujoco.mju_mat2Quat(
+        cq, np.asarray(d_pose.geom_xmat).reshape(-1)[9 * _g:9 * _g + 9])
+    print(f"QUAT g{_g} maxabsdiff="
+          f"{float(np.max(np.abs(np.asarray(nq) - cq))):.2e}", flush=True)
   # Live CPU trace at gate-baked XML.
   zf = repr(float(np.float32(float(_GATE_QP[2]))))
   xml_text = f"""<mujoco>
