@@ -63,10 +63,10 @@ kernel void clear_contact_candidate_workspace(
     constant int* dims [[buffer(2)]],
     uint tid [[thread_position_in_grid]]) {
   int ncontacts=dims[2], batch=dims[3];
-  int width=max(ncontacts,1)*36;
+  int width=max(ncontacts,1)*42;
   int world=int(tid)/width, lane=int(tid)%width;
   if(world>=batch || !pair_contact_world_enabled(dims,world)) return;
-  if(lane<ncontacts*36) row_data[world*ncontacts*36+lane]=0.0f;
+  if(lane<ncontacts*42) row_data[world*ncontacts*42+lane]=0.0f;
   if(lane<ncontacts*12) frame[world*ncontacts*12+lane]=0.0f;
 }
 
@@ -1447,7 +1447,7 @@ kernel void contact_normal(
   if (raw_ncon<0) {
     int overflow_slot=offset;
     if (overflow_slot<ncontacts_max) {
-      int rb=(world*ncontacts_max+overflow_slot)*36;
+      int rb=(world*ncontacts_max+overflow_slot)*42;
       row_data[rb]=1.0f; row_data[rb+1]=NAN;
       row_data[rb+2]=NAN; row_data[rb+3]=NAN;
       row_data[rb+4]=NAN; row_data[rb+5]=NAN;
@@ -1482,7 +1482,7 @@ kernel void contact_normal(
     if (slot >= ncontacts_max) break;
     int out = world * ncontacts_max + slot;
     int jbase = out * 6 * nv;
-    int rb = out * 6 * 6;
+    int rb = out * 6 * 7;
     int fb = out * 12;
     int row_start = pair_contact_offsets_dims[slot_rows_base + slot];
 
@@ -1502,7 +1502,7 @@ kernel void contact_normal(
                          contact_records[contact_base+3]);
 
     // Zero out buffers
-    for (int i = 0; i < 6 * 6; ++i) row_data[rb + i] = 0.0f;
+    for (int i = 0; i < 6 * 7; ++i) row_data[rb + i] = 0.0f;
     if (!packed_rows)
       for (int i = 0; i < 6 * nv; ++i) jacobian[jbase + i] = 0.0f;
     for (int i = 0; i < 12; ++i) frame[fb + i] = 0.0f;
@@ -1598,8 +1598,7 @@ kernel void contact_normal(
     }
 
     for (int row = 0; row < 6; ++row) {
-      float vel = 0.0f;
-      if (dim == 3 && cone < 0.5f && row > 0 && row < 5) {
+      float vel = 0.0f;      if (dim == 3 && cone < 0.5f && row > 0 && row < 5) {
         int axis = (row - 1) / 2 + 1;
         float sign = ((row - 1) & 1) == 0 ? 1.0f : -1.0f;
         float mu = pair_friction[pair_idx * 5 + axis - 1];
@@ -1612,9 +1611,8 @@ kernel void contact_normal(
         if (packed_rows) vel = axis_velocity[row];
         else for (int i = 0; i < nv; ++i) vel += jacobian[jbase + row * nv + i] * qvel[world * nv + i];
       }
-      int r = rb + row * 6;
-      row_data[r] = d < m ? 1.0f : 0.0f;
-      row_data[r + 1] = d;
+      int r = rb + row * 7;
+      row_data[r] = d < m ? 1.0f : 0.0f;      row_data[r + 1] = d;
       row_data[r + 2] = vel;
       row_data[r + 3] = (row == 0 || (dim == 3 && cone < 0.5f))
           ? -B * vel - K * impedance * (d - m)
@@ -1635,9 +1633,9 @@ kernel void contact_normal(
     if (slot >= ncontacts_max) break;
     int out = world * ncontacts_max + slot;
     int jbase = out * 6 * nv;
-    int rb = out * 6 * 6;
+    int rb = out * 6 * 7;
     int fb = out * 12;
-    for (int i = 0; i < 6 * 6; ++i) row_data[rb + i] = 0.0f;
+    for (int i = 0; i < 6 * 7; ++i) row_data[rb + i] = 0.0f;
     if (!packed_rows)
       for (int i = 0; i < 6 * nv; ++i) jacobian[jbase + i] = 0.0f;
     for (int i = 0; i < 12; ++i) frame[fb + i] = 0.0f;
@@ -7583,7 +7581,7 @@ kernel void solve_coupled_constraints(
       int cdim = contact_condim[s * 3 + 0];
       int row_offset = contact_condim[s * 3 + 1];
       int row_start = base_contact + row_offset;
-      int crbase = (world * ncontacts_max + s) * 36;
+      int crbase = (world * ncontacts_max + s) * 42;
       if (contact_row_data[crbase] <= 0.5f) continue;
       if (cone_type == 1 && cdim > 1) {
         if (elliptic_count < nr) {
@@ -7609,7 +7607,7 @@ kernel void solve_coupled_constraints(
       int row_start = base_contact + row_offset;
       int cb = world * ncontacts_max + s;
       int cjbase = cb * 6 * nv;
-      int crbase = cb * 6 * 6;
+      int crbase = cb * 6 * 7;
 
       if (cdim == 1) {
         int r = crbase;
@@ -7644,7 +7642,7 @@ kernel void solve_coupled_constraints(
           for (int k = 0; k < cdim; ++k) {
             int row = row_start + k;
             elliptic_member[row] = true;
-            int r = crbase + k * 6;
+            int r = crbase + k * 7;
             if (jheader[2] == CCJ_DENSE)
               for (int i = 0; i < nv; ++i) ccj_set(J_world, row, i, contact_jacobian[cjbase + k * nv + i], nv);
             if (k == 0) {
@@ -7684,7 +7682,7 @@ kernel void solve_coupled_constraints(
               int row = row_start + k;
               float sign = side == 0 ? 1.0f : -1.0f;
               int r0 = crbase;
-              int rt = crbase + (axis + 1) * 6;
+              int rt = crbase + (axis + 1) * 7;
               if (jheader[2] == CCJ_DENSE)
                 for (int i = 0; i < nv; ++i) {
                   ccj_set(J_world, row, i, contact_jacobian[cjbase + i] + sign * mu * contact_jacobian[cjbase + (axis + 1) * nv + i], nv);
@@ -8755,7 +8753,7 @@ kernel void solve_coupled_constraints(
       for (int i = 0; i < nv; ++i) {
         PrimalFloatPair acceleration = primal_pair_fma(
             Z[row * nv + i],
-            {lam[row], solver_type == 0 ? pgs_lambda_low[row] : 0.0f},
+            {lam[row], pgs_lambda_low[row]},
             {out_acc[qb + i], out_acc[batch * nv + qb + i]});
         if (dims[20] == -2) {
           // Component PGS retains the mass-solve residual correction for each
@@ -8766,7 +8764,7 @@ kernel void solve_coupled_constraints(
               batch, world, row, i, nr, nv, true)];
           acceleration = primal_pair_fma(
               z_low,
-              {lam[row], solver_type == 0 ? pgs_lambda_low[row] : 0.0f},
+              {lam[row], pgs_lambda_low[row]},
               acceleration);
         }
         out_acc[qb + i] = acceleration.hi;
@@ -9572,7 +9570,7 @@ kernel void solve_coupled_constraints_block(
       int cdim = contact_condim[s * 3 + 0];
       int row_offset = contact_condim[s * 3 + 1];
       int row_start = base_contact + row_offset;
-      int crbase = (world * ncontacts_max + s) * 36;
+      int crbase = (world * ncontacts_max + s) * 42;
       if (contact_row_data[crbase] <= 0.5f) continue;
       if (cone_type == 1 && cdim > 1) {
         if (elliptic_count < nr) {
@@ -9600,7 +9598,7 @@ kernel void solve_coupled_constraints_block(
       int row_start = base_contact + row_offset;
       int cb = world * ncontacts_max + s;
       int cjbase = cb * 6 * nv;
-      int crbase = cb * 6 * 6;
+      int crbase = cb * 6 * 7;
 
       if (cdim == 1) {
         int r = crbase;
@@ -9637,7 +9635,7 @@ kernel void solve_coupled_constraints_block(
           for (int k = 0; k < cdim; ++k) {
             int row = row_start + k;
             elliptic_member[row] = true;
-            int r = crbase + k * 6;
+            int r = crbase + k * 7;
             if (jheader[2] == CCJ_DENSE)
               for (int i = 0; i < nv; ++i) ccj_set(J_world, row, i, contact_jacobian[cjbase + k * nv + i], nv);
             if (k == 0) {
@@ -9677,7 +9675,7 @@ kernel void solve_coupled_constraints_block(
               int row = row_start + k;
               float sign = side == 0 ? 1.0f : -1.0f;
               int r0 = crbase;
-              int rt = crbase + (axis + 1) * 6;
+              int rt = crbase + (axis + 1) * 7;
               if (jheader[2] == CCJ_DENSE)
                 for (int i = 0; i < nv; ++i) {
                   ccj_set(J_world, row, i, contact_jacobian[cjbase + i] + sign * mu * contact_jacobian[cjbase + (axis + 1) * nv + i], nv);
@@ -9685,7 +9683,7 @@ kernel void solve_coupled_constraints_block(
               R[row] = pyramid_R;
               if (dims[20] == -1) rhs[row] = imp;
               ar[row] = cdim == 3
-                  ? contact_row_data[crbase + (k + 1) * 6 + 3]
+                  ? contact_row_data[crbase + (k + 1) * 7 + 3]
                   : contact_row_data[r0 + 3] + sign * mu * contact_row_data[rt + 3];
               lo[row] = 0.0f;
               hi[row] = INFINITY;

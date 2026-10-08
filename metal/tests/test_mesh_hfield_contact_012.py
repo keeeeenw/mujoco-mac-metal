@@ -557,7 +557,7 @@ def test_mesh_heightfield_bad_world_ccd_status_preserves_healthy_neighbor():
   status = program._workspace["out_status"].detach().cpu().numpy().copy()
   assert status.tolist() == [2, 0]
   rows = (program._workspace["contact_row_data"]
-          .reshape(2, program.descriptor.ncontacts_max, 6, 6)[:, :, 0, 0]
+          .reshape(2, program.descriptor.ncontacts_max, 6, 7)[:, :, 0, 0]
           .detach().cpu().numpy())
   assert not np.any(rows[0])
   assert np.count_nonzero(rows[1]) == len(_source_contacts(model)[1])
@@ -568,7 +568,7 @@ def test_mesh_heightfield_bad_world_ccd_status_preserves_healthy_neighbor():
   program.generate_candidates(valid, state._qvel)
   assert program._workspace["out_status"].cpu().numpy().tolist() == [0, 0]
   rows = (program._workspace["contact_row_data"]
-          .reshape(2, program.descriptor.ncontacts_max, 6, 6)[:, :, 0, 0]
+          .reshape(2, program.descriptor.ncontacts_max, 6, 7)[:, :, 0, 0]
           .detach().cpu().numpy())
   assert all(np.count_nonzero(row) == len(_source_contacts(model)[1])
              for row in rows)

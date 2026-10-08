@@ -34,7 +34,7 @@ def test_workspace_mirror_is_byte_exact_cpu():
   parts, total = estimate_workspace(nv=1, npairs=1, nslots=2, nr=3,
                                     nr_joint=1, neq=0, batch=2)
   by_name = dict(parts)
-  assert by_name["contact_row_data"] == 2 * 2 * 36 * 4
+  assert by_name["contact_row_data"] == 2 * 2 * 42 * 4
   assert by_name["contact_frame"] == 2 * 2 * 12 * 4
   assert by_name["contact_jacobian"] == 2 * 2 * 6 * 1 * 4
   assert by_name["pair_mask"] == 2 * 1 * 4

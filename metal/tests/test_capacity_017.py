@@ -759,7 +759,7 @@ def estimate_workspace_expected(model, batch, npairs, nslots, nr,
   b, v = batch, max(int(model.nv), 1)
   nc = nslots
   sizes = (
-      max(b * nc * 36, 1), max(b * nc * 12, 1),
+      max(b * nc * 42, 1), max(b * nc * 12, 1),
       max(b * nc * 6 * v, 1), max(b * max(npairs, 1), 1),
       # Production coupled records are always paired (high + low planes).
       max(b * (12 + 2 * nr * v), 1), max(b * nr, 1), max(b * (nr * nr + 7 * nr

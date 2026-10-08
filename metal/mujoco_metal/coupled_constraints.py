@@ -2902,7 +2902,7 @@ class MetalCoupledConstraints:
     contact_jacobian_size = (b * nc * 6 * nv
                              if jacobian_layout.mode == 0 else 1)
     self._workspace = {
-        "contact_row_data": empty(b * nc * 6 * 6),
+        "contact_row_data": empty(b * nc * 6 * 7),
         "contact_frame": empty(b * nc * 12),
         "contact_pair_count": torch.zeros(
             max(b * d.npairs, 1), dtype=torch.int32, device=self._device),
@@ -3557,7 +3557,7 @@ class MetalCoupledConstraints:
     w, d = self._workspace, self.descriptor
     b, npairs, nc = self.batch_size, d.npairs, d.ncontacts_max
     mask = w["pair_mask"][: b * max(npairs, 1)].detach().cpu().numpy().reshape(b, max(npairs, 1))
-    rows = w["contact_row_data"][: b * max(nc, 1) * 36].detach().cpu().numpy().reshape(b, max(nc, 1), 6, 6)
+    rows = w["contact_row_data"][: b * max(nc, 1) * 42].detach().cpu().numpy().reshape(b, max(nc, 1), 6, 7)
     out = []
     for env in range(b):
       m = int(np.sum(mask[env, :npairs] > 0.5)) if npairs else 0
@@ -3572,7 +3572,7 @@ class MetalCoupledConstraints:
     w = self._workspace
     nc = d.ncontacts_max
     cone_type = int(self._mjmodel_ref.opt.cone)
-    rows = w["contact_row_data"][: self.batch_size * max(nc, 1) * 36].detach().cpu().numpy().reshape(self.batch_size, max(nc, 1), 6, 6)
+    rows = w["contact_row_data"][: self.batch_size * max(nc, 1) * 42].detach().cpu().numpy().reshape(self.batch_size, max(nc, 1), 6, 7)
     out = []
     for env in range(self.batch_size):
       mask_act, slot_act = counts[env]
@@ -4700,7 +4700,7 @@ class MetalCoupledConstraints:
           + self._solver_island_ntree]
     nc = int(d.ncontacts_max)
     if nc:
-      contact_rows = w["contact_row_data"][:b * nc * 36].reshape(b, nc, 6, 6)
+      contact_rows = w["contact_row_data"][:b * nc * 42].reshape(b, nc, 6, 7)
       contact_frames = w["contact_frame"][:b * nc * 12].reshape(b, nc, 12)
       contact_forces = w["out_contact_force"][:b * nc * 11].reshape(b, nc, 11)
       contact_jacobians = (
@@ -5489,7 +5489,7 @@ class MetalCoupledConstraints:
         result["jacobian_pattern"] = self._jacobian_pattern
 
     if nc > 0:
-      contact_rows = w["contact_row_data"][: b * nc * 6 * 6].reshape(b, nc, 6, 6)
+      contact_rows = w["contact_row_data"][: b * nc * 6 * 7].reshape(b, nc, 6, 7)
       contact_frames = w["contact_frame"][: b * nc * 12].reshape(b, nc, 12)
       contact_forces = w["out_contact_force"][: b * nc * 11].reshape(b, nc, 11)
       contact_jacobians = (
@@ -5796,7 +5796,7 @@ class MetalCoupledConstraints:
       elif materialize_jacobian:
         result["J"] = self.materialize_jacobian()
     if nc:
-      rows = w["contact_row_data"][:b * nc * 36].reshape(b, nc, 6, 6)
+      rows = w["contact_row_data"][:b * nc * 42].reshape(b, nc, 6, 7)
       frames = w["contact_frame"][:b * nc * 12].reshape(b, nc, 12)
       result.update({
           "contact_mask": rows[:, :, 0, 0],

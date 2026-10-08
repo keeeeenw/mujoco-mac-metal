@@ -322,7 +322,7 @@ def _candidate_dispatch_fixture():
   program.descriptor = SimpleNamespace(
       npairs=1, ncontacts_max=1, nr=1, nv=1, ngeom=2)
   program._workspace = {
-      "contact_row_data": _FakeTensor(np.zeros((2, 36), dtype=np.float32)),
+      "contact_row_data": _FakeTensor(np.zeros((2, 42), dtype=np.float32)),
       "contact_frame": _FakeTensor(np.zeros((2, 12), dtype=np.float32)),
       "contact_jacobian": _FakeTensor(np.zeros((2, 6), dtype=np.float32)),
       "pair_mask": _FakeTensor(np.zeros(2, dtype=np.int32), dtype="int32"),

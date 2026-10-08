@@ -2731,7 +2731,7 @@ class MetalSimulation:
       ])
       if d.nc > 0:
         entries.extend([
-            {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max}, 5, 6)", "dtype": "float32"},
+            {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max}, 6, 7)", "dtype": "float32"},
             {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max}, 5, {d.nv})", "dtype": "float32"},
             {"name": "out_contact_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max * 5})", "dtype": "float32"},
         ])
@@ -3657,7 +3657,7 @@ class MetalSimulation:
       return None
     w = cc._workspace
     b = self.batch_size
-    row_data = w["contact_row_data"][: b * nc * 36].reshape(b, nc, 6, 6)
+    row_data = w["contact_row_data"][: b * nc * 42].reshape(b, nc, 6, 7)
     return {
         "frame": w["contact_frame"][: b * nc * 12].reshape(b, nc, 12),
         "force": w["out_contact_force"][: b * nc * 11].reshape(b, nc, 11),

@@ -1279,7 +1279,7 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
                             if jacobian_kind == "dense" else 1)
   blocks = max((int(nr) + 255) // 256, 1)
   parts = (
-      ("contact_row_data", _bytes(guarded(b * nc * 6 * 6))),
+      ("contact_row_data", _bytes(guarded(b * nc * 6 * 7))),
       ("contact_frame", _bytes(guarded(b * nc * 12))),
       ("contact_jacobian", _bytes(guarded(contact_jacobian_words))),
       ("pair_mask", _bytes(guarded(b * max(int(npairs), 1)))),
