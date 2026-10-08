@@ -8342,6 +8342,12 @@ kernel void solve_coupled_constraints(
   // (refinement and qacc reconstruction run only on early stops, never on
   // budget-exhausted iterates).
   int solver_used = 0;
+  // Per-island stopping contract: each island solve receives the full
+  // configured maxiter budget (pinned semantics), so polish requires EVERY
+  // island to have stopped early (max island iterations below budget), not
+  // merely the summed count below one per-island budget. The sum stays the
+  // reported diagnostic (see below); the max gates polish.
+  int solver_max_island_used = 0;
   // Convergence history: 7 coarse main-sweep samples + final main-sweep
   // residual (refinement afterwards is a separate exact phase; the retained
   // diagnostics[0] is post-refinement). Unfilled slots repeat the final.
@@ -8463,6 +8469,8 @@ kernel void solve_coupled_constraints(
         return;
       }
       used += island_used;
+      if (island_used > solver_max_island_used)
+        solver_max_island_used = island_used;
       if (trace_solver_counts && island < 8)
         primal_island_iterations[island] = island_used;
       primal_residual = max(primal_residual, out_diagnostics[world * 10]);
@@ -8479,11 +8487,13 @@ kernel void solve_coupled_constraints(
     for (int row = 0; row < total_nr; ++row)
       enabled[row] = solver_row_island[row] >= 0;
     // 8b. Projected dual refinement (Newton/CG, dense only).
-    // Runs only when the solver stopped early (used < maxiter): it polishes
-    // converged solutions and never extends an explicit iteration budget.
-    // Budget-exhausted iterates (including the entire 0/1/2-iteration
-    // contract) are published raw, exactly as the primal solver left them.
-    // The primal iterate minimizes the working-precision objective; small
+    // Runs only when every island stopped early (max island iterations
+    // below the per-island maxiter budget) AND the primal iterate converged
+    // (primal_residual <= tol): it polishes converged solutions and never
+    // extends an explicit iteration budget or substitutes for an
+    // unconverged finite iterate. Budget-exhausted iterates (including the
+    // entire 0/1/2-iteration contract) are published raw, exactly as the
+    // primal solver left them.
     // The primal iterate minimizes the working-precision objective; small
     // inertias can leave the dual residual of the accepted multipliers
     // several ulps off zero against the EFFECTIVE operator (paired J,
@@ -8500,16 +8510,20 @@ kernel void solve_coupled_constraints(
     // (cap 4; fixtures quiesce in 1-2). The pair correction is retained in
     // lam/pgs_lambda_low (split hi/lo) and consumed by force/qacc
     // reconstruction for all solvers on this path, so sub-ulp corrections
-    // survive in the published force/acceleration; certificates,
-    // reconstruction and published lambda share one coherent value. Skipped bit-identically
+    // survive in the published force/acceleration. Refinement moves are
+    // bounded by the per-row change rule; rows that would worsen the dual
+    // objective keep primal values. Skipped bit-identically
     // without low-word corrections, and entire mixed systems (any
     // equality row with its separate paired aref, any elliptic-cone row
     // needing cone projections, any symmetric-bounded friction row with
     // Huber semantics): partial moves would shift skipped rows'
     // optimality, so mixed systems keep primal values untouched.
     // Component stages (-2/-3, no dense L) keep the hi-only system.
+    // Mixed systems retain complete primal force/qacc semantics below via
+    // the unconditional paired force reconstruction and the verified
+    // mass-solve path (recon runs independent of this uniformity gate).
     if ((solver_type == 1 || solver_type == 2) && dims[20] >= 0
-        && used < maxiter) {
+        && solver_max_island_used < maxiter && primal_residual <= tol) {
       // Uniform scalar-contact systems only: moving a subset of rows
       // would shift skipped rows' optimality (equality rows own a
       // separate paired aref; elliptic blocks need cone projections;
@@ -9124,17 +9138,30 @@ kernel void solve_coupled_constraints(
   }
 
   // solver_diagnostics[0] certifies the multipliers that will be retained
-  // and published below.  The optimizer's scaled-gradient/cost-improvement
+  // and published below against the stored high-word assembled row system
+  // (W/R/rhs with high multipliers). Publication consumes the paired
+  // effective operator (paired J via J_world/J_lo, multiplier lows in
+  // pgs_lambda_low, aref lows): refinement moves are bounded by the
+  // per-row change-acceptance rule and qacc reconstruction publishes only
+  // on verified real-operator improvement (see above), so the retained
+  // certificate and the published effective values share one coherent
+  // accepted state. The optimizer's scaled-gradient/cost-improvement
   // metric remains in solver_history and is not a dual-feasibility claim.
+  // Nonzero low words alone are not evidence polish fired: the primal
+  // solver itself produces force lows via the per-island refresh above.
   out_diagnostics[world * 10] = cert_retained_system_residual(W, R, rhs, ar,
       lo, hi, lam, enabled, elliptic_member, elliptic_start, elliptic_dim,
       elliptic_friction, elliptic_count, nr, total_nr);
 
   // G2: nonfinite residuals fail explicitly (NaN never satisfies `> tol`,
   // so without this guard a nonfinite solve would report success).
+  // Multiplier lows are consumed by publication, so nonfinite lows fail
+  // the world as well; correction acceptance already rejects nonfinite
+  // per-row moves, this guards retained-plane contamination.
   bool finite_solution = isfinite(max_res);
   for (int r = 0; r < total_nr; ++r)
-    if (enabled[r] && !isfinite(lam[r])) finite_solution = false;
+    if (enabled[r] && (!isfinite(lam[r]) || !isfinite(pgs_lambda_low[r])))
+      finite_solution = false;
   if (!finite_solution) out_status[world] = 3;
 
   // 10. Reconstruct forces and acceleration
@@ -9186,9 +9213,10 @@ kernel void solve_coupled_constraints(
   }
 
   // Reconstruct qacc from the corrected force on Newton/CG primal paths.
-  // Runs only when the solver stopped early (used < maxiter): at
-  // budget-exhausted iterates (including the 0/1/2-iteration contract)
-  // the finite primal qacc is published as-is; force balance at
+  // Runs only when every island stopped early (per-island max below the
+  // configured budget) and the primal iterate converged: at
+  // budget-exhausted or unconverged iterates (including the 0/1/2-iteration
+  // contract) the finite primal qacc is published as-is; force balance at
   // convergence is not permission to replace it with a more converged
   // dual result. The Newton primal iterate minimizes the high-word-J
   // objective; when 2e-8 Jacobian rounding is amplified by small inertias
@@ -9201,8 +9229,11 @@ kernel void solve_coupled_constraints(
   // so non-SDF behavior is unchanged. Sleeping DOFs keep the Newton
   // values. Component modes (-2/-3, no dense L) use high-only force
   // (consistent hi-only system, J_lo correction gated to dense mass).
+  // Mixed systems receive this verified reconstruction independent of the
+  // uniformity-gated refinement above: when refinement is skipped, primal
+  // multipliers and this mass-solve path are the complete semantics.
   if (primal_acceleration_output && (solver_type == 1 || solver_type == 2)
-      && dims[20] >= 0 && solver_used < maxiter) {
+      && dims[20] >= 0 && solver_max_island_used < maxiter && converged) {
     bool need_recon = false;
     for (int row = 0; row < nr && !need_recon; ++row)
       for (int i = 0; i < nv; ++i) {
