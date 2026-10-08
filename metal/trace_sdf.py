@@ -24,7 +24,7 @@ import os
 import sys
 import tempfile
 
-_ROOT = os.path.dirname(
+_ROOT = os.environ.get("MUJOCO_METAL_TRACE_ROOT") or os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _TRACE_LIB = os.path.join(
     _ROOT, ".upstream", "mujoco-trace", "build-fixed", "lib",

@@ -28,10 +28,11 @@ import sys
 import numpy as np
 import pytest
 
-_ROOT = os.path.dirname(
+_ROOT = os.environ.get("MUJOCO_METAL_TRACE_ROOT") or os.path.dirname(
     os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-_HELPER = os.path.join(_ROOT, "project", "metal", "trace_sdf.py")
+_METAL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_HELPER = os.path.join(_METAL, "trace_sdf.py")
 _TRACE_SRC = os.path.join(
     _ROOT, ".upstream", "mujoco-trace", "src", "engine",
     "engine_collision_sdf.c")
@@ -389,7 +390,7 @@ def test_instrumentation_patch_applies_deterministically(tmp_path):
   import subprocess
   if shutil.which("patch") is None:
     pytest.skip("system patch tool absent")
-  patch = os.path.join(_ROOT, "project", "metal",
+  patch = os.path.join(_METAL,
                        "trace_instrumentation.patch")
   assert os.path.exists(patch), patch
   (tmp_path / "src" / "engine").mkdir(parents=True)

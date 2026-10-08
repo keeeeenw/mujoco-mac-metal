@@ -139,7 +139,9 @@ def _ordered_key(x):
   """Monotone ulp-order key: finite values map preserving order, with
   -0.0 and +0.0 sharing one key; callers handle nonfinites explicitly."""
   b = _f64_bits(x)
-  return (b + 0x8000000000000000) & 0xFFFFFFFFFFFFFFFF
+  sign = 0x8000000000000000
+  magnitude = b & (sign - 1)
+  return sign - magnitude if b & sign else sign + magnitude
 
 
 def _ulp_distance(a, b):
@@ -147,10 +149,10 @@ def _ulp_distance(a, b):
   numerically equal values (including -0.0 vs +0.0)."""
   import math
   fa, fb = float(a), float(b)
-  if fa == fb:
-    return 0
   if not (math.isfinite(fa) and math.isfinite(fb)):
     return None
+  if fa == fb:
+    return 0
   return abs(_ordered_key(fa) - _ordered_key(fb))
 
 
@@ -176,13 +178,18 @@ def test_seed_word_ulp_machinery_host():
   tiny = np.nextafter(0.0, 1.0)
   assert tiny > 0.0 and _ulp_distance(tiny, 0.0) == 1
   assert _ulp_distance(float("inf"), 1.0) is None
+  assert _ulp_distance(float("inf"), float("inf")) is None
   assert _ulp_distance(float("nan"), float("nan")) is None
   assert _ulp_distance(-1.0, np.nextafter(-1.0, -2.0)) == 1
-  # Cross-sign tiny values (the seed-1 transverse channel): ordered keys
-  # run through zero monotonically; verified against direct bit math.
-  assert _ulp_distance(float.fromhex("-0x1.ea999835accffp-63"),
-                       float.fromhex("0x1.e3cb80ddeaacap-56")
-                       ) == 9254777518651858379
+  assert _ordered_key(-2.0) < _ordered_key(-1.0) < _ordered_key(0.0)
+  assert _ulp_distance(-tiny, 0.0) == 1
+  assert _ulp_distance(-tiny, tiny) == 2
+  assert _ordered_key(-0.0) == _ordered_key(0.0)
+  # Across zero, distance is the sum of the two positive magnitudes'
+  # distances to zero; this is independent of the negative-key transform.
+  a = float.fromhex("-0x1.ea999835accffp-63")
+  b = float.fromhex("0x1.e3cb80ddeaacap-56")
+  assert _ulp_distance(a, b) == _f64_bits(abs(a)) + _f64_bits(abs(b))
   # math.fsum is exactly rounded: catastrophic cancellation case where
   # naive left-to-right addition loses the small word entirely.
   assert math.fsum([1e16, 1.0, -1e16]) == 1.0
@@ -196,10 +203,11 @@ def test_seed_word_ulp_machinery_host():
 
 def _trace_build_paths():
   import os
-  root = os.path.dirname(
+  root = os.environ.get("MUJOCO_METAL_TRACE_ROOT") or os.path.dirname(
       os.path.dirname(
           os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-  helper = os.path.join(root, "project", "metal", "trace_sdf.py")
+  helper = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                        "trace_sdf.py")
   lib = os.path.join(root, ".upstream", "mujoco-trace", "build-fixed",
                      "lib", "libmujoco.dylib")
   return helper, lib
