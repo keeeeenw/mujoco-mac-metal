@@ -1576,6 +1576,19 @@ kernel void contact_normal(
   }
 }
 
+// Low-word correction for contact Jacobians assembled above.
+//
+// For each contact row entry this kernel computes the exact entry E in
+// compensated (hi, lo) pair arithmetic from wide inputs (contact point
+// and normal triples from the 37-word records, body position/quaternion
+// triples from FK poses) and writes J_lo = E - J_hi, where J_hi is the
+// high word the main kernel produced. The pair (J_hi, J_lo) sums to E
+// within one low-word ulp; force reconstruction adds the correction, so
+// previously-correct entries keep bitwise-identical high words and only
+// genuinely mis-rounded entries change (through the pair sum).
+// Anchors, axes and friction tangents stay float32 (documented residual
+// bound for non-free joints); the gate fixtures use free joints whose
+// pivots and axes derive exactly from wide FK triples.
 // Coupled projected constraint solve
 inline void project_lorentz(thread float* x, int dim) {
   float norm = 0.0f;
@@ -2032,6 +2045,341 @@ inline PrimalFloatPair primal_pair_fma_pair(PrimalFloatPair a,
     PrimalFloatPair b, PrimalFloatPair c) {
   return primal_pair_add(primal_pair_product(a, b), c);
 }
+
+// Compensated triple-pair vector arithmetic for low-word Jacobian
+// assembly. Each component carries (hi, lo) with 48 significant bits;
+// tails stored in contact records are reserved for descent/convergence
+// use (48 bits exceed the ~30 bits the correction needs). All ops
+// renormalize value-exactly; negation is exact on both words.
+struct PrimalFloat3Pair {
+  PrimalFloatPair x;
+  PrimalFloatPair y;
+  PrimalFloatPair z;
+};
+struct PrimalFloat4Pair {
+  PrimalFloatPair x;
+  PrimalFloatPair y;
+  PrimalFloatPair z;
+  PrimalFloatPair w;
+};
+inline PrimalFloatPair primal_pair_neg(PrimalFloatPair a) {
+  return {-a.hi, -a.lo};
+}
+inline PrimalFloat3Pair p3_pair(float3 hi, float3 lo) {
+  return {{hi.x, lo.x}, {hi.y, lo.y}, {hi.z, lo.z}};
+}
+inline PrimalFloat4Pair p4_pair(float4 hi, float4 lo) {
+  return {{hi.x, lo.x}, {hi.y, lo.y}, {hi.z, lo.z}, {hi.w, lo.w}};
+}
+inline PrimalFloat3Pair p3_add(PrimalFloat3Pair a, PrimalFloat3Pair b) {
+  return {primal_pair_add(a.x, b.x), primal_pair_add(a.y, b.y),
+          primal_pair_add(a.z, b.z)};
+}
+inline PrimalFloat3Pair p3_sub(PrimalFloat3Pair a, PrimalFloat3Pair b) {
+  return {primal_pair_add(a.x, primal_pair_neg(b.x)),
+          primal_pair_add(a.y, primal_pair_neg(b.y)),
+          primal_pair_add(a.z, primal_pair_neg(b.z))};
+}
+inline PrimalFloatPair p3_dot(PrimalFloat3Pair a, PrimalFloat3Pair b) {
+  PrimalFloatPair s = primal_pair_product(a.x, b.x);
+  s = primal_pair_add(s, primal_pair_product(a.y, b.y));
+  return primal_pair_add(s, primal_pair_product(a.z, b.z));
+}
+inline PrimalFloat3Pair p3_cross(PrimalFloat3Pair a, PrimalFloat3Pair b) {
+  return {
+    primal_pair_add(primal_pair_product(a.y, b.z),
+                    primal_pair_neg(primal_pair_product(a.z, b.y))),
+    primal_pair_add(primal_pair_product(a.z, b.x),
+                    primal_pair_neg(primal_pair_product(a.x, b.z))),
+    primal_pair_add(primal_pair_product(a.x, b.y),
+                    primal_pair_neg(primal_pair_product(a.y, b.x)))};
+}
+inline PrimalFloat3Pair p3_scale(PrimalFloat3Pair a, float s) {
+  return {primal_pair_multiply(a.x, s), primal_pair_multiply(a.y, s),
+          primal_pair_multiply(a.z, s)};
+}
+// v + 2*cross(q.xyz, cross(q.xyz, v) + q.w * v), all in pairs. Scaling by
+// two is exact for finite floats; q is (w, x, y, z) like body_quat.
+inline PrimalFloat3Pair p3_rotate_quat(PrimalFloat4Pair q, PrimalFloat3Pair v) {
+  PrimalFloat3Pair qv = {q.y, q.z, q.w};
+  PrimalFloat3Pair inner = p3_cross(qv, v);
+  inner = p3_add(inner, {primal_pair_product(q.x, v.x),
+                         primal_pair_product(q.x, v.y),
+                         primal_pair_product(q.x, v.z)});
+  PrimalFloat3Pair outer = p3_cross(qv, inner);
+  PrimalFloat3Pair twice = {{2.0f * outer.x.hi, 2.0f * outer.x.lo},
+                            {2.0f * outer.y.hi, 2.0f * outer.y.lo},
+                            {2.0f * outer.z.hi, 2.0f * outer.z.lo}};
+  return p3_add(v, twice);
+}
+kernel void contact_jacobian_low(
+    device const int* geom_bodyid [[buffer(0)]],
+    device const float* body_pos [[buffer(1)]],
+    device const float* body_pos_low [[buffer(2)]],
+    device const float* body_pos_tail [[buffer(3)]],
+    device const float* body_quat [[buffer(4)]],
+    device const float* body_quat_low [[buffer(5)]],
+    device const float* body_quat_tail [[buffer(6)]],
+    device const float* anchors [[buffer(7)]],
+    device const float* axes [[buffer(8)]],
+    device const int* body_parentid [[buffer(9)]],
+    device const int* body_jntadr [[buffer(10)]],
+    device const int* body_jntnum [[buffer(11)]],
+    device const int* jnt_type [[buffer(12)]],
+    device const int* jnt_dofadr [[buffer(13)]],
+    device const int* pair_geoms [[buffer(14)]],
+    device const int* pair_condim [[buffer(15)]],
+    device const int* pair_contact_offsets_dims [[buffer(16)]],
+    device const float* pair_friction [[buffer(17)]],
+    device const float* contact_records [[buffer(18)]],
+    device const float* jacobian [[buffer(19)]],
+    device float* jacobian_paired [[buffer(20)]],
+    device const int* contact_count [[buffer(21)]],
+    device const int* logical_pair_to_packed [[buffer(22)]],
+    device const float* contact_row_data [[buffer(23)]],
+    uint tid [[thread_position_in_grid]]) {
+  int nv = pair_contact_offsets_dims[0];
+  int npairs = pair_contact_offsets_dims[1];
+  int ncontacts_max = pair_contact_offsets_dims[2];
+  int batch = pair_contact_offsets_dims[3];
+  int nbody = pair_contact_offsets_dims[4];
+  int njnt = pair_contact_offsets_dims[5];
+  int offsets_base = 10;
+  int world = int(tid) / max(npairs, 1);
+  int pair_idx = int(tid) % max(npairs, 1);
+  if (uint(world) >= uint(batch) || pair_idx >= npairs) return;
+  if (!pair_contact_world_enabled(pair_contact_offsets_dims, world)) return;
+  bool packed_rows = (pair_contact_offsets_dims[9] & 2) != 0;
+  bool prune_pairs = (pair_contact_offsets_dims[9] & 1) != 0;
+  if (prune_pairs
+      && logical_pair_to_packed[world * npairs + pair_idx] < 0) return;
+  int a = pair_geoms[pair_idx * 2 + 0];
+  int b = pair_geoms[pair_idx * 2 + 1];
+  int dim = pair_condim[pair_idx];
+  float cone = float(pair_contact_offsets_dims[7]);
+  int offset = pair_contact_offsets_dims[offsets_base + pair_idx];
+  int max_con = pair_contact_offsets_dims[offsets_base + pair_idx + 1] - offset;
+  int slot_rows_base = offsets_base + npairs + 1;
+  int raw_ncon = contact_count[world * npairs + pair_idx];
+  if (raw_ncon < 0) return;
+  int ncon = clamp(raw_ncon, 0, min(50, max_con));
+  int ba = geom_bodyid[a];
+  int bb = geom_bodyid[b];
+  int bo = world * nbody;
+  int jo = world * njnt;
+  device float* jacobian_record = jacobian_paired;
+  {
+    // World record base for low-plane writes in both packed and dense
+    // modes. Packed records reuse the hot kernel's header dance; dense
+    // records carry the same header. An invalid header fails closed
+    // (low plane stays cleared, high-word behavior is unchanged).
+    device int* header = reinterpret_cast<device int*>(jacobian_record);
+    int stride = header[9];
+    if (header[0] != CCJ_MAGIC || header[1] != CCJ_VERSION
+        || stride < CCJ_HEADER_WORDS
+        || stride > 0x7fffffff / max(world + 1, 1)) return;
+    jacobian_record += world * stride;
+  }
+  for (int k = 0; k < ncon; ++k) {
+    int slot = offset + k;
+    if (slot >= ncontacts_max) break;
+    int out = world * ncontacts_max + slot;
+    int jbase = out * 6 * nv;
+    int row_start = pair_contact_offsets_dims[slot_rows_base + slot];
+    int contact_base = (world * ncontacts_max + slot) * 37 + 12;
+    int res = (world * ncontacts_max + slot) * 37;
+    float3 point_hi = float3(contact_records[contact_base + 1],
+                             contact_records[contact_base + 2],
+                             contact_records[contact_base + 3]);
+    float3 normal_hi = float3(contact_records[contact_base + 4],
+                              contact_records[contact_base + 5],
+                              contact_records[contact_base + 6]);
+    PrimalFloat3Pair P = p3_pair(point_hi,
+        float3(contact_records[res + 25], contact_records[res + 26],
+               contact_records[res + 27]));
+    PrimalFloat3Pair N = p3_pair(normal_hi,
+        float3(contact_records[res + 28], contact_records[res + 29],
+               contact_records[res + 30]));
+    for (int dof_outer = 0; dof_outer < nv; ++dof_outer) {
+      PrimalFloatPair E[6] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f},
+                              {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+      bool visited = false;
+      for (int side = 0; side < 2; ++side) {
+        int body = side == 0 ? ba : bb;
+        float sign = side == 0 ? -1.0f : 1.0f;
+        while (body > 0 && body < nbody) {
+          int ja = body_jntadr[body];
+          int jn = body_jntnum[body];
+          for (int jj = 0; jj < jn; ++jj) {
+            int j = ja + jj;
+            int da = jnt_dofadr[j];
+            int typ = jnt_type[j];
+            int nd = typ == 0 ? 6 : typ == 1 ? 3 : 1;
+            for (int q = 0; q < nd; ++q) {
+              int dof = da + q;
+              if (dof < 0 || dof >= nv) continue;
+              if (dof != dof_outer) continue;
+              visited = true;
+              PrimalFloat3Pair col = {{0.0f, 0.0f}, {0.0f, 0.0f},
+                                      {0.0f, 0.0f}};
+              PrimalFloat3Pair angular = col;
+              if (typ == 2) {
+                col = p3_pair(float3(axes[(jo + j) * 3],
+                                     axes[(jo + j) * 3 + 1],
+                                     axes[(jo + j) * 3 + 2]),
+                              float3(0.0f));
+              } else if (typ == 3) {
+                PrimalFloat3Pair axis = p3_pair(
+                    float3(axes[(jo + j) * 3], axes[(jo + j) * 3 + 1],
+                           axes[(jo + j) * 3 + 2]), float3(0.0f));
+                angular = axis;
+                PrimalFloat3Pair anchor = p3_pair(
+                    float3(anchors[(jo + j) * 3], anchors[(jo + j) * 3 + 1],
+                           anchors[(jo + j) * 3 + 2]), float3(0.0f));
+                col = p3_cross(axis, p3_sub(P, anchor));
+              } else if (typ == 0 || typ == 1) {
+                if (typ == 0 && q < 3) {
+                  float3 unit = float3(q == 0, q == 1, q == 2);
+                  col = p3_pair(unit, float3(0.0f));
+                } else {
+                  int qrot = typ == 0 ? q - 3 : q;
+                  float3 unit = float3(qrot == 0, qrot == 1, qrot == 2);
+                  PrimalFloat4Pair bq = p4_pair(
+                      float4(body_quat[(bo + body) * 4],
+                             body_quat[(bo + body) * 4 + 1],
+                             body_quat[(bo + body) * 4 + 2],
+                             body_quat[(bo + body) * 4 + 3]),
+                      float4(body_quat_low[(bo + body) * 4],
+                             body_quat_low[(bo + body) * 4 + 1],
+                             body_quat_low[(bo + body) * 4 + 2],
+                             body_quat_low[(bo + body) * 4 + 3]));
+                  PrimalFloat3Pair axis = p3_rotate_quat(bq, p3_pair(unit, float3(0.0f)));
+                  angular = axis;
+                  PrimalFloat3Pair pivot;
+                  if (typ == 0) {
+                    pivot = p3_pair(
+                        float3(body_pos[(bo + body) * 3],
+                               body_pos[(bo + body) * 3 + 1],
+                               body_pos[(bo + body) * 3 + 2]),
+                        float3(body_pos_low[(bo + body) * 3],
+                               body_pos_low[(bo + body) * 3 + 1],
+                               body_pos_low[(bo + body) * 3 + 2]));
+                  } else {
+                    pivot = p3_pair(
+                        float3(anchors[(jo + j) * 3],
+                               anchors[(jo + j) * 3 + 1],
+                               anchors[(jo + j) * 3 + 2]), float3(0.0f));
+                  }
+                  col = p3_cross(axis, p3_sub(P, pivot));
+                }
+              }
+              PrimalFloatPair axis_j[6];
+              axis_j[0] = p3_dot(N, col);
+              axis_j[1] = p3_dot(p3_pair(float3(contact_records[contact_base + 7],
+                                                contact_records[contact_base + 8],
+                                                contact_records[contact_base + 9]),
+                                         float3(0.0f)), col);
+              axis_j[2] = p3_dot(p3_pair(float3(contact_records[contact_base + 10],
+                                                contact_records[contact_base + 11],
+                                                contact_records[contact_base + 12]),
+                                         float3(0.0f)), col);
+              axis_j[3] = p3_dot(N, angular);
+              axis_j[4] = p3_dot(p3_pair(float3(contact_records[contact_base + 7],
+                                                contact_records[contact_base + 8],
+                                                contact_records[contact_base + 9]),
+                                         float3(0.0f)), angular);
+              axis_j[5] = p3_dot(p3_pair(float3(contact_records[contact_base + 10],
+                                                contact_records[contact_base + 11],
+                                                contact_records[contact_base + 12]),
+                                         float3(0.0f)), angular);
+              for (int axis = 0; axis < 6; ++axis) {
+                PrimalFloatPair contrib = (sign > 0.0f) ? axis_j[axis]
+                    : primal_pair_neg(axis_j[axis]);
+                E[axis] = primal_pair_add(E[axis], contrib);
+              }
+            }
+          }
+          body = body_parentid[body];
+        }
+      }
+      if (!visited) continue;
+      for (int axis = 0; axis < 6; ++axis) {
+        float Jlo = 0.0f;
+        if (packed_rows) {
+          int row = -1;
+          PrimalFloatPair Eval = E[axis];
+          if (dim == 1) {
+            if (axis == 0) row = row_start;
+          } else if (axis < dim && cone > 0.5f) {
+            row = row_start + axis;
+          }
+          if (row >= 0) {
+            float Jhi = ccj_get(jacobian_record, row, dof_outer, nv);
+            Jlo = (Eval.hi - Jhi) + Eval.lo;
+            Jlo = Jlo + 0.0f;
+            ccj_set_lo(jacobian_record, row, dof_outer, Jlo, nv);
+          }
+          if (dim > 1 && cone < 0.5f && axis >= 1 && axis < dim) {
+            // Pyramidal friction combination rows mirror the hot kernel:
+            // row += axis_j[0] +/- mu * axis_j[axis].
+            float mu = pair_friction[pair_idx * 5 + axis - 1];
+            for (int s = 0; s < 2; ++s) {
+              float sgn = (s == 0) ? 1.0f : -1.0f;
+              PrimalFloatPair combo = primal_pair_add(
+                  E[0], primal_pair_multiply(E[axis], sgn * mu));
+              int combo_row = row_start + 2 * (axis - 1) + s;
+              float Jhi = ccj_get(jacobian_record, combo_row, dof_outer, nv);
+              float Clo = (combo.hi - Jhi) + combo.lo;
+              Clo = Clo + 0.0f;
+              ccj_set_lo(jacobian_record, combo_row, dof_outer, Clo, nv);
+            }
+          }
+        } else if (axis == 0) {
+          // Dense mode: canonical rows follow the solve-time pack mapping
+          // (slot row starts shared with the assembly table by
+          // construction), gated by the same row-activity flags. J_hi
+          // comes from the hot kernel's unpacked blocks.
+          int crbase = (world * ncontacts_max + slot) * 36;
+          if (contact_row_data[crbase] > 0.5f) {
+            if (dim == 1) {
+              float Jhi = jacobian[jbase + 0 * nv + dof_outer];
+              float Jlo = (E[0].hi - Jhi) + E[0].lo;
+              Jlo = Jlo + 0.0f;
+              ccj_set_lo(jacobian_record, row_start, dof_outer, Jlo, nv);
+            } else if (cone > 0.5f) {
+              for (int k = 0; k < dim; ++k) {
+                float Jhi = jacobian[jbase + k * nv + dof_outer];
+                float Jlo = (E[k].hi - Jhi) + E[k].lo;
+                Jlo = Jlo + 0.0f;
+                ccj_set_lo(jacobian_record, row_start + k, dof_outer,
+                           Jlo, nv);
+              }
+            } else {
+              for (int axis = 1; axis < dim; ++axis) {
+                float mu = pair_friction[pair_idx * 5 + axis - 1];
+                for (int s = 0; s < 2; ++s) {
+                  float sgn = (s == 0) ? 1.0f : -1.0f;
+                  float hi0 = jacobian[jbase + 0 * nv + dof_outer];
+                  float hia = jacobian[jbase + axis * nv + dof_outer];
+                  float Jhi = hi0 + sgn * mu * hia;
+                  PrimalFloatPair combo = primal_pair_add(
+                      E[0], primal_pair_multiply(E[axis], sgn * mu));
+                  int combo_row = row_start + 2 * (axis - 1) + s;
+                  float Jlo = (combo.hi - Jhi) + combo.lo;
+                  Jlo = Jlo + 0.0f;
+                  ccj_set_lo(jacobian_record, combo_row, dof_outer, Jlo,
+                             nv);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+
 
 inline bool primal_pair_is_finite(PrimalFloatPair value) {
   return isfinite(value.hi) && isfinite(value.lo);
@@ -8102,6 +8450,12 @@ kernel void solve_coupled_constraints(
     for (int i = 0; i < nv; ++i) {
       PrimalFloatPair force = primal_pair_fma(ccj_get(J_world, row, i, nv),
           {lam[row], lambda_low}, {out_force[qb + i], pgs_pair_tail[i]});
+      // Low-word Jacobian correction. Skipped (bitwise-identical legacy
+      // behavior) where the low plane is exactly zero.
+      float Jlo = ccj_get_lo(J_world, row, i, nv);
+      if (Jlo != 0.0f)
+        force = primal_pair_add(force, primal_pair_product(
+            {Jlo, 0.0f}, {lam[row], lambda_low}));
       out_force[qb + i] = force.hi;
       pgs_pair_tail[i] = force.lo;
     }
@@ -8131,6 +8485,61 @@ kernel void solve_coupled_constraints(
     }
   }
 
+  // Reconstruct qacc from the corrected force on Newton/CG primal paths.
+  // The Newton primal iterate minimizes the high-word-J objective; when
+  // 2e-8 Jacobian rounding is amplified by small inertias its minimum can
+  // sit 1e-2 off the CPU minimum even while multipliers are accurate
+  // (force-balance evidence). MuJoCo publishes qacc from the solved force
+  // (M qacc = qfrc_smooth + qfrc_constraint); mirror that data flow here
+  // with an exact diagonal mass solve. Diagonal mass covers free bodies
+  // (including the rigid-SDF fixtures); non-diagonal masses keep the
+  // Newton iterate (a paired general solve is future work, explicitly out
+  // of scope here). Skipped bit-identically when no low-word Jacobian
+  // corrections exist, so non-SDF behavior is unchanged. Sleeping DOFs
+  // keep the Newton values.
+  if (primal_acceleration_output && (solver_type == 1 || solver_type == 2)
+      && dims[20] >= 0 && nv <= 32) {
+    bool need_recon = false;
+    for (int row = 0; row < nr && !need_recon; ++row)
+      for (int i = 0; i < nv; ++i) {
+        if (ccj_get_lo(J_world, row, i, nv) != 0.0f) {
+          need_recon = true; break;
+        }
+      }
+    if (need_recon) {
+      device const float* mass_world = mass + mb;
+      bool diag_only = true;
+      for (int i = 0; i < nv && diag_only; ++i)
+        for (int k = 0; k < nv; ++k) {
+          float e = solver_mass_entry(mass_world, dbg_pre, dims,
+              solver_awake_tree, world, nv, i, k);
+          if (i == k) { if (!(e > 0.0f)) diag_only = false; }
+          else if (e != 0.0f) diag_only = false;
+        }
+      if (diag_only) {
+        for (int i = 0; i < nv; ++i) {
+          if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
+          PrimalFloatPair smooth = {qfrc[qb + i], paired_qfrc_input
+              ? qfrc[batch * nv + qb + i] : 0.0f};
+          PrimalFloatPair both = primal_pair_add(
+              smooth, {out_force[qb + i], pgs_pair_tail[i]});
+          float target = both.hi + both.lo;
+          if (provided_qacc_smooth) {
+            float mii = solver_mass_entry(mass_world, dbg_pre, dims,
+                solver_awake_tree, world, nv, i, i);
+            target = mii * (qfrc[qb + i] + (paired_qfrc_input
+                ? qfrc[batch * nv + qb + i] : 0.0f))
+                + out_force[qb + i] + pgs_pair_tail[i];
+          }
+          float mii = solver_mass_entry(mass_world, dbg_pre, dims,
+              solver_awake_tree, world, nv, i, i);
+          out_acc[qb + i] = target / mii;
+          out_acc[batch * nv + qb + i] = 0.0f;
+        }
+      }
+    }
+  }
+
   // Dense PGS forms qacc by summing independently rounded M^-1 J^T columns.
   // Recover the residual of that accepted iterate against the original mass
   // equation, then apply one bounded Cholesky correction in paired precision.
@@ -8148,9 +8557,14 @@ kernel void solve_coupled_constraints(
     device const float* mass_world = mass + mb;
     for (int i = 0; i < nv; ++i) {
       PrimalFloatPair force = {0.0f, 0.0f};
-      for (int row = 0; row < total_nr; ++row) if (enabled[row])
+      for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
         force = primal_pair_fma(ccj_get(J_world, row, i, nv),
             {lam[row], pgs_lambda_low[row]}, force);
+        float Jlo = ccj_get_lo(J_world, row, i, nv);
+        if (Jlo != 0.0f)
+          force = primal_pair_add(force, primal_pair_product(
+              {Jlo, 0.0f}, {lam[row], pgs_lambda_low[row]}));
+      }
       out_force[qb + i] = force.hi;
       constraint_force_low[i] = force.lo;
     }
@@ -9762,6 +10176,12 @@ kernel void solve_coupled_constraints_block(
     float total = 0.0f;
     for (int row = 0; row < nr; ++row)
       if (enabled[row]) total += ccj_get(J_world, row, i, nv) * lam[row];
+    // Low-word Jacobian correction (skipped when zero: bitwise legacy).
+    for (int row = 0; row < nr; ++row)
+      if (enabled[row]) {
+        float Jlo = ccj_get_lo(J_world, row, i, nv);
+        if (Jlo != 0.0f) total = fma(Jlo, lam[row], total);
+      }
     out_force[qb + i] = total;
   }
 

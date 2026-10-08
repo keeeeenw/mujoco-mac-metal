@@ -2208,6 +2208,7 @@ class MetalCoupledConstraints:
     # entry point does not enlarge the collision/SDF/solver compilation unit.
     self._equality_library = torch.mps.compile_shader(_EQUALITY_SHADER.read_text())
     self._contact_kernel = self._library.contact_normal
+    self._contact_jacobian_low_kernel = self._library.contact_jacobian_low
     self._mask_failed_candidate_worlds_kernel = (
         self._library.mask_failed_candidate_worlds)
     self._common_ccd_hfield_mesh_kernel = (
@@ -2362,7 +2363,8 @@ class MetalCoupledConstraints:
     self._jacobian_pattern = jacobian_pattern
     self._jacobian_layout = PackedJacobianLayout.create(
         d.nr, d.nv, pattern=jacobian_pattern,
-        mode=(PACKED_J_CSR if jacobian_kind == "sparse" else None))
+        mode=(PACKED_J_CSR if jacobian_kind == "sparse" else None),
+        paired=True)
     jacobian_layout = self._jacobian_layout
     # `_solver_dimension_tensor` is called while constructing `_constants`,
     # so the sparse-layout defaults must exist before that pack is evaluated.
@@ -2549,7 +2551,8 @@ class MetalCoupledConstraints:
       self._jacobian_pattern = pattern
       self._jacobian_layout = PackedJacobianLayout.create(
           d.nr, d.nv, pattern=pattern,
-          mode=(PACKED_J_CSR if kind == "sparse" else None))
+          mode=(PACKED_J_CSR if kind == "sparse" else None),
+          paired=True)
     nv, nr, ntree = d.nv, d.nr, self._solver_island_ntree
     layout_words = (int(self._component_operator_layout_device.numel())
                     if self._component_operator_layout_device is not None else 0)
@@ -2889,7 +2892,7 @@ class MetalCoupledConstraints:
       raise ValueError("sparse Jacobian profile has no compiled row pattern")
     jacobian_storage, jacobian_layout = packed_jacobian_device_storage(
         torch, self._device, b, pattern, nr=nr, nv=nv,
-        mode=(PACKED_J_CSR if kind == "sparse" else None))
+        mode=(PACKED_J_CSR if kind == "sparse" else None), paired=True)
     # Cache records have their own per-world immutable headers/maps and
     # independent numeric values. A plain clone also prevents later header
     # or support updates from aliasing retained POS state.
@@ -2921,8 +2924,7 @@ class MetalCoupledConstraints:
             max(b * (d.npairs if self._has_analytic_sdf_pairs else 0)
                 * self._sdf_seed_tile, 1),
             dtype=torch.int32, device=self._device),
-        "contact_jacobian": empty(contact_jacobian_size),
-        "pair_mask": torch.zeros(max(b * max(d.npairs, 1), 1), dtype=torch.float32, device=self._device),
+        "contact_jacobian": empty(contact_jacobian_size),        "pair_mask": torch.zeros(max(b * max(d.npairs, 1), 1), dtype=torch.float32, device=self._device),
         "workspace_J": jacobian_storage,
         "workspace_debug": empty(b * self._debug_stride),
         "position_context_zero": empty(b * nr),
@@ -3221,6 +3223,7 @@ class MetalCoupledConstraints:
             self._library.clear_selected_jacobian_values(
                 w["contact_jacobian"], clear_dims,
                 threads=(b * contact_width,), group_size=(128,))
+
       self._broadphase_kernel(
           poses["geom_pos"].reshape(-1),
           self._constants["geom_rbound"],
@@ -3425,6 +3428,44 @@ class MetalCoupledConstraints:
           w["contact_pair_count"], w["contact_pair_records"],
           threads=(b * d.npairs,), group_size=(1,),
       )
+      if self._has_analytic_sdf_pairs:
+        # Low-word Jacobian corrections only where SDF residual planes
+        # exist. Models without SDF pairs skip this dispatch entirely, so
+        # their behavior cannot change. Triple FK poses are required;
+        # a missing plane fails closed instead of silently degrading.
+        for pose_name in ("body_pos_low", "body_pos_tail",
+                          "body_quat_low", "body_quat_tail"):
+          pose_value = poses.get(pose_name)
+          if pose_value is None:
+            raise ValueError(
+                f"contact Jacobian correction requires FK pose {pose_name}")
+          expect = ((b, int(d.nbody), 3) if "pos" in pose_name
+                    else (b, int(d.nbody), 4))
+          if tuple(pose_value.shape) != expect:
+            raise ValueError(
+                f"FK pose {pose_name} has shape {tuple(pose_value.shape)}; "
+                f"expected {expect}")
+        self._contact_jacobian_low_kernel(
+            self._constants["geom_bodyid"], poses["body_pos"],
+            poses["body_pos_low"], poses["body_pos_tail"],
+            poses["body_quat"], poses["body_quat_low"],
+            poses["body_quat_tail"],
+            poses["joint_anchor"], poses["joint_axis"],
+            self._constants["body_parentid"], self._constants["body_jntadr"],
+            self._constants["body_jntnum"], self._constants["jnt_type"],
+            self._constants["jnt_dofadr"],
+            self._constants["pair_geoms"], self._constants["pair_condim"],
+            self._constants["pair_contact_offsets_dims"],
+            self._constants["pair_friction"],
+            w["contact_pair_records"],
+            (w["workspace_J"] if self._jacobian_layout.mode == 1
+             else w["contact_jacobian"]),
+            w["workspace_J"],
+            w["contact_pair_count"],
+            pair_maps.logical_to_packed.reshape(-1),
+            w["contact_row_data"],
+            threads=(b * d.npairs,), group_size=(1,),
+        )
       slot_flags = w["contact_row_data"][:b * nc * 36].reshape(b, nc, 36)[:, :, 0]
       slot_maps = self._slot_compaction.run(slot_flags,
                                              world_mask=candidate_world_mask)
@@ -3607,6 +3648,9 @@ class MetalCoupledConstraints:
           torch, w["workspace_J"], b, self._jacobian_layout,
           self._jacobian_pattern, source_rows, row_start,
           row_count=count, active=active)
+      self._zero_jacobian_lo_rows(
+          torch, w, b, self._jacobian_layout, self._jacobian_pattern,
+          row_start, row_start + count)
       return
     values = source_rows if active is None else source_rows * active.unsqueeze(-1)
     layout = self._jacobian_layout
@@ -3615,6 +3659,30 @@ class MetalCoupledConstraints:
       begin = base + row_start * nv
       end = begin + count * nv
       w["workspace_J"][begin:end].copy_(values[world].reshape(-1))
+      if layout.paired:
+        w["workspace_J"][begin + layout.nnz:end + layout.nnz].zero_()
+    return
+
+  @staticmethod
+  def _zero_jacobian_lo_rows(torch, w, b, layout, pattern, row_start,
+                             row_stop):
+    """Zero the low-word plane over a canonical row interval."""
+    if not layout.paired:
+      return
+    if layout.mode == 0:
+      for world in range(int(b)):
+        base = (world * layout.stride_words + layout.lo_values_offset()
+                + int(row_start) * layout.nv)
+        w["workspace_J"][base:base + (int(row_stop) - int(row_start))
+                          * layout.nv].zero_()
+      return
+    first = int(pattern.row_offsets[int(row_start)])
+    last = int(pattern.row_offsets[int(row_stop)])
+    if first == last:
+      return
+    for world in range(int(b)):
+      base = world * layout.stride_words + layout.lo_values_offset()
+      w["workspace_J"][base + first:base + last].zero_()
 
   def _clear_jacobian_rows(self, row_start, row_stop, world_mask=None):
     """Clear a canonical row interval while preserving packed CSR metadata."""
@@ -3636,19 +3704,26 @@ class MetalCoupledConstraints:
         dims[0] = b
         dims[1] = width
         dims[2] = int(layout.stride_words)
-        dims[3] = int(layout.values_offset + first)
-        dims[4:].copy_(world_mask)
         storage = w["workspace_J"]
         if layout.mode == 1:
           storage = storage.view(torch.float32)
-        self._library.clear_selected_jacobian_values(
-            storage, dims, threads=(b * width,), group_size=(128,))
+        # Clear the high plane and, on paired layouts, the low-word
+        # plane over the same masked rows; a single masked kernel call
+        # cannot span the two disjoint value intervals.
+        planes = (0, layout.nnz) if layout.paired else (0,)
+        for plane in planes:
+          dims[3] = int(layout.values_offset + first + plane)
+          dims[4:].copy_(world_mask)
+          self._library.clear_selected_jacobian_values(
+              storage, dims, threads=(b * width,), group_size=(128,))
       return
     if layout.mode == 0:
       for world in range(b):
         base = world * layout.stride_words + layout.values_offset
         begin, end = base + row_start * nv, base + row_stop * nv
         w["workspace_J"][begin:end].zero_()
+        if layout.paired:
+          w["workspace_J"][begin + layout.nnz:end + layout.nnz].zero_()
       return
     first = int(pattern.row_offsets[row_start])
     last = int(pattern.row_offsets[row_stop])
@@ -3661,6 +3736,9 @@ class MetalCoupledConstraints:
       # values untouched, allowing the next contact assembly to accumulate
       # onto the previous step's Jacobian.
       w["workspace_J"][value_base + first:value_base + last].zero_()
+      if layout.paired:
+        w["workspace_J"][value_base + layout.nnz + first:
+                          value_base + layout.nnz + last].zero_()
 
   def materialize_jacobian(self, storage=None):
     """Explicitly materialize dense canonical J for query/diagnostic APIs."""

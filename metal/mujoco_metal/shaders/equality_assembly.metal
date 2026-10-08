@@ -93,6 +93,86 @@ inline float ccj_get(device const float* record, int row, int dof, int nv) {
   if (lo >= rowptr[row + 1] || columns[lo] != dof) return 0.0f;
   return record[h[8] + lo];
 }
+// Low-word plane of a paired Jacobian record: same maps and order as the
+// high plane, values starting at values_offset + nnz. Callers guarantee a
+// paired record (all workspace_J records are paired); the plane-fit check
+// below is defensive and returns zeros on unpaired records.
+inline bool ccj_has_lo_plane(device const int* h) {
+  return h[8] + 2 * h[5] <= h[9];
+}
+inline float ccj_get_lo(device const float* record, int row, int dof, int nv) {
+  device const int* h = ccj_header(record);
+  if (!ccj_header_valid(h, h[3], nv)) return 0.0f;
+  if (!ccj_has_lo_plane(h)) return 0.0f;
+  if (row < 0 || row >= h[3] || dof < 0 || dof >= h[4]) return 0.0f;
+  int nnz = h[5];
+  if (h[2] == CCJ_DENSE)
+    return record[h[8] + nnz + row * h[4] + dof];
+  if (h[2] != CCJ_CSR) return 0.0f;
+  device const int* rowptr = reinterpret_cast<device const int*>(record) + h[6];
+  device const int* columns = reinterpret_cast<device const int*>(record) + h[7];
+  int lo = rowptr[row], hi = rowptr[row + 1];
+  if (lo < 0 || hi < lo || hi > nnz) return 0.0f;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (columns[mid] < 0 || columns[mid] >= h[4]) return 0.0f;
+    if (columns[mid] < dof) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo >= rowptr[row + 1] || columns[lo] != dof) return 0.0f;
+  return record[h[8] + nnz + lo];
+}
+inline void ccj_set_lo(device float* record, int row, int dof, float value, int nv) {
+  device int* h = ccj_header(record);
+  if (!ccj_header_valid(h, h[3], nv)) {
+    atomic_store_explicit(reinterpret_cast<device atomic_int*>(&h[10]), 1,
+                          memory_order_relaxed);
+    return;
+  }
+  if (!ccj_has_lo_plane(h)) return;
+  if (row < 0 || row >= h[3] || dof < 0 || dof >= h[4]) {
+    if (value != 0.0f && h[0] == CCJ_MAGIC)
+      atomic_store_explicit(reinterpret_cast<device atomic_int*>(&h[10]), 1,
+                            memory_order_relaxed);
+    return;
+  }
+  int nnz = h[5];
+  if (h[2] == CCJ_DENSE) {
+    record[h[8] + nnz + row * h[4] + dof] = value;
+    return;
+  }
+  if (h[2] != CCJ_CSR) {
+    if (value != 0.0f)
+      atomic_store_explicit(reinterpret_cast<device atomic_int*>(&h[10]), 1,
+                            memory_order_relaxed);
+    return;
+  }
+  device const int* rowptr = reinterpret_cast<device const int*>(record) + h[6];
+  device const int* columns = reinterpret_cast<device const int*>(record) + h[7];
+  int lo = rowptr[row], hi = rowptr[row + 1];
+  if (lo < 0 || hi < lo || hi > nnz) {
+    atomic_store_explicit(reinterpret_cast<device atomic_int*>(&h[10]), 1,
+                          memory_order_relaxed);
+    return;
+  }
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (columns[mid] < 0 || columns[mid] >= h[4]) {
+      atomic_store_explicit(reinterpret_cast<device atomic_int*>(&h[10]), 1,
+                            memory_order_relaxed);
+      return;
+    }
+    if (columns[mid] < dof) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo >= rowptr[row + 1] || columns[lo] != dof) {
+    if (value != 0.0f)
+      atomic_store_explicit(reinterpret_cast<device atomic_int*>(&h[10]), 1,
+                            memory_order_relaxed);
+    return;
+  }
+  record[h[8] + nnz + lo] = value;
+}
 inline void ccj_set(device float* record, int row, int dof, float value, int nv) {
   device int* h = ccj_header(record);
   if (!ccj_header_valid(h, h[3], nv)) {

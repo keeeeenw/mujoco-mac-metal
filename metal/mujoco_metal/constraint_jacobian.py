@@ -43,9 +43,19 @@ class PackedJacobianLayout:
   columns_offset: int
   values_offset: int
   stride_words: int
+  paired: int = 0
 
   @classmethod
-  def create(cls, nr, nv, *, pattern=None, mode=None):
+  def create(cls, nr, nv, *, pattern=None, mode=None, paired=False):
+    """Describe one per-world Jacobian record.
+
+    With ``paired`` true the record carries a second value plane holding
+    low-word corrections beside the high words (same maps, same order):
+    the low plane starts at ``values_offset + nnz`` and the stride grows
+    by ``nnz``. Header, maps and high-plane accesses are unchanged, so
+    existing readers keep working; low-plane accessors add the plane
+    offset explicitly.
+    """
     nr, nv = int(nr), int(nv)
     if nr < 0 or nv < 0:
       raise ValueError("packed Jacobian dimensions must be nonnegative")
@@ -67,9 +77,18 @@ class PackedJacobianLayout:
       rowptr = columns = 0
       values = PACKED_J_HEADER_WORDS
       stride = values + nnz
+    if paired:
+      stride += nnz
     if stride > np.iinfo(np.int32).max:
       raise ValueError("packed Jacobian record exceeds signed int32 addressing")
-    return cls(mode, nr, nv, nnz, rowptr, columns, values, stride)
+    return cls(mode, nr, nv, nnz, rowptr, columns, values, stride,
+               1 if paired else 0)
+
+  def lo_values_offset(self):
+    """Start of the low-word plane (paired layouts only)."""
+    if not self.paired:
+      raise ValueError("low-word plane requires a paired layout")
+    return self.values_offset + self.nnz
 
   def header(self):
     return np.asarray((PACKED_J_MAGIC, PACKED_J_VERSION, self.mode,
@@ -119,7 +138,8 @@ def initialize_packed_jacobian_records(storage_i32, batch_size, layout,
 
 
 def packed_jacobian_device_storage(torch, device, batch_size, pattern=None,
-                                  *, nr=None, nv=None, mode=None):
+                                  *, nr=None, nv=None, mode=None,
+                                  paired=False):
   """Allocate and initialize per-world CSR records on ``device``.
 
   Each world owns a complete typed header, row pointer, and column map. This
@@ -136,7 +156,7 @@ def packed_jacobian_device_storage(torch, device, batch_size, pattern=None,
   if mode is None:
     mode = PACKED_J_DENSE
   layout = PackedJacobianLayout.create(
-      int(nr), int(nv), pattern=pattern, mode=mode)
+      int(nr), int(nv), pattern=pattern, mode=mode, paired=paired)
   words = batch_size * layout.stride_words
   if words > np.iinfo(np.int32).max:
     raise ValueError("batched packed Jacobian exceeds signed int32 addressing")
