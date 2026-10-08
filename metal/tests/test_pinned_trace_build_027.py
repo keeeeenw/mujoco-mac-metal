@@ -155,7 +155,8 @@ def test_trace_source_diff_is_guarded_output_only():
                                          trace):
     kinds.add(match.group(1))
   for kind in ("step", "trial", "terminal", "seed", "stage", "gradpick",
-               "meshface", "meshseed", "precontact", "fps", "fps-pick"):
+               "meshface", "meshseed", "precontact", "fps", "fps-pick",
+               "aabb"):
     assert kind in kinds, kind
   for marker in ("amin = 1e-4", "dist - dist0 > wolfe", "sdf_initpoints",
                  "mju_Halton(j, 2)"):
