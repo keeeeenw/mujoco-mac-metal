@@ -84,7 +84,7 @@ def test_record_dist_lo_and_const_lo_present_gpu():
   nslots = 8
   los = [float(rec[i * 37 + 9]) for i in range(nslots)]
   assert any(v != 0.0 for v in los), los
-  clo = cc._constants["pair_const_lo"].cpu().numpy().reshape(-1, 9)
+  clo = cc._constants["pair_const_lo"].cpu().numpy().reshape(-1, 11)
   assert clo.shape[0] >= 1
   assert float(np.max(np.abs(clo))) > 0.0
   # Independent oracle: lo = f64 TRUE - f32 hi. This fixture resolves to
