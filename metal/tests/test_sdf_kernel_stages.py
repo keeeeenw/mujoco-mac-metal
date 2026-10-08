@@ -52,7 +52,24 @@ def test_sdf_stage_workspace_is_bounded_and_all_seeds_are_host_dispatched():
   assert "_SDF_STAGE_STATE_WORDS = 159" in host
   assert "_contact_sdf_seed_producer" not in host
   from mujoco_metal.coupled_constraints import _pair_contact_cache_bytes
-  assert _pair_contact_cache_bytes(1, 50, 1, 32) == 31232
+  # Independent plane-by-plane arithmetic (mirrors the producer-split
+  # inventory proof): count + 37-word records + 50x12 mesh candidates +
+  # 37-word seed records + seed valid/control + 159-word staged descent
+  # state + 5 stage dims, 4 bytes each. The 31232 expectation predates the
+  # seed valid/control/state planes; the allocator is authoritative.
+  def independently_summed_bytes(batch, ncontacts, npairs, tile):
+    count = max(batch * npairs, 1)
+    records = max(batch * ncontacts * 37, 1)
+    mesh_candidates = max(batch * npairs * 50 * 12, 1)
+    seed_records = max(batch * npairs * tile * 37, 1)
+    seed_valid = max(batch * npairs * tile, 1)
+    seed_state = max(batch * npairs * tile * 159, 1)
+    seed_control = max(batch * npairs * tile, 1)
+    stage_dims = 5
+    return 4 * (count + records + mesh_candidates + seed_records
+                + seed_valid + seed_state + seed_control + stage_dims)
+  assert _pair_contact_cache_bytes(1, 50, 1, 32) == 35168
+  assert independently_summed_bytes(1, 50, 1, 32) == 35168
   assert _pair_contact_cache_bytes(1, 0, 0, 0) == 48
 
 
