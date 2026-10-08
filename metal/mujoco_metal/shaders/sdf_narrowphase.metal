@@ -692,8 +692,21 @@ inline void sdf_mesh_face_candidates(int face_id,float3x3 R,float3 t,
       u=sw_sub(sw(1.0f),u);v=sw_sub(sw(1.0f),v);
     }
     SdfWide b0=sw_sub(sw_sub(sw(1.0f),u),v);
-    // Pinned seed nest fuses left-to-right (FMA form); the installed
-    // trajectory sends sp7 to the x2 basin only under this association.
+    // Seed-nest association (documented inference, see qualification notes).
+    // The pinned nest is inside a static function that cannot be bound even
+    // by the guarded diagnostic adapter, so its contraction is established
+    // by elimination, not by direct call: over the enumerated plausible
+    // associations (separate left/right nests and every fused-outer form),
+    // only fused-outer nests send seed 7 to the observed x2 contact basin
+    // (position verified through a fitted production map to 8 digits), and
+    // all fused-outer forms agree there. This matches the toolchain's
+    // behavior everywhere else it is directly observable (fused dots,
+    // sequential-FMA gradients, fused updates, all verified bitwise against
+    // the installed oracle). Portability limit: a non-fusing toolchain's
+    // binary could use a separate nest; native behavior does not depend on
+    // Metal compiler contraction because every nest step below is an
+    // explicit sw_source_fma builtin, and the 4-witness gate verifies the
+    // outcome on unchanged fixtures.
     SdfPointPair t1=sdf_mesh_pair_add_scaled(
         SdfPointPair{float3(0),float3(0),float3(0)},a,b0);
     SdfPointPair t2=sdf_mesh_pair_fma_scaled(t1,b,u);
@@ -732,6 +745,7 @@ inline void sdf_mesh_face_candidates_cached(int face_id,float3x3 R,float3 t,
       u=sw_sub(sw(1.0f),u);v=sw_sub(sw(1.0f),v);
     }
     SdfWide b0=sw_sub(sw_sub(sw(1.0f),u),v);
+    // Same fused-outer seed nest as above (documented inference there).
     SdfPointPair t1=sdf_mesh_pair_add_scaled(
         SdfPointPair{float3(0),float3(0),float3(0)},a,b0);
     SdfPointPair t2=sdf_mesh_pair_fma_scaled(t1,b,u);
