@@ -24,6 +24,38 @@ PACKED_J_DENSE = 0
 PACKED_J_CSR = 1
 
 
+def paired_jacobian_stride_words(nr, nv, *, mode=None, nnz=None, paired=True):
+  """Model-only per-world stride for a canonical Jacobian record.
+
+  Shared by capacity planning and allocation so the two cannot drift.
+  Production coupled records are always ``paired=True`` (high + low value
+  planes); pass ``paired=False`` explicitly only for high-only negative
+  controls. Dense: ``12 + nnz + (nnz if paired)`` with ``nnz = nr*nv``.
+  CSR: ``12 + nr + 1 + 2*nnz + (nnz if paired)``.
+  """
+  nr, nv = int(nr), int(nv)
+  if nr < 0 or nv < 0:
+    raise ValueError("packed Jacobian dimensions must be nonnegative")
+  if mode is None:
+    mode = PACKED_J_DENSE
+  mode = int(mode)
+  if mode not in (PACKED_J_DENSE, PACKED_J_CSR):
+    raise ValueError("packed Jacobian mode must be dense or CSR")
+  if mode == PACKED_J_CSR:
+    if nnz is None:
+      raise ValueError("CSR stride requires nnz")
+    nnz = int(nnz)
+    if nnz < 0:
+      raise ValueError("packed Jacobian nnz must be nonnegative")
+    stride = (PACKED_J_HEADER_WORDS + nr + 1 + 2 * nnz
+              + (nnz if paired else 0))
+  else:
+    stride = PACKED_J_HEADER_WORDS + nr * nv + (nr * nv if paired else 0)
+  if stride > np.iinfo(np.int32).max:
+    raise ValueError("packed Jacobian record exceeds signed int32 addressing")
+  return int(stride)
+
+
 @dataclass(frozen=True)
 class PackedJacobianLayout:
   """Typed per-world storage record for a canonical constraint Jacobian.
@@ -71,16 +103,13 @@ class PackedJacobianLayout:
       rowptr = PACKED_J_HEADER_WORDS
       columns = rowptr + nr + 1
       values = columns + nnz
-      stride = values + nnz
     else:
       nnz = nr * nv
       rowptr = columns = 0
       values = PACKED_J_HEADER_WORDS
-      stride = values + nnz
-    if paired:
-      stride += nnz
-    if stride > np.iinfo(np.int32).max:
-      raise ValueError("packed Jacobian record exceeds signed int32 addressing")
+    stride = paired_jacobian_stride_words(
+        nr, nv, mode=mode,
+        nnz=nnz, paired=bool(paired))
     return cls(mode, nr, nv, nnz, rowptr, columns, values, stride,
                1 if paired else 0)
 

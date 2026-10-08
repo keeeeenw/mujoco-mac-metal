@@ -197,9 +197,14 @@ def test_estimate_is_deterministic_and_counts_memory():
   assert sparse_runtime["smooth.mass"] == 0
   assert sparse_runtime["smooth.mass_blocks"] == 2 * layout["nnz"] * 4
   assert sparse_runtime["smooth.mass_armature"] == 2 * layout["nnz"] * 4
-  # This fixture uses MuJoCo's default CG solver, so the PGS smooth-force pair
-  # is not allocated in either dense or block-sparse mass mode.
-  assert sparse_runtime["component_smooth_acceleration_pair"] == 0
+  # The smooth-force pair follows actual allocation: dense-path models
+  # (nr<=96 and nv<=32) allocate it for any solver; otherwise only PGS.
+  # This CG fixture is small (dense path), so both mass modes allocate it.
+  assert sparse_runtime["component_smooth_acceleration_pair"] == 2 * 2 * 4 * 4
+  big = estimate_capacity(
+      model, 1, npairs=0, nslots=0, nr=200, mass_storage="block_sparse")
+  assert dict(big.memory_breakdown)[
+      "component_smooth_acceleration_pair"] == 0
   solver_breakdown = dict(sparse_estimate.memory_breakdown)
   sparse_solver = dict(estimate_workspace_expected(
       model, 2, 3, 5, 20, mass_storage="block_sparse"))
@@ -519,7 +524,8 @@ def test_cached_constraint_position_backings_have_exact_capacity_rows():
   assert sizes["position_qvel"] == 2 * 4 * 4
   assert sizes["position_current_qvel"] == 2 * 4 * 4
   # Per-world typed packed-J header is part of the persistent query cache.
-  assert sizes["position_cache_J"] == 2 * (12 + 5 * 4) * 4
+  # Paired records carry both high and low value planes.
+  assert sizes["position_cache_J"] == 2 * (12 + 2 * 5 * 4) * 4
   assert sizes["position_cache_rows"] == 2 * 7 * 5 * 4
   assert sizes["position_cache_impedance"] == 2 * 5 * 4
   assert sizes["position_cache_contact_data"] == 2 * 3 * 36 * 4
@@ -755,7 +761,8 @@ def estimate_workspace_expected(model, batch, npairs, nslots, nr,
   sizes = (
       max(b * nc * 36, 1), max(b * nc * 12, 1),
       max(b * nc * 6 * v, 1), max(b * max(npairs, 1), 1),
-      max(b * (12 + nr * v), 1), max(b * nr, 1), max(b * (nr * nr + 7 * nr
+      # Production coupled records are always paired (high + low planes).
+      max(b * (12 + 2 * nr * v), 1), max(b * nr, 1), max(b * (nr * nr + 7 * nr
                                     + primal_scratch_floats(
                                         v, nr, model.opt.solver, model.ntree,
                                         model.nbody, mass_storage)

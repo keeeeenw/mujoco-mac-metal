@@ -144,11 +144,15 @@ def test_packed_csr_jacobian_abi_uses_typed_header_and_checked_slots():
   model = _model(jacobian="sparse")
   descriptor = lower_coupled_constraints(model)
   pattern = descriptor.jacobian_pattern
+  # Production coupled records are always paired; keep an explicit
+  # unpaired layout below as the high-only negative control.
   layout = PackedJacobianLayout.create(
-      descriptor.nr, descriptor.nv, pattern=pattern)
+      descriptor.nr, descriptor.nv, pattern=pattern, paired=True)
   assert layout.mode == PACKED_J_CSR
+  assert layout.paired == 1
+  assert layout.lo_values_offset() == layout.values_offset + pattern.nnz
   assert layout.stride_words == (
-      12 + descriptor.nr + 1 + pattern.nnz + pattern.nnz)
+      12 + descriptor.nr + 1 + pattern.nnz + 2 * pattern.nnz)
 
   batch = 2
   words = np.full(batch * layout.stride_words, -1, dtype=np.int32)
@@ -208,7 +212,7 @@ def test_sparse_capacity_charges_per_world_csr_records_instead_of_dense_j():
   descriptor = lower_coupled_constraints(model)
   pattern = descriptor.jacobian_pattern
   layout = PackedJacobianLayout.create(
-      descriptor.nr, descriptor.nv, pattern=pattern)
+      descriptor.nr, descriptor.nv, pattern=pattern, paired=True)
   estimate = estimate_capacity(
       model, 2, descriptor.npairs, descriptor.ncontacts_max, descriptor.nr,
       neq=descriptor.neq, nr_joint=descriptor.nr_joint,
@@ -225,9 +229,9 @@ def test_packed_runtime_scatter_and_explicit_dense_materialization_cpu():
   descriptor = lower_coupled_constraints(model)
   pattern = descriptor.jacobian_pattern
   layout = PackedJacobianLayout.create(
-      descriptor.nr, descriptor.nv, pattern=pattern)
+      descriptor.nr, descriptor.nv, pattern=pattern, paired=True)
   storage, runtime_layout = packed_jacobian_device_storage(
-      torch, torch.device("cpu"), 2, pattern)
+      torch, torch.device("cpu"), 2, pattern, paired=True)
   assert runtime_layout == layout
   row_start = max(0, descriptor.nr - 2)
   count = descriptor.nr - row_start
@@ -261,10 +265,12 @@ def test_sparse_inverse_constraint_force_consumes_csr_without_dense_J():
   model = _model(jacobian="sparse")
   descriptor = lower_coupled_constraints(model)
   pattern = descriptor.jacobian_pattern
+  # High-only negative control: unaffected inverse/scatter paths keep
+  # working on explicitly unpaired records (no low plane).
   layout = PackedJacobianLayout.create(
-      descriptor.nr, descriptor.nv, pattern=pattern)
+      descriptor.nr, descriptor.nv, pattern=pattern, paired=False)
   storage, _ = packed_jacobian_device_storage(
-      torch, torch.device("cpu"), 2, pattern)
+      torch, torch.device("cpu"), 2, pattern, paired=False)
   # Start from the numerical values a producer would have emitted. The rows
   # are zero outside their topology-compiled support by construction.
   source = torch.zeros((2, descriptor.nr, descriptor.nv), dtype=torch.float32)
@@ -314,10 +320,12 @@ def test_sparse_elliptic_inverse_keeps_packed_j_after_contact_metadata_load():
   assert descriptor.ncontacts_max > 0
   assert int(descriptor.cone_type) == int(mujoco.mjtCone.mjCONE_ELLIPTIC)
   pattern = descriptor.jacobian_pattern
+  # High-only negative control: unaffected inverse/scatter paths keep
+  # working on explicitly unpaired records (no low plane).
   layout = PackedJacobianLayout.create(
-      descriptor.nr, descriptor.nv, pattern=pattern)
+      descriptor.nr, descriptor.nv, pattern=pattern, paired=False)
   storage, _ = packed_jacobian_device_storage(
-      torch, torch.device("cpu"), 2, pattern)
+      torch, torch.device("cpu"), 2, pattern, paired=False)
   dense = torch.zeros((2, descriptor.nr, descriptor.nv), dtype=torch.float32)
   for row in range(descriptor.nr):
     columns = pattern.row_columns(row)
@@ -365,10 +373,12 @@ def test_sparse_scatter_fails_closed_on_unsupported_nonzero_per_world():
   model = _model(jacobian="sparse")
   descriptor = lower_coupled_constraints(model)
   pattern = descriptor.jacobian_pattern
+  # High-only negative control: unaffected inverse/scatter paths keep
+  # working on explicitly unpaired records (no low plane).
   layout = PackedJacobianLayout.create(
-      descriptor.nr, descriptor.nv, pattern=pattern)
+      descriptor.nr, descriptor.nv, pattern=pattern, paired=False)
   storage, _ = packed_jacobian_device_storage(
-      torch, torch.device("cpu"), 2, pattern)
+      torch, torch.device("cpu"), 2, pattern, paired=False)
   row = next(r for r in range(descriptor.nr)
              if pattern.row_columns(r).size < descriptor.nv)
   support = set(map(int, pattern.row_columns(row)))
@@ -616,8 +626,10 @@ def test_primal_row_dot_products_match_dense_and_csr_headers(mode):
   model = _model(jacobian="sparse")
   descriptor = lower_coupled_constraints(model)
   pattern = descriptor.jacobian_pattern if mode == PACKED_J_CSR else None
+  # Explicit high-only negative control for the row-dot contract.
   layout = PackedJacobianLayout.create(
-      descriptor.nr, descriptor.nv, pattern=pattern, mode=mode)
+      descriptor.nr, descriptor.nv, pattern=pattern, mode=mode,
+      paired=False)
   batch = 2
   words = np.zeros(batch * layout.stride_words, dtype=np.int32)
   initialize_packed_jacobian_records(words, batch, layout, pattern)
@@ -663,3 +675,37 @@ def test_primal_coupled_shader_never_treats_packed_record_as_dense_rows():
   assert "component_row_rhs[dof] = ccj_get(J_world" in source
   assert "J_world + row * nv" not in source
   assert "J_world + b * nv" not in source
+
+
+def test_unpaired_layout_rejects_low_plane_and_zero_low_is_hi_only_cpu():
+  # Explicit high-only negative control: unpaired records have no low
+  # plane (access raises); a paired record with a zeroed low plane keeps
+  # high-word behavior bit-identically (the force-reconstruction gate
+  # `Jlo != 0` skips zero corrections).
+  from mujoco_metal.constraint_jacobian import (
+      PACKED_J_CSR, PackedJacobianLayout, initialize_packed_jacobian_records,
+      packed_jacobian_device_storage,
+  )
+  import torch
+  model = _model(jacobian="sparse")
+  descriptor = lower_coupled_constraints(model)
+  pattern = descriptor.jacobian_pattern
+  unpaired = PackedJacobianLayout.create(
+      descriptor.nr, descriptor.nv, pattern=pattern, paired=False)
+  assert unpaired.paired == 0
+  with pytest.raises(ValueError, match="low-word plane"):
+    unpaired.lo_values_offset()
+  storage, _ = packed_jacobian_device_storage(
+      torch, torch.device("cpu"), 1, pattern, paired=False)
+  assert storage.numel() == unpaired.stride_words
+  # Paired layout with a cleared low plane round-trips high words and
+  # reports a zero low plane.
+  paired = PackedJacobianLayout.create(
+      descriptor.nr, descriptor.nv, pattern=pattern, paired=True)
+  assert paired.stride_words == unpaired.stride_words + pattern.nnz
+  assert paired.lo_values_offset() == paired.values_offset + pattern.nnz
+  words = np.zeros(paired.stride_words, dtype=np.int32)
+  initialize_packed_jacobian_records(words, 1, paired, pattern)
+  f32 = words.view(np.float32)
+  assert float(np.max(np.abs(
+      f32[paired.lo_values_offset():paired.stride_words]))) == 0.0

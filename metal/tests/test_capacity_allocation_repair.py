@@ -39,7 +39,8 @@ def test_workspace_mirror_is_byte_exact_cpu():
   assert by_name["contact_jacobian"] == 2 * 2 * 6 * 1 * 4
   assert by_name["pair_mask"] == 2 * 1 * 4
   # Dense records keep the typed 12-word row-layout header ahead of values.
-  assert by_name["workspace_J"] == 2 * (12 + 3 * 1) * 4
+  # Production records are always paired (high + low planes).
+  assert by_name["workspace_J"] == 2 * (12 + 2 * 3 * 1) * 4
   assert by_name["position_cache_J"] == by_name["workspace_J"]
   assert by_name["position_context_zero"] == 2 * 3 * 4
   # PGS core plus qacc input/output, canonical labels, union-find and tree
@@ -248,3 +249,126 @@ def test_raised_ceilings_admit_beyond_old_caps_cpu():
   m2 = _plinko_model(n_friction=24, n_free=12)
   with pytest.raises(ValueError, match="exceeds capacity"):
     lower_coupled_constraints(m2)
+
+
+def test_paired_jacobian_dense_bytes_and_shared_stride_cpu():
+  # Production coupled records always carry high + low planes. The
+  # estimator must agree with the shared model-only stride definition:
+  # dense 12 + 2*nr*nv words per world (both workspace_J and cache).
+  from mujoco_metal.constraint_jacobian import paired_jacobian_stride_words
+  assert paired_jacobian_stride_words(16, 6, mode=0, paired=True) == 12 + 2 * 16 * 6
+  assert paired_jacobian_stride_words(16, 6, mode=0, paired=False) == 12 + 16 * 6
+  parts, _ = estimate_workspace(nv=6, npairs=1, nslots=8, nr=16,
+                                nr_joint=8, neq=0, batch=1)
+  by_name = dict(parts)
+  assert by_name["workspace_J"] == (12 + 2 * 16 * 6) * 4
+  assert by_name["position_cache_J"] == (12 + 2 * 16 * 6) * 4
+
+
+def test_paired_jacobian_csr_bytes_batch_and_zero_guards_cpu():
+  from mujoco_metal.constraint_jacobian import paired_jacobian_stride_words
+  assert (paired_jacobian_stride_words(16, 6, mode=1, nnz=48, paired=True)
+          == 12 + 16 + 1 + 3 * 48)
+  parts, _ = estimate_workspace(nv=6, npairs=1, nslots=8, nr=16,
+                                nr_joint=8, neq=0, batch=2,
+                                jacobian_kind="sparse", jacobian_nnz=48)
+  by_name = dict(parts)
+  assert by_name["workspace_J"] == 2 * (12 + 16 + 1 + 3 * 48) * 4
+  assert by_name["position_cache_J"] == 2 * (12 + 16 + 1 + 3 * 48) * 4
+  empty, _ = estimate_workspace(nv=0, npairs=0, nslots=0, nr=0,
+                                nr_joint=0, neq=0, batch=1,
+                                jacobian_kind="sparse", jacobian_nnz=0)
+  assert dict(empty)["workspace_J"] == (12 + 0 + 1 + 0) * 4
+  assert dict(empty)["position_cache_J"] == (12 + 0 + 1 + 0) * 4
+
+
+def test_paired_stride_rejects_signed_overflow_cpu():
+  from mujoco_metal.constraint_jacobian import paired_jacobian_stride_words
+  with pytest.raises(CapacityOverflow, match="signed int32"):
+    estimate_workspace(nv=1, npairs=1, nslots=1, nr=1, nr_joint=0,
+                       neq=0, batch=1, jacobian_kind="sparse",
+                       jacobian_nnz=SIGNED_I32_ELEMENT_LIMIT)
+  with pytest.raises(ValueError, match="signed int32"):
+    paired_jacobian_stride_words(0, 0, mode=1, nnz=SIGNED_I32_ELEMENT_LIMIT,
+                                paired=True)
+
+
+def test_budget_between_old_and_actual_paired_totals_rejects_cpu():
+  # Old high-only dense J for nv=6,nr=16 is 384 bytes per J buffer below
+  # the actual paired total. A memory budget inside that gap must reject
+  # via check_capacity (invoked before any device allocation).
+  from mujoco_metal.capacity import CapacityLimits
+  old_j = (12 + 16 * 6) * 4
+  new_j = (12 + 2 * 16 * 6) * 4
+  assert new_j - old_j == 384
+  m = _model()
+  est = estimate_capacity(m, 1, npairs=1, nslots=2, nr=4)
+  full = est.memory_bytes
+  assert full > 2 * (new_j - old_j)
+  # A budget covering everything except one J plane delta still rejects.
+  with pytest.raises(CapacityOverflow, match="memory"):
+    check_capacity(est, CapacityLimits(memory_budget_bytes=full - 1))
+  check_capacity(est, CapacityLimits(memory_budget_bytes=full))
+
+
+def test_paired_correction_uses_existing_tail_without_new_words_cpu():
+  # Paired W/solver correction introduces no new global words: J low
+  # planes are counted above; multiplier/rhs low words reuse the existing
+  # 8*nv+3*nr tail (pgs_rhs_low/lambda_low/aref_low for all solver
+  # types); accumulation beyond that is thread-local compensated
+  # arithmetic. Assert the tail formula still covers exactly three row
+  # planes and eight DOF planes.
+  parts, _ = estimate_workspace(nv=6, npairs=1, nslots=8, nr=16,
+                                nr_joint=8, neq=0, batch=1)
+  by_name = dict(parts)
+  # Tail length is embedded in workspace_debug; verify the 8*nv+3*nr
+  # structure by comparing two nv values with nr fixed (difference is
+  # exactly 8 words per DOF, no hidden paired-W plane).
+  parts2, _ = estimate_workspace(nv=7, npairs=1, nslots=8, nr=16,
+                                 nr_joint=8, neq=0, batch=1)
+  d1 = dict(parts2)["workspace_debug"] - by_name["workspace_debug"]
+  # nv 6->7 changes dense mass factor (v^2+2v: 48->63 = +15), the v*r
+  # Delassus-transpose block (96->112 = +16), equality scratch (12v:
+  # 72->84 = +12), qacc pair (2v: +2), and tail 8v (+8): total +53 words
+  # = +212 bytes. No hidden paired-W plane (that correction reuses the
+  # existing tail + thread-local arithmetic).
+  assert d1 == (15 + 16 + 12 + 2 + 8) * 4
+
+
+@_needs_gpu()
+def test_runtime_paired_buffers_match_estimates_gpu():
+  # Runtime-owned allocations must equal the pre-allocation estimates on
+  # real paired layouts, including batch>1 and the SDF fixture layout.
+  import os
+  assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
+  from mujoco_metal.coupled_constraints import MetalCoupledConstraints
+  from mujoco_metal.capacity import estimate_capacity
+  import sys
+  sys.path.insert(0, "metal/tests")
+  from test_bundled_sdf_rigid_oracle_019 import _plugin_sphere_model
+  for name in ("bowl",):
+    model = _plugin_sphere_model(name)
+    for batch in (1, 2):
+      cc = MetalCoupledConstraints(model, batch_size=batch)
+      est = estimate_capacity(
+          model, batch, cc.descriptor.npairs, cc.descriptor.ncontacts_max,
+          cc.descriptor.nr, neq=cc.descriptor.neq,
+          nr_joint=cc.descriptor.nr_joint,
+          mass_storage=cc._component_mass_storage,
+          jacobian_kind=str(getattr(cc.descriptor, "jacobian_kind", "dense")),
+          jacobian_nnz=(int(cc.descriptor.jacobian_pattern.nnz)
+                        if getattr(cc.descriptor, "jacobian_pattern", None)
+                        is not None else None))
+      by_name = dict(est.memory_breakdown)
+      w = cc._workspace
+      assert w["workspace_J"].numel() * 4 == by_name["workspace_J"]
+      assert w["position_cache_J"].numel() * 4 == by_name["position_cache_J"]
+      layout = cc._jacobian_layout
+      assert layout.paired == 1
+      assert layout.stride_words * 4 * batch == by_name["workspace_J"]
+  # Zero-row/contact guard: floor-only model keeps one-word sentinels.
+  m = _model()
+  cc0 = MetalCoupledConstraints(m, batch_size=1)
+  assert cc0._workspace["workspace_J"].numel() >= 1
+  assert cc0._workspace["position_cache_J"].numel() == (
+      cc0._workspace["workspace_J"].numel())

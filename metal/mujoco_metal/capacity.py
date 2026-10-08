@@ -1245,12 +1245,28 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
     if jacobian_nnz is None:
       raise ValueError("sparse Jacobian capacity requires compiled nnz")
     jacobian_nnz = _integer_count("jacobian_nnz", jacobian_nnz)
-    jacobian_words = (12 + nr + 1 + 2 * jacobian_nnz)
+    # Production coupled records are always paired (high + low value
+    # planes); count both via the shared model-only layout definition.
+    # Paired W/solver correction reuses the existing 8*nv+3*nr tail words
+    # (pgs_rhs_low/lambda_low/aref_low for all solver types) plus
+    # thread-local compensated arithmetic, so no additional global words
+    # beyond the J low planes are introduced here.
+    from mujoco_metal.constraint_jacobian import paired_jacobian_stride_words
+    try:
+      jacobian_words = paired_jacobian_stride_words(
+          nr, nv, mode=1, nnz=jacobian_nnz, paired=True)
+    except ValueError as exc:
+      raise CapacityOverflow(str(exc))
     if jacobian_words > SIGNED_I32_ELEMENT_LIMIT:
       raise CapacityOverflow("packed Jacobian record exceeds signed int32 range")
   else:
     jacobian_nnz = nv * nr
-    jacobian_words = 12 + nv * nr
+    from mujoco_metal.constraint_jacobian import paired_jacobian_stride_words
+    try:
+      jacobian_words = paired_jacobian_stride_words(
+          nr, nv, mode=0, nnz=jacobian_nnz, paired=True)
+    except ValueError as exc:
+      raise CapacityOverflow(str(exc))
   v = max(nv, 1)
   primal_scratch = primal_scratch_floats(
       nv, nr, solver_type, ntree, nbody, mass_storage)
@@ -1332,17 +1348,17 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
       ("position_cache_pair_overflow", _bytes_i32(b)),
       # PGS may split canonical row assembly from sparse component-wise
       # application of M^-1. The RHS backing holds all logical rows plus the
-      # smooth-force row; it is allocated only for the PGS solver path.
+      # smooth-force row; it is allocated whenever the PGS solver path is
+      # selected (mirroring prepare_workspace, which gates only on solver).
       ("component_mass_rhs", _bytes(
           guarded(b * (int(nr) + 1) * int(nv))
-          if (component_configured
-              and int(solver_type) == int(mujoco.mjtSolver.mjSOL_PGS)
-              and int(nv) > 0) else 0)),
+          if int(solver_type) == int(mujoco.mjtSolver.mjSOL_PGS) else 0)),
       ("component_smooth_acceleration_pair", _bytes(
           guarded(2 * b * int(nv))
-          if ((mass_storage == "dense"
-               or int(solver_type) == int(mujoco.mjtSolver.mjSOL_PGS))
-              and int(nv) > 0) else 0)),
+          if (int(nv) > 0 and (
+              (int(nr) <= DENSE_ROW_THRESHOLD and int(nv) <= 32)
+              or int(solver_type) == int(mujoco.mjtSolver.mjSOL_PGS)))
+          else 0)),
       # Reusable acceleration-space primal-solver scratch shares the debug
       # binding to preserve Metal's 31-buffer ABI.
       ("workspace_debug", _bytes(guarded(
