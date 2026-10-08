@@ -8476,8 +8476,9 @@ kernel void solve_coupled_constraints(
     // survive in the published force/acceleration; certificates,
     // reconstruction and published lambda share one coherent value. Skipped bit-identically
     // without low-word corrections; elliptic-cone rows keep primal values
-    // (box projection is wrong for SOC); component stages (-2/-3, no
-    // dense L) keep the hi-only system.
+    // (box projection is wrong for SOC), equality rows keep primal values
+    // (separate paired aref plane in equality assembly); component stages
+    // (-2/-3, no dense L) keep the hi-only system.
     if ((solver_type == 1 || solver_type == 2) && dims[20] >= 0) {
       bool refine_any_jlo = false;
       for (int row = 0; row < total_nr && !refine_any_jlo; ++row)
@@ -8533,6 +8534,13 @@ kernel void solve_coupled_constraints(
         for (int sweep = 0; sweep < 4; ++sweep) {
           bool moved = false;
           for (int row = 0; row < total_nr; ++row) if (enabled[row] && !elliptic_member[row]) {
+            // Equality rows own a separate paired aref (different plane in
+            // equality assembly); the contact aref_low plane carries no
+            // correction for them, so refining them here would corrupt
+            // their multipliers. They keep primal (hi-consistent) values.
+            // Tendon rows are hi-only end to end (no tendon low plane
+            // exists), so their b rebuild with aref_low == 0 is coherent.
+            if (row < n_eq_rows) continue;
             PrimalFloatPair wlam = {0.0f, 0.0f};
             PrimalFloatPair ja = {0.0f, 0.0f};
             for (int i = 0; i < nv; ++i) {
