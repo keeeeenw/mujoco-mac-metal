@@ -8577,7 +8577,10 @@ kernel void solve_coupled_constraints(
           float e = solver_mass_entry(mass_world, dbg_pre, dims,
               solver_awake_tree, world, nv, i, k);
           if (i == k) { if (!(e > 0.0f)) diag_only = false; }
-          else if (e != 0.0f) diag_only = false;
+          // Exact-zero test rejects float32 rotation noise (~1e-13) on
+          // theoretically diagonal free-body inertia; gate with a tight
+          // absolute bound far below any physical coupling.
+          else if (e > 1e-09f || e < -1e-09f) diag_only = false;
         }
       if (diag_only) {
         for (int i = 0; i < nv; ++i) {

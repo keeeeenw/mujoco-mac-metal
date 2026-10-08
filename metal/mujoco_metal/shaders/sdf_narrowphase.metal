@@ -1254,6 +1254,128 @@ inline SdfMatrixWide sdf_quat_matrix_wide_qw(SdfWide qw, SdfWide qx,
   sdf_matrix_set(out, 1, 2, r21);
   return out;
 }
+// Pinned quaternion helpers (mji_/mju_ spatial ops) in wide arithmetic.
+// Used for mapPose-equivalent T construction; fusion choices match voted
+// pinned behavior (plain unless a vote proves otherwise).
+inline void sdf_quat_neg_wide(SdfWide qw, SdfWide qx, SdfWide qy, SdfWide qz,
+                              thread SdfWide& rw, thread SdfWide& rx,
+                              thread SdfWide& ry, thread SdfWide& rz) {
+  rw = qw;
+  rx = sw_neg(qx);
+  ry = sw_neg(qy);
+  rz = sw_neg(qz);
+}
+inline void sdf_quat_mul_wide(SdfWide aw, SdfWide ax, SdfWide ay, SdfWide az,
+                              SdfWide bw, SdfWide bx, SdfWide by, SdfWide bz,
+                              thread SdfWide& rw, thread SdfWide& rx,
+                              thread SdfWide& ry, thread SdfWide& rz) {
+  // Plain left-assoc (no FMA in source): ((a*b-c*d)-e*f)-g*h etc.
+  SdfWide t0 = sw_sub(sw_sub(sw_sub(sw_mul(aw, bw), sw_mul(ax, bx)),
+                                 sw_mul(ay, by)), sw_mul(az, bz));
+  SdfWide t1 = sw_sub(sw_add(sw_add(sw_mul(aw, bx), sw_mul(ax, bw)),
+                                        sw_mul(ay, bz)), sw_mul(az, by));
+  SdfWide t2 = sw_add(sw_sub(sw_add(sw_mul(aw, by), sw_mul(az, bx)),
+                                        sw_mul(ax, bz)), sw_mul(ay, bw));
+  // Note: source t2 = aw*by - ax*bz + ay*bw + az*bx left-assoc:
+  // ((aw*by - ax*bz) + ay*bw) + az*bx. Above matches.
+  SdfWide t3 = sw_add(sw_sub(sw_add(sw_mul(aw, bz), sw_mul(ax, by)),
+                                        sw_mul(ay, bx)), sw_mul(az, bw));
+  // Source t3 = aw*bz + ax*by - ay*bx + az*bw left-assoc.
+  rw = t0; rx = t1; ry = t2; rz = t3;
+}
+inline void sdf_quat_normalize4_wide(thread SdfWide& qw, thread SdfWide& qx,
+                                     thread SdfWide& qy, thread SdfWide& qz) {
+  // mju_normalize4: norm = sqrt(dot4); if <MINVAL set identity; else if
+  // |norm-1|>MINVAL scale by 1/norm (two roundings: rcp then mul).
+  // Dot uses plain left-assoc adds (source order, no FMA).
+  SdfWide d01 = sw_add(sw_mul(qw, qw), sw_mul(qx, qx));
+  SdfWide d012 = sw_add(d01, sw_mul(qy, qy));
+  SdfWide d0123 = sw_add(d012, sw_mul(qz, qz));
+  SdfWide norm = sw_sqrt(d0123);
+  if (sw_sign(sw_sub(norm, sw_source_minval())) < 0) {
+    qw = sw(1.0f); qx = sw(0.0f); qy = sw(0.0f); qz = sw(0.0f);
+    return;
+  }
+  SdfWide diff = sw_sub(norm, sw(1.0f));
+  // |norm-1| <= MINVAL keeps the input (no scaling).
+  bool near_one = !(sw_sign(diff) > 0 || sw_sign(sw_neg(diff)) > 0) ||
+      (sw_sign(diff) > 0 ? sw_sign(sw_sub(diff, sw_source_minval())) < 0
+                         : sw_sign(sw_sub(sw_neg(diff),
+                                          sw_source_minval())) < 0);
+  // Simpler exact test: |diff| <= MINVAL via signs.
+  SdfWide adiff = sw_sign(diff) < 0 ? sw_neg(diff) : diff;
+  if (sw_sign(sw_sub(adiff, sw_source_minval())) <= 0) return;
+  (void)near_one;
+  SdfWide ninv = sw_div(sw(1.0f), norm);
+  qw = sw_mul(qw, ninv);
+  qx = sw_mul(qx, ninv);
+  qy = sw_mul(qy, ninv);
+  qz = sw_mul(qz, ninv);
+}
+inline void sdf_rotVecQuat_wide(SdfWide vx, SdfWide vy, SdfWide vz,
+                                SdfWide qw, SdfWide qx, SdfWide qy, SdfWide qz,
+                                thread SdfWide& rx, thread SdfWide& ry,
+                                thread SdfWide& rz) {
+  // Pinned mji_rotVecQuat plain source order (fusion voted separately;
+  // plain first, matching source left-assoc).
+  // Zero-vec and null-quat fast paths use exact equality on represented
+  // values (CPU tests float64 ==0/==1; triples exact in those cases).
+  bool zero_vec = (vx.hi == 0.0f && vx.mid == 0.0f && vx.lo == 0.0f &&
+                   vy.hi == 0.0f && vy.mid == 0.0f && vy.lo == 0.0f &&
+                   vz.hi == 0.0f && vz.mid == 0.0f && vz.lo == 0.0f);
+  bool null_quat = (qw.hi == 1.0f && qw.mid == 0.0f && qw.lo == 0.0f &&
+                    qx.hi == 0.0f && qx.mid == 0.0f && qx.lo == 0.0f &&
+                    qy.hi == 0.0f && qy.mid == 0.0f && qy.lo == 0.0f &&
+                    qz.hi == 0.0f && qz.mid == 0.0f && qz.lo == 0.0f);
+  if (zero_vec) {
+    rx = sw(0.0f); ry = sw(0.0f); rz = sw(0.0f);
+    return;
+  }
+  if (null_quat) {
+    rx = vx; ry = vy; rz = vz;
+    return;
+  }
+  SdfWide t0 = sw_sub(sw_add(sw_mul(qw, vx), sw_mul(qy, vz)),
+                                 sw_mul(qz, vy));
+  SdfWide t1 = sw_sub(sw_add(sw_mul(qw, vy), sw_mul(qz, vx)),
+                                 sw_mul(qx, vz));
+  SdfWide t2 = sw_sub(sw_add(sw_mul(qw, vz), sw_mul(qx, vy)),
+                                 sw_mul(qy, vx));
+  rx = sw_add(vx, sw_mul(sw(2.0f),
+                         sw_sub(sw_mul(qy, t2), sw_mul(qz, t1))));
+  ry = sw_add(vy, sw_mul(sw(2.0f),
+                         sw_sub(sw_mul(qz, t0), sw_mul(qx, t2))));
+  rz = sw_add(vz, sw_mul(sw(2.0f),
+                         sw_sub(sw_mul(qx, t1), sw_mul(qy, t0))));
+}
+// Pinned mapPose: (pos2,quat2)^-1 o (pos1,quat1) -> (pos12, mat12).
+// neg = negPose(pos2,quat2); (pos12,quat12) = mulPose(neg, pos1,quat1);
+// mat12 = quat2Mat(quat12).
+inline void sdf_mapPose_wide(SdfWide px1, SdfWide py1, SdfWide pz1,
+                             SdfWide qw1, SdfWide qx1, SdfWide qy1,
+                             SdfWide qz1,
+                             SdfWide px2, SdfWide py2, SdfWide pz2,
+                             SdfWide qw2, SdfWide qx2, SdfWide qy2,
+                             SdfWide qz2,
+                             thread SdfWide& ox, thread SdfWide& oy,
+                             thread SdfWide& oz,
+                             thread SdfMatrixWide& mat) {
+  SdfWide nqw, nqx, nqy, nqz;
+  sdf_quat_neg_wide(qw2, qx2, qy2, qz2, nqw, nqx, nqy, nqz);
+  SdfWide npx, npy, npz;
+  sdf_rotVecQuat_wide(px2, py2, pz2, nqw, nqx, nqy, nqz, npx, npy, npz);
+  npx = sw_neg(npx); npy = sw_neg(npy); npz = sw_neg(npz);
+  SdfWide q12w, q12x, q12y, q12z;
+  sdf_quat_mul_wide(nqw, nqx, nqy, nqz, qw1, qx1, qy1, qz1,
+                    q12w, q12x, q12y, q12z);
+  sdf_quat_normalize4_wide(q12w, q12x, q12y, q12z);
+  SdfWide rpx, rpy, rpz;
+  sdf_rotVecQuat_wide(px1, py1, pz1, nqw, nqx, nqy, nqz, rpx, rpy, rpz);
+  ox = sw_add(rpx, npx);
+  oy = sw_add(rpy, npy);
+  oz = sw_add(rpz, npz);
+  mat = sdf_quat_matrix_wide_qw(q12w, q12x, q12y, q12z);
+}
 inline SdfMatrixWide sdf_quat_matrix_wide(float4 q) {
   return sdf_quat_matrix_wide_qw(sw(q.x), sw(q.y), sw(q.z), sw(q.w));
 }
@@ -1291,50 +1413,49 @@ inline SdfTransformWide sdf_reverse_transform_wide(
   }
   return result;
 }
-// Wide-pose variants: same formulas, but quaternion/position words come
-// from FK triple planes (hi/lo/tail) instead of float32 promotion, so
-// sub-ulp32 residuals survive into T12/T21. Positions are SdfWide triples,
-// quats are (w,x,y,z) SdfWide quads in the same order as float4.
+// Wide-pose variants via pinned mapPose (not matrix multiply): T12/T21 must
+// match CPU offset/rotation bit-for-bit, including the near-identity R2
+// rounding. Positions are SdfWide triples, quats are (w,x,y,z) SdfWide.
 inline SdfTransformWide sdf_relative_transform_wide_wide(
     SdfWide qw_from, SdfWide qx_from, SdfWide qy_from, SdfWide qz_from,
     SdfWide qw_to, SdfWide qx_to, SdfWide qy_to, SdfWide qz_to,
     SdfWide px_from, SdfWide py_from, SdfWide pz_from,
     SdfWide px_to, SdfWide py_to, SdfWide pz_to) {
-  SdfMatrixWide Rfrom = sdf_quat_matrix_wide_qw(qw_from, qx_from, qy_from,
-                                               qz_from);
-  SdfMatrixWide Rto = sdf_quat_matrix_wide_qw(qw_to, qx_to, qy_to, qz_to);
   SdfTransformWide result;
-  result.rotation = sdf_matrix_multiply(sdf_matrix_transpose(Rto), Rfrom);
-  SdfWide delta[3] = {sw_sub(px_from, px_to),
-                      sw_sub(py_from, py_to),
-                      sw_sub(pz_from, pz_to)};
-  SdfMatrixWide inverse = sdf_matrix_transpose(Rto);
-  for (int row = 0; row < 3; ++row) {
-    SdfWide value = sw_mul(sdf_matrix_get(inverse, 0, row), delta[0]);
-    value = sw_add(value, sw_mul(sdf_matrix_get(inverse, 1, row), delta[1]));
-    value = sw_add(value, sw_mul(sdf_matrix_get(inverse, 2, row), delta[2]));
-    result.translation[row] = value;
-  }
+  SdfWide ox, oy, oz;
+  SdfMatrixWide mat;
+  sdf_mapPose_wide(px_from, py_from, pz_from, qw_from, qx_from, qy_from,
+                   qz_from, px_to, py_to, pz_to, qw_to, qx_to, qy_to, qz_to,
+                   ox, oy, oz, mat);
+  result.rotation = mat;
+  result.translation[0] = ox;
+  result.translation[1] = oy;
+  result.translation[2] = oz;
   return result;
 }
 inline SdfTransformWide sdf_reverse_transform_wide_wide(
     SdfTransformWide forward,
     SdfWide qw_from, SdfWide qx_from, SdfWide qy_from, SdfWide qz_from,
+    SdfWide qw_to, SdfWide qx_to, SdfWide qy_to, SdfWide qz_to,
     SdfWide px_from, SdfWide py_from, SdfWide pz_from,
     SdfWide px_to, SdfWide py_to, SdfWide pz_to) {
+  // T21 is the direct mapPose (SDF->analytic), not the algebraic inverse
+  // of T12: CPU builds offset21/rotation21 independently, and rounding
+  // differs from inverting T12. The forward arg is unused (kept for call
+  // compatibility); both quats/positions are required.
+  // Note: callers pass (qw1.. = analytic, qw2.. = SDF) with forward=T12;
+  // T21 = mapPose(SDF, analytic) = mapPose(px2,q2, px1,q1).
+  (void)forward;
   SdfTransformWide result;
-  result.rotation = sdf_matrix_transpose(forward.rotation);
-  SdfMatrixWide inverse = sdf_matrix_transpose(
-      sdf_quat_matrix_wide_qw(qw_from, qx_from, qy_from, qz_from));
-  SdfWide delta[3] = {sw_sub(px_to, px_from),
-                      sw_sub(py_to, py_from),
-                      sw_sub(pz_to, pz_from)};
-  for (int row = 0; row < 3; ++row) {
-    SdfWide value = sw_mul(sdf_matrix_get(inverse, 0, row), delta[0]);
-    value = sw_add(value, sw_mul(sdf_matrix_get(inverse, 1, row), delta[1]));
-    value = sw_add(value, sw_mul(sdf_matrix_get(inverse, 2, row), delta[2]));
-    result.translation[row] = value;
-  }
+  SdfWide ox, oy, oz;
+  SdfMatrixWide mat;
+  sdf_mapPose_wide(px_to, py_to, pz_to, qw_to, qx_to, qy_to, qz_to,
+                   px_from, py_from, pz_from, qw_from, qx_from, qy_from,
+                   qz_from, ox, oy, oz, mat);
+  result.rotation = mat;
+  result.translation[0] = ox;
+  result.translation[1] = oy;
+  result.translation[2] = oz;
   return result;
 }
 inline SdfTransformWide sdf_transform_transpose(SdfTransformWide T) {
@@ -2069,7 +2190,8 @@ inline bool sdf_stage_seed_init_wide(int t1, float3 sz1,
       qw1, qx1, qy1, qz1, qw2, qx2, qy2, qz2,
       px1, py1, pz1, px2, py2, pz2);
   SdfTransformWide T21 = sdf_reverse_transform_wide_wide(
-      T12, qw1, qx1, qy1, qz1, px1, py1, pz1, px2, py2, pz2);
+      T12, qw1, qx1, qy1, qz1, qw2, qx2, qy2, qz2,
+      px1, py1, pz1, px2, py2, pz2);
   SdfPointPair lo = {float3(SDF_MAXVAL), float3(0.0f), float3(0.0f)};
   SdfPointPair hi = {float3(-SDF_MAXVAL), float3(0.0f), float3(0.0f)};
   SdfWide lower1[3], upper1[3], lower2[3], upper2[3];
@@ -2112,7 +2234,14 @@ inline bool sdf_stage_seed_init_wide(int t1, float3 sz1,
     SdfWide value = sw_add(l, sw_mul(sw_sub(h, l), halton));
     sdf_point_store(s1, a, value);
   }
-  SdfPointPair x = sdf_pair_transform(T12, s1);
+  // Pinned mjc_SDF seed loop is two-step: y = R2*s1+off2 (near-identity
+  // self-map, rounding included), then x = R12*y+off12. Skipping R2 loses
+  // its 1ulp rounding vs CPU.
+  SdfTransformWide T22 = sdf_relative_transform_wide_wide(
+      qw1, qx1, qy1, qz1, qw1, qx1, qy1, qz1,
+      px1, py1, pz1, px1, py1, pz1);
+  SdfPointPair y = sdf_pair_transform(T22, s1);
+  SdfPointPair x = sdf_pair_transform(T12, y);
   sdf_stage_store_point(state, state_base + SDF_STAGE_X, x);
   sdf_stage_store_transform(state, state_base + SDF_STAGE_T21, T21);
   sdf_stage_store_wide(state, state_base + SDF_STAGE_DIST,

@@ -168,6 +168,9 @@ def _source_pair_replay(model, data, sdf_geom, analytic_geom):
   sdf_dist, sdf_grad = _plugin_callbacks(model, data, sdf_geom)
   offset21, rotation21 = _pose_map(data, sdf_geom, analytic_geom)
   offset12, rotation12 = _pose_map(data, analytic_geom, sdf_geom)
+  # Pinned mjc_SDF seed loop is two-step (self-map R2 then R12); skipping R2
+  # loses its 1ulp rounding vs CPU at rotated states.
+  offset2, rotation2 = _pose_map(data, analytic_geom, analytic_geom)
   geom_aabb = np.asarray(model.geom_aabb, dtype=np.float64).reshape(-1)
   aabb1 = geom_aabb[6 * analytic_geom:6 * analytic_geom + 6]
   aabb2 = geom_aabb[6 * sdf_geom:6 * sdf_geom + 6]
@@ -260,7 +263,9 @@ def _source_pair_replay(model, data, sdf_geom, analytic_geom):
         lo[1] + (hi[1] - lo[1]) * mujoco.mju_Halton(seed, 3),
         lo[2] + (hi[2] - lo[2]) * mujoco.mju_Halton(seed, 5)],
         dtype=np.float64)
-    point = _matvec(rotation12, start) + offset12
+    # Two-step pinned seed transform (see above).
+    mid = _matvec(rotation2, start) + offset2
+    point = _matvec(rotation12, mid) + offset12
     collision_x, collision_dist, collision = descend(
         point, 2, int(model.opt.sdf_iterations))
     intersection_x, intersection_dist, intersection = descend(

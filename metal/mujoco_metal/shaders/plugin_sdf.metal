@@ -417,14 +417,16 @@ inline SdfJet sjlength2(SdfJet x, SdfJet y) {
     // origin is the norm of that coordinate's component directions.
     return sj(0.0f, sqrt(x.d*x.d + y.d*y.d));
   }
-  return sjsqrt(sjadd(sjmul(x,x),sjmul(y,y)));
+  // Match pinned mju_norm(n=2): y-first fused (voted).
+  return sjsqrt(sjfma(x, x, sjmul(y, y)));
 }
 inline SdfJet sjlength3(SdfJet x, SdfJet y, SdfJet z) {
   if (sjcompare(x,sj(0.0f))==0 && sjcompare(y,sj(0.0f))==0 &&
       sjcompare(z,sj(0.0f))==0) {
     return sj(0.0f, sqrt(x.d*x.d + y.d*y.d + z.d*z.d));
   }
-  return sjsqrt(sjadd(sjadd(sjmul(x,x),sjmul(y,y)),sjmul(z,z)));
+  // Match pinned mju_norm3: y-first fused dot (voted 133-0).
+  return sjsqrt(sjfma(z, z, sjfma(x, x, sjmul(y, y))));
 }
 inline SdfJet sjunion(SdfJet a,SdfJet b) { return sjmin(a,b); }
 inline SdfJet sjintersection(SdfJet a,SdfJet b) { return sjmax(a,b); }
