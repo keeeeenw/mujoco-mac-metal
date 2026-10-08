@@ -8488,12 +8488,10 @@ kernel void solve_coupled_constraints(
       enabled[row] = solver_row_island[row] >= 0;
     // 8b. Projected dual refinement (Newton/CG, dense only).
     // Runs only when every island stopped early (max island iterations
-    // below the per-island maxiter budget) AND the primal iterate converged
-    // (primal_residual <= tol): it polishes converged solutions and never
-    // extends an explicit iteration budget or substitutes for an
-    // unconverged finite iterate. Budget-exhausted iterates (including the
-    // entire 0/1/2-iteration contract) are published raw, exactly as the
-    // primal solver left them.
+    // below the per-island maxiter budget): it polishes early-stopped
+    // solutions and never extends an explicit iteration budget.
+    // Budget-exhausted iterates (including the entire 0/1/2-iteration
+    // contract) are published raw, exactly as the primal solver left them.
     // The primal iterate minimizes the working-precision objective; small
     // inertias can leave the dual residual of the accepted multipliers
     // several ulps off zero against the EFFECTIVE operator (paired J,
@@ -8523,7 +8521,7 @@ kernel void solve_coupled_constraints(
     // the unconditional paired force reconstruction and the verified
     // mass-solve path (recon runs independent of this uniformity gate).
     if ((solver_type == 1 || solver_type == 2) && dims[20] >= 0
-        && solver_max_island_used < maxiter && primal_residual <= tol) {
+        && solver_max_island_used < maxiter) {
       // Uniform scalar-contact systems only: moving a subset of rows
       // would shift skipped rows' optimality (equality rows own a
       // separate paired aref; elliptic blocks need cone projections;
@@ -9214,9 +9212,8 @@ kernel void solve_coupled_constraints(
 
   // Reconstruct qacc from the corrected force on Newton/CG primal paths.
   // Runs only when every island stopped early (per-island max below the
-  // configured budget) and the primal iterate converged: at
-  // budget-exhausted or unconverged iterates (including the 0/1/2-iteration
-  // contract) the finite primal qacc is published as-is; force balance at
+  // configured budget): at budget-exhausted iterates (including the
+  // 0/1/2-iteration contract) the finite primal qacc is published as-is; force balance at
   // convergence is not permission to replace it with a more converged
   // dual result. The Newton primal iterate minimizes the high-word-J
   // objective; when 2e-8 Jacobian rounding is amplified by small inertias
@@ -9233,7 +9230,7 @@ kernel void solve_coupled_constraints(
   // uniformity-gated refinement above: when refinement is skipped, primal
   // multipliers and this mass-solve path are the complete semantics.
   if (primal_acceleration_output && (solver_type == 1 || solver_type == 2)
-      && dims[20] >= 0 && solver_max_island_used < maxiter && converged) {
+      && dims[20] >= 0 && solver_max_island_used < maxiter) {
     bool need_recon = false;
     for (int row = 0; row < nr && !need_recon; ++row)
       for (int i = 0; i < nv; ++i) {
