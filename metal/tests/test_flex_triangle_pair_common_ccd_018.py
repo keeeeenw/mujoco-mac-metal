@@ -140,44 +140,8 @@ def _dense_efc_jacobian(model, data):
   return result
 
 
-def _tetra_pair_fixture(jacobian=None):
-  def flex(name, z):
-    return f"""
-      <flexcomp name="{name}" type="grid" count="2 2 2"
-                pos="0 0 {z}" spacing=".1 .1 .1" mass="1"
-                dim="3" radius=".01">
-        <contact contype="1" conaffinity="1" selfcollide="none"/>
-      </flexcomp>
-    """
-  xml = ("<mujoco><option gravity='0 0 0'/><worldbody>"
-         + flex("lower", "0") + flex("upper", ".015")
-         + "</worldbody></mujoco>")
-  model = mujoco.MjModel.from_xml_string(xml)
-  if jacobian is not None:
-    model.opt.jacobian = {
-        "dense": mujoco.mjtJacobian.mjJAC_DENSE,
-        "sparse": mujoco.mjtJacobian.mjJAC_SPARSE,
-    }[jacobian]
-  data = mujoco.MjData(model)
-  data.qpos[:] = np.asarray(data.qpos, np.float32).astype(np.float64)
-  data.qvel[:] = np.asarray(data.qvel, np.float32).astype(np.float64)
-  mujoco.mj_forward(model, data)
-  return model, data
 
 
-def _dense_efc_jacobian(model, data):
-  """Expand the pinned dense or compiled-CSR efc_J representation."""
-  values = np.asarray(data.efc_J, dtype=np.float64)
-  if not mujoco.mj_isSparse(model):
-    return values.reshape(int(data.nefc), int(model.nv)).copy()
-  result = np.zeros((int(data.nefc), int(model.nv)), dtype=np.float64)
-  for row in range(int(data.nefc)):
-    start = int(data.efc_J_rowadr[row])
-    count = int(data.efc_J_rownnz[row])
-    columns = np.asarray(data.efc_J_colind[start:start + count],
-                         dtype=np.int64)
-    result[row, columns] = values[start:start + count]
-  return result
 
 
 def _expected_pair_contacts(model, data, descriptor):
