@@ -474,6 +474,24 @@ def test_triple_word_packing_paths_execute_success_and_rejection_cpu():
                         {"radius": "1e-100", "height": "0.32",
                          "thickness": "0.05"})
   assert _mujoco.__version__ == "3.10.0"
+  # Octree aabb/coeff lowering and SDF seed aabb/size packing execute on
+  # real models (success), and the seed path fails closed on an
+  # unrepresentable compiled bound (rejection through the real call
+  # chain; nothing is published).
+  import sys as _sys
+  if "test_bundled_sdf_rigid_oracle_019" not in _sys.modules:
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+  from test_bundled_sdf_rigid_oracle_019 import (
+      _plugin_mesh_sdf_model,
+      _plugin_sphere_model,
+  )
+  from mujoco_metal.coupled_constraints import lower_coupled_constraints
+  lower_coupled_constraints(_plugin_mesh_sdf_model())
+  lower_coupled_constraints(_plugin_sphere_model("bowl"))
+  bad_seed_model = _plugin_sphere_model("bowl")
+  bad_seed_model.geom_aabb[:] = 1e-100
+  with pytest.raises(ValueError, match="exact hi\\+lo\\+tail split"):
+    lower_coupled_constraints(bad_seed_model)
 
 
 def test_pinned_step_gradient_accepts_improvement_and_exits_on_increase_cpu():
