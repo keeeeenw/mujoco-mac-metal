@@ -378,7 +378,9 @@ def test_native_limb_carry_helper_and_wrapper_gpu(unit):
                                float(tri_h[i, 2])), "helper"),
                        ((float(tri_w[i, 0]), float(tri_w[i, 1]),
                                 float(tri_w[i, 2])), "wrapper")):
-      if float(_exact(got)) != oracle:
+      # Exact rational comparison: a retained sub-binary64 tail must not
+      # be hidden by a second host rounding of the exact sum.
+      if _exact(got) != Fraction.from_float(oracle):
         failures.append(
             f"{tag}[{label}]: got {float(_exact(got)).hex()} "
             f"want {oracle.hex()}")
