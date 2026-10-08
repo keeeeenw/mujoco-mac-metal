@@ -767,6 +767,46 @@ static __attribute__((noinline)) int sw_expansion_compare_value(
   return sw_expansion_sign(work,work_count);
 }
 
+// Exact float for the integer-mantissa product M*2^E with M < 2^24
+// (caller-masked). Bits are constructed directly, never rounded: normal
+// exponents always fit; subnormal results fit only when the scaled units
+// stay below 2^24. Reports exactness so callers can fail closed.
+//
+// Range proof. lead = floor(log2(m)) in [0,23] (m != 0 checked first, so
+// clz is defined). E = e+lead is the unbiased exponent of the value.
+// Normal branch needs no shift. Overflow (E > 127) fails closed.
+// Subnormal branch: K = m*2^(e+149) must be a nonzero integer below 2^24.
+// Here E in [-149,-127], so s = e+149 = E-lead+149 lies in [-23,22]:
+// left shifts (s >= 0) are in range and checked against 2^24, while right
+// shifts (s < 0, r = -s in [1,23]) require exact divisibility and reject
+// anything that would discard nonzero bits.
+static inline bool sw_exact_piece(uint m, int e, thread float* out) {
+  if (m == 0u) { *out = 0.0f; return true; }
+  if (m >= 0x1000000u) return false;
+  int lead = 31 - int(clz(m));          // 0..23: highest set bit
+  int E = e + lead;                     // unbiased exponent of the value
+  if (E >= -126) {
+    if (E > 127) return false;          // finite overflow: fail closed
+    uint sig = (m << (uint)(23 - lead)) & 0x007FFFFFu;
+    *out = as_type<float>((uint(E + 127) << 23) | sig);
+    return true;
+  }
+  if (E < -149) return false;           // below subnormal granularity
+  int s = e + 149;                      // in [-23,22] by the bounds above
+  if (s >= 0) {
+    ulong k = (ulong)m << (uint)s;
+    if (k == 0u || k >= 0x1000000u) return false;
+    *out = as_type<float>(uint(k));
+    return true;
+  }
+  uint r = (uint)(-s);                  // 1..23: exact right shift only
+  if ((m & ((1u << r) - 1u)) != 0u) return false;
+  uint k = m >> r;
+  if (k == 0u) return false;
+  *out = as_type<float>(k);
+  return true;
+}
+
 // Round an exact expansion to the nearest binary64 significand, ties to even.
 // Three float components hold the resulting 53 bits without using unsupported
 // Metal `double`. This is for source-order mju_dot3 support selection only.

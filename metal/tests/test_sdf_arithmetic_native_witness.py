@@ -40,6 +40,135 @@ def _f32(value):
   return struct.unpack("=f", struct.pack("=f", float(value)))[0]
 
 
+_EXACT_PIECE_KERNEL = r"""
+kernel void sdf_exact_piece_witness(
+    device const int* m_in [[buffer(0)]],
+    device const int* e_in [[buffer(1)]],
+    device int* out_bits [[buffer(2)]],
+    device int* out_ok [[buffer(3)]],
+    constant int& count [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= uint(count)) return;
+  float value = 0.0f;
+  bool ok = sw_exact_piece(uint(m_in[index]), e_in[index], &value);
+  // Exact integer bit output avoids float subnormal flushing during
+  // observation: the bits round-trip through the int buffer untouched.
+  out_bits[index] = as_type<int>(value);
+  out_ok[index] = ok ? 1 : 0;
+}
+"""
+
+
+def _exact_piece_oracle(m, e):
+  """Independent exact oracle for the m * 2**e float32 piece contract.
+
+  Uses correctly-rounded host conversion plus exact-rational equality, no
+  bit shifting, so it cannot share a construction bug with the shader.
+  Returns (ok, bits_or_None).
+  """
+  if not isinstance(m, int) or not isinstance(e, int):
+    return False, None
+  if not 0 <= m < 2 ** 24:
+    return False, None
+  if m == 0:
+    return True, 0x00000000
+  value = Fraction(m) * (Fraction(2) ** e)
+  with warnings.catch_warnings():
+    warnings.simplefilter("ignore", RuntimeWarning)
+    candidate = np.float32(float(value))
+  if not math.isfinite(float(candidate)) and math.isfinite(float(value)):
+    return False, None
+  if Fraction.from_float(float(candidate)) != value:
+    return False, None
+  return True, struct.unpack("=I", struct.pack("=f", float(candidate)))[0]
+
+
+def _exact_piece_cases():
+  # (m, e, expected_ok, expected_bits_or_None). The first four rows are the
+  # independently reproduced native-probe counterexample table: the previous
+  # helper double-counted the leading-bit normalization in its subnormal
+  # shift and returned 0x6/0x2/0x3 instead of 0x3/0x1/reject.
+  return [
+      (3, -149, True, 0x00000003),
+      (2, -150, True, 0x00000001),
+      (3, -150, False, None),
+      (1, -149, True, 0x00000001),
+      (0, -149, True, 0x00000000),
+      (0, 0, True, 0x00000000),
+      # Normal/subnormal boundary and carry into the normal range.
+      (1, -126, True, 0x00800000),
+      (1, -127, True, 0x00400000),
+      (0x800000, -149, True, 0x00800000),
+      (0x800000, -150, True, 0x00400000),
+      (0xFFFFFF, -149, True, 0x00FFFFFF),
+      (0x7FFFFF, -149, True, 0x007FFFFF),
+      # Inexact right shifts and below-granularity inputs must reject.
+      (1, -150, False, None),
+      (1, -1000, False, None),
+      (0xFFFFFF, -150, False, None),
+      # Finite overflow and invalid mantissas must reject, never wrap.
+      (0xFFFFFF, 104, True, 0x7F7FFFFF),
+      (0xFFFFFF, 105, False, None),
+      (0x800000, 104, True, 0x7F000000),
+      (1 << 24, -149, False, None),
+      (1 << 24, 0, False, None),
+  ]
+
+
+def test_exact_piece_oracle_contract_cpu():
+  """The independent oracle agrees with every committed literal case."""
+  cases = _exact_piece_cases()
+  assert len(cases) >= 20
+  for m, e, expected_ok, expected_bits in cases:
+    ok, bits = _exact_piece_oracle(m, e)
+    assert ok == expected_ok, (m, e, ok, expected_ok)
+    if expected_ok:
+      assert bits == expected_bits, (m, e, hex(bits), hex(expected_bits))
+  shader = (Path(__file__).parents[1] /
+            "mujoco_metal/shaders/plugin_sdf.metal").read_text()
+  assert "static inline bool sw_exact_piece(uint m, int e" in shader
+
+
+@pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
+                    reason="native helper witness is parent-dispatched")
+def test_native_exact_piece_witness_gpu():
+  """Execute sw_exact_piece from the complete production shader unit."""
+  import torch
+  if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
+    pytest.skip("MPS compile_shader is unavailable")
+  cases = _exact_piece_cases()
+  shader = (Path(__file__).parents[1] /
+            "mujoco_metal/shaders/plugin_sdf.metal").read_text()
+  library = torch.mps.compile_shader(shader + "\n" + _EXACT_PIECE_KERNEL)
+  kernel = library.sdf_exact_piece_witness
+  n = len(cases)
+  m_in = torch.as_tensor(
+      np.asarray([c[0] for c in cases], dtype=np.int32),
+      dtype=torch.int32, device="mps")
+  e_in = torch.as_tensor(
+      np.asarray([c[1] for c in cases], dtype=np.int32),
+      dtype=torch.int32, device="mps")
+  out_bits = torch.empty((n,), dtype=torch.int32, device="mps")
+  out_ok = torch.empty((n,), dtype=torch.int32, device="mps")
+  count = torch.tensor([n], dtype=torch.int32, device="mps")
+  kernel(m_in, e_in, out_bits, out_ok, count,
+         threads=(n,), group_size=(1,))
+  torch.mps.synchronize()
+  got_bits = out_bits.cpu().numpy().tolist()
+  got_ok = out_ok.cpu().numpy().tolist()
+  failures = []
+  for i, (m, e, expected_ok, expected_bits) in enumerate(cases):
+    ok, bits = _exact_piece_oracle(m, e)
+    assert ok == expected_ok and (not ok or bits == expected_bits), (m, e)
+    if bool(got_ok[i]) != expected_ok:
+      failures.append(f"case=({m},{e}) ok={bool(got_ok[i])} expected={expected_ok}")
+    elif expected_ok and (got_bits[i] & 0xFFFFFFFF) != expected_bits:
+      failures.append(
+          f"case=({m},{e}) bits={got_bits[i] & 0xFFFFFFFF:#x} "
+          f"expected={expected_bits:#x}")
+  assert not failures, "native exact-piece mismatches:\n" + "\n".join(failures)
+
+
 def _words(value):
   high = _f32(value)
   residual = value - high
