@@ -2994,7 +2994,7 @@ class MetalCoupledConstraints:
         # slice. The latter is reused by solver dispatches and is borrowed
         # from a padded per-world debug stride.
         "position_cache_impedance": empty(b * nr),
-        "position_cache_contact_data": empty(b * nc * 36),
+        "position_cache_contact_data": empty(b * nc * 42),
         "position_cache_contact_frame": empty(b * nc * 12),
         "position_cache_contact_jacobian": empty(contact_jacobian_size),
         "position_cache_slot_packed": torch.full(

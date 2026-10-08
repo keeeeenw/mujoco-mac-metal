@@ -528,7 +528,7 @@ def test_cached_constraint_position_backings_have_exact_capacity_rows():
   assert sizes["position_cache_J"] == 2 * (12 + 2 * 5 * 4) * 4
   assert sizes["position_cache_rows"] == 2 * 7 * 5 * 4
   assert sizes["position_cache_impedance"] == 2 * 5 * 4
-  assert sizes["position_cache_contact_data"] == 2 * 3 * 36 * 4
+  assert sizes["position_cache_contact_data"] == 2 * 3 * 42 * 4
   assert sizes["position_cache_contact_frame"] == 2 * 3 * 12 * 4
   assert sizes["position_cache_contact_jacobian"] == 2 * 3 * 6 * 4 * 4
   assert sizes["position_cache_cvel"] == 2 * 2 * 6 * 4
