@@ -1,5 +1,5 @@
 --- .upstream/mujoco-3.10.0/src/engine/engine_collision_sdf.c	2026-06-22 07:22:23
-+++ .upstream/mujoco-trace/src/engine/engine_collision_sdf.c	2026-10-08 00:12:33
++++ .upstream/mujoco-trace/src/engine/engine_collision_sdf.c	2026-10-08 00:49:53
 @@ -16,6 +16,7 @@
  
  #include <math.h>
@@ -102,7 +102,7 @@
  static mjtNum stepGradient(mjtNum x[3], const mjModel* m, const mjSDF* s,
                             const mjData* d, int niter) {
    const mjtNum c = .1;       // reduction factor for the target decrease in the objective function
-@@ -641,13 +694,41 @@
+@@ -641,14 +694,42 @@
      mjtNum dist0 = mjc_distance(m, d, s, x0);
      mjtNum wolfe = - c * alpha * mju_dot3(grad, grad);
  
@@ -133,7 +133,7 @@
 +            niter, step, alpha, dist, dist - dist0, wolfe, backtrack);
 +      }
      } while (alpha > amin && dist - dist0 > wolfe);
-+
+ 
 +    if (mjc_sdf_trace_on()) {
 +      fprintf(stderr,
 +          "MJCSDFTRACE terminal niter=%d step=%d x=%.17g %.17g %.17g "
@@ -141,9 +141,10 @@
 +          niter, step, x[0], x[1], x[2], dist, dist0,
 +          (dist0 < dist) ? 0 : 1);
 +    }
- 
++
      // if no improvement, early stop
      if (dist0 < dist) {
+       return dist;
 @@ -811,6 +892,14 @@
    mjtNum x[3], depth;
  
@@ -172,11 +173,10 @@
      if (depth < 0) {
        int nc = *ncandidate;
        mju_copy3(candidate + 3*nc, x);
-@@ -1025,6 +1120,19 @@
-   // farthest point sampling (FPS) for spatial coverage
+@@ -1026,6 +1121,19 @@
    int selected_indices[mjMAXCONPAIR];
    int nselected = selectFPS(candidate, dist2, ncandidate, selected_indices, mjMAXCONPAIR);
-+
+ 
 +  if (mjc_sdf_trace_on()) {
 +    fprintf(stderr, "MJCSDFTRACE fps ncandidate=%d nselected=%d\n",
 +            ncandidate, nselected);
@@ -189,10 +189,25 @@
 +          candidate[3*idx+2], dist2[idx]);
 +    }
 +  }
- 
++
    // add selected contacts
    for (int i = 0; i < nselected; i++) {
-@@ -1156,14 +1264,35 @@
+     int idx = selected_indices[i];
+@@ -1093,6 +1201,13 @@
+     aabb[3+k] = mju_min(aabb1[3+k], aabb2[3+k]);
+   }
+ 
++  if (mjc_sdf_trace_on()) {
++    fprintf(stderr,
++        "MJCSDFTRACE aabb g1=%d g2=%d lo=%.17g %.17g %.17g "
++        "hi=%.17g %.17g %.17g\n",
++        g1, g2, aabb[0], aabb[1], aabb[2], aabb[3], aabb[4], aabb[5]);
++  }
++
+   // no intersection if max < min
+   if (aabb[3] < aabb[0] || aabb[4] < aabb[1] || aabb[5] < aabb[2]) {
+     return cnt;
+@@ -1156,14 +1271,35 @@
        sdf_ptr[0]->compute(m, d, instance[0], mjPLUGIN_SDF);
      }
  

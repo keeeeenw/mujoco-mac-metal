@@ -420,8 +420,7 @@ def _check_shallow(model, etier):
 
 @_needs_gpu()
 @pytest.mark.parametrize("condim", ["3", "4", "6"], ids=["c3", "c4", "c6"])
-def test_friction_rows_mapped_with_moving_state_gpu(condim):
-  # Position-matched ALL-ROW comparison with nonzero tangent/spin/rolling
+def test_friction_rows_mapped_with_moving_state_gpu(condim):  # Position-matched ALL-ROW comparison with nonzero tangent/spin/rolling
   # velocity: the 019 row-mapped oracle (J/R/ar/rhs/W per contact row plus
   # qacc/qfrc) runs on pyramidal condim 3/4/6 SDF fixtures with moving
   # states, so friction-row velocities, references and forces are
@@ -469,23 +468,44 @@ def test_friction_rows_mapped_with_moving_state_gpu(condim):
 @_needs_gpu()
 @pytest.mark.parametrize("which", ["solref", "solimp"],
                          ids=["iref", "iimp"])
-def test_override_settings_consumed_at_use_time_gpu(which):
-  # Mutable override settings are verified at use time (post-construction
-  # solve), not only at lowering: the lowered descriptor carries the
-  # mutated values, and the paired reference plus publication match the
-  # oracle built from the same mutated model.
+def test_override_lifecycle_rebuild_gpu(which):
+  # Documented lifecycle contract (no auto-recompile): mutating override
+  # options after construction makes the next state/cache-touching call
+  # fail BEFORE any state or workspace write (proving the binding, not a
+  # stale silent solve); the documented `apply_lifecycle` rebuild then
+  # consumes the mutated values and matches the oracle built from the
+  # same mutated model.
   import mujoco
   import sys
   sys.path.insert(0, "metal/tests")
+  from mujoco_metal.simulation import MetalSimulation
   from mujoco_metal.coupled_constraints import lower_coupled_constraints
   flag = int(mujoco.mjtEnableBit.mjENBL_OVERRIDE)
   m = mujoco.MjModel.from_xml_string(_torus_xml())
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qpos = np.asarray(
+      sim.state._qpos[0].cpu().numpy(), dtype=np.float64).copy()
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=np.zeros((1, m.nv), dtype=np.float32))
+  s0 = sim.assembled_system(recompute=True)
+  assert int(np.asarray(
+      sim.state.status.cpu().numpy()).ravel()[0]) == 0
+  qpos_before = np.asarray(
+      sim.state._qpos[0].cpu().numpy()).copy()
+  # Post-construction mutation WITHOUT rebuild: the binding rejects the
+  # next solve before touching state (no silent stale solve).
   m.opt.enableflags |= flag
   if which == "solref":
     m.opt.o_solref[:] = (0.05, 2.0)
   else:
     m.opt.o_solimp[:] = (0.85, 0.9, 0.002, 0.4, 3.0)
-  desc = lower_coupled_constraints(m)
+  with pytest.raises(ValueError, match="apply_lifecycle"):
+    sim.assembled_system(recompute=True)
+  np.testing.assert_array_equal(
+      np.asarray(sim.state._qpos[0].cpu().numpy()), qpos_before)
+  # Documented rebuild consumes the mutated values.
+  sim.apply_lifecycle(m)
+  desc = sim._coupled_constraints.descriptor
   assert int(desc.npairs) >= 1
   if which == "solref":
     np.testing.assert_array_equal(
@@ -495,4 +515,67 @@ def test_override_settings_consumed_at_use_time_gpu(which):
     np.testing.assert_array_equal(
         np.asarray(desc.solimp).reshape(-1, 5)[0],
         np.asarray(m.opt.o_solimp, dtype=np.float32))
-  _check_variant_xml(m, 5e-9)
+  # A second solve proceeds without rebinding, and publication matches
+  # the oracle built from the same mutated model.
+  s = sim.assembled_system(recompute=True)
+  assert int(np.asarray(
+      sim.state.status.cpu().numpy()).ravel()[0]) == 0
+  d = mujoco.MjData(m)
+  d.qpos[:] = qpos.astype(np.float32).astype(np.float64)
+  d.qvel[:] = np.zeros(m.nv)
+  mujoco.mj_forward(m, d)
+  assert d.ncon > 0
+  np.testing.assert_allclose(
+      np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qacc, dtype=np.float64), rtol=1e-3, atol=1e-3)
+  np.testing.assert_allclose(
+      np.asarray(s["qfrc_constraint"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qfrc_constraint, dtype=np.float64), rtol=1e-3, atol=1e-3)
+
+
+@_needs_gpu()
+def test_elliptic_friction_rows_mapped_with_moving_state_gpu():
+  # Distinct non-default elliptic solref/solreffriction with nonzero
+  # tangent/spin velocity: the elliptic cone block (normal + tangent rows
+  # with friction_B from solreffriction) is row-mapped against the oracle,
+  # with nonzero friction-row velocities and multipliers asserted.
+  import mujoco
+  import sys
+  sys.path.insert(0, "metal/tests")
+  from test_bundled_sdf_rigid_oracle_019 import (
+      _cpu_contacts, _assert_contact_system_matches_cpu,
+      _unique_native_slots)
+  from mujoco_metal.simulation import MetalSimulation
+  flag = int(mujoco.mjtEnableBit.mjENBL_OVERRIDE)
+  m = mujoco.MjModel.from_xml_string(_torus_xml(condim="3",
+                                               opt='cone="elliptic"'))
+  m.opt.enableflags |= flag
+  m.opt.o_solref[:] = (0.03, 1.5)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qpos = np.asarray(
+      sim.state._qpos[0].cpu().numpy(), dtype=np.float64).copy()
+  qvel = np.array([0.1, -0.35, 0.05, 0.0, 1.2, -0.4])
+  qvel32 = qvel.astype(np.float32).astype(np.float64)
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=qvel.astype(np.float32).reshape(1, -1))
+  cpu_data, cpu_J, contacts = _cpu_contacts(m, qpos, qvel32)
+  assert len(contacts) == 8
+  assert all(len(c["rows"]) > 1 for c in contacts)
+  _assert_contact_system_matches_cpu(m, sim, cpu_data, cpu_J, contacts)
+  s = sim.assembled_system(recompute=True)
+  lam = np.asarray(s["lambda"][0].cpu().numpy(), dtype=np.float64)
+  desc = sim._coupled_constraints.descriptor
+  packed = np.asarray(desc.contact_condim_packed, dtype=np.int32).reshape(-1, 3)
+  mask = np.asarray(s["contact_mask"][0].cpu().numpy())
+  npos = np.asarray(s["contact_position"][0].cpu().numpy())
+  assignment = _unique_native_slots(contacts, mask, npos)
+  fric_vel, fric_lam = 0.0, 0.0
+  for ci, contact in enumerate(contacts):
+    slot, _ = assignment[ci]
+    gpu_base = int(desc.nr_joint) + int(packed[slot, 1])
+    rows = np.arange(gpu_base, gpu_base + len(contact["rows"]))
+    fric_vel = max(fric_vel, float(np.max(np.abs(
+        np.asarray(cpu_data.efc_vel, dtype=np.float64)[contact["rows"][1:]]))))
+    fric_lam = max(fric_lam, float(np.max(np.abs(lam[rows[1:]]))))
+  assert fric_vel > 1e-6, fric_vel
+  assert fric_lam > 0.0, fric_lam

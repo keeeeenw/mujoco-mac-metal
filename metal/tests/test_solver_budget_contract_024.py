@@ -505,6 +505,9 @@ def test_warmstart_per_island_stopping_gpu():
 def test_warmstart_disabled_ignores_values_gpu(solver):
   # With mjDSBL_WARMSTART, installed nonzero values are ignored on both
   # sides: warm-set is bit-identical to cold, and both match the oracle.
+  # Uses trajectory history (which demonstrably beats smooth when enabled
+  # at this budget), so a broken disable that honored it would publish
+  # different values and fail: the equality is sensitive, not vacuous.
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
   model = _torus_model()
@@ -516,26 +519,43 @@ def test_warmstart_disabled_ignores_values_gpu(solver):
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
   sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
             qvel=np.zeros((1, model.nv), dtype=np.float32))
+  sim.step(1)
+  w = sim.get_warmstart()
+  assert float(np.linalg.norm(w)) > 0.0
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=np.zeros((1, model.nv), dtype=np.float32))
   s_cold = sim.assembled_system(recompute=True)
-  sim.set_warmstart(np.full((1, model.nv), 5.0, dtype=np.float32))
+  # Owned copies FIRST: result tensors are borrowed workspace views that
+  # the warm solve below rewrites in place.
+  lam_cold = np.asarray(s_cold["lambda"][0].cpu().numpy()).copy()
+  qacc_cold = np.asarray(s_cold["qacc"][0].cpu().numpy()).copy()
+  assert float(np.max(np.abs(lam_cold))) > 0.0
+  sim.set_warmstart(w)
   s_warm = sim.assembled_system(recompute=True)
   np.testing.assert_array_equal(
-      np.asarray(s_warm["lambda"][0].cpu().numpy()),
-      np.asarray(s_cold["lambda"][0].cpu().numpy()))
+      np.asarray(s_warm["lambda"][0].cpu().numpy()), lam_cold)
+  np.testing.assert_array_equal(
+      np.asarray(s_warm["qacc"][0].cpu().numpy()), qacc_cold)
   data = mujoco.MjData(model)
   data.qpos[:] = qpos32
   data.qvel[:] = np.zeros(model.nv)
-  data.qacc_warmstart[:] = 5.0
-  mujoco.mj_forward(model, data)
+  mujoco.mj_step(model, data)
+  w_cpu = np.asarray(data.qacc_warmstart).copy()
+  assert float(np.linalg.norm(w_cpu)) > 0.0
+  data_w = mujoco.MjData(model)
+  data_w.qpos[:] = qpos32
+  data_w.qvel[:] = np.zeros(model.nv)
+  data_w.qacc_warmstart[:] = w_cpu
+  mujoco.mj_forward(model, data_w)
   data_c = mujoco.MjData(model)
   data_c.qpos[:] = qpos32
   data_c.qvel[:] = np.zeros(model.nv)
   mujoco.mj_forward(model, data_c)
-  np.testing.assert_array_equal(np.asarray(data.qacc),
+  np.testing.assert_array_equal(np.asarray(data_w.qacc),
                                 np.asarray(data_c.qacc))
   np.testing.assert_allclose(
       np.asarray(s_warm["qacc"][0].cpu().numpy(), dtype=np.float64),
-      np.asarray(data.qacc, dtype=np.float64), rtol=1e-3, atol=1e-3)
+      np.asarray(data_w.qacc, dtype=np.float64), rtol=1e-3, atol=1e-3)
 
 
 @_needs_gpu()
@@ -567,15 +587,24 @@ def test_warmstart_restore_and_world_isolation_gpu():
   np.testing.assert_array_equal(got[0], np.asarray(w[0], dtype=np.float32))
   assert float(np.linalg.norm(got[1])) == 0.0
   s = sim.assembled_system(recompute=True)
-  lam_all = np.asarray(s["lambda"].cpu().numpy())
-  assert np.all(lam_all[1] == 0.0)
+  # Owned copy FIRST: result tensors borrow workspace buffers that later
+  # solves rewrite; the post-restore comparison below must read frozen
+  # pre-step values. Nonzero world-0 content keeps the equality
+  # meaningful (a broken restore that leaves post-step values behind
+  # cannot match it: the step demonstrably advances warmstart above).
+  lam_pre = np.asarray(s["lambda"].cpu().numpy()).copy()
+  assert np.all(lam_pre[1] == 0.0)
+  assert float(np.max(np.abs(lam_pre[0]))) > 0.0
   assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[1]) == 0
   snap = sim.snapshot()
   sim.step(1)
-  assert float(np.linalg.norm(sim.get_warmstart())) > 0.0
+  stepped = sim.get_warmstart()
+  assert float(np.linalg.norm(stepped)) > 0.0
+  # The live buffers demonstrably advanced past the preserved values, so
+  # the restore assertions below cannot pass on stale/aliased state.
+  assert not np.array_equal(np.asarray(stepped), np.asarray(got))
   sim.restore(snap)
   np.testing.assert_array_equal(sim.get_warmstart(), got)
   sr = sim.assembled_system(recompute=True)
   np.testing.assert_array_equal(
-      np.asarray(sr["lambda"].cpu().numpy()),
-      np.asarray(s["lambda"].cpu().numpy()))
+      np.asarray(sr["lambda"].cpu().numpy()), lam_pre)

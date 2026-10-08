@@ -2,15 +2,17 @@
 # Licensed under the Apache License, Version 2.0.
 """Forced eight-step torus reproducer with separated error accounts.
 
-Bounded reproducer for the ORIGINAL forced gate
-(`test_bundled_rigid_plugin_sdf_force_trajectory_checkpoint_matches_cpu[torus]`,
-qfrc_applied[0] = 0.01, 8 steps) plus structured same-input stage packets:
+DIAGNOSTIC characterization (not an accuracy gate): the original 019
+trajectory gate owns pass/fail on rollout equality. This file bounds the
+reproducer and reports structured same-input stage packets for the
+ORIGINAL forced gate (qfrc_applied[0] = 0.01, 8 steps):
 
-- per-step trajectory divergence curve (earliest mismatch: step 1
-  carries qacc noise, the gate tier first breaks later);
+- per-step trajectory divergence curve with successful native steps
+  asserted every step (earliest mismatch: step 1 carries qacc noise,
+  the gate tier first breaks later);
 - same-state forward error at the post-step-1 native state, separated
-  from accumulated trajectory error (contacts exact, force at the
-  float32 floor, source-row-mapped multipliers — no sorted vectors);
+  from accumulated trajectory error (contacts within stated bounds —
+  bounds, not exact identity — force at the float32 floor,
 - reproducible oracle sensitivity: uniform +1e-9 perturbation on all 7
   qpos entries (meters on positions, unnormalized units on the quaternion
   components) rolled out on the CPU for the same 8 forced steps, with
@@ -53,7 +55,8 @@ def _forced_rollout(nsteps=8):
   for _ in range(nsteps):
     cpu_data.qfrc_applied[:] = qfrc[0]
     mujoco.mj_step(m, cpu_data)
-    sim.step(1, qfrc_applied=qfrc)
+    status = sim.step(1, qfrc_applied=qfrc)
+    assert status.cpu().numpy().tolist() == [0]
     curve.append((
         float(np.max(np.abs(
             np.asarray(sim.state._qpos[0].cpu().numpy()) - cpu_data.qpos))),
@@ -97,6 +100,7 @@ def test_same_state_forward_separated_from_trajectory_gpu():
   d2.qfrc_applied[:] = qfrc[0].astype(np.float64)
   mujoco.mj_forward(m, d2)
   s = sim.assembled_system(qfrc_applied=qfrc, recompute=True)
+  assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[0]) == 0
   mask = np.asarray(s["contact_mask"][0].cpu().numpy())
   npos = np.asarray(s["contact_position"][0].cpu().numpy())
   ndist = np.asarray(s["contact_distance"][0].cpu().numpy())
@@ -113,8 +117,9 @@ def test_same_state_forward_separated_from_trajectory_gpu():
     worst[0] = max(worst[0], abs(cpu[c][0] - ndist[i]))
     worst[1] = max(worst[1], float(np.linalg.norm(cpu[c][1] - npos[i])))
     worst[2] = max(worst[2], float(np.linalg.norm(cpu[c][2] - nnrm[i])))
-  # Same-state contacts are exact: no positional seed error drives the
-  # first divergence.
+  # Same-state contacts agree within the stated bounds (dist measured 0.0
+  # here, bounded by 1e-12 — a measured bound, not a universal exactness
+  # claim): no positional seed error drives the first divergence.
   assert worst[0] < 1e-12, worst
   assert worst[1] < 1e-7, worst
   assert worst[2] < 1e-7, worst

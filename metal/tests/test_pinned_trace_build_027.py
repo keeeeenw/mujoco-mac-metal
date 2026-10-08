@@ -100,8 +100,7 @@ def test_trace_lib_reports_pinned_version():
 
 
 @_needs_trace_build()
-def test_trace_provenance_files_and_hashes():
-  # Provenance: pristine vs modified source identity (sha256 reported,
+def test_trace_provenance_files_and_hashes():  # Provenance: pristine vs modified source identity (sha256 reported,
   # differing exactly by the guarded instrumentation), built library and
   # plugin presence, and the pinned Release build flags on record. Hash
   # values are reported, not hard-asserted, so a deliberate rebuild does
@@ -376,3 +375,41 @@ def test_trace_mesh_face_route_records_and_equivalence(tmp_path):
   kinds = {ln.split()[1] for ln in lines}
   assert "meshface" in kinds and "meshseed" in kinds
   assert "precontact" in kinds
+
+
+@_needs_trace_build()
+def test_instrumentation_patch_applies_deterministically(tmp_path):
+  # Deterministic instrumentation application: the committed patch
+  # applies cleanly to the pristine tree with the system patch tool and
+  # reproduces the instrumented source bit-identically (no fuzz, no
+  # rejects). This is the clean-source reproduction path the rebuild
+  # script documents.
+  import shutil
+  import subprocess
+  if shutil.which("patch") is None:
+    pytest.skip("system patch tool absent")
+  patch = os.path.join(_ROOT, "project", "metal",
+                       "trace_instrumentation.patch")
+  assert os.path.exists(patch), patch
+  (tmp_path / "src" / "engine").mkdir(parents=True)
+  shutil.copy(_PRISTINE_SRC, tmp_path / "src" / "engine" /
+              "engine_collision_sdf.c")
+  adapted = []
+  for line in open(patch).read().split("\n"):
+    if line.startswith("--- "):
+      adapted.append("--- src/engine/engine_collision_sdf.c")
+    elif line.startswith("+++ "):
+      adapted.append("+++ src/engine/engine_collision_sdf.c")
+    else:
+      adapted.append(line)
+  adapted_path = tmp_path / "test.patch"
+  adapted_path.write_text("\n".join(adapted))
+  proc = subprocess.run(
+      ["patch", "-p0", "--quiet", "--forward"],
+      input=adapted_path.read_bytes(), cwd=str(tmp_path),
+      capture_output=True, timeout=120)
+  assert proc.returncode == 0, proc.stderr.decode()[-2000:]
+  produced = (tmp_path / "src" / "engine" /
+              "engine_collision_sdf.c").read_bytes()
+  with open(_TRACE_SRC, "rb") as f:
+    assert produced == f.read()

@@ -204,8 +204,10 @@ def test_island_low_ownership_multibody_gpu():
   nat = np.asarray(s["qfrc_constraint"][0].cpu().numpy(), dtype=np.float64)
   cpu = np.asarray(d.qfrc_constraint, dtype=np.float64)
   np.testing.assert_allclose(nat, cpu, rtol=1e-4, atol=1e-4)
-  # Restore roundtrip reproduces the assembly bit-identically.
+  # Restore roundtrip reproduces the assembly bit-identically (owned copy
+  # first; nonzero content keeps the equality sensitive).
   lam0 = np.asarray(s["lambda"].cpu().numpy()).copy()
+  assert float(np.max(np.abs(lam0))) > 0.0
   snap = sim.snapshot()
   sim.step(1)
   sim.restore(snap)
@@ -301,9 +303,15 @@ def test_mixed_multibody_budget_exhausted_low_ownership_gpu(swap):
       np.asarray(s["qfrc_constraint"][0].cpu().numpy(), dtype=np.float64),
       np.asarray(d.qfrc_constraint, dtype=np.float64), rtol=1e-3, atol=1e-3)
   # Replay: snapshot/step/restore reproduces the assembly bit-identically.
+  # Owned copy FIRST (borrowed workspace views); nonzero content plus a
+  # demonstrably advanced live warmstart keep the equality sensitive.
   lam0 = np.asarray(s["lambda"].cpu().numpy()).copy()
+  assert float(np.max(np.abs(lam0))) > 0.0
+  w_pre = sim.get_warmstart()
   snap = sim.snapshot()
   sim.step(1)
+  w_post = sim.get_warmstart()
+  assert not np.array_equal(np.asarray(w_post), np.asarray(w_pre))
   sim.restore(snap)
   sr = sim.assembled_system(recompute=True)
   np.testing.assert_array_equal(

@@ -75,10 +75,15 @@ def _read_system(s, cc, nr):
 
 
 @_needs_gpu()
-def test_high_only_diagnostic_and_paired_residual_gpu():
+def test_high_only_diagnostic_and_paired_multiplier_residual_gpu():
   # Torus, Newton, ordinary budget: uniform scalar-contact system with live
   # low words (SDF Jacobian corrections), so polish runs and the paired
-  # check exercises actual corrections.
+  # check exercises actual corrections. Scope: the paired residual here
+  # pairs MULTIPLIERS ONLY (published lam+lamlo) on the STORED high-word
+  # operator (W/R/rhs/ar high). It is NOT the full effective operator
+  # (which would also need J-low Delassus, mass-solve and aref-low
+  # operator terms); the full published force balance is checked
+  # separately below.
   import sys
   sys.path.insert(0, "metal/tests")
   from test_solver_budget_contract_024 import _fixed_state
@@ -225,3 +230,54 @@ def test_polish_semantics_tolerance_and_budget_gpu(tol, budget):
       np.asarray(d.qacc, dtype=np.float64), rtol=1e-3, atol=1e-3)
   print(f"SEMANTICS tol={tol} budget={budget} dev={dev_iters} "
         f"cpu={cpu_iters} cert={float(diag[0]):.3e}", flush=True)
+
+
+@_needs_gpu()
+def test_published_force_balance_paired_gpu():
+  # Offline force-balance check of the ACTUAL published values (no new
+  # kernel): M @ (qacc+qacc_lo) vs (J+J_lo)' @ (lam+lam_lo), all pairs
+  # read from published views and owned workspace planes, in float64.
+  # Reference/regulator inputs enter through the published multipliers
+  # (solved against R/aref); the smooth force is ~0 on this gravity-free
+  # zero-velocity fixture with no applied forces. The paired balance is
+  # tighter than the high-only balance (lows improve it); the gap is far
+  # above rounding, proving low words affect the published result. This
+  # checks publication, not the retained high-only diagnostic above.
+  import sys
+  sys.path.insert(0, "metal/tests")
+  from test_solver_budget_contract_024 import _fixed_state
+  from mujoco_metal.simulation import MetalSimulation
+  model = _torus_model(solver=2, iterations=100)
+  qpos = _fixed_state()
+  sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=np.zeros((1, model.nv), dtype=np.float32))
+  s = sim.assembled_system(recompute=True)
+  assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[0]) == 0
+  cc = sim._coupled_constraints
+  nv, nr = int(model.nv), int(cc.descriptor.nr)
+  M = np.asarray(s["mass_matrix"][0].cpu().numpy(), dtype=np.float64)
+  qa = np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64)
+  qal = np.asarray(s["qacc_low"][0].cpu().numpy(), dtype=np.float64)
+  Jh = np.asarray(s["J"][0].cpu().numpy(), dtype=np.float64)
+  lay = cc._jacobian_layout
+  W = cc._workspace["workspace_J"].cpu().numpy().astype(np.float64)
+  Jl = W[lay.lo_values_offset():lay.lo_values_offset() + lay.nnz].reshape(
+      nr, nv)
+  lam = np.asarray(s["lambda"][0].cpu().numpy(), dtype=np.float64)
+  lamlo = _lamlo(cc)
+  assert np.all(np.isfinite(Jl)) and np.all(np.isfinite(lamlo))
+  assert float(np.max(np.abs(Jl))) > 0.0
+  assert float(np.max(np.abs(lamlo))) > 0.0
+  r_hi = M @ qa - Jh.T @ lam
+  r_pair = M @ (qa + qal) - (Jh + Jl).T @ (lam + lamlo)
+  scale = max(1.0, float(np.max(np.abs(M @ qa))))
+  assert np.all(np.isfinite(r_hi)) and np.all(np.isfinite(r_pair))
+  assert float(np.max(np.abs(r_pair))) / scale < 1e-6
+  assert float(np.max(np.abs(r_hi))) / scale < 1e-6
+  assert abs(float(np.max(np.abs(r_pair))) - float(
+      np.max(np.abs(r_hi)))) > 1e-9
+  assert float(np.max(np.abs(r_pair))) <= float(np.max(np.abs(r_hi)))
+  print(f"FORCEBAL hi={float(np.max(np.abs(r_hi))):.3e} "
+        f"pair={float(np.max(np.abs(r_pair))):.3e} scale={scale:.3e}",
+        flush=True)

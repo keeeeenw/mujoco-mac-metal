@@ -9,6 +9,14 @@
 # licensing, host settings, toolchains, or the installed MuJoCo reference.
 # All inputs, build tree, and outputs stay inside this workspace.
 #
+# SCOPE LIMIT (reported accurately): this script rebuilds an ALREADY
+# modified ignored tree (`.upstream/mujoco-trace`); it does NOT acquire or
+# verify pinned pristine source and does NOT apply the committed
+# instrumentation (`project/metal/trace_instrumentation.patch`) — apply
+# that patch to a pristine tree first for a clean-source reproduction
+# (provenance test asserts the pristine/modified relationship).
+# Missing tools fail explicitly (exit 2) rather than silently skipping.
+#
 # Usage: ./rebuild_trace.sh [build-dir]
 #   Default build dir: .upstream/mujoco-trace/build-fixed
 set -eu
