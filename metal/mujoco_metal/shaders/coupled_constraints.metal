@@ -5051,13 +5051,20 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
                                                 : base_row_residual_low[row]};
       PrimalFloatPair d = {0.0f, 0.0f};
       for (int dof = 0; dof < nv; ++dof) {
-        if (base_row_residual == nullptr)
+        if (base_row_residual == nullptr) {
           r = primal_pair_fma(ccj_get(J, row, dof, nv),
               {acc[dof], acc_low[dof]}, r);
-      { float _jlo = ccj_get_lo(J, row, dof, nv); if (_jlo != 0.0f) r = primal_pair_add(r, primal_pair_product({_jlo, 0.0f}, {acc[dof], acc_low[dof]})); }
+          float _rlo = ccj_get_lo(J, row, dof, nv);
+          if (_rlo != 0.0f)
+            r = primal_pair_add(r, primal_pair_product(
+                {_rlo, 0.0f}, {acc[dof], acc_low[dof]}));
+        }
         d = primal_pair_fma(ccj_get(J, row, dof, nv),
             {direction[dof], direction_low[dof]}, d);
-      { float _jlo = ccj_get_lo(J, row, dof, nv); if (_jlo != 0.0f) d = primal_pair_add(d, primal_pair_product({_jlo, 0.0f}, {direction[dof], direction_low[dof]})); }
+        float _dlo = ccj_get_lo(J, row, dof, nv);
+        if (_dlo != 0.0f)
+          d = primal_pair_add(d, primal_pair_product(
+              {_dlo, 0.0f}, {direction[dof], direction_low[dof]}));
       }
       row_residual[k] = r;
       row_direction[k] = d;
@@ -5574,6 +5581,58 @@ kernel void primal_precision_witness(
   output[3] = derivative.lo;
   output[4] = second_derivative.hi;
   output[5] = second_derivative.lo;
+}
+
+// Opt-in witness for the cached elliptic-residual path in
+// primal_accel_cost_delta_elliptic. Calls the production function with
+// identical inputs except the residual source: use_cache!=0 forwards the
+// supplied base pair, use_cache==0 passes nullptr so the residual is
+// rebuilt from the effective Jacobian. dims layout: [0]=nv,[1]=nr,[2]=n,
+// [3]=n_eq,[4]=ecount, production dims at dims+10 ([34]=dims[24]).
+kernel void primal_cached_elliptic_residual_probe(
+    device const float* mass [[buffer(0)]],
+    device const float* J [[buffer(1)]],
+    device const float* R [[buffer(2)]],
+    device const float* aref [[buffer(3)]],
+    device const float* lo [[buffer(4)]],
+    device const float* hi [[buffer(5)]],
+    device const float* q0 [[buffer(6)]],
+    device const float* acc [[buffer(7)]],
+    device const float* acc_low [[buffer(8)]],
+    device const float* direction [[buffer(9)]],
+    device const float* direction_low [[buffer(10)]],
+    device const int* enabled [[buffer(11)]],
+    device const int* elliptic_member [[buffer(12)]],
+    device const int* elliptic_start [[buffer(13)]],
+    device const int* elliptic_dim [[buffer(14)]],
+    device const float* elliptic_friction [[buffer(15)]],
+    device const float* base_res [[buffer(16)]],
+    device const float* base_res_low [[buffer(17)]],
+    constant int* dims [[buffer(18)]],
+    device const float* debug [[buffer(19)]],
+    device float* mass_grad [[buffer(20)]],
+    device float* projected [[buffer(21)]],
+    device float* output [[buffer(22)]],
+    device const float* alpha_pair [[buffer(23)]],
+    device const int* use_cache [[buffer(24)]],
+    uint tid [[thread_position_in_grid]]) {
+  if (tid != 0) return;
+  int nv = dims[0], nr = dims[1], n = dims[2], n_eq = dims[3];
+  int ecount = dims[4];
+  constant int* pdims = dims + 10;
+  PrimalFloatPair alpha = {alpha_pair[0], alpha_pair[1]};
+  PrimalFloatPair deriv = {0.0f, 0.0f};
+  PrimalFloatPair second = {0.0f, 0.0f};
+  device const float* br = (use_cache[0] != 0) ? base_res : nullptr;
+  device const float* brl = (use_cache[0] != 0) ? base_res_low : nullptr;
+  PrimalFloatPair cost = primal_accel_cost_delta_elliptic(
+      alpha, mass, false, debug, pdims, J, R, aref, lo, hi, q0, acc, acc_low,
+      direction, direction_low, enabled, elliptic_member, elliptic_start,
+      elliptic_dim, elliptic_friction, ecount, mass_grad, projected,
+      nv, nr, n, n_eq, deriv, second, nullptr, nullptr, br, brl);
+  output[0] = cost.hi; output[1] = cost.lo;
+  output[2] = deriv.hi; output[3] = deriv.lo;
+  output[4] = second.hi; output[5] = second.lo;
 }
 
 // Verify the matrix-free paired H*v path against its native basis columns.
