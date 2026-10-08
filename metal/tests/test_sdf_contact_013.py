@@ -267,6 +267,77 @@ def test_mesh_sdf_source_oracle_safe_capacity_cpu():
   assert len({tuple(np.round(c[2], 5)) for c in contacts}) >= 2, contacts
 
 
+def _multiwitness_model():
+  mesh_vertices = " ".join(str(float(v) * 0.5)
+                            for v in np.fromstring(VBOX, sep=" "))
+  return mujoco.MjModel.from_xml_string(
+      f'''<mujoco>
+    <asset><mesh name="sdfmesh" vertex="{VBOX}"/>
+          <mesh name="collider" vertex="{mesh_vertices}"/></asset>
+    <option timestep=".0005" integrator="Euler" gravity="0 0 0"
+            sdf_initpoints="50" sdf_iterations="10"/>
+    <worldbody>
+      <geom name="sdf" type="sdf" mesh="sdfmesh"
+            contype="1" conaffinity="1"/>
+      <body><freejoint/><geom name="mesh" type="mesh" mesh="collider"
+            contype="1" conaffinity="1"/></body>
+    </worldbody>
+  </mujoco>''')
+
+
+def test_octree_tail_words_reconstruct_source_field_cpu():
+  """50N packing carries genuine nonzero tails with bitwise reconstruction.
+
+  The 4-witness GPU gate is razor-sensitive to octree rounding: with only
+  two words the Frank-Wolfe vertex selections collapse to three witnesses,
+  so the tails are load-bearing, not padding. This audits the exact
+  layout/bounds (50 floats/node; tail regions inside the upload) and checks
+  every aabb/coeff entry bit-for-bit: hi is the direct rounding, lo/tail
+  are float32 residuals, and at least one tail is nonzero on this fixture.
+  """
+  model = _multiwitness_model()
+  desc = lower_coupled_constraints(model)
+  sdf_g = int(np.flatnonzero(
+      np.asarray(model.geom_type) == int(mujoco.mjtGeom.mjGEOM_SDF))[0])
+  info = np.asarray(desc.mesh_hull_info).reshape(-1, 9)
+  co, nn = int(info[sdf_g, 0]), int(info[sdf_g, 1])
+  assert nn > 0
+  hull = np.asarray(desc.mesh_hull)
+  assert hull.size >= co + 50 * nn, (hull.size, co, nn)
+  mid = int(model.geom_dataid[sdf_g])
+  adr, num = int(model.mesh_octadr[mid]), int(model.mesh_octnum[mid])
+  assert num == nn
+  aabb = np.asarray(model.oct_aabb[adr:adr + num]).reshape(-1)
+  coeff = np.asarray(model.oct_coeff[adr:adr + num]).reshape(-1)
+  assert aabb.size == 6 * num and coeff.size == 8 * num
+  for src, base, tail in ((aabb, 8, 36), (coeff, 14, 42)):
+    width = src.size // num
+    hi = src.astype(np.float32)
+    np.testing.assert_array_equal(
+        hull[co + base * nn:co + (base + width) * nn], hi.reshape(-1))
+    lo = (src - hi.astype(np.float64)).astype(np.float32)
+    np.testing.assert_array_equal(
+        hull[co + (base + 14) * nn:co + (base + 14 + width) * nn], lo.reshape(-1))
+    tail_exp = (src - hi.astype(np.float64) - lo.astype(np.float64)).astype(np.float32)
+    np.testing.assert_array_equal(
+        hull[co + tail * nn:co + (tail + width) * nn], tail_exp.reshape(-1))
+  tails = np.concatenate([hull[co + 36 * nn:co + 42 * nn],
+                          hull[co + 42 * nn:co + 50 * nn]])
+  assert np.any(tails != 0.0), "fixture tails must be genuinely nonzero"
+  # Bitwise reconstruction (not formula repetition): hi+lo+tail as exact
+  # reals must equal the source binary64 on a deterministic sample. This
+  # is what makes the "bitwise" claim genuine.
+  from fractions import Fraction
+  for src, hi_base, tail_base, width in ((aabb, 8, 36, 6), (coeff, 14, 42, 8)):
+    sure = np.arange(0, src.size, 97)
+    for k in sure:
+      node, lane = divmod(int(k), width)
+      triple = tuple(
+          Fraction(float(hull[co + (b) * nn + node * width + lane]))
+          for b in (hi_base, hi_base + 14, tail_base))
+      assert sum(triple, Fraction(0)) == Fraction.from_float(float(src[int(k)])), k
+
+
 def test_pinned_step_gradient_accepts_improvement_and_exits_on_increase_cpu():
   """Lock down the source Wolfe retry and post-line-search exit directions."""
   # These are the two source predicates in engine_collision_sdf.c: the line

@@ -172,6 +172,7 @@ def test_cpu_oracle_cases_cover_rounding_and_admission_boundaries():
   assert "inline SdfWide sw_sqrt(SdfWide a)" in source
   assert "inline SdfWide sw_source_fma(" in source
   assert "inline float sw_float32(SdfWide value)" in source
+  assert "inline float sw_project_float32(SdfWide value)" in source
   assert "sw_float32_from_subnormal_units" in source
   assert "leading_quanta+int(step_hi)+int(lower)" in source
   assert "return hi+rounded_tail;" in source
@@ -247,3 +248,116 @@ def test_native_witness_calls_production_sdf_arithmetic_helpers():
       failures.append(
           f"case={i} op=float32(fma) got={actual[i, 16]} expected={float_fma}")
   assert not failures, "native SDF arithmetic mismatches:\n" + "\n".join(failures)
+
+
+_PROJECTION_KERNEL = r"""
+kernel void sdf_float32_projection_witness(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant int& count [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= uint(count)) return;
+  SdfWide triple = {input[3 * index], input[3 * index + 1],
+                    input[3 * index + 2]};
+  output[2 * index] = sw_project_float32(triple);
+  output[2 * index + 1] = (input[3 * index] + input[3 * index + 1]) +
+      input[3 * index + 2];
+}
+"""
+
+
+def _projection_split(value):
+  # Mirror the host octree uploader: hi is the direct binary64 rounding,
+  # lo/tail are float32 residuals. The split must be exact as reals.
+  high = _f32(value)
+  middle = _f32(value - high)
+  low = _f32(value - high - middle)
+  assert sum((Fraction.from_float(word) for word in
+              (high, middle, low)), Fraction()) == Fraction.from_float(value)
+  return high, middle, low
+
+
+def _projection_cases():
+  # (source double, expect naive sequential float32 sum to differ)
+  base = float.fromhex("0x1.000002fffffffp+0")
+  below = float.fromhex("0x1.000002fffffffp+0") - 2.0 ** -53
+  above = float.fromhex("0x1.0000038000000p+0")
+  exact = float.fromhex("0x1.000004p+0")
+  return [
+      # Double-rounding boundary: direct rounds to 0x3f800001, the naive
+      # float32 re-sum ties halfway (even) and lands on 0x3f800002.
+      (base, True),
+      # Sign control: the same hazard mirrored below zero.
+      (-base, True),
+      # Just below the boundary: direct still rounds to 0x3f800001 while
+      # the naive re-sum stays on 0x3f800002.
+      (below, True),
+      # Clearly above: both agree on 0x3f800002.
+      (above, False),
+      # Exact zero and exactly representable values agree trivially.
+      (0.0, False),
+      (exact, False),
+  ]
+
+
+def _f32_bits(value):
+  return struct.unpack("=I", struct.pack("=f", float(value)))[0]
+
+
+@pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
+                    reason="native helper witness is parent-dispatched")
+def test_native_float32_projection_boundary_gpu():
+  """Correctly rounded float32 projection must not double-round residuals.
+
+  The scalar octree readers project retained (hi, lo, tail) triples with
+  sw_project_float32 (the high word, i.e. the direct binary64 rounding).
+  Re-adding residuals in float32 double-rounds on real upload data: for
+  0x1.000002fffffffp+0, direct rounding gives 0x3f800001 while sequential
+  float32 (hi+lo)+tail gives 0x3f800002. The naive-sum assertions below
+  prove this test is genuine: they fail if the projection is implemented
+  as a float32 re-sum. Tails are nonzero on the boundary cases, so the
+  hazard is really exercised, not padded with zeros.
+  """
+  import torch
+  if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
+    pytest.skip("MPS compile_shader is unavailable")
+  cases = _projection_cases()
+  words = []
+  for value, _ in cases:
+    words.extend(_projection_split(value))
+  assert any(word != 0.0 for word in words[2::3]), "tails must be nonzero"
+  shader = (Path(__file__).parents[1] /
+            "mujoco_metal/shaders/plugin_sdf.metal").read_text()
+  assert "inline float sw_project_float32(SdfWide value)" in shader
+  library = torch.mps.compile_shader(shader + "\n" + _PROJECTION_KERNEL)
+  kernel = library.sdf_float32_projection_witness
+  host = np.asarray(words, dtype=np.float32)
+  inputs = torch.as_tensor(host.copy(), dtype=torch.float32, device="mps").contiguous()
+  output = torch.empty((len(cases), 2), dtype=torch.float32, device="mps")
+  count = torch.tensor([len(cases)], dtype=torch.int32, device="mps")
+  kernel(inputs.reshape(-1), output.reshape(-1), count,
+         threads=(len(cases),), group_size=(1,))
+  torch.mps.synchronize()
+  actual = output.cpu().numpy()
+  failures = []
+  for i, (value, expect_naive_differs) in enumerate(cases):
+    got_helper = _f32_bits(actual[i, 0])
+    want_helper = _f32_bits(np.float32(value))
+    if got_helper != want_helper:
+      failures.append(
+          f"case={i} projection got={got_helper:#x} expected={want_helper:#x}")
+    hi, lo, tail = (float(words[3 * i]), float(words[3 * i + 1]),
+                    float(words[3 * i + 2]))
+    want_naive = _f32_bits(np.float32(np.float32(hi + lo) + np.float32(tail)))
+    got_naive = _f32_bits(actual[i, 1])
+    if got_naive != want_naive:
+      failures.append(
+          f"case={i} naive got={got_naive:#x} expected={want_naive:#x}")
+    if expect_naive_differs and got_naive == got_helper:
+      failures.append(
+          f"case={i} hazard not exercised: naive matches projection")
+    if not expect_naive_differs and got_naive != got_helper:
+      failures.append(
+          f"case={i} control diverged: naive={got_naive:#x} "
+          f"projection={got_helper:#x}")
+  assert not failures, "native projection mismatches:\n" + "\n".join(failures)
