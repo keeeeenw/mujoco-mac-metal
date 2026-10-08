@@ -316,3 +316,66 @@ def test_mixed_multibody_budget_exhausted_low_ownership_gpu(swap):
   sr = sim.assembled_system(recompute=True)
   np.testing.assert_array_equal(
       np.asarray(sr["lambda"].cpu().numpy()), lam0)
+
+
+@_needs_gpu()
+def test_per_island_gate_each_early_gpu():
+  # Each-early regime for the per-island stopping contract: two uniform
+  # islands at maxiter=3 use 2 iterations each (total reported 4, already
+  # at/above the nominal budget) while every island stopped early
+  # (per-island max 2 < 3). The summed count never authorized polish; the
+  # per-island maximum does. Records tight oracle agreement and identical
+  # summed iteration accounting on both sides.
+  import mujoco
+  from mujoco_metal.simulation import MetalSimulation
+  xml = """
+    <mujoco>
+      <option timestep="0.002" integrator="Euler" gravity="0 0 0"
+              iterations="3" tolerance="1e-2" sdf_initpoints="8"/>
+      <extension><plugin plugin="mujoco.sdf.torus">
+        <instance name="shape"/>
+      </plugin></extension>
+      <asset><mesh name="shape_mesh"><plugin instance="shape"/></mesh></asset>
+      <worldbody>
+        <geom name="plugin_sdf" type="sdf" mesh="shape_mesh">
+          <plugin instance="shape"/>
+        </geom>
+        <body name="a" pos="0.45 0 0">
+          <freejoint/><geom name="sa" type="sphere" size="0.1"/>
+        </body>
+        <body name="b" pos="-0.45 0 0">
+          <freejoint/><geom name="sb" type="sphere" size="0.1"/>
+        </body>
+      </worldbody>
+      <contact>
+        <pair geom1="plugin_sdf" geom2="sa" condim="1"/>
+        <pair geom1="plugin_sdf" geom2="sb" condim="1"/>
+      </contact>
+    </mujoco>"""
+  m = mujoco.MjModel.from_xml_string(xml)
+  m.opt.solver = 2
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qpos = np.asarray(sim.state._qpos[0].cpu().numpy(), dtype=np.float64).copy()
+  qpos32 = qpos.astype(np.float32).astype(np.float64)
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=np.zeros((1, m.nv), dtype=np.float32))
+  s = sim.assembled_system(recompute=True)
+  assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[0]) == 0
+  row_island = np.asarray(s["row_island"].cpu().numpy()).reshape(-1)
+  islands = sorted(set(int(v) for v in row_island if int(v) >= 0))
+  assert len(islands) >= 2
+  diag = np.asarray(s["solver_diagnostics"][0].cpu().numpy())
+  dev_iters, cert = float(diag[1]), float(diag[0])
+  assert dev_iters == 4.0
+  assert cert <= 1e-6
+  d = mujoco.MjData(m)
+  d.qpos[:] = qpos32
+  d.qvel[:] = np.zeros(m.nv)
+  mujoco.mj_forward(m, d)
+  assert int(np.sum(d.solver_niter)) == 4
+  np.testing.assert_allclose(
+      np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qacc, dtype=np.float64), rtol=1e-4, atol=1e-4)
+  np.testing.assert_allclose(
+      np.asarray(s["qfrc_constraint"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qfrc_constraint, dtype=np.float64), rtol=1e-4, atol=1e-4)
