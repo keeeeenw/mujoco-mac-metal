@@ -262,13 +262,18 @@ def test_delayed_step_response_onset_gpu():  # D1 integrated delay: constant con
 
 
 @_needs_gpu()
-def test_delay_lifecycle_and_failure_gpu():
+@pytest.mark.parametrize("autoreset", [False, True])
+def test_delay_lifecycle_and_failure_gpu(autoreset):
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
   import mujoco
   import torch
   from mujoco_metal.simulation import MetalSimulation
   m = _delayed_motor_model(delay=0.004, nsample=8, interp=1)
+  if not autoreset:
+    # Frozen failure rows and pinned automatic recovery are different policies.
+    # Choose the former explicitly rather than relying on missing recovery.
+    m.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_AUTORESET)
   sim = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
   sim.reset(qpos=np.asarray(m.qpos0, dtype=np.float32).reshape(1, -1).repeat(2, 0),
             qvel=np.zeros((2, m.nv), dtype=np.float32))
@@ -308,10 +313,27 @@ def test_delay_lifecycle_and_failure_gpu():
   before = sim.state._history.cpu().numpy().copy()
   bad_q = sim.state._qpos.cpu().numpy()
   bad_q[1, 0] = np.nan
+  cpu = mujoco.MjData(m)
+  cpu.qpos[:] = bad_q[1]
+  cpu.qvel[:] = sim.state._qvel[1].cpu().numpy()
+  cpu.time = float(sim.state._time[1].cpu())
+  cpu.ctrl[:] = [2.0]
+  cpu.history[:] = before[1]
   sim.state._qpos.copy_(torch.as_tensor(bad_q))
   sim.step(1, ctrl=np.array([[1.0], [2.0]], dtype=np.float32))
   after = sim.state._history.cpu().numpy()
-  np.testing.assert_array_equal(after[1], before[1])
+  if autoreset:
+    mujoco.mj_step(m, cpu)
+    np.testing.assert_array_equal(after[1], cpu.history.astype(np.float32))
+    np.testing.assert_allclose(sim.state._qpos[1].cpu().numpy(), cpu.qpos,
+                               rtol=0, atol=1e-7)
+    np.testing.assert_allclose(float(sim.state._time[1].cpu()), cpu.time,
+                               rtol=0, atol=1e-9)
+    warning = int(mujoco.mjtWarning.mjWARN_BADQPOS)
+    assert int(sim.state._warning_number[1, warning].cpu()) == \
+        int(cpu.warning[warning].number) == 1
+  else:
+    np.testing.assert_array_equal(after[1], before[1])
   assert not np.array_equal(after[0], before[0])
   # Copy reproduces rows.
   sim2 = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
@@ -355,4 +377,3 @@ def test_rk4_delayed_step_response_gpu():
   sim.restore(snap)
   v_restored = float(sim.state.qvel.cpu().numpy()[0, 0])
   assert v_restored == pytest.approx(vels[-1], abs=1e-6)
-
