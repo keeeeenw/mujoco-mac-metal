@@ -430,7 +430,8 @@ inline bool solver_restore_smooth_acceleration(device float* out_acc,
 inline bool solver_row_has_awake_contributor(constant int* dims,
     device const float* J, device const int* awake_tree, int row, int nv) {
   for (int dof = 0; dof < nv; ++dof) {
-    if (ccj_get(J, row, dof, nv) != 0.0f
+    if ((ccj_get(J, row, dof, nv) != 0.0f ||
+         ccj_get_lo(J, row, dof, nv) != 0.0f)
         && solver_dof_awake(dims, awake_tree, dof)) return true;
   }
   // Contacts and connect/weld rows retain structural endpoint identity even
@@ -542,7 +543,8 @@ inline int build_solver_island_maps(constant int* dims,
       solver_tree_union(parent, used, tree0, tree1, ntree);
     } else {
       for (int dof = 0; dof < nv; ++dof) {
-        if (ccj_get(J, row, dof, nv) == 0.0f) continue;
+        if (ccj_get(J, row, dof, nv) == 0.0f &&
+            ccj_get_lo(J, row, dof, nv) == 0.0f) continue;
         int tree = dims[dof_tree_offset + dof];
         if (tree < 0 || tree >= ntree) continue;
         used[tree] = 1;
@@ -1742,6 +1744,8 @@ inline float dual_objective_thread(thread const float* W, thread const float* R,
 // equalities and all remaining non-friction rows are unilateral inequalities.
 inline void primal_compensated_product_add(float a, float b,
     thread float& sum, thread float& correction);
+inline void primal_compensated_product_add_eff(float hi, float lo, float x,
+    thread float& sum, thread float& correction);
 inline device const float* primal_aref_low_view(device const float* debug,
     constant int* dims, int nv, int nr);
 inline float primal_accel_eval_scalar(device const float* mass,
@@ -1774,8 +1778,7 @@ inline float primal_accel_eval_scalar(device const float* mass,
         : -aref_low[row];
     if (!incremental_state) {
       for (int dof = 0; dof < nv; ++dof)
-        primal_compensated_product_add(ccj_get(J, row, dof, nv), acc[dof],
-            rsum, correction);
+        primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc[dof], rsum, correction);
     }
     float r = rsum + correction;
     residual[row] = r;
@@ -1839,8 +1842,7 @@ inline float primal_accel_eval_scalar(device const float* mass,
     float sum = 0.0f, correction = 0.0f;
     for (int row = 0; row < n; ++row)
       if (enabled[row] && force[row] != 0.0f)
-        primal_compensated_product_add(ccj_get(J, row, dof, nv), force[row],
-            sum, correction);
+        primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), force[row], sum, correction);
     generalized_force[dof] = sum + correction;
   }
   for (int dof = 0; dof < nv; ++dof) gradient[dof] -= generalized_force[dof];
@@ -1952,8 +1954,7 @@ inline float primal_accel_eval_elliptic(device const float* mass,
         float sum = -aref[start + k];
         float correction = -aref_low[start + k];
         for (int dof = 0; dof < nv; ++dof)
-          primal_compensated_product_add(
-              ccj_get(J, (start + k), dof, nv), acc[dof], sum, correction);
+          primal_compensated_product_add_eff(ccj_get(J, start + k, dof, nv), ccj_get_lo(J, start + k, dof, nv), acc[dof], sum, correction);
         value = sum + correction;
       }
       residual[start + k] = local_residual[k] = value;
@@ -1972,8 +1973,7 @@ inline float primal_accel_eval_elliptic(device const float* mass,
     for (int dof = 0; dof < nv; ++dof) {
       float block_force = 0.0f, block_force_correction = 0.0f;
       for (int k = 0; k < dim; ++k)
-        primal_compensated_product_add(ccj_get(J, (start + k), dof, nv),
-            local_force[k], block_force, block_force_correction);
+        primal_compensated_product_add_eff(ccj_get(J, start + k, dof, nv), ccj_get_lo(J, start + k, dof, nv), local_force[k], block_force, block_force_correction);
       gradient[dof] -= block_force + block_force_correction;
     }
   }
@@ -2011,6 +2011,15 @@ inline void primal_compensated_product_add(float a, float b,
       : (product - next) + sum;
   correction += addition_error + product_error;
   sum = next;
+}
+// Effective-J compensated product: hi term always, low-word correction
+// only when nonzero (preserves high-only behavior bit-identically for
+// zero-low models/rows). Thread-local sum/correction only, no new storage.
+inline void primal_compensated_product_add_eff(float hi, float lo, float x,
+    thread float& sum, thread float& correction) {
+  primal_compensated_product_add(hi, x, sum, correction);
+  if (lo != 0.0f)
+    primal_compensated_product_add(lo, x, sum, correction);
 }
 
 inline void primal_compensated_product3_add(float a, float b, float c,
@@ -2463,8 +2472,7 @@ inline PrimalFloatPair primal_ccj_compensated_dot_pair(
     device const float* J, int row, device const float* vector, int nv) {
   float sum = 0.0f, correction = 0.0f;
   for (int dof = 0; dof < nv; ++dof)
-    primal_compensated_product_add(ccj_get(J, row, dof, nv), vector[dof],
-        sum, correction);
+    primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), vector[dof], sum, correction);
   return primal_pair_renormalize(sum, correction);
 }
 
@@ -3063,10 +3071,8 @@ inline void primal_refresh_pair_state(device const float* mass,
     // line-search update.
     float sum = -aref[row], correction = -aref_low[row];
     for (int dof = 0; dof < nv; ++dof) {
-      primal_compensated_product_add(ccj_get(J, row, dof, nv), acc[dof],
-          sum, correction);
-      primal_compensated_product_add(ccj_get(J, row, dof, nv), acc_low[dof],
-          sum, correction);
+      primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc[dof], sum, correction);
+      primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc_low[dof], sum, correction);
     }
     PrimalFloatPair r = primal_pair_renormalize(sum, correction);
     row_residual[row] = r.hi;
@@ -3254,6 +3260,10 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
       PrimalFloatPair jd = primal_pair_add(jd_hi, jd_low);
       PrimalFloatPair coefficient = primal_pair_product(
           {row_hessian[row], 0.0f}, {ccj_get(J, row, dof, nv), 0.0f});
+      float Jlo_c = ccj_get_lo(J, row, dof, nv);
+      if (Jlo_c != 0.0f)
+        coefficient = primal_pair_add(coefficient, primal_pair_product(
+            {row_hessian[row], 0.0f}, {Jlo_c, 0.0f}));
       PrimalFloatPair contribution = primal_pair_product(coefficient, jd);
       primal_compensated_product_add(contribution.hi, 1.0f, value, correction);
       primal_compensated_product_add(contribution.lo, 1.0f, value, correction);
@@ -3283,10 +3293,8 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
         local_residual_low[k] = row_residual_low[start + k];
         float dir_sum = 0.0f, dir_correction = 0.0f;
         for (int j = 0; j < nv; ++j) {
-          primal_compensated_product_add(ccj_get(J, (start + k), j, nv),
-              vector[j], dir_sum, dir_correction);
-          primal_compensated_product_add(ccj_get(J, (start + k), j, nv),
-              vector_low[j], dir_sum, dir_correction);
+          primal_compensated_product_add_eff(ccj_get(J, start + k, j, nv), ccj_get_lo(J, start + k, j, nv), vector[j], dir_sum, dir_correction);
+          primal_compensated_product_add_eff(ccj_get(J, start + k, j, nv), ccj_get_lo(J, start + k, j, nv), vector_low[j], dir_sum, dir_correction);
         }
         PrimalFloatPair dir = primal_pair_renormalize(dir_sum,
             dir_correction);
@@ -3316,10 +3324,8 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
         }
         local_hv[a] = hv_pair.hi;
         local_hv_low[a] = hv_pair.lo;
-        primal_compensated_product_add(ccj_get(J, (start + a), dof, nv),
-            local_hv[a], value, correction);
-        primal_compensated_product_add(ccj_get(J, (start + a), dof, nv),
-            local_hv_low[a], value, correction);
+        primal_compensated_product_add_eff(ccj_get(J, start + a, dof, nv), ccj_get_lo(J, start + a, dof, nv), local_hv[a], value, correction);
+        primal_compensated_product_add_eff(ccj_get(J, start + a, dof, nv), ccj_get_lo(J, start + a, dof, nv), local_hv_low[a], value, correction);
       }
       if (product_scale) {
         for (int a = 0; a < dim; ++a) {
@@ -4333,8 +4339,24 @@ inline float primal_accel_curvature_scalar(device const float* mass,
   for (int i = 0; i < nv; ++i) for (int j = 0; j < nv; ++j)
     value += direction[i] * mass[i * nv + j] * direction[j];
   for (int row = 0; row < n; ++row) if (enabled[row] && row_hessian[row] > 0.0f) {
+    bool row_has_lo = false;
+    for (int i = 0; i < nv; ++i) {
+      if (ccj_get_lo(J, row, i, nv) != 0.0f) { row_has_lo = true; break; }
+    }
     float jd = 0.0f;
-    for (int i = 0; i < nv; ++i) jd += ccj_get(J, row, i, nv) * direction[i];
+    if (!row_has_lo) {
+      for (int i = 0; i < nv; ++i) jd += ccj_get(J, row, i, nv) * direction[i];
+    } else {
+      PrimalFloatPair jp = {0.0f, 0.0f};
+      for (int i = 0; i < nv; ++i) {
+        jp = primal_pair_fma(ccj_get(J, row, i, nv), {direction[i], 0.0f}, jp);
+        float Jlo = ccj_get_lo(J, row, i, nv);
+        if (Jlo != 0.0f)
+          jp = primal_pair_add(jp, primal_pair_product(
+              {Jlo, 0.0f}, {direction[i], 0.0f}));
+      }
+      jd = jp.hi + jp.lo;
+    }
     value += row_hessian[row] * jd * jd;
   }
   return value;
@@ -4943,15 +4965,11 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
     float direction_sum = 0.0f, direction_correction = 0.0f;
     for (int dof = 0; dof < nv; ++dof) {
       if (base_row_residual == nullptr)
-        primal_compensated_product_add(ccj_get(J, row, dof, nv), acc[dof],
-            start_sum, start_correction);
+        primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc[dof], start_sum, start_correction);
       if (base_row_residual == nullptr)
-        primal_compensated_product_add(ccj_get(J, row, dof, nv), acc_low[dof],
-            start_sum, start_correction);
-      primal_compensated_product_add(ccj_get(J, row, dof, nv), direction[dof],
-          direction_sum, direction_correction);
-      primal_compensated_product_add(ccj_get(J, row, dof, nv), direction_low[dof],
-          direction_sum, direction_correction);
+        primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc_low[dof], start_sum, start_correction);
+      primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), direction[dof], direction_sum, direction_correction);
+      primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), direction_low[dof], direction_sum, direction_correction);
     }
     if (base_row_residual == nullptr)
       start = primal_pair_add(start,
@@ -5036,8 +5054,10 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
         if (base_row_residual == nullptr)
           r = primal_pair_fma(ccj_get(J, row, dof, nv),
               {acc[dof], acc_low[dof]}, r);
+      { float _jlo = ccj_get_lo(J, row, dof, nv); if (_jlo != 0.0f) r = primal_pair_add(r, primal_pair_product({_jlo, 0.0f}, {acc[dof], acc_low[dof]})); }
         d = primal_pair_fma(ccj_get(J, row, dof, nv),
             {direction[dof], direction_low[dof]}, d);
+      { float _jlo = ccj_get_lo(J, row, dof, nv); if (_jlo != 0.0f) d = primal_pair_add(d, primal_pair_product({_jlo, 0.0f}, {direction[dof], direction_low[dof]})); }
       }
       row_residual[k] = r;
       row_direction[k] = d;
@@ -6058,10 +6078,8 @@ inline int solve_primal_accel_scalar(device const float* mass,
     for (int row = 0; row < n; ++row) {
       float row_direction = 0.0f, row_direction_correction = 0.0f;
       for (int dof = 0; dof < nv; ++dof) {
-        primal_compensated_product_add(ccj_get(J, row, dof, nv), direction[dof],
-            row_direction, row_direction_correction);
-        primal_compensated_product_add(ccj_get(J, row, dof, nv),
-            direction_low[dof], row_direction, row_direction_correction);
+        primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), direction[dof], row_direction, row_direction_correction);
+        primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), direction_low[dof], row_direction, row_direction_correction);
       }
       PrimalFloatPair updated = primal_pair_fma_pair(accepted_alpha,
           primal_pair_renormalize(row_direction, row_direction_correction),
@@ -6215,8 +6233,25 @@ inline void seed_pgs_warmstart_qacc(device const float* J, int nr,
     lambda[row] = 0.0f;
     if (!enabled[row]) continue;
     float jar = -aref[row];
-    for (int dof = 0; dof < nv; ++dof)
-      jar += ccj_get(J, row, dof, nv) * qacc_warmstart[dof];
+    bool jar_has_lo = false;
+    for (int dof = 0; dof < nv; ++dof) {
+      if (ccj_get_lo(J, row, dof, nv) != 0.0f) { jar_has_lo = true; break; }
+    }
+    if (!jar_has_lo) {
+      for (int dof = 0; dof < nv; ++dof)
+        jar += ccj_get(J, row, dof, nv) * qacc_warmstart[dof];
+    } else {
+      PrimalFloatPair jarp = {jar, 0.0f};
+      for (int dof = 0; dof < nv; ++dof) {
+        jarp = primal_pair_fma(ccj_get(J, row, dof, nv),
+                               {qacc_warmstart[dof], 0.0f}, jarp);
+        float Jlo = ccj_get_lo(J, row, dof, nv);
+        if (Jlo != 0.0f)
+          jarp = primal_pair_add(jarp, primal_pair_product(
+              {Jlo, 0.0f}, {qacc_warmstart[dof], 0.0f}));
+      }
+      jar = jarp.hi;
+    }
     float D = 1.0f / max(R[row], 1e-15f);
     bool dry_friction = lo[row] < 0.0f && hi[row] > 0.0f
         && isfinite(lo[row]) && isfinite(hi[row])
@@ -6291,8 +6326,25 @@ inline void seed_pgs_warmstart_qacc(device const float* J, int nr,
     lambda[row] = 0.0f;
     if (!enabled[row]) continue;
     float jar = -aref[row];
-    for (int dof = 0; dof < nv; ++dof)
-      jar += ccj_get(J, row, dof, nv) * qacc_warmstart[dof];
+    bool jar_has_lo = false;
+    for (int dof = 0; dof < nv; ++dof) {
+      if (ccj_get_lo(J, row, dof, nv) != 0.0f) { jar_has_lo = true; break; }
+    }
+    if (!jar_has_lo) {
+      for (int dof = 0; dof < nv; ++dof)
+        jar += ccj_get(J, row, dof, nv) * qacc_warmstart[dof];
+    } else {
+      PrimalFloatPair jarp = {jar, 0.0f};
+      for (int dof = 0; dof < nv; ++dof) {
+        jarp = primal_pair_fma(ccj_get(J, row, dof, nv),
+                               {qacc_warmstart[dof], 0.0f}, jarp);
+        float Jlo = ccj_get_lo(J, row, dof, nv);
+        if (Jlo != 0.0f)
+          jarp = primal_pair_add(jarp, primal_pair_product(
+              {Jlo, 0.0f}, {qacc_warmstart[dof], 0.0f}));
+      }
+      jar = jarp.hi;
+    }
     float D = 1.0f / max(R[row], 1e-15f);
     bool dry_friction = lo[row] < 0.0f && hi[row] > 0.0f
         && isfinite(lo[row]) && isfinite(hi[row])
@@ -6364,8 +6416,25 @@ inline void seed_pgs_warmstart_qacc(device const float* J, int nr,
     lambda[row] = 0.0f;
     if (!enabled[row]) continue;
     float jar = -aref[row];
-    for (int dof = 0; dof < nv; ++dof)
-      jar += ccj_get(J, row, dof, nv) * qacc_warmstart[dof];
+    bool jar_has_lo = false;
+    for (int dof = 0; dof < nv; ++dof) {
+      if (ccj_get_lo(J, row, dof, nv) != 0.0f) { jar_has_lo = true; break; }
+    }
+    if (!jar_has_lo) {
+      for (int dof = 0; dof < nv; ++dof)
+        jar += ccj_get(J, row, dof, nv) * qacc_warmstart[dof];
+    } else {
+      PrimalFloatPair jarp = {jar, 0.0f};
+      for (int dof = 0; dof < nv; ++dof) {
+        jarp = primal_pair_fma(ccj_get(J, row, dof, nv),
+                               {qacc_warmstart[dof], 0.0f}, jarp);
+        float Jlo = ccj_get_lo(J, row, dof, nv);
+        if (Jlo != 0.0f)
+          jarp = primal_pair_add(jarp, primal_pair_product(
+              {Jlo, 0.0f}, {qacc_warmstart[dof], 0.0f}));
+      }
+      jar = jarp.hi;
+    }
     float D = 1.0f / max(R[row], 1e-15f);
     bool dry_friction = lo[row] < 0.0f && hi[row] > 0.0f
         && isfinite(lo[row]) && isfinite(hi[row])
@@ -6890,6 +6959,7 @@ inline PrimalFloatPair pgs_delassus_pair(device const float* J,
                                         nr, nv, true)];
     value = primal_pair_fma(ccj_get(J, row, k, nv),
         {Z[col * nv + k], z_low}, value);
+      { float _jlo = ccj_get_lo(J, row, k, nv); if (_jlo != 0.0f) value = primal_pair_add(value, primal_pair_product({_jlo, 0.0f}, {Z[col * nv + k], z_low})); }
   }
   return value;
 }
@@ -7751,57 +7821,149 @@ kernel void solve_coupled_constraints(
       for (int i = 0; i < nv; ++i) out_acc[qb + i] = x[i];
     }
 
-    // 5. Solve M Z_r = J_r^T for all active rows
+    // 5. Solve M Z_r = J_r^T for all active rows, with paired J.
+    // Z hi is RNE32 of the exact solve (optimal); pair solve reuses
+    // acc/gradient scratch as y_lo/x_lo (free before Newton starts), so no
+    // new global words. Rows without low-word corrections use the original
+    // float path bit-identically (Jlo==0 skips pair work).
+    device float* primal_scratch_base = solver_scratch
+        + dims[dims[24] + dims[9] * 10 + 9];
+    device float* pair_y_lo = primal_scratch_base;
+    device float* pair_x_lo = primal_scratch_base + max(nv, 1);
     for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+      bool row_has_lo = false;
       for (int i = 0; i < nv; ++i) {
-        float v = solver_dof_awake(dims, solver_awake_tree, i)
-            ? ccj_get(J_world, row, i, nv) : 0.0f;
-        for (int k = 0; k < i; ++k) v -= L[i * nv + k] * y[k];
-        y[i] = v / L[i * nv + i];
+        if (ccj_get_lo(J_world, row, i, nv) != 0.0f) {
+          row_has_lo = true; break;
+        }
       }
-      for (int i = nv - 1; i >= 0; --i) {
-        float v = y[i];
-        for (int k = i + 1; k < nv; ++k) v -= L[k * nv + i] * x[k];
-        x[i] = v / L[i * nv + i];
+      if (!row_has_lo) {
+        for (int i = 0; i < nv; ++i) {
+          float v = solver_dof_awake(dims, solver_awake_tree, i)
+              ? ccj_get(J_world, row, i, nv) : 0.0f;
+          for (int k = 0; k < i; ++k) v -= L[i * nv + k] * y[k];
+          y[i] = v / L[i * nv + i];
+        }
+        for (int i = nv - 1; i >= 0; --i) {
+          float v = y[i];
+          for (int k = i + 1; k < nv; ++k) v -= L[k * nv + i] * x[k];
+          x[i] = v / L[i * nv + i];
+        }
+        for (int i = 0; i < nv; ++i) Z[row * nv + i] = x[i];
+      } else {
+        for (int i = 0; i < nv; ++i) {
+          PrimalFloatPair rhs = solver_dof_awake(dims, solver_awake_tree, i)
+              ? PrimalFloatPair{ccj_get(J_world, row, i, nv),
+                                ccj_get_lo(J_world, row, i, nv)}
+              : PrimalFloatPair{0.0f, 0.0f};
+          PrimalFloatPair acc = rhs;
+          for (int k = 0; k < i; ++k) {
+            PrimalFloatPair prod = primal_pair_product(
+                {L[i * nv + k], 0.0f}, {y[k], pair_y_lo[k]});
+            acc = primal_pair_add(acc, primal_pair_multiply(prod, -1.0f));
+          }
+          float linv = 1.0f / L[i * nv + i];
+          PrimalFloatPair q = primal_pair_product(acc, {linv, 0.0f});
+          q = primal_pair_renormalize(q.hi, q.lo);
+          y[i] = q.hi; pair_y_lo[i] = q.lo;
+        }
+        for (int i = nv - 1; i >= 0; --i) {
+          PrimalFloatPair acc = {y[i], pair_y_lo[i]};
+          for (int k = i + 1; k < nv; ++k) {
+            PrimalFloatPair prod = primal_pair_product(
+                {L[k * nv + i], 0.0f}, {x[k], pair_x_lo[k]});
+            acc = primal_pair_add(acc, primal_pair_multiply(prod, -1.0f));
+          }
+          float linv = 1.0f / L[i * nv + i];
+          PrimalFloatPair q = primal_pair_product(acc, {linv, 0.0f});
+          q = primal_pair_renormalize(q.hi, q.lo);
+          x[i] = q.hi; pair_x_lo[i] = q.lo;
+        }
+        for (int i = 0; i < nv; ++i) Z[row * nv + i] = x[i];
       }
-      for (int i = 0; i < nv; ++i) Z[row * nv + i] = x[i];
     }
   }
 
-  // 6. Form Delassus matrix W = J M^-1 J^T
+  // 6. Form Delassus matrix W = J M^-1 J^T with paired J.
+  // W hi is RNE32 of the exact Delassus (optimal); pair accumulation uses
+  // thread-local pairs (no new words). Pairs without low-word corrections
+  // use the original float sum bit-identically. A global low-word scan
+  // first skips per-pair pre-scans entirely for high-only models.
+  bool any_jlo = false;
+  for (int row = 0; row < total_nr && !any_jlo; ++row) if (enabled[row]) {
+    for (int i = 0; i < nv; ++i) {
+      if (ccj_get_lo(J_world, row, i, nv) != 0.0f) {
+        any_jlo = true; break;
+      }
+    }
+  }
   for (int a = 0; a < total_nr; ++a) if (enabled[a]) {
     for (int b = 0; b < total_nr; ++b) if (enabled[b]) {
-      float v = 0.0f;
-      for (int k = 0; k < nv; ++k) {
-        v += ccj_get(J_world, a, k, nv) * Z[b * nv + k];
-        if (dims[20] == -2)
-          v += ccj_get(J_world, a, k, nv) * mass[
-              component_pair_index(batch, world, b, k, nr, nv, true)];
+      bool pair_has_lo = any_jlo;
+      if (pair_has_lo) {
+        pair_has_lo = false;
+        for (int k = 0; k < nv; ++k) {
+          if (ccj_get_lo(J_world, a, k, nv) != 0.0f ||
+              ccj_get_lo(J_world, b, k, nv) != 0.0f) {
+            pair_has_lo = true; break;
+          }
+        }
       }
-      W[a * nr + b] = v;
+      if (!pair_has_lo) {
+        float v = 0.0f;
+        for (int k = 0; k < nv; ++k) {
+          v += ccj_get(J_world, a, k, nv) * Z[b * nv + k];
+          if (dims[20] == -2)
+            v += ccj_get(J_world, a, k, nv) * mass[
+                component_pair_index(batch, world, b, k, nr, nv, true)];
+        }
+        W[a * nr + b] = v;
+      } else {
+        PrimalFloatPair acc = {0.0f, 0.0f};
+        for (int k = 0; k < nv; ++k) {
+          PrimalFloatPair jk = {ccj_get(J_world, a, k, nv),
+                                ccj_get_lo(J_world, a, k, nv)};
+          PrimalFloatPair zk = {Z[b * nv + k], 0.0f};
+          acc = primal_pair_add(acc, primal_pair_product(jk, zk));
+          if (dims[20] == -2) {
+            PrimalFloatPair mk = {mass[component_pair_index(
+                batch, world, b, k, nr, nv, true)], 0.0f};
+            acc = primal_pair_add(acc, primal_pair_product(jk, mk));
+          }
+        }
+        W[a * nr + b] = acc.hi;
+      }
     }
   }
 
-  // 7. Form RHS: ar - J q0
-  if (solver_type == 0) {
-    for (int row = 0; row < nr; ++row) {
-      pgs_rhs_low[row] = 0.0f;
-      pgs_lambda_low[row] = 0.0f;
-    }
+  // 7. Form RHS: ar - J q0 with paired J. rhs lo is retained for all
+  // solver types in the existing pgs_rhs_low plane (already counted);
+  // PGS consumes it directly, Newton/CG carry it for paired certificates
+  // and refinement. Zero-low rows use the original float-equivalent path
+  // bit-identically (Jlo==0 skips the extra product).
+  for (int row = 0; row < nr; ++row) {
+    pgs_rhs_low[row] = 0.0f;
+    pgs_lambda_low[row] = 0.0f;
   }
   for (int row = 0; row < total_nr; ++row) {
     if (enabled[row]) {
       PrimalFloatPair ja = {0.0f, 0.0f};
-      for (int k = 0; k < nv; ++k)
+      for (int k = 0; k < nv; ++k) {
         ja = primal_pair_fma(ccj_get(J_world, row, k, nv),
             {out_acc[qb + k], out_acc[batch * nv + qb + k]}, ja);
+        float Jlo = ccj_get_lo(J_world, row, k, nv);
+        if (Jlo != 0.0f)
+          ja = primal_pair_add(ja, primal_pair_product(
+              {Jlo, 0.0f},
+              {out_acc[qb + k], out_acc[batch * nv + qb + k]}));
+      }
       PrimalFloatPair rhs_pair = primal_pair_add(
           {ar[row], aref_low[row]}, primal_pair_multiply(ja, -1.0f));
       rhs[row] = rhs_pair.hi;
-      if (solver_type == 0) pgs_rhs_low[row] = rhs_pair.lo;
+      pgs_rhs_low[row] = rhs_pair.lo;
     } else {
       rhs[row] = 0.0f;
-      if (solver_type == 0) pgs_rhs_low[row] = 0.0f;
+      pgs_rhs_low[row] = 0.0f;
     }
   }
 
@@ -8513,10 +8675,13 @@ kernel void solve_coupled_constraints(
     for (int i = 0; i < nv; ++i) {
       PrimalFloatPair force = primal_pair_fma(ccj_get(J_world, row, i, nv),
           {lam[row], lambda_low}, {out_force[qb + i], pgs_pair_tail[i]});
-      // Low-word Jacobian correction. Skipped (bitwise-identical legacy
-      // behavior) where the low plane is exactly zero.
+      // Low-word Jacobian correction on dense mass only (consistent
+      // effective system with the dense qacc reconstruction below).
+      // Skipped (bitwise-identical legacy behavior) where the low plane
+      // is exactly zero; component modes (-2/-3, no dense L) stay
+      // high-only (consistent hi-only system).
       float Jlo = ccj_get_lo(J_world, row, i, nv);
-      if (Jlo != 0.0f)
+      if (Jlo != 0.0f && dims[20] >= 0)
         force = primal_pair_add(force, primal_pair_product(
             {Jlo, 0.0f}, {lam[row], lambda_low}));
       out_force[qb + i] = force.hi;
@@ -8552,16 +8717,17 @@ kernel void solve_coupled_constraints(
   // The Newton primal iterate minimizes the high-word-J objective; when
   // 2e-8 Jacobian rounding is amplified by small inertias its minimum can
   // sit 1e-2 off the CPU minimum even while multipliers are accurate
-  // (force-balance evidence). MuJoCo publishes qacc from the solved force
-  // (M qacc = qfrc_smooth + qfrc_constraint); mirror that data flow here
-  // with an exact diagonal mass solve. Diagonal mass covers free bodies
-  // (including the rigid-SDF fixtures); non-diagonal masses keep the
-  // Newton iterate (a paired general solve is future work, explicitly out
-  // of scope here). Skipped bit-identically when no low-word Jacobian
-  // corrections exist, so non-SDF behavior is unchanged. Sleeping DOFs
-  // keep the Newton values.
+  // (force-balance evidence). The published acceleration must satisfy the
+  // force-balance identity M qacc = qfrc_smooth + qfrc_constraint with the
+  // same effective Jacobian used for force reconstruction; mirror that
+  // identity here with a full mass solve using the retained Cholesky
+  // factor L (exact for dense mass, any nv, no diagonal cutoff).
+  // Skipped bit-identically when no low-word Jacobian corrections exist,
+  // so non-SDF behavior is unchanged. Sleeping DOFs keep the Newton
+  // values. Component modes (-2/-3, no dense L) use high-only force
+  // (consistent hi-only system, J_lo correction gated to dense mass).
   if (primal_acceleration_output && (solver_type == 1 || solver_type == 2)
-      && dims[20] >= 0 && nv <= 32) {
+      && dims[20] >= 0) {
     bool need_recon = false;
     for (int row = 0; row < nr && !need_recon; ++row)
       for (int i = 0; i < nv; ++i) {
@@ -8571,37 +8737,36 @@ kernel void solve_coupled_constraints(
       }
     if (need_recon) {
       device const float* mass_world = mass + mb;
-      bool diag_only = true;
-      for (int i = 0; i < nv && diag_only; ++i)
-        for (int k = 0; k < nv; ++k) {
-          float e = solver_mass_entry(mass_world, dbg_pre, dims,
-              solver_awake_tree, world, nv, i, k);
-          if (i == k) { if (!(e > 0.0f)) diag_only = false; }
-          // Exact-zero test rejects float32 rotation noise (~1e-13) on
-          // theoretically diagonal free-body inertia; gate with a tight
-          // absolute bound far below any physical coupling.
-          else if (e > 1e-09f || e < -1e-09f) diag_only = false;
+      for (int i = 0; i < nv; ++i) {
+        if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
+        PrimalFloatPair smooth = {qfrc[qb + i], paired_qfrc_input
+            ? qfrc[batch * nv + qb + i] : 0.0f};
+        PrimalFloatPair both = primal_pair_add(
+            smooth, {out_force[qb + i], pgs_pair_tail[i]});
+        float target = both.hi + both.lo;
+        if (provided_qacc_smooth) {
+          float smooth_acc = 0.0f;
+          for (int k = 0; k < nv; ++k)
+            smooth_acc += solver_mass_entry(mass_world, dbg_pre, dims,
+                solver_awake_tree, world, nv, i, k)
+                * (solver_dof_awake(dims, solver_awake_tree, k)
+                   ? (qfrc[qb + k] + (paired_qfrc_input
+                      ? qfrc[batch * nv + qb + k] : 0.0f)) : 0.0f);
+          target = smooth_acc + out_force[qb + i] + pgs_pair_tail[i];
         }
-      if (diag_only) {
-        for (int i = 0; i < nv; ++i) {
-          if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
-          PrimalFloatPair smooth = {qfrc[qb + i], paired_qfrc_input
-              ? qfrc[batch * nv + qb + i] : 0.0f};
-          PrimalFloatPair both = primal_pair_add(
-              smooth, {out_force[qb + i], pgs_pair_tail[i]});
-          float target = both.hi + both.lo;
-          if (provided_qacc_smooth) {
-            float mii = solver_mass_entry(mass_world, dbg_pre, dims,
-                solver_awake_tree, world, nv, i, i);
-            target = mii * (qfrc[qb + i] + (paired_qfrc_input
-                ? qfrc[batch * nv + qb + i] : 0.0f))
-                + out_force[qb + i] + pgs_pair_tail[i];
-          }
-          float mii = solver_mass_entry(mass_world, dbg_pre, dims,
-              solver_awake_tree, world, nv, i, i);
-          out_acc[qb + i] = target / mii;
-          out_acc[batch * nv + qb + i] = 0.0f;
-        }
+        float v = solver_dof_awake(dims, solver_awake_tree, i) ? target : 0.0f;
+        for (int k = 0; k < i; ++k) v -= L[i * nv + k] * y[k];
+        y[i] = v / L[i * nv + i];
+      }
+      for (int i = nv - 1; i >= 0; --i) {
+        float v = y[i];
+        for (int k = i + 1; k < nv; ++k) v -= L[k * nv + i] * x[k];
+        x[i] = v / L[i * nv + i];
+      }
+      for (int i = 0; i < nv; ++i) {
+        if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
+        out_acc[qb + i] = x[i];
+        out_acc[batch * nv + qb + i] = 0.0f;
       }
     }
   }
@@ -9682,9 +9847,11 @@ kernel void solve_coupled_constraints_block(
   for (int row = 0; row < nr; ++row) {
     if (enabled[row]) {
       PrimalFloatPair ja = {0.0f, 0.0f};
-      for (int k = 0; k < nv; ++k)
+      for (int k = 0; k < nv; ++k) {
         ja = primal_pair_fma(ccj_get(J_world, row, k, nv),
             {q0[k], out_acc[batch * nv + qb + k]}, ja);
+      { float _jlo = ccj_get_lo(J_world, row, k, nv); if (_jlo != 0.0f) ja = primal_pair_add(ja, primal_pair_product({_jlo, 0.0f}, {q0[k], out_acc[batch * nv + qb + k]})); }
+      }
       PrimalFloatPair rhs_pair = primal_pair_add(
           {ar[row], aref_low[row]}, primal_pair_multiply(ja, -1.0f));
       rhs[row] = rhs_pair.hi;
@@ -10242,11 +10409,14 @@ kernel void solve_coupled_constraints_block(
     float total = 0.0f;
     for (int row = 0; row < nr; ++row)
       if (enabled[row]) total += ccj_get(J_world, row, i, nv) * lam[row];
-    // Low-word Jacobian correction (skipped when zero: bitwise legacy).
+    // Low-word Jacobian correction on dense mass only (consistent
+    // effective system with the dense qacc reconstruction below).
+    // Skipped (bitwise-identical legacy behavior) where the low plane
+    // is exactly zero; component modes (-2/-3, no dense L) stay high-only.
     for (int row = 0; row < nr; ++row)
       if (enabled[row]) {
         float Jlo = ccj_get_lo(J_world, row, i, nv);
-        if (Jlo != 0.0f) total = fma(Jlo, lam[row], total);
+        if (Jlo != 0.0f && dims[20] >= 0) total = fma(Jlo, lam[row], total);
       }
     out_force[qb + i] = total;
   }
@@ -10422,9 +10592,28 @@ kernel void capture_cached_position_context(
   int row = int(tid % uint(nr));
   if (!cc_solver_world_enabled(dims, world)) return;
   device const float* J_world = ccj_world(J, world, nr, nv, dims);
+  bool row_has_lo = false;
+  for (int dof = 0; dof < nv; ++dof) {
+    if (ccj_get_lo(J_world, row, dof, nv) != 0.0f) {
+      row_has_lo = true; break;
+    }
+  }
   float jv = 0.0f;
-  for (int dof = 0; dof < nv; ++dof)
-    jv += ccj_get(J_world, row, dof, nv) * qvel[world * nv + dof];
+  if (!row_has_lo) {
+    for (int dof = 0; dof < nv; ++dof)
+      jv += ccj_get(J_world, row, dof, nv) * qvel[world * nv + dof];
+  } else {
+    PrimalFloatPair jp = {0.0f, 0.0f};
+    for (int dof = 0; dof < nv; ++dof) {
+      jp = primal_pair_fma(ccj_get(J_world, row, dof, nv),
+                           {qvel[world * nv + dof], 0.0f}, jp);
+      float Jlo = ccj_get_lo(J_world, row, dof, nv);
+      if (Jlo != 0.0f)
+        jp = primal_pair_add(jp, primal_pair_product(
+            {Jlo, 0.0f}, {qvel[world * nv + dof], 0.0f}));
+    }
+    jv = jp.hi + jp.lo;
+  }
   float B = velocity_scale[row];
   int context_base = (world * nr + row) * 5;
   int debug_base = world * stride;
@@ -10577,8 +10766,27 @@ kernel void refresh_cached_constraint_aref(
   }
   float velocity = surface_velocity[world * nr + row];
   device const float* J_world = ccj_world(J, world, nr, nv, dims);
-  for (int dof = 0; dof < nv; ++dof)
-    velocity += ccj_get(J_world, row, dof, nv) * qvel[world * nv + dof];
+  bool vel_has_lo = false;
+  for (int dof = 0; dof < nv; ++dof) {
+    if (ccj_get_lo(J_world, row, dof, nv) != 0.0f) {
+      vel_has_lo = true; break;
+    }
+  }
+  if (!vel_has_lo) {
+    for (int dof = 0; dof < nv; ++dof)
+      velocity += ccj_get(J_world, row, dof, nv) * qvel[world * nv + dof];
+  } else {
+    PrimalFloatPair vp = {velocity, 0.0f};
+    for (int dof = 0; dof < nv; ++dof) {
+      vp = primal_pair_fma(ccj_get(J_world, row, dof, nv),
+                           {qvel[world * nv + dof], 0.0f}, vp);
+      float Jlo = ccj_get_lo(J_world, row, dof, nv);
+      if (Jlo != 0.0f)
+        vp = primal_pair_add(vp, primal_pair_product(
+            {Jlo, 0.0f}, {qvel[world * nv + dof], 0.0f}));
+    }
+    velocity = vp.hi + vp.lo;
+  }
   float K = position_context[context_base];
   float B = position_context[context_base + 1];
   float impedance = position_context[context_base + 2];
@@ -10639,6 +10847,13 @@ kernel void refresh_cached_constraint_aref_low(
         primal_pair_product({j, 0.0f}, {qvel[world * nv + dof], 0.0f}));
     velocity_delta = primal_pair_add(velocity_delta,
         primal_pair_product({-j, 0.0f}, {old_qvel[world * nv + dof], 0.0f}));
+    float jlo = ccj_get_lo(J_world, row, dof, nv);
+    if (jlo != 0.0f) {
+      velocity_delta = primal_pair_add(velocity_delta,
+          primal_pair_product({jlo, 0.0f}, {qvel[world * nv + dof], 0.0f}));
+      velocity_delta = primal_pair_add(velocity_delta,
+          primal_pair_product({-jlo, 0.0f}, {old_qvel[world * nv + dof], 0.0f}));
+    }
   }
   PrimalFloatPair coeff = {
       position_context[context_base + 1], velocity_scale_low[row]};

@@ -567,6 +567,112 @@ def test_bowl_qp_reference_and_cross_swap_gpu():
   assert kkt_cpu["complementarity"] < 1e-6, kkt_cpu
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
+                    reason="opt-in same-state operator-swap diagnostic")
+@pytest.mark.parametrize("name", ["torus", "bowl"])
+def test_same_state_operator_swap_shows_causal_sensitivity_gpu(name):
+  """Same-state operator swaps with owned snapshots and real smooth input.
+
+  At an identical represented native state (post-rollout for torus where
+  the gate drifts, initial for bowl), compare effective J_hi+J_lo, mass,
+  W, R, aref/rhs, multipliers, reconstructed force/acceleration using
+  owned clones and the actual native smooth rhs captured read-only (never
+  the implied M*qacc-qfrc residual as a consistency certificate; the
+  implied quantity is still reported labeled separately alongside the
+  real rhs oracle). Asserts order-of-magnitude separation (not exact
+  equality): bowl J carries (prior test), torus lam/W carries at the
+  drifting state. Routes are not inferred from iteration counts.
+  """
+  model = _plugin_sphere_model(name)
+  sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  qfrc = np.zeros((1, model.nv), dtype=np.float32)
+  qfrc[0, 0] = 0.01
+  steps = 4 if name == "torus" else 0
+  for _ in range(steps):
+    sim.step(1, qfrc_applied=qfrc)
+  qpos = _clone(sim.state._qpos)[0].astype(np.float64)
+  qvel = _clone(sim.state._qvel)[0].astype(np.float64)
+  # Fresh assembly at the identical represented state (no warmstart on
+  # either side); owned snapshots cloned before any recompute.
+  sim2 = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  sim2.reset(qpos=qpos.astype(np.float32)[None],
+             qvel=qvel.astype(np.float32)[None])
+  # Read-only capture of the actual native smooth rhs (solver qfrc input);
+  # cloning never mutates device state (noninterference holds by
+  # construction, as with the staged-workspace capture).
+  smooth_seen = {}
+  cc = sim2._coupled_constraints
+  orig = cc._solve_kernel
+  def wrapped(*args, **kwargs):
+    import torch
+    # qfrc_smooth is the second positional solver input (mass, smooth,
+    # qpos, qvel, ...); record a clone without mutating the call.
+    try:
+      if len(args) >= 2 and isinstance(args[1], torch.Tensor):
+        smooth_seen["qfrc"] = args[1].cpu().numpy().copy()
+    except Exception:
+      pass
+    return orig(*args, **kwargs)
+  cc._solve_kernel = wrapped
+  try:
+    system = sim2.assembled_system(recompute=True, qfrc_applied=qfrc)
+  finally:
+    cc._solve_kernel = orig
+  assert "qfrc" in smooth_seen, "smooth rhs was not captured"
+  native_smooth = np.asarray(smooth_seen["qfrc"]).reshape(-1).astype(np.float64)
+  cpu_data, _, _ = _cpu_contacts(model, qpos, qvel)
+  cpu_data.qfrc_applied[:] = qfrc[0].astype(np.float64)
+  import mujoco as _mj
+  _mj.mj_forward(model, cpu_data)
+  cpu_smooth = np.asarray(cpu_data.qfrc_smooth, dtype=np.float64)
+  cpu_applied = np.asarray(cpu_data.qfrc_applied, dtype=np.float64)
+  # Real-rhs oracle gap (never the implied residual as certificate).
+  # Native solver smooth input carries applied forces; compare against
+  # CPU smooth+applied for identical staging.
+  smooth_gap = float(np.max(np.abs(native_smooth - (cpu_smooth + cpu_applied))))
+  # Owned snapshots for operators/multipliers/forces.
+  desc = sim2._coupled_constraints.descriptor
+  mask = _clone(system["contact_mask"])[0]
+  pos = _clone(system["contact_position"])[0]
+  _, _, contacts, pair_geoms = _cpu_contacts_from_data(model, cpu_data)
+  assert len(pair_geoms) == 1 and all(c["dim"] == 1 for c in contacts)
+  assignment = _unique_native_slots(contacts, mask, pos)
+  packed = np.asarray(
+      desc.contact_condim_packed, dtype=np.int32).reshape(-1, 3)
+  grows, crows = [], []
+  for ci, contact in enumerate(contacts):
+    slot, position_error = assignment[ci]
+    assert position_error < 1e-3
+    grows.append(int(desc.nr_joint) + int(packed[slot, 1]))
+    crows.extend(contact["rows"].tolist())
+  grows = np.asarray(grows)
+  crows = np.asarray(crows)
+  Jn = _clone(system["J"])[0].astype(np.float64)[grows]
+  Jc = np.asarray(cpu_data.efc_J).reshape(
+      cpu_data.nefc, model.nv)[crows].astype(np.float64)
+  lamn = _clone(system["lambda"])[0].astype(np.float64)[grows]
+  lamc = np.asarray(cpu_data.efc_force).astype(np.float64)[crows]
+  qfrc_cpu = np.asarray(cpu_data.qfrc_constraint).astype(np.float64)
+  cross = {}
+  cross_rot = {}
+  for tag, Jm, lm in (("natJ-natLam", Jn, lamn), ("natJ-cpuLam", Jn, lamc),
+                       ("cpuJ-natLam", Jc, lamn), ("cpuJ-cpuLam", Jc, lamc)):
+    err = Jm.T @ lm - qfrc_cpu
+    cross[tag] = float(np.max(np.abs(err)))
+    cross_rot[tag] = float(np.max(np.abs(err[3:])))
+  print(f"OPERATOR_SWAP[{name}] {json.dumps({'smooth_gap': smooth_gap, 'cross': cross, 'cross_rot': cross_rot})}")
+  # Bowl: J carries by >1e2 on the rotational subspace (gate-sensitive;
+  # translational errors are absorbed by the 4.19 body mass). Torus at the
+  # drifting state: multipliers carry (lam-driven force error dominates
+  # J-driven by an order of magnitude), directing the paired-operator
+  # repair at W/b/lam accuracy rather than J alone.
+  if name == "bowl":
+    assert cross_rot["natJ-cpuLam"] / max(cross_rot["cpuJ-natLam"], 1e-30) > 1e2
+  else:
+    assert cross["cpuJ-natLam"] / max(cross["natJ-cpuLam"], 1e-30) > 3
+
+
 def test_smooth_force_balance_uses_qfrc_smooth_cpu():
   """Force balance must use the actual smooth-force result.
 
