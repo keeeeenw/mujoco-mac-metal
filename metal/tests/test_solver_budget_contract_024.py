@@ -79,11 +79,22 @@ def test_budget_contract_matches_oracle_gpu(solver, budget, warm):
   if not warm:
     model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
   qpos = _fixed_state()
+  # Same represented state on both sides: the device consumes float32, so
+  # the CPU oracle runs at float32(qpos) reinterpreted as float64 (not the
+  # unrounded float64 pose). Geometry-input differences are thus separated
+  # from solver-formula tolerances.
+  qpos32 = qpos.astype(np.float32).astype(np.float64)
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
   sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
             qvel=np.zeros((1, model.nv), dtype=np.float32))
+  if warm:
+    # Populate nonzero owned warmstart/history before the measured solve:
+    # reset is cold, so discard one assembly on both sides (retained
+    # multipliers become the next solve's warm input) at identical inputs.
+    sim.assembled_system(recompute=True)
+    _cpu_forward(model, qpos32)
   s = sim.assembled_system(recompute=True)
-  d = _cpu_forward(model, qpos)
+  d = _cpu_forward(model, qpos32)
   nv = model.nv
   # Iteration counts and status are exact contract terms.
   dev_iters = float(np.asarray(s["solver_diagnostics"][0].cpu().numpy())[1])
@@ -99,6 +110,11 @@ def test_budget_contract_matches_oracle_gpu(solver, budget, warm):
   assert int(np.count_nonzero(lam)) == int(np.count_nonzero(lc))
   # Device contact rows are the trailing block for this pinned fixture
   # (nr=16, 8 joint-pad zeros then 8 contact rows); CPU efc is contacts.
+  # Sorted comparison here tiers aggregate solver values only (slot order
+  # is internal packing); index-aware row ownership is proven separately
+  # via row_island in the island tests, and position-matched contact
+  # agreement in the narrowphase/oracle gates. Mapped qacc/qfrc below are
+  # the primary DOF-indexed (unsorted) contract checks.
   assert lam.shape == (16,) and lc.shape == (8,)
   dev_lam = np.sort(lam[8:16])
   cpu_lam = np.sort(lc)
@@ -132,21 +148,52 @@ def test_budget_contract_matches_oracle_gpu(solver, budget, warm):
 
 @_needs_gpu()
 @pytest.mark.parametrize("noslip", [0, 2], ids=["noslip0", "noslip2"])
-def test_noslip_budget_contract_gpu(noslip):
+@pytest.mark.parametrize("condim", [1, 3], ids=["condim1", "condim3"])
+def test_noslip_budget_contract_gpu(noslip, condim):
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
-  model = _torus_model()
-  model.opt.noslip_iterations = noslip
+  # condim-3 exercises active contact friction blocks under no-slip;
+  # condim-1 (frictionless) preserves the legacy frictionless path.
+  if condim == 3:
+    m = mujoco.MjModel.from_xml_string(_torus_condim3_xml())
+  else:
+    m = _torus_model()
+  m.opt.noslip_iterations = noslip
   qpos = _fixed_state()
-  sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  qpos32 = qpos.astype(np.float32).astype(np.float64)
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
   sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
-            qvel=np.zeros((1, model.nv), dtype=np.float32))
+            qvel=np.zeros((1, m.nv), dtype=np.float32))
   s = sim.assembled_system(recompute=True)
-  d = _cpu_forward(model, qpos)
+  d = _cpu_forward(m, qpos32)
   np.testing.assert_allclose(
       np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64),
       np.asarray(d.qacc, dtype=np.float64), rtol=1e-3, atol=1e-3)
+  np.testing.assert_allclose(
+      np.asarray(s["qfrc_constraint"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qfrc_constraint, dtype=np.float64), rtol=1e-3, atol=1e-3)
   assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[0]) == 0
+
+
+def _torus_condim3_xml():
+  return """
+    <mujoco>
+      <option timestep="0.002" integrator="Euler" gravity="0 0 0"
+              iterations="100" tolerance="1e-8" sdf_initpoints="8"/>
+      <extension><plugin plugin="mujoco.sdf.torus">
+        <instance name="shape"/>
+      </plugin></extension>
+      <asset><mesh name="shape_mesh"><plugin instance="shape"/></mesh></asset>
+      <worldbody>
+        <geom name="plugin_sdf" type="sdf" mesh="shape_mesh">
+          <plugin instance="shape"/>
+        </geom>
+        <body name="probe" pos="0.45 0 0">
+          <freejoint/><geom name="probe_sphere" type="sphere" size="0.1"/>
+        </body>
+      </worldbody>
+      <contact><pair geom1="plugin_sdf" geom2="probe_sphere" condim="3"/></contact>
+    </mujoco>"""
 
 
 @_needs_gpu()
