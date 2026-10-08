@@ -970,6 +970,9 @@ kernel void contact_sdf_seed_init(
     device const float* geom_pos_tail [[buffer(14)]],
     device const float* geom_quat_low [[buffer(15)]],
     device const float* geom_quat_tail [[buffer(16)]],
+    device const float* geom_xmat [[buffer(17)]],
+    device const float* geom_xmat_low [[buffer(18)]],
+    device const float* geom_xmat_tail [[buffer(19)]],
     uint tid [[thread_position_in_grid]]) {
   int npairs = dims[1], batch = dims[3];
   int tile_count = stage_dims[0], capacity = max(stage_dims[2], 1);
@@ -1009,22 +1012,24 @@ kernel void contact_sdf_seed_init(
   SdfWide pz2 = {in.pos2.z, 0.0f, 0.0f};
   // Overwrite with triple planes when the host provides them. Indexing
   // matches the float32 buffers: (go+geom)*3/4.
-  qw1 = {geom_quat[(go + gc1) * 4], geom_quat_low[(go + gc1) * 4],
-         geom_quat_tail[(go + gc1) * 4]};
-  qx1 = {geom_quat[(go + gc1) * 4 + 1], geom_quat_low[(go + gc1) * 4 + 1],
-         geom_quat_tail[(go + gc1) * 4 + 1]};
-  qy1 = {geom_quat[(go + gc1) * 4 + 2], geom_quat_low[(go + gc1) * 4 + 2],
-         geom_quat_tail[(go + gc1) * 4 + 2]};
-  qz1 = {geom_quat[(go + gc1) * 4 + 3], geom_quat_low[(go + gc1) * 4 + 3],
-         geom_quat_tail[(go + gc1) * 4 + 3]};
-  qw2 = {geom_quat[(go + gc2) * 4], geom_quat_low[(go + gc2) * 4],
-         geom_quat_tail[(go + gc2) * 4]};
-  qx2 = {geom_quat[(go + gc2) * 4 + 1], geom_quat_low[(go + gc2) * 4 + 1],
-         geom_quat_tail[(go + gc2) * 4 + 1]};
-  qy2 = {geom_quat[(go + gc2) * 4 + 2], geom_quat_low[(go + gc2) * 4 + 2],
-         geom_quat_tail[(go + gc2) * 4 + 2]};
-  qz2 = {geom_quat[(go + gc2) * 4 + 3], geom_quat_low[(go + gc2) * 4 + 3],
-         geom_quat_tail[(go + gc2) * 4 + 3]};
+  // Pinned mjc_SDF derives its quats from geom_xmat via mju_mat2Quat, NOT
+  // from FK quat composition. Derive the T quats the same way so the seed
+  // box, Halton points and maps start from identical words. Positions come
+  // from the FK triple planes (bit-exact vs CPU xpos); xmat triples are
+  // bit-exact vs CPU xmat, so the derived quats match the binary.
+  SdfWide _m1[9], _m2[9];
+  for (int _k = 0; _k < 9; ++_k) {
+    _m1[_k] = {geom_xmat[(go + gc1) * 9 + _k],
+               geom_xmat_low[(go + gc1) * 9 + _k],
+               geom_xmat_tail[(go + gc1) * 9 + _k]};
+    _m2[_k] = {geom_xmat[(go + gc2) * 9 + _k],
+               geom_xmat_low[(go + gc2) * 9 + _k],
+               geom_xmat_tail[(go + gc2) * 9 + _k]};
+  }
+  sdf_quat_from_mat_wide(_m1[0], _m1[1], _m1[2], _m1[3], _m1[4], _m1[5],
+                         _m1[6], _m1[7], _m1[8], qw1, qx1, qy1, qz1);
+  sdf_quat_from_mat_wide(_m2[0], _m2[1], _m2[2], _m2[3], _m2[4], _m2[5],
+                         _m2[6], _m2[7], _m2[8], qw2, qx2, qy2, qz2);
   px1 = {geom_pos[(go + gc1) * 3], geom_pos_low[(go + gc1) * 3],
          geom_pos_tail[(go + gc1) * 3]};
   py1 = {geom_pos[(go + gc1) * 3 + 1], geom_pos_low[(go + gc1) * 3 + 1],

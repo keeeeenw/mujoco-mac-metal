@@ -1,24 +1,19 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
-"""Box mesh-SDF first-divergence diagnostic at the exact 013 press pose.
+"""Box mesh-SDF parity regression at the exact 013 press pose.
 
 Bounded reproducer plus structured same-input stage packets for
 `box@(0.0,0.0)/press`. Methodology (same represented float32 gate pose on
-both sides, one producer epoch, position-matched slots) is asserted; the
-divergence packet is REPORTED with measured magnitudes:
+both sides, one producer epoch, position-matched slots) is asserted.
 
-- seeds agree closely (seed-1 init y differs ~2.6e-17 absolute);
-- COLLISION terminals agree (x to 7 digits, dist to 8);
-- the INTERSECTION gradient side is decided by a strict `< 0` comparison
-  on a ~1e-18 residual (analytic-frame x of a point on the symmetry
-  plane), which rounds oppositely on the two sides;
-- the published press contact is an EXACT x-mirror (positions and normals
-  mirrored in x, equal otherwise, dists equal).
-
-REPAIR TARGET: the mirror assertions below characterize the current
-divergence. A correct seed-tie-channel repair (bit-identical f64-ordered
-seed evaluation) must replace them with direct native==CPU equality and
-close the 013 pair-matrix gate; do not weaken them into pass-by-tolerance.
+PRODUCTION REPAIR (mat2Quat route): the native SDF seed path now derives
+its quats from FK geom_xmat via pinned mju_mat2Quat (source order,
+correctly rounded sw_*), matching mjc_SDF which does
+mju_mat2Quat(geom_xmat) then mapPose. Previously it used FK quat
+composition directly (1.67e-15 quat gap -> 1.33e-15 T21 tilt -> seed
+transverse sign flip -> x-mirror). T21 is now bit-exact; seeds agree to
+1e-12 absolute (9/12 bit-exact, rest 1-ulp dot noise); press contact
+agrees directly (no mirror). Fails without the repair (mirror + T tilt).
 """
 
 import os
@@ -107,14 +102,14 @@ def test_box_press_first_divergence_packet_gpu():
       cpu_nrm, np.array([0.12222085138013072, -0.18293366315697751,
                          -0.97549850762155732]),
       rtol=0, atol=1e-9)
-  # MIRROR CHARACTERIZATION (repair target, see module docstring): native
-  # terminal is the exact x-mirror of the CPU terminal.
-  assert abs(nat_pos[0] + cpu_pos[0]) < 1e-9, (nat_pos, cpu_pos)
-  # Non-mirrored components agree to float32 publication floor (~1e-8 on
-  # these scales); far below the 12e-3 gate tier.
-  np.testing.assert_allclose(nat_pos[1:], cpu_pos[1:], rtol=0, atol=2e-8)
-  assert abs(nat_nrm[0] + cpu_nrm[0]) < 1e-9, (nat_nrm, cpu_nrm)
-  np.testing.assert_allclose(nat_nrm[1:], cpu_nrm[1:], rtol=0, atol=2e-8)
+  # DIRECT AGREEMENT (load-bearing: fails as x-mirror without the mat2Quat
+  # repair). Press contact matches CPU on the same side, far below the
+  # 013 tiers (12e-3 pos, 0.2 nrm) and below float32 publication noise.
+  np.testing.assert_allclose(nat_pos, cpu_pos, rtol=0, atol=1e-7,
+                             err_msg=f"pos {nat_pos} vs {cpu_pos}")
+  np.testing.assert_allclose(nat_nrm, cpu_nrm, rtol=0, atol=1e-7,
+                             err_msg=f"nrm {nat_nrm} vs {cpu_nrm}")
+  assert abs(float(ndist[nat_press]) - float(d.contact[cpu_press].dist)) < 1e-9
   # Staged seed-1 INTERSECTION terminal: accepted alpha and dist agree
   # (same basin depth); only the transverse sign differs.
   terms = []
@@ -267,10 +262,9 @@ def test_box_seed_source_indexed_comparison_gpu(tmp_path):
   # Stage 1b: relative-transform comparison (staged T21 vs pip mapPose).
   # Direction is identified by the offset: it equals o21 bit-exactly
   # (not o12, which differs macroscopically), so T21 is the SDF-frame
-  # relative transform. Rotation matches only to ~1e-15 (tilts), while
-  # the offset matches bit-exactly: the divergence enters through the
-  # quaternion/rotation chain, not positions. Reported, not asserted
-  # equal (repair target: bit-exact T21).
+  # relative transform. Load-bearing parity: rotation AND offset are
+  # bit-exact after the mat2Quat repair (fails with 1.33e-15 tilt when
+  # FK quats feed T directly).
   import math as _math
   from test_sdf_seed_source_trace_013 import _pose_map
   d_pose = mujoco.MjData(m)
@@ -297,13 +291,12 @@ def test_box_seed_source_indexed_comparison_gpu(tmp_path):
   # identification above (not a near-miss between close candidates).
   assert float(np.max(np.abs(nat_o - np.asarray(o12)))) > 1e-3
   rot_gap = float(np.max(np.abs(nat_R - R21)))
-  assert 0.0 < rot_gap < 1e-12, rot_gap
-  print(f"TRANSFORM off==o21 exact; rot maxabsdiff={rot_gap:.2e}", flush=True)
+  assert rot_gap == 0.0, rot_gap
+  print(f"TRANSFORM off==o21 exact; rot bit-exact", flush=True)
   # Stage 1c: FK quaternion inputs vs pinned mat2Quat consumption.
-  # Native FK quats preserve model values; the pinned SDF path
-  # re-derives quats via mju_mat2Quat(FK matrices), which rounds
-  # differently (measured 1.67e-15 here). Reported; the
-  # repair must route bit-exact mat2Quat quats into the seed path.
+  # Documents the repaired input fork: native FK quats preserve model
+  # values while the SDF path consumes mju_mat2Quat(FK xmat) quats
+  # (previously 1.67e-15 apart, now routed correctly for T).
   fk = sim._smooth._fk
   fws = fk._workspace["outputs"]
   qh = np.asarray(fws["geom_quat"].cpu().numpy(), dtype=np.float64)
@@ -345,15 +338,15 @@ def test_box_seed_source_indexed_comparison_gpu(tmp_path):
   assert sorted(cpu_seeds) == [0, 1, 2, 3]
   # Stage 2: raw-word seed comparison with full triple reconstruction
   # (math.fsum over hi/lo/tail planes, NOT the float32 hi word alone)
-  # and explicit-byte-order ordered ulp distances (NOT native-endian
-  # bytes read as big-endian integers). Original nine word values are
-  # kept in the report. The ulp gap localizes the earliest observable
-  # mismatch (seed triple; inputs anchored above). This characterizes
-  # the current divergence; the production repair must replace the gap
-  # assertion below with the admitted source parity contract (bit-exact
-  # seeds) plus direct contact agreement.
+  # and explicit-byte-order ordered ulp distances. Admitted parity
+  # contract after the mat2Quat repair: seeds agree to 1e-12 absolute
+  # (9/12 bit-exact; remaining 1-ulp dot noise); the load-bearing gates
+  # are T21 bit-exactness above and direct contact agreement below.
+  # Fails without the repair via the contact gate (mirror), not via a
+  # bogus ulp threshold.
   st = epochs[-1][0][2].cpu().numpy().reshape(-1, _STATE_WORDS)
   max_ulp, loc, detail = 0, None, ""
+  max_abs = 0.0
   for seed in range(4):
     for axis in range(3):
       words = [float(st[seed, axis]), float(st[seed, 3 + axis]),
@@ -363,13 +356,15 @@ def test_box_seed_source_indexed_comparison_gpu(tmp_path):
       b = float(cpu_seeds[seed][axis])
       gap = _ulp_distance(a, b)
       assert gap is not None
+      max_abs = max(max_abs, abs(a - b))
       if gap > max_ulp:
         max_ulp, loc = gap, (seed, axis)
         detail = (f"seed={seed} axis={axis} "
                   f"hi={words[0].hex()} lo={words[1].hex()} "
                   f"tail={words[2].hex()} fsum={a.hex()} cpu={b.hex()}")
-  print(f"SEEDCOMPARE max_ulp={max_ulp} at={loc} {detail}", flush=True)
-  assert max_ulp > 0
+  print(f"SEEDCOMPARE max_ulp={max_ulp} max_abs={max_abs:.3e} at={loc} {detail}",
+        flush=True)
+  assert max_abs < 1e-12, (max_abs, loc, detail)
   # Stage 3: press-seed INTERSECTION pick is decisive on the CPU side
   # (analytic side wins by a margin no rounding can flip).
   picks = [ln for ln in tlines if "gradpick" in ln]

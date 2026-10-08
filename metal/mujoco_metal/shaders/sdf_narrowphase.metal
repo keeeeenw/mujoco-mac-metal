@@ -1283,6 +1283,64 @@ inline void sdf_quat_normalize4_wide(thread SdfWide& qw, thread SdfWide& qx,
   qy = sw_mul(qy, ninv);
   qz = sw_mul(qz, ninv);
 }
+// Pinned mju_mat2Quat in wide arithmetic (3.10.0 source order, no FMA).
+// Consumes the FK geom_xmat triple (bit-exact vs CPU xmat) and produces the
+// same quat words the CPU SDF path consumes via mju_mat2Quat. Branch
+// predicates and every add/sub/mul/div/sqrt use source left-assoc rounding
+// (sw_* are correctly rounded); normalization reuses the pinned helper
+// above, matching mju_normalize4 exactly.
+inline void sdf_quat_from_mat_wide(SdfWide m0, SdfWide m1, SdfWide m2,
+                                   SdfWide m3, SdfWide m4, SdfWide m5,
+                                   SdfWide m6, SdfWide m7, SdfWide m8,
+                                   thread SdfWide& qw, thread SdfWide& qx,
+                                   thread SdfWide& qy, thread SdfWide& qz) {
+  SdfWide half_w = sw(0.5f);
+  SdfWide quarter_w = sw(0.25f);
+  SdfWide one = sw(1.0f);
+  SdfWide trace = sw_add(sw_add(m0, m4), m8);
+  if (sw_sign(trace) > 0) {
+    SdfWide sarg = sw_add(sw_add(sw_add(one, m0), m4), m8);
+    SdfWide root = sw_sqrt(sarg);
+    qw = sw_mul(half_w, root);
+    SdfWide d1 = sw_sub(m7, m5);
+    SdfWide d2 = sw_sub(m2, m6);
+    SdfWide d3 = sw_sub(m3, m1);
+    qx = sw_div(sw_mul(quarter_w, d1), qw);
+    qy = sw_div(sw_mul(quarter_w, d2), qw);
+    qz = sw_div(sw_mul(quarter_w, d3), qw);
+  } else if (sw_sign(sw_sub(m0, m4)) > 0 && sw_sign(sw_sub(m0, m8)) > 0) {
+    SdfWide sarg = sw_sub(sw_sub(sw_add(one, m0), m4), m8);
+    SdfWide root = sw_sqrt(sarg);
+    qx = sw_mul(half_w, root);
+    SdfWide d0 = sw_sub(m7, m5);
+    SdfWide s2 = sw_add(m1, m3);
+    SdfWide s3 = sw_add(m2, m6);
+    qw = sw_div(sw_mul(quarter_w, d0), qx);
+    qy = sw_div(sw_mul(quarter_w, s2), qx);
+    qz = sw_div(sw_mul(quarter_w, s3), qx);
+  } else if (sw_sign(sw_sub(m4, m8)) > 0) {
+    SdfWide sarg = sw_sub(sw_add(sw_sub(one, m0), m4), m8);
+    SdfWide root = sw_sqrt(sarg);
+    qy = sw_mul(half_w, root);
+    SdfWide d0 = sw_sub(m2, m6);
+    SdfWide s1 = sw_add(m1, m3);
+    SdfWide s3 = sw_add(m5, m7);
+    qw = sw_div(sw_mul(quarter_w, d0), qy);
+    qx = sw_div(sw_mul(quarter_w, s1), qy);
+    qz = sw_div(sw_mul(quarter_w, s3), qy);
+  } else {
+    SdfWide sarg = sw_add(sw_sub(sw_sub(one, m0), m4), m8);
+    SdfWide root = sw_sqrt(sarg);
+    qz = sw_mul(half_w, root);
+    SdfWide d0 = sw_sub(m3, m1);
+    SdfWide s1 = sw_add(m2, m6);
+    SdfWide s2 = sw_add(m5, m7);
+    qw = sw_div(sw_mul(quarter_w, d0), qz);
+    qx = sw_div(sw_mul(quarter_w, s1), qz);
+    qy = sw_div(sw_mul(quarter_w, s2), qz);
+  }
+  sdf_quat_normalize4_wide(qw, qx, qy, qz);
+}
 inline void sdf_rotVecQuat_wide(SdfWide vx, SdfWide vy, SdfWide vz,
                                 SdfWide qw, SdfWide qx, SdfWide qy, SdfWide qz,
                                 thread SdfWide& rx, thread SdfWide& ry,

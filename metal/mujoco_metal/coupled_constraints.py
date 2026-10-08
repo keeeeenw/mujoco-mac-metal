@@ -3387,6 +3387,8 @@ class MetalCoupledConstraints:
               self._sdf_stage_dims,
               poses["geom_pos_low"], poses["geom_pos_tail"],
               poses["geom_quat_low"], poses["geom_quat_tail"],
+              poses["geom_xmat"], poses["geom_xmat_low"],
+              poses["geom_xmat_tail"],
               threads=(thread_count,), group_size=(1,))
           for step in range(self._sdf_max_iterations):
             set_sdf_stage(2, step)
