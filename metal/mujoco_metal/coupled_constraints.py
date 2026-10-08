@@ -1435,7 +1435,10 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
   sdf_geom_tail_floats = 15 * int(model.ngeom) if sdf_geoms else 0
   geometry_upload_floats = (
       _MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA +
-      36 * sdf_oct_total + (18 * int(model.ngeom) if sdf_geoms else 0) +
+      # Octree blocks carry a third residual word per aabb/coeff entry
+      # (50 floats/node) so razor mesh-SDF vertex selections reproduce
+      # pinned float64 ties bitwise.
+      50 * sdf_oct_total + (18 * int(model.ngeom) if sdf_geoms else 0) +
       sdf_geom_tail_floats +
       mesh_sdf_float_count + plugin_sdf_float_count)
   geometry_upload_bytes = 4 * (
@@ -1452,7 +1455,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
         f"({geometry_upload_bytes} bytes) exceeds "
         f"budget {memory_budget} bytes")
   mesh_hull = np.zeros((_MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA +
-                      36 * sdf_oct_total + (18 * int(model.ngeom) if sdf_geoms else 0) +
+                      50 * sdf_oct_total + (18 * int(model.ngeom) if sdf_geoms else 0) +
                       sdf_geom_tail_floats +
                       mesh_sdf_float_count + plugin_sdf_float_count,),
                      dtype=np.float32)
@@ -1558,12 +1561,14 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
 
   # Milestone 013 SDF octree + local-AABB upload. Oct blocks pack per SDF
   # mesh as child[8N] (local indices as floats, exact below 2^24), then
-  # aabb[6N], coeff[8N], aabb residual[6N], coeff residual[8N];
+  # aabb[6N], coeff[8N], aabb residual[6N], coeff residual[8N],
+  # aabb tail[6N], coeff tail[8N] (50N total; hi+lo+tail is bitwise float64,
+  # required by razor mesh-SDF vertex selections);
   # per-SDF-geom info holds child base, node
   # count and sdf_iterations. Local AABBs (compiled, center+half) upload
   # for every geom at a fixed stride for the seed-box computation.
   oct_base = _MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA
-  sdf_aabb_base = oct_base + 36 * sdf_oct_total
+  sdf_aabb_base = oct_base + 50 * sdf_oct_total
   ocursor = oct_base
   mesh_oct_base = {}
   for mid, (adr, num) in sorted(sdf_mesh_nodes.items()):
@@ -1576,11 +1581,23 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     mesh_hull[ocursor + 8 * num:ocursor + 14 * num] = aabb.astype(np.float32)
     mesh_hull[ocursor + 14 * num:ocursor + 22 * num] = coeff.astype(np.float32)
     mesh_oct_base[mid] = ocursor
+    aabb_hi = aabb.astype(np.float32)
+    coeff_hi = coeff.astype(np.float32)
     mesh_hull[ocursor + 22 * num:ocursor + 28 * num] = (
-        aabb.astype(np.float64) - aabb.astype(np.float32).astype(np.float64))
+        aabb.astype(np.float64) - aabb_hi.astype(np.float64))
     mesh_hull[ocursor + 28 * num:ocursor + 36 * num] = (
-        coeff.astype(np.float64) - coeff.astype(np.float32).astype(np.float64))
-    ocursor += 36 * num
+        coeff.astype(np.float64) - coeff_hi.astype(np.float64))
+    # Third residual words: hi+lo+tail reproduces the pinned float64 entry
+    # bitwise (exact Sterbenz splits), which razor gradient ties require.
+    aabb_lo = (aabb.astype(np.float64) - aabb_hi.astype(np.float64)).astype(np.float32)
+    coeff_lo = (coeff.astype(np.float64) - coeff_hi.astype(np.float64)).astype(np.float32)
+    mesh_hull[ocursor + 36 * num:ocursor + 42 * num] = (
+        aabb.astype(np.float64) - aabb_hi.astype(np.float64)
+        - aabb_lo.astype(np.float64))
+    mesh_hull[ocursor + 42 * num:ocursor + 50 * num] = (
+        coeff.astype(np.float64) - coeff_hi.astype(np.float64)
+        - coeff_lo.astype(np.float64))
+    ocursor += 50 * num
   sdf_iters = int(model.opt.sdf_iterations)
   if sdf_geoms and sdf_iters <= 0:
     raise ValueError("opt.sdf_iterations must be positive with SDF pairs")
@@ -1627,6 +1644,10 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
   # local vertices, triangle indices, then depth-first BVH records. Each BVH
   # record is [leaf face id, child0, child1, center xyz, half xyz]. The
   # shader traverses this compiled tree in the pinned callback order.
+  # NOTE: pinned mesh_vert is float32, so corners are exact by promotion;
+  # no residual words are stored for verts (they would be zeros). Corner
+  # precision lives in the rotation/translation arithmetic (qualified with
+  # rotated/translated fixtures), not in padding.
   mcursor = (sdf_aabb_base + (18 * int(model.ngeom) if sdf_geoms else 0)
              + sdf_geom_tail_floats)
   for mid in mesh_sdf_assets:

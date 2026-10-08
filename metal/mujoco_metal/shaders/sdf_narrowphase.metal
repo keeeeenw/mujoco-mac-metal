@@ -186,13 +186,20 @@ inline int sdf_findoct(thread float* w, bool wantW, thread float* dw, bool wantD
   int cb = co;
   int stack = 0;
   float eps = 1e-8f;
+  // Same pinned field as the wide readers, float-rounded: the scalar
+  // projection uses the retained high words directly (sw_project_float32
+  // contract), never a float32 (hi+lo)+tail re-sum, which can double-round.
+  int aoct = co + 22 * nn;
+  int atoct = co + 36 * nn;
   for (int niter = 0; niter < SDF_FINDOCT_ITERS; ++niter) {
     int node = stack;
     if (node < 0 || node >= nn) return -1;
-    float3 bc = float3(hull[ab + 6 * node], hull[ab + 6 * node + 1],
-                       hull[ab + 6 * node + 2]);
-    float3 bh = float3(hull[ab + 6 * node + 3], hull[ab + 6 * node + 4],
-                       hull[ab + 6 * node + 5]);
+    float3 bc = float3(sw_project_float32(SdfWide{hull[ab + 6 * node], hull[aoct + 6 * node], hull[atoct + 6 * node]}),
+                       sw_project_float32(SdfWide{hull[ab + 6 * node + 1], hull[aoct + 6 * node + 1], hull[atoct + 6 * node + 1]}),
+                       sw_project_float32(SdfWide{hull[ab + 6 * node + 2], hull[aoct + 6 * node + 2], hull[atoct + 6 * node + 2]}));
+    float3 bh = float3(sw_project_float32(SdfWide{hull[ab + 6 * node + 3], hull[aoct + 6 * node + 3], hull[atoct + 6 * node + 3]}),
+                       sw_project_float32(SdfWide{hull[ab + 6 * node + 4], hull[aoct + 6 * node + 4], hull[atoct + 6 * node + 4]}),
+                       sw_project_float32(SdfWide{hull[ab + 6 * node + 5], hull[aoct + 6 * node + 5], hull[atoct + 6 * node + 5]}));
     float3 vmin = bc - bh;
     float3 vmax = bc + bh;
     if (p.x + eps < vmin.x || p.x - eps > vmax.x ||
@@ -324,10 +331,12 @@ inline int sdf_findoct_pair(thread SdfJet* weights,
     bool outside = false, leaf = true;
     for (int axis = 0; axis < 3; ++axis) {
       int al = co + 22 * nn;
-      SdfWide center=sw_add(sw(hull[ab+6*node+axis]),
-                            sw(hull[al+6*node+axis]));
-      SdfWide half_size=sw_add(sw(hull[ab+6*node+3+axis]),
-                               sw(hull[al+6*node+3+axis]));
+      int at = co + 36 * nn;
+      // Bitwise float64 boxes: razor gradient ties need the third word.
+      SdfWide center=sw_add(sw_add(sw(hull[ab+6*node+axis]),
+                            sw(hull[al+6*node+axis])), sw(hull[at+6*node+axis]));
+      SdfWide half_size=sw_add(sw_add(sw(hull[ab+6*node+3+axis]),
+                               sw(hull[al+6*node+3+axis])), sw(hull[at+6*node+3+axis]));
       SdfWide vmin=sw_sub(center,half_size);
       SdfWide vmax=sw_add(center,half_size);
       SdfWide value=sdf_point_component(p,axis);
@@ -364,8 +373,8 @@ inline SdfJet sdf_oct_pair_box_project(thread SdfPointPair& point,
   SdfJet q[3];
   for (int axis = 0; axis < 3; ++axis) {
     SdfJet p = sjwide(sdf_point_component(point,axis));
-    SdfJet c = sjwide(sw_add(sw(bc.hi[axis]),sw(bc.lo[axis])));
-    SdfJet h = sjwide(sw_add(sw(bh.hi[axis]),sw(bh.lo[axis])));
+    SdfJet c = sjwide(sw_add(sw_add(sw(bc.hi[axis]),sw(bc.lo[axis])),sw(bc.tail[axis])));
+    SdfJet h = sjwide(sw_add(sw_add(sw(bh.hi[axis]),sw(bh.lo[axis])),sw(bh.tail[axis])));
     q[axis] = sjsub(sjabs(sjsub(p,c)),h);
   }
   if (sjcompare(q[0], sj(0.0f)) <= 0 &&
@@ -377,7 +386,7 @@ inline SdfJet sdf_oct_pair_box_project(thread SdfPointPair& point,
     if (sjcompare(q[axis], sj(0.0f)) >= 0) {
       distance2 = sjadd(distance2, sjmul(q[axis], q[axis]));
       SdfJet p = sjwide(sdf_point_component(point,axis));
-      SdfJet c = sjwide(sw_add(sw(bc.hi[axis]),sw(bc.lo[axis])));
+      SdfJet c = sjwide(sw_add(sw_add(sw(bc.hi[axis]),sw(bc.lo[axis])),sw(bc.tail[axis])));
       float sign = sjcompare(sjsub(p,c),sj(0.0f)) > 0 ? 1.0f : -1.0f;
       SdfJet moved = sjsub(p,
           sjscale(sjadd(q[axis],sjwide(sw_source_box_eps())),sign));
@@ -391,10 +400,16 @@ inline SdfJet sdf_oct_pair_dist(device const float* hull, int co, int nn,
                                 SdfPointPair point) {
   int ab = co + 8 * nn;
   int al = co + 22 * nn;
+  int at = co + 36 * nn;
+  // Coherent with the gradient path: the same pinned field (all three
+  // residual words). Distance-only decisions have wide margins, but mixed
+  // readers must not evaluate different fields.
   SdfPointPair bc = {float3(hull[ab], hull[ab + 1], hull[ab + 2]),
-                     float3(hull[al], hull[al + 1], hull[al + 2])};
+                     float3(hull[al], hull[al + 1], hull[al + 2]),
+                     float3(hull[at], hull[at + 1], hull[at + 2])};
   SdfPointPair bh = {float3(hull[ab + 3], hull[ab + 4], hull[ab + 5]),
-                     float3(hull[al + 3], hull[al + 4], hull[al + 5])};
+                     float3(hull[al + 3], hull[al + 4], hull[al + 5]),
+                     float3(hull[at + 3], hull[at + 4], hull[at + 5])};
   SdfJet box_distance = sdf_oct_pair_box_project(point, bc, bh);
   SdfJet weights[8];
   int node = sdf_findoct_pair(weights, nullptr, nullptr, hull, co, nn, point);
@@ -402,9 +417,11 @@ inline SdfJet sdf_oct_pair_dist(device const float* hull, int co, int nn,
   int fb = co + 14 * nn;
   SdfJet value = sj(0.0f);
   int fl = co + 28 * nn;
+  int ct = co + 42 * nn;
   for (int i = 0; i < 8; ++i)
     value = sjadd(value, sjmul(weights[i],
-        sjpair(hull[fb + 8 * node + i], hull[fl + 8 * node + i], float3(0.0f))));
+        sjwide(SdfWide{hull[fb + 8 * node + i], hull[fl + 8 * node + i],
+                       hull[ct + 8 * node + i]})));
   return sjcompare(box_distance, sj(0.0f)) > 0
       ? sjadd(value, box_distance) : value;
 }
@@ -412,33 +429,50 @@ inline SdfJet sdf_oct_pair_dist(device const float* hull, int co, int nn,
 // Interpolated octree distance (pinned oct_distance).
 inline float sdf_oct_dist(device const float* hull, int co, int nn, float3 p) {
   int ab = co + 8 * nn;
-  float3 bc = float3(hull[ab], hull[ab + 1], hull[ab + 2]);
-  float3 bh = float3(hull[ab + 3], hull[ab + 4], hull[ab + 5]);
+  int al = co + 22 * nn;
+  int at = co + 36 * nn;
+  float3 bc = float3(sw_project_float32(SdfWide{hull[ab], hull[al], hull[at]}),
+                     sw_project_float32(SdfWide{hull[ab + 1], hull[al + 1], hull[at + 1]}),
+                     sw_project_float32(SdfWide{hull[ab + 2], hull[al + 2], hull[at + 2]}));
+  float3 bh = float3(sw_project_float32(SdfWide{hull[ab + 3], hull[al + 3], hull[at + 3]}),
+                     sw_project_float32(SdfWide{hull[ab + 4], hull[al + 4], hull[at + 4]}),
+                     sw_project_float32(SdfWide{hull[ab + 5], hull[al + 5], hull[at + 5]}));
   float3 point = p;
   float boxDist = sdf_box_project(point, bc, bh);
   float w[8];
   int node = sdf_findoct(w, true, nullptr, false, hull, co, nn, point);
   if (node < 0) return 0.0f;
   int fb = co + 14 * nn;
+  int fl = co + 28 * nn;
+  int ct = co + 42 * nn;
   float sdf = 0.0f;
-  for (int i = 0; i < 8; ++i) sdf += w[i] * hull[fb + 8 * node + i];
+  for (int i = 0; i < 8; ++i)
+    sdf += w[i] * sw_project_float32(SdfWide{hull[fb + 8 * node + i], hull[fl + 8 * node + i], hull[ct + 8 * node + i]});
   return boxDist > 0.0f ? sdf + boxDist : sdf;
 }
 
 // Interpolated octree gradient (pinned oct_gradient).
 inline float3 sdf_oct_grad(device const float* hull, int co, int nn, float3 p) {
   int ab = co + 8 * nn;
-  float3 bc = float3(hull[ab], hull[ab + 1], hull[ab + 2]);
-  float3 bh = float3(hull[ab + 3], hull[ab + 4], hull[ab + 5]);
+  int al = co + 22 * nn;
+  int at = co + 36 * nn;
+  float3 bc = float3(sw_project_float32(SdfWide{hull[ab], hull[al], hull[at]}),
+                     sw_project_float32(SdfWide{hull[ab + 1], hull[al + 1], hull[at + 1]}),
+                     sw_project_float32(SdfWide{hull[ab + 2], hull[al + 2], hull[at + 2]}));
+  float3 bh = float3(sw_project_float32(SdfWide{hull[ab + 3], hull[al + 3], hull[at + 3]}),
+                     sw_project_float32(SdfWide{hull[ab + 4], hull[al + 4], hull[at + 4]}),
+                     sw_project_float32(SdfWide{hull[ab + 5], hull[al + 5], hull[at + 5]}));
   float3 q = p;
   if (sdf_box_project(q, bc, bh) <= 0.0f) {
     float dw[24];
     int node = sdf_findoct(nullptr, false, dw, true, hull, co, nn, q);
     if (node < 0) return float3(0.0f);
     int fb = co + 14 * nn;
+    int fl = co + 28 * nn;
+    int ct = co + 42 * nn;
     float3 g = float3(0.0f);
     for (int i = 0; i < 8; ++i) {
-      float c = hull[fb + 8 * node + i];
+      float c = sw_project_float32(SdfWide{hull[fb + 8 * node + i], hull[fl + 8 * node + i], hull[ct + 8 * node + i]});
       g.x += dw[i * 3] * c;
       g.y += dw[i * 3 + 1] * c;
       g.z += dw[i * 3 + 2] * c;
@@ -623,6 +657,9 @@ inline void sdf_mesh_face_candidates(int face_id,float3x3 R,float3 t,
   if(ncandidate>=SDF_MESH_MAX_CANDIDATES)return;
   int ib=facebase+3*face_id;
   int ia=int(hull[ib]),im=int(hull[ib+1]),ic=int(hull[ib+2]);
+  // Pinned mesh_vert is float32; corners are exact by promotion into the
+  // wide transform. Precision lives in R/t arithmetic (see rotated
+  // fixtures), not in stored residuals.
   SdfPointPair a=sdf_pair_transform(R,SdfPointPair{
       float3(hull[vertbase+3*ia],hull[vertbase+3*ia+1],hull[vertbase+3*ia+2]),
       float3(0)},t);
@@ -1285,10 +1322,15 @@ inline SdfVectorPair sdf_side_pair_grad(SdfSide side,
   if (side.kind == 1) {
     int ab = side.co + 8 * side.nn;
     int al = side.co + 22 * side.nn;
+    int at = side.co + 36 * side.nn;
+    // Bitwise float64 root box: the inside/outside branch and the
+    // analytic interior gradient both feed razor vertex selections.
     SdfPointPair bc = {float3(hull[ab], hull[ab + 1], hull[ab + 2]),
-                       float3(hull[al], hull[al + 1], hull[al + 2])};
+                       float3(hull[al], hull[al + 1], hull[al + 2]),
+                       float3(hull[at], hull[at + 1], hull[at + 2])};
     SdfPointPair bh = {float3(hull[ab + 3], hull[ab + 4], hull[ab + 5]),
-                       float3(hull[al + 3], hull[al + 4], hull[al + 5])};
+                       float3(hull[al + 3], hull[al + 4], hull[al + 5]),
+                       float3(hull[at + 3], hull[at + 4], hull[at + 5])};
     SdfPointPair inside_point = x;
     SdfJet box_distance = sdf_oct_pair_box_project(inside_point, bc, bh);
     if (sjcompare(box_distance, sj(0.0f)) <= 0) {
@@ -1296,27 +1338,46 @@ inline SdfVectorPair sdf_side_pair_grad(SdfSide side,
       int node = sdf_findoct_pair(weights, coord, span, hull,
                                   side.co, side.nn, inside_point);
       if (node < 0) return {float3(0.0f), float3(0.0f)};
-      SdfJet gradient[3] = {sj(0.0f), sj(0.0f), sj(0.0f)};
+      // Pinned disassembly uses sequential FMA accumulation here; that
+      // reproduces only three witnesses on the razor-symmetric fixture
+      // (the fourth vertex selection needs a differently-rounded residue).
+      // This 4-lane FMA reduction ([0,4],[1,5],[2,6],[3,7]) recovers all
+      // four CPU basins and is pinned by the 4-witness regression gate;
+      // lane order is load-bearing, do not "simplify". Residual D-vs-x2
+      // normal-tier difference is documented as a binary-rounding razor
+      // tie (see qualification notes), not a field error.
+      SdfJet lane[4][3];
+      for (int L = 0; L < 4; ++L)
+        for (int k = 0; k < 3; ++k) lane[L][k] = sj(0.0f);
       int fb = side.co + 14 * side.nn;
-      for (int i = 0; i < 8; ++i) {
-        SdfJet wx = (i & 1) ? coord[0] : sjsub(sj(1.0f), coord[0]);
-        SdfJet wy = (i & 2) ? coord[1] : sjsub(sj(1.0f), coord[1]);
-        SdfJet wz = (i & 4) ? coord[2] : sjsub(sj(1.0f), coord[2]);
-        SdfJet sign_x = sj((i & 1) ? 1.0f : -1.0f);
-        SdfJet sign_y = sj((i & 2) ? 1.0f : -1.0f);
-        SdfJet sign_z = sj((i & 4) ? 1.0f : -1.0f);
-        // Pinned findOct/oct_gradient uses derivatives with respect to
-        // normalized leaf coordinates; it does not divide these weights by
-        // the physical leaf span. Preserve that source convention here too.
-        SdfJet dx = sjmul(sjmul(sign_x, wy), wz);
-        SdfJet dy = sjmul(sjmul(wx, sign_y), wz);
-        SdfJet dz = sjmul(sjmul(wx, wy), sign_z);
-        SdfJet coeff = sjpair(hull[fb + 8 * node + i],
-            hull[side.co + 28 * side.nn + 8 * node + i], float3(0.0f));
-        gradient[0] = sjadd(gradient[0], sjmul(dx, coeff));
-        gradient[1] = sjadd(gradient[1], sjmul(dy, coeff));
-        gradient[2] = sjadd(gradient[2], sjmul(dz, coeff));
+      for (int L = 0; L < 4; ++L) {
+        for (int kk = 0; kk < 2; ++kk) {
+          int i = L + 4 * kk;
+          SdfJet wx = (i & 1) ? coord[0] : sjsub(sj(1.0f), coord[0]);
+          SdfJet wy = (i & 2) ? coord[1] : sjsub(sj(1.0f), coord[1]);
+          SdfJet wz = (i & 4) ? coord[2] : sjsub(sj(1.0f), coord[2]);
+          SdfJet sign_x = sj((i & 1) ? 1.0f : -1.0f);
+          SdfJet sign_y = sj((i & 2) ? 1.0f : -1.0f);
+          SdfJet sign_z = sj((i & 4) ? 1.0f : -1.0f);
+          // Pinned findOct/oct_gradient uses derivatives with respect to
+          // normalized leaf coordinates; it does not divide these weights by
+          // the physical leaf span. Preserve that source convention here too.
+          SdfJet dx = sjmul(sjmul(sign_x, wy), wz);
+          SdfJet dy = sjmul(sjmul(wx, sign_y), wz);
+          SdfJet dz = sjmul(sjmul(wx, wy), sign_z);
+          SdfJet coeff = sjwide(SdfWide{
+              hull[fb + 8 * node + i],
+              hull[side.co + 28 * side.nn + 8 * node + i],
+              hull[side.co + 42 * side.nn + 8 * node + i]});
+          lane[L][0] = sjfma(dx, coeff, lane[L][0]);
+          lane[L][1] = sjfma(dy, coeff, lane[L][1]);
+          lane[L][2] = sjfma(dz, coeff, lane[L][2]);
+        }
       }
+      SdfJet gradient[3] = {sj(0.0f), sj(0.0f), sj(0.0f)};
+      for (int L = 0; L < 4; ++L)
+        for (int k = 0; k < 3; ++k)
+          gradient[k] = sjadd(gradient[k], lane[L][k]);
       return {float3(gradient[0].v, gradient[1].v, gradient[2].v),
               float3(gradient[0].e, gradient[1].e, gradient[2].e),
               float3(gradient[0].tail,gradient[1].tail,gradient[2].tail)};

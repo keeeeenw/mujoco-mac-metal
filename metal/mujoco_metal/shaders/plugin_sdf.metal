@@ -157,6 +157,7 @@ inline SdfWide sw_sub(SdfWide a, SdfWide b);
 inline SdfWide sw_mul(SdfWide a, SdfWide b);
 inline SdfWide sw_div(SdfWide a, SdfWide b);
 inline SdfWide sw_sqrt(SdfWide a);
+inline SdfWide sw_source_fma(SdfWide a, SdfWide b, SdfWide c);
 inline int sw_sign(SdfWide a);
 struct SdfJet { float v; float e; float3 d; float tail; };
 inline SdfJet sjpair(float hi, float lo, float3 d) { return {hi, lo, d, 0.0f}; }
@@ -194,6 +195,13 @@ inline SdfJet sjneg(SdfJet a) { return SdfJet{-a.v, -a.e, -a.d, -a.tail}; }
 inline SdfJet sjmul(SdfJet a, SdfJet b) {
   return sjwide(sw_mul(sjwide_value(a), sjwide_value(b)),
       a.d*sjvalue(b) + b.d*sjvalue(a));
+}
+// Fused multiply-add on jets: single-rounding value via sw_source_fma,
+// matching pinned ARM codegen for accumulator loops (gradients, dots).
+// Derivative follows d(a*b+c) with float value words.
+inline SdfJet sjfma(SdfJet a, SdfJet b, SdfJet c) {
+  return sjwide(sw_source_fma(sjwide_value(a), sjwide_value(b), sjwide_value(c)),
+      a.d*sjvalue(b) + b.d*sjvalue(a) + c.d);
 }
 inline SdfJet sjscale(SdfJet a, float b) {
   return sjwide(sw_mul(sjwide_value(a), sw(b)), a.d*b);
@@ -937,6 +945,18 @@ static __attribute__((noinline)) float sw_expansion_round_float32(
 inline float sw_float32(SdfWide value) {
   thread float expansion[3]={value.lo,value.mid,value.hi};
   return sw_expansion_round_float32(expansion,3);
+}
+// Correctly rounded float32 projection of a retained upload triple. The
+// high word already holds the direct binary64-to-float32 rounding, so
+// re-adding the residuals in float32 can double-round and change it:
+// for 0x1.000002fffffffp+0 (hi 0x1.000002p+0, lo 0x1p-24, tail -0x1p-52),
+// direct rounding gives 0x3f800001 while sequential float32 (hi+lo)+tail
+// gives 0x3f800002. Contract: valid only for retained upload triples
+// whose hi word is the direct rounding (octree aabb/coeff words); it is
+// not a substitute for retaining residuals during weighted field
+// evaluation, and computed triples must keep full words instead.
+inline float sw_project_float32(SdfWide value) {
+  return value.hi;
 }
 
 inline float2 sw_two_sum(float a, float b) {
