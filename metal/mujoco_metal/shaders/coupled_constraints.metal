@@ -2105,6 +2105,10 @@ inline float primal_pair_dot(device const float* a_hi,
 }
 
 inline PrimalFloatPair primal_pair_product(PrimalFloatPair a,
+    PrimalFloatPair b);
+inline PrimalFloatPair primal_pair_divide(PrimalFloatPair numerator,
+    PrimalFloatPair denominator);
+inline PrimalFloatPair primal_pair_product(PrimalFloatPair a,
     PrimalFloatPair b) {
   float sum = 0.0f, correction = 0.0f;
   primal_compensated_product_add(a.hi, b.hi, sum, correction);
@@ -7155,6 +7159,55 @@ inline int solve_pgs_thread(thread const float* W, thread const float* R,
   return used;
 }
 
+// Corrected mass-inverse action for dual refinement: u0 = L^-T L^-1 v_hi
+// (float preconditioner factors) into u, residual r = v - M u0 in pair
+// against real mass entries, du = L^-T L^-1 r_hi, u += du. Sleeping DOFs
+// stay zero. Accumulation is thread-local except caller scratch: v (hi/lo),
+// u and the pair temp t (hi/lo) with nv entries each.
+inline void refine_minv_pair(device const float* L,
+    device const float* mass_world, device const float* dbg_pre,
+    constant int* dims, device const int* awake_tree, int world, int nv,
+    device const float* v_hi, device const float* v_lo,
+    device float* u, device float* t_hi, device float* t_lo) {
+  for (int i = 0; i < nv; ++i) {
+    float t = solver_dof_awake(dims, awake_tree, i) ? v_hi[i] : 0.0f;
+    for (int k = 0; k < i; ++k) t -= L[i * nv + k] * u[k];
+    u[i] = t / L[i * nv + i];
+  }
+  for (int i = nv - 1; i >= 0; --i) {
+    float t = u[i];
+    for (int k = i + 1; k < nv; ++k) t -= L[k * nv + i] * u[k];
+    u[i] = t / L[i * nv + i];
+  }
+  for (int i = 0; i < nv; ++i) {
+    if (!solver_dof_awake(dims, awake_tree, i)) {
+      t_hi[i] = 0.0f; t_lo[i] = 0.0f; continue;
+    }
+    PrimalFloatPair racc = {v_hi[i], v_lo[i]};
+    for (int j = 0; j < nv; ++j) {
+      if (!solver_dof_awake(dims, awake_tree, j)) continue;
+      float mij = solver_mass_entry(mass_world, dbg_pre, dims,
+          awake_tree, world, nv, i, j);
+      racc = primal_pair_add(racc, primal_pair_product(
+          {mij, 0.0f}, {-u[j], 0.0f}));
+    }
+    t_hi[i] = racc.hi; t_lo[i] = racc.lo;
+  }
+  for (int i = 0; i < nv; ++i) {
+    float t = solver_dof_awake(dims, awake_tree, i) ? t_hi[i] : 0.0f;
+    for (int k = 0; k < i; ++k) t -= L[i * nv + k] * t_hi[k];
+    t_hi[i] = t / L[i * nv + i];
+  }
+  for (int i = nv - 1; i >= 0; --i) {
+    float t = t_hi[i];
+    for (int k = i + 1; k < nv; ++k) t -= L[k * nv + i] * t_hi[k];
+    t_hi[i] = t / L[i * nv + i];
+  }
+  for (int i = 0; i < nv; ++i)
+    if (solver_dof_awake(dims, awake_tree, i)) u[i] += t_hi[i];
+}
+
+
 // Rebuild one Delassus entry as a compensated pair for PGS. The retained W
 // plane stays the public/high workspace; component mode also has a low half
 // for M^-1 J^T in `mass`. Dense mode at least preserves dot-product error.
@@ -7541,6 +7594,12 @@ kernel void solve_coupled_constraints(
   device float* pgs_rhs_low = pgs_pair_tail + 8 * max(nv, 1);
   device float* pgs_lambda_low = pgs_rhs_low + max(nr, 1);
   device const float* aref_low = pgs_lambda_low + max(nr, 1);
+  // Writable alias of the aref_low plane for fresh contact assembly below:
+  // the low kernel stages per-row aref corrections in row_data[+6] and
+  // canonical assembly publishes them here next to ar (same row mapping).
+  // Component/block routes leave exact zeros (low kernel skips them).
+  device float* aref_low_published = pgs_pair_tail + 8 * max(nv, 1)
+      + 2 * max(nr, 1);
   // Row R/aref/bounds and retained lambda share the public dynamic prefix.
   // Reset only activation here: assembly already wrote source row data into
   // that prefix, and an aliasing copy from a just-cleared local array would
@@ -7771,6 +7830,7 @@ kernel void solve_coupled_constraints(
           R[row] = max(1e-15f, (1.0f - imp) * diag_approx / imp);
           if (dims[20] == -1) dbg_pre[nr * nr + 2 * nr + row] = imp;
           ar[row] = contact_row_data[r + 3];
+          aref_low_published[row] = contact_row_data[r + 6];
           lo[row] = 0.0f;
           hi[row] = INFINITY;
           enabled[row] = true;
@@ -7810,6 +7870,7 @@ kernel void solve_coupled_constraints(
               hi[row] = INFINITY;
             }
             ar[row] = contact_row_data[r + 3];
+            aref_low_published[row] = contact_row_data[r + 6];
             enabled[row] = true;
           }
         } else {
@@ -7845,8 +7906,12 @@ kernel void solve_coupled_constraints(
               // normal/tangent source rows here, so combine their velocity
               // references and add the normal position term only once.
               ar[row] = cdim == 3
-                  ? contact_row_data[crbase + (k + 1) * 6 + 3]
+                  ? contact_row_data[crbase + (k + 1) * 7 + 3]
                   : contact_row_data[r0 + 3] + sign * mu * contact_row_data[rt + 3];
+              // Paired edge aref mirrors the hi combination above.
+              aref_low_published[row] = cdim == 3
+                  ? contact_row_data[crbase + (k + 1) * 7 + 6]
+                  : contact_row_data[r0 + 6] + sign * mu * contact_row_data[rt + 6];
               lo[row] = 0.0f;
               hi[row] = INFINITY;
               enabled[row] = true;
@@ -8032,10 +8097,14 @@ kernel void solve_coupled_constraints(
     }
 
     // 5. Solve M Z_r = J_r^T for all active rows, with paired J.
-    // Z hi is RNE32 of the exact solve (optimal); pair solve reuses
-    // acc/gradient scratch as y_lo/x_lo (free before Newton starts), so no
-    // new global words. Rows without low-word corrections use the original
-    // float path bit-identically (Jlo==0 skips pair work).
+    // The stored Z plane keeps working-precision values; the pair solve
+    // below reduces float-accumulation bias in those values (it does not
+    // claim exact or optimally-rounded solves: the float32 factor L has
+    // its own error and division is corrected with a two-quotient pair
+    // divide). Pair temporaries reuse acc/gradient scratch (free before
+    // Newton starts), so no new global words. Rows without low-word
+    // corrections use the original float path bit-identically (Jlo==0
+    // skips pair work).
     device float* primal_scratch_base = solver_scratch
         + dims[dims[24] + dims[9] * 10 + 9];
     device float* pair_y_lo = primal_scratch_base;
@@ -8072,9 +8141,8 @@ kernel void solve_coupled_constraints(
                 {L[i * nv + k], 0.0f}, {y[k], pair_y_lo[k]});
             acc = primal_pair_add(acc, primal_pair_multiply(prod, -1.0f));
           }
-          float linv = 1.0f / L[i * nv + i];
-          PrimalFloatPair q = primal_pair_product(acc, {linv, 0.0f});
-          q = primal_pair_renormalize(q.hi, q.lo);
+          // Two-quotient pair divide (no exact-reciprocal assumption).
+          PrimalFloatPair q = primal_pair_divide(acc, {L[i * nv + i], 0.0f});
           y[i] = q.hi; pair_y_lo[i] = q.lo;
         }
         for (int i = nv - 1; i >= 0; --i) {
@@ -8084,9 +8152,7 @@ kernel void solve_coupled_constraints(
                 {L[k * nv + i], 0.0f}, {x[k], pair_x_lo[k]});
             acc = primal_pair_add(acc, primal_pair_multiply(prod, -1.0f));
           }
-          float linv = 1.0f / L[i * nv + i];
-          PrimalFloatPair q = primal_pair_product(acc, {linv, 0.0f});
-          q = primal_pair_renormalize(q.hi, q.lo);
+          PrimalFloatPair q = primal_pair_divide(acc, {L[i * nv + i], 0.0f});
           x[i] = q.hi; pair_x_lo[i] = q.lo;
         }
         for (int i = 0; i < nv; ++i) Z[row * nv + i] = x[i];
@@ -8095,10 +8161,12 @@ kernel void solve_coupled_constraints(
   }
 
   // 6. Form Delassus matrix W = J M^-1 J^T with paired J.
-  // W hi is RNE32 of the exact Delassus (optimal); pair accumulation uses
-  // thread-local pairs (no new words). Pairs without low-word corrections
-  // use the original float sum bit-identically. A global low-word scan
-  // first skips per-pair pre-scans entirely for high-only models.
+  // Pair accumulation reduces sequential-sum rounding versus the float
+  // loop (no optimality claim: Z itself is working precision and the
+  // stored W plane keeps working-precision values). Thread-local pairs
+  // use no new words. Pairs without low-word corrections use the
+  // original float sum bit-identically. A global low-word scan first
+  // skips per-pair pre-scans entirely for high-only models.
   bool any_jlo = false;
   for (int row = 0; row < total_nr && !any_jlo; ++row) if (enabled[row]) {
     for (int i = 0; i < nv; ++i) {
@@ -8146,11 +8214,15 @@ kernel void solve_coupled_constraints(
     }
   }
 
-  // 7. Form RHS: ar - J q0 with paired J. rhs lo is retained for all
-  // solver types in the existing pgs_rhs_low plane (already counted);
-  // PGS consumes it directly, Newton/CG carry it for paired certificates
-  // and refinement. Zero-low rows use the original float-equivalent path
-  // bit-identically (Jlo==0 skips the extra product).
+  // 7. Form RHS: ar - J q0 with paired J. rhs lo is retained in the
+  // existing pgs_rhs_low plane (already counted) for the PGS sweeps,
+  // which consume it directly. Zero-low rows use the original
+  // float-equivalent path bit-identically (Jlo==0 skips the extra
+  // product). Lifetime note: the Newton/CG primal solver below aliases
+  // this tail region as its own row-residual scratch (row_residual_low
+  // at the same offset), so stage-7 rhs_lo values do not survive a
+  // Newton/CG solve; Newton/CG-side consumers that need b rebuild it
+  // from ar/aref_low and the smooth baseline (see the refinement).
   for (int row = 0; row < nr; ++row) {
     pgs_rhs_low[row] = 0.0f;
     pgs_lambda_low[row] = 0.0f;
@@ -8384,6 +8456,139 @@ kernel void solve_coupled_constraints(
     }
     for (int row = 0; row < total_nr; ++row)
       enabled[row] = solver_row_island[row] >= 0;
+    // 8b. Projected dual refinement (Newton/CG, dense only).
+    // The primal iterate minimizes the working-precision objective; small
+    // inertias can leave the dual residual of the accepted multipliers
+    // several ulps off zero against the EFFECTIVE operator (paired J,
+    // real mass entries, paired b rebuilt from ar/aref_low and the smooth
+    // baseline). Gauss-Seidel sweeps with immediate operator refresh and
+    // pair-computed residuals correct it, matrix-free (no stored paired
+    // W/Z planes): v=J^T lam and Wlam=J u are rebuilt in pair precision;
+    // Minv uses the retained L with pair residual correction against real
+    // mass entries (refine_minv_pair); division uses two-quotient pair
+    // divides and the stored hi-only diagonal as a preconditioner (no
+    // exactness claim). Each row mirrors solve_pgs_device (clamp + pair
+    // change acceptance, same 1e-10 rule) so inactive-at-bound rows stay
+    // put and no harmful update is applied. Sweeps repeat until quiescent
+    // (cap 4; fixtures quiesce in 1-2). The pair correction is retained in
+    // lam/pgs_lambda_low (split hi/lo) and consumed by force/qacc
+    // reconstruction for all solvers on this path, so sub-ulp corrections
+    // survive in the published force/acceleration; certificates,
+    // reconstruction and published lambda share one coherent value. Skipped bit-identically
+    // without low-word corrections; elliptic-cone rows keep primal values
+    // (box projection is wrong for SOC); component stages (-2/-3, no
+    // dense L) keep the hi-only system.
+    if ((solver_type == 1 || solver_type == 2) && dims[20] >= 0) {
+      bool refine_any_jlo = false;
+      for (int row = 0; row < total_nr && !refine_any_jlo; ++row)
+        if (enabled[row]) {
+          for (int i = 0; i < nv; ++i) {
+            if (ccj_get_lo(J_world, row, i, nv) != 0.0f) {
+              refine_any_jlo = true; break;
+            }
+          }
+        }
+      bool refine_any_row = false;
+      for (int row = 0; row < total_nr; ++row)
+        if (enabled[row] && !elliptic_member[row]) { refine_any_row = true; break; }
+      if (refine_any_jlo && refine_any_row) {
+        // Lifetimes: y/x hold dead stage-5 Z solves. The Newton scratch
+        // region (dead after the island loop above) supplies pair words:
+        // v in y/vlo, u in x, Minv temp pair in tlo/tlo2 (3nv words of a
+        // 16v+5r region). The pgs_rhs_low plane is NOT readable here (the
+        // primal solver above aliases it as row-residual scratch), so b is
+        // rebuilt from ar/aref_low and the pre-island smooth baseline
+        // parked in out_force. No new global words.
+        device float* refine_scratch_base = solver_scratch
+            + dims[dims[24] + dims[9] * 10 + 9];
+        device float* vlo = refine_scratch_base;
+        device float* tlo = refine_scratch_base + max(nv, 1);
+        device float* tlo2 = refine_scratch_base + 2 * max(nv, 1);
+        device const float* mass_world_ref = mass + mb;
+        device const float* q0smooth = out_force + qb;
+        // v = J^T lam (pair) over all enabled rows (elliptic included).
+        for (int i = 0; i < nv; ++i) { y[i] = 0.0f; vlo[i] = 0.0f; }
+        for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
+          PrimalFloatPair lpair = {lam[row], pgs_lambda_low[row]};
+          for (int i = 0; i < nv; ++i) {
+            if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
+            PrimalFloatPair term = primal_pair_product(
+                {ccj_get(J_world, row, i, nv), ccj_get_lo(J_world, row, i, nv)},
+                lpair);
+            PrimalFloatPair vsum = primal_pair_add(
+                {y[i], vlo[i]}, term);
+            y[i] = vsum.hi; vlo[i] = vsum.lo;
+          }
+        }
+        refine_minv_pair(L, mass_world_ref, dbg_pre, dims, solver_awake_tree,
+            world, nv, y, vlo, x, tlo, tlo2);
+        // Gauss-Seidel sweeps with immediate operator refresh: after each
+        // accepted row move, v += J_row^T delta and u is rebuilt, so every
+        // row residual is exact given current multipliers (PGS sequencing
+        // with the real-mass operator). Per-row clamp + pair change
+        // acceptance (same 1e-10 rule as solve_pgs_device) rejects harm;
+        // satisfied-at-bound rows clamp to no-ops. Sweeps repeat until no
+        // row moves (quiescence), capped at 4: fixture systems quiesce in
+        // 1-2 sweeps; the cap only bounds pathological inputs.
+        for (int sweep = 0; sweep < 4; ++sweep) {
+          bool moved = false;
+          for (int row = 0; row < total_nr; ++row) if (enabled[row] && !elliptic_member[row]) {
+            PrimalFloatPair wlam = {0.0f, 0.0f};
+            PrimalFloatPair ja = {0.0f, 0.0f};
+            for (int i = 0; i < nv; ++i) {
+              if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
+              PrimalFloatPair jp = {ccj_get(J_world, row, i, nv),
+                                    ccj_get_lo(J_world, row, i, nv)};
+              wlam = primal_pair_add(wlam, primal_pair_product(
+                  jp, {x[i], 0.0f}));
+              ja = primal_pair_add(ja, primal_pair_product(
+                  jp, {q0smooth[i], 0.0f}));
+            }
+            PrimalFloatPair bpair = primal_pair_add(
+                {ar[row], aref_low[row]},
+                primal_pair_multiply(ja, -1.0f));
+            PrimalFloatPair lamfull = {lam[row], pgs_lambda_low[row]};
+            PrimalFloatPair res = primal_pair_add(
+                bpair,
+                primal_pair_multiply(primal_pair_add(wlam, primal_pair_product(
+                    {R[row], 0.0f}, lamfull)), -1.0f));
+            float diag = W[row * nr + row] + R[row];
+            if (!(diag > 1e-15f) || !isfinite(diag)) continue;
+            PrimalFloatPair oldf = {lam[row], pgs_lambda_low[row]};
+            PrimalFloatPair step = primal_pair_divide(res, {diag, 0.0f});
+            PrimalFloatPair nextf = primal_pair_add(oldf, step);
+            float nextval = nextf.hi + nextf.lo;
+            if (nextval < lo[row]) nextf = {lo[row], 0.0f};
+            else if (nextval > hi[row]) nextf = {hi[row], 0.0f};
+            PrimalFloatPair delta = primal_pair_add(nextf,
+                primal_pair_multiply(oldf, -1.0f));
+            PrimalFloatPair change = primal_pair_add(
+                primal_pair_multiply(primal_pair_product(delta, delta),
+                                     0.5f * diag),
+                primal_pair_multiply(primal_pair_product(delta, res), -1.0f));
+            if (!isfinite(nextf.hi + nextf.lo)) continue;
+            if (change.hi + change.lo > 1e-10f) continue;
+            if (delta.hi == 0.0f && delta.lo == 0.0f) continue;
+            lam[row] = nextf.hi;
+            pgs_lambda_low[row] = nextf.lo;
+            moved = true;
+            // Immediate refresh: v += J_row^T delta; rebuild u.
+            for (int i = 0; i < nv; ++i) {
+              if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
+              PrimalFloatPair add = primal_pair_add({y[i], vlo[i]},
+                  primal_pair_product(
+                      {ccj_get(J_world, row, i, nv),
+                       ccj_get_lo(J_world, row, i, nv)},
+                      delta));
+              y[i] = add.hi; vlo[i] = add.lo;
+            }
+            refine_minv_pair(L, mass_world_ref, dbg_pre, dims,
+                solver_awake_tree, world, nv, y, vlo, x, tlo, tlo2);
+          }
+          if (!moved) break;
+        }
+      }
+    }
     primal_acceleration_output = true;
     max_res = primal_residual;
     converged = max_res <= tol;
@@ -8881,7 +9086,7 @@ kernel void solve_coupled_constraints(
     pgs_pair_tail[i] = 0.0f;
   }
   for (int row = 0; row < total_nr; ++row) if (enabled[row]) {
-    float lambda_low = solver_type == 0 ? pgs_lambda_low[row] : 0.0f;
+    float lambda_low = pgs_lambda_low[row];
     for (int i = 0; i < nv; ++i) {
       PrimalFloatPair force = primal_pair_fma(ccj_get(J_world, row, i, nv),
           {lam[row], lambda_low}, {out_force[qb + i], pgs_pair_tail[i]});
