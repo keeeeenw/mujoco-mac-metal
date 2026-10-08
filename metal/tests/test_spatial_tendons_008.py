@@ -1055,15 +1055,37 @@ def test_site_armature_assembled_system_bias_force_mass_replay_gpu():
   back = sim.assembled_system(recompute=True)
   np.testing.assert_array_equal(back["qacc"].cpu().numpy(), qacc_snap)
   np.testing.assert_array_equal(back["mass_matrix"].cpu().numpy(), mass_snap)
-  # Step-trajectory replay after restore is bitwise exact per world.
+  # Step-trajectory replay after restore is bitwise exact per world, with
+  # accepted steps, advancing time, and genuinely nonstationary state
+  # (position and velocity): repeated failed or no-op steps cannot satisfy
+  # these checks.
+  dt = float(m.opt.timestep)
   stepped = []
-  for _ in range(5):
-    sim.step(1)
-    stepped.append(sim.state.qpos.cpu().numpy().copy())
+  t0 = sim.state.time.cpu().numpy().copy()
+  for i in range(5):
+    st = sim.step(1)
+    assert st.cpu().numpy().tolist() == [0, 0], st.cpu().numpy()
+    assert int(sim.state.status.cpu().numpy()[0]) == 0
+    assert int(sim.state.status.cpu().numpy()[1]) == 0
+    stepped.append((sim.state.qpos.cpu().numpy().copy(),
+                    sim.state.qvel.cpu().numpy().copy(),
+                    sim.state.time.cpu().numpy().copy()))
+  # Time advances by exactly one timestep per accepted step in both worlds.
+  for i, (_, _, t) in enumerate(stepped):
+    np.testing.assert_allclose(t, t0 + dt * (i + 1), rtol=0, atol=1e-9)
+  # Nonstationary: positions move between steps and velocities are nonzero.
+  for w in range(2):
+    assert float(np.max(np.abs(stepped[-1][1][w]))) > 1e-6
+    moves = [float(np.max(np.abs(stepped[i][0][w] - stepped[i - 1][0][w])))
+             for i in range(1, 5)]
+    assert max(moves) > 1e-9, moves
   sim.restore(snap)
-  for expected in stepped:
-    sim.step(1)
-    np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), expected)
+  for expected_q, expected_v, expected_t in stepped:
+    st = sim.step(1)
+    assert st.cpu().numpy().tolist() == [0, 0]
+    np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), expected_q)
+    np.testing.assert_array_equal(sim.state.qvel.cpu().numpy(), expected_v)
+    np.testing.assert_array_equal(sim.state.time.cpu().numpy(), expected_t)
 
 
 @pytest.mark.gpu

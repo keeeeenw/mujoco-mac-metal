@@ -91,6 +91,17 @@ def _cases():
       # on exact powers or one hand-picked subnormal bit pattern.
       (3.0 * tiny, 1.0, 0.0),
       (2.0 ** -126 + tiny, 1.0, 0.0),
+      # Production razor operand triple from the mesh-SDF Frank-Wolfe update
+      # (face5/sp8 step1): fused single rounding must hold on GPU words.
+      ((0.6666666865348816, -1.9868215517249155e-08, 5.551115123125783e-16),
+       (0.03999999910593033, 0.0, 0.0),
+       (-0.019999999552965164, 3.469446951953614e-18, 0.0)),
+      # Fused-vs-separate discriminators: naive separate multiply-add rounds
+      # these differently, so they fail closed on an unfused implementation.
+      (0.2750700585440605, -0.22040888733484526, -0.14404877411885747),
+      (916312.6616423248, 753211.6602122856, 1171857.4824565682),
+      (2368.6215373227114, -13574.021118237719, 11486.609269564708),
+      (-6569828.860219568, 10999784.937490845, -6120873.1286308),
   ]
 
 
@@ -163,6 +174,28 @@ def test_cpu_oracle_cases_cover_rounding_and_admission_boundaries():
   assert _exact(_expected(cases[17])[0][2]) == tiny
   assert _expected(cases[18])[0][3][1] != 0.0
   assert _expected(cases[19])[0][3][1] != 0.0
+  # Production razor triple (face5/sp8 step1 update): fused single rounding
+  # lands on 0x3f7b4e81aaaaaaad, matching the installed oracle; the naive
+  # separate multiply-add double-rounds to ...aaac.
+  import struct as _struct
+
+  def _fl64(value):
+    return _struct.unpack("<d", _struct.pack("<d", float(value)))[0]
+
+  razor = cases[-5]
+  assert _fl64(_exact(_expected(razor)[0][4])) == _fl64(
+      Fraction("0.006666666517655057"))
+  razor_bits = hex(_struct.unpack(
+      "<Q", _struct.pack("<d", _fl64(_exact(_expected(razor)[0][4]))))[0])
+  assert razor_bits == "0x3f7b4e81aaaaaaad"
+  for case in cases[-5:]:
+    av, bv, cv = case
+    a, b, c = map(_case_words, (av, bv, cv))
+    A, B, C = map(_exact, (a, b, c))
+    fused = float(A * B + C)
+    separate = float(float(A * B) + float(C))
+    assert fused != separate, case
+    assert _fl64(_exact(_expected(case)[0][4])) == fused, case
 
   source = (Path(__file__).parents[1] /
             "mujoco_metal/shaders/plugin_sdf.metal").read_text()
