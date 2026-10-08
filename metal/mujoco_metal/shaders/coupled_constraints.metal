@@ -3222,6 +3222,14 @@ inline void primal_refresh_pair_state(device const float* mass,
   }
 
   for (int row = 0; row < n; ++row) {
+    // Per-island ownership: enabled is the current island's row mask, and
+    // force_low/row_residual_low alias retained multiplier/residual planes.
+    // Clearing or writing disabled rows here would erase earlier islands'
+    // retained low words (later islands run the same refresh). Globally
+    // inactive rows keep the stage-7 zeros (both planes are zeroed for all
+    // nr rows before the island loop); scratch force/row_hessian for
+    // disabled rows is never read (all consumers check enabled).
+    if (!enabled[row]) continue;
     force[row] = force_low[row] = row_hessian[row] = 0.0f;
     // The pair represents aref_hi + aref_low, so J*qacc - aref must
     // subtract both words.  Keeping the low word positive here doubles its
@@ -3233,9 +3241,10 @@ inline void primal_refresh_pair_state(device const float* mass,
       primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc_low[dof], sum, correction);
     }
     PrimalFloatPair r = primal_pair_renormalize(sum, correction);
+    // Retained-plane writes stay island-scoped (see clear above).
     row_residual[row] = r.hi;
     row_residual_low[row] = r.lo;
-    if (!enabled[row] || elliptic_member[row]) continue;
+    if (elliptic_member[row]) continue;
     float reg = max(R[row], 1e-15f);
     float D = 1.0f / reg;
     bool friction = lo[row] < 0.0f && hi[row] > 0.0f
@@ -3279,6 +3288,7 @@ inline void primal_refresh_pair_state(device const float* mass,
         R + start, elliptic_friction + block * 5, dim,
         local_force, local_force_low);
     for (int k = 0; k < dim; ++k) {
+      if (!enabled[start + k]) continue;
       force[start + k] = local_force[k];
       force_low[start + k] = local_force_low[k];
     }

@@ -3,11 +3,11 @@
 Dual refinement runs only on uniform scalar-contact systems; any
 enabled equality row, elliptic-cone row or symmetric-bounded friction
 row disables it system-wide (partial moves would shift skipped rows'
-optimality). These tests prove the gate both ways (fires on uniform
-SDF systems, stays off on mixed ones with exact-zero low planes) and
-prove per-island low-word ownership index-aware via row_island (not
-multisets): rows of every island retain their own lows alongside highs,
-with masked/empty worlds, reset/restore and no-slip transitions.
+optimality). These tests prove per-island low-word ownership index-aware
+via row_island (not multisets): rows of every island retain their own
+lows alongside highs, including mixed systems and budget-exhausted
+solves where polish cannot repopulate them, with masked/empty worlds,
+reset/restore and no-slip transitions.
 """
 import os
 
@@ -205,6 +205,102 @@ def test_island_low_ownership_multibody_gpu():
   cpu = np.asarray(d.qfrc_constraint, dtype=np.float64)
   np.testing.assert_allclose(nat, cpu, rtol=1e-4, atol=1e-4)
   # Restore roundtrip reproduces the assembly bit-identically.
+  lam0 = np.asarray(s["lambda"].cpu().numpy()).copy()
+  snap = sim.snapshot()
+  sim.step(1)
+  sim.restore(snap)
+  sr = sim.assembled_system(recompute=True)
+  np.testing.assert_array_equal(
+      np.asarray(sr["lambda"].cpu().numpy()), lam0)
+
+
+def _mixed_two_island_xml(swap=False):
+  # Two SDF probes on separate trees (two islands) where one side carries
+  # joint frictionloss (symmetric-bounded Huber rows). The system is mixed
+  # so dual refinement stays off globally; with iterations=1 the solve is
+  # also budget-exhausted, so no polish pass can repopulate multiplier lows.
+  # `swap` reverses body/row order to exercise reverse island traversal.
+  bodies = [
+      """<body name="a" pos="0.45 0 0">
+          <freejoint/><geom name="sa" type="sphere" size="0.1"/>
+        </body>""",
+      """<body name="b" pos="-0.45 0 0">
+          <joint name="slideb" type="slide" axis="1 0 0" frictionloss="0.5"/>
+          <geom name="sb" type="sphere" size="0.1"/>
+        </body>""",
+  ]
+  if swap:
+    bodies = bodies[::-1]
+  return f"""
+    <mujoco>
+      <option timestep="0.002" integrator="Euler" gravity="0 0 0"
+              iterations="1" tolerance="1e-8" sdf_initpoints="8"/>
+      <extension><plugin plugin="mujoco.sdf.torus">
+        <instance name="shape"/>
+      </plugin></extension>
+      <asset><mesh name="shape_mesh"><plugin instance="shape"/></mesh></asset>
+      <worldbody>
+        <geom name="plugin_sdf" type="sdf" mesh="shape_mesh">
+          <plugin instance="shape"/>
+        </geom>
+        {"".join(bodies)}
+      </worldbody>
+      <contact>
+        <pair geom1="plugin_sdf" geom2="sa" condim="1"/>
+        <pair geom1="plugin_sdf" geom2="sb" condim="1"/>
+      </contact>
+    </mujoco>"""
+
+
+@_needs_gpu()
+@pytest.mark.parametrize("swap", [False, True], ids=["order", "reversed"])
+def test_mixed_multibody_budget_exhausted_low_ownership_gpu(swap):
+  import mujoco
+  from mujoco_metal.simulation import MetalSimulation
+  m = mujoco.MjModel.from_xml_string(_mixed_two_island_xml(swap=swap))
+  m.opt.solver = 2  # Newton primal path with pair refresh per island
+  m.opt.iterations = 1  # budget-exhausted: polish/recon cannot mask loss
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qpos = np.asarray(sim.state._qpos[0].cpu().numpy(), dtype=np.float64).copy()
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=np.zeros((1, m.nv), dtype=np.float32))
+  s = sim.assembled_system(recompute=True)
+  assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[0]) == 0
+  cc = sim._coupled_constraints
+  nv, nr = int(m.nv), int(cc.descriptor.nr)
+  # Mixed system: symmetric-bounded frictionloss rows present, so the
+  # uniform-scalar gate must stay off (no system-wide refinement).
+  assert cc.descriptor.nr > 0
+  row_island = np.asarray(s["row_island"].cpu().numpy()).reshape(-1)
+  lamlo = _lamlo(cc)
+  assert lamlo.shape == (nr,)
+  assert np.all(np.isfinite(lamlo))
+  islands = sorted(set(int(v) for v in row_island if int(v) >= 0))
+  assert len(islands) >= 2
+  # Index-aware ownership without polish: EVERY island with enabled rows
+  # retains its own nonzero lows (later islands must not erase earlier
+  # ones via the retained force-low/residual-low planes). A uniform-system
+  # fixture would let system-wide refinement repopulate these; here both
+  # the mixed gate and the exhausted budget keep polish off.
+  lamhi = np.asarray(s["lambda"][0].cpu().numpy(), dtype=np.float64)
+  for isl in islands:
+    rows = [r for r in range(nr) if int(row_island[r]) == isl]
+    assert rows
+    assert float(np.max(np.abs(lamlo[rows]))) > 0.0, (swap, isl)
+    assert np.all(np.isfinite(lamhi[rows]))
+  # Mapped value agreement against the pinned oracle at the same
+  # represented state (DOF-indexed, no sorting): force and acceleration.
+  d = mujoco.MjData(m)
+  d.qpos[:] = qpos
+  d.qvel[:] = np.zeros(m.nv)
+  mujoco.mj_forward(m, d)
+  np.testing.assert_allclose(
+      np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qacc, dtype=np.float64), rtol=1e-3, atol=1e-3)
+  np.testing.assert_allclose(
+      np.asarray(s["qfrc_constraint"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qfrc_constraint, dtype=np.float64), rtol=1e-3, atol=1e-3)
+  # Replay: snapshot/step/restore reproduces the assembly bit-identically.
   lam0 = np.asarray(s["lambda"].cpu().numpy()).copy()
   snap = sim.snapshot()
   sim.step(1)
