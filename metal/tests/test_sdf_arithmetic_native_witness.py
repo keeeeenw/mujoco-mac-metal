@@ -231,6 +231,48 @@ def _cases():
       (916312.6616423248, 753211.6602122856, 1171857.4824565682),
       (2368.6215373227114, -13574.021118237719, 11486.609269564708),
       (-6569828.860219568, 10999784.937490845, -6120873.1286308),
+      # Two-ULP fused counterexample from the independent complete-unit
+      # probe (diagnostic case 600): overlapping expansion tops after
+      # cancellation need a 52-bit tail that staged float32 quantization
+      # cannot represent. Oracle: -0x1.9bfd0fc6a05e6p-24; the staged
+      # rounder produced -0x1.9bfd0fc6a05e8p-24.
+      ((float.fromhex("0x1.4c1be6p+0"), float.fromhex("0x1.f68bfep-25"),
+        float.fromhex("-0x1p-52")),
+       (float.fromhex("0x1.9dc69cp-1"), float.fromhex("-0x1.be1648p-26"),
+        float.fromhex("-0x1.8p-51")),
+       (float.fromhex("-0x1.0c6556p+0"), float.fromhex("-0x1.afa662p-25"),
+        float.fromhex("-0x1p-50"))),
+      # Further extreme-cancellation samples from the admitted-domain
+      # differential set (each mis-rounded by 2-4 ULP before the repair).
+      (float.fromhex("0x1.a82df2cacba22p-1"),
+       float.fromhex("0x1.195135776dcdfp+0"),
+       float.fromhex("-0x1.d220fd793c975p-1")),
+      (float.fromhex("0x1.a69aa6d9ff394p+0"),
+       float.fromhex("0x1.867636e8e2226p+0"),
+       float.fromhex("-0x1.42496118f8be3p+1")),
+      (float.fromhex("0x1.d7c0d82bb8162p+0"),
+       float.fromhex("0x1.375a73a18c5a2p+0"),
+       float.fromhex("-0x1.1ee0fc0d29baep+1")),
+      (float.fromhex("0x1.a78aaffd8cc90p+0"),
+       float.fromhex("0x1.acb89cbd58fe6p+0"),
+       float.fromhex("-0x1.62a6a58d16ab9p+1")),
+      (float.fromhex("0x1.9d69a52d8a768p-1"),
+       float.fromhex("0x1.002cb9e12626dp+0"),
+       float.fromhex("-0x1.9db1e0d050064p-1")),
+      (float.fromhex("0x1.f59cf6623b4f8p+0"),
+       float.fromhex("0x1.a79afc1e08f6dp+0"),
+       float.fromhex("-0x1.9f03064be72cfp+1")),
+      # Exact-halfway fused ties with even and odd leading quanta, plus
+      # just-off-half neighbors that must resolve away from the tie.
+      (1.0, 1.0 + 2.0 ** -51, 2.0 ** -53),
+      (1.0, 1.0 + 2.0 ** -52, 2.0 ** -53),
+      (1.0, 1.0 + 2.0 ** -52, math.nextafter(2.0 ** -53, math.inf)),
+      (1.0, 1.0 + 2.0 ** -52, math.nextafter(2.0 ** -53, 0.0)),
+      # Binade-crossing fused sums: exact powers, just-below with full
+      # tails, and a tie at the power boundary that stays even.
+      (2.0 - 2.0 ** -23, 1.0, 2.0 ** -23),
+      (2.0 - 2.0 ** -23, 1.0, 2.0 ** -23 - 2.0 ** -53),
+      (2.0 - 2.0 ** -23, 1.0, 2.0 ** -23 + 2.0 ** -52),
   ]
 
 
@@ -311,13 +353,13 @@ def test_cpu_oracle_cases_cover_rounding_and_admission_boundaries():
   def _fl64(value):
     return _struct.unpack("<d", _struct.pack("<d", float(value)))[0]
 
-  razor = cases[-5]
+  razor = cases[20]
   assert _fl64(_exact(_expected(razor)[0][4])) == _fl64(
       Fraction("0.006666666517655057"))
   razor_bits = hex(_struct.unpack(
       "<Q", _struct.pack("<d", _fl64(_exact(_expected(razor)[0][4]))))[0])
   assert razor_bits == "0x3f7b4e81aaaaaaad"
-  for case in cases[-5:]:
+  for case in cases[20:25]:
     av, bv, cv = case
     a, b, c = map(_case_words, (av, bv, cv))
     A, B, C = map(_exact, (a, b, c))

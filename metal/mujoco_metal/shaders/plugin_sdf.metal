@@ -807,6 +807,172 @@ static inline bool sw_exact_piece(uint m, int e, thread float* out) {
   return true;
 }
 
+// Normalize one 20-limb unsigned magnitude (see the exact rounder below).
+// Returns the carry out of the top limb; the proven window bounds make a
+// nonzero carry impossible, and callers treat it as a legacy fallback.
+static inline uint sw_limbs_normalize(thread uint* limbs) {
+  uint carry=0u;
+  for (int i=0;i<20;i++) {
+    ulong total=(ulong)limbs[i]+(ulong)carry;
+    limbs[i]=uint(total&0xffffffffUL);
+    carry=uint(total>>32);
+  }
+  return carry;
+}
+
+// Exact 53-bit rounding of an exact float32-word expansion.
+//
+// The staged float32 tail quantization below cannot represent integer
+// corrections beyond 2^24 quanta, and two float32 tail words cannot hold
+// more than 48 tail bits; overlapping expansion tops after cancellation
+// need up to 52 (observed two-ULP fused errors, every one outside the
+// float32 correction range). This path instead accumulates the exact real
+// sum in a fixed 640-bit window, rounds half-even to 53 bits, and splits
+// the rounded significand into three exactly-constructed words. The triple
+// sums EXACTLY to the correctly-rounded binary64 value: no unrounded tail
+// bits are retained. Anything outside the proven window (nonfinite words,
+// above-window bits, top carry, inexact pieces) returns false, and the
+// caller keeps the legacy path bit-identically.
+//
+// Range proof. Every finite float32 word is s*m*2^e with m < 2^24 and bit
+// span [e, e+24) inside [-149, 128]. emax <= 128, so with T = emax+8 and
+// B = T-639 the window [B, T] always covers [-149, 128]: every set bit
+// lands in-window, rel = p-B stays in [0, 639], and limb indices plus
+// 1u<< shifts are safe. Per-limb sums stay far below 2^32 (at most 24
+// words contribute, each placing at most 24 one-bits), so uint limbs with
+// a uint carry normalize exactly; the top carry is zero because the
+// summed magnitude stays below 2^(emax+5) < 2^T. Subtraction borrows stay
+// 0/1 because normalized limbs are below 2^32.
+static __attribute__((noinline)) bool sw_expansion_round53_exact(
+    thread const float* expansion, int count, thread SdfProjection53* out) {
+  uint pos_limbs[20];
+  uint neg_limbs[20];
+  uint mag_limbs[20];
+  for (int i=0;i<20;i++) { pos_limbs[i]=0u; neg_limbs[i]=0u; }
+  // Pass 1: window top from the word bounds.
+  int emax=-100000;
+  int nparts=0;
+  for (int i=0;i<count;i++) {
+    uint mag=as_type<uint>(expansion[i])&0x7fffffffu;
+    if (mag==0u) continue;
+    if ((mag>>23)==0xffu) return false;
+    int e=((mag>>23)==0u) ? -149 : (int(mag>>23)-150);
+    int top=e+24;
+    if (top>emax) emax=top;
+    nparts++;
+  }
+  if (nparts==0) {
+    out->hi=0.0f; out->mid=0.0f; out->low=0.0f;
+    return true;
+  }
+  int T=emax+8;
+  int B=T-639;
+  uint sticky=0u;
+  // Pass 2: accumulate sign-separated magnitudes bit by bit.
+  for (int i=0;i<count;i++) {
+    uint bits=as_type<uint>(expansion[i]);
+    uint mag=bits&0x7fffffffu;
+    if (mag==0u) continue;
+    if ((mag>>23)==0xffu) return false;
+    bool negative=(bits&0x80000000u)!=0u;
+    uint m;
+    int e;
+    if ((mag>>23)==0u) { m=mag&0x007fffffu; e=-149; }
+    else { m=(mag&0x007fffffu)|0x00800000u; e=int(mag>>23)-150; }
+    for (int b=0;b<24;b++) {
+      if (((m>>uint(b))&1u)==0u) continue;
+      int p=e+b;
+      if (p<B) { sticky=1u; continue; }
+      int rel=p-B;
+      if (rel>=640) return false;
+      if (negative) neg_limbs[rel/32]+=1u<<uint(rel%32);
+      else pos_limbs[rel/32]+=1u<<uint(rel%32);
+    }
+  }
+  if (sw_limbs_normalize(pos_limbs)!=0u) return false;
+  if (sw_limbs_normalize(neg_limbs)!=0u) return false;
+  int sign=0;
+  for (int i=19;i>=0;i--) {
+    if (pos_limbs[i]!=neg_limbs[i]) {
+      sign=(pos_limbs[i]>neg_limbs[i]) ? 1 : -1;
+      break;
+    }
+  }
+  if (sign==0) {
+    if (sticky!=0u) return false;
+    out->hi=0.0f; out->mid=0.0f; out->low=0.0f;
+    return true;
+  }
+  uint borrow=0u;
+  for (int i=0;i<20;i++) {
+    uint big=(sign>0) ? pos_limbs[i] : neg_limbs[i];
+    uint small=(sign>0) ? neg_limbs[i] : pos_limbs[i];
+    long d=(long)big-(long)small-(long)borrow;
+    if (d<0) { mag_limbs[i]=uint(d+0x100000000L); borrow=1u; }
+    else { mag_limbs[i]=uint(d); borrow=0u; }
+  }
+  int topbit=-1;
+  for (int i=19;i>=0;i--) {
+    if (mag_limbs[i]!=0u) {
+      topbit=32*i+(31-int(clz(mag_limbs[i])));
+      break;
+    }
+  }
+  if (topbit<0) {
+    out->hi=0.0f; out->mid=0.0f; out->low=0.0f;
+    return true;
+  }
+  int E_top=B+topbit;
+  ulong S=0UL;
+  for (int j=0;j<53;j++) {
+    int k=E_top-j;
+    uint bit=0u;
+    if (k>=B) {
+      int rel=k-B;
+      if (rel<640) bit=(mag_limbs[rel/32]>>uint(rel%32))&1u;
+    }
+    S=(S<<1)|(ulong)bit;
+  }
+  uint rnd=0u;
+  {
+    int k=E_top-53;
+    if (k>=B) {
+      int rel=k-B;
+      if (rel<640) rnd=(mag_limbs[rel/32]>>uint(rel%32))&1u;
+    }
+  }
+  uint st=sticky;
+  {
+    int need=E_top-53;
+    for (int i=0;i<20;i++) {
+      int base=B+32*i;
+      if (base+31<need) { if (mag_limbs[i]!=0u) st=1u; }
+      else if (base<need) {
+        int n=need-base;
+        uint mask=(n>=32) ? 0xffffffffu : ((1u<<uint(n))-1u);
+        if ((mag_limbs[i]&mask)!=0u) st=1u;
+      }
+    }
+  }
+  if (rnd!=0u && (st!=0u || (S&1UL)!=0UL)) {
+    S+=1UL;
+    if (S>=(1UL<<53)) { S>>=1; E_top+=1; }
+  }
+  int E_D=E_top;
+  uint hi_b=uint((S>>29)&0xFFFFFFUL);
+  uint mid_b=uint((S>>5)&0xFFFFFFUL);
+  uint lo5=uint(S&0x1FUL);
+  float h=0.0f;
+  float m=0.0f;
+  float l=0.0f;
+  if (!sw_exact_piece(hi_b,E_D-23,&h)) return false;
+  if (!sw_exact_piece(mid_b,E_D-47,&m)) return false;
+  if (!sw_exact_piece(lo5,E_D-52,&l)) return false;
+  if (sign<0) { h=-h; m=-m; l=-l; }
+  out->hi=h; out->mid=m; out->low=l;
+  return true;
+}
+
 // Round an exact expansion to the nearest binary64 significand, ties to even.
 // Three float components hold the resulting 53 bits without using unsupported
 // Metal `double`. This is for source-order mju_dot3 support selection only.
@@ -833,6 +999,13 @@ static __attribute__((noinline)) SdfProjection53 sw_expansion_round53(
     return {sw_float32_from_subnormal_units(boundary_units),0.0f,0.0f};
   result.hi=expansion[count-1];
   if (count==1) return result;
+  // Exact big-int rounding (see above): the triple sums exactly to the
+  // correctly-rounded binary64 value. Anything outside its proven window
+  // keeps the legacy staged path below bit-identically.
+  {
+    SdfProjection53 exact=SdfProjection53{0.0f,0.0f,0.0f};
+    if (sw_expansion_round53_exact(expansion,count,&exact)) return exact;
+  }
   int exponent=0;
   float significand=frexp(fabs(result.hi),exponent);
   int tail_sign=sw_expansion_sign(expansion,count-1);
@@ -915,6 +1088,91 @@ static inline float sw_float32_from_subnormal_units(int signed_units) {
   return as_type<float>(sign_bit | bits);
 }
 
+// Exact integer rounding of an exact expansion tail to quantum 2^qe.
+//
+// Returns N = round-half-even(TRUE_tail / 2^qe) in int64, where TRUE_tail is
+// the exact real sum of the input words and ties break so that
+// (base_parity + N) is even. Anything outside the proven integer range
+// (nonfinite words, contributions beyond 2^60 quanta, or a near-tie with
+// sub-quantum words present whose influence could cross the boundary)
+// returns false, and the caller keeps its legacy float path bit-identically.
+//
+// Range proof. Each finite float32 word is s*m*2^lsb with m < 2^24.
+// With k = qe-lsb the word contributes m*2^-k quanta: k <= 0 adds an exact
+// integer (guarded to shifts <= 31 and a 2^60 total, far above the <= 2^27
+// totals of contracted triple tails); 1 <= k <= 40 splits into an exact
+// integer part plus fraction bits accumulated at a common 2^-40 scale
+// (each below 2^40 units, the total below 2^45); k > 40 words sit below
+// 2^-17 quanta each and only enter through the proximity gate. Halves and
+// integer boundaries are decided from the exact mid fraction unless a
+// sub-quantum word is present within twice its maximum influence, in
+// which case the rounding is genuinely unresolvable at this scale.
+static __attribute__((noinline)) bool sw_tail_round_int64(
+    thread const float* residual, int count, int quantum_exp,
+    long base_parity, thread long* n_out) {
+  long int_sum=0L;
+  long frac_sum=0L;
+  thread float tiny[24];
+  int tiny_count=0;
+  for (int i=0;i<count;i++) {
+    uint bits=as_type<uint>(residual[i]);
+    uint mag=bits&0x7fffffffu;
+    if (mag==0u) continue;
+    if ((mag>>23)==0xffu) return false;
+    long sgn=((bits&0x80000000u)!=0u) ? -1L : 1L;
+    uint m;
+    int lsb;
+    if ((mag>>23)==0u) { m=mag&0x007fffffu; lsb=-149; }
+    else { m=(mag&0x007fffffu)|0x00800000u; lsb=int(mag>>23)-150; }
+    int k=quantum_exp-lsb;
+    if (k<=0) {
+      int sh=-k;
+      if (sh>31) return false;
+      long add=(long)m<<sh;
+      int_sum+=sgn*add;
+      if (int_sum>1152921504606846976L
+          || int_sum<-1152921504606846976L) return false;
+    } else if (k<=40) {
+      uint ip=(k>=24) ? 0u : (m>>uint(k));
+      uint mask=(k>=32) ? 0xffffffffu : ((1u<<uint(k))-1u);
+      uint fp=m&mask;
+      int_sum+=sgn*(long)ip;
+      if (int_sum>1152921504606846976L
+          || int_sum<-1152921504606846976L) return false;
+      frac_sum+=sgn*((long)fp<<(40-k));
+    } else {
+      if (tiny_count>=24) return false;
+      tiny[tiny_count++]=residual[i];
+    }
+  }
+  // Floor the exact mid fraction without implementation-defined negative
+  // shifts, then resolve halves and integers against the proximity gate.
+  long q0=(frac_sum>=0L) ? (frac_sum>>40)
+      : -(((-frac_sum+1099511627775L)>>40));
+  // NB: q0 is often negative here, so the remainder uses a multiplication:
+  // left-shifting a negative signed value is undefined behavior.
+  long rem=frac_sum-q0*1099511627776L;
+  const long HALF=549755813888L;
+  const long Q=1099511627776L;
+  long N;
+  if (tiny_count==0) {
+    if (rem>HALF) N=int_sum+q0+1L;
+    else if (rem<HALF) N=int_sum+q0;
+    else N=int_sum+q0+((((base_parity+int_sum+q0)%2L)!=0L) ? 1L : 0L);
+  } else {
+    long tol=(long)tiny_count<<24;
+    long d_int=(rem<(Q-rem)) ? rem : (Q-rem);
+    long d_half=(rem>=HALF) ? (rem-HALF) : (HALF-rem);
+    long d=(d_int<d_half) ? d_int : d_half;
+    if (d<tol) return false;
+    if (rem>HALF) N=int_sum+q0+1L;
+    else if (rem<HALF) N=int_sum+q0;
+    else N=int_sum+q0+((((base_parity+int_sum+q0)%2L)!=0L) ? 1L : 0L);
+  }
+  *n_out=N;
+  return true;
+}
+
 static __attribute__((noinline)) float sw_expansion_round_float32(
     thread const float* expansion,int count) {
   if (count<=0) return 0.0f;
@@ -943,15 +1201,39 @@ static __attribute__((noinline)) float sw_expansion_round_float32(
   int tail_sign=sw_expansion_sign(expansion,count-1);
   bool toward_zero=(hi>0.0f && tail_sign<0)
                    || (hi<0.0f && tail_sign>0);
+  // The leading word is an integral number of output quanta. Its
+  // significand parity participates in ties along with the rounded tail
+  // quanta. hi is normal here (subnormal leading words took the integer
+  // path above), so hi/quanta is the exact small integer below: unchanged
+  // by the grid halving of toward_zero (which only clears the parity).
+  int hi_exp=exponent;
+  uint hi_mant=(hi_bits&0x007fffffu)|0x00800000u;
   if (significand==0.5f && toward_zero) exponent-=1;
   int quantum_exp=exponent-24;
+  long base_parity=(exponent==hi_exp) ? (long)(hi_mant&1u) : 0L;
   thread float residual[24];
   thread float scratch[24];
   int residual_count=0;
-  float estimate=0.0f;
   for (int i=0;i<count-1;i++) {
     residual_count=sw_expansion_add(residual,residual_count,
                                     expansion[i],scratch);
+  }
+  // Exact int64 tail rounding (see above): N carries the correctly rounded
+  // tail quanta, so (float)N followed by the legacy scaling emits the same
+  // word the legacy path emits whenever that path was right, and the
+  // correct word when it was not. Anything outside the proven range keeps
+  // the legacy staged path below bit-identically.
+  {
+    long tail_N=0L;
+    if (sw_tail_round_int64(residual,residual_count,quantum_exp,
+                            base_parity,&tail_N)) {
+      float rounded_tail=sw_scale_word_pow2((float)tail_N,quantum_exp);
+      if (rounded_tail==0.0f) return hi;
+      return hi+rounded_tail;
+    }
+  }
+  float estimate=0.0f;
+  for (int i=0;i<count-1;i++) {
     estimate+=sw_scale_word_pow2(expansion[i],-quantum_exp);
   }
   float step_hi=rint(estimate);
