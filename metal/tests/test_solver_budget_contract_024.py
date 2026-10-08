@@ -279,3 +279,303 @@ def test_zero_low_control_analytic_gpu():
   np.testing.assert_allclose(
       np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64),
       np.asarray(d.qacc, dtype=np.float64), rtol=1e-4, atol=1e-4)
+
+
+def _install_warm(sim, data, kind, qpos):
+  """Install the SAME represented warmstart on both sides; return it.
+
+  kind="traj": one native step, then re-seat the state (reset clears the
+  native warmstart, so reinstall the produced history explicitly). The CPU
+  side keeps its stepped data object, whose `qacc_warmstart` the stepper
+  wrote. kind="bad": deliberately different constant 5.0 on both sides.
+  kind="cold": zeros (reset state on native, fresh data on CPU). At budget
+  0 the step publishes zeros, so trajectory history is legitimately zero
+  there; all other budgets produce nonzero history.
+  """
+  import mujoco
+  if kind == "traj":
+    sim.step(1)
+    w = sim.get_warmstart()
+    sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+              qvel=np.zeros((1, sim._mjmodel.nv), dtype=np.float32))
+    sim.set_warmstart(w)
+    data.qacc_warmstart[:] = np.asarray(w[0], dtype=np.float64)
+    return w
+  if kind == "bad":
+    w = np.full((1, sim._mjmodel.nv), 5.0, dtype=np.float32)
+    sim.set_warmstart(w)
+    data.qacc_warmstart[:] = np.asarray(w[0], dtype=np.float64)
+    return w
+  w = np.zeros((1, sim._mjmodel.nv), dtype=np.float32)
+  assert float(np.linalg.norm(sim.get_warmstart())) == 0.0
+  assert float(np.linalg.norm(data.qacc_warmstart)) == 0.0
+  return w
+
+
+@_needs_gpu()
+def test_genuine_warmstart_population_installation_gpu():
+  # The public qacc warmstart is populated by stepping (not by assembly),
+  # cleared by reset, and installed verbatim by the setter on both sides.
+  import mujoco
+  from mujoco_metal.simulation import MetalSimulation
+  model = _torus_model()
+  model.opt.solver = 2
+  model.opt.iterations = 2
+  sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  assert float(np.linalg.norm(sim.get_warmstart())) == 0.0
+  sim.assembled_system(recompute=True)
+  sim.assembled_system(recompute=True)
+  assert float(np.linalg.norm(sim.get_warmstart())) == 0.0
+  sim.step(1)
+  w = sim.get_warmstart()
+  assert w.shape == (1, model.nv)
+  assert float(np.linalg.norm(w)) > 100.0
+  data = mujoco.MjData(model)
+  assert float(np.linalg.norm(data.qacc_warmstart)) == 0.0
+  mujoco.mj_step(model, data)
+  assert float(np.linalg.norm(data.qacc_warmstart)) > 100.0
+  # Trajectory-produced history agrees up to the float32 store rounding of
+  # the native warmstart plus step-path rounding (rel 5e-5 measured).
+  np.testing.assert_allclose(
+      np.asarray(w[0], dtype=np.float64),
+      np.asarray(data.qacc_warmstart, dtype=np.float64), rtol=1e-4, atol=1e-2)
+  sim.reset(qpos=_fixed_state().astype(np.float32).reshape(1, -1),
+            qvel=np.zeros((1, model.nv), dtype=np.float32))
+  assert float(np.linalg.norm(sim.get_warmstart())) == 0.0
+  sim.set_warmstart(w)
+  np.testing.assert_array_equal(sim.get_warmstart(), np.asarray(
+      w, dtype=np.float32))
+
+
+@_needs_gpu()
+@pytest.mark.parametrize("solver", [2, 1], ids=["newton", "cg"])
+@pytest.mark.parametrize("budget", [0, 1, 2, 100])
+@pytest.mark.parametrize("warm", ["traj", "bad"], ids=["wtraj", "wbad"])
+def test_genuine_warmstart_matched_budgets_gpu(solver, budget, warm):
+  # SAME represented warmstart installed on both sides (trajectory-produced
+  # history or a deliberately different constant), compared at every
+  # budget against the pinned oracle with the identical warm input.
+  # Consumption is proven by bad-vs-cold divergence on BOTH sides at
+  # 0/1/2 (the published result is a function of the warm input) and by
+  # history wash-out at the ordinary budget on BOTH sides. Tiers are the
+  # pre-existing 024 tiers (exact at 0, 1e-3/1e-3 elsewhere); iteration
+  # counts are bounded by the configured budget on both sides (exact
+  # count equality is not asserted for warm cells: best-of warm/smooth
+  # selection can legitimately take different iteration paths).
+  import mujoco
+  from mujoco_metal.simulation import MetalSimulation
+  model = _torus_model()
+  model.opt.solver = solver
+  model.opt.iterations = budget
+  qpos = _fixed_state()
+  qpos32 = qpos.astype(np.float32).astype(np.float64)
+  sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=np.zeros((1, model.nv), dtype=np.float32))
+  data = mujoco.MjData(model)
+  data.qpos[:] = qpos32
+  data.qvel[:] = np.zeros(model.nv)
+  w = _install_warm(sim, data, warm, qpos)
+  if budget == 0:
+    # At zero budget the step publishes zeros, so trajectory history is
+    # legitimately zero; the deliberately different constant is nonzero.
+    # Both sides install the identical represented value either way.
+    if warm == "traj":
+      assert float(np.linalg.norm(w)) == 0.0
+      assert float(np.linalg.norm(data.qacc_warmstart)) == 0.0
+    else:
+      assert float(np.linalg.norm(w)) > 0.0
+      assert float(np.linalg.norm(data.qacc_warmstart)) > 0.0
+  else:
+    assert float(np.linalg.norm(w)) > 0.0
+    assert float(np.linalg.norm(data.qacc_warmstart)) > 0.0
+  s = sim.assembled_system(recompute=True)
+  mujoco.mj_forward(model, data)
+  dev_iters = float(np.asarray(s["solver_diagnostics"][0].cpu().numpy())[1])
+  cpu_iters = int(np.sum(data.solver_niter))
+  assert dev_iters <= budget
+  assert cpu_iters <= budget
+  assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[0]) == 0
+  if budget == 0:
+    rtol, atol = 1e-5, 1e-9
+  else:
+    rtol, atol = 1e-3, 1e-3
+  nat = np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64)
+  cpu = np.asarray(data.qacc, dtype=np.float64)
+  np.testing.assert_allclose(nat, cpu, rtol=rtol, atol=atol)
+  natf = np.asarray(s["qfrc_constraint"][0].cpu().numpy(), dtype=np.float64)
+  cpuf = np.asarray(data.qfrc_constraint, dtype=np.float64)
+  np.testing.assert_allclose(natf, cpuf, rtol=rtol, atol=atol)
+  lam = np.asarray(s["lambda"][0].cpu().numpy(), dtype=np.float64)
+  lc = np.asarray(data.efc_force, dtype=np.float64)
+  np.testing.assert_allclose(np.sort(lam[8:16]), np.sort(lc), rtol=rtol,
+                             atol=atol * max(1.0, float(np.max(np.abs(lc)))))
+  # Consumption / wash-out against the cold baseline at identical setup.
+  # Which warm input moves the published result is decided by the pinned
+  # best-of warm/smooth selection, identically on both sides: at budget 0
+  # there is no selection and the raw input publishes (bad differs, traj
+  # history is zero); at 1/2 the trajectory history beats smooth on both
+  # sides while the out-of-state constant loses to smooth on both sides;
+  # at the ordinary budget every start converges, washing history out on
+  # both sides. Assert the effective input per cell.
+  sim_c = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  sim_c.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+              qvel=np.zeros((1, model.nv), dtype=np.float32))
+  sc = sim_c.assembled_system(recompute=True)
+  data_c = mujoco.MjData(model)
+  data_c.qpos[:] = qpos32
+  data_c.qvel[:] = np.zeros(model.nv)
+  mujoco.mj_forward(model, data_c)
+  nat_q = np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64)
+  nat_c = np.asarray(sc["qacc"][0].cpu().numpy(), dtype=np.float64)
+  cpu_q = np.asarray(data.qacc, dtype=np.float64)
+  cpu_c = np.asarray(data_c.qacc, dtype=np.float64)
+  scale = max(1.0, float(np.max(np.abs(cpu_c))))
+  effective = (budget == 0 and warm == "bad") or (
+      budget in (1, 2) and warm == "traj")
+  if effective:
+    assert float(np.max(np.abs(nat_q - nat_c))) / scale > 1e-3
+    assert float(np.max(np.abs(cpu_q - cpu_c))) / scale > 1e-3
+  if budget == 100:
+    assert float(np.max(np.abs(nat_q - nat_c))) / scale < 1e-3
+    assert float(np.max(np.abs(cpu_q - cpu_c))) / scale < 1e-3
+
+
+@_needs_gpu()
+def test_warmstart_per_island_stopping_gpu():
+  # Two-island uniform fixture at an exhausted per-island budget with
+  # trajectory warmstart: per-island early-stop accounting holds, every
+  # island retains its lows, and the oracle matches at the fixture floor.
+  import mujoco
+  from mujoco_metal.simulation import MetalSimulation
+  xml = """
+    <mujoco>
+      <option timestep="0.002" integrator="Euler" gravity="0 0 0"
+              iterations="1" tolerance="1e-8" sdf_initpoints="8"/>
+      <extension><plugin plugin="mujoco.sdf.torus">
+        <instance name="shape"/>
+      </plugin></extension>
+      <asset><mesh name="shape_mesh"><plugin instance="shape"/></mesh></asset>
+      <worldbody>
+        <geom name="plugin_sdf" type="sdf" mesh="shape_mesh">
+          <plugin instance="shape"/>
+        </geom>
+        <body name="a" pos="0.45 0 0">
+          <freejoint/><geom name="sa" type="sphere" size="0.1"/>
+        </body>
+        <body name="b" pos="-0.45 0 0">
+          <freejoint/><geom name="sb" type="sphere" size="0.1"/>
+        </body>
+      </worldbody>
+      <contact>
+        <pair geom1="plugin_sdf" geom2="sa" condim="1"/>
+        <pair geom1="plugin_sdf" geom2="sb" condim="1"/>
+      </contact>
+    </mujoco>"""
+  m = mujoco.MjModel.from_xml_string(xml)
+  m.opt.solver = 2
+  sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+  qpos = np.asarray(sim.state._qpos[0].cpu().numpy(), dtype=np.float64).copy()
+  sim.step(1)
+  w = sim.get_warmstart()
+  assert float(np.linalg.norm(w)) > 0.0
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=np.zeros((1, m.nv), dtype=np.float32))
+  sim.set_warmstart(w)
+  s = sim.assembled_system(recompute=True)
+  assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[0]) == 0
+  row_island = np.asarray(s["row_island"].cpu().numpy()).reshape(-1)
+  islands = sorted(set(int(v) for v in row_island if int(v) >= 0))
+  assert len(islands) >= 2
+  d = mujoco.MjData(m)
+  d.qpos[:] = qpos.astype(np.float32).astype(np.float64)
+  d.qvel[:] = np.zeros(m.nv)
+  d.qacc_warmstart[:] = np.asarray(w[0], dtype=np.float64)
+  mujoco.mj_forward(m, d)
+  np.testing.assert_allclose(
+      np.asarray(s["qacc"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qacc, dtype=np.float64), rtol=1e-3, atol=1e-3)
+  np.testing.assert_allclose(
+      np.asarray(s["qfrc_constraint"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(d.qfrc_constraint, dtype=np.float64), rtol=1e-3, atol=1e-3)
+
+
+@_needs_gpu()
+@pytest.mark.parametrize("solver", [2, 1], ids=["newton", "cg"])
+def test_warmstart_disabled_ignores_values_gpu(solver):
+  # With mjDSBL_WARMSTART, installed nonzero values are ignored on both
+  # sides: warm-set is bit-identical to cold, and both match the oracle.
+  import mujoco
+  from mujoco_metal.simulation import MetalSimulation
+  model = _torus_model()
+  model.opt.solver = solver
+  model.opt.iterations = 2
+  model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
+  qpos = _fixed_state()
+  qpos32 = qpos.astype(np.float32).astype(np.float64)
+  sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+  sim.reset(qpos=qpos.astype(np.float32).reshape(1, -1),
+            qvel=np.zeros((1, model.nv), dtype=np.float32))
+  s_cold = sim.assembled_system(recompute=True)
+  sim.set_warmstart(np.full((1, model.nv), 5.0, dtype=np.float32))
+  s_warm = sim.assembled_system(recompute=True)
+  np.testing.assert_array_equal(
+      np.asarray(s_warm["lambda"][0].cpu().numpy()),
+      np.asarray(s_cold["lambda"][0].cpu().numpy()))
+  data = mujoco.MjData(model)
+  data.qpos[:] = qpos32
+  data.qvel[:] = np.zeros(model.nv)
+  data.qacc_warmstart[:] = 5.0
+  mujoco.mj_forward(model, data)
+  data_c = mujoco.MjData(model)
+  data_c.qpos[:] = qpos32
+  data_c.qvel[:] = np.zeros(model.nv)
+  mujoco.mj_forward(model, data_c)
+  np.testing.assert_array_equal(np.asarray(data.qacc),
+                                np.asarray(data_c.qacc))
+  np.testing.assert_allclose(
+      np.asarray(s_warm["qacc"][0].cpu().numpy(), dtype=np.float64),
+      np.asarray(data.qacc, dtype=np.float64), rtol=1e-3, atol=1e-3)
+
+
+@_needs_gpu()
+def test_warmstart_restore_and_world_isolation_gpu():
+  # Selective warmstart with masked-world isolation plus snapshot/restore
+  # preservation: world 1 (far/masked) keeps zero warmstart and zero
+  # solve while world 0 carries history; restore reproduces exactly.
+  import mujoco
+  from mujoco_metal.simulation import MetalSimulation
+  model = _torus_model()
+  model.opt.solver = 2
+  model.opt.iterations = 2
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  qpos = _fixed_state()
+  far = qpos.copy()
+  far[0:3] += np.array([5.0, 5.0, 5.0])
+  sim.reset(qpos=np.stack(
+      [qpos.astype(np.float32), far.astype(np.float32)]),
+      qvel=np.zeros((2, model.nv), dtype=np.float32))
+  sim.step(1)
+  w = sim.get_warmstart()
+  assert w.shape == (2, model.nv)
+  assert float(np.linalg.norm(w[0])) > 0.0
+  sim.reset(qpos=np.stack(
+      [qpos.astype(np.float32), far.astype(np.float32)]),
+      qvel=np.zeros((2, model.nv), dtype=np.float32))
+  sim.set_warmstart(w[0], env_ids=[0])
+  got = sim.get_warmstart()
+  np.testing.assert_array_equal(got[0], np.asarray(w[0], dtype=np.float32))
+  assert float(np.linalg.norm(got[1])) == 0.0
+  s = sim.assembled_system(recompute=True)
+  lam_all = np.asarray(s["lambda"].cpu().numpy())
+  assert np.all(lam_all[1] == 0.0)
+  assert int(np.asarray(sim.state.status.cpu().numpy()).ravel()[1]) == 0
+  snap = sim.snapshot()
+  sim.step(1)
+  assert float(np.linalg.norm(sim.get_warmstart())) > 0.0
+  sim.restore(snap)
+  np.testing.assert_array_equal(sim.get_warmstart(), got)
+  sr = sim.assembled_system(recompute=True)
+  np.testing.assert_array_equal(
+      np.asarray(sr["lambda"].cpu().numpy()),
+      np.asarray(s["lambda"].cpu().numpy()))
