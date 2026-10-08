@@ -299,8 +299,14 @@ def _sdf_attributes(name: str, config) -> np.ndarray:
 
 def _sdf_attribute_pair(name: str, config):
   """Split exact parsed attributes into three nonoverlapping float32 words."""
+  from mujoco_metal.model import require_triple_word_domain
   keys = tuple(_SUPPORTED_DEFAULTS[name])
-  exact = np.asarray([float(config[key]) for key in keys], dtype=np.float64)
+  try:
+    exact = require_triple_word_domain(
+        [float(config[key]) for key in keys],
+        what=f"SDF plugin {name} attributes")
+  except ValueError as error:
+    raise BundledPluginError(str(error)) from error
   high = _sdf_attributes(name, config)
   low = np.zeros((5,), dtype=np.float32)
   low[:len(keys)] = (exact - high[:len(keys)].astype(np.float64)).astype(np.float32)

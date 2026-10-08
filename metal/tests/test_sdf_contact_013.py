@@ -338,6 +338,47 @@ def test_octree_tail_words_reconstruct_source_field_cpu():
       assert sum(triple, Fraction(0)) == Fraction.from_float(float(src[int(k)])), k
 
 
+def test_triple_word_domain_contract_cpu():
+  """Upload-domain admission: exact-split inputs pass, the rest fail closed.
+
+  Triple-float32 words cannot preserve every finite binary64 value, so the
+  packing paths validate the domain instead of truncating silently:
+  non-finite, float32-overflowing, and subnormal-magnitude entries are
+  rejected with explicit errors; zeros and in-range normals are admitted.
+  """
+  from mujoco_metal.model import require_triple_word_domain
+  out = require_triple_word_domain([0.0, 1.0, -0.02, 3.4e38, 2.0 ** -90],
+                                   what="probe")
+  assert out.shape == (5,)
+  require_triple_word_domain([], what="probe")
+  for bad, match in (([float("nan")], "finite"),
+                     ([float("inf")], "finite"),
+                     ([1e300], "exceeds float32 range"),
+                     ([-4e38], "exceeds float32 range"),
+                     ([1e-100], "below 2\\*\\*-90"),
+                     ([-2.0 ** -120], "below 2\\*\\*-90"),
+                     ([0.0, 1.0, float("nan")], "finite")):
+    with pytest.raises(ValueError, match=match):
+      require_triple_word_domain(bad, what="probe")
+
+
+def test_triple_word_domain_enforced_at_packing_sites_cpu():
+  """The validator guards every triple-split upload path in production."""
+  from pathlib import Path
+
+  root = Path(__file__).resolve().parents[1] / "mujoco_metal"
+  source = (root / "coupled_constraints.py").read_text()
+  assert source.count("require_triple_word_domain(") >= 4
+  assert "model.oct_aabb[adr:adr + num]" in source
+  assert "model.oct_coeff[adr:adr + num]" in source
+  kinematics = (root / "metal_kinematics.py").read_text()
+  assert "require_triple_word_domain(values[name], what=name)" in kinematics
+  plugins = (root / "bundled_plugins.py").read_text()
+  assert "require_triple_word_domain(" in plugins
+  model_src = (root / "model.py").read_text()
+  assert "_TRIPLE_WORD_MIN_MAGNITUDE = 2.0 ** -90" in model_src
+
+
 def test_pinned_step_gradient_accepts_improvement_and_exits_on_increase_cpu():
   """Lock down the source Wolfe retry and post-line-search exit directions."""
   # These are the two source predicates in engine_collision_sdf.c: the line

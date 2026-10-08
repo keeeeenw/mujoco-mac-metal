@@ -20,6 +20,7 @@ import numpy as np
 
 from mujoco_metal.model import _validate_lowered
 from mujoco_metal.model import ModelDescriptor
+from mujoco_metal.model import require_triple_word_domain
 from mujoco_metal.model import snapshot_descriptor
 from mujoco_metal.capacity import _fk_auxiliary_words
 
@@ -163,7 +164,7 @@ def _prepare_host_arrays(model: ModelDescriptor):
   # can distinguish the remaining binary64 bits after repeated FK transforms.
   for name in ("body_pos", "jnt_pos", "qpos0", "geom_pos",
                "body_ipos", "site_pos"):
-    raw = np.asarray(values[name], dtype=np.float64).reshape(-1)
+    raw = require_triple_word_domain(values[name], what=name)
     if raw.size:
       high = host[name][:raw.size].astype(np.float64, copy=False)
       low = (raw - high).astype(np.float32)
@@ -183,7 +184,7 @@ def _prepare_host_arrays(model: ModelDescriptor):
   # residual-of-residual, each with the original flattened shape.
   for name in ("body_quat", "body_iquat", "geom_quat", "site_quat",
                "jnt_axis"):
-    raw = np.asarray(values[name], dtype=np.float64).reshape(-1)
+    raw = require_triple_word_domain(values[name], what=name)
     high_words = np.array(host[name][:max(raw.size, 1)], dtype=np.float32,
                           copy=True)
     if raw.size:

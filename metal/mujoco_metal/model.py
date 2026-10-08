@@ -698,6 +698,44 @@ def _validate_lowered(counts, values):
     raise ValueError("invalid or nonfinite qpos0")
 
 
+# Smallest magnitude admitted to triple-float32 upload. Successive
+# Sterbenz remainders of a normal binary64 value need roughly 54 bits below
+# the leading exponent; float32 subnormal granularity ends at 2**-149, so
+# magnitudes below 2**-90 cannot keep an exact hi+lo+tail split. Zeros are
+# exact and always admitted.
+_TRIPLE_WORD_MIN_MAGNITUDE = 2.0 ** -90
+
+
+def require_triple_word_domain(values, *, what):
+  """Enforce the exact-split admission contract for triple-word upload.
+
+  Accepted values satisfy, as exact reals, ``hi + lo + tail == source``
+  with ``hi`` the direct binary64-to-float32 rounding: every value must be
+  finite, within float32 range, and either zero or of magnitude at least
+  2**-90. Anything else (non-finite, overflowing, or subnormal-magnitude)
+  raises instead of truncating silently, because downstream razor
+  vertex-selection ties require bitwise field reconstruction.
+  """
+  arr = np.asarray(values, dtype=np.float64).reshape(-1)
+  if arr.size == 0:
+    return arr
+  if not np.all(np.isfinite(arr)):
+    raise ValueError(
+        f"{what} must be finite for triple-word upload; "
+        "non-finite entries cannot be represented")
+  magnitude = np.abs(arr)
+  if np.any(magnitude > np.finfo(np.float32).max):
+    raise ValueError(
+        f"{what} exceeds float32 range for triple-word upload; "
+        "overflowing entries cannot be represented")
+  tiny = (magnitude != 0.0) & (magnitude < _TRIPLE_WORD_MIN_MAGNITUDE)
+  if np.any(tiny):
+    raise ValueError(
+        f"{what} has nonzero entries below 2**-90 for triple-word upload; "
+        "subnormal-magnitude entries cannot keep an exact hi+lo+tail split")
+  return arr
+
+
 def load_model(source):
   """Compile XML/path/bytes with pinned MuJoCo and lower all FK constants."""
   if mujoco.__version__ != "3.10.0":

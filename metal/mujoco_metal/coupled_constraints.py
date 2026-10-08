@@ -29,6 +29,8 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from mujoco_metal.model import require_triple_word_domain
+
 _SHADER = Path(__file__).parent / "shaders" / "coupled_constraints.metal"
 _BROADPHASE_SHADER = Path(__file__).parent / "shaders" / "broadphase.metal"
 _EQUALITY_SHADER = Path(__file__).parent / "shaders" / "equality_assembly.metal"
@@ -1573,8 +1575,10 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
   mesh_oct_base = {}
   for mid, (adr, num) in sorted(sdf_mesh_nodes.items()):
     child = np.asarray(model.oct_child[adr:adr + num]).reshape(-1)
-    aabb = np.asarray(model.oct_aabb[adr:adr + num]).reshape(-1)
-    coeff = np.asarray(model.oct_coeff[adr:adr + num]).reshape(-1)
+    aabb = require_triple_word_domain(
+        model.oct_aabb[adr:adr + num], what=f"SDF mesh {mid} oct_aabb")
+    coeff = require_triple_word_domain(
+        model.oct_coeff[adr:adr + num], what=f"SDF mesh {mid} oct_coeff")
     if child.size != 8 * num or aabb.size != 6 * num or coeff.size != 8 * num:
       raise ValueError(f"SDF mesh {mid} octree layout mismatch")
     mesh_hull[ocursor:ocursor + 8 * num] = child.astype(np.float32)
@@ -1617,12 +1621,14 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
       # plugin meshes. The plugin callback's construction bounds can have
       # a different center/extent from the compiled mesh bounds.
       aabb = model.geom_aabb[g]
-      aabb_exact = np.asarray(aabb, dtype=np.float64)
+      aabb_exact = require_triple_word_domain(
+          aabb, what=f"geom {g} SDF seed aabb")
       aabb_high = aabb_exact.astype(np.float32)
       aabb_low = (aabb_exact - aabb_high.astype(np.float64)).astype(np.float32)
       mesh_hull[sdf_aabb_base + 18 * g:sdf_aabb_base + 18 * g + 6] = aabb_high
       mesh_hull[sdf_aabb_base + 18 * g + 6:sdf_aabb_base + 18 * g + 12] = aabb_low
-      size = np.asarray(model.geom_size[g], dtype=np.float64)
+      size = require_triple_word_domain(
+          model.geom_size[g], what=f"geom {g} SDF seed size")
       size_high = size.astype(np.float32)
       mesh_hull[sdf_aabb_base + 18*g + 12:sdf_aabb_base + 18*g + 15] = size_high
       size_low = (size - size_high.astype(np.float64)).astype(np.float32)
