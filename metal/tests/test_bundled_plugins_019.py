@@ -1248,3 +1248,39 @@ def test_native_sdf_signed_zero_axes_match_pinned_callbacks():
                              rtol=0, atol=3e-5)
   np.testing.assert_array_equal(actual_distance[~valid], 0)
   np.testing.assert_array_equal(actual_gradient[~valid], 0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
+def test_native_sdf_angle_retains_low_only_perturbations_and_signed_zeros():
+  import math
+  import torch
+  from mujoco_metal.plugin_sdf import _SHADER
+
+  pairs = []
+  for x in (0., -0., 1e-8, -1e-8):
+    for y in (0., -0., 1e-8, -1e-8):
+      pairs.append([0. if x else x, x if x else 0.,
+                    0. if y else y, y if y else 0.])
+  operands = torch.tensor(pairs, dtype=torch.float32, device="mps")
+  before = operands.clone()
+  output = torch.zeros((len(pairs), 2), dtype=torch.float32, device="mps")
+  source = _SHADER.read_text() + r"""
+  kernel void test_sdf_angles(device const float* input [[buffer(0)]],
+      device float* output [[buffer(1)]], uint index [[thread_position_in_grid]]) {
+    int i=4*int(index), o=2*int(index);
+    float2 result=sdatan2(float2(input[i+2],input[i+3]),
+                          float2(input[i],input[i+1]));
+    output[o]=result.x;output[o+1]=result.y;
+  }
+  """
+  library = torch.mps.compile_shader(source)
+  library.test_sdf_angles(operands, output, threads=len(pairs))
+  actual = output.cpu().double().numpy().sum(axis=1)
+  represented = operands.cpu().numpy()
+  expected = [math.atan2(float(row[2]) if row[3]==0 else float(row[3]),
+                        float(row[0]) if row[1]==0 else float(row[1]))
+              for row in represented]
+  np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-14)
+  torch.testing.assert_close(operands.view(torch.int32), before.view(torch.int32),
+                             rtol=0, atol=0)

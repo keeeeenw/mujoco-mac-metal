@@ -295,6 +295,11 @@ inline float2 sdatan(float2 x) {
   return neg ? sdneg(a) : a;
 }
 inline float2 sdatan2(float2 y,float2 x) {
+  // A source finite-difference step at zero may live wholly in the low
+  // word. Promote that nonzero operand before the quotient and quadrant
+  // tests. Leave true signed zeros untouched for the pinned atan2 branches.
+  if (x.x==0.0f && x.y!=0.0f) x=float2(x.y,0.0f);
+  if (y.x==0.0f && y.y!=0.0f) y=float2(y.y,0.0f);
   bool xzero=x.x==0.0f && x.y==0.0f;
   bool yzero=y.x==0.0f && y.y==0.0f;
   bool xneg=x.x<0.0f || (xzero && (sdnegative(x.x) || x.y<0.0f));
