@@ -250,8 +250,9 @@ def test_mesh_rejections_cpu():
       '<geom name="mb" type="sphere" size="0.1" contype="1" conaffinity="1"/>'
       '</body></worldbody></mujoco>')
   assert int(m2.mesh_graph[int(m2.mesh_graphadr[0])]) == 70
-  with pytest.raises(ValueError, match="64"):
-    lower_coupled_constraints(m2)
+  large = lower_coupled_constraints(m2)
+  assert int(large.mesh_hull_info[1]) == 70
+  assert large.mesh_hull.size > 3 * 70
 
 
 def test_mesh_assets_admit_cpu():

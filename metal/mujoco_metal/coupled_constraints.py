@@ -943,9 +943,6 @@ def lower_collision_geometry(model, pairs, limits=None):
   # analytic plugin SDFs use compact per-geom high/low attributes.
   sdf_geoms = sorted({g for pr in pairs for g in (pr[0], pr[1])
                       if int(geoms[g]) == _SDF})
-  if len(sdf_geoms) > _SDF_MAX_GEOMS:
-    raise ValueError(f"at most {_SDF_MAX_GEOMS} SDF geoms; found "
-                     f"{len(sdf_geoms)}")
   plugin_sdf_model = None
   plugin_sdf_rows = {}
   sdf_plugin_geoms = [g for g in sdf_geoms
@@ -971,9 +968,8 @@ def lower_collision_geometry(model, pairs, limits=None):
         raise ValueError(f"SDF geom {g} mesh {mid} has no compiled octree")
       sdf_mesh_nodes[mid] = (adr, num)
   sdf_oct_total = sum(num for _, num in sdf_mesh_nodes.values())
-  if sdf_oct_total > _SDF_MAX_NODES:
-    raise ValueError(f"total SDF octree nodes {sdf_oct_total} exceeds 013 "
-                     f"capacity {_SDF_MAX_NODES}")
+  if any(num >= (1 << 24) for _, num in sdf_mesh_nodes.values()):
+    raise ValueError("SDF octree local indices exceed exact float32 addressing")
   sdf_ip_global = int(model.opt.sdf_initpoints)
   sdf_active = any(
       (ta == _SDF or tb == _SDF) and ta not in (_PLANE, _HFIELD, _MESH) and
@@ -990,6 +986,24 @@ def lower_collision_geometry(model, pairs, limits=None):
       9 * int(model.mesh_bvhnum[mid]) for mid in mesh_sdf_assets)
   if mesh_sdf_float_count > (1 << 24):
     raise ValueError("mesh-SDF BVH data exceeds exact float-index capacity")
+  mesh_sdf_only = set(mesh_sdf_geoms)
+  for pr in pairs:
+    for g in pr[:2]:
+      if int(geoms[g]) == _MESH and int(geoms[pr[1] if pr[0] == g else pr[0]]) != _SDF:
+        mesh_sdf_only.discard(g)
+  from mujoco_metal.mesh_hull import collision_mesh_hull
+  compiled_hulls = {}
+  for g in mesh_used:
+    mid = int(model.geom_dataid[g])
+    if mid < 0 or int(model.mesh_vertnum[mid]) <= 0:
+      raise ValueError(f"mesh geom {g} has no source vertices")
+    if g not in mesh_sdf_only:
+      compiled_hulls[g] = collision_mesh_hull(model, mid)
+  mesh_vertex_count = sum(len(v) for v, _ in compiled_hulls.values())
+  mesh_face_count = sum(len(f) for _, f in compiled_hulls.values())
+  if mesh_vertex_count >= (1 << 24):
+    raise ValueError("mesh hull vertex indices exceed exact float32 addressing")
+  mesh_data_floats = 3 * (mesh_vertex_count + 2 * mesh_face_count)
   plugin_sdf_float_count = 15 * len(sdf_plugin_geoms)
   sdf_geom_tail_floats = 15 * int(model.ngeom) if sdf_geoms else 0
   # Terrain descriptors already carry per-geom dimensions and offsets.
@@ -1007,7 +1021,7 @@ def lower_collision_geometry(model, pairs, limits=None):
       raise ValueError(f"heightfield geom {g} needs at least two rows and columns")
     hf_data_count += nrow * ncol
   hf_size_count = 4 * len(hf_used)
-  terrain_end = _MESH_DATA_FLOATS + hf_size_count + hf_data_count
+  terrain_end = mesh_data_floats + hf_size_count + hf_data_count
   geometry_upload_floats = (
       terrain_end +
       # Octree blocks carry a third residual word per aabb/coeff entry
@@ -1037,13 +1051,8 @@ def lower_collision_geometry(model, pairs, limits=None):
   mesh_hull_info = np.full((int(model.ngeom) * 9,), -1, dtype=np.int32)
   mesh_rbound_extra = {}
   cursor = 0
-  ncursor = 3 * _MESH_MAX_TOTAL
-  icursor = 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES)
-  mesh_sdf_only = set(mesh_sdf_geoms)
-  for pr in pairs:
-    for g in pr[:2]:
-      if int(geoms[g]) == _MESH and int(geoms[pr[1] if pr[0] == g else pr[0]]) != _SDF:
-        mesh_sdf_only.discard(g)
+  ncursor = 3 * mesh_vertex_count
+  icursor = 3 * (mesh_vertex_count + mesh_face_count)
   for g in mesh_used:
     mid = int(model.geom_dataid[g])
     if mid < 0:
@@ -1055,16 +1064,10 @@ def lower_collision_geometry(model, pairs, limits=None):
       # Mesh-SDF consumes the full source triangle mesh and BVH below; it does
       # not use the convex support hull or face-snap data.
       continue
-    from mujoco_metal.mesh_hull import collision_mesh_hull
-    verts, faces = collision_mesh_hull(model, mid)
+    verts, faces = compiled_hulls[g]
     vnum, fnum = len(verts), len(faces)
-    if vnum <= 0 or vnum > _MESH_MAX_VERTS:
-      raise ValueError(
-          f"mesh geom {g} collision hull has {vnum} verts; 011 supports "
-          f"1..{_MESH_MAX_VERTS} compiled hull verts")
-    if cursor + vnum > _MESH_MAX_TOTAL:
-      raise ValueError("total mesh hull verts exceed 011 capacity "
-                       f"{_MESH_MAX_TOTAL}")
+    if vnum <= 0:
+      raise ValueError(f"mesh geom {g} has an empty compiled collision hull")
     mesh_hull[3 * cursor:3 * (cursor + vnum)] = verts.reshape(-1)
     mesh_hull_info[9 * g] = cursor
     mesh_hull_info[9 * g + 1] = vnum
@@ -1073,10 +1076,6 @@ def lower_collision_geometry(model, pairs, limits=None):
     # Snap planes come from the compiler collision hull, not the potentially
     # concave raw source surface retained separately for ray/SDF queries.
     faces = np.asarray(faces, dtype=np.int64)
-    if ncursor + 3 * fnum > 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES) or \
-        icursor + 3 * fnum > _MESH_DATA_FLOATS:
-      raise ValueError("total mesh faces exceed 011 capacity "
-                       f"{_MESH_MAX_FACES}")
     vd = verts.astype(np.float64)
     interior = vd.mean(axis=0)
     mesh_hull_info[9 * g + 2] = ncursor // 3
@@ -1102,8 +1101,8 @@ def lower_collision_geometry(model, pairs, limits=None):
   # Milestone 012: heightfield store. Per hfield geom: 4 size floats plus
   # the compiled (normalized, row-flipped) data block. Like meshes, the
   # world height is data*size2 over the grid; prism bottoms sit at -size3.
-  scursor = _MESH_DATA_FLOATS
-  dcursor = _MESH_DATA_FLOATS + hf_size_count
+  scursor = mesh_data_floats
+  dcursor = mesh_data_floats + hf_size_count
   for g in hf_used:
     hid = int(model.geom_dataid[g])
     if hid < 0:

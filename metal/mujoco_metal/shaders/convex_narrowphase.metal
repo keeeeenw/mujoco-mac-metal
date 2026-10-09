@@ -69,7 +69,6 @@ inline float3 cx_support(int type, float3 p, float3x3 R, float3 sz, float3 d,
     int off = hull_info[gi * 9];
     int cnt = hull_info[gi * 9 + 1];
     if (cnt < 0) cnt = 0;
-    if (cnt > CX_MESH_MAXSCAN) cnt = CX_MESH_MAXSCAN;
     float best = -3.4028235e+38f;
     for (int k = 0; k < cnt; ++k) {
       float3 v = float3(hull[(off + k) * 3], hull[(off + k) * 3 + 1],
@@ -392,7 +391,7 @@ inline bool cx_mesh_snap(int gi, float3 p, float3x3 R,
   // hit wins; the 0.5 gate rejects grazing hits.
   int hoff = hull_info[gi * 9];
   int hcnt = hull_info[gi * 9 + 1];
-  if (hcnt <= 0 || hcnt > CX_MESH_MAXSCAN) return false;
+  if (hcnt <= 0) return false;
   float rl = length(rayDir);
   if (rl < 1e-24f) return false;
   float3 rd = rayDir / rl;
@@ -469,7 +468,7 @@ inline bool cx_mesh_snap_u(int gi, float3 p, float3x3 R,
   float3 el = float3(dot(R[0], d), dot(R[1], d), dot(R[2], d));
   int hoff = hull_info[gi * 9];
   int hcnt = hull_info[gi * 9 + 1];
-  if (hcnt <= 0 || hcnt > CX_MESH_MAXSCAN) return false;
+  if (hcnt <= 0) return false;
   int bestV = -1;
   float bestD2 = 3.4028235e+38f;
   for (int k = 0; k < hcnt; ++k) {
@@ -1250,7 +1249,6 @@ inline int collide_mesh_plane_manifold(float3 p1, float4 q1,
   int off = hull_info[ib * 9];
   int cnt = hull_info[ib * 9 + 1];
   if (cnt < 0) cnt = 0;
-  if (cnt > CX_MESH_MAXSCAN) cnt = CX_MESH_MAXSCAN;
   // Deepest hull vert in world (recompute to map ties to verts, not the
   // averaged support centroid).
   float deepest = 3.4028235e+38f;

@@ -138,8 +138,13 @@ def test_compiled_simplification_controls_support_and_actual_capacity():
   # while simulating the unsimplified hull.
   assert abs(float(a.contact[0].dist) - float(b.contact[0].dist)) > 1e-4
   assert np.linalg.norm(a.contact[0].frame[:3] - b.contact[0].frame[:3]) > .05
-  with pytest.raises(ValueError, match="64"):
-    lower_coupled_constraints(full)
+  full_descriptor = lower_coupled_constraints(full)
+  full_vertices, full_faces = collision_mesh_hull(full, 0)
+  assert len(full_vertices) == 100
+  full_info = full_descriptor.mesh_hull_info.reshape(-1, 9)[0]
+  assert full_info[1] == 100 and full_info[4] == len(full_faces)
+  np.testing.assert_array_equal(full_descriptor.mesh_hull[:300].reshape(100,3),
+                                full_vertices)
 
 
 @pytest.mark.parametrize("fixture", ["concave", "simplified16", "simplified32"])
@@ -165,7 +170,7 @@ def test_common_source_descriptor_uses_compiled_graph_faces_not_surface_faces(fi
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="native simplified-hull trajectory requires GPU opt-in")
-@pytest.mark.parametrize("bound", [16, 32])
+@pytest.mark.parametrize("bound", [16, 32, -1])
 def test_native_compiled_simplification_contact_force_trajectory(bound):
   import torch
   from mujoco_metal.simulation import MetalSimulation
