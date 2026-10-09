@@ -106,8 +106,8 @@ def component_solver_workspace_sizes(*, batch, nv, ncomponent, nnz,
       "component_mass_euler_dt": 1,
       "component_mass_allow_indefinite": 1,
       "component_mass_phase": 1,
-      "component_mass_dims": 5,
-      "component_mass_single_dims": 5,
+      "component_mass_dims": 6,
+      "component_mass_single_dims": 6,
       "component_mass_merge_dims": 2,
       "component_mass_row_dims": 3,
       "component_mass_row_index": 1,
@@ -515,9 +515,9 @@ class MetalComponentMassSolver:
         dtype=torch.int32, device=self._device)
     self._dims = torch.tensor(
         [self.nv, self.ncomponent, batch_size, self.nnz,
-         rhs_capacity], dtype=torch.int32, device=self._device)
+         rhs_capacity, 0], dtype=torch.int32, device=self._device)
     self._single_dims = torch.tensor(
-        [self.nv, self.ncomponent, batch_size, self.nnz, 1],
+        [self.nv, self.ncomponent, batch_size, self.nnz, 1, 0],
         dtype=torch.int32, device=self._device)
     self._row_dims = torch.tensor(
         [self.nv, rhs_capacity, batch_size], dtype=torch.int32,
@@ -577,10 +577,35 @@ class MetalComponentMassSolver:
         (batch_size, max(self.nnz, 1)), dtype=torch.float32,
         device=self._device)
 
+  def _validate_rhs_low(self, rhs_low):
+    """Accept either the legacy last-row residual or every canonical row.
+
+    Validation does not write dimensions or factors. Both forms are borrowed
+    contiguous inputs; no expansion or transient device allocation is needed.
+    """
+    if rhs_low is None:
+      return self._workspace["zero_rhs_low"], False
+    torch = self._torch
+    if (not isinstance(rhs_low, torch.Tensor)
+        or rhs_low.dtype != torch.float32 or rhs_low.device.type != "mps"
+        or not rhs_low.is_contiguous()
+        or tuple(rhs_low.shape) not in (
+            (self.batch_size, self.nv),
+            (self.batch_size, self.rhs_capacity, self.nv))):
+      raise ValueError(
+          "rhs_low must be contiguous float32 MPS [batch,nv] "
+          "or [batch,rhs_capacity,nv]")
+    return rhs_low, rhs_low.ndim == 3
+
   def run_device(self, mass_blocks, rhs, *, dof_ids=None, counts=None,
                  tendon_armature_blocks=None, diagonal_add=None,
                  allow_indefinite=False, rhs_low=None, world_mask=None):
-    """Return borrowed ``(solution, per-component status)`` MPS tensors."""
+    """Return borrowed ``(solution, per-component status)`` MPS tensors.
+
+    ``rhs_low`` is optional. Its legacy ``[batch,nv]`` layout applies to the
+    final RHS row only; ``[batch,rhs_capacity,nv]`` retains a residual for
+    every row. The solution pair represents the sum of both input planes.
+    """
     torch = self._torch
     if (not isinstance(mass_blocks, torch.Tensor)
         or tuple(mass_blocks.shape) != (self.batch_size, self.nnz)
@@ -614,13 +639,7 @@ class MetalComponentMassSolver:
           or not tendon_armature_blocks.is_contiguous()):
       raise ValueError("tendon_armature_blocks must be contiguous float32 MPS [batch,nnz]")
     diagonal_add = self._validate_diagonal_add(diagonal_add)
-    if rhs_low is None:
-      rhs_low = self._workspace["zero_rhs_low"]
-    elif (not isinstance(rhs_low, torch.Tensor)
-          or tuple(rhs_low.shape) != (self.batch_size, self.nv)
-          or rhs_low.dtype != torch.float32 or rhs_low.device.type != "mps"
-          or not rhs_low.is_contiguous()):
-      raise ValueError("rhs_low must be contiguous float32 MPS [batch,nv]")
+    rhs_low, full_rhs_low = self._validate_rhs_low(rhs_low)
     if not isinstance(allow_indefinite, (bool, np.bool_)):
       raise ValueError("allow_indefinite must be a boolean")
     if world_mask is None:
@@ -632,6 +651,7 @@ class MetalComponentMassSolver:
           or not world_mask.is_contiguous()):
       raise ValueError("world_mask must be contiguous MPS int32 [batch]")
     self._factorized = False
+    self._dims[5] = int(full_rhs_low)
     self._allow_indefinite.fill_(int(allow_indefinite))
     self._phase.fill_(2)
     output, output_low = (self._workspace["output"],
@@ -760,14 +780,9 @@ class MetalComponentMassSolver:
         or not rhs.is_contiguous()):
       raise ValueError(
           "rhs must be contiguous float32 MPS [batch,rhs_capacity,nv]")
+    rhs_low, full_rhs_low = self._validate_rhs_low(rhs_low)
+    self._dims[5] = int(full_rhs_low)
     self._phase.fill_(1)
-    if rhs_low is None:
-      rhs_low = self._workspace["zero_rhs_low"]
-    elif (not isinstance(rhs_low, torch.Tensor)
-          or tuple(rhs_low.shape) != (self.batch_size, self.nv)
-          or rhs_low.dtype != torch.float32 or rhs_low.device.type != "mps"
-          or not rhs_low.is_contiguous()):
-      raise ValueError("rhs_low must be contiguous float32 MPS [batch,nv]")
     output, output_low, status, workspace = (
         self._workspace["output"], self._workspace["output_low"],
         self._workspace["status"], self._workspace)

@@ -272,8 +272,9 @@ kernel void factor_apply_components(
                                component_layout,dof_base,begin,end);
         return;
       }
-      if (r == nrhs-1 && dof_mask[dof_mask_base+dof] != 0
-          && !component_finite(rhs_low[world*max(nv,1)+dof])) {
+      int low_index = dims[5] != 0 ? rhs_row+dof : world*max(nv,1)+dof;
+      if ((dims[5] != 0 || r == nrhs-1) && dof_mask[dof_mask_base+dof] != 0
+          && !component_finite(rhs_low[low_index])) {
         status[world*ncomponent+component]=1;
         clear_component_outputs(output,output_low,output_base,nv,rhs_capacity,
                                component_layout,dof_base,begin,end);
@@ -481,8 +482,9 @@ kernel void factor_apply_components(
         output_low[out_row+dof_i]=0.0f;
         continue;
       }
+      int low_index = dims[5] != 0 ? rhs_row+dof_i : world*max(nv,1)+dof_i;
       ComponentFloatPair residual={rhs[rhs_row+dof_i],
-          r == nrhs-1 ? rhs_low[world*max(nv,1)+dof_i] : 0.0f};
+          (dims[5] != 0 || r == nrhs-1) ? rhs_low[low_index] : 0.0f};
       for (int j=0; j<width; ++j) {
         int dof_j=component_layout[dof_base+begin+j];
         if (dof_mask[dof_mask_base+dof_j] == 0) continue;
