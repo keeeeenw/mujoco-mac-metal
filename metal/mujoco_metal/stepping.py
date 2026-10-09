@@ -413,6 +413,9 @@ def validate_stepping_profile(
           "timestep must be representable as a finite positive float32"
       )
 
+    from mujoco_metal.model import require_triple_word_domain
+    require_triple_word_domain([dt],what='timestep')
+
     opt = model.opt
     if int(opt.integrator) != int(mujoco.mjtIntegrator.mjINT_EULER):
       raise ValueError(f"{profile} requires the Euler integrator")
@@ -574,12 +577,12 @@ def validate_stepping_profile(
     passive_damping_enabled = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
 
     execution_plan = replace(_build_integrated_execution_plan(
-        model, float(native_dt), implicit_euler_damping, passive_damping_enabled, coupled_desc
+        model, dt, implicit_euler_damping, passive_damping_enabled, coupled_desc
     ), profile_name=profile)
 
     return SteppingProfile(
         name=profile,
-        timestep=float(native_dt),
+        timestep=dt,
         model_fingerprint=_fingerprint(model),
         descriptor_fingerprint=_fingerprint(load_model(model)),
         nq=int(model.nq),
