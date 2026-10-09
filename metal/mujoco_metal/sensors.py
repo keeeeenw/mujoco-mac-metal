@@ -517,7 +517,8 @@ def lower_sensors(model) -> SensorDescriptor:
           if _ta == _SDF_T or _tb == _SDF_T:
             raise ValueError(
                 f"sensor {i}: SDF geom distance is unsupported in 016")
-          pair_max_contacts(_ta, _tb, _sdf_ip)
+          if (_ta, _tb) not in ((0,0),(0,1),(1,0),(1,1)):
+            pair_max_contacts(_ta, _tb, _sdf_ip)
     if typ in (int(S.mjSENS_FRAMELINACC), int(S.mjSENS_FRAMEANGACC)):
       objtype, objid = int(arrays["sensor_objtype"][i]), int(arrays["sensor_objid"][i])
       if objtype not in valid_objtypes or objtype == int(mujoco.mjtObj.mjOBJ_UNKNOWN) or not 0 <= objid < _object_count(objtype, nb, ng, nsite):
@@ -1905,95 +1906,24 @@ class SensorProgram:
             rb[g] = max(float(rb[g]), float(_np.max(_np.linalg.norm(verts, axis=1))))
     self._sp_geom_rbound = ftensor(rb.reshape(max(ng, 1)), (max(ng, 1),))
     self._sp_sdf_maxn = min(int(model.opt.sdf_initpoints), 8)
-    # Geometry-distance operands retain the coupled layout. Rangefinders use
-    # the complete, dynamically packed public scene-ray operands instead.
-    from mujoco_metal.coupled_constraints import (
-        _HF_MAX_DATA, _HF_MAX_GEOMS, _HF_MAX_N, _MESH_DATA_FLOATS,
-        _MESH_MAX_FACES, _MESH_MAX_TOTAL, _MESH_MAX_VERTS,
-        mesh_hull_is_convex)
-    _MESH_T = int(mujoco.mjtGeom.mjGEOM_MESH)
-    _HF_T = int(mujoco.mjtGeom.mjGEOM_HFIELD)
+    # Query assets are independent of physical candidate masks and motion.
+    # Pack the same compiled hull/terrain operands as native collision.
+    from mujoco_metal.coupled_constraints import lower_collision_geometry
     distance_types = [int(getattr(mujoco.mjtSensor, name)) for name in (
         "mjSENS_GEOMDIST", "mjSENS_GEOMNORMAL", "mjSENS_GEOMFROMTO")]
-    has_distances = np.any(np.isin(model.sensor_type, distance_types))
-    _mesh_used = sorted(g for g in range(ng) if has_distances and int(model.geom_type[g]) == _MESH_T)
-    _hf_used = sorted(g for g in range(ng) if has_distances and int(model.geom_type[g]) == _HF_T)
-    if _mesh_used or _hf_used:
-      if len(_hf_used) > _HF_MAX_GEOMS:
-        raise ValueError(f"at most {_HF_MAX_GEOMS} heightfield geoms; found {len(_hf_used)}")
-      _hull = np.zeros((_MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA,), dtype=np.float32)
-      _hinfo = np.full((max(ng, 1) * 9,), -1, dtype=np.int32)
-      _cursor, _ncursor = 0, 3 * _MESH_MAX_TOTAL
-      _icursor = 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES)
-      for g in _mesh_used:
-        mid = int(model.geom_dataid[g])
-        if mid < 0:
-          raise ValueError(f"mesh geom {g} has no asset")
-        vnum = int(model.mesh_vertnum[mid])
-        if vnum <= 0 or vnum > _MESH_MAX_VERTS:
-          raise ValueError(f"mesh geom {g} has {vnum} verts; 011 supports 1..{_MESH_MAX_VERTS}")
-        if not mesh_hull_is_convex(model, mid):
-          raise ValueError(f"mesh geom {g} is non-convex; 016 geomdist requires convex meshes")
-        if _cursor + vnum > _MESH_MAX_TOTAL:
-          raise ValueError("total mesh hull verts exceed 011 capacity")
-        vadr = int(model.mesh_vertadr[mid])
-        verts = np.asarray(model.mesh_vert[vadr:vadr + vnum], dtype=np.float32)
-        _hull[3 * _cursor:3 * (_cursor + vnum)] = verts.reshape(-1)
-        _hinfo[9 * g] = _cursor
-        _hinfo[9 * g + 1] = vnum
-        _cursor += vnum
-        fadr = int(model.mesh_faceadr[mid])
-        fnum = int(model.mesh_facenum[mid])
-        faces = np.asarray(model.mesh_face[fadr:fadr + fnum], dtype=np.int64)
-        if _ncursor + 3 * fnum > 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES) or \
-            _icursor + 3 * fnum > _MESH_DATA_FLOATS:
-          raise ValueError("total mesh faces exceed 011 capacity")
-        vd = verts.astype(np.float64)
-        interior = vd.mean(axis=0)
-        _hinfo[9 * g + 2] = _ncursor // 3
-        _hinfo[9 * g + 3] = _icursor // 3
-        _hinfo[9 * g + 4] = fnum
-        for f in faces:
-          i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
-          n = np.cross(vd[i1] - vd[i0], vd[i2] - vd[i0])
-          nl = float(np.linalg.norm(n))
-          if nl < 1e-12:
-            n = np.zeros(3)
-          else:
-            n = n / nl
-            if float(n @ (vd[[i0, i1, i2]].mean(axis=0) - interior)) < 0.0:
-              n = -n
-          _hull[_ncursor:_ncursor + 3] = n.astype(np.float32)
-          _hull[_icursor:_icursor + 3] = np.array([i0, i1, i2], dtype=np.float32)
-          _ncursor += 3
-          _icursor += 3
-      _scursor = _MESH_DATA_FLOATS
-      _dcursor = _MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS
-      for g in _hf_used:
-        hid = int(model.geom_dataid[g])
-        if hid < 0:
-          raise ValueError(f"heightfield geom {g} has no asset")
-        nrow, ncol = int(model.hfield_nrow[hid]), int(model.hfield_ncol[hid])
-        if not (2 <= nrow <= _HF_MAX_N and 2 <= ncol <= _HF_MAX_N):
-          raise ValueError(f"heightfield dims {(nrow, ncol)} outside 012 bounds")
-        ndata = nrow * ncol
-        if _dcursor + ndata > len(_hull):
-          raise ValueError("total heightfield data exceeds 012 capacity")
-        _hull[_scursor:_scursor + 4] = np.asarray(model.hfield_size[hid], dtype=np.float32)
-        adr = int(model.hfield_adr[hid])
-        _hull[_dcursor:_dcursor + ndata] = np.asarray(
-            model.hfield_data[adr:adr + ndata], dtype=np.float32)
-        _hinfo[9 * g + 5] = _dcursor
-        _hinfo[9 * g + 6] = nrow
-        _hinfo[9 * g + 7] = ncol
-        _hinfo[9 * g + 8] = _scursor
-        _scursor += 4
-        _dcursor += ndata
-      self._sp_hull = torch.as_tensor(_hull.copy(), dtype=torch.float32, device=self._device)
-      self._sp_hull_info = torch.as_tensor(_hinfo.copy(), dtype=torch.int32, device=self._device)
-    else:
-      self._sp_hull = torch.zeros(1, dtype=torch.float32, device=self._device)
-      self._sp_hull_info = torch.zeros(9, dtype=torch.int32, device=self._device)
+    distance_pairs = []
+    for i in range(int(model.nsensor)):
+      if int(model.sensor_type[i]) not in distance_types:
+        continue
+      for a in _sensor_geoms(model, model.sensor_objtype[i], model.sensor_objid[i]):
+        for b in _sensor_geoms(model, model.sensor_reftype[i], model.sensor_refid[i]):
+          if a != b:
+            distance_pairs.append((a, b))
+    scene = lower_collision_geometry(model, distance_pairs)
+    self._sp_hull = torch.tensor(np.array(scene.mesh_hull, copy=True),
+                                dtype=torch.float32, device=self._device)
+    self._sp_hull_info = torch.tensor(np.array(scene.mesh_hull_info, copy=True),
+                                     dtype=torch.int32, device=self._device)
     # Compile each independent query entry on first use. Rangefinders must
     # not compile the complete geometry collision dispatcher as a side effect.
     # All families remain available, including queries requested after setup.
@@ -2012,6 +1942,8 @@ class SensorProgram:
           [self.batch_size, self.descriptor.nsensor, self.descriptor.nsensordata,
            ng, nsite, self.descriptor.disableflags,len(pixels['ray_entries']),nb],
           dtype=torch.int32, device=self._device)
+    from mujoco_metal.geometry_queries import GeometryQueryProgram
+    self._geometry_queries = GeometryQueryProgram(model,self.batch_size)
     self._sp_geomdist = partial(_dispatch_spatial, 4, "evaluate_geomdist")
     self._sp_tactile = partial(_dispatch_spatial, 1, "evaluate_tactile")
     self._build_tactile_constants(model)
@@ -2222,19 +2154,7 @@ class SensorProgram:
       dest = self._s_state_out
     self._set_world_mask(world_mask)
     self._stage_mask[0].fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
-    gdims = torch.tensor(
-        [b, d.nsensor, d.nsensordata, d.ngeom, d.nbody, d.disableflags,
-         0, int(self._sp_sdf_maxn), 0],
-        dtype=torch.int32, device=self._device)
-    self._sp_geomdist(
-        poses["geom_pos"].reshape(-1), poses["geom_quat"].reshape(-1),
-        self._sp_geom_type.reshape(-1), self._sp_geom_size.reshape(-1),
-        self._sp_geom_rbound.reshape(-1),
-        self._sp_body_geoms.reshape(-1),
-        hull.reshape(-1), hull_info.reshape(-1),
-        self._s_meta.reshape(-1),
-        dest.reshape(-1), self._stage_mask, gdims,
-        threads=(b * max(d.nsensor, 1),), group_size=(1,))
+    self._geometry_queries.run(poses,self._s_meta.reshape(-1),self._stage_mask,dest)
     return dest
 
   def run_acc_device(self, qpos, qvel, qacc, poses, *, qacc_low=None, xfrc=None,

@@ -226,9 +226,11 @@ def test_ray_occlusion_exclusion_and_miss():
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_native_spatial_query_matches_forward_gpu():
   from mujoco_metal.simulation import MetalSimulation
+  from mujoco_metal.capacity import model_component_capacity_limits
   model = mujoco.MjModel.from_xml_string(_XML)
   qpos, qvel, times = _states(model)
-  sim = MetalSimulation(model, batch_size=len(qpos), profile="integrated_euler_v1")
+  sim = MetalSimulation(model, batch_size=len(qpos), profile="integrated_euler_v1",
+                        limits=model_component_capacity_limits(model,len(qpos)))
   sim.reset(qpos=qpos.astype(np.float32), qvel=qvel.astype(np.float32))
   sim.step(30)
   gq = sim.state.qpos.cpu().numpy().astype(np.float64)
@@ -249,9 +251,11 @@ def test_native_spatial_query_matches_forward_gpu():
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_stored_spatial_sample_matches_mj_step_gpu():
   from mujoco_metal.simulation import MetalSimulation
+  from mujoco_metal.capacity import model_component_capacity_limits
   model = mujoco.MjModel.from_xml_string(_XML)
   qpos, qvel, _ = _states(model, batch=2)
-  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1",
+                        limits=model_component_capacity_limits(model,len(qpos)))
   sim.reset(qpos=qpos.astype(np.float32), qvel=qvel.astype(np.float32))
   cpus = []
   for w in range(2):

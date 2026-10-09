@@ -1482,7 +1482,8 @@ static inline void flex_epa_write_witness_dd(
     const thread FlexEpaFace& face, device const FlexDDVertex* vertices,
     thread ContactGeom& contact,
     thread FlexDD3* source_position=nullptr,
-    thread FlexDD3* source_normal=nullptr) {
+    thread FlexDD3* source_normal=nullptr,
+    thread FlexDD3* witness_a=nullptr, thread FlexDD3* witness_b=nullptr) {
   FlexDD3 s1=vertices[face.a].m, s2=vertices[face.b].m;
   FlexDD3 s3=vertices[face.c].m, p=face.v_dd;
   FlexDD m14=flex_epa_affine_minor(FlexDD2{s1.y,s1.z},
@@ -1511,6 +1512,8 @@ static inline void flex_epa_write_witness_dd(
   FlexDD3 values_b[3]={vertices[face.a].b,vertices[face.b].b,vertices[face.c].b};
   FlexDD3 xa=flex_dd3_lincomb_source(values_a,weights,3);
   FlexDD3 xb=flex_dd3_lincomb_source(values_b,weights,3);
+  if (witness_a!=nullptr) *witness_a=xa;
+  if (witness_b!=nullptr) *witness_b=xb;
   FlexDD3 witness_delta=flex_dd3_sub(xa,xb);
   FlexDD witness_norm=flex_dd_sqrt(flex_dd3_dot(witness_delta,witness_delta));
   FlexDD3 normal=flex_dd_compare(witness_norm,flex_dd(0.0f))>0
