@@ -630,7 +630,11 @@ def test_teleport_rejects_stale_seed_gpu():
   for _ in range(5):
     sim.step(1)
   sim.set_warmstart(np.full(m.nv, 10.0, dtype=np.float32))
-  gated = sim.assembled_system(recompute=True)
+  # Solver outputs are borrowed. Capture before the cold recomputation
+  # overwrites their backing, otherwise this gate compares a buffer to itself.
+  gated = {key: value.clone() for key, value in
+           sim.assembled_system(recompute=True).items()
+           if key in ("qacc", "qfrc_constraint", "lambda", "status")}
   sim.clear_warmstart()
   cold = sim.assembled_system(recompute=True)
   for key in ("qacc", "qfrc_constraint", "lambda"):
@@ -652,7 +656,13 @@ def test_teleport_rejects_stale_seed_gpu():
   # Teleport WITHOUT reset: retained seed stays stale (reset would clear it).
   sim.state._qpos.copy_(sim.state._torch.as_tensor(tele))
   cold = MetalSimulation(m2, batch_size=1, profile=PROFILE)
-  cold.reset(qpos=tele, qvel=qv.copy())
+  # The cold twin must consume the same represented physical state, including
+  # retained velocity residuals. Resetting only its float32 heads discards
+  # residuals developed by the preceding trajectory and changes its inputs.
+  # The device-state snapshot excludes retained constraint multipliers; clear
+  # canonical acceleration warmstarts too so only the original has stale seeds.
+  cold.state.restore(sim.state.snapshot())
+  cold.clear_warmstart()
   sim.step(1)
   cold.step(1)
   np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(),

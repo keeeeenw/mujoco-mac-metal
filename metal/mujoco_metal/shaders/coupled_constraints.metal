@@ -11036,9 +11036,14 @@ kernel void solve_coupled_constraints_block(
 
   // 10. Reconstruct forces and acceleration
   for (int i = 0; i < nv; ++i) {
-    float total = 0.0f;
+    PrimalFloatPair total = {0.0f, 0.0f};
     for (int row = 0; row < nr; ++row)
-      if (enabled[row]) total += ccj_get(J_world, row, i, nv) * lam[row];
+      if (enabled[row]) total = primal_pair_fma(
+          ccj_get(J_world, row, i, nv),
+          {lam[row], pgs_lambda_low[row]}, total);
+    // Newton/CG refresh and PGS both retain multiplier residuals here.
+    // Consuming only their high words publishes a different force from the
+    // accepted acceleration, especially when large contact forces cancel.
     // Low-word Jacobian correction on dense mass only (consistent
     // effective system with the dense qacc reconstruction below).
     // Skipped (bitwise-identical legacy behavior) where the low plane
@@ -11046,9 +11051,12 @@ kernel void solve_coupled_constraints_block(
     for (int row = 0; row < nr; ++row)
       if (enabled[row]) {
         float Jlo = ccj_get_lo(J_world, row, i, nv);
-        if (Jlo != 0.0f && dims[20] >= 0) total = fma(Jlo, lam[row], total);
+        if (Jlo != 0.0f && dims[20] >= 0)
+          total = primal_pair_add(total, primal_pair_product(
+              {Jlo, 0.0f}, {lam[row], pgs_lambda_low[row]}));
       }
-    out_force[qb + i] = total;
+    out_force[qb + i] = total.hi;
+    pgs_pair_tail[i] = total.lo;
   }
 
   // Acceleration-space CG retains its finite accepted primal iterate.
