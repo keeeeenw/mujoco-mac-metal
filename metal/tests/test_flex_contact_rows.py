@@ -539,62 +539,19 @@ def test_p2_epa_initialization_uses_precise_seed_and_pinned_rotation_route():
   assert least_axis(precise) == 2
 
 
-def test_s2d_area_matches_pinned_arm64_fma_contraction():
-  """The exact captured triangle needs the installed ARM64 FMA sequence."""
-  from decimal import Decimal, localcontext
-
-  # Captured exact-input 4085 GJK iter-2 simplex, projected on x/z. Pinned
-  # engine_collision_gjk.c:S2D produces this C33 weight on the installed
-  # ARM64 binary; separately rounded products lose one binary64 ULP.
-  px, py = -3.46461688864063722e-35, -4.57054544407578593e-18
-  ax, ay = -0.00288675134594812421, -0.00288675134594812421
-  bx, by = 0.00288675134594812421, 0.102886752836064244
-  det = -0.0113952870125042099
-
-  def fma64(a, b, c):
-    with localcontext() as ctx:
-      ctx.prec = 200
-      return float(Decimal.from_float(a) * Decimal.from_float(b)
-                   + Decimal.from_float(c))
-
-  def separately_rounded_area2():
-    area = px * ay
-    area = area + py * bx
-    area = area + ax * by
-    area = area - px * by
-    area = area - py * ax
-    area = area - bx * ay
-    return area
-
-  def arm64_area2():
-    area = px * ay
-    area = fma64(py, bx, area)
-    area = fma64(ax, by, area)
-    area = fma64(-px, by, area)
-    area = fma64(-py, ax, area)
-    area = fma64(-bx, ay, area)
-    return area
-
-  rounded_weight = separately_rounded_area2() / det
-  pinned_weight = arm64_area2() / det
-  assert rounded_weight == 0.02533285371220925
-  assert pinned_weight == 0.025332853712209256
-  assert pinned_weight != rounded_weight
-
-  shader = (Path(__file__).parents[1] / "mujoco_metal" / "shaders"
-            / "flex_contact.metal").read_text()
-  start = shader.index("static inline FlexDD flex_dd_area2(")
-  stop = shader.index("static inline void flex_dd_s2d(", start)
-  area = shader[start:stop]
-  ordered = (
-      "area=flex_dd_source_mul(ax,by)",
-      "area=flex_dd_source_fma(ay,cx,area)",
-      "area=flex_dd_source_fma(bx,cy,area)",
-      "area=flex_dd_source_fma(flex_dd_neg(ax),cy,area)",
-      "area=flex_dd_source_fma(flex_dd_neg(ay),bx,area)",
-      "area=flex_dd_source_fma(flex_dd_neg(cx),by,area)",
-  )
-  assert tuple(sorted(ordered, key=area.index)) == ordered
+def test_gjk_triangle_helpers_are_shared_and_distinct_from_epa():
+  """Structural guard; native C-oracle tests establish the arithmetic."""
+  import re
+  shaders = Path(__file__).parents[1] / "mujoco_metal" / "shaders"
+  core = (shaders / "common_ccd_core.metal").read_text()
+  flex = (shaders / "flex_contact.metal").read_text()
+  for name in ("flex_gjk_triangle_minor", "flex_gjk_triangle_area"):
+    pattern = rf"static inline FlexDD {name}\([^{{]+\{{[^}}]+\}}"
+    body = re.search(pattern, core).group()
+    assert body == re.search(pattern, flex).group()
+    assert "source_fma" not in body
+  assert "flex_dd_area2" not in core
+  assert "flex_dd_area2" not in flex
 
 
 def test_gjk_lincomb_preserves_installed_arm64_contraction_order():

@@ -836,23 +836,46 @@ static inline void flex_dd_s1d(thread FlexDD* lambda, FlexDD3 a, FlexDD3 b) {
 }
 
 
-static inline FlexDD flex_dd_area2(FlexDD ax, FlexDD ay,
-                                    FlexDD bx, FlexDD by,
-                                    FlexDD cx, FlexDD cy) {
-  // Match the pinned arm64 contraction of the lexical S2D area expression:
-  // the first product is rounded, then each remaining product is fused into
-  // the accumulator in source order. Separately rounding all six products
-  // changes the final barycentric weight by one mjtNum ULP for the captured
-  // near-symmetric simplex, which then perturbs GJK's next support point.
-  FlexDD area=flex_dd_source_mul(ax,by);
-  area=flex_dd_source_fma(ay,cx,area);
-  area=flex_dd_source_fma(bx,cy,area);
-  area=flex_dd_source_fma(flex_dd_neg(ax),cy,area);
-  area=flex_dd_source_fma(flex_dd_neg(ay),bx,area);
-  area=flex_dd_source_fma(flex_dd_neg(cx),by,area);
-  return area;
+// Preserve triAffineCoord's compiled arm64 contraction and source order.
+// Reassociation changes witness points and can change later restart support ties.
+static inline FlexDD flex_epa_affine_minor(FlexDD2 a, FlexDD2 b, FlexDD2 c) {
+  FlexDD value=flex_dd_source_mul(b.x,c.y);
+  value=flex_dd_source_fma(flex_dd_neg(b.y),c.x,value);
+  value=flex_dd_source_fma(flex_dd_neg(a.x),c.y,value);
+  value=flex_dd_source_fma(a.y,c.x,value);
+  value=flex_dd_source_fma(a.x,b.y,value);
+  return flex_dd_source_sub(value,flex_dd_source_mul(a.y,b.x));
 }
 
+static inline FlexDD flex_epa_affine_area(FlexDD2 p, FlexDD2 b, FlexDD2 c) {
+  FlexDD value=flex_dd_source_add(flex_dd_source_mul(p.x,b.y),
+                                  flex_dd_source_mul(p.y,c.x));
+  value=flex_dd_source_fma(b.x,c.y,value);
+  value=flex_dd_source_sub(value,flex_dd_source_mul(p.x,c.y));
+  value=flex_dd_source_sub(value,flex_dd_source_mul(p.y,b.x));
+  return flex_dd_source_fma(flex_dd_neg(c.x),b.y,value);
+}
+
+// S2D reuses these products for its minors and projected cofactors. The
+// pinned arm64 compiler rounds the reused products before the lexical sums;
+// triAffineCoord has a different contraction and must keep its own helpers.
+static inline FlexDD flex_gjk_triangle_minor(FlexDD2 a, FlexDD2 b, FlexDD2 c) {
+  FlexDD value=flex_dd_source_sub(flex_dd_source_mul(b.x,c.y),
+                                 flex_dd_source_mul(b.y,c.x));
+  value=flex_dd_source_sub(value,flex_dd_source_mul(a.x,c.y));
+  value=flex_dd_source_add(value,flex_dd_source_mul(a.y,c.x));
+  value=flex_dd_source_add(value,flex_dd_source_mul(a.x,b.y));
+  return flex_dd_source_sub(value,flex_dd_source_mul(a.y,b.x));
+}
+
+static inline FlexDD flex_gjk_triangle_area(FlexDD2 p, FlexDD2 b, FlexDD2 c) {
+  FlexDD value=flex_dd_source_add(flex_dd_source_mul(p.x,b.y),
+                                  flex_dd_source_mul(p.y,c.x));
+  value=flex_dd_source_add(value,flex_dd_source_mul(b.x,c.y));
+  value=flex_dd_source_sub(value,flex_dd_source_mul(p.x,c.y));
+  value=flex_dd_source_sub(value,flex_dd_source_mul(p.y,b.x));
+  return flex_dd_source_sub(value,flex_dd_source_mul(c.x,b.y));
+}
 
 static inline void flex_dd_s2d(thread FlexDD* lambda, FlexDD3 a,
                                FlexDD3 b, FlexDD3 c) {
@@ -860,10 +883,12 @@ static inline void flex_dd_s2d(thread FlexDD* lambda, FlexDD3 a,
   if (flex_dd_project_origin_plane(origin_projection,a,b,c)) {
     flex_dd_s1d(lambda,a,b); lambda[2]=flex_dd(0.0f); return;
   }
-  FlexDD m14=flex_dd_det3(a,b,c); // overwritten below with pinned minors
-  m14=flex_dd_area2(b.y,b.z,c.y,c.z,a.y,a.z);
-  FlexDD m24=flex_dd_area2(b.x,b.z,c.x,c.z,a.x,a.z);
-  FlexDD m34=flex_dd_area2(b.x,b.y,c.x,c.y,a.x,a.y);
+  FlexDD m14=flex_gjk_triangle_minor(FlexDD2{a.y,a.z},
+      FlexDD2{b.y,b.z},FlexDD2{c.y,c.z});
+  FlexDD m24=flex_gjk_triangle_minor(FlexDD2{a.x,a.z},
+      FlexDD2{b.x,b.z},FlexDD2{c.x,c.z});
+  FlexDD m34=flex_gjk_triangle_minor(FlexDD2{a.x,a.y},
+      FlexDD2{b.x,b.y},FlexDD2{c.x,c.y});
   FlexDD abs14=flex_dd_abs(m14), abs24=flex_dd_abs(m24), abs34=flex_dd_abs(m34);
   int xaxis,yaxis;
   FlexDD mmax;
@@ -879,9 +904,9 @@ static inline void flex_dd_s2d(thread FlexDD* lambda, FlexDD3 a,
   FlexDD ax=flex_dd3_component(a,xaxis), ay=flex_dd3_component(a,yaxis);
   FlexDD bx=flex_dd3_component(b,xaxis), by=flex_dd3_component(b,yaxis);
   FlexDD cx=flex_dd3_component(c,xaxis), cy=flex_dd3_component(c,yaxis);
-  FlexDD c31=flex_dd_area2(px,py,bx,by,cx,cy);
-  FlexDD c32=flex_dd_area2(px,py,cx,cy,ax,ay);
-  FlexDD c33=flex_dd_area2(px,py,ax,ay,bx,by);
+  FlexDD c31=flex_gjk_triangle_area(FlexDD2{px,py},FlexDD2{bx,by},FlexDD2{cx,cy});
+  FlexDD c32=flex_gjk_triangle_area(FlexDD2{px,py},FlexDD2{cx,cy},FlexDD2{ax,ay});
+  FlexDD c33=flex_gjk_triangle_area(FlexDD2{px,py},FlexDD2{ax,ay},FlexDD2{bx,by});
   bool comp1=flex_dd_same_sign(mmax,c31), comp2=flex_dd_same_sign(mmax,c32);
   bool comp3=flex_dd_same_sign(mmax,c33);
   if (comp1 && comp2 && comp3) {
@@ -1062,26 +1087,6 @@ static inline bool flex_project_origin_plane_dd(
   return true;
 }
 
-
-// Preserve triAffineCoord's compiled arm64 contraction and source order.
-// Reassociation changes witness points and can change later restart support ties.
-static inline FlexDD flex_epa_affine_minor(FlexDD2 a, FlexDD2 b, FlexDD2 c) {
-  FlexDD value=flex_dd_source_mul(b.x,c.y);
-  value=flex_dd_source_fma(flex_dd_neg(b.y),c.x,value);
-  value=flex_dd_source_fma(flex_dd_neg(a.x),c.y,value);
-  value=flex_dd_source_fma(a.y,c.x,value);
-  value=flex_dd_source_fma(a.x,b.y,value);
-  return flex_dd_source_sub(value,flex_dd_source_mul(a.y,b.x));
-}
-
-static inline FlexDD flex_epa_affine_area(FlexDD2 p, FlexDD2 b, FlexDD2 c) {
-  FlexDD value=flex_dd_source_add(flex_dd_source_mul(p.x,b.y),
-                                  flex_dd_source_mul(p.y,c.x));
-  value=flex_dd_source_fma(b.x,c.y,value);
-  value=flex_dd_source_sub(value,flex_dd_source_mul(p.x,c.y));
-  value=flex_dd_source_sub(value,flex_dd_source_mul(p.y,b.x));
-  return flex_dd_source_fma(flex_dd_neg(c.x),b.y,value);
-}
 
 static inline void flex_epa_write_witness_dd(
     const thread FlexEpaFace& face, device const FlexDDVertex* vertices,
