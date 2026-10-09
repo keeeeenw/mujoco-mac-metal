@@ -1739,6 +1739,11 @@ class FlexContactProgram:
       _flex_pipeline_log("compile_shader returned", started)
     else:
       self._shader = None
+    # A GPU event closes the custom-kernel epoch before Torch/MPS consumers
+    # and the next masked assembly reuse these borrowed workspaces. This is
+    # an encoder dependency, not a host readback of contact or solver data.
+    self._completion_event = (torch.mps.Event()
+                              if self._shader is not None else None)
 
   def run_device(self, flexvert_xpos, geom_pos, geom_quat, *,
                  flexvert_xpos_low=None,
@@ -2060,6 +2065,9 @@ class FlexContactProgram:
     if include_wake_links:
       result["active_tree_links"], result["active_tree_link_overflow"] = (
           self.run_active_tree_links(result, world_mask=world_mask))
+    if self._completion_event is not None:
+      self._completion_event.record()
+      self._completion_event.wait()
     return result
 
   def _pack_paired_flexvert_positions(self, high, low, tail):

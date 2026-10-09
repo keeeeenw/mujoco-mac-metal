@@ -140,9 +140,7 @@ def test_native_flex_gjk_iteration_trace_records_target_candidate_only(elem_id):
   program = FlexContactProgram(
       model, batch_size=1, device="mps",
       capture_gjk_trace_slot=(0, slot))
-  assert not program._narrowphase_admitted
-  # Isolated diagnostic-stage execution. Public admission remains unchanged.
-  program._narrowphase_admitted = True
+  assert program._narrowphase_admitted
   mps = lambda value: torch.as_tensor(
       np.asarray(value, np.float32).copy(), dtype=torch.float32,
       device="mps").contiguous()
@@ -159,6 +157,18 @@ def test_native_flex_gjk_iteration_trace_records_target_candidate_only(elem_id):
     support_ids = records[stage, valid, 60].astype(np.int32)
     assert np.all((support_ids >= 0) & (support_ids < 4))
   assert result["ccd_trace"].shape[:2] == (1, descriptor.slot_count)
+  # Recording one candidate must not alter the admitted detector's outputs.
+  control = FlexContactProgram(model, batch_size=1, device="mps")
+  assert control._narrowphase_admitted
+  control_result = control.run_device(
+      mps(first.flexvert_xpos[None]), mps(first.geom_xpos[None]),
+      mps(_geom_quat_batch(model, [first])))
+  for name in ("active", "raw_active", "narrowphase_status", "dist", "pos",
+               "normal", "frame", "barycentric1", "barycentric2",
+               "jacobian_weights1", "jacobian_weights2"):
+    np.testing.assert_array_equal(
+        result[name].cpu().numpy(), control_result[name].cpu().numpy(),
+        err_msg=f"GJK trace altered {name} for element {elem_id}")
 
 
 def test_native_flex_row_adapter_forwards_packed_global_jacobian():
@@ -539,7 +549,7 @@ def test_p2_epa_initialization_uses_precise_seed_and_pinned_rotation_route():
   assert least_axis(precise) == 2
 
 
-def test_gjk_triangle_helpers_are_shared_and_distinct_from_epa():
+def test_gjk_triangle_helpers_share_pinned_default_contractions():
   """Structural guard; native C-oracle tests establish the arithmetic."""
   import re
   shaders = Path(__file__).parents[1] / "mujoco_metal" / "shaders"
@@ -549,7 +559,8 @@ def test_gjk_triangle_helpers_are_shared_and_distinct_from_epa():
     pattern = rf"static inline FlexDD {name}\([^{{]+\{{[^}}]+\}}"
     body = re.search(pattern, core).group()
     assert body == re.search(pattern, flex).group()
-    assert "source_fma" not in body
+    affine = name.replace("flex_gjk_triangle_", "flex_epa_affine_")
+    assert f"return {affine}(" in body
   assert "flex_dd_area2" not in core
   assert "flex_dd_area2" not in flex
 
@@ -761,8 +772,7 @@ def test_absolute_source_dot_can_round_away_exact_projection_difference():
   assert "FlexProjection53 best_projection=flex_mju_dot3_projection53(" in shader
   assert "if (flex_projection53_compare(projection,best_projection)>0)" in shader
   assert "int quantum_exp=exponent-53;" in shader
-  assert "product[i]=flex_expansion_round53(expansion,count);" in shader
-  assert "FlexProjection53 first_fma=flex_expansion_round53(expansion,count);" in shader
+  assert "FlexDD value=flex_dd_source_dot3(point,direction);" in shader
   assert "int half_cmp=flex_expansion_compare_value(" in shader
 
 
@@ -808,11 +818,8 @@ def test_pinned_dot3_fma_order_resolves_float32_support_vertex():
   start = shader.index("FlexProjection53 flex_mju_dot3_projection53(")
   stop = shader.index("// Round the exact sum of float expansions", start)
   projection = shader[start:stop]
-  assert "product[1].low" in projection
-  assert "FlexProjection53 first_fma=flex_expansion_round53(expansion,count);" in projection
-  assert "FlexDD scalar=coordinate[0];" in projection
-  assert "scalar=coordinate[2]; d=axis[2];" in projection
-  assert "return flex_expansion_round53(expansion,count);" in projection
+  assert "FlexDD value=flex_dd_source_dot3(point,direction);" in projection
+  assert "return FlexProjection53{value.hi,value.lo,value.tail};" in projection
   assert "FlexProjection53 last_two" not in projection
 
 
@@ -862,9 +869,11 @@ def test_binary64_projection_rounding_reference_covers_gaps_and_ties():
   start = shader.index("FlexProjection53 flex_expansion_round53(")
   stop = shader.index("static inline int flex_projection53_compare(", start)
   rounder = shader[start:stop]
-  # Every component below the leading float contributes to the quantum count;
-  # this is essential when the second expansion component is widely separated.
-  assert "for (int i=0;i<count-1;i++)" in rounder
+  # Compress the overlapping leading estimate, then retain every exact tail
+  # component when quantizing; cancellation must not overflow parity counts.
+  assert "for (int i=count-1;i>=0;i--) result.hi+=expansion[i];" in rounder
+  assert "tail_count=flex_expansion_add(tail,tail_count,-result.hi,tail_scratch);" in rounder
+  assert "for (int i=0;i<tail_count;i++)" in rounder
   assert "int quantum_exp=exponent-53;" in rounder
   assert "result.mid=ldexp(step_hi,quantum_exp);" in rounder
   assert "result.low=ldexp(step_lo,quantum_exp);" in rounder
@@ -1655,10 +1664,7 @@ def test_native_rigid_flex_spatial_jacobian_matches_pinned_contact_rows():
     mujoco.mju_mat2Quat(
         geom_quat[geom], np.asarray(data.geom_xmat[geom], np.float64).reshape(9))
   program = FlexContactProgram(model, device="mps")
-  # Isolated kernel exercise only. The public production contact route remains
-  # guarded until the full candidate/solver pipeline passes admission.
-  assert not program._narrowphase_admitted
-  program._narrowphase_admitted = True
+  assert program._narrowphase_admitted
   result = program.run_device(
       flex.flexvert_xpos, mps(data.geom_xpos), mps(geom_quat))
   active = result["active"].cpu().numpy()[0]
@@ -1707,10 +1713,19 @@ def test_native_rigid_flex_spatial_jacobian_matches_pinned_contact_rows():
     ref_bary = np.asarray([1.0-uv.sum(), uv[0], uv[1]])
     np.testing.assert_allclose(bary, ref_bary, rtol=0, atol=3e-5)
 
+    # Pinned mj_elemBodyWeight uses inverse distance from contact.pos to the
+    # element vertices. Geometric barycentrics specify the witness, not the
+    # Jacobian interpolation. mj_jacSum evaluates every body at contact.pos.
+    jac_weights = 1.0 / np.maximum(
+        np.linalg.norm(tri - np.asarray(contact.pos), axis=1), 1e-15)
+    jac_weights /= jac_weights.sum()
+    np.testing.assert_allclose(
+        result["jacobian_weights1"].cpu().numpy()[0, slot, :3],
+        jac_weights, rtol=4e-5, atol=4e-6)
     ref_flex = np.zeros((6, int(model.nv)), np.float64)
-    for weight, vertex in zip(ref_bary, node_ids):
+    for weight, vertex in zip(jac_weights, node_ids):
       ref_flex += weight * _point_body_spatial_jacobian(
-          model, data, data.flexvert_xpos[int(vertex)],
+          model, data, contact.pos,
           model.flex_vertbodyid[int(vertex)])
     geom_body = int(model.geom_bodyid[int(contact.geom[0])])
     ref_geom = _point_body_spatial_jacobian(
@@ -1741,6 +1756,39 @@ def test_native_rigid_flex_spatial_jacobian_matches_pinned_contact_rows():
                              rtol=8e-5, atol=2e-6)
   np.testing.assert_allclose(rows["aref"].cpu().numpy()[0], expected_aref,
                              rtol=8e-5, atol=2e-5)
+
+
+def test_rigid_flex_contact_rows_use_source_weights_at_contact_point():
+  """Pinned assembled rows distinguish inverse-distance from witness weights."""
+  model, data, descriptor = _moving_geom_flex_fixture()
+  dense = _dense_efc_jacobian(model, data)
+  contacts = [c for c in data.contact[:data.ncon] if int(c.flex[1]) == 0]
+  assert contacts
+  for contact in contacts:
+    slots = np.flatnonzero(
+        (descriptor.geom == int(contact.geom[0]))
+        & (descriptor.elem1 == int(contact.elem[1])))
+    assert len(slots) == 1
+    nodes = np.asarray(descriptor.nodes1[int(slots[0]), :3], np.int32)
+    vertices = np.asarray(data.flexvert_xpos[nodes], np.float64)
+    point = np.asarray(contact.pos, np.float64)
+    weights = 1.0 / np.maximum(np.linalg.norm(vertices-point, axis=1), 1e-15)
+    weights /= weights.sum()
+    flexible = sum(weight * _point_body_spatial_jacobian(
+        model, data, point, model.flex_vertbodyid[int(vertex)])
+        for weight, vertex in zip(weights, nodes))
+    rigid = _point_body_spatial_jacobian(
+        model, data, point, model.geom_bodyid[int(contact.geom[0])])
+    np.testing.assert_allclose(
+        np.asarray(contact.frame[:3]) @ (flexible-rigid)[:3],
+        dense[int(contact.efc_address)], rtol=0, atol=1e-12)
+    surface = point + np.asarray(contact.frame[:3]) * (
+        float(model.flex_radius[0]) + 0.5*float(contact.dist))
+    uv = np.linalg.lstsq(np.column_stack((vertices[1]-vertices[0],
+                                         vertices[2]-vertices[0])),
+                        surface-vertices[0], rcond=None)[0]
+    barycentric = np.array([1.0-uv.sum(), uv[0], uv[1]])
+    assert np.max(np.abs(weights-barycentric)) > 0.15
 
 
 def test_gap_only_flex_candidates_keep_zero_includemargin_and_are_excluded():
@@ -3158,7 +3206,6 @@ def test_native_sphere_triangle_detector_matches_pinned_contacts_B2():
   row_R = result["R"].cpu().numpy()
   row_aref = result["aref"].cpu().numpy()
   row_active = result["row_active"].cpu().numpy()
-  ccd_trace = result["ccd_trace"].cpu().numpy()
   diagA = program._diag_approx.cpu().numpy()
   for env, data in enumerate(worlds):
     contacts = [c for c in data.contact[:data.ncon]
@@ -3202,9 +3249,9 @@ def test_native_sphere_triangle_detector_matches_pinned_contacts_B2():
       np.testing.assert_allclose(
           row_R[env, row], float(data.efc_R[int(contact.efc_address)]),
           rtol=8e-5, atol=2e-6)
-    np.testing.assert_allclose(
-        row_aref[env, row], float(data.efc_aref[int(contact.efc_address)]),
-        rtol=8e-5, atol=2e-5)
+      np.testing.assert_allclose(
+          row_aref[env, row], float(data.efc_aref[int(contact.efc_address)]),
+          rtol=8e-5, atol=2e-5)
     assert set(np.flatnonzero(active[env]).tolist()) == expected_slots
 
 
@@ -3293,10 +3340,7 @@ def test_native_capsule_triangle_manifold_matches_pinned_B2():
     pytest.skip("capsule/triangle detector requires MPS")
   model, descriptor, capsule, worlds = _capsule_triangle_fixture()
   program = FlexContactProgram(model, batch_size=len(worlds), device="mps")
-  assert not program._narrowphase_admitted
-  # Stage qualification keeps the constructor gate closed; only this test
-  # instance reaches the native source-composed detector and row builder.
-  program._narrowphase_admitted = True
+  assert program._narrowphase_admitted
   mps = lambda value: torch.as_tensor(
       np.asarray(value, np.float32).copy(), dtype=torch.float32,
       device="mps").contiguous()
@@ -4438,7 +4482,7 @@ def test_native_dynamic_element_geom_diag_matches_pinned_cpu(dof, shell):
     pytest.skip("dynamic flex diagApprox requires MPS")
   model, data, descriptor = _dynamic_diag_fixture(dof, shell, False)
   program = FlexContactProgram(model, device="mps")
-  assert not program._narrowphase_admitted
+  assert program._narrowphase_admitted == (dof is not None)
   mps = lambda value: torch.as_tensor(
       np.asarray(value, np.float32)[None].copy(), dtype=torch.float32,
       device="mps").contiguous()
@@ -4724,7 +4768,7 @@ def test_native_dynamic_cross_flex_diag_matches_pinned_cpu(dof, shell):
     pytest.skip("dynamic flex diagApprox requires MPS")
   model, data, descriptor = _dynamic_diag_fixture(dof, shell, True)
   program = FlexContactProgram(model, device="mps")
-  assert not program._narrowphase_admitted
+  assert program._narrowphase_admitted
   mps = lambda value: torch.as_tensor(
       np.asarray(value, np.float32)[None].copy(), dtype=torch.float32,
       device="mps").contiguous()
@@ -4810,7 +4854,7 @@ def test_cross_flex_capsule_fixture_has_exact_cpu_contact_and_slot_witness():
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="cross-flex capsule detector requires GPU opt-in")
 def test_native_cross_flex_capsule_manifold_matches_pinned_cpu():
-  """Compare the native kind-6 capsule path without opening public admission."""
+  """Compare the admitted native kind-6 capsule path against pinned CPU."""
   torch = pytest.importorskip("torch")
   if not torch.backends.mps.is_available():
     pytest.skip("cross-flex capsule detector requires MPS")
@@ -4823,10 +4867,7 @@ def test_native_cross_flex_capsule_manifold_matches_pinned_cpu():
   expected = _cross_flex_contact_slots(model, data, descriptor)
   assert len(expected) == 6
   program = FlexContactProgram(model, device="mps")
-  # The public route remains fail-closed. This stage gate only executes the
-  # already-implemented 1D/1D raw capsule pair branch for pinned comparison.
-  assert not program._narrowphase_admitted
-  program._narrowphase_admitted = True
+  assert program._narrowphase_admitted
 
   def mps(value):
     return torch.as_tensor(
