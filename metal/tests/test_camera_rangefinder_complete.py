@@ -195,6 +195,23 @@ def test_native_camera_rangefinder_all_modes_lenses_fields_and_masked_worlds(mod
 
 @gpu
 @pytest.mark.parametrize("lens",["perspective","orthographic"])
+def test_native_camera_and_site_fields_obey_pinned_compiled_cutoff(lens):
+  import torch
+  from mujoco_metal.sensors import SensorProgram
+  model=_model(lens=lens)
+  model.sensor_cutoff[:] = .2
+  refs,poses,expected=_feed(model,_states(model))
+  assert np.max(expected)<=.2+1e-7
+  assert np.min(expected)>=-.2-1e-7
+  program=SensorProgram(model,batch_size=2)
+  tensor=lambda a:torch.tensor(np.asarray(a).copy(),device="mps")
+  actual=program.run_rays_device({name:tensor(value) for name,value in poses.items()},
+      program._sp_hull,program._sp_hull_info)
+  np.testing.assert_allclose(actual.cpu(),expected,rtol=3e-5,atol=3e-5)
+
+
+@gpu
+@pytest.mark.parametrize("lens",["perspective","orthographic"])
 @pytest.mark.parametrize("history",["",'nsample="6" interval=".004"',
                                     'nsample="6" delay=".004" interval=".004" interp="linear"'])
 def test_public_camera_rangefinder_stored_step_restore_and_query_order(lens,history):

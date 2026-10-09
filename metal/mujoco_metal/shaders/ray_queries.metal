@@ -300,6 +300,7 @@ kernel void evaluate_site_rays(
   if (spec&16) for (int k=0;k<3;++k) output[base+offset++]=hit ? normal[k] : 0.0f;
   if (spec&32) output[base+offset++]=!hit ? -1.0f :
       camera ? -dot(point-cam_pos,cam_z) : distance;
+  sp_apply_cutoff(output,base,uint(offset),sensors[10*i+1],as_type<float>(sensors[10*i+7]));
 }
 
 kernel void query_analytic_rays(

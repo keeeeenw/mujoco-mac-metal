@@ -27,8 +27,10 @@ def _fixture(cone, condim, inactive):
     <default><geom condim="{condim}" friction=".7 .01 .001"/></default>
     <worldbody><geom name="floor" type="plane" size="2 2 .1"/>
       <site name="zone" type="box" pos="0 0 .01" size="2 2 .04"/>
-      <body name="many" pos="0 0 {'.08' if inactive else '.04'}"><freejoint/>{geoms}</body>
-    </worldbody>{pairs}<sensor>{queries}</sensor></mujoco>''')
+      <body name="many" pos="0 0 {'.08' if inactive else '.04'}"><freejoint/>{geoms}
+        <site name="touch_zone" type="box" size="2 2 .2"/>
+      </body>
+    </worldbody>{pairs}<sensor>{queries}<touch site="touch_zone"/></sensor></mujoco>''')
 
 
 def _states(model):
@@ -40,8 +42,10 @@ def _states(model):
 
 
 @pytest.mark.parametrize("inactive", [False, True])
-def test_contact_host_oracle_all_fields_slots_and_detected_inactive_contacts(inactive):
+@pytest.mark.parametrize("cutoff", [0., .2])
+def test_contact_host_oracle_all_fields_slots_and_detected_inactive_contacts(inactive, cutoff):
   model = _fixture("elliptic", 6, inactive)
+  model.sensor_cutoff[:] = cutoff
   qp, qv, times = _states(model)
   poses, extra, expected = _feed(model, qp, qv, times)
   assert np.all(extra["ncon"] == 30)
@@ -59,12 +63,14 @@ def test_contact_host_oracle_all_fields_slots_and_detected_inactive_contacts(ina
 @pytest.mark.parametrize("cone,condim", [("pyramidal", 1), ("pyramidal", 3),
                                        ("pyramidal", 6), ("elliptic", 6)])
 @pytest.mark.parametrize("inactive", [False, True])
-def test_actual_native_contact_query_all_matches_slots_fields_and_reductions(cone, condim, inactive):
+@pytest.mark.parametrize("cutoff",[0.,.2])
+def test_actual_native_contact_query_all_matches_slots_fields_and_reductions(cone, condim, inactive,cutoff):
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("explicit native qualification required")
   import torch
   from mujoco_metal.sensors import SensorProgram
   model = _fixture(cone, condim, inactive)
+  model.sensor_cutoff[:] = cutoff
   qp, qv, times = _states(model)
   poses, extra, expected = _feed(model, qp, qv, times)
   count = int(extra["ncon"][0])
@@ -110,4 +116,7 @@ def test_actual_native_contact_query_all_matches_slots_fields_and_reductions(con
   torch.testing.assert_close(selected, retained, rtol=0, atol=0)
   unmasked = program.run_contact_device(gpu_poses, contact)
   assert float(unmasked[0, 0]) == 0
+  # Pinned CONTACT is explicitly exempt from cutoff; TOUCH is positive data.
   assert float(retained[0, 0]) == 30
+  if cutoff and not inactive:
+    assert float(retained[0, -1]) == np.float32(cutoff)

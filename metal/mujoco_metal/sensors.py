@@ -1275,9 +1275,10 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
         else:
           axis = typ - int(mujoco.mjtSensor.mjSENS_FRAMEXAXIS)
           value = _quat_rot(np.array([rquat[0], *(-rquat[1:])]), _quat_rot(quat, np.eye(3)[axis]))
-      if desc.sensor_datatype[i] == int(mujoco.mjtDataType.mjDATATYPE_REAL) and desc.sensor_cutoff[i] > 0:
+      cutoff_exempt = typ in (int(S.mjSENS_CONTACT), int(S.mjSENS_GEOMFROMTO))
+      if not cutoff_exempt and desc.sensor_datatype[i] == int(mujoco.mjtDataType.mjDATATYPE_REAL) and desc.sensor_cutoff[i] > 0:
         value = np.clip(value, -desc.sensor_cutoff[i], desc.sensor_cutoff[i])
-      elif desc.sensor_datatype[i] == int(mujoco.mjtDataType.mjDATATYPE_POSITIVE) and desc.sensor_cutoff[i] > 0:
+      elif not cutoff_exempt and desc.sensor_datatype[i] == int(mujoco.mjtDataType.mjDATATYPE_POSITIVE) and desc.sensor_cutoff[i] > 0:
         value = np.minimum(value, desc.sensor_cutoff[i])
       adr, dim = int(desc.sensor_adr[i]), int(desc.sensor_dim[i])
       out[w, adr:adr+dim] = value

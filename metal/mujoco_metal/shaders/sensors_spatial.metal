@@ -18,6 +18,14 @@ inline float3 sp_qrot(float4 q, float3 v) {
   return v+2.0f*cross(q.yzw,cross(q.yzw,v)+q.x*v);
 }
 
+inline void sp_apply_cutoff(device float* output,uint base,uint count,int datatype,float cutoff) {
+  if (!(cutoff>0.0f)) return;
+  if (datatype==0) for (uint k=0;k<count;++k)
+    output[base+k]=clamp(output[base+k],-cutoff,cutoff);
+  else if (datatype==1) for (uint k=0;k<count;++k)
+    output[base+k]=min(output[base+k],cutoff);
+}
+
 // One thread owns one taxel. Opposing geom eligibility and SDF/velocity
 // reductions stay on device; each opposing geom contributes at most once.
 // Mirrors engine_sensor.c tactile_taxel_batch and geomDistance (3.10.0).
@@ -681,6 +689,7 @@ kernel void evaluate_contact_sensors(
       if (rg_analytic(stype,sp,sm,ssize,cp,ray,dn)>=0.0f) total+=fn;
     }
     output[base]=total;
+    sp_apply_cutoff(output,base,dim,meta[i*10+1],as_type<float>(meta[i*10+7]));
     return;
   }
   int t1=meta[i*10+3], id1=meta[i*10+4];
@@ -776,6 +785,7 @@ kernel void evaluate_contact_sensors(
         float(pick_flip)*sp_r3(contact_frame,(world*nc+slot)*12+3));
   }
   (void)pair_live;
+  // CONTACT values are exempt from output cutoff in engine_sensor.c.
 }
 
 #endif
@@ -884,5 +894,7 @@ kernel void evaluate_geomdist(
     output[base+3]=f1.x; output[base+4]=f1.y; output[base+5]=f1.z;
   }
   (void)dim;
+  // FROMTO uses cutoff as its search bound, never as a coordinate clamp.
+  if (typ!=41) sp_apply_cutoff(output,base,dim,meta[i*10+1],cutoff);
 }
 #endif

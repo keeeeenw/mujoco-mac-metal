@@ -61,3 +61,34 @@ def test_native_body_distance_uses_complete_ranges_in_both_orders():
   torch.testing.assert_close(actual, previous, rtol=0, atol=0)
   unmasked = program.run_geomdist_device(poses, program._sp_hull, program._sp_hull_info)
   assert abs(float(unmasked[0, 0]) - float(previous[0, 0])) > .2
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_fromto_search_cutoff_does_not_clip_world_coordinates(native):
+  if native and os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
+    pytest.skip("explicit native qualification required")
+  from mujoco_metal.sensors import SensorProgram, sensor_oracle
+  from test_sensor_spatial_016 import _feed
+  model = mujoco.MjModel.from_xml_string('''<mujoco>
+    <worldbody>
+      <geom name="a" type="sphere" pos="100 0 0" size=".1"/>
+      <geom name="b" type="sphere" pos="100.5 0 0" size=".1"/>
+    </worldbody>
+    <sensor><fromto geom1="a" geom2="b" cutoff="1"/>
+      <fromto geom1="b" geom2="a" cutoff="1"/></sensor>
+  </mujoco>''')
+  poses, extra, expected = _feed(model, np.empty((2, 0)),
+                                np.empty((2, 0)), np.zeros(2))
+  assert np.min(expected[:, [0, 3, 6, 9]]) > 100
+  if native:
+    import torch
+    program = SensorProgram(model, batch_size=2)
+    gpu_poses = {name: torch.tensor(np.asarray(value).copy(), dtype=torch.float32,
+                                   device="mps") for name, value in poses.items()}
+    actual = program.run_geomdist_device(gpu_poses, program._sp_hull,
+                                         program._sp_hull_info).cpu().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+  else:
+    actual = sensor_oracle(model, np.empty((2, 0)), np.empty((2, 0)),
+                           np.zeros(2), poses, extra=extra)
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
