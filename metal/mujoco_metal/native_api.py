@@ -1957,3 +1957,45 @@ def mjd_inverseFD(sim, eps=1e-6, flg_actuation=False):
   """
   from mujoco_metal.finite_difference import mjd_inverseFD as implementation
   return implementation(sim, eps, flg_actuation)
+
+
+
+def mj_readCtrl(sim, identifier, time, interp=-1):
+  """Return owned controls[B] from canonical history at arbitrary time.
+
+  -1 selects compiled interpolation; 0/1/2 select ZOH/linear/cubic.
+  No-history actuators return held controls. Reads never advance history.
+  """
+  from mujoco_metal.history_api import read_history
+  return read_history(sim, 0, identifier, time, interp)
+
+
+def mj_readSensor(sim, identifier, time, interp=-1):
+  """Return owned samples[B,dim]; no-history sensors read stored samples.
+
+  This does not run current-state forward sensors. Host timestamps or
+  contiguous float32 MPS timestamps may be scalar or [B].
+  """
+  from mujoco_metal.history_api import read_history
+  return read_history(sim, 1, identifier, time, interp)
+
+
+def mj_initCtrlHistory(sim, identifier, times=None, values=None, *, env_ids=None):
+  """Atomically initialize a compiled canonical control ring on selected worlds.
+
+  times[n]/[K,n], values[n,1]/[K,n,1] are copied at the explicit boundary.
+  None preserves physical timestamps/values, including source rejection of
+  unsorted physical timestamps after ring rotation. The user word is retained.
+  """
+  from mujoco_metal.history_api import init_history
+  return init_history(sim, 0, identifier, times, values, env_ids=env_ids)
+
+
+def mj_initSensorHistory(sim, identifier, times=None, values=None, phase=0.0, *, env_ids=None):
+  """Atomically initialize a compiled canonical sensor ring on selected worlds.
+
+  values[n,dim]/[K,n,dim], times[n]/[K,n], phase scalar/[K] follow the owned
+  float32 input contract. No-history entries reject initialization.
+  """
+  from mujoco_metal.history_api import init_history
+  return init_history(sim, 1, identifier, times, values, phase, env_ids)

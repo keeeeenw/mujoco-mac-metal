@@ -841,3 +841,35 @@ are counted before allocation; aggregate package-owned memory is checked at
 the public boundary. Query configuration changes replace a single cache at
 a host boundary; the replacement peak includes its existing backing.
 This is a batched backend counterpart, not the upstream pointer signature.
+
+
+### Public canonical history APIs in development source
+
+`mj_readCtrl(sim, actuator_id, time, interp=-1)` returns an owned MPS `[B]`
+control tensor; `mj_readSensor(sim, sensor_id, time, interp=-1)` returns owned
+`[B, sensor_dim]` samples. They read the compiled canonical ring at `time-delay`
+without recording samples or running physics. `-1` selects compiled
+interpolation; `0`, `1`, `2` select zero-order hold, linear or endpoint-clamped
+cubic interpolation. With no ring, they return held controls or stored sensor
+samples, respectively. A sensor read does not recompute current-state sensors.
+Host times are scalar or `[B]` finite float32-representable numbers with a
+retained low query word; device times are contiguous float32 MPS scalar or `[B]`.
+
+`mj_initCtrlHistory(sim, actuator_id, times=None, values=None, env_ids=None)`
+and `mj_initSensorHistory(sim, sensor_id, times=None, values=None, phase=0,
+env_ids=None)` atomically initialize existing compiled rings. For `K` selected
+worlds and `n` compiled samples, times are `[n]` or `[K,n]`, values are `[n,dim]`
+or `[K,n,dim]`, and phase is scalar or `[K]`. Host arrays and contiguous float32
+MPS tensors use owned canonical float32 storage. Inputs are copied, never
+modified; nonfinite values, invalid IDs/selections, wrong shapes and unsorted
+timestamps fail before changing state. `None` preserves **physical** timestamps
+or samples; it does not reorder a rotated ring. Pinned MuJoCo likewise rejects
+unsorted physical timestamps in this case. Control initialization retains the
+ring's user word; sensor initialization writes phase. No-history initialization
+is an error. A successful write invalidates prepared stages; reads do not.
+
+Explicit API validation can synchronize at its input boundary. Reads interpolate
+on Metal, and initialization copies device storage without invoking CPU physics.
+Temporary allocation admission includes current owned backings and a conservative
+named per-call workspace peak before device allocation. These backend signatures
+and owned outputs differ from upstream pointer-returning APIs.

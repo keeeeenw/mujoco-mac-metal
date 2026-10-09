@@ -158,3 +158,21 @@ kernel void history_sensor_compute_mask(
   bool compute=tick&&(enabled[0]||delay>0);
   for(int c=0;c<dim;c++)mask[w*dims[4]+out+c]=int(compute);
 }
+
+// Standalone source reads do not advance cursors or invoke forward sensors.
+// Every returned channel belongs to an output allocation owned by the caller.
+kernel void history_read_query(
+    device const float* history [[buffer(0)]],
+    device const float* raw [[buffer(1)]],
+    device const float* query [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device const int* metadata [[buffer(4)]],
+    device const float* delay [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]) {
+  int dim=metadata[5];
+  if(tid>=uint(metadata[0]*dim))return;
+  int w=int(tid)/dim,c=int(tid)%dim,n=metadata[4];
+  if(n==0) {output[tid]=raw[w*metadata[2]+metadata[7]+c];return;}
+  float2 time=clock_add(float2(query[2*w],query[2*w+1]),float2(-delay[0],-delay[1]));
+  output[tid]=history_read(history+w*metadata[1]+metadata[3],n,dim,c,time,metadata[6]);
+}

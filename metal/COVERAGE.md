@@ -40,7 +40,7 @@ table below remains the implementation and fixture-qualification contract.
 `pinned_binding_surface` additionally records 809 public fields across `MjModel`,
 `MjData`, `MjOption`, `MjContact` and `MjStatistic`; 69 exported non-enum Python
 classes and their public member sets; all 317 public free-function bindings;
-all 29 option fields; and an exact map of the 68 package `native_api`
+all 29 option fields; and an exact map of the 72 package `native_api`
 counterparts. Each remaining upstream function has its own host boundary or
 subsystem-owner row; internal/prepared counterparts are distinguished from
 same-named wrappers. It retains 812 field declarations and 527 function

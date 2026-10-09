@@ -11380,6 +11380,30 @@
       "requirement": "REQ-GEO-001",
       "execution": "native_gpu_query",
       "semantics": "owned batch distance/status/witnesses; explicit float32 bound; independent native FK/CCD"
+    },
+    "mj_readCtrl": {
+      "path": "mujoco_metal/native_api.py:mj_readCtrl",
+      "requirement": "REQ-STATE-006",
+      "execution": "device_or_host_validation",
+      "semantics": "owned_history_read_or_atomic_selected_initialization"
+    },
+    "mj_readSensor": {
+      "path": "mujoco_metal/native_api.py:mj_readSensor",
+      "requirement": "REQ-STATE-006",
+      "execution": "device_or_host_validation",
+      "semantics": "owned_history_read_or_atomic_selected_initialization"
+    },
+    "mj_initCtrlHistory": {
+      "path": "mujoco_metal/native_api.py:mj_initCtrlHistory",
+      "requirement": "REQ-STATE-006",
+      "execution": "device_or_host_validation",
+      "semantics": "owned_history_read_or_atomic_selected_initialization"
+    },
+    "mj_initSensorHistory": {
+      "path": "mujoco_metal/native_api.py:mj_initSensorHistory",
+      "requirement": "REQ-STATE-006",
+      "execution": "device_or_host_validation",
+      "semantics": "owned_history_read_or_atomic_selected_initialization"
     }
   },
   "python_function_map": {
@@ -11856,20 +11880,20 @@
       "counterpart_kind": null
     },
     "mj_initCtrlHistory": {
-      "classification": "control_history_stage",
+      "classification": "package_counterpart",
       "owner": "REQ-STATE-006",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_initCtrlHistory.",
-      "counterpart_kind": null
+      "execution": "native canonical history with explicit batched input validation",
+      "counterpart": "mujoco_metal/native_api.py:mj_initCtrlHistory",
+      "counterpart_kind": "public_wrapper",
+      "gap": "Float32 buffer contract and owned batched outputs differ from upstream pointers; full integrator/sleep/extension composition remains under qualification."
     },
     "mj_initSensorHistory": {
-      "classification": "sensor_or_energy_stage",
-      "owner": "REQ-SENS-002",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_initSensorHistory.",
-      "counterpart_kind": null
+      "classification": "package_counterpart",
+      "owner": "REQ-STATE-006",
+      "execution": "native canonical history with explicit batched input validation",
+      "counterpart": "mujoco_metal/native_api.py:mj_initSensorHistory",
+      "counterpart_kind": "public_wrapper",
+      "gap": "Float32 buffer contract and owned batched outputs differ from upstream pointers; full integrator/sleep/extension composition remains under qualification."
     },
     "mj_integratePos": {
       "classification": "package_counterpart",
@@ -12248,20 +12272,20 @@
       "gap": "Backend signature and owned outputs differ from upstream MjData mutation; qualification is recorded separately."
     },
     "mj_readCtrl": {
-      "classification": "control_history_stage",
+      "classification": "package_counterpart",
       "owner": "REQ-STATE-006",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_readCtrl.",
-      "counterpart_kind": null
+      "execution": "native canonical history with explicit batched input validation",
+      "counterpart": "mujoco_metal/native_api.py:mj_readCtrl",
+      "counterpart_kind": "public_wrapper",
+      "gap": "Float32 buffer contract and owned batched outputs differ from upstream pointers; full integrator/sleep/extension composition remains under qualification."
     },
     "mj_readSensor": {
-      "classification": "sensor_or_energy_stage",
-      "owner": "REQ-SENS-002",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_readSensor.",
-      "counterpart_kind": null
+      "classification": "package_counterpart",
+      "owner": "REQ-STATE-006",
+      "execution": "native canonical history with explicit batched input validation",
+      "counterpart": "mujoco_metal/native_api.py:mj_readSensor",
+      "counterpart_kind": "public_wrapper",
+      "gap": "Float32 buffer contract and owned batched outputs differ from upstream pointers; full integrator/sleep/extension composition remains under qualification."
     },
     "mj_referenceConstraint": {
       "classification": "constraint_or_island_stage",
