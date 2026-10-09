@@ -135,10 +135,13 @@ def test_native_sleep_cutoff_and_pose_freeze_match_damped_pinned_worlds():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_failed_native_world_preserves_sleep_counters_and_lists():
+@pytest.mark.parametrize("autoreset", [False, True])
+def test_failed_native_world_preserves_sleep_counters_and_lists(autoreset):
   import torch
   from mujoco_metal import MetalSimulation
   model = mujoco.MjModel.from_xml_string(DAMPED_XML)
+  if not autoreset:
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_AUTORESET)
   sim = MetalSimulation(model, 2, qvel=np.asarray([[.06], [.04]], np.float32),
                         profile="integrated_scalable_v1")
   saved = sim._snapshot_sleep_device()
@@ -151,9 +154,25 @@ def test_failed_native_world_preserves_sleep_counters_and_lists():
   for name, before in saved.items():
     np.testing.assert_array_equal(getattr(sim._sleep_schedule, name)[1].cpu().numpy(),
                                   before[1].cpu().numpy(), err_msg=name)
+  # Sticky failure and source automatic recovery are distinct policies.
+  # BADQACC resets the physical row when AUTORESET is enabled; test its real
+  # pinned reset/forward semantics rather than assuming default rows freeze.
+  cpu = mujoco.MjData(model)
   for name, before in physical.items():
+    if name == "time":
+      cpu.time = float(before[1].cpu())
+    else:
+      getattr(cpu, name)[:] = before[1].cpu().numpy()
+  cpu.qacc[:] = np.nan
+  mujoco.mj_checkAcc(model, cpu)
+  warning = int(mujoco.mjtWarning.mjWARN_BADQACC)
+  assert int(sim.state._warning_number[1, warning].cpu()) == \
+      int(cpu.warning[warning].number)
+  for name, before in physical.items():
+    expected = (np.asarray(getattr(cpu, name), dtype=np.float32)
+                if autoreset else before[1].cpu().numpy())
     np.testing.assert_array_equal(getattr(sim.state, "_" + name)[1].cpu().numpy(),
-                                  before[1].cpu().numpy(), err_msg=name)
+                                  expected, err_msg=name)
   # A sticky failed world stays frozen even after its held force is cleared.
   sim.step(qfrc_applied=torch.zeros_like(force))
   for name, before in saved.items():

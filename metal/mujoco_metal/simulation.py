@@ -6614,9 +6614,11 @@ class MetalSimulation:
     MPS tensors stay on device and nonfinite rows fail independently.
 
     The fixed workspace is reused. Failed worlds retain their previous state
-    and acceleration while status records the failure. Failure remains sticky
-    until reset or restore. Device stepping performs no CPU physics, solve,
-    integration or readback.
+    and acceleration except for the pinned automatic BADQPOS/BADQVEL/BADQACC
+    recovery when AUTORESET is enabled. Disable AUTORESET to preserve physical
+    rows on those failures. Failure status remains sticky until reset or
+    restore. Device stepping performs no CPU physics, solve, integration or
+    readback.
     """
     self._assert_contact_override_binding()
     if isinstance(steps, bool) or not isinstance(steps, numbers.Integral):
