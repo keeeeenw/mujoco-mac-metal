@@ -314,11 +314,19 @@ def build_common_ccd_model_upload(model, legacy_vertices, legacy_info):
       voff = vertex_base_float // 3 + int(model.mesh_vertadr[mesh_id])
       vcount = int(model.mesh_vertnum[mesh_id])
       goff = int(model.mesh_graphadr[mesh_id])
-      fcount = int(model.mesh_facenum[mesh_id])
       if _source_uses_mesh_graph(vcount, goff):
-        graph_words = 2 + 3 * int(source_graph[goff]) + 6 * fcount
+        if goff + 2 > source_graph.size:
+          raise ValueError("compiled mesh graph header exceeds its source storage")
+        graph_vertices = int(source_graph[goff])
+        graph_faces = int(source_graph[goff + 1])
+        # mesh_facenum describes the original surface, not the compiled hull.
+        # Concave and maxhullvert meshes can have different graph face counts.
+        graph_words = 2 + 3 * graph_vertices + 6 * graph_faces
+        if (not 0 < graph_vertices <= vcount or graph_faces <= 0
+            or goff + graph_words > source_graph.size):
+          raise ValueError("compiled mesh graph exceeds its source storage")
         info[rec:rec + 5] = [voff, vcount, graph_base + goff,
-                             int(source_graph[goff]), graph_words]
+                             graph_vertices, graph_words]
       else:
         info[rec:rec + 5] = [voff, vcount, -1, 0, 0]
       polyadr = int(model.mesh_polyadr[mesh_id])

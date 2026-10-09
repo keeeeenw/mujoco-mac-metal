@@ -142,6 +142,26 @@ def test_compiled_simplification_controls_support_and_actual_capacity():
     lower_coupled_constraints(full)
 
 
+@pytest.mark.parametrize("fixture", ["concave", "simplified16", "simplified32"])
+def test_common_source_descriptor_uses_compiled_graph_faces_not_surface_faces(fixture):
+  from mujoco_metal.common_ccd_bridge import build_common_ccd_model_upload
+  model = _model() if fixture == "concave" else _simplified_model(int(fixture[10:]))
+  descriptor = lower_coupled_constraints(model)
+  vertices, info, layout = build_common_ccd_model_upload(
+      model, descriptor.mesh_hull, descriptor.mesh_hull_info)
+  goff = int(model.mesh_graphadr[0])
+  graph = np.asarray(model.mesh_graph)
+  if fixture == "concave":
+    assert int(graph[goff+1]) != int(model.mesh_facenum[0])
+  else:
+    assert int(graph[goff]) < int(model.mesh_vertnum[0])
+  record = info[layout["geom_base"]:layout["geom_base"]+9]
+  expected_words = 2+3*int(graph[goff])+6*int(graph[goff+1])
+  assert int(record[4]) == expected_words
+  np.testing.assert_array_equal(info[int(record[2]):int(record[2])+expected_words],
+                                graph[goff:goff+expected_words])
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="native simplified-hull trajectory requires GPU opt-in")
