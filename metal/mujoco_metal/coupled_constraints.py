@@ -4355,9 +4355,6 @@ class MetalCoupledConstraints:
       _validate_cached_tensor(torch, self._device, "qacc_smooth_low",
                               qacc_smooth_low, expected_q, torch.float32)
     if qfrc_smooth_low is not None:
-      if (not d.dense_path
-          and d.solver_type != int(mujoco.mjtSolver.mjSOL_PGS)):
-        raise ValueError("qfrc_smooth_low requires a dense or PGS paired route")
       _validate_cached_tensor(torch, self._device, "qfrc_smooth_low",
                               qfrc_smooth_low, expected_q, torch.float32)
     _validate_cached_tensor(torch, self._device, "qpos", qpos, (b, int(d.nq)),
@@ -4612,10 +4609,9 @@ class MetalCoupledConstraints:
 
     solver_acceleration_input = (qfrc_smooth if qacc_smooth is None
                                  else qacc_smooth)
-    paired_dense_input = (d.dense_path
-        and (qacc_smooth is not None or qfrc_smooth_low is not None))
+    paired_smooth_input = (qacc_smooth is not None or qfrc_smooth_low is not None)
     if (d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS)
-        or paired_dense_input):
+        or paired_smooth_input):
       pair = w.get("component_smooth_acceleration_pair")
       if pair is None:
         raise RuntimeError("paired smooth-acceleration workspace was not prepared")
@@ -4632,7 +4628,7 @@ class MetalCoupledConstraints:
               pair[b * nv:2 * b * nv], qacc_smooth_low, world_mask,
               width=nv, source_stride=nv, destination_stride=nv)
       else:
-        if paired_dense_input:
+        if paired_smooth_input:
           self._copy_world_masked(
               pair[:b * nv], qfrc_smooth, world_mask, width=nv,
               source_stride=nv, destination_stride=nv)
@@ -4644,10 +4640,15 @@ class MetalCoupledConstraints:
           self._copy_world_masked(
               pair[b * nv:2 * b * nv], qfrc_smooth_low, world_mask,
               width=nv, source_stride=nv, destination_stride=nv)
-      if qacc_smooth is not None or paired_dense_input:
+      if qacc_smooth is not None or paired_smooth_input:
         solver_acceleration_input = pair
 
     def dispatch_solver(mass_input, smooth_input=None):
+      with (_paired_smooth_input_stage(self._constants["solver_dims"])
+            if paired_smooth_input and smooth_input is None else nullcontext()):
+        dispatch_solver_bound(mass_input, smooth_input)
+
+    def dispatch_solver_bound(mass_input, smooth_input=None):
       solve_fn(
           mass_input.reshape(-1),
           (solver_acceleration_input if smooth_input is None
@@ -4682,7 +4683,7 @@ class MetalCoupledConstraints:
           _provided_smooth_acceleration_stage(solver_dims)
           if qacc_smooth is not None else nullcontext()), (
               _paired_smooth_input_stage(solver_dims)
-              if paired_dense_input else nullcontext()), (
+              if paired_smooth_input else nullcontext()), (
               _preassembled_rows_stage(solver_dims)
               if exact_data is not None else nullcontext()):
         dispatch_solver(mass)
@@ -4921,9 +4922,6 @@ class MetalCoupledConstraints:
     # debug staging, or any output workspace writes below.
     _validate_geom_pose_residuals(torch, self._device, poses, b, int(d.ngeom))
     if qfrc_smooth_low is not None:
-      if (not d.dense_path
-          and d.solver_type != int(mujoco.mjtSolver.mjSOL_PGS)):
-        raise ValueError("qfrc_smooth_low requires a dense or PGS paired route")
       _validate_cached_tensor(torch, self._device, "qfrc_smooth_low",
                               qfrc_smooth_low, (b, nv), torch.float32)
     if candidate_token is not None:
@@ -5442,17 +5440,22 @@ class MetalCoupledConstraints:
       packed_slots = self._empty_compaction_map
     else:
       packed_slots = slot_maps.packed_to_logical.reshape(-1)
-    paired_dense_input = d.dense_path and qfrc_smooth_low is not None
+    paired_smooth_input = qfrc_smooth_low is not None
     smooth_solver_input = qfrc_smooth
-    if paired_dense_input:
+    if paired_smooth_input:
       pair = w.get("component_smooth_acceleration_pair")
       if pair is None:
-        raise RuntimeError("dense paired smooth-force workspace was not prepared")
+        raise RuntimeError("paired smooth-force workspace was not prepared")
       pair[:b * nv].copy_(qfrc_smooth.reshape(-1))
       pair[b * nv:2 * b * nv].copy_(qfrc_smooth_low.reshape(-1))
       smooth_solver_input = pair
 
     def dispatch_solver(mass_input, smooth_input=None):
+      with (_paired_smooth_input_stage(self._constants["solver_dims"])
+            if paired_smooth_input and smooth_input is None else nullcontext()):
+        dispatch_solver_bound(mass_input, smooth_input)
+
+    def dispatch_solver_bound(mass_input, smooth_input=None):
       solve_fn(
           mass_input.reshape(-1),
           (smooth_solver_input if smooth_input is None
@@ -5575,12 +5578,12 @@ class MetalCoupledConstraints:
       exact_data = recompute_exact_impedance()
       with (_preassembled_rows_stage(solver_dims),
             _paired_smooth_input_stage(solver_dims)
-            if paired_dense_input else nullcontext()):
+            if paired_smooth_input else nullcontext()):
         dispatch_solver(mass)
       exact_world_status = exact_data["status"]
     else:
       with (_paired_smooth_input_stage(solver_dims)
-            if paired_dense_input else nullcontext()):
+            if paired_smooth_input else nullcontext()):
         dispatch_solver(mass)
       exact_world_status = None
 

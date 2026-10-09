@@ -110,11 +110,11 @@ def test_component_pgs_reconstruction_multiplies_both_words_of_lambda():
 def test_dense_pgs_pairs_smooth_force_or_cached_acceleration_inputs():
   module = Path(__file__).parents[1] / "mujoco_metal" / "coupled_constraints.py"
   host = module.read_text()
-  assert "paired_dense_input = (d.dense_path" in host
+  assert "paired_smooth_input = (qacc_smooth is not None" in host
   assert "pair[:b * nv].copy_(qfrc_smooth.reshape(-1))" in host
   assert "pair[b * nv:2 * b * nv].copy_(qfrc_smooth_low.reshape(-1))" in host
   assert "_paired_smooth_input_stage(solver_dims)" in host
-  assert "self._coupled_constraints.descriptor.solver_type" in (
+  assert "qfrc_smooth_low=self._rhs_low" in (
       (Path(__file__).parents[1] / "mujoco_metal" / "simulation.py").read_text())
 
   shader = Path(__file__).parents[1] / "mujoco_metal" / "shaders" / "coupled_constraints.metal"

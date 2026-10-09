@@ -361,6 +361,11 @@ inline bool solver_component_mass_solve(device const float* debug,
   return true;
 }
 
+inline bool solver_component_force_pair(device const float* debug,
+    constant int* dims, device const int* awake, device const float* rhs_hi,
+    device const float* rhs_low, device float* result, device float* result_low,
+    device float* scratch);
+
 // Restore the smooth acceleration after a primal solve when the pinned
 // no-slip post-pass changes the final multipliers.  The primal iterate is no
 // longer consistent with those multipliers, so dual-finish must start from
@@ -392,6 +397,14 @@ inline bool solver_restore_smooth_acceleration(device float* out_acc,
     return true;
   }
   if (dims[20] == -3) {
+    if (paired_qfrc_input) {
+      int header=dims[24]+nr*10;
+      device float* pair_work=const_cast<device float*>(debug)+nr*nr+7*nr
+          +dims[header+15];
+      return solver_component_force_pair(debug,dims,awake_tree,
+          qfrc+qb,qfrc+batch*nv+qb,out_acc+qb,
+          out_acc+batch*nv+qb,pair_work);
+    }
     if (!solver_component_mass_solve(debug, dims, awake_tree, nv,
         qfrc + qb, work_a, work_b)) return false;
     for (int i = 0; i < nv; ++i) {
@@ -7600,6 +7613,26 @@ inline int solve_pgs_device(device const float* W, device const float* R, device
   return used;
 }
 
+// Source force residuals belong to every mass route. Use the original
+// component operator for refinement, with disjoint retained pair scratch.
+inline bool solver_component_force_pair(device const float* debug,
+    constant int* dims, device const int* awake, device const float* rhs_hi,
+    device const float* rhs_low, device float* result, device float* result_low,
+    device float* scratch) {
+  int nv=dims[1];
+  bool has_low=false;
+  for(int dof=0;dof<nv;dof++) {
+    result_low[dof]=0;
+    has_low=has_low || rhs_low[dof]!=0;
+  }
+  if(!has_low) return solver_component_mass_solve(debug,dims,awake,nv,
+      rhs_hi,result,scratch);
+  return primal_hessian_mass_precondition_pair_elliptic(nullptr,nullptr,true,
+      debug,dims,awake,rhs_hi,rhs_low,result,result_low,
+      scratch,scratch+nv,scratch+2*nv,scratch+3*nv,scratch+4*nv,
+      nullptr,0,false,nv);
+}
+
 inline bool solver_component_row_pair(device const float* mass,
     device const float* debug, constant int* dims, device const int* awake,
     device const float* J, int row, int nv, device float* result,
@@ -8245,7 +8278,14 @@ kernel void solve_coupled_constraints(
     device float* component_solution = solver_scratch;
     device float* component_work = solver_scratch + nv;
     if (provided_qacc_smooth) {
-      for (int i = 0; i < nv; ++i) component_solution[i] = qfrc[qb + i];
+      for (int i = 0; i < nv; ++i) {
+        component_solution[i] = qfrc[qb + i];
+        out_acc[batch*nv+qb+i] = paired_qfrc_input ? qfrc[batch*nv+qb+i] : 0;
+      }
+    } else if (paired_qfrc_input) {
+      if (!solver_component_force_pair(dbg_pre,dims,solver_awake_tree,
+          qfrc+qb,qfrc+batch*nv+qb,component_solution,
+          out_acc+batch*nv+qb,pgs_pair_tail)) { out_status[world]=2; return; }
     } else if (!solver_component_mass_solve(dbg_pre, dims, solver_awake_tree, nv,
         qfrc + qb, component_solution, component_work)) {
         out_status[world] = 2;
@@ -10514,7 +10554,14 @@ kernel void solve_coupled_constraints_block(
     device float* component_solution = solver_scratch;
     device float* component_work = solver_scratch + nv;
     if (provided_qacc_smooth) {
-      for (int i = 0; i < nv; ++i) component_solution[i] = qfrc[qb + i];
+      for (int i = 0; i < nv; ++i) {
+        component_solution[i] = qfrc[qb + i];
+        out_acc[batch*nv+qb+i] = paired_qfrc_input ? qfrc[batch*nv+qb+i] : 0;
+      }
+    } else if (paired_qfrc_input) {
+      if (!solver_component_force_pair(dbg,dims,solver_awake_tree,
+          qfrc+qb,qfrc+batch*nv+qb,component_solution,
+          out_acc+batch*nv+qb,pgs_pair_tail)) { out_status[world]=2; return; }
     } else if (!solver_component_mass_solve(dbg, dims, solver_awake_tree, nv,
         qfrc + qb, component_solution, component_work)) {
         out_status[world] = 2;

@@ -3081,6 +3081,7 @@ class MetalSimulation:
         awake_lists=awake_lists, tendon_J=sparse_tendon_J)
     torch = state._torch
     rhs = torch.neg(dynamics["qfrc_bias"])
+    rhs_low = torch.neg(dynamics["qfrc_bias_low"])
     if self._applied_force is not None:
       rhs.add_(self._applied_force)
     if self._passive is not None:
@@ -3137,6 +3138,7 @@ class MetalSimulation:
         cdof=dynamics.get("cdof", None), cdof_dot=dynamics.get("cdof_dot", None),
         tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
         flex=self._flex, qacc_warmstart=state._qacc_warmstart,
+        qfrc_smooth_low=rhs_low,
         awake_tree=getattr(getattr(self, "_sleep_schedule", None), "tree_awake", None),
         component_solver=(self._component_solver
                           if self._component_mass_enabled else None),
@@ -6159,10 +6161,7 @@ class MetalSimulation:
                         else None),
           exact_impedance=self._constraint_impedance,
           exact_dense_solver=self._exact_impedance_dense_solver,
-          qfrc_smooth_low=(self._rhs_low
-              if (self._coupled_constraints.descriptor.dense_path
-                  or self._coupled_constraints.descriptor.solver_type
-                     == int(mujoco.mjtSolver.mjSOL_PGS)) else None),
+          qfrc_smooth_low=self._rhs_low,
           world_mask=world_mask_i32,
       )
       coupled["mass_matrix"] = dynamics.get("mass_matrix")
