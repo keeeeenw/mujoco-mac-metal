@@ -2280,7 +2280,9 @@ class MetalSimulation:
     # Do not reset it a second time here: that would clear the just-established
     # reset/cache epoch independently of the state transaction.
     if getattr(self, "_flex", None) is not None:
-      dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
+      dyn = self._smooth.run_device(
+          self._state._qpos, self._state._qvel,
+          self._state._mpos, self._state._mquat)
       self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
     self._assembled_system_valid = False
     self._accepted_step = None
@@ -2536,7 +2538,9 @@ class MetalSimulation:
       self._sleep_schedule.reset(
           env_ids=(None if env_ids is None else self._state._env_ids(env_ids)))
     if getattr(self, "_flex", None) is not None:
-      dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
+      dyn = self._smooth.run_device(
+          self._state._qpos, self._state._qvel,
+          self._state._mpos, self._state._mquat)
       self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
     self._assembled_system_valid = False
     self._accepted_step = None
