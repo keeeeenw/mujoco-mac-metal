@@ -586,11 +586,23 @@ static inline FlexDD flex_dd_source_sqrt(FlexDD value) {
   // refinement, which otherwise creates NaNs in degenerate capsule witnesses.
   if (value.hi == 0.0f && value.lo == 0.0f && value.tail == 0.0f)
     return flex_dd(0.0f);
+  // Scale by an exact even power of two before refinement. Otherwise the
+  // squared low correction can underflow in Metal float arithmetic, removing
+  // the sign that decides a binary64 midpoint at small geometric scales.
+  int exponent=0;
+  frexp(value.hi,exponent);
+  int root_exponent=exponent/2;
+  int scale=-2*root_exponent;
+  value=FlexDD{ldexp(value.hi,scale),ldexp(value.lo,scale),
+               ldexp(value.tail,scale)};
   float q0=sqrt(value.hi);
   FlexDD q0_value=flex_dd(q0);
   FlexDD remainder=flex_dd_product_residual(value,q0_value,q0_value);
   float q1=((remainder.hi+remainder.lo)+remainder.tail)/(2.0f*q0);
-  FlexDD approximation=flex_dd_add(q0_value,flex_dd(q1));
+  // Keep q0+q1 unrounded while computing q2. Rounding this temporary to
+  // binary64 and then adding q2 to the original digits counts that rounding
+  // error twice (e.g. sqrt(nextafter(1,+inf)) incorrectly rounds above 1).
+  FlexDD approximation=FlexDD{q0,q1,0.0f};
   remainder=flex_dd_product_residual(value,approximation,approximation);
   float q2=((remainder.hi+remainder.lo)+remainder.tail)/(2.0f*q0);
   thread float expansion[32];
@@ -599,7 +611,9 @@ static inline FlexDD flex_dd_source_sqrt(FlexDD value) {
   count=flex_expansion_add(expansion,count,q0,scratch);
   count=flex_expansion_add(expansion,count,q1,scratch);
   count=flex_expansion_add(expansion,count,q2,scratch);
-  return flex_dd_from_projection53(flex_expansion_round53(expansion,count));
+  FlexDD root=flex_dd_from_projection53(flex_expansion_round53(expansion,count));
+  return FlexDD{ldexp(root.hi,root_exponent),ldexp(root.lo,root_exponent),
+               ldexp(root.tail,root_exponent)};
 }
 
 static inline FlexDD3 flex_dd3_cross(FlexDD3 a, FlexDD3 b) {
