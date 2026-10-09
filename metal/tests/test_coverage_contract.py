@@ -168,3 +168,24 @@ def test_supported_builtin_admitted_with_evidence():
   assert user.milestone == "019"
   assert user.implementation == Implementation.NATIVE_GPU
   assert "mjtDyn.mjDYN_USER" in user.enums
+
+
+def test_feature_summary_projects_selectable_enums_from_requirement_owners():
+  from mujoco_metal.registry import FEATURES
+  features = {row.name: row for row in FEATURES}
+  for req in REQUIREMENTS:
+    for member in req.enums:
+      row = features[member]
+      assert req.id in row.limitation
+      assert row.execution == req.execution
+      assert row.implementation == req.implementation
+  for name in ('collision pipeline', 'constraint assembly and solvers',
+               'actuator evaluation', 'forward/inverse dynamics',
+               'integrators/stepping'):
+    assert features[name].implementation == Implementation.NATIVE_GPU
+    assert features[name].qualification == Qualification.UNQUALIFIED
+  assert features['mjtGeom.mjGEOM_HFIELD'].qualification == Qualification.UNQUALIFIED
+  assert 'exact compiled grid' in next(
+      req.admission for req in REQUIREMENTS if req.id == 'REQ-GEO-004')
+  assert 'fifty' in next(
+      req.admission for req in REQUIREMENTS if req.id == 'REQ-GEO-004')

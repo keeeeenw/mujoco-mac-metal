@@ -67,8 +67,8 @@ class Feature:
   limitation: str
 
 
-# Every member is an explicit inventory row, but remains unsupported until the
-# corresponding stage gains an implementation and qualification record.
+# Selectable members are projected from the canonical requirements below.
+# Enumeration and native implementation remain separate from qualification.
 _ENUMS = (
     "mjtJoint",
     "mjtGeom",
@@ -89,32 +89,39 @@ _ENUMS = (
 
 
 def _enum_inventory():
+  """Project selectable enum rows from the canonical requirement contract.
+
+  Enumerating a member is not a support claim. Its actual owner, execution
+  and restriction come from REQUIREMENTS, including count sentinels and
+  renderer-only members. The full pinned header catalogue remains separate.
+  """
+  covered = {}
+  for requirement in REQUIREMENTS:
+    for member in requirement.enums:
+      covered.setdefault(member, []).append(requirement)
   rows = []
   for enum_name in _ENUMS:
     enum_type = getattr(mujoco, enum_name, None)
     if enum_type is None:
-      rows.append(
-          Feature(
-              f"enum:{enum_name}",
-              Stage.MODEL,
-              Implementation.NOT_IMPLEMENTED,
-              Qualification.UNQUALIFIED,
-              Execution.NONE,
-              "not exposed by pinned Python bindings",
-          )
-      )
+      rows.append(Feature(f"enum:{enum_name}", Stage.MODEL,
+                          Implementation.NOT_IMPLEMENTED,
+                          Qualification.UNQUALIFIED, Execution.NONE,
+                          "not exposed by pinned Python bindings"))
       continue
     for member_name in enum_type.__members__:
-      rows.append(
-          Feature(
-              f"{enum_name}.{member_name}",
-              Stage.MODEL,
-              Implementation.NOT_IMPLEMENTED,
-              Qualification.UNQUALIFIED,
-              Execution.NONE,
-              "inventory only; not implemented by this package",
-          )
-      )
+      name = f"{enum_name}.{member_name}"
+      requirements = covered.get(name, [])
+      if not requirements:
+        raise ValueError(f"unclassified selectable enum member: {name}")
+      primary = requirements[0]
+      # A selectable member with multiple contracts is only as qualified as
+      # their common scope. Never promote an unqualified combination.
+      qualification = (Qualification.GPU_QUALIFIED
+          if all(r.qualification == Qualification.GPU_QUALIFIED
+                 for r in requirements) else Qualification.UNQUALIFIED)
+      rows.append(Feature(name, primary.stage, primary.implementation,
+                          qualification, primary.execution,
+                          "; ".join(f"{r.id}: {r.limitation}" for r in requirements)))
   return rows
 
 
@@ -401,7 +408,6 @@ def _inventory():
   return tuple(result)
 
 
-FEATURES = _inventory()
 INVENTORY_COMPLETE = False
 
 
@@ -489,9 +495,9 @@ REQUIREMENTS = (
     Requirement(
         "REQ-JNT-002", "scalar hinge/slide joint limits",
         Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "ball/tendon limits rejected",
+        Execution.DEVICE, "scalar hinge/slide limit rows; ball and tendon rows are separately implemented by the integrated constraint stage",
         "mujoco_metal/coupled_constraints.py:lower_coupled_constraints",
-        "accept limited hinge/slide, reject limited ball",
+        "accept scalar limits; legacy scalar-only profiles still reject ball limits",
         "MetalSimulation(profile='integrated_euler_v1')", "baseline",
         ("test_coupled_constraints.py",),
     ),
@@ -525,23 +531,23 @@ REQUIREMENTS = (
     Requirement(
         "REQ-GEO-003", "convex mesh collision",
         Stage.COLLISION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
-        Execution.DEVICE, "011 implements convex-hull vertex-support GJK/MPR singles + face-snap",
-        "mujoco_metal/shaders/convex_narrowphase.metal", "admit convex mesh pairs (<=64 verts) with singles slot counts",
+        Execution.DEVICE, "compiled convex graphs with source GJK/EPA and alternate libccd MPR; full degenerate/manifold/trajectory composition remains under qualification",
+        "mujoco_metal/shaders/common_ccd_production.metal", "admit compiled hull graphs with complete source manifold and explicit memory/count budgets",
         "MetalSimulation(profile='integrated_euler_v1')", "011", ("test_mesh_contact_011.py",),
         enums=("mjtGeom.mjGEOM_MESH",),
     ),
     Requirement(
         "REQ-GEO-004", "heightfield collision",
         Stage.COLLISION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
-        Execution.DEVICE, "012 implements per-prism terrain collision vs sphere/capsule/box/cylinder/ellipsoid; mesh-hfield and hfield-hfield rejected, plane-hfield yields nothing",
-        "mujoco_metal/shaders/convex_narrowphase.metal", "admit heightfield pairs within dim/data caps with per-prism slot counts",
+        Execution.DEVICE, "source per-prism terrain collision against five convex primitive families and compiled mesh hulls, both CCD routes; hfield-hfield absent from the pinned dispatcher, plane-hfield yields no contacts; complete force/trajectory/integrator qualification remains open",
+        "mujoco_metal/shaders/common_ccd_production.metal", "reserve fifty source witnesses per terrain pair and exact compiled grid storage subject to explicit capacity/memory budgets",
         "MetalSimulation(profile='integrated_euler_v1')", "012", ("test_hfield_contact_012.py",),
         enums=("mjtGeom.mjGEOM_HFIELD",),
     ),
     Requirement(
         "REQ-GEO-005", "SDF collision",
         Stage.COLLISION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
-        Execution.DEVICE, "013 implements plugin-free mesh-octree SDF vs analytic/SDF-SDF via Halton/descent; mesh-SDF gap, plugin SDFs per 019 contract",
+        Execution.DEVICE, "mesh-octree and bundled plugin SDF contacts against analytic, mesh and SDF partners; complete source witness/force/trajectory and extension compositions remain under qualification",
         "mujoco_metal/shaders/sdf_narrowphase.metal", "admit SDF pairs within oct/node/initpoint caps with per-seed slot counts",
         "MetalSimulation(profile='integrated_euler_v1')", "013", ("test_sdf_contact_013.py",),
         enums=("mjtGeom.mjGEOM_SDF",),
@@ -990,9 +996,9 @@ REQUIREMENTS = (
     ),
     Requirement(
         "REQ-DSBL-002", "island/ccd disable flags",
-        Stage.INTEGRATION, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
-        Execution.DEVICE, "island disable flag supported; ccd flags rejected",
-        "mujoco_metal/islands.py", "native island disable",
+        Stage.INTEGRATION, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+        Execution.DEVICE, "island disable, native CCD selection and multicontact disable paths implemented; broad geometry/deformable composition remains under qualification",
+        "mujoco_metal/islands.py; mujoco_metal/shaders/common_ccd_production.metal", "validate compiled island/CCD flags and profile composition",
         "MetalSimulation(profile='integrated_scalable_v1')", "017",
         ("test_scalable_017.py",),
         enums=("mjtDisableBit.mjDSBL_NATIVECCD", "mjtDisableBit.mjDSBL_ISLAND",
@@ -1428,3 +1434,52 @@ def _jsonable_requirement(req):
 def feature_status():
   """Return the immutable pinned-version inventory without loading Torch."""
   return FEATURES
+
+
+_FEATURE_REQUIREMENTS = {
+    "collision pipeline": ("REQ-GEO-001", "REQ-GEO-002", "REQ-GEO-003", "REQ-GEO-004", "REQ-GEO-005"),
+    "constraint assembly and solvers": ("REQ-CON-001",),
+    "forward/inverse dynamics": ("REQ-API-003",),
+    "integrators/stepping": ("REQ-PROF-005", "REQ-PROF-006", "REQ-PROF-007"),
+}
+
+
+def _coherent_feature_inventory():
+  requirements = {row.id: row for row in REQUIREMENTS}
+  rows = []
+  for feature in _inventory():
+    ids = _FEATURE_REQUIREMENTS.get(feature.name)
+    if ids is not None:
+      owners = [requirements[ident] for ident in ids]
+      rows.append(Feature(feature.name, feature.stage,
+                          Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+                          Execution.DEVICE,
+                          "; ".join(f"{r.id}: {r.limitation}" for r in owners)))
+    elif feature.name == "actuator evaluation":
+      rows.append(Feature(feature.name, feature.stage,
+                          Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
+                          Execution.DEVICE,
+                          "built-in actuator families and native adapters are implemented; "
+                          "complete transmission/dynamics/force/integrator combinations remain under qualification"))
+    elif feature.name.startswith("api:"):
+      rows.append(Feature(feature.name, feature.stage,
+                          Implementation.UPSTREAM_CPU_ONLY, Qualification.UNQUALIFIED,
+                          Execution.UPSTREAM_HOST,
+                          "upstream bindings retain their host execution; explicit package counterparts "
+                          "and missing functions are classified individually in pinned_surface.json"))
+    elif feature.name == "bounded implicitfast":
+      rows.append(Feature(feature.name, feature.stage, feature.implementation,
+                          feature.qualification, feature.execution,
+                          "historically qualified narrow implicitfast profile; full implicit and scalable "
+                          "effective-mass implementations have separate, incomplete composition qualification"))
+    elif feature.name == "current-state sensor queries":
+      rows.append(Feature(feature.name, feature.stage, feature.implementation,
+                          feature.qualification, feature.execution,
+                          "historically qualified current-state subset; stored step stages, history, "
+                          "delay and spatial queries have separate, incomplete composition qualification"))
+    else:
+      rows.append(feature)
+  return tuple(rows)
+
+
+FEATURES = _coherent_feature_inventory()
