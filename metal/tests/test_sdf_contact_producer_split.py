@@ -110,22 +110,19 @@ def test_pair_ownership_mask_count_and_order_contracts():
   assert "if self._has_analytic_sdf_pairs else None" in host
   assert "self._library.contact_produce_generic" in host
   assert "self._library.contact_sdf_seed_init" in host
-  assert "range(0, self._sdf_seed_count, self._sdf_seed_tile)" in host
-  assert "self._contact_sdf_finalize_producer(" in host
-  tile_loop = host[host.index("for seed_start in seed_starts:"):]
-  tile_loop = tile_loop[:tile_loop.index(
-      "if self._contact_mesh_sdf_producer is not None:")]
-  assert "tile_count = min(self._sdf_seed_tile," in tile_loop
-  assert "max(0, self._sdf_seed_count - seed_start)" in tile_loop
+  dispatch = (ROOT / "mujoco_metal" / "sdf_dispatch.py").read_text()
+  assert "range(0, seed_count, seed_tile)" in dispatch
+  tile_loop = dispatch[dispatch.index("for seed_start in seed_starts:"):]
+  assert "tile_count = min(seed_tile," in tile_loop
+  assert "max(0, seed_count - seed_start)" in tile_loop
   assert "[tile_count, seed_start, seed_capacity, mode, step]" in tile_loop
-  init_pos = tile_loop.index("self._contact_sdf_seed_init(")
-  step_pos = tile_loop.index("for step in range(self._sdf_max_iterations)")
-  normal_pos = tile_loop.index("self._contact_sdf_publish_normal(")
-  contact_pos = tile_loop.index("self._contact_sdf_publish_contact(")
-  final_pos = tile_loop.index("self._contact_sdf_finalize_producer(", contact_pos)
+  init_pos = tile_loop.index("kernels.seed_init(")
+  step_pos = tile_loop.index("for step in range(max_iterations)")
+  normal_pos = tile_loop.index("kernels.publish_normal(")
+  contact_pos = tile_loop.index("kernels.publish_contact(")
+  final_pos = tile_loop.index("kernels.finalize(", contact_pos)
   assert init_pos < step_pos < normal_pos < contact_pos < final_pos
-  assert host.index("self._contact_sdf_seed_init(") < host.index(
-      "self._contact_kernel(")
+  assert host.index("dispatch_staged_sdf(\n") < host.index("self._contact_kernel(")
   assert host.index("self._contact_generic_producer(") < host.index("self._contact_kernel(")
   assert '"contact_pair_count"' in host and '"contact_pair_records"' in host
   assert "_pair_contact_cache_bytes(\n        b, d.ncontacts_max, d.npairs, sdf_seed_tile)" in host

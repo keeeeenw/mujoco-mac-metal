@@ -3410,122 +3410,19 @@ class MetalCoupledConstraints:
             w["contact_pair_count"], w["contact_pair_records"],
             threads=(b * d.npairs,), group_size=(1,))
       if self._contact_sdf_seed_init is not None:
-        seed_capacity = self._sdf_seed_tile
-        seed_starts = (range(0, self._sdf_seed_count, self._sdf_seed_tile)
-                       if self._sdf_seed_count else (0,))
-        for seed_start in seed_starts:
-          tile_count = min(self._sdf_seed_tile,
-                           max(0, self._sdf_seed_count - seed_start))
-          thread_count = b * d.npairs * max(tile_count, 1)
-          def set_sdf_stage(mode, step):
-            self._sdf_stage_dims.copy_(self._torch.tensor(
-                [tile_count, seed_start, seed_capacity, mode, step],
-                dtype=self._torch.int32, device=self._device))
-          if tile_count == 0:
-            set_sdf_stage(0, 0)
-            self._contact_sdf_finalize_producer(
-                self._constants["geom_type"], self._constants["pair_geoms"],
-                self._constants["pair_contact_offsets_dims"],
-                pair_maps.logical_to_packed.reshape(-1),
-                w["contact_sdf_seed_records"], w["contact_sdf_seed_valid"],
-                w["contact_pair_count"], w["contact_pair_records"],
-                self._sdf_stage_dims,
-                threads=(b * d.npairs,), group_size=(1,))
-            continue
-          set_sdf_stage(2, 0)
-          self._contact_sdf_seed_init(
-              poses["geom_pos"], poses["geom_quat"],
-              self._constants["geom_size"], self._constants["geom_type"],
-              self._constants["pair_geoms"],
-              self._constants["pair_contact_offsets_dims"],
-              pair_maps.logical_to_packed.reshape(-1),
-              self._constants["mesh_hull"], self._constants["mesh_hull_info"],
-              w["contact_sdf_seed_valid"],
-              w["contact_sdf_seed_state"], w["contact_sdf_seed_ctrl"],
-              self._sdf_stage_dims,
-              poses["geom_pos_low"], poses["geom_pos_tail"],
-              poses["geom_quat_low"], poses["geom_quat_tail"],
-              poses["geom_xmat"], poses["geom_xmat_low"],
-              poses["geom_xmat_tail"],
-              threads=(thread_count,), group_size=(1,))
-          for step in range(self._sdf_max_iterations):
-            set_sdf_stage(2, step)
-            self._contact_sdf_descent_prepare(
-                poses["geom_pos"], poses["geom_quat"],
-                self._constants["geom_size"], self._constants["geom_type"],
-                self._constants["pair_geoms"],
-                self._constants["pair_contact_offsets_dims"],
-                pair_maps.logical_to_packed.reshape(-1),
-                self._constants["mesh_hull"], self._constants["mesh_hull_info"],
-                w["contact_sdf_seed_valid"], w["contact_sdf_seed_state"],
-                w["contact_sdf_seed_ctrl"], self._sdf_stage_dims,
-                threads=(thread_count,), group_size=(1,))
-            self._contact_sdf_line_search(
-                poses["geom_pos"], poses["geom_quat"],
-                self._constants["geom_size"], self._constants["geom_type"],
-                self._constants["pair_geoms"],
-                self._constants["pair_contact_offsets_dims"],
-                pair_maps.logical_to_packed.reshape(-1),
-                self._constants["mesh_hull"], self._constants["mesh_hull_info"],
-                w["contact_sdf_seed_valid"], w["contact_sdf_seed_state"],
-                w["contact_sdf_seed_ctrl"], self._sdf_stage_dims,
-                threads=(thread_count,), group_size=(1,))
-          set_sdf_stage(0, 0)
-          self._contact_sdf_phase_reset(
-              poses["geom_pos"], poses["geom_quat"],
-              self._constants["geom_size"], self._constants["geom_type"],
-              self._constants["pair_geoms"],
-              self._constants["pair_contact_offsets_dims"],
-              pair_maps.logical_to_packed.reshape(-1),
-              w["contact_sdf_seed_valid"], w["contact_sdf_seed_state"],
-              w["contact_sdf_seed_ctrl"], self._sdf_stage_dims,
-              threads=(thread_count,), group_size=(1,))
-          self._contact_sdf_descent_prepare(
-              poses["geom_pos"], poses["geom_quat"],
-              self._constants["geom_size"], self._constants["geom_type"],
-              self._constants["pair_geoms"],
-              self._constants["pair_contact_offsets_dims"],
-              pair_maps.logical_to_packed.reshape(-1),
-              self._constants["mesh_hull"], self._constants["mesh_hull_info"],
-              w["contact_sdf_seed_valid"], w["contact_sdf_seed_state"],
-              w["contact_sdf_seed_ctrl"], self._sdf_stage_dims,
-              threads=(thread_count,), group_size=(1,))
-          self._contact_sdf_line_search(
-              poses["geom_pos"], poses["geom_quat"],
-              self._constants["geom_size"], self._constants["geom_type"],
-              self._constants["pair_geoms"],
-              self._constants["pair_contact_offsets_dims"],
-              pair_maps.logical_to_packed.reshape(-1),
-              self._constants["mesh_hull"], self._constants["mesh_hull_info"],
-              w["contact_sdf_seed_valid"], w["contact_sdf_seed_state"],
-              w["contact_sdf_seed_ctrl"], self._sdf_stage_dims,
-              threads=(thread_count,), group_size=(1,))
-          self._contact_sdf_publish_normal(
-              poses["geom_pos"], poses["geom_quat"],
-              self._constants["geom_size"], self._constants["geom_type"],
-              self._constants["pair_geoms"],
-              self._constants["pair_contact_offsets_dims"],
-              pair_maps.logical_to_packed.reshape(-1),
-              self._constants["mesh_hull"], self._constants["mesh_hull_info"],
-              w["contact_sdf_seed_valid"], w["contact_sdf_seed_state"],
-              self._sdf_stage_dims,
-              threads=(thread_count,), group_size=(1,))
-          self._contact_sdf_publish_contact(
-              poses["geom_pos"], poses["geom_quat"], self._constants["geom_type"],
-              self._constants["pair_geoms"],
-              self._constants["pair_contact_offsets_dims"],
-              pair_maps.logical_to_packed.reshape(-1),
-              w["contact_sdf_seed_records"], w["contact_sdf_seed_valid"],
-              w["contact_sdf_seed_state"], self._sdf_stage_dims,
-              threads=(thread_count,), group_size=(1,))
-          self._contact_sdf_finalize_producer(
-              self._constants["geom_type"], self._constants["pair_geoms"],
-              self._constants["pair_contact_offsets_dims"],
-              pair_maps.logical_to_packed.reshape(-1),
-              w["contact_sdf_seed_records"], w["contact_sdf_seed_valid"],
-              w["contact_pair_count"], w["contact_pair_records"],
-              self._sdf_stage_dims,
-              threads=(b * d.npairs,), group_size=(1,))
+        from mujoco_metal.sdf_dispatch import dispatch_staged_sdf, StagedSdfKernels
+        kernels = StagedSdfKernels(
+            self._contact_sdf_seed_init, self._contact_sdf_phase_reset,
+            self._contact_sdf_descent_prepare, self._contact_sdf_line_search,
+            self._contact_sdf_publish_normal, self._contact_sdf_publish_contact,
+            self._contact_sdf_finalize_producer)
+        dispatch_staged_sdf(
+            kernels, self._torch, poses, self._constants,
+            self._constants["pair_contact_offsets_dims"],
+            pair_maps.logical_to_packed.reshape(-1), w, self._sdf_stage_dims,
+            batch_size=b, npairs=d.npairs, seed_count=self._sdf_seed_count,
+            seed_tile=self._sdf_seed_tile,
+            max_iterations=self._sdf_max_iterations)
       if self._contact_mesh_sdf_producer is not None:
         self._contact_mesh_sdf_producer(
             poses["geom_pos"], poses["geom_quat"],

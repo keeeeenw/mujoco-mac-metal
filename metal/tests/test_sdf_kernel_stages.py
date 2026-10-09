@@ -46,8 +46,10 @@ def test_sdf_stage_workspace_is_bounded_and_all_seeds_are_host_dispatched():
                "contact_sdf_publish_normal", "contact_sdf_publish_contact"):
     assert name in shader
     assert name in host
-  assert "for step in range(self._sdf_max_iterations)" in host
-  assert "range(0, self._sdf_seed_count, self._sdf_seed_tile)" in host
+  dispatch = (_ROOT / "mujoco_metal" / "sdf_dispatch.py").read_text()
+  assert "dispatch_staged_sdf(" in host
+  assert "for step in range(max_iterations)" in dispatch
+  assert "range(0, seed_count, seed_tile)" in dispatch
   assert "SDF_STAGE_STATE_WORDS 159" in narrow
   assert "_SDF_STAGE_STATE_WORDS = 159" in host
   assert "_contact_sdf_seed_producer" not in host
