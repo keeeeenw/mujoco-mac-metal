@@ -903,6 +903,434 @@ def _fixed_tendon_maps(model):
   return length_map.astype(np.float32), moment_map.astype(np.float32)
 
 
+@dataclass(frozen=True)
+class CollisionGeometryUpload:
+  """Immutable source operands shared by collision and scene queries.
+
+  Pair membership selects assets without changing the compiled model's
+  collision masks, bodies or model constants. Host packing is independent
+  of simulation DOF count and solver admission.
+  """
+  geom_size: np.ndarray
+  mesh_hull: np.ndarray
+  mesh_hull_info: np.ndarray
+  mesh_rbound_extra: dict
+  byte_count: int
+  sdf_active: bool
+
+
+def lower_collision_geometry(model, pairs, limits=None):
+  """Pack the complete source operands referenced by actual geom pairs."""
+  if not isinstance(model, mujoco.MjModel):
+    raise TypeError("collision geometry requires a compiled MuJoCo MjModel")
+  geoms = np.asarray(model.geom_type)
+  pairs = tuple(pairs)
+  for pair in pairs:
+    if len(pair) < 2 or any(
+        isinstance(g, (bool, np.bool_)) or not isinstance(g, (int, np.integer))
+        or not 0 <= int(g) < int(model.ngeom) for g in pair[:2]):
+      raise ValueError("collision geometry pairs need valid integer geom IDs")
+  geom_size_mat = np.asarray(model.geom_size, dtype=np.float32).reshape(model.ngeom, 3)
+
+  # Milestone 011: convex-mesh hull store. Mesh geoms referenced by admitted
+  # pairs must be single-convex-piece assets with bounded vertex counts;
+  # hull verts are geom-local (world = geom frame composed with mesh_vert,
+  # calibrated against CPU contacts) and uploaded once per model.
+  mesh_used = sorted({g for pr in pairs for g in (pr[0], pr[1])
+                      if int(geoms[g]) == _MESH})
+  # Milestone 013 SDF pre-pass: exact oct sizing + validation. SDF geoms
+  # reference mesh assets whose compiled octrees are uploaded below; bundled
+  # analytic plugin SDFs use compact per-geom high/low attributes.
+  sdf_geoms = sorted({g for pr in pairs for g in (pr[0], pr[1])
+                      if int(geoms[g]) == _SDF})
+  if len(sdf_geoms) > _SDF_MAX_GEOMS:
+    raise ValueError(f"at most {_SDF_MAX_GEOMS} SDF geoms; found "
+                     f"{len(sdf_geoms)}")
+  plugin_sdf_model = None
+  plugin_sdf_rows = {}
+  sdf_plugin_geoms = [g for g in sdf_geoms
+                      if int(model.geom_plugin[g]) != -1]
+  if sdf_plugin_geoms:
+    from mujoco_metal.bundled_plugins import lower_bundled_plugins
+    plugin_sdf_model = lower_bundled_plugins(model)
+    plugin_sdf_rows = {
+        int(g): row for row, g in enumerate(plugin_sdf_model.sdf_geom_id.tolist())}
+    if any(g not in plugin_sdf_rows for g in sdf_plugin_geoms):
+      raise ValueError("SDF plugin geom has no supported bundled analytic descriptor")
+  sdf_mesh_nodes = {}
+  for g in sdf_geoms:
+    if g in sdf_plugin_geoms:
+      continue
+    mid = int(model.geom_dataid[g])
+    if mid < 0:
+      raise ValueError(f"SDF geom {g} has no asset")
+    if mid not in sdf_mesh_nodes:
+      adr = int(model.mesh_octadr[mid])
+      num = int(model.mesh_octnum[mid])
+      if adr < 0 or num <= 0:
+        raise ValueError(f"SDF geom {g} mesh {mid} has no compiled octree")
+      sdf_mesh_nodes[mid] = (adr, num)
+  sdf_oct_total = sum(num for _, num in sdf_mesh_nodes.values())
+  if sdf_oct_total > _SDF_MAX_NODES:
+    raise ValueError(f"total SDF octree nodes {sdf_oct_total} exceeds 013 "
+                     f"capacity {_SDF_MAX_NODES}")
+  sdf_ip_global = int(model.opt.sdf_initpoints)
+  sdf_active = any(
+      (ta == _SDF or tb == _SDF) and ta not in (_PLANE, _HFIELD, _MESH) and
+      tb not in (_PLANE, _HFIELD, _MESH)
+      for ta, tb in [(int(geoms[p[0]]), int(geoms[p[1]])) for p in pairs])
+
+  mesh_sdf_geoms = sorted({g for pr in pairs for g in pr[:2]
+                           if int(geoms[g]) == _MESH and
+                           int(geoms[pr[1] if pr[0] == g else pr[0]]) == _SDF})
+  mesh_sdf_assets = sorted({int(model.geom_dataid[g]) for g in mesh_sdf_geoms})
+  mesh_sdf_float_count = sum(
+      3 * int(model.mesh_vertnum[mid]) +
+      3 * int(model.mesh_facenum[mid]) +
+      9 * int(model.mesh_bvhnum[mid]) for mid in mesh_sdf_assets)
+  if mesh_sdf_float_count > (1 << 24):
+    raise ValueError("mesh-SDF BVH data exceeds exact float-index capacity")
+  plugin_sdf_float_count = 15 * len(sdf_plugin_geoms)
+  sdf_geom_tail_floats = 15 * int(model.ngeom) if sdf_geoms else 0
+  # Terrain descriptors already carry per-geom dimensions and offsets.
+  # Reserve the compiled grids exactly; former 8-geom/64x64/4096-sample
+  # ceilings were allocation policy, not a device algorithm restriction.
+  hf_used = sorted({g for pr in pairs for g in pr[:2]
+                    if int(geoms[g]) == _HFIELD})
+  hf_data_count = 0
+  for g in hf_used:
+    hid = int(model.geom_dataid[g])
+    if hid < 0:
+      raise ValueError(f"heightfield geom {g} has no asset")
+    nrow, ncol = int(model.hfield_nrow[hid]), int(model.hfield_ncol[hid])
+    if nrow < 2 or ncol < 2:
+      raise ValueError(f"heightfield geom {g} needs at least two rows and columns")
+    hf_data_count += nrow * ncol
+  hf_size_count = 4 * len(hf_used)
+  terrain_end = _MESH_DATA_FLOATS + hf_size_count + hf_data_count
+  geometry_upload_floats = (
+      terrain_end +
+      # Octree blocks carry a third residual word per aabb/coeff entry
+      # (50 floats/node) so razor mesh-SDF vertex selections reproduce
+      # pinned float64 ties bitwise.
+      50 * sdf_oct_total + (18 * int(model.ngeom) if sdf_geoms else 0) +
+      sdf_geom_tail_floats +
+      mesh_sdf_float_count + plugin_sdf_float_count)
+  geometry_upload_bytes = 4 * (
+      geometry_upload_floats + 9 * int(model.ngeom))
+  if geometry_upload_floats >= (1 << 31):
+    from mujoco_metal.capacity import CapacityOverflow
+    raise CapacityOverflow("collision geometry upload exceeds int32 addressing")
+  from mujoco_metal.capacity import CapacityLimits, CapacityOverflow
+  memory_budget = (CapacityLimits().memory_budget_bytes if limits is None else
+                   int(limits.memory_budget_bytes))
+  if geometry_upload_bytes > memory_budget:
+    raise CapacityOverflow(
+        "estimated device memory including collision geometry upload "
+        f"({geometry_upload_bytes} bytes) exceeds "
+        f"budget {memory_budget} bytes")
+  mesh_hull = np.zeros((terrain_end +
+                      50 * sdf_oct_total + (18 * int(model.ngeom) if sdf_geoms else 0) +
+                      sdf_geom_tail_floats +
+                      mesh_sdf_float_count + plugin_sdf_float_count,),
+                     dtype=np.float32)
+  mesh_hull_info = np.full((int(model.ngeom) * 9,), -1, dtype=np.int32)
+  mesh_rbound_extra = {}
+  cursor = 0
+  ncursor = 3 * _MESH_MAX_TOTAL
+  icursor = 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES)
+  mesh_sdf_only = set(mesh_sdf_geoms)
+  for pr in pairs:
+    for g in pr[:2]:
+      if int(geoms[g]) == _MESH and int(geoms[pr[1] if pr[0] == g else pr[0]]) != _SDF:
+        mesh_sdf_only.discard(g)
+  for g in mesh_used:
+    mid = int(model.geom_dataid[g])
+    if mid < 0:
+      raise ValueError(f"mesh geom {g} has no asset")
+    raw_vnum = int(model.mesh_vertnum[mid])
+    if raw_vnum <= 0:
+      raise ValueError(f"mesh geom {g} has no source vertices")
+    if g in mesh_sdf_only:
+      # Mesh-SDF consumes the full source triangle mesh and BVH below; it does
+      # not use the convex support hull or face-snap data.
+      continue
+    from mujoco_metal.mesh_hull import collision_mesh_hull
+    verts, faces = collision_mesh_hull(model, mid)
+    vnum, fnum = len(verts), len(faces)
+    if vnum <= 0 or vnum > _MESH_MAX_VERTS:
+      raise ValueError(
+          f"mesh geom {g} collision hull has {vnum} verts; 011 supports "
+          f"1..{_MESH_MAX_VERTS} compiled hull verts")
+    if cursor + vnum > _MESH_MAX_TOTAL:
+      raise ValueError("total mesh hull verts exceed 011 capacity "
+                       f"{_MESH_MAX_TOTAL}")
+    mesh_hull[3 * cursor:3 * (cursor + vnum)] = verts.reshape(-1)
+    mesh_hull_info[9 * g] = cursor
+    mesh_hull_info[9 * g + 1] = vnum
+    mesh_rbound_extra[g] = float(np.max(np.linalg.norm(verts, axis=1)))
+    cursor += vnum
+    # Snap planes come from the compiler collision hull, not the potentially
+    # concave raw source surface retained separately for ray/SDF queries.
+    faces = np.asarray(faces, dtype=np.int64)
+    if ncursor + 3 * fnum > 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES) or \
+        icursor + 3 * fnum > _MESH_DATA_FLOATS:
+      raise ValueError("total mesh faces exceed 011 capacity "
+                       f"{_MESH_MAX_FACES}")
+    vd = verts.astype(np.float64)
+    interior = vd.mean(axis=0)
+    mesh_hull_info[9 * g + 2] = ncursor // 3
+    mesh_hull_info[9 * g + 3] = icursor // 3
+    mesh_hull_info[9 * g + 4] = fnum
+    for f in faces:
+      i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
+      n = np.cross(vd[i1] - vd[i0], vd[i2] - vd[i0])
+      nl = float(np.linalg.norm(n))
+      if nl < 1e-12:
+        n = np.zeros(3)
+      else:
+        n = n / nl
+        if float(n @ (vd[[i0, i1, i2]].mean(axis=0) - interior)) < 0.0:
+          n = -n
+      mesh_face_nrm = n.astype(np.float32)
+      mesh_hull[ncursor:ncursor + 3] = mesh_face_nrm
+      mesh_hull[icursor:icursor + 3] = np.array(
+          [i0, i1, i2], dtype=np.float32)
+      ncursor += 3
+      icursor += 3
+
+  # Milestone 012: heightfield store. Per hfield geom: 4 size floats plus
+  # the compiled (normalized, row-flipped) data block. Like meshes, the
+  # world height is data*size2 over the grid; prism bottoms sit at -size3.
+  scursor = _MESH_DATA_FLOATS
+  dcursor = _MESH_DATA_FLOATS + hf_size_count
+  for g in hf_used:
+    hid = int(model.geom_dataid[g])
+    if hid < 0:
+      raise ValueError(f"heightfield geom {g} has no asset")
+    nrow = int(model.hfield_nrow[hid])
+    ncol = int(model.hfield_ncol[hid])
+    ndata = nrow * ncol
+    if dcursor + ndata > terrain_end:
+      raise ValueError("heightfield upload exceeds its exact compiled allocation")
+    size = np.asarray(model.hfield_size[hid], dtype=np.float32)
+    mesh_hull[scursor:scursor + 4] = size
+    adr = int(model.hfield_adr[hid])
+    mesh_hull[dcursor:dcursor + ndata] = np.asarray(
+        model.hfield_data[adr:adr + ndata], dtype=np.float32)
+    mesh_hull_info[9 * g + 5] = dcursor
+    mesh_hull_info[9 * g + 6] = nrow
+    mesh_hull_info[9 * g + 7] = ncol
+    mesh_hull_info[9 * g + 8] = scursor
+    scursor += 4
+    dcursor += ndata
+
+  # Milestone 013 SDF octree + local-AABB upload. Oct blocks pack per SDF
+  # mesh as child[8N] (local indices as floats, exact below 2^24), then
+  # aabb[6N], coeff[8N], aabb residual[6N], coeff residual[8N],
+  # aabb tail[6N], coeff tail[8N] (50N total; hi+lo+tail is bitwise float64,
+  # required by razor mesh-SDF vertex selections);
+  # per-SDF-geom info holds child base, node
+  # count and sdf_iterations. Local AABBs (compiled, center+half) upload
+  # for every geom at a fixed stride for the seed-box computation.
+  oct_base = terrain_end
+  sdf_aabb_base = oct_base + 50 * sdf_oct_total
+  ocursor = oct_base
+  mesh_oct_base = {}
+  for mid, (adr, num) in sorted(sdf_mesh_nodes.items()):
+    child = np.asarray(model.oct_child[adr:adr + num]).reshape(-1)
+    aabb = require_triple_word_domain(
+        model.oct_aabb[adr:adr + num], what=f"SDF mesh {mid} oct_aabb")
+    coeff = require_triple_word_domain(
+        model.oct_coeff[adr:adr + num], what=f"SDF mesh {mid} oct_coeff")
+    if child.size != 8 * num or aabb.size != 6 * num or coeff.size != 8 * num:
+      raise ValueError(f"SDF mesh {mid} octree layout mismatch")
+    mesh_hull[ocursor:ocursor + 8 * num] = child.astype(np.float32)
+    mesh_hull[ocursor + 8 * num:ocursor + 14 * num] = aabb.astype(np.float32)
+    mesh_hull[ocursor + 14 * num:ocursor + 22 * num] = coeff.astype(np.float32)
+    mesh_oct_base[mid] = ocursor
+    aabb_hi = aabb.astype(np.float32)
+    coeff_hi = coeff.astype(np.float32)
+    mesh_hull[ocursor + 22 * num:ocursor + 28 * num] = (
+        aabb.astype(np.float64) - aabb_hi.astype(np.float64))
+    mesh_hull[ocursor + 28 * num:ocursor + 36 * num] = (
+        coeff.astype(np.float64) - coeff_hi.astype(np.float64))
+    # Third residual words: hi+lo+tail reproduces the pinned float64 entry
+    # bitwise (exact Sterbenz splits), which razor gradient ties require.
+    aabb_lo = (aabb.astype(np.float64) - aabb_hi.astype(np.float64)).astype(np.float32)
+    coeff_lo = (coeff.astype(np.float64) - coeff_hi.astype(np.float64)).astype(np.float32)
+    mesh_hull[ocursor + 36 * num:ocursor + 42 * num] = (
+        aabb.astype(np.float64) - aabb_hi.astype(np.float64)
+        - aabb_lo.astype(np.float64))
+    mesh_hull[ocursor + 42 * num:ocursor + 50 * num] = (
+        coeff.astype(np.float64) - coeff_hi.astype(np.float64)
+        - coeff_lo.astype(np.float64))
+    ocursor += 50 * num
+  sdf_iters = int(model.opt.sdf_iterations)
+  if sdf_geoms and sdf_iters <= 0:
+    raise ValueError("opt.sdf_iterations must be positive with SDF pairs")
+  for g in sdf_geoms:
+    if g in sdf_plugin_geoms:
+      continue
+    mid = int(model.geom_dataid[g])
+    mesh_hull_info[9 * g] = mesh_oct_base[mid]
+    mesh_hull_info[9 * g + 1] = sdf_mesh_nodes[mid][1]
+    mesh_hull_info[9 * g + 2] = sdf_iters
+    mesh_hull_info[9 * g + 3] = sdf_aabb_base
+    mesh_hull_info[9 * g + 6] = sdf_aabb_base + 18 * int(model.ngeom)
+  if sdf_geoms:
+    sdf_aabb_tail_base = sdf_aabb_base + 18 * int(model.ngeom)
+    for g in range(int(model.ngeom)):
+      # Pinned mjc_SDF seeds use m->geom_aabb for both geoms, including
+      # plugin meshes. The plugin callback's construction bounds can have
+      # a different center/extent from the compiled mesh bounds.
+      aabb = model.geom_aabb[g]
+      aabb_exact = require_triple_word_domain(
+          aabb, what=f"geom {g} SDF seed aabb")
+      aabb_high = aabb_exact.astype(np.float32)
+      aabb_low = (aabb_exact - aabb_high.astype(np.float64)).astype(np.float32)
+      mesh_hull[sdf_aabb_base + 18 * g:sdf_aabb_base + 18 * g + 6] = aabb_high
+      mesh_hull[sdf_aabb_base + 18 * g + 6:sdf_aabb_base + 18 * g + 12] = aabb_low
+      size = require_triple_word_domain(
+          model.geom_size[g], what=f"geom {g} SDF seed size")
+      size_high = size.astype(np.float32)
+      mesh_hull[sdf_aabb_base + 18*g + 12:sdf_aabb_base + 18*g + 15] = size_high
+      size_low = (size - size_high.astype(np.float64)).astype(np.float32)
+      mesh_hull[sdf_aabb_base + 18*g + 15:sdf_aabb_base + 18*g + 18] = size_low
+      tail = sdf_aabb_tail_base + 15 * g
+      mesh_hull[tail:tail + 3] = (
+          aabb_exact[:3] - aabb_high[:3].astype(np.float64)
+          - aabb_low[:3].astype(np.float64)).astype(np.float32)
+      mesh_hull[tail + 6:tail + 9] = (
+          aabb_exact[3:] - aabb_high[3:].astype(np.float64)
+          - aabb_low[3:].astype(np.float64)).astype(np.float32)
+      mesh_hull[tail + 12:tail + 15] = (
+          size - size_high.astype(np.float64)
+          - size_low.astype(np.float64)).astype(np.float32)
+    for g in sdf_geoms:
+      mesh_hull_info[9 * g + 4] = max(1, int(model.opt.sdf_initpoints))
+
+  # Mesh-SDF collision data is uploaded once per referenced mesh asset:
+  # local vertices, triangle indices, then depth-first BVH records. Each BVH
+  # record is [leaf face id, child0, child1, center xyz, half xyz]. The
+  # shader traverses this compiled tree in the pinned callback order.
+  # NOTE: pinned mesh_vert is float32, so corners are exact by promotion;
+  # no residual words are stored for verts (they would be zeros). Corner
+  # precision lives in the rotation/translation arithmetic (qualified with
+  # rotated/translated fixtures), not in padding.
+  mcursor = (sdf_aabb_base + (18 * int(model.ngeom) if sdf_geoms else 0)
+             + sdf_geom_tail_floats)
+  for mid in mesh_sdf_assets:
+    verts = np.asarray(model.mesh_vert[int(model.mesh_vertadr[mid]):
+                                       int(model.mesh_vertadr[mid]) +
+                                       int(model.mesh_vertnum[mid])],
+                       dtype=np.float32).reshape(-1, 3)
+    faces = np.asarray(model.mesh_face[int(model.mesh_faceadr[mid]):
+                                       int(model.mesh_faceadr[mid]) +
+                                       int(model.mesh_facenum[mid])],
+                       dtype=np.int32).reshape(-1, 3)
+    bad_index = np.any(faces < 0) or np.any(faces >= len(verts))
+    if bad_index:
+      raise ValueError(f"mesh-SDF asset {mid} has invalid face vertex indices")
+    bvh_adr = int(model.mesh_bvhadr[mid])
+    bvh_num = int(model.mesh_bvhnum[mid])
+    if bvh_adr < 0 or bvh_num <= 0:
+      raise ValueError(f"mesh-SDF asset {mid} has no compiled BVH")
+    nodeids = np.asarray(model.bvh_nodeid[bvh_adr:bvh_adr + bvh_num],
+                         dtype=np.int32)
+    children = np.asarray(model.bvh_child[bvh_adr:bvh_adr + bvh_num],
+                          dtype=np.int32).reshape(-1, 2)
+    boxes = np.asarray(model.bvh_aabb[bvh_adr:bvh_adr + bvh_num],
+                       dtype=np.float32).reshape(-1, 6)
+    invalid_child = ((children < -1) | (children >= bvh_num)).any(axis=1)
+    invalid_leaf = ((nodeids >= len(faces)) |
+                    ((nodeids >= 0) & (children != -1).any(axis=1)))
+    invalid_internal = ((nodeids < 0) & (children == -1).all(axis=1))
+    if (invalid_child.any() or invalid_leaf.any() or invalid_internal.any()
+        or not np.all(np.isfinite(boxes)) or np.any(boxes[:, 3:] < 0)):
+      raise ValueError(f"mesh-SDF asset {mid} has invalid BVH records")
+    # The native traversal uses a fixed 64-entry stack and expects a single
+    # rooted tree. Validate the full compiled tree before upload so no node
+    # can be silently skipped or overflow the shader's local stack.
+    pending = [0]
+    visited = set()
+    max_pending = 1
+    while pending:
+      node = pending.pop()
+      if node in visited:
+        raise ValueError(f"mesh-SDF asset {mid} BVH contains a cycle/shared node")
+      visited.add(node)
+      if nodeids[node] < 0:
+        for child in children[node]:
+          if child >= 0:
+            pending.append(int(child))
+        max_pending = max(max_pending, len(pending))
+        if max_pending > 64:
+          raise ValueError(f"mesh-SDF asset {mid} BVH exceeds native stack depth")
+    if len(visited) != bvh_num:
+      raise ValueError(f"mesh-SDF asset {mid} BVH has unreachable nodes")
+    vbase = mcursor
+    mesh_hull[vbase:vbase + 3 * len(verts)] = verts.reshape(-1)
+    mcursor += 3 * len(verts)
+    fbase = mcursor
+    mesh_hull[fbase:fbase + 3 * len(faces)] = faces.reshape(-1).astype(np.float32)
+    mcursor += 3 * len(faces)
+    bbase = mcursor
+    records = np.concatenate([
+        nodeids[:, None].astype(np.float32), children.astype(np.float32), boxes
+    ], axis=1)
+    mesh_hull[bbase:bbase + 9 * bvh_num] = records.reshape(-1)
+    mcursor += 9 * bvh_num
+    for g in mesh_sdf_geoms:
+      if int(model.geom_dataid[g]) != mid:
+        continue
+      mesh_hull_info[9 * g + 4] = len(faces)
+      mesh_hull_info[9 * g + 5] = vbase
+      mesh_hull_info[9 * g + 6] = fbase
+      mesh_hull_info[9 * g + 7] = bbase
+      mesh_hull_info[9 * g + 8] = bvh_num
+  # Bundled plugin-SDF data is packed as five high-word attributes, five
+  # low-word residuals, and five third-word residuals per geom. The first info word uses -2 as
+  # a descriptor tag; the remaining fields retain kind, iteration budget,
+  # AABB base, seed count and attribute base.
+  plugin_attr_cursor = mcursor
+  for g in sdf_plugin_geoms:
+    row = plugin_sdf_rows[g]
+    kind = int(plugin_sdf_model.instance_kind[
+        int(plugin_sdf_model.sdf_geom_instance[row])])
+    attrs = np.asarray(plugin_sdf_model.sdf_geom_attributes[row], dtype=np.float32)
+    attrs_low = np.asarray(plugin_sdf_model.sdf_geom_attributes_low[row], dtype=np.float32)
+    attrs_tail = np.asarray(plugin_sdf_model.sdf_geom_attributes_tail[row],
+                            dtype=np.float32)
+    if attrs.shape != (5,) or attrs_low.shape != (5,) or attrs_tail.shape != (5,) or not (
+        np.all(np.isfinite(attrs)) and np.all(np.isfinite(attrs_low)) and
+        np.all(np.isfinite(attrs_tail))):
+      raise ValueError(f"SDF plugin geom {g} has invalid attribute payload")
+    mesh_hull[plugin_attr_cursor:plugin_attr_cursor + 5] = attrs
+    mesh_hull[plugin_attr_cursor + 5:plugin_attr_cursor + 10] = attrs_low
+    mesh_hull[plugin_attr_cursor + 10:plugin_attr_cursor + 15] = attrs_tail
+    base = 9 * g
+    mesh_hull_info[base] = -2
+    mesh_hull_info[base + 1] = kind
+    mesh_hull_info[base + 2] = sdf_iters
+    mesh_hull_info[base + 3] = sdf_aabb_base
+    mesh_hull_info[base + 4] = max(1, int(model.opt.sdf_initpoints))
+    mesh_hull_info[base + 5] = plugin_attr_cursor
+    mesh_hull_info[base + 6] = sdf_aabb_base + 18 * int(model.ngeom)
+    mesh_hull_info[base + 7] = plugin_attr_cursor + 10
+    plugin_attr_cursor += 15
+  mcursor = plugin_attr_cursor
+  if mcursor != len(mesh_hull):
+    raise RuntimeError("collision geometry packed data length mismatch")
+
+  return CollisionGeometryUpload(
+      geom_size=_frozen(geom_size_mat, np.float32),
+      mesh_hull=_frozen(mesh_hull, np.float32),
+      mesh_hull_info=_frozen(mesh_hull_info, np.int32),
+      mesh_rbound_extra=mesh_rbound_extra.copy(),
+      byte_count=geometry_upload_bytes, sdf_active=sdf_active)
+
+
 def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> CoupledConstraintDescriptor:
   """Validate and lower combined joint and contact constraints from an MjModel."""
   if not isinstance(model, mujoco.MjModel):
@@ -1434,398 +1862,13 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     c_condim_packed = np.zeros(3, dtype=np.int32)
 
 
-  geom_size_mat = np.asarray(model.geom_size, dtype=np.float32).reshape(model.ngeom, 3)
-
-  # Milestone 011: convex-mesh hull store. Mesh geoms referenced by admitted
-  # pairs must be single-convex-piece assets with bounded vertex counts;
-  # hull verts are geom-local (world = geom frame composed with mesh_vert,
-  # calibrated against CPU contacts) and uploaded once per model.
-  mesh_used = sorted({g for pr in pairs for g in (pr[0], pr[1])
-                      if int(geoms[g]) == _MESH})
-  # Milestone 013 SDF pre-pass: exact oct sizing + validation. SDF geoms
-  # reference mesh assets whose compiled octrees are uploaded below; bundled
-  # analytic plugin SDFs use compact per-geom high/low attributes.
-  sdf_geoms = sorted({g for pr in pairs for g in (pr[0], pr[1])
-                      if int(geoms[g]) == _SDF})
-  if len(sdf_geoms) > _SDF_MAX_GEOMS:
-    raise ValueError(f"at most {_SDF_MAX_GEOMS} SDF geoms; found "
-                     f"{len(sdf_geoms)}")
-  plugin_sdf_model = None
-  plugin_sdf_rows = {}
-  sdf_plugin_geoms = [g for g in sdf_geoms
-                      if int(model.geom_plugin[g]) != -1]
-  if sdf_plugin_geoms:
-    from mujoco_metal.bundled_plugins import lower_bundled_plugins
-    plugin_sdf_model = lower_bundled_plugins(model)
-    plugin_sdf_rows = {
-        int(g): row for row, g in enumerate(plugin_sdf_model.sdf_geom_id.tolist())}
-    if any(g not in plugin_sdf_rows for g in sdf_plugin_geoms):
-      raise ValueError("SDF plugin geom has no supported bundled analytic descriptor")
-  sdf_mesh_nodes = {}
-  for g in sdf_geoms:
-    if g in sdf_plugin_geoms:
-      continue
-    mid = int(model.geom_dataid[g])
-    if mid < 0:
-      raise ValueError(f"SDF geom {g} has no asset")
-    if mid not in sdf_mesh_nodes:
-      adr = int(model.mesh_octadr[mid])
-      num = int(model.mesh_octnum[mid])
-      if adr < 0 or num <= 0:
-        raise ValueError(f"SDF geom {g} mesh {mid} has no compiled octree")
-      sdf_mesh_nodes[mid] = (adr, num)
-  sdf_oct_total = sum(num for _, num in sdf_mesh_nodes.values())
-  if sdf_oct_total > _SDF_MAX_NODES:
-    raise ValueError(f"total SDF octree nodes {sdf_oct_total} exceeds 013 "
-                     f"capacity {_SDF_MAX_NODES}")
-  sdf_ip_global = int(model.opt.sdf_initpoints)
-  sdf_active = any(
-      (ta == _SDF or tb == _SDF) and ta not in (_PLANE, _HFIELD, _MESH) and
-      tb not in (_PLANE, _HFIELD, _MESH)
-      for ta, tb in [(int(geoms[p[0]]), int(geoms[p[1]])) for p in pairs])
-
-  mesh_sdf_geoms = sorted({g for pr in pairs for g in pr[:2]
-                           if int(geoms[g]) == _MESH and
-                           int(geoms[pr[1] if pr[0] == g else pr[0]]) == _SDF})
-  mesh_sdf_assets = sorted({int(model.geom_dataid[g]) for g in mesh_sdf_geoms})
-  mesh_sdf_float_count = sum(
-      3 * int(model.mesh_vertnum[mid]) +
-      3 * int(model.mesh_facenum[mid]) +
-      9 * int(model.mesh_bvhnum[mid]) for mid in mesh_sdf_assets)
-  if mesh_sdf_float_count > (1 << 24):
-    raise ValueError("mesh-SDF BVH data exceeds exact float-index capacity")
-  plugin_sdf_float_count = 15 * len(sdf_plugin_geoms)
-  sdf_geom_tail_floats = 15 * int(model.ngeom) if sdf_geoms else 0
-  # Terrain descriptors already carry per-geom dimensions and offsets.
-  # Reserve the compiled grids exactly; former 8-geom/64x64/4096-sample
-  # ceilings were allocation policy, not a device algorithm restriction.
-  hf_used = sorted({g for pr in pairs for g in pr[:2]
-                    if int(geoms[g]) == _HFIELD})
-  hf_data_count = 0
-  for g in hf_used:
-    hid = int(model.geom_dataid[g])
-    if hid < 0:
-      raise ValueError(f"heightfield geom {g} has no asset")
-    nrow, ncol = int(model.hfield_nrow[hid]), int(model.hfield_ncol[hid])
-    if nrow < 2 or ncol < 2:
-      raise ValueError(f"heightfield geom {g} needs at least two rows and columns")
-    hf_data_count += nrow * ncol
-  hf_size_count = 4 * len(hf_used)
-  terrain_end = _MESH_DATA_FLOATS + hf_size_count + hf_data_count
-  geometry_upload_floats = (
-      terrain_end +
-      # Octree blocks carry a third residual word per aabb/coeff entry
-      # (50 floats/node) so razor mesh-SDF vertex selections reproduce
-      # pinned float64 ties bitwise.
-      50 * sdf_oct_total + (18 * int(model.ngeom) if sdf_geoms else 0) +
-      sdf_geom_tail_floats +
-      mesh_sdf_float_count + plugin_sdf_float_count)
-  geometry_upload_bytes = 4 * (
-      geometry_upload_floats + 9 * int(model.ngeom))
-  if geometry_upload_floats >= (1 << 31):
-    from mujoco_metal.capacity import CapacityOverflow
-    raise CapacityOverflow("collision geometry upload exceeds int32 addressing")
-  from mujoco_metal.capacity import CapacityLimits, CapacityOverflow
-  memory_budget = (CapacityLimits().memory_budget_bytes if limits is None else
-                   int(limits.memory_budget_bytes))
-  if geometry_upload_bytes > memory_budget:
-    raise CapacityOverflow(
-        "estimated device memory including collision geometry upload "
-        f"({geometry_upload_bytes} bytes) exceeds "
-        f"budget {memory_budget} bytes")
-  mesh_hull = np.zeros((terrain_end +
-                      50 * sdf_oct_total + (18 * int(model.ngeom) if sdf_geoms else 0) +
-                      sdf_geom_tail_floats +
-                      mesh_sdf_float_count + plugin_sdf_float_count,),
-                     dtype=np.float32)
-  mesh_hull_info = np.full((int(model.ngeom) * 9,), -1, dtype=np.int32)
-  mesh_rbound_extra = {}
-  cursor = 0
-  ncursor = 3 * _MESH_MAX_TOTAL
-  icursor = 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES)
-  mesh_sdf_only = set(mesh_sdf_geoms)
-  for pr in pairs:
-    for g in pr[:2]:
-      if int(geoms[g]) == _MESH and int(geoms[pr[1] if pr[0] == g else pr[0]]) != _SDF:
-        mesh_sdf_only.discard(g)
-  for g in mesh_used:
-    mid = int(model.geom_dataid[g])
-    if mid < 0:
-      raise ValueError(f"mesh geom {g} has no asset")
-    raw_vnum = int(model.mesh_vertnum[mid])
-    if raw_vnum <= 0:
-      raise ValueError(f"mesh geom {g} has no source vertices")
-    if g in mesh_sdf_only:
-      # Mesh-SDF consumes the full source triangle mesh and BVH below; it does
-      # not use the convex support hull or face-snap data.
-      continue
-    from mujoco_metal.mesh_hull import collision_mesh_hull
-    verts, faces = collision_mesh_hull(model, mid)
-    vnum, fnum = len(verts), len(faces)
-    if vnum <= 0 or vnum > _MESH_MAX_VERTS:
-      raise ValueError(
-          f"mesh geom {g} collision hull has {vnum} verts; 011 supports "
-          f"1..{_MESH_MAX_VERTS} compiled hull verts")
-    if cursor + vnum > _MESH_MAX_TOTAL:
-      raise ValueError("total mesh hull verts exceed 011 capacity "
-                       f"{_MESH_MAX_TOTAL}")
-    mesh_hull[3 * cursor:3 * (cursor + vnum)] = verts.reshape(-1)
-    mesh_hull_info[9 * g] = cursor
-    mesh_hull_info[9 * g + 1] = vnum
-    mesh_rbound_extra[g] = float(np.max(np.linalg.norm(verts, axis=1)))
-    cursor += vnum
-    # Snap planes come from the compiler collision hull, not the potentially
-    # concave raw source surface retained separately for ray/SDF queries.
-    faces = np.asarray(faces, dtype=np.int64)
-    if ncursor + 3 * fnum > 3 * (_MESH_MAX_TOTAL + _MESH_MAX_FACES) or \
-        icursor + 3 * fnum > _MESH_DATA_FLOATS:
-      raise ValueError("total mesh faces exceed 011 capacity "
-                       f"{_MESH_MAX_FACES}")
-    vd = verts.astype(np.float64)
-    interior = vd.mean(axis=0)
-    mesh_hull_info[9 * g + 2] = ncursor // 3
-    mesh_hull_info[9 * g + 3] = icursor // 3
-    mesh_hull_info[9 * g + 4] = fnum
-    for f in faces:
-      i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
-      n = np.cross(vd[i1] - vd[i0], vd[i2] - vd[i0])
-      nl = float(np.linalg.norm(n))
-      if nl < 1e-12:
-        n = np.zeros(3)
-      else:
-        n = n / nl
-        if float(n @ (vd[[i0, i1, i2]].mean(axis=0) - interior)) < 0.0:
-          n = -n
-      mesh_face_nrm = n.astype(np.float32)
-      mesh_hull[ncursor:ncursor + 3] = mesh_face_nrm
-      mesh_hull[icursor:icursor + 3] = np.array(
-          [i0, i1, i2], dtype=np.float32)
-      ncursor += 3
-      icursor += 3
-
-  # Milestone 012: heightfield store. Per hfield geom: 4 size floats plus
-  # the compiled (normalized, row-flipped) data block. Like meshes, the
-  # world height is data*size2 over the grid; prism bottoms sit at -size3.
-  scursor = _MESH_DATA_FLOATS
-  dcursor = _MESH_DATA_FLOATS + hf_size_count
-  for g in hf_used:
-    hid = int(model.geom_dataid[g])
-    if hid < 0:
-      raise ValueError(f"heightfield geom {g} has no asset")
-    nrow = int(model.hfield_nrow[hid])
-    ncol = int(model.hfield_ncol[hid])
-    ndata = nrow * ncol
-    if dcursor + ndata > terrain_end:
-      raise ValueError("heightfield upload exceeds its exact compiled allocation")
-    size = np.asarray(model.hfield_size[hid], dtype=np.float32)
-    mesh_hull[scursor:scursor + 4] = size
-    adr = int(model.hfield_adr[hid])
-    mesh_hull[dcursor:dcursor + ndata] = np.asarray(
-        model.hfield_data[adr:adr + ndata], dtype=np.float32)
-    mesh_hull_info[9 * g + 5] = dcursor
-    mesh_hull_info[9 * g + 6] = nrow
-    mesh_hull_info[9 * g + 7] = ncol
-    mesh_hull_info[9 * g + 8] = scursor
-    scursor += 4
-    dcursor += ndata
-
-  # Milestone 013 SDF octree + local-AABB upload. Oct blocks pack per SDF
-  # mesh as child[8N] (local indices as floats, exact below 2^24), then
-  # aabb[6N], coeff[8N], aabb residual[6N], coeff residual[8N],
-  # aabb tail[6N], coeff tail[8N] (50N total; hi+lo+tail is bitwise float64,
-  # required by razor mesh-SDF vertex selections);
-  # per-SDF-geom info holds child base, node
-  # count and sdf_iterations. Local AABBs (compiled, center+half) upload
-  # for every geom at a fixed stride for the seed-box computation.
-  oct_base = terrain_end
-  sdf_aabb_base = oct_base + 50 * sdf_oct_total
-  ocursor = oct_base
-  mesh_oct_base = {}
-  for mid, (adr, num) in sorted(sdf_mesh_nodes.items()):
-    child = np.asarray(model.oct_child[adr:adr + num]).reshape(-1)
-    aabb = require_triple_word_domain(
-        model.oct_aabb[adr:adr + num], what=f"SDF mesh {mid} oct_aabb")
-    coeff = require_triple_word_domain(
-        model.oct_coeff[adr:adr + num], what=f"SDF mesh {mid} oct_coeff")
-    if child.size != 8 * num or aabb.size != 6 * num or coeff.size != 8 * num:
-      raise ValueError(f"SDF mesh {mid} octree layout mismatch")
-    mesh_hull[ocursor:ocursor + 8 * num] = child.astype(np.float32)
-    mesh_hull[ocursor + 8 * num:ocursor + 14 * num] = aabb.astype(np.float32)
-    mesh_hull[ocursor + 14 * num:ocursor + 22 * num] = coeff.astype(np.float32)
-    mesh_oct_base[mid] = ocursor
-    aabb_hi = aabb.astype(np.float32)
-    coeff_hi = coeff.astype(np.float32)
-    mesh_hull[ocursor + 22 * num:ocursor + 28 * num] = (
-        aabb.astype(np.float64) - aabb_hi.astype(np.float64))
-    mesh_hull[ocursor + 28 * num:ocursor + 36 * num] = (
-        coeff.astype(np.float64) - coeff_hi.astype(np.float64))
-    # Third residual words: hi+lo+tail reproduces the pinned float64 entry
-    # bitwise (exact Sterbenz splits), which razor gradient ties require.
-    aabb_lo = (aabb.astype(np.float64) - aabb_hi.astype(np.float64)).astype(np.float32)
-    coeff_lo = (coeff.astype(np.float64) - coeff_hi.astype(np.float64)).astype(np.float32)
-    mesh_hull[ocursor + 36 * num:ocursor + 42 * num] = (
-        aabb.astype(np.float64) - aabb_hi.astype(np.float64)
-        - aabb_lo.astype(np.float64))
-    mesh_hull[ocursor + 42 * num:ocursor + 50 * num] = (
-        coeff.astype(np.float64) - coeff_hi.astype(np.float64)
-        - coeff_lo.astype(np.float64))
-    ocursor += 50 * num
-  sdf_iters = int(model.opt.sdf_iterations)
-  if sdf_geoms and sdf_iters <= 0:
-    raise ValueError("opt.sdf_iterations must be positive with SDF pairs")
-  for g in sdf_geoms:
-    if g in sdf_plugin_geoms:
-      continue
-    mid = int(model.geom_dataid[g])
-    mesh_hull_info[9 * g] = mesh_oct_base[mid]
-    mesh_hull_info[9 * g + 1] = sdf_mesh_nodes[mid][1]
-    mesh_hull_info[9 * g + 2] = sdf_iters
-    mesh_hull_info[9 * g + 3] = sdf_aabb_base
-    mesh_hull_info[9 * g + 6] = sdf_aabb_base + 18 * int(model.ngeom)
-  if sdf_geoms:
-    sdf_aabb_tail_base = sdf_aabb_base + 18 * int(model.ngeom)
-    for g in range(int(model.ngeom)):
-      # Pinned mjc_SDF seeds use m->geom_aabb for both geoms, including
-      # plugin meshes. The plugin callback's construction bounds can have
-      # a different center/extent from the compiled mesh bounds.
-      aabb = model.geom_aabb[g]
-      aabb_exact = require_triple_word_domain(
-          aabb, what=f"geom {g} SDF seed aabb")
-      aabb_high = aabb_exact.astype(np.float32)
-      aabb_low = (aabb_exact - aabb_high.astype(np.float64)).astype(np.float32)
-      mesh_hull[sdf_aabb_base + 18 * g:sdf_aabb_base + 18 * g + 6] = aabb_high
-      mesh_hull[sdf_aabb_base + 18 * g + 6:sdf_aabb_base + 18 * g + 12] = aabb_low
-      size = require_triple_word_domain(
-          model.geom_size[g], what=f"geom {g} SDF seed size")
-      size_high = size.astype(np.float32)
-      mesh_hull[sdf_aabb_base + 18*g + 12:sdf_aabb_base + 18*g + 15] = size_high
-      size_low = (size - size_high.astype(np.float64)).astype(np.float32)
-      mesh_hull[sdf_aabb_base + 18*g + 15:sdf_aabb_base + 18*g + 18] = size_low
-      tail = sdf_aabb_tail_base + 15 * g
-      mesh_hull[tail:tail + 3] = (
-          aabb_exact[:3] - aabb_high[:3].astype(np.float64)
-          - aabb_low[:3].astype(np.float64)).astype(np.float32)
-      mesh_hull[tail + 6:tail + 9] = (
-          aabb_exact[3:] - aabb_high[3:].astype(np.float64)
-          - aabb_low[3:].astype(np.float64)).astype(np.float32)
-      mesh_hull[tail + 12:tail + 15] = (
-          size - size_high.astype(np.float64)
-          - size_low.astype(np.float64)).astype(np.float32)
-    for g in sdf_geoms:
-      mesh_hull_info[9 * g + 4] = max(1, int(model.opt.sdf_initpoints))
-
-  # Mesh-SDF collision data is uploaded once per referenced mesh asset:
-  # local vertices, triangle indices, then depth-first BVH records. Each BVH
-  # record is [leaf face id, child0, child1, center xyz, half xyz]. The
-  # shader traverses this compiled tree in the pinned callback order.
-  # NOTE: pinned mesh_vert is float32, so corners are exact by promotion;
-  # no residual words are stored for verts (they would be zeros). Corner
-  # precision lives in the rotation/translation arithmetic (qualified with
-  # rotated/translated fixtures), not in padding.
-  mcursor = (sdf_aabb_base + (18 * int(model.ngeom) if sdf_geoms else 0)
-             + sdf_geom_tail_floats)
-  for mid in mesh_sdf_assets:
-    verts = np.asarray(model.mesh_vert[int(model.mesh_vertadr[mid]):
-                                       int(model.mesh_vertadr[mid]) +
-                                       int(model.mesh_vertnum[mid])],
-                       dtype=np.float32).reshape(-1, 3)
-    faces = np.asarray(model.mesh_face[int(model.mesh_faceadr[mid]):
-                                       int(model.mesh_faceadr[mid]) +
-                                       int(model.mesh_facenum[mid])],
-                       dtype=np.int32).reshape(-1, 3)
-    bad_index = np.any(faces < 0) or np.any(faces >= len(verts))
-    if bad_index:
-      raise ValueError(f"mesh-SDF asset {mid} has invalid face vertex indices")
-    bvh_adr = int(model.mesh_bvhadr[mid])
-    bvh_num = int(model.mesh_bvhnum[mid])
-    if bvh_adr < 0 or bvh_num <= 0:
-      raise ValueError(f"mesh-SDF asset {mid} has no compiled BVH")
-    nodeids = np.asarray(model.bvh_nodeid[bvh_adr:bvh_adr + bvh_num],
-                         dtype=np.int32)
-    children = np.asarray(model.bvh_child[bvh_adr:bvh_adr + bvh_num],
-                          dtype=np.int32).reshape(-1, 2)
-    boxes = np.asarray(model.bvh_aabb[bvh_adr:bvh_adr + bvh_num],
-                       dtype=np.float32).reshape(-1, 6)
-    invalid_child = ((children < -1) | (children >= bvh_num)).any(axis=1)
-    invalid_leaf = ((nodeids >= len(faces)) |
-                    ((nodeids >= 0) & (children != -1).any(axis=1)))
-    invalid_internal = ((nodeids < 0) & (children == -1).all(axis=1))
-    if (invalid_child.any() or invalid_leaf.any() or invalid_internal.any()
-        or not np.all(np.isfinite(boxes)) or np.any(boxes[:, 3:] < 0)):
-      raise ValueError(f"mesh-SDF asset {mid} has invalid BVH records")
-    # The native traversal uses a fixed 64-entry stack and expects a single
-    # rooted tree. Validate the full compiled tree before upload so no node
-    # can be silently skipped or overflow the shader's local stack.
-    pending = [0]
-    visited = set()
-    max_pending = 1
-    while pending:
-      node = pending.pop()
-      if node in visited:
-        raise ValueError(f"mesh-SDF asset {mid} BVH contains a cycle/shared node")
-      visited.add(node)
-      if nodeids[node] < 0:
-        for child in children[node]:
-          if child >= 0:
-            pending.append(int(child))
-        max_pending = max(max_pending, len(pending))
-        if max_pending > 64:
-          raise ValueError(f"mesh-SDF asset {mid} BVH exceeds native stack depth")
-    if len(visited) != bvh_num:
-      raise ValueError(f"mesh-SDF asset {mid} BVH has unreachable nodes")
-    vbase = mcursor
-    mesh_hull[vbase:vbase + 3 * len(verts)] = verts.reshape(-1)
-    mcursor += 3 * len(verts)
-    fbase = mcursor
-    mesh_hull[fbase:fbase + 3 * len(faces)] = faces.reshape(-1).astype(np.float32)
-    mcursor += 3 * len(faces)
-    bbase = mcursor
-    records = np.concatenate([
-        nodeids[:, None].astype(np.float32), children.astype(np.float32), boxes
-    ], axis=1)
-    mesh_hull[bbase:bbase + 9 * bvh_num] = records.reshape(-1)
-    mcursor += 9 * bvh_num
-    for g in mesh_sdf_geoms:
-      if int(model.geom_dataid[g]) != mid:
-        continue
-      mesh_hull_info[9 * g + 4] = len(faces)
-      mesh_hull_info[9 * g + 5] = vbase
-      mesh_hull_info[9 * g + 6] = fbase
-      mesh_hull_info[9 * g + 7] = bbase
-      mesh_hull_info[9 * g + 8] = bvh_num
-  # Bundled plugin-SDF data is packed as five high-word attributes, five
-  # low-word residuals, and five third-word residuals per geom. The first info word uses -2 as
-  # a descriptor tag; the remaining fields retain kind, iteration budget,
-  # AABB base, seed count and attribute base.
-  plugin_attr_cursor = mcursor
-  for g in sdf_plugin_geoms:
-    row = plugin_sdf_rows[g]
-    kind = int(plugin_sdf_model.instance_kind[
-        int(plugin_sdf_model.sdf_geom_instance[row])])
-    attrs = np.asarray(plugin_sdf_model.sdf_geom_attributes[row], dtype=np.float32)
-    attrs_low = np.asarray(plugin_sdf_model.sdf_geom_attributes_low[row], dtype=np.float32)
-    attrs_tail = np.asarray(plugin_sdf_model.sdf_geom_attributes_tail[row],
-                            dtype=np.float32)
-    if attrs.shape != (5,) or attrs_low.shape != (5,) or attrs_tail.shape != (5,) or not (
-        np.all(np.isfinite(attrs)) and np.all(np.isfinite(attrs_low)) and
-        np.all(np.isfinite(attrs_tail))):
-      raise ValueError(f"SDF plugin geom {g} has invalid attribute payload")
-    mesh_hull[plugin_attr_cursor:plugin_attr_cursor + 5] = attrs
-    mesh_hull[plugin_attr_cursor + 5:plugin_attr_cursor + 10] = attrs_low
-    mesh_hull[plugin_attr_cursor + 10:plugin_attr_cursor + 15] = attrs_tail
-    base = 9 * g
-    mesh_hull_info[base] = -2
-    mesh_hull_info[base + 1] = kind
-    mesh_hull_info[base + 2] = sdf_iters
-    mesh_hull_info[base + 3] = sdf_aabb_base
-    mesh_hull_info[base + 4] = max(1, int(model.opt.sdf_initpoints))
-    mesh_hull_info[base + 5] = plugin_attr_cursor
-    mesh_hull_info[base + 6] = sdf_aabb_base + 18 * int(model.ngeom)
-    mesh_hull_info[base + 7] = plugin_attr_cursor + 10
-    plugin_attr_cursor += 15
-  mcursor = plugin_attr_cursor
-  if mcursor != len(mesh_hull):
-    raise RuntimeError("collision geometry packed data length mismatch")
+  geometry = lower_collision_geometry(model, pairs, limits=limits)
+  geom_size_mat = geometry.geom_size
+  mesh_hull = geometry.mesh_hull
+  mesh_hull_info = geometry.mesh_hull_info
+  mesh_rbound_extra = geometry.mesh_rbound_extra
+  geometry_upload_bytes = geometry.byte_count
+  sdf_active = geometry.sdf_active
 
   iter_req = int(model.opt.iterations)
   if iter_req < 0 or iter_req > _MAX_ITERATIONS:
