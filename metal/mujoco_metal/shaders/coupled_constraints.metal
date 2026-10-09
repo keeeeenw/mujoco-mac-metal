@@ -817,6 +817,8 @@ kernel void contact_produce_generic(
   int a=pair_geoms[pair_idx*2], b=pair_geoms[pair_idx*2+1];
   int ta=geom_type[a], tb=geom_type[b];
   if (ta==8 || tb==8) return;
+  // PlaneConvex owns the complete source-ordered records for these pairs.
+  if ((ta==0 && (tb==4 || tb==7)) || (tb==0 && (ta==4 || ta==7))) return;
   contact_count[count_index]=0;
   bool prune=(dims[9]&1)!=0;
   if (prune && logical_to_packed[world*npairs+pair_idx]<0) return;

@@ -1744,7 +1744,7 @@ static inline int common_ccd_source_plane_convex(
   return count;
 }
 
-kernel void contact_produce_plane_sdf(
+kernel void contact_produce_plane_convex(
     device const float* geom_pos [[buffer(0)]],
     device const float* geom_pos_low [[buffer(1)]],
     device const float* geom_pos_tail [[buffer(2)]],
@@ -1760,7 +1760,8 @@ kernel void contact_produce_plane_sdf(
   int np=dims[1],nc=dims[2],batch=dims[3],ng=dims[6];
   if(np<=0 || tid>=uint(batch*np)) return;
   int world=int(tid)/np,pair=int(tid)%np,a=pairs[2*pair],b=pairs[2*pair+1];
-  if(!((types[a]==0 && types[b]==8)||(types[a]==8 && types[b]==0))) return;
+  int other=types[a]==0?types[b]:types[a];
+  if(!((types[a]==0 || types[b]==0) && (other==4 || other==7 || other==8))) return;
   int ptr=10+np+1+nc,mask_offset=dims[ptr];
   if(dims[mask_offset+world]==0 || logical_map[tid]<0) return;
   counts[tid]=0;
@@ -1775,7 +1776,9 @@ kernel void contact_produce_plane_sdf(
   }
   int base=info[header+1],rb=info[header+33]+3*solid;
   CommonCCDSupportObject p=common_ccd_production_geom(plane,0,base+9*plane,info,hull,pa,ma,float3(0),0);
-  CommonCCDSupportObject c=common_ccd_production_geom(solid,7,base+9*solid,info,hull,pb,mb,float3(0),0);
+  CommonCCDSupportObject c=common_ccd_production_geom(solid,other==8?7:other,base+9*solid,info,hull,pb,mb,float3(0),0);
+  int sizes=info[header+34]+9*solid;
+  for(int j=0;j<3;j++) c.size[j]=common_ccd_production_size(hull,sizes,j);
   FlexDD depths[3];FlexDD3 points[3],normal;
   int count=common_ccd_source_plane_convex(p,c,flex_dd(margins[2*pair]+margins[2*pair+1]),
       FlexDD{hull[rb],hull[rb+1],hull[rb+2]},hull,info,depths,points,normal);

@@ -363,7 +363,7 @@ def _candidate_dispatch_fixture():
       (_ for _ in ()).throw(_StopAfterCommonDispatch()))
   program._common_ccd_rigid_kernel = None
   program._common_ccd_requested = True
-  program._contact_plane_sdf_producer = None
+  program._contact_plane_convex_producer = None
   program._contact_kernel = lambda *_, **__: pytest.fail(
       "dispatch should stop at the common kernel witness")
   poses = {

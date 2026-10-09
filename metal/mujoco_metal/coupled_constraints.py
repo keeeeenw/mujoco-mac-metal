@@ -632,8 +632,8 @@ def pair_max_contacts(t1: int, t2: int, sdf_initpoints: int = 40) -> int:
     # Native box/mesh face clipping yields four contacts, but margins and
     # capsule/cylinder-mesh pairs use mjc_Convex's initial witness plus four
     # perturbation searches. Reserve all five rather than silently truncating
-    # that valid source path. Plane-mesh keeps its separate four-point bound.
-    return 4 if t_min == _PLANE else 5
+    # that valid source path. PlaneConvex emits at most three source-ordered plane-mesh witnesses.
+    return 3 if t_min == _PLANE else 5
   if (t_min, t_max) in (
       (_PLANE, _CAPSULE),
       (_CAPSULE, _CAPSULE),
@@ -2229,11 +2229,11 @@ class MetalCoupledConstraints:
     pair_types = [(int(model.geom_type[int(a)]), int(model.geom_type[int(b)]))
                   for a, b in zip(self.descriptor.geom1, self.descriptor.geom2)]
     self._has_mesh_sdf_pairs = any(set(pair) == {7, 8} for pair in pair_types)
-    self._has_plane_sdf_pairs=any(set(pair)=={0,8} for pair in pair_types)
+    self._has_plane_convex_pairs=any(min(pair)==0 and max(pair) in (4,7,8) for pair in pair_types)
     self._has_analytic_sdf_pairs = any(
         8 in pair and min(pair)>=2 and 7 not in pair for pair in pair_types)
     self._has_sdf_contact_pairs = (
-        self._has_mesh_sdf_pairs or self._has_analytic_sdf_pairs or self._has_plane_sdf_pairs)
+        self._has_mesh_sdf_pairs or self._has_analytic_sdf_pairs or self._has_plane_convex_pairs)
     self._has_generic_contact_pairs = any(8 not in pair for pair in pair_types)
     self.solver_settings = self.descriptor.solver_settings
     self._line_search_iterations = int(self.descriptor.line_search_iterations)
@@ -2258,7 +2258,7 @@ class MetalCoupledConstraints:
         for a, b in zip(d.geom1, d.geom2))
     self._common_ccd_requested = (
         self._common_ccd_hfield_mesh_requested or self._common_ccd_rigid_requested
-        or self._has_plane_sdf_pairs)
+        or self._has_plane_convex_pairs)
     if self._common_ccd_requested:
       from mujoco_metal.common_ccd_bridge import (
           append_production_workspace, estimate_production_upload_bytes)
@@ -2335,8 +2335,8 @@ class MetalCoupledConstraints:
     self._common_ccd_rigid_kernel = (
         self._library.common_ccd_rigid_convex_candidates
         if self._common_ccd_rigid_requested else None)
-    self._contact_plane_sdf_producer=(
-        self._library.contact_produce_plane_sdf if self._has_plane_sdf_pairs else None)
+    self._contact_plane_convex_producer=(
+        self._library.contact_produce_plane_convex if self._has_plane_convex_pairs else None)
     self._clear_contact_pair_counts = self._library.clear_contact_pair_counts
     self._contact_generic_producer = (
         self._library.contact_produce_generic
@@ -3393,8 +3393,8 @@ class MetalCoupledConstraints:
               self._constants["mesh_hull"], self._constants["mesh_hull_info"],
               w["out_status"], restart_pass,
               threads=(b * d.npairs,), group_size=(1,))
-      if self._contact_plane_sdf_producer is not None:
-        self._contact_plane_sdf_producer(
+      if self._contact_plane_convex_producer is not None:
+        self._contact_plane_convex_producer(
             poses['geom_pos'],poses['geom_pos_low'],poses['geom_pos_tail'],
             poses['geom_xmat'],poses['geom_xmat_low'],poses['geom_xmat_tail'],
             self._constants['geom_type'],self._constants['pair_geoms'],
