@@ -391,13 +391,13 @@ def test_cpu_oracle_cases_cover_rounding_and_admission_boundaries():
   assert "sw_source_mul_core" in source and "sw_source_fma_core" in source
   assert "sw_division_residual(a,b,q0,q1,q2)" in source
   assert "count=sw_expansion_add(expansion,count,q3,scratch);" in source
-  assert "int scale=-48-exponent;" in source
-  assert "if (exponent < -78)" in source
   sqrt_source = source[source.index("inline SdfWide sw_sqrt(SdfWide a) {",
                                    source.index("sw_sqrt_core")):]
   assert sqrt_source.index("sw_wide_has_subnormal_leading(a)") < sqrt_source.index("a.hi==0.0f")
   assert "if (!has_subnormal_leading &&" in sqrt_source
-  assert "sw_sqrt_core(sw_scale_wide_pow2(a,scale)),-scale/2" in source
+  assert "int root_exponent=(exponent+1)/2;" in sqrt_source
+  assert "sw_sqrt_core(sw_scale_wide_pow2(a,-2*root_exponent)),root_exponent" in sqrt_source
+  assert "SdfWide approximation={q0,q1,0.0f};" in source
   assert "sw_float_power_upper" in source
   assert "scaling_c_overflows && product_below_half_ulp" in source
   assert "sw_expansion_add_product" in source
