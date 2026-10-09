@@ -84,6 +84,32 @@ def _cpu_reference(model, qpos, qvel):
   return result
 
 
+def _cpu_inverse_at_requested_acceleration(model, qpos, qvel, qacc):
+  """Evaluate the pinned inverse at the actual public query inputs."""
+  data = mujoco.MjData(model)
+  data.qpos[:], data.qvel[:], data.qacc[:] = qpos, qvel, qacc
+  mujoco.mj_inverse(model, data)
+  return np.asarray(data.qfrc_inverse, dtype=np.float64).copy()
+
+
+def test_cpu_inverse_oracle_retains_requested_acceleration_precision():
+  model = _diag_model("pyramidal", "CG")
+  model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_DIAGEXACT)
+  qpos = np.asarray(model.qpos0, dtype=np.float32).copy()
+  qpos[int(model.jnt_qposadr[1])] = .24
+  qpos[int(model.jnt_qposadr[2])] = -.11
+  qvel = np.linspace(-.13, .16, model.nv).astype(np.float32)
+  source = _cpu_reference(model, qpos, qvel)
+  exact = _cpu_inverse_at_requested_acceleration(
+      model, qpos, qvel, source["qacc"])
+  np.testing.assert_array_equal(exact, source["qfrc_inverse"])
+  requested = source["qacc"].astype(np.float32)
+  cast = _cpu_inverse_at_requested_acceleration(model, qpos, qvel, requested)
+  # Stiff inverse constraints amplify the float32 input quantization. This
+  # is a different query, even though the forward acceleration is unchanged.
+  assert np.max(np.abs(cast - exact)) > 5e-5
+
+
 def _canonical_cpu_row_map(model, descriptor, cpu, cone_groups):
   """Map exact logical equality/contact rows to pinned CPU efc rows."""
   equality_kind = int(mujoco.mjtConstraint.mjCNSTR_EQUALITY)
@@ -291,9 +317,14 @@ def test_public_diagexact_prepared_and_inverse_stages(cone, solver, profile):
   np.testing.assert_array_equal(
       rows_after["R"].detach().cpu().numpy(), actual_R.astype(np.float32))
 
-  qacc = torch.as_tensor(np.stack([item["qacc"] for item in cpu]).astype(
-      np.float32), device=sim.state._device)
-  expected_inverse = np.stack([item["qfrc_inverse"] for item in cpu])
+  requested_qacc = np.stack([item["qacc"] for item in cpu]).astype(np.float32)
+  qacc = torch.as_tensor(requested_qacc, device=sim.state._device)
+  # The query accepts float32 accelerations. Run the CPU inverse with these
+  # identical values, rather than its unrounded forward-solver output.
+  expected_inverse = np.stack([
+      _cpu_inverse_at_requested_acceleration(model, qpos[w], qvel[w],
+                                            requested_qacc[w])
+      for w in range(2)])
   for skipstage in (mujoco.mjtStage.mjSTAGE_VEL,
                     mujoco.mjtStage.mjSTAGE_POS,
                     mujoco.mjtStage.mjSTAGE_NONE):
