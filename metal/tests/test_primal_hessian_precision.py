@@ -1,5 +1,7 @@
 """Float32 replay for the bounded elliptic-Newton Hessian PCG."""
 
+import pytest
+
 import os
 
 from pathlib import Path
