@@ -160,7 +160,7 @@ def _evaluate(model, qpos, qvel):
       torch.tensor(qpos[None], dtype=torch.float32),
       torch.tensor(qvel[None], dtype=torch.float32), poses,
       torch.tensor(data.cvel[None], dtype=torch.float32))
-  return data, flex, force.detach().numpy()[0], damping.detach().numpy()[0], stiffness
+  return data, flex, force.detach().cpu().numpy()[0], damping.detach().cpu().numpy()[0], stiffness
 
 
 def test_masked_recovery_flex_force_uses_separate_result_owner():
@@ -281,22 +281,22 @@ def _cached_pos_velocity_witness(device):
   np.testing.assert_allclose(reference_data.flexedge_velocity, pinned_velocity,
                              rtol=1e-12, atol=1e-12)
   np.testing.assert_allclose(
-      cached[0].detach().numpy()[0], reference_data.qfrc_passive,
+      cached[0].detach().cpu().numpy()[0], reference_data.qfrc_passive,
       rtol=4e-4, atol=5e-5)
-  np.testing.assert_allclose(flex._flexvert_xpos.detach().numpy()[0],
+  np.testing.assert_allclose(flex._flexvert_xpos.detach().cpu().numpy()[0],
                              reference_data.flexvert_xpos,
                              rtol=0, atol=3e-7)
-  np.testing.assert_allclose(flex._flexedge_length.detach().numpy()[0],
+  np.testing.assert_allclose(flex._flexedge_length.detach().cpu().numpy()[0],
                              reference_data.flexedge_length,
                              rtol=2e-6, atol=2e-7)
-  np.testing.assert_allclose(flex.flexedge_velocity.detach().numpy()[0],
+  np.testing.assert_allclose(flex.flexedge_velocity.detach().cpu().numpy()[0],
                              reference_data.flexedge_velocity,
                              rtol=3e-5, atol=3e-6)
   root_com = _root_com(model, reference_data)[model.flex_vertbodyid]
   point_velocity = (reference_data.cvel[model.flex_vertbodyid, 3:]
                     + np.cross(reference_data.cvel[model.flex_vertbodyid, :3],
                                reference_data.flexvert_xpos - root_com))
-  np.testing.assert_allclose(flex._flexvert_xvel.detach().numpy()[0],
+  np.testing.assert_allclose(flex._flexvert_xvel.detach().cpu().numpy()[0],
                              point_velocity, rtol=3e-5, atol=3e-6)
   reference_poses = {
       "body_pos": to_device(reference_data.xpos[None]),
@@ -409,23 +409,23 @@ def _cached_flex_equality_witness(device):
   # Canonical row order is increasing non-rigid edge ID; the compiled
   # equality can share this flex with a second flexcomp-generated equality.
   assert edge_ids.size == rows.size
-  np.testing.assert_allclose(actual[0].detach().numpy()[0, edge_ids],
+  np.testing.assert_allclose(actual[0].detach().cpu().numpy()[0, edge_ids],
                              data.efc_pos[rows], rtol=2e-6, atol=2e-7)
-  np.testing.assert_allclose(actual[3].detach().numpy()[0, edge_ids],
+  np.testing.assert_allclose(actual[3].detach().cpu().numpy()[0, edge_ids],
                              dense_rows(data.efc_J, data.efc_J_rowadr,
                                         data.efc_J_rownnz, data.efc_J_colind,
                                         data.nefc)[rows],
                              rtol=3e-5, atol=3e-6)
   np.testing.assert_allclose(
-      flex.flexedge_velocity.detach().numpy()[0, edge_ids],
+      flex.flexedge_velocity.detach().cpu().numpy()[0, edge_ids],
       data.efc_vel[rows], rtol=3e-5, atol=3e-6)
-  np.testing.assert_allclose(actual[1].detach().numpy()[0, edge_ids],
+  np.testing.assert_allclose(actual[1].detach().cpu().numpy()[0, edge_ids],
                              data.efc_aref[rows], rtol=5e-4, atol=5e-5)
-  np.testing.assert_allclose(actual[2].detach().numpy()[0, edge_ids],
+  np.testing.assert_allclose(actual[2].detach().cpu().numpy()[0, edge_ids],
                              data.efc_R[rows], rtol=5e-4, atol=5e-5)
   raw = flex.equality_position_context
   assert raw["edge_J"] is flex.flexedge_J
-  np.testing.assert_allclose(raw["pos"].detach().numpy()[0, edge_ids],
+  np.testing.assert_allclose(raw["pos"].detach().cpu().numpy()[0, edge_ids],
                              data.efc_pos[rows], rtol=2e-6, atol=2e-7)
   assert len(raw["edge_ids_by_flex"]) == model.nflex
 
@@ -518,9 +518,9 @@ def _flexvert_equalities_witness(device):
   row_ids = flex.flexvert_row_ids(f)
   assert rows.size == row_ids.size == 2 * int(model.flex_vertnum[f])
   np.testing.assert_array_equal(actual["row_ids"], row_ids)
-  np.testing.assert_allclose(actual["pos"].detach().numpy()[0],
+  np.testing.assert_allclose(actual["pos"].detach().cpu().numpy()[0],
                              data.efc_pos[rows], rtol=3e-5, atol=3e-6)
-  np.testing.assert_allclose(actual["vel"].detach().numpy()[0],
+  np.testing.assert_allclose(actual["vel"].detach().cpu().numpy()[0],
                              data.efc_vel[rows], rtol=3e-5, atol=3e-6)
   # flexvert_J is a paired sparse value matrix; rowadr counts scalar entries
   # in its flattened storage, not rows in the 2-column Python view.
@@ -532,27 +532,27 @@ def _flexvert_equalities_witness(device):
   for row in range(2 * model.nflexvert):
     start, count = int(rowadr[row]), int(rownnz[row])
     dense_J[row, colind[start:start + count]] = values[start:start + count]
-  np.testing.assert_allclose(actual["J"].detach().numpy()[0], dense_J,
+  np.testing.assert_allclose(actual["J"].detach().cpu().numpy()[0], dense_J,
                              rtol=5e-5, atol=5e-6)
-  np.testing.assert_allclose(actual["aref"].detach().numpy()[0],
+  np.testing.assert_allclose(actual["aref"].detach().cpu().numpy()[0],
                              data.efc_aref[rows], rtol=5e-4, atol=5e-5)
-  np.testing.assert_allclose(actual["R"].detach().numpy()[0],
+  np.testing.assert_allclose(actual["R"].detach().cpu().numpy()[0],
                              data.efc_R[rows], rtol=5e-4, atol=5e-5)
   unified = flex.flex_equality_position_context(context)[eqid]
   assert unified["kind"] == "flexvert"
   assert unified["jdot_included"] is False
   assert unified["jdot_policy"] == "pinned_zero_for_flex_equality"
   np.testing.assert_array_equal(unified["row_ids"], row_ids)
-  np.testing.assert_allclose(unified["pos"].detach().numpy()[0],
+  np.testing.assert_allclose(unified["pos"].detach().cpu().numpy()[0],
                              data.efc_pos[rows], rtol=3e-5, atol=3e-6)
-  np.testing.assert_allclose(unified["J"].detach().numpy()[0], dense_J,
+  np.testing.assert_allclose(unified["J"].detach().cpu().numpy()[0], dense_J,
                              rtol=5e-5, atol=5e-6)
   qvel_replay = qvel[::-1].copy()
   replay = flex.run_flex_equality_rows(
       eqid, context, to_device(qpos[None]), to_device(qvel_replay[None]))
-  np.testing.assert_allclose(replay["pos"].detach().numpy()[0], data.efc_pos[rows],
+  np.testing.assert_allclose(replay["pos"].detach().cpu().numpy()[0], data.efc_pos[rows],
                              rtol=3e-5, atol=3e-6)
-  np.testing.assert_allclose(replay["vel"].detach().numpy()[0],
+  np.testing.assert_allclose(replay["vel"].detach().cpu().numpy()[0],
                              dense_J @ qvel_replay, rtol=5e-5, atol=5e-6)
   assert replay["jdot_included"] is False
 
@@ -857,7 +857,7 @@ def test_compiled_simplex_metric_matches_pinned_cpu(dim):
     numerical_q = (_oracle_passive_force(model, qpos_hi, qvel)
                    - _oracle_passive_force(model, qpos_lo, qvel)) / (2*eps)
     np.testing.assert_allclose(
-        stiffness_tangent.detach().numpy()[0, :, dof], numerical_q,
+        stiffness_tangent.detach().cpu().numpy()[0, :, dof], numerical_q,
         rtol=3e-2, atol=8e-2)
     qvel_hi, qvel_lo = qvel.copy(), qvel.copy()
     qvel_hi[dof] += eps
@@ -870,6 +870,8 @@ def test_compiled_simplex_metric_matches_pinned_cpu(dim):
 
 
 @pytest.mark.parametrize("dim", [2, 3])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mps_simplex_kernel_matches_pinned_cpu(dim):
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -954,7 +956,7 @@ def test_material_rayleigh_velocity_tangent_matches_finite_difference():
        "joint_axis": torch.tensor(data.xaxis[None], dtype=torch.float32)},
       torch.tensor(data.cvel[None], dtype=torch.float32))[2]
   np.testing.assert_allclose(
-      analytic.detach().numpy()[0, :, dof], position_difference,
+      analytic.detach().cpu().numpy()[0, :, dof], position_difference,
       rtol=3e-2, atol=2e-2)
 
 
@@ -984,7 +986,7 @@ def test_1d_edge_spring_tangent_includes_directional_geometry():
     _, _, lo, _, _ = _evaluate(model, qpos_lo, qvel)
     numerical = (hi - lo) / (2 * eps)
     np.testing.assert_allclose(
-        stiffness.detach().numpy()[0, :, dof], numerical,
+        stiffness.detach().cpu().numpy()[0, :, dof], numerical,
         rtol=3e-2, atol=1e-2)
 
     qvel_hi, qvel_lo = qvel.copy(), qvel.copy()
@@ -1025,7 +1027,7 @@ def test_compiled_triangle_shell_bending_matches_pinned_cpu():
   numerical_q = (_oracle_passive_force(model, qpos_hi, qvel)
                  - _oracle_passive_force(model, qpos_lo, qvel)) / (2*eps)
   np.testing.assert_allclose(
-      stiffness_tangent.detach().numpy()[0, :, 3], numerical_q,
+      stiffness_tangent.detach().cpu().numpy()[0, :, 3], numerical_q,
       rtol=3e-2, atol=5e-3)
   qvel_hi, qvel_lo = qvel.copy(), qvel.copy()
   qvel_hi[3] += eps
@@ -1037,6 +1039,8 @@ def test_compiled_triangle_shell_bending_matches_pinned_cpu():
       rtol=3e-2, atol=5e-3)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mps_triangle_shell_bending_force_and_tangent():
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -1122,7 +1126,7 @@ def test_articulated_triangle_bend_tangent_matches_pinned_qpos_difference():
   numerical = (_oracle_passive_force(model, qpos_hi, qvel)
                - _oracle_passive_force(model, qpos_lo, qvel)) / (2*eps)
   np.testing.assert_allclose(
-      tangent.detach().numpy()[0, :, 0], numerical,
+      tangent.detach().cpu().numpy()[0, :, 0], numerical,
       rtol=5e-2, atol=5e-3)
 
 
@@ -1152,7 +1156,7 @@ def test_material_force_uses_articulated_off_center_flex_vertices():
   assert np.max(np.abs(data.qfrc_passive)) > 1e-3
   np.testing.assert_allclose(force, data.qfrc_passive, rtol=1e-3, atol=8e-5)
   np.testing.assert_allclose(
-      flex.flexvert_xpos.detach().numpy()[0], data.flexvert_xpos.reshape(-1, 3),
+      flex.flexvert_xpos.detach().cpu().numpy()[0], data.flexvert_xpos.reshape(-1, 3),
       rtol=1e-5, atol=2e-6)
   eps = 2e-3
   qpos_hi, qpos_lo = qpos.copy(), qpos.copy()
@@ -1162,7 +1166,7 @@ def test_material_force_uses_articulated_off_center_flex_vertices():
   _, _, force_lo, _, _ = _evaluate(model, qpos_lo, qvel)
   numerical = (force_hi - force_lo) / (2 * eps)
   np.testing.assert_allclose(
-      stiffness.detach().numpy()[0, :, 0], numerical,
+      stiffness.detach().cpu().numpy()[0, :, 0], numerical,
       rtol=5e-2, atol=2e-3)
 
 
@@ -1199,7 +1203,7 @@ def test_material_force_tangent_tracks_articulated_rotation(joint_type, rot_dof)
   _, _, force_lo, _, _ = _evaluate(model, qpos_lo, qvel)
   numerical = (force_hi - force_lo) / (2 * eps)
   np.testing.assert_allclose(
-      stiffness.detach().numpy()[0, :, rot_dof], numerical,
+      stiffness.detach().cpu().numpy()[0, :, rot_dof], numerical,
       rtol=8e-2, atol=2e-4)
 
 
@@ -1610,10 +1614,12 @@ def test_attached_trilinear_q1_material_uses_pinned_direct_dof_path():
   numerical = (_oracle_passive_force(model, qhi, qvel)
                - _oracle_passive_force(model, qlo, qvel)) / (2*eps)
   np.testing.assert_allclose(
-      tangent.detach().numpy()[0, :, 1], numerical,
+      tangent.detach().cpu().numpy()[0, :, 1], numerical,
       rtol=3e-2, atol=3e-3)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mps_attached_trilinear_q1_material_uses_pinned_direct_dof_path():
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -1667,6 +1673,8 @@ def test_mps_attached_trilinear_q1_material_uses_pinned_direct_dof_path():
       rtol=3e-2, atol=3e-3)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mps_interpolated_material_operator_workspace_matches_cpu():
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -1707,7 +1715,7 @@ def test_mps_interpolated_material_operator_workspace_matches_cpu():
     actual = native_ops[name]
     assert actual.device.type == "mps" and actual.is_contiguous()
     np.testing.assert_allclose(
-        actual.detach().cpu().numpy(), expected.detach().numpy(),
+        actual.detach().cpu().numpy(), expected.detach().cpu().numpy(),
         rtol=2e-4, atol=2e-5)
 
 
@@ -1873,6 +1881,8 @@ def test_mps_matrix_free_flex_material_products_match_dense_oracle(
     flex.apply_material_operator_context_device(context, vector_mps)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mps_interpolated_q1_volume_kernel_matches_pinned_cpu():
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -1944,6 +1954,8 @@ def test_mps_interpolated_q1_volume_kernel_matches_pinned_cpu():
   model.opt.disableflags = 0
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mps_interpolated_q2_volume_kernel_matches_pinned_cpu():
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -2046,7 +2058,7 @@ def test_interpolated_volume_analytic_tangent_matches_qpos_difference(count, dof
   _, _, force_lo, _, _ = _evaluate(model, qpos_lo, qvel)
   numerical = (force_hi - force_lo) / (2 * eps)
   np.testing.assert_allclose(
-      tangent.detach().numpy()[0, :, 3], numerical,
+      tangent.detach().cpu().numpy()[0, :, 3], numerical,
       rtol=2e-2, atol=4e-3)
   qvel_hi, qvel_lo = qvel.copy(), qvel.copy()
   qvel_hi[3] += eps
@@ -2059,6 +2071,8 @@ def test_interpolated_volume_analytic_tangent_matches_qpos_difference(count, dof
       rtol=2e-2, atol=4e-3)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mps_interpolated_q1_shell_bending_matches_pinned_cpu():
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -2136,7 +2150,7 @@ def test_interpolated_q1_shell_bending_matches_pinned_cpu():
   _, _, force_lo, _, _ = _evaluate(model, qpos_lo, qvel)
   numerical = (force_hi - force_lo) / (2 * eps)
   np.testing.assert_allclose(
-      tangent.detach().numpy()[0, :, 3], numerical,
+      tangent.detach().cpu().numpy()[0, :, 3], numerical,
       rtol=3e-2, atol=5e-3)
 
 
@@ -2167,7 +2181,7 @@ def test_interpolated_q2_shell_bending_tangent_matches_pinned_cpu():
   numerical = (_oracle_passive_force(model, qpos_hi, qvel)
                - _oracle_passive_force(model, qpos_lo, qvel)) / (2*eps)
   np.testing.assert_allclose(
-      tangent.detach().numpy()[0, :, 3], numerical,
+      tangent.detach().cpu().numpy()[0, :, 3], numerical,
       rtol=3e-2, atol=2e-4)
 
 
@@ -2178,6 +2192,8 @@ def test_interpolated_q2_shell_bending_tangent_matches_pinned_cpu():
     ("2 2 2", "trilinear", "bend"),
     ("3 3 3", "quadratic", "bend"),
 ])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_public_integrators_step_compiled_flex_material(profile, count, dof, elastic2d):
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")
@@ -2224,6 +2240,8 @@ def test_public_integrators_step_compiled_flex_material(profile, count, dof, ela
   np.testing.assert_allclose(native_qvel, cpu.qvel, rtol=5e-3, atol=5e-4)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mps_interpolated_q2_shell_bending_force_and_tangent():
   if torch is None or not torch.backends.mps.is_available():
     pytest.skip("Apple MPS is unavailable in this test process")

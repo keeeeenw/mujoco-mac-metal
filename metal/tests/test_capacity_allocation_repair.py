@@ -8,6 +8,8 @@ partial device allocation. Same scene across batch sizes must agree
 per-world; broadphase active counts stay distinguished from allocated.
 """
 
+import os
+
 import mujoco
 import numpy as np
 import pytest
@@ -160,6 +162,8 @@ def _needs_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_allocation_gate_rejects_before_allocating_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -170,6 +174,8 @@ def test_allocation_gate_rejects_before_allocating_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_same_scene_across_batch_sizes_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -195,6 +201,8 @@ def test_same_scene_across_batch_sizes_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_active_counts_distinguished_from_allocated_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -336,6 +344,8 @@ def test_paired_correction_uses_existing_tail_without_new_words_cpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_runtime_paired_buffers_match_estimates_gpu():
   # Runtime-owned allocations must equal the pre-allocation estimates on
   # real paired layouts, including batch>1 and the SDF fixture layout.
@@ -419,6 +429,8 @@ def test_pair_const_lo_envelope_host_cpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_pair_const_lo_runtime_inventory_matches_estimates_gpu():
   # GPU-gated inventory proof: runtime-owned pair_const_lo allocation
   # equals the pre-allocation estimate (11 words per pair, 11-word

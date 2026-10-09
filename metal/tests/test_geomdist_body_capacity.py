@@ -33,6 +33,8 @@ def test_cpu_body_distance_witness_is_after_former_capacity():
   np.testing.assert_allclose(data.sensordata[:2], .3, atol=1e-14)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_body_distance_uses_complete_ranges_in_both_orders():
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("explicit native qualification required")
@@ -64,6 +66,8 @@ def test_native_body_distance_uses_complete_ranges_in_both_orders():
 
 
 @pytest.mark.parametrize("native", [False, True])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_fromto_search_cutoff_does_not_clip_world_coordinates(native):
   if native and os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("explicit native qualification required")

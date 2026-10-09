@@ -116,6 +116,8 @@ def _run_case(lib, torch, dim, zone, alpha, zero_low):
                     reason="native cached-residual witness is opt-in")
 @pytest.mark.parametrize("dim", [2, 3])
 @pytest.mark.parametrize("zone,alpha", [("middle", 0.375), ("bottom", 0.9)])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_cached_elliptic_residual_matches_uncached_gpu(
     dim, zone, alpha):
   torch, lib = _compile()

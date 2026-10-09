@@ -62,6 +62,8 @@ def test_shader_aliasing_is_documented():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_aref_low_survives_newton_solve_gpu():
   import sys
   sys.path.insert(0, "metal/tests")

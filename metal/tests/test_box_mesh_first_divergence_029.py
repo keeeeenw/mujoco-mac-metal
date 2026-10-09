@@ -45,6 +45,8 @@ def _gate_model():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_box_press_first_divergence_packet_gpu():
   import mujoco
   import sys
@@ -214,6 +216,8 @@ def _trace_build_paths():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_box_seed_source_indexed_comparison_gpu(tmp_path):
   # Executable same-input, source-indexed CPU/native comparison at the
   # exact press pose (mjc_SDF octree-versus-analytic route, NOT per-face

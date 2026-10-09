@@ -20,6 +20,8 @@ def _scene(mode):
 
 
 @pytest.mark.parametrize("mode", ["cpu", "metal"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_real_carousel_depth_frames_and_independent_rollout(mode):
   if mode == "metal" and os.getenv("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("explicit native qualification required")

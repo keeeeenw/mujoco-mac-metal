@@ -1,4 +1,6 @@
 """CPU source-contract tests for the staged rigid-contact producer split."""
+
+import os
 from pathlib import Path
 
 import pytest
@@ -199,6 +201,8 @@ def _tiny_mesh_sdf_model(mujoco):
       '</body></worldbody></mujoco>')
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_tiny_sdf_producer_pipeline_selector():
   import os
   import mujoco
@@ -214,6 +218,8 @@ def test_native_tiny_sdf_producer_pipeline_selector():
   assert stage._contact_generic_producer is None
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_tiny_generic_producer_pipeline_selector():
   import os
   import mujoco
@@ -232,6 +238,8 @@ def test_native_tiny_generic_producer_pipeline_selector():
   assert stage._contact_sdf_finalize_producer is None
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_tiny_mesh_sdf_producer_pipeline_selector():
   import os
   import mujoco

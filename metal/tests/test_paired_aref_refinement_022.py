@@ -27,6 +27,8 @@ def _needs_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_paired_aref_chain_matches_cpu_reference_gpu():
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -72,6 +74,8 @@ def test_paired_aref_chain_matches_cpu_reference_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_record_dist_lo_and_const_lo_present_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _torus_model()
@@ -97,6 +101,8 @@ def test_record_dist_lo_and_const_lo_present_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_same_state_force_tight_gpu():
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -125,6 +131,8 @@ def test_same_state_force_tight_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_block_sparse_route_keeps_zero_low_planes_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _torus_model()

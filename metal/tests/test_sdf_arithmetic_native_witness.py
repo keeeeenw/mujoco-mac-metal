@@ -131,6 +131,8 @@ def test_exact_piece_oracle_contract_cpu():
 
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="native helper witness is parent-dispatched")
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_exact_piece_witness_gpu():
   """Execute sw_exact_piece from the complete production shader unit."""
   import torch
@@ -425,6 +427,8 @@ def test_existing_plugin_input_rejection_contract_is_unchanged():
 
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="native helper witness is parent-dispatched")
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_witness_calls_production_sdf_arithmetic_helpers():
   import torch
   if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
@@ -517,6 +521,8 @@ def _f32_bits(value):
 
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="native helper witness is parent-dispatched")
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_float32_projection_boundary_gpu():
   """Correctly rounded float32 projection must not double-round residuals.
 

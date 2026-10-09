@@ -51,6 +51,8 @@ def _torus_xml(extra_worldbody="", extra="", opt=""):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_uniform_scalar_fires_mixed_skips_gpu():
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -89,6 +91,8 @@ def test_uniform_scalar_fires_mixed_skips_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_frictionloss_skips_refinement_gpu():
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -118,6 +122,8 @@ def test_frictionloss_skips_refinement_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_elliptic_sdf_skips_refinement_gpu():
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -140,6 +146,8 @@ def test_elliptic_sdf_skips_refinement_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_island_low_ownership_multibody_gpu():
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -256,6 +264,8 @@ def _mixed_two_island_xml(swap=False):
 
 @_needs_gpu()
 @pytest.mark.parametrize("swap", [False, True], ids=["order", "reversed"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mixed_multibody_budget_exhausted_low_ownership_gpu(swap):
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -319,6 +329,8 @@ def test_mixed_multibody_budget_exhausted_low_ownership_gpu(swap):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_per_island_gate_each_early_gpu():
   # Each-early regime for the per-island stopping contract: two uniform
   # islands at maxiter=3 use 2 iterations each (total reported 4, already

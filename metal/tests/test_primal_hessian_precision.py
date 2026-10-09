@@ -1,5 +1,7 @@
 """Float32 replay for the bounded elliptic-Newton Hessian PCG."""
 
+import os
+
 from pathlib import Path
 
 import numpy as np
@@ -698,6 +700,8 @@ def test_native_hessian_witness_dense_j_uses_packed_record_abi():
   np.testing.assert_array_equal(single[single_header[8]:], vector)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_primal_pair_native_witness_executes_production_hessian_and_line_helpers():
   """Run the production MSL H*v and line-polynomial helpers on an exact quad."""
   import pytest
@@ -762,6 +766,8 @@ def test_primal_pair_native_witness_executes_production_hessian_and_line_helpers
       rtol=2e-6, atol=2e-7)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_hager_zhang_keeps_outer_cg_history_and_direction_paired():
   """The production HZ helper retains low words and excludes other islands."""
   import pytest
@@ -817,6 +823,8 @@ def test_native_hager_zhang_keeps_outer_cg_history_and_direction_paired():
                              rtol=2e-6, atol=2e-8)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_paired_hessian_operator_matches_basis_reconstruction():
   """Paired H*v must match applying the operator captured column-by-column."""
   import pytest
@@ -1005,6 +1013,8 @@ def test_cancellation_pair_is_canonicalized_before_mass_preconditioning():
   assert "rhs_all_active_zero" in dispatch
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_production_pcg_scale_witness():
   """Run the production PCG routine at tiny, huge and ill-scaled magnitudes."""
   import pytest

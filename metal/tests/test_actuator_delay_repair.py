@@ -8,6 +8,8 @@ wiring and admission stay pending coordination with in-flight simulation
 state work; guards are unchanged by this commit.
 """
 
+import os
+
 import numpy as np
 import pytest
 
@@ -184,6 +186,8 @@ def _needs_gpu():
 
 @_needs_gpu()
 @pytest.mark.parametrize("interp", [0, 1, 2])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_device_delay_matches_host_reference_gpu(interp):
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -207,6 +211,8 @@ def test_device_delay_matches_host_reference_gpu(interp):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_device_delay_snapshot_restore_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -232,6 +238,8 @@ def test_device_delay_snapshot_restore_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_delayed_step_response_onset_gpu():  # D1 integrated delay: constant control from t=0 with a 4 ms ZOH delay
   # produces zero force until the first stamp at/after the delay, then the
   # live value — onset pinned to the exact step (zero-state rings match
@@ -263,6 +271,8 @@ def test_delayed_step_response_onset_gpu():  # D1 integrated delay: constant con
 
 @_needs_gpu()
 @pytest.mark.parametrize("autoreset", [False, True])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_delay_lifecycle_and_failure_gpu(autoreset):
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -347,6 +357,8 @@ def test_delay_lifecycle_and_failure_gpu(autoreset):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_rk4_delayed_step_response_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"

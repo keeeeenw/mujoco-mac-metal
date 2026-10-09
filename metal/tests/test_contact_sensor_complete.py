@@ -64,6 +64,8 @@ def test_contact_host_oracle_all_fields_slots_and_detected_inactive_contacts(ina
                                        ("pyramidal", 6), ("elliptic", 6)])
 @pytest.mark.parametrize("inactive", [False, True])
 @pytest.mark.parametrize("cutoff",[0.,.2])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_actual_native_contact_query_all_matches_slots_fields_and_reductions(cone, condim, inactive,cutoff):
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("explicit native qualification required")

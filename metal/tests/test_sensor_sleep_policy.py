@@ -1,5 +1,7 @@
 """Pinned sensor sleep-state output-retention policy fixtures."""
 
+import os
+
 import numpy as np
 import mujoco
 import pytest
@@ -163,6 +165,8 @@ def test_sensor_lowering_covers_pinned_object_families():
   assert np.all(sensor_refs == -1)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_sensor_awake_mask_native_matches_pinned_cpu_oracle():
   torch = pytest.importorskip("torch")
   if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):

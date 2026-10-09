@@ -7,6 +7,8 @@ intentional omissions, not gaps). Later commits add multi-contact mesh
 manifolds with identity, missing valid pairs, margins/settings, and demos.
 """
 
+import os
+
 import mujoco
 import numpy as np
 import pytest
@@ -74,6 +76,8 @@ def _needs_gpu():
 
 @_needs_gpu()
 @pytest.mark.parametrize("condim", [3, 4, 6])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_sdf_condim_force_parity_gpu(condim):
   # R05-3: SDF condim 4/6 qualify with the 013 gates (translation 15% +
   # 0.1 N, rotation at force scale). Frictional rows engage on the press.
@@ -115,6 +119,8 @@ def test_sdf_condim_force_parity_gpu(condim):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mesh_manifold_force_sensor_gpu():
   # R05-3 = R01 re-qualification on the new manifolds: force/torque/
   # accelerometer on a mesh-plane face press agree with the CPU oracle
@@ -163,6 +169,8 @@ def test_mesh_manifold_force_sensor_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mesh_pallet_asymmetric_settle_gpu():
   # R05-3 mesh pallet with asymmetric loading: mesh box deck plus a welded
   # corner load settles from a tilt; rest pose matches the CPU oracle.
@@ -223,6 +231,8 @@ def test_hfield_positive_margin_near_contact_cpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_hfield_positive_margin_parity_gpu():
   # R05-2: native margin detection matches the CPU oracle (counts, depths,
   # normals) in near-contact and in press; margin 0 unchanged.
@@ -257,6 +267,8 @@ def test_hfield_positive_margin_parity_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mesh_plane_manifold_counts_and_wrench_gpu():
   # Bounded native manifold (R05-1): the cube face yields true hull-vert
   # witnesses with the pinned normal/depths; slot identity is deterministic
@@ -309,6 +321,8 @@ def test_mesh_plane_manifold_counts_and_wrench_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mesh_manifold_cardinality_change_and_settle_gpu():
   # Edge/corner transition changes manifold cardinality; warm starts stay
   # finite and the settle trajectory tracks the CPU oracle.
@@ -347,6 +361,8 @@ def test_mesh_manifold_cardinality_change_and_settle_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_assembly_puzzle_boundaries_counterfactuals_and_containment_gpu():
   """Finding 3 (R05/R09): assembly puzzle boundary and piece collision qualification.
 

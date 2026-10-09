@@ -8,6 +8,8 @@ outputs. TACTILE/PLUGIN/USER stay deferred with classified boundaries;
 SDF rays/distances stay on the plugin path with an explicit rejection test.
 """
 
+import os
+
 import mujoco
 import numpy as np
 import pytest
@@ -108,6 +110,8 @@ def _needs_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_sdf_ray_no_hit_parity_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -129,6 +133,8 @@ def test_sdf_ray_no_hit_parity_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_camprojection_device_parity_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -156,6 +162,8 @@ def test_camprojection_device_parity_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_camprojection_rotated_camera_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"

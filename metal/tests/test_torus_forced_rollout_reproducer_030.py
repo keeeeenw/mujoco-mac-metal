@@ -68,6 +68,8 @@ def _forced_rollout(nsteps=8):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_forced_rollout_divergence_curve_gpu():
   _, _, _, curve = _forced_rollout()
   assert len(curve) == 8
@@ -86,6 +88,8 @@ def test_forced_rollout_divergence_curve_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_same_state_forward_separated_from_trajectory_gpu():
   import sys
   sys.path.insert(0, "metal/tests")

@@ -29,6 +29,8 @@ def test_line_alpha_fixture_distinguishes_paired_and_float_transport():
   assert abs(exact_updated - collapsed_updated) > 4.0e-3
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_line_alpha_witness_retains_source_precision():
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("native MPS execution is opt-in via MUJOCO_METAL_RUN_GPU=1")

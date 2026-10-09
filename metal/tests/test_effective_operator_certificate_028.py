@@ -81,6 +81,8 @@ def _read_system(s, cc, nr):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_high_only_diagnostic_and_paired_multiplier_residual_gpu():
   # Torus, Newton, ordinary budget: uniform scalar-contact system with live
   # low words (SDF Jacobian corrections), so polish runs and the paired
@@ -137,6 +139,8 @@ def test_high_only_diagnostic_and_paired_multiplier_residual_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_paired_residual_mixed_system_gpu():
   # Elliptic-cone SDF system: refinement stays off globally, but the
   # paired-operator check still runs over the primal-produced lows with
@@ -197,6 +201,8 @@ def test_paired_residual_mixed_system_gpu():
 @_needs_gpu()
 @pytest.mark.parametrize("tol,budget", [(1e-2, 100), (1e-8, 1)],
                          ids=["loose", "exhausted"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_polish_semantics_tolerance_and_budget_gpu(tol, budget):
   # Loose tolerance: early cost-improvement stop keeps pinned behavior
   # (fewer iterations, honest small diagnostic, oracle agreement).
@@ -239,6 +245,8 @@ def test_polish_semantics_tolerance_and_budget_gpu(tol, budget):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_published_force_balance_paired_gpu():
   # Offline force-balance check of the ACTUAL published values (no new
   # kernel): M @ (qacc+qacc_lo) vs (J+J_lo)' @ (lam+lam_lo), all pairs

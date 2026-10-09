@@ -188,6 +188,8 @@ def test_cpu_source_hessian_and_force_fixtures_cover_cone_zones(dim, zone):
 
 @pytest.mark.parametrize("dim", [3, 4, 6])
 @pytest.mark.parametrize("zone", ["top", "middle", "bottom", "zero_tangent"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_paired_hessian_matches_source_formula(dim, zone):
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("native MPS execution is opt-in via MUJOCO_METAL_RUN_GPU=1")
@@ -223,6 +225,8 @@ def test_native_paired_hessian_matches_source_formula(dim, zone):
 
 @pytest.mark.parametrize("dim", [3, 4, 6])
 @pytest.mark.parametrize("zone", ["top", "middle", "bottom", "zero_tangent"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_paired_force_matches_source_formula(dim, zone):
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("native MPS execution is opt-in via MUJOCO_METAL_RUN_GPU=1")

@@ -77,6 +77,8 @@ def test_host_cloth_reference_precision_and_actual_owned_capacity():
   _run("cpu")
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_cloth_reference_precision_and_actual_owned_capacity():
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1" or not torch.backends.mps.is_available():
     pytest.skip("explicit native Metal qualification required")

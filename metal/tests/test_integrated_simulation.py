@@ -463,6 +463,8 @@ def test_integrated_simulation_plan_runtime_agreement():
   assert "sensordata" not in audit_empty_names
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_integrated_simulation_capacity_boundary_and_overflow_rejection():
   from mujoco_metal.capacity import CapacityLimits
   from mujoco_metal.coupled_constraints import lower_coupled_constraints

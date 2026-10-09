@@ -2,6 +2,8 @@
 # Licensed under the Apache License, Version 2.0.
 """R06/D3: stateful RK4 activation-stage composition (failing-first)."""
 
+import os
+
 import mujoco
 import numpy as np
 import pytest
@@ -32,6 +34,8 @@ def _needs_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_rk4_filter_activation_parity_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -58,6 +62,8 @@ def test_rk4_filter_activation_parity_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_rk4_muscle_activation_parity_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"

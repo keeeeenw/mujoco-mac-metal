@@ -124,6 +124,8 @@ def test_cpu_source_line_formula_is_finite_and_zone_sensitive(dim, zone, alpha):
 @pytest.mark.parametrize("zone,alpha", [("middle",.375),
     ("top_to_middle",.7), ("middle_to_bottom",.8), ("bottom",.3),
     ("zero_tangent",.5)])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_pair_line_matches_source_cost_and_derivatives(dim,zone,alpha):
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("native MPS execution is opt-in via MUJOCO_METAL_RUN_GPU=1")

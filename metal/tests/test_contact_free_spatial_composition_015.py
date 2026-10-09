@@ -76,6 +76,8 @@ def test_actual_spatial_constructor_allocates_force_flags_in_dimension_abi_cpu(m
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="opt-in native trajectory qualification")
 @pytest.mark.parametrize("integrator", ["Euler", "RK4"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_contact_free_mixed_spatial_force_mass_trajectory_and_replay_gpu(integrator):
   from mujoco_metal import MetalSimulation
 

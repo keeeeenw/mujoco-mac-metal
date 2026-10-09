@@ -101,6 +101,8 @@ def _needs_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_disabled_actuation_preserves_activation_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -151,6 +153,8 @@ def _failure_atomicity_model():
 
 @_needs_gpu()
 @pytest.mark.parametrize("fail_stage", ["force", "constraint", "integration"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_failed_world_rolls_back_sensors_warmstarts_and_state_gpu(fail_stage):
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -273,6 +277,8 @@ def _full_state(sim):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_simulation_snapshot_replay_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _contact_model()
@@ -305,6 +311,8 @@ def test_simulation_snapshot_replay_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_copy_environment_reproduces_trajectory_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _contact_model()
@@ -325,6 +333,8 @@ def test_copy_environment_reproduces_trajectory_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_query_twins_have_identical_next_steps_gpu():
   from mujoco_metal.simulation import MetalSimulation
   # Includes FORCE/TORQUE and accelerometer sensors (executes the _has_acc_sensors branch)
@@ -367,6 +377,8 @@ def test_query_twins_have_identical_next_steps_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_invalid_restore_leaves_state_unchanged_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _contact_model(with_acc_sensors=True)
@@ -413,6 +425,8 @@ def test_invalid_restore_leaves_state_unchanged_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_selected_world_restore_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _contact_model(with_acc_sensors=True)
@@ -451,6 +465,8 @@ def test_selected_world_restore_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_fresh_snapshot_restores_and_replays_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _contact_model(with_acc_sensors=True)
@@ -495,6 +511,8 @@ def test_fresh_snapshot_restores_and_replays_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_retained_step_and_zero_solves_on_assembled_system_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _contact_model(with_acc_sensors=True)
@@ -528,6 +546,8 @@ def test_retained_step_and_zero_solves_on_assembled_system_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_restore_then_randomize_stays_coherent_gpu():
   from mujoco_metal.simulation import MetalSimulation
   rng = np.random.default_rng(7)
@@ -554,6 +574,8 @@ def test_restore_then_randomize_stays_coherent_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_raw_reset_keeps_warmstart_simulator_reset_clears_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _contact_model()
@@ -581,6 +603,8 @@ def test_raw_reset_keeps_warmstart_simulator_reset_clears_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_warmstart_invalidation_forces_fresh_assembly_and_caller_immutability_gpu():
   """Finding 1 (R03/R04): warmstart mutations invalidate cached assembly.
 
@@ -632,6 +656,8 @@ def test_warmstart_invalidation_forces_fresh_assembly_and_caller_immutability_gp
 
 @_needs_gpu()
 @pytest.mark.parametrize("integrator", ["Euler", "RK4"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_first_step_failure_nan_inf_sensor_rollback_and_all_failed_omission_gpu(integrator):
   """Finding 2 (R02): first failed step does not retain NaN/Inf sensor values.
 

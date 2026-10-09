@@ -65,6 +65,8 @@ def test_fixture_reproduces_compiled_mesh_matrix_residual_witness():
 
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="set MUJOCO_METAL_RUN_GPU=1 for native Metal")
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_fk_geom_xmat_retains_compiled_mesh_source_residual():
   import torch
   if not torch.backends.mps.is_available():

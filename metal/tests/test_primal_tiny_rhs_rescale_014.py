@@ -223,6 +223,8 @@ def test_cpu_arbitrary_mantissa_half_boundary_vectors_use_exact_fraction_oracle(
     assert np.all((expected_words[selected]&0x7fffffff)<=1)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_arbitrary_mantissa_half_boundary_vector_matches_exact_oracle():
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("native MPS execution is opt-in via MUJOCO_METAL_RUN_GPU=1")
@@ -338,6 +340,8 @@ def test_cpu_exact_rhs_pair_rne_boundaries(case,expected_word):
     "normal_midpoint_at_neg","normal_midpoint_above_neg",
     "invalid_zero_scale","invalid_subnormal_scale",
     "invalid_infinite_scale"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_tiny_rhs_rescale_keeps_a_finite_solution(case):
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("native MPS execution is opt-in via MUJOCO_METAL_RUN_GPU=1")

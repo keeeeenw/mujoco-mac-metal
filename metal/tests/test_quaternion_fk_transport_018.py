@@ -264,6 +264,8 @@ def _full_qpos_cases(model):
 
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="set MUJOCO_METAL_RUN_GPU=1 for native Metal")
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_fk_sameframe_all_modes_and_dynamic_joint_frames():
   import torch
   if not torch.backends.mps.is_available():
@@ -318,6 +320,8 @@ def test_native_fk_sameframe_all_modes_and_dynamic_joint_frames():
 
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="set MUJOCO_METAL_RUN_GPU=1 for native Metal")
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_fk_world_mask_and_cache_invalidation_preserve_other_world():
   import torch
   if not torch.backends.mps.is_available():

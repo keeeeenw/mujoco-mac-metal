@@ -1,5 +1,7 @@
 """Narrowphase active-slot links used by MuJoCo tree sleep scheduling."""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -200,6 +202,8 @@ def test_pair_tree_ids_follow_compiled_geom_body_and_tree_maps():
       [[-1, 0], [0, 1], [1, 1]])
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_mps_link_map_native_batch_local():
   torch = pytest.importorskip("torch")
   from mujoco_metal.row_compaction import compact_flags

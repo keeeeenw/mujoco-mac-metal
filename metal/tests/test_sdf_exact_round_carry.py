@@ -365,6 +365,8 @@ def _run_producer(lib, cases, op_override=None):
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="native carry witness is parent-dispatched")
 @pytest.mark.parametrize("unit", ["helper-only", "complete"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_limb_carry_helper_and_wrapper_gpu(unit):
   lib = _compile(_sources()[unit])
   oks, tri_h, tri_w = _run_words(lib, _LIMB_WORD_ROWS)
@@ -390,6 +392,8 @@ def test_native_limb_carry_helper_and_wrapper_gpu(unit):
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="native carry witness is parent-dispatched")
 @pytest.mark.parametrize("unit", ["helper-only", "complete"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_producer_duplicates_gpu(unit):
   lib = _compile(_sources()[unit])
   failures = _run_producer(lib, _PRODUCER_CASES)
@@ -399,6 +403,8 @@ def test_native_producer_duplicates_gpu(unit):
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="native carry witness is parent-dispatched")
 @pytest.mark.parametrize("unit", ["helper-only", "complete"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_fma64_device_fixture_gpu(unit):
   lib = _compile(_sources()[unit])
   cases = [("fma64-%d" % i, 2, _split3(a), _split3(b), _split3(c))

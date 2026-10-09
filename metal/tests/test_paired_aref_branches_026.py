@@ -166,6 +166,8 @@ def _check_contact_transition(xml, etier):
     "clamp-equal-d0d1",
     "clamp-low-bound",
 ])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_paired_aref_branch_variants_gpu(variant):
   import mujoco
   flag = int(mujoco.mjtEnableBit.mjENBL_OVERRIDE)
@@ -420,6 +422,8 @@ def _check_shallow(model, etier):
 
 @_needs_gpu()
 @pytest.mark.parametrize("condim", ["3", "4", "6"], ids=["c3", "c4", "c6"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_friction_rows_mapped_with_moving_state_gpu(condim):  # Position-matched ALL-ROW comparison with nonzero tangent/spin/rolling
   # velocity: the 019 row-mapped oracle (J/R/ar/rhs/W per contact row plus
   # qacc/qfrc) runs on pyramidal condim 3/4/6 SDF fixtures with moving
@@ -468,6 +472,8 @@ def test_friction_rows_mapped_with_moving_state_gpu(condim):  # Position-matched
 @_needs_gpu()
 @pytest.mark.parametrize("which", ["solref", "solimp"],
                          ids=["iref", "iimp"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_override_lifecycle_rebuild_gpu(which):
   # Documented lifecycle contract (no auto-recompile): mutating override
   # options after construction makes the next state/cache-touching call
@@ -544,6 +550,8 @@ def test_override_lifecycle_rebuild_gpu(which):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_elliptic_friction_rows_mapped_with_moving_state_gpu():
   # Distinct non-default elliptic solref/solreffriction with nonzero
   # tangent/spin velocity: the elliptic cone block (normal + tangent rows
@@ -592,6 +600,8 @@ def test_elliptic_friction_rows_mapped_with_moving_state_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_elliptic_distinct_reference_coefficients_mapped_gpu():
   # Distinct independently chosen normal/friction reference coefficients
   # via explicit pair attributes (solref vs solreffriction differ, not

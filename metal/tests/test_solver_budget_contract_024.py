@@ -70,6 +70,8 @@ def _row_map(s, d, npos):
 @pytest.mark.parametrize("solver", [2, 1], ids=["newton", "cg"])
 @pytest.mark.parametrize("budget", [0, 1, 2, 100])
 @pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_budget_contract_matches_oracle_gpu(solver, budget, warm):
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -149,6 +151,8 @@ def test_budget_contract_matches_oracle_gpu(solver, budget, warm):
 @_needs_gpu()
 @pytest.mark.parametrize("noslip", [0, 2], ids=["noslip0", "noslip2"])
 @pytest.mark.parametrize("condim", [1, 3], ids=["condim1", "condim3"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_noslip_budget_contract_gpu(noslip, condim):
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -197,6 +201,8 @@ def _torus_condim3_xml():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_refinement_fires_only_on_early_stop_gpu():
   from mujoco_metal.simulation import MetalSimulation
   import mujoco
@@ -254,6 +260,8 @@ def test_refinement_fires_only_on_early_stop_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_zero_low_control_analytic_gpu():
   import mujoco
   from mujoco_metal.simulation import MetalSimulation
@@ -313,6 +321,8 @@ def _install_warm(sim, data, kind, qpos):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_genuine_warmstart_population_installation_gpu():
   # The public qacc warmstart is populated by stepping (not by assembly),
   # cleared by reset, and installed verbatim by the setter on both sides.
@@ -351,6 +361,8 @@ def test_genuine_warmstart_population_installation_gpu():
 @pytest.mark.parametrize("solver", [2, 1], ids=["newton", "cg"])
 @pytest.mark.parametrize("budget", [0, 1, 2, 100])
 @pytest.mark.parametrize("warm", ["traj", "bad"], ids=["wtraj", "wbad"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_genuine_warmstart_matched_budgets_gpu(solver, budget, warm):
   # SAME represented warmstart installed on both sides (trajectory-produced
   # history or a deliberately different constant), compared at every
@@ -442,6 +454,8 @@ def test_genuine_warmstart_matched_budgets_gpu(solver, budget, warm):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_warmstart_per_island_stopping_gpu():
   # Two-island uniform fixture at an exhausted per-island budget with
   # trajectory warmstart: per-island early-stop accounting holds, every
@@ -502,6 +516,8 @@ def test_warmstart_per_island_stopping_gpu():
 
 @_needs_gpu()
 @pytest.mark.parametrize("solver", [2, 1], ids=["newton", "cg"])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_warmstart_disabled_ignores_values_gpu(solver):
   # With mjDSBL_WARMSTART, installed nonzero values are ignored on both
   # sides: warm-set is bit-identical to cold, and both match the oracle.
@@ -559,6 +575,8 @@ def test_warmstart_disabled_ignores_values_gpu(solver):
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_warmstart_restore_and_world_isolation_gpu():
   # Selective warmstart with masked-world isolation plus snapshot/restore
   # preservation: world 1 (far/masked) keeps zero warmstart and zero

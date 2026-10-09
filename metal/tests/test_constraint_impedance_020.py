@@ -145,6 +145,8 @@ def test_component_rhs_contraction_fixture_is_batched_and_row_major():
 
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="opt-in MPS kernel qualification")
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_exact_diagonal_and_cone_impedance_component_rhs():
   torch = pytest.importorskip("torch")
   if not torch.backends.mps.is_available():

@@ -45,6 +45,8 @@ def test_cut_fixture_really_exercises_restricted_mass_operator():
   assert np.linalg.det(two_dof[1][np.ix_(two_dof[6], two_dof[6])]) == 21.0
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_native_paired_preconditioner_matches_restricted_binary64_system():
   if os.environ.get("MUJOCO_METAL_RUN_GPU") != "1":
     pytest.skip("native MPS execution is opt-in via MUJOCO_METAL_RUN_GPU=1")

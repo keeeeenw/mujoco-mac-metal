@@ -8,6 +8,8 @@ instead of rejecting those models. Guards remain for fluid Jacobians and
 velocity-dependent actuator forces.
 """
 
+import os
+
 import mujoco
 import numpy as np
 import pytest
@@ -144,6 +146,8 @@ def test_ellipsoid_fluid_derivative_matches_fd_cpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_automatic_derivative_native_parity_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -183,6 +187,8 @@ def test_automatic_derivative_native_parity_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_automatic_derivative_pinned_step_parity_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -247,6 +253,8 @@ def test_automatic_derivative_pinned_step_parity_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_fluid_implicitfast_trajectory_parity_gpu():  # R06d end-to-end: native solve with automatic derivatives (passive +
   # fluid) plus pinned advance math reproduces CPU implicitfast stepping
   # on a viscous + dense fluid hinge.
@@ -291,6 +299,8 @@ def test_fluid_implicitfast_trajectory_parity_gpu():  # R06d end-to-end: native 
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_program_tendon_auto_derivative_gpu():
   # R06/D2 program level: run_device_auto with a damped-tendon tangent
   # matches the oracle fed with the host reference derivative.
@@ -346,6 +356,8 @@ def test_program_tendon_auto_derivative_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_integrated_implicitfast_auto_trajectory_gpu():
   # R06/D2 integrated wiring: an implicitfast-profile simulation with
   # polynomial damping steps with natively assembled derivatives and

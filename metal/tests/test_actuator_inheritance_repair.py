@@ -8,6 +8,8 @@ armature/damping is supported via tendon stage folding; delay and history
 stay rejected.
 """
 
+import os
+
 import mujoco
 import numpy as np
 import pytest
@@ -72,6 +74,8 @@ def _needs_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_actuator_armature_damping_parity_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -106,6 +110,8 @@ def test_actuator_armature_damping_parity_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_actuator_dampingpoly_parity_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -137,6 +143,8 @@ def test_actuator_dampingpoly_parity_gpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_tendon_armature_damping_parity_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -207,6 +215,8 @@ def test_actuator_delay_history_admitted_cpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_multiple_actuators_and_gear_signs_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -274,6 +284,8 @@ def test_ball_and_free_joint_actuator_inheritance_cpu():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_disabled_actuation_semantics_gpu():
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -313,6 +325,8 @@ def test_model_rebuilding_with_actuator_inheritance():
 
 
 @_needs_gpu()
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_inherited_vs_explicit_damping_equivalence_gpu():
   # Pinned inheritance semantics: actuator damping d with gear g on a joint
   # behaves exactly like dof damping d*g^2 (and armature likewise). Two
