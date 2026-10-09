@@ -9,6 +9,7 @@ candidate capacities do not restrict this scene-query path.
 """
 from dataclasses import dataclass
 from pathlib import Path
+from functools import lru_cache
 import numbers
 
 import mujoco
@@ -54,6 +55,7 @@ def lower_ray_scene(model):
   attrs = np.zeros((max(ng, 1), 5), dtype=np.float32)
   attrs_low = np.zeros_like(attrs)
   hull, octree = [], []
+  octree_meshes = {}
   for g in range(ng):
     body, mat = int(model.geom_bodyid[g]), int(model.geom_matid[g])
     alpha = model.geom_rgba[g, 3] if mat < 0 else model.mat_rgba[mat, 3]
@@ -101,11 +103,11 @@ def lower_ray_scene(model):
         adr, count = int(model.mesh_octadr[mesh]), int(model.mesh_octnum[mesh])
         if adr < 0 or count <= 0 or count >= 2**24:
           raise ValueError("SDF geom needs a compiled octree or native plugin")
-        octinfo[g] = [len(octree), count]
-        octree.extend(np.concatenate([
-            model.oct_child[adr:adr+count].reshape(-1),
-            model.oct_aabb[adr:adr+count].reshape(-1),
-            model.oct_coeff[adr:adr+count].reshape(-1)]).astype(np.float32).tolist())
+        if mesh not in octree_meshes:
+          from mujoco_metal.compiled_octree import compiled_octree_block
+          octree_meshes[mesh] = (len(octree), count)
+          octree.extend(compiled_octree_block(model, adr, count).tolist())
+        octinfo[g] = octree_meshes[mesh]
   fields = {
       'metadata': metadata, 'sizes': np.asarray(model.geom_size) if ng else np.zeros((1, 3)),
       'hull_info': info, 'hull': hull or [0.0], 'octree_info': octinfo,
@@ -123,12 +125,16 @@ def lower_ray_scene(model):
   return RayScene(ng, **fields)
 
 
-def _compile_ray_library(torch):
+def _ray_shader_source():
   directory = Path(__file__).parent / 'shaders'
-  from mujoco_metal.coupled_constraints import _COLLISION_SHADER, _CONVEX_SHADER, _SDF_SHADER
-  paths = (_COLLISION_SHADER, _CONVEX_SHADER, _SDF_SHADER,
-           directory/'sensors_spatial.metal', directory/'plugin_sdf.metal', directory/'ray_queries.metal')
-  return torch.mps.compile_shader('\n'.join(path.read_text() for path in paths))
+  from mujoco_metal.sensors import _spatial_shader_source
+  return '\n'.join((_spatial_shader_source(entry=None),
+                    (directory/'ray_queries.metal').read_text()))
+
+
+@lru_cache(maxsize=1)
+def _compile_ray_library(torch):
+  return torch.mps.compile_shader(_ray_shader_source())
 
 
 class MetalRayQueries:

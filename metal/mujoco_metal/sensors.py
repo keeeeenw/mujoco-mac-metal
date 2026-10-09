@@ -29,9 +29,11 @@ def _spatial_shader_source(entry=0):
   root = _SHADER.parent
   # SDF octree and transform operations consume the shared retained-precision
   # helpers, including plugin-free queries. Define them before either user.
-  if entry not in (0, 1, 2, 3, 4):
+  if entry not in (None, 0, 1, 2, 3, 4):
     raise ValueError("unknown spatial sensor entry")
-  selector = "" if entry == 0 else f"#define MUJOCO_METAL_SENSOR_ENTRY {entry}"
+  # None exposes helpers only to other native queries, without instantiating
+  # unrelated sensor kernels. The default still exposes all sensor entries.
+  selector = "" if entry == 0 else f"#define MUJOCO_METAL_SENSOR_ENTRY {entry or 0}"
   return "\n".join((
       selector,
       (root / "collision_primitives.metal").read_text(),
@@ -74,24 +76,6 @@ def tactile_workspace_sizes(model):
   return {"meta": 7 * max(taxels, 1), "frames": 10 * max(taxels, 1),
           "oct_info": 2 * max(int(model.ngeom), 1), "oct": max(50 * nodes, 1),
           "dims": 8}
-
-
-def _tactile_octree_block(model, adr, count):
-  """The shared SDF decoder consumes children and three source-word planes."""
-  from mujoco_metal.model import require_triple_word_domain
-  child = np.asarray(model.oct_child[adr:adr+count]).reshape(-1)
-  aabb = require_triple_word_domain(model.oct_aabb[adr:adr+count],
-                                   what="tactile octree AABB")
-  coeff = require_triple_word_domain(model.oct_coeff[adr:adr+count],
-                                    what="tactile octree coefficients")
-  if child.size != 8*count or aabb.size != 6*count or coeff.size != 8*count:
-    raise ValueError("invalid compiled tactile octree layout")
-  high = [v.astype(np.float32) for v in (aabb, coeff)]
-  low = [(v-h.astype(np.float64)).astype(np.float32)
-         for v, h in zip((aabb, coeff), high)]
-  tail = [(v-h.astype(np.float64)-l.astype(np.float64)).astype(np.float32)
-          for v, h, l in zip((aabb, coeff), high, low)]
-  return np.concatenate([child.astype(np.float32), *high, *low, *tail])
 
 
 _SUPPORTED = {
@@ -1998,7 +1982,8 @@ class SensorProgram:
         adr, count = int(model.mesh_octadr[mesh]), int(model.mesh_octnum[mesh])
         if count <= 0 or count >= 2**24:
           raise ValueError("tactile octree must have a positive float32-exact node count")
-        block = _tactile_octree_block(model, adr, count)
+        from mujoco_metal.compiled_octree import compiled_octree_block
+        block = compiled_octree_block(model, adr, count)
         offsets[mesh] = cursor, count
         cursor += block.size
         blocks.append(block)

@@ -457,11 +457,13 @@ are packed dynamically; non-convex mesh rays do not require convex contact
 hulls. Model compilation and asset preprocessing remain host operations.
 The constructor captures model constants; rebuild it after model edits. Runtime
 rays and nearest-hit decisions execute on Metal without CPU physics fallback.
+Plugin-free SDF meshes retain all three compiled octree word planes in the
+shared decoder layout, with one captured block for each shared mesh asset.
 The query memory budget covers its captured assets, owned outputs and shader
 parameter bindings. Caller inputs, simulation storage and temporary saved
 forward workspaces are additional memory. Source gates compare default and
 provided-stage queries, asset/filter behavior, non-convex mesh holes, SDFs,
-small directions, heightfield side hits and capacity rejection with the pinned
+small directions, plugin-free octree hits and misses, heightfield side hits and capacity rejection with the pinned
 CPU engine; they also check prepared-stage and state preservation.
 These development APIs require source qualification separately from release
 wheel coverage. They do not add a Metal renderer.
