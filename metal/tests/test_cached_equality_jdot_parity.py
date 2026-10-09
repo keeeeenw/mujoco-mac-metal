@@ -92,7 +92,7 @@ def test_native_articulated_equality_rows_survive_overwritten_pose_workspaces(
   nr, ne = cc.descriptor.nr, int(data.ne)
   def current_rows():
     debug = cc._workspace["workspace_debug"].reshape(1, cc._debug_stride)
-    return {"J": cc._workspace["workspace_J"].reshape(1, nr, model.nv)[0, :ne].cpu().numpy().copy(),
+    return {"J": cc.materialize_jacobian()[0, :ne].cpu().numpy().copy(),
             "R": debug[0, nr*nr:nr*nr+ne].cpu().numpy().copy(),
             "aref": debug[0, nr*nr+nr:nr*nr+nr+ne].cpu().numpy().copy()}
   for name, value in current_rows().items():
