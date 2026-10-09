@@ -392,13 +392,16 @@ def test_cpu_reset_orchestration_matches_pinned_cold_defaults_without_torch():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_native_integrated_rk4_sleep_cached_position_lifecycle_matches_mj_step():
+@pytest.mark.parametrize("autoreset", [False, True])
+def test_native_integrated_rk4_sleep_cached_position_lifecycle_matches_mj_step(autoreset):
   """Exercise public RK4 sleep with cached X3 position and restored X0 state."""
   import torch
   from mujoco_metal import MetalSimulation
   from mujoco_metal.sleep_schedule import initial_sleep_state
 
   model = _rk4_sleep_model()
+  if not autoreset:
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_AUTORESET)
 
   batch, dt = 2, float(model.opt.timestep)
   qpos = np.tile(np.asarray(model.qpos0, dtype=np.float32), (batch, 1))
@@ -557,9 +560,18 @@ def test_native_integrated_rk4_sleep_cached_position_lifecycle_matches_mj_step()
   after = sim.state.snapshot()
   assert int(failed_status[0].item()) == 0
   assert int(failed_status[1].item()) != 0
-  np.testing.assert_array_equal(after.qpos[1], before.qpos[1])
-  np.testing.assert_array_equal(after.qvel[1], before.qvel[1])
-  np.testing.assert_array_equal(after.time[1], before.time[1])
+  if autoreset:
+    # Match the actual pinned BADQACC reset/forward operation; default
+    # recovery does not preserve the pre-failure physical state.
+    refs[1].qacc[:] = np.nan
+    mujoco.mj_checkAcc(model, refs[1])
+    for field in ("qpos", "qvel", "time"):
+      np.testing.assert_array_equal(getattr(after, field)[1],
+          np.asarray(getattr(refs[1], field), dtype=np.float32))
+  else:
+    for field in ("qpos", "qvel", "time"):
+      np.testing.assert_array_equal(getattr(after, field)[1],
+                                    getattr(before, field)[1])
   refs[0].qfrc_applied[:] = 0
   mujoco.mj_step(model, refs[0])
   sim.reset(env_ids=[1])
@@ -741,7 +753,7 @@ def test_pinned_forward_skip_gravcomp_uses_cached_final_stage_pose():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_rk4_sensor_outer_forward_calls_force_callback_four_times_and_error_once():
+def test_rk4_sensor_outer_forward_commits_four_force_stages_and_error_once():
   import torch
   from mujoco_metal import MetalSimulation
   from mujoco_metal.extensions import NativePlugin, PluginType, default_registry
@@ -750,6 +762,7 @@ def test_rk4_sensor_outer_forward_calls_force_callback_four_times_and_error_once
     def __init__(self):
       super().__init__("rk4_counter", PluginType.FORCE)
       self.attempts = 0
+      self.masks = []
       self.fail = False
 
     def init(self, model, batch_size=1, device=None):
@@ -758,6 +771,8 @@ def test_rk4_sensor_outer_forward_calls_force_callback_four_times_and_error_once
 
     def run_device(self, state, **kwargs):
       self.attempts += 1  # Diagnostic invocation count, outside physics state.
+      mask = kwargs.get("compute_mask")
+      self.masks.append(None if mask is None else mask.detach().cpu().numpy().copy())
       self.count.add_(1)
       if self.fail:
         raise TypeError("force callback body failed")
@@ -778,6 +793,10 @@ def test_rk4_sensor_outer_forward_calls_force_callback_four_times_and_error_once
     def restore_masked(self, snapshot, accepted_mask):
       self.count.copy_(torch.where(accepted_mask, self.count, snapshot))
 
+    def reset_masked(self, reset_mask):
+      self.count.copy_(torch.where(reset_mask, torch.zeros_like(self.count),
+                                   self.count))
+
   model = mujoco.MjModel.from_xml_string('''<mujoco><option integrator="RK4"
     gravity="0 0 0"><flag contact="disable"/></option><worldbody><body>
     <joint name="j"/><geom type="sphere" size=".1" mass="1"/>
@@ -788,12 +807,21 @@ def test_rk4_sensor_outer_forward_calls_force_callback_four_times_and_error_once
     plugin = sim._native_plugins[0]
     sim.step()
     np.testing.assert_array_equal(plugin.snapshot(), [4, 4])
-    assert plugin.attempts == 4
+    # Four RK4 evaluations plus the predicated AUTORESET forward. The latter
+    # is dispatched without a host mask readback and commits no plugin state.
+    assert plugin.attempts == 5
+    enabled = [np.ones(2, dtype=bool) if mask is None else mask
+               for mask in plugin.masks]
+    assert sorted(int(mask.sum()) for mask in enabled) == [0, 2, 2, 2, 2]
+    for mask in enabled:
+      assert mask.shape == (2,)
+      assert bool(mask.all()) or not bool(mask.any())
+    before_attempts = plugin.attempts
     before = sim.state.snapshot()
     plugin.fail = True
     with pytest.raises(TypeError, match="force callback body failed"):
       sim.step()
-    assert plugin.attempts == 5
+    assert plugin.attempts == before_attempts + 1
     np.testing.assert_array_equal(plugin.snapshot(), [4, 4])
     after = sim.state.snapshot()
     np.testing.assert_array_equal(after.qpos, before.qpos)

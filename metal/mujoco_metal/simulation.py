@@ -2309,7 +2309,7 @@ class MetalSimulation:
     for name in ("_control", "_body_wrench", "_applied_force", "_energy",
                  "_sensordata", "_raw_sensordata", "_next_act", "_act_dot",
                  "_act_vel", "_sen_act_force", "_sen_qfrc_act",
-                 "_sensor_plugin_status", "_combined_status", "_next_status"):
+                 "_sensor_plugin_status", "_combined_status"):
       clear_rows(getattr(self, name, None))
     seen = set()
     for program in (getattr(self, "_sensors", None),
@@ -2414,7 +2414,11 @@ class MetalSimulation:
     acceleration = torch.where(mask[:, None], self._state._qacc,
                                 self._next_qacc)
     qvel = torch.where(mask[:, None], self._state._qvel, qvel)
-    status = torch.where(mask, self._state._status, self._next_status)
+    # Recovery replaces physical values but must not erase the failed
+    # transaction. Its status stays sticky until an explicit reset/restore.
+    status = torch.where(mask, torch.maximum(self._state._status,
+                                             self._next_status),
+                         self._next_status)
     if source_low is not None:
       recovery_low = getattr(self, "_last_recovery_qacc_low", None)
       if (not isinstance(recovery_low, torch.Tensor)
@@ -3427,7 +3431,7 @@ class MetalSimulation:
         world_mask=world_mask)
     self._component_solver.merge_world_status(
         component_status, self._component_world_status,
-        world_mask=world_mask)
+        world_mask=world_mask, replace=True)
     return (self._copy_component_first_rhs(
         solution, rhs_index, world_mask=world_mask),
             self._component_world_status)

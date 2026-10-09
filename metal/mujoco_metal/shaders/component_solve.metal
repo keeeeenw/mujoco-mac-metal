@@ -592,6 +592,20 @@ kernel void merge_component_world_status(
   world_status[world]=status;
 }
 
+kernel void reduce_component_world_status(
+    device const int* component_status [[buffer(0)]],
+    device int* world_status [[buffer(1)]],
+    constant int* dims [[buffer(2)]],
+    device const int* world_mask [[buffer(3)]],
+    uint world [[thread_position_in_grid]]) {
+  int ncomponent=dims[0], batch=dims[1];
+  if (int(world) >= batch || world_mask[world] == 0) return;
+  int status=0;
+  for (int component=0; component<ncomponent; ++component)
+    status=max(status, component_status[world*ncomponent+component]);
+  world_status[world]=status;
+}
+
 kernel void apply_component_mass(
     device const float* mass_blocks [[buffer(0)]],
     device const float* tendon_armature_blocks [[buffer(1)]],

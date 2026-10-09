@@ -833,11 +833,12 @@ class MetalComponentMassSolver:
     return output[:, :self.nv], status[:, :self.ncomponent]
 
   def merge_world_status(self, component_status, world_status, *,
-                         world_mask=None):
+                         world_mask=None, replace=False):
     """Max-reduce component failures into the caller's per-world status.
 
     This is a device-only merge so a staged component solve can contribute to
-    an existing transaction status without a host readback.
+    an existing transaction status without a host readback. With ``replace=True``,
+    selected worlds start a fresh reduction; unselected worlds are preserved.
     """
     torch = self._torch
     if (not isinstance(component_status, torch.Tensor)
@@ -861,8 +862,10 @@ class MetalComponentMassSolver:
           or world_mask.device.type != "mps"
           or not world_mask.is_contiguous()):
       raise ValueError("world_mask must be contiguous MPS int32 [batch]")
-    if self.ncomponent:
-      self._library.merge_component_world_status(
+    if self.ncomponent or replace:
+      kernel = (self._library.reduce_component_world_status if replace
+                else self._library.merge_component_world_status)
+      kernel(
           component_status.reshape(-1), world_status, self._merge_dims,
           world_mask,
           threads=(self.batch_size,), group_size=(1,))

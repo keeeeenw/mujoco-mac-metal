@@ -94,7 +94,9 @@ class NativePlugin:
     velocity forward on a sleep transition). Stateful plugins should gate
     updates by this mask; the simulation also restores device state for
     unselected worlds. Callbacks must not rely on untracked host side effects
-    to represent simulation state.
+    to represent simulation state. Conditional recovery may dispatch with an
+    entirely false mask: this schedules device work without reading its mask
+    back to the host. Python invocation counts are not accepted-step counts.
     """
     raise NotImplementedError("NativePlugin subclasses must implement run_device")
 

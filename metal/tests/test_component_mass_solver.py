@@ -371,6 +371,18 @@ def test_component_status_merge_is_device_side_and_preserves_existing_failure():
   np.testing.assert_array_equal(component_status.cpu().numpy(),
                                 [[1, 0], [0, 1]])
   np.testing.assert_array_equal(world_status.cpu().numpy(), [5, 1])
+  # A fresh successful solve must not inherit an earlier transaction failure.
+  # Masked worlds retain their previous status until they are evaluated.
+  mass.fill_(0.)
+  mass[:, [0, 3, 4]] = 1.
+  _, component_status = solver.run_device(mass, rhs)
+  mask = torch.tensor([1, 0], dtype=torch.int32, device="mps")
+  solver.merge_world_status(component_status, world_status,
+                            world_mask=mask, replace=True)
+  np.testing.assert_array_equal(world_status.cpu().numpy(), [0, 1])
+  solver.merge_world_status(component_status, world_status, replace=True)
+  np.testing.assert_array_equal(world_status.cpu().numpy(), [0, 0])
+
 
 
 @pytest.mark.gpu
