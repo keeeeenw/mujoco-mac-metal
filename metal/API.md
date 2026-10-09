@@ -460,7 +460,7 @@ rays and nearest-hit decisions execute on Metal without CPU physics fallback.
 Site rangefinder sensors use the same scene intersections and filters,
 including bundled and plugin-free SDFs, non-convex meshes and dynamically
 packed heightfields. Their output fields and selected-world writes follow the
-stored sensor contract. Camera rangefinders still require separate support.
+stored sensor contract.
 Plugin-free SDF meshes retain all three compiled octree word planes in the
 shared decoder layout, with one captured block for each shared mesh asset.
 The query memory budget covers its captured assets, owned outputs and shader
@@ -471,6 +471,31 @@ small directions, plugin-free octree hits and misses, heightfield side hits and 
 CPU engine; they also check prepared-stage and state preservation.
 These development APIs require source qualification separately from release
 wheel coverage. They do not add a Metal renderer.
+
+### Camera rangefinders in development source
+
+`<rangefinder camera="eye" data="dist dir origin point normal depth"/>`
+evaluates a depth image on Metal. Pixels use the camera's compiled resolution
+and appear in row-major order, with row zero at the top and rays through pixel
+centers. Each pixel stores the selected fields consecutively. Perspective
+cameras support either `fovy` or intrinsic focal/principal-point parameters;
+orthographic cameras produce parallel rays with different origins.
+
+The current source computes fixed, track, track-COM, target-body and
+target-body-COM camera frames from the prepared body poses and masses. Runtime
+camera poses, pixel rays, intersections and optical depth execute on the GPU.
+`dist` is distance along the ray, while camera `depth` projects the hit onto
+the optical axis. Missing hits have distance/depth `-1`, zero direction, point
+and normal, and retain their ray origin. This is geometric sensing, not image
+rendering or an RGB camera.
+
+Independent native gates compare all five camera modes, perspective and
+orthographic projections, intrinsic lenses, every output field, selected
+worlds, mixed site/camera sensors, stored step samples, interval sampling,
+delayed linear interpolation and exact checkpoint replay with pinned MuJoCo.
+The allocation inventory includes pixel topology, captured camera constants
+and the scene assets. These checks do not close all sensor/geometry/solver
+combinations or qualify a released wheel.
 
 ### Flex and skin rays in development source
 

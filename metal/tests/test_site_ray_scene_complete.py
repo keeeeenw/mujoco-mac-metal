@@ -55,7 +55,7 @@ def test_site_ray_inventory_has_complete_mesh_terrain_and_octree_assets():
   sizes=site_ray_workspace_sizes(model)
   assert sizes["hull"] > 3*128 + 3*256 + 67*3
   assert sizes["octree"] == 50*int(model.mesh_octnum[model.mesh("cube").id])
-  assert sizes["dimensions"] == 6
+  assert sizes["dimensions"] == 8
   empty=mujoco.MjModel.from_xml_string('<mujoco/>')
   assert site_ray_workspace_sizes(empty) == {}
 
@@ -86,7 +86,8 @@ def test_actual_native_rangefinder_all_fields_full_scene_mask_and_buffer_invento
   sizes=site_ray_workspace_sizes(model)
   inventory=dict(_runtime_buffer_sizes(model,2))
   for name,count in sizes.items():
-    actual_buffer=program._site_ray_dims if name=="dimensions" else constants[name]
+    actual_buffer=(program._site_ray_dims if name=="dimensions" else
+        program._site_ray_pixels[name] if name in program._site_ray_pixels else constants[name])
     assert actual_buffer.numel()==count==inventory[f"sensor.site_rays.{name}"]
   retained=actual.clone()
   poses["site_pos"][:,:,2] += .03

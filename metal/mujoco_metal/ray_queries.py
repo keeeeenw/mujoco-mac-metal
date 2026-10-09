@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import lru_cache
 import numbers
+import math
 
 import mujoco
 import numpy as np
@@ -142,8 +143,64 @@ def site_ray_workspace_sizes(model):
   if not np.any(np.asarray(model.sensor_type) == int(mujoco.mjtSensor.mjSENS_RANGEFINDER)):
     return {}
   scene = lower_ray_scene(model)
+  pixels = lower_rangefinder_pixels(model)
   return {**{name: value.size for name, value in vars(scene).items()
-             if isinstance(value, np.ndarray)}, "dimensions": 6}
+             if isinstance(value, np.ndarray)},
+          **{name: value.size for name, value in pixels.items()}, "dimensions": 8}
+
+
+def lower_rangefinder_pixels(model):
+  """Compile pixel topology and lens constants; dynamic camera poses stay native."""
+  entries=[]
+  used_cameras=set()
+  camera_meta=np.zeros((max(int(model.ncam),1),6),np.int32)
+  camera_values=np.zeros((max(int(model.ncam),1),27),np.float32)
+  for i in range(int(model.nsensor)):
+    if int(model.sensor_type[i]) != int(mujoco.mjtSensor.mjSENS_RANGEFINDER):
+      continue
+    if int(model.sensor_objtype[i]) == int(mujoco.mjtObj.mjOBJ_SITE):
+      entries.append((i,0,0))
+    else:
+      c=int(model.sensor_objid[i])
+      used_cameras.add(c)
+      width,height=map(int,model.cam_resolution[c])
+      if width<=0 or height<=0 or 3*width*height>2**31-1:
+        raise ValueError("camera pixel topology exceeds signed int32 indexing")
+      entries.extend((i,col,row) for row in range(height) for col in range(width))
+  for c in range(int(model.ncam)):
+    if c not in used_cameras:
+      continue
+    width,height=map(int,model.cam_resolution[c])
+    projection=int(model.cam_projection[c])
+    camera_meta[c]=[int(model.cam_bodyid[c]),int(model.cam_mode[c]),
+                    int(model.cam_targetbodyid[c]),projection,width,height]
+    if projection == int(mujoco.mjtProjection.mjPROJ_PERSPECTIVE):
+      size=model.cam_sensorsize[c]
+      if size[0] and size[1]:
+        intrinsic=model.cam_intrinsic[c]
+        # Upstream operands are float, so each ratio is rounded before it
+        # is multiplied by the integer resolution and widened to mjtNum.
+        fx=float(np.float32(np.float32(intrinsic[0]/size[0])*width))
+        fy=float(np.float32(np.float32(intrinsic[1]/size[1])*height))
+        cx=float(np.float32(np.float32(intrinsic[2]/size[0])*width))
+        cy=float(np.float32(np.float32(intrinsic[3]/size[1])*height))
+      else:
+        fx=fy=.5/math.tan(float(model.cam_fovy[c])*math.pi/360)*height
+        cx,cy=width/2,height/2
+    elif projection == int(mujoco.mjtProjection.mjPROJ_ORTHOGRAPHIC):
+      fx=cx=width/2;fy=cy=height/2
+    else:
+      raise ValueError("unknown compiled camera projection")
+    camera_values[c]=np.concatenate((model.cam_pos[c],model.cam_quat[c],
+        model.cam_pos0[c],model.cam_poscom0[c],model.cam_mat0[c].reshape(-1),
+        [fx,fy,cx,cy,float(model.cam_fovy[c])]))
+    if not np.all(np.isfinite(camera_values[c])) or fx<=0 or fy<=0:
+      raise ValueError("camera ray constants must be finite with positive focal lengths")
+  if len(entries)*3>2**31-1:
+    raise ValueError("rangefinder topology exceeds signed int32 indexing")
+  return {"ray_entries":_frozen(entries or [(0,0,0)],np.int32).reshape(-1,3),
+          "camera_meta":_frozen(camera_meta,np.int32),
+          "camera_values":_frozen(camera_values,np.float32)}
 
 
 class MetalRayQueries:
@@ -186,7 +243,8 @@ class MetalRayQueries:
     return value
 
   def _run_sites_device(self, poses, site_bodyid, sensor_meta, intprm,
-                        output, stage_mask, dimensions):
+                        output, stage_mask, dimensions, pixels, body_tree,
+                        body_mass, dummy):
     """Internal stored-sensor entry; consumes the caller's selection and output."""
     c = self._constants
     self._library.evaluate_site_rays(
@@ -195,7 +253,10 @@ class MetalRayQueries:
         c['sdf_attributes'], c['sdf_attributes_low'], c['rbound'],
         poses['site_pos'], poses['site_quat'], site_bodyid, sensor_meta,
         intprm, output, stage_mask, dimensions,
-        threads=(output.shape[0]*sensor_meta.shape[0],), group_size=(1,))
+        pixels['ray_entries'],pixels['camera_meta'],pixels['camera_values'],
+        poses.get('body_pos',dummy),poses.get('body_quat',dummy),
+        poses.get('inertial_pos',dummy),body_tree,body_mass,
+        threads=(output.shape[0]*pixels['ray_entries'].shape[0],), group_size=(1,))
 
   def run_device(self, poses, origins, vectors, *, geomgroup=None,
                  flg_static=True, bodyexclude=-1, geomid=-1, cutoff=None,

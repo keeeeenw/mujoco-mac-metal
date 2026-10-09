@@ -370,6 +370,14 @@ def lower_sensors(model) -> SensorDescriptor:
       expected_dim = dim
     elif typ == int(S.mjSENS_RANGEFINDER):
       expected_dim = _raydata_size(int(arrays["sensor_intprm"][i, 0]))
+      if int(arrays["sensor_objtype"][i]) == int(mujoco.mjtObj.mjOBJ_CAMERA):
+        cam = int(arrays["sensor_objid"][i])
+        if not 0 <= cam < ncam:
+          raise ValueError(f"sensor {i}: invalid rangefinder camera id")
+        width, height = map(int, model.cam_resolution[cam])
+        if width <= 0 or height <= 0:
+          raise ValueError(f"sensor {i}: camera rangefinder requires positive resolution")
+        expected_dim *= width * height
     elif typ == int(S.mjSENS_CONTACT):
       dataspec = int(arrays["sensor_intprm"][i, 0])
       reduce = int(arrays["sensor_intprm"][i, 1])
@@ -464,14 +472,12 @@ def lower_sensors(model) -> SensorDescriptor:
       if not 0 <= int(arrays["sensor_objid"][i]) < nsite:
         raise ValueError(f"sensor {i}: invalid site id")
     if typ == int(S.mjSENS_RANGEFINDER):
-      if int(arrays["sensor_objtype"][i]) != int(mujoco.mjtObj.mjOBJ_SITE):
-        raise ValueError(f"sensor {i}: only site rangefinders are supported")
-      if not 0 <= int(arrays["sensor_objid"][i]) < nsite:
-        raise ValueError(f"sensor {i}: invalid rangefinder site id")
-      # R07a: no SDF-scene rejection. Without a registered SDF plugin both
-      # engines skip SDF geoms in rays (pinned mj_ray reports no-hit);
-      # the native kernel mirrors that skip, verified by parity tests.
-      # With-plugin SDF ray hits stay 019-owned.
+      objtype = int(arrays["sensor_objtype"][i])
+      if objtype not in (int(mujoco.mjtObj.mjOBJ_SITE), int(mujoco.mjtObj.mjOBJ_CAMERA)):
+        raise ValueError(f"sensor {i}: rangefinders require a site or camera")
+      count = nsite if objtype == int(mujoco.mjtObj.mjOBJ_SITE) else ncam
+      if not 0 <= int(arrays["sensor_objid"][i]) < count:
+        raise ValueError(f"sensor {i}: invalid rangefinder object id")
     if typ == int(S.mjSENS_CONTACT):
       for key in ("sensor_objtype", "sensor_reftype"):
         t = int(arrays[key][i])
@@ -905,6 +911,12 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
        "efc_type": (B, nefc), "efc_id": (B, nefc),
        "efc_pos": (B, nefc), "efc_vel": (B, nefc),
        "efc_margin": (B, nefc), "ne": int, "nf": int}
+
+  Camera rangefinders use ``extra['camera_ray'][sensor_id]`` with batched
+  ``distance[B,P]``, ``origin/direction/normal[B,P,3]`` and
+  ``camera_pos/camera_z[B,3]`` from the explicit host geometry oracle feed.
+  The reference assembles fields and optical depth; it is not a runtime
+  fallback for native queries.
   """
   desc = lower_sensors(model)
   qpos, qvel, time = np.asarray(qpos), np.asarray(qvel), np.asarray(time)
@@ -995,29 +1007,58 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
       elif typ in (int(S.mjSENS_E_POTENTIAL), int(S.mjSENS_E_KINETIC)):
         value = np.array([float(Need("energy")["energy"][w, 0 if typ == int(S.mjSENS_E_POTENTIAL) else 1])])
       elif typ == int(S.mjSENS_RANGEFINDER):
-        ex = Need("ray")
-        r = np.asarray(ex["ray"][w, i], dtype=np.float64)
-        dataspec = int(desc.sensor_intprm[i, 0])
-        sid = objid
-        origin = np.asarray(poses["site_pos"])[w, sid].copy()
-        sq = _unit(np.asarray(poses["site_quat"])[w, sid], "site quaternion")
-        direction = _quat_rot(sq, np.array([0.0, 0.0, 1.0]))
-        hit = float(r[0]) >= 0
-        parts = []
-        if dataspec & 1:
-          parts += [float(r[0])]
-        if dataspec & 2:
-          parts += list(direction if hit else np.zeros(3))
-        if dataspec & 4:
-          parts += list(origin)
-        point = origin + direction * float(r[0]) if hit else np.zeros(3)
-        if dataspec & 8:
-          parts += list(point)
-        if dataspec & 16:
-          parts += list(r[4:7] if hit else np.zeros(3))
-        if dataspec & 32:
-          parts += [float(r[0]) if hit else -1.0]
-        value = np.array(parts)
+        if int(desc.sensor_objtype[i]) == int(mujoco.mjtObj.mjOBJ_CAMERA):
+          if extra is None or "camera_ray" not in extra or i not in extra["camera_ray"]:
+            raise ValueError("camera sensor oracle needs explicit extra['camera_ray'][sensor]")
+          ex = extra["camera_ray"][i]
+          fields = {name:np.asarray(ex[name],dtype=np.float64)[w] for name in (
+              "distance","origin","direction","normal","camera_pos","camera_z")}
+          count = int(desc.sensor_dim[i]) // _raydata_size(int(desc.sensor_intprm[i,0]))
+          if (fields["distance"].shape != (count,)
+              or any(fields[name].shape != (count,3) for name in ("origin","direction","normal"))
+              or any(fields[name].shape != (3,) for name in ("camera_pos","camera_z"))
+              or any(not np.all(np.isfinite(v)) for v in fields.values())):
+            raise ValueError("camera ray oracle requires finite compiled pixel/stage fields")
+          spec = int(desc.sensor_intprm[i,0])
+          values=[]
+          for pixel in range(count):
+            distance=fields["distance"][pixel]
+            hit=distance>=0
+            origin,direction,normal=(fields[name][pixel] for name in ("origin","direction","normal"))
+            point=origin+direction*distance if hit else np.zeros(3)
+            parts=[]
+            if spec&1:parts.append(distance)
+            if spec&2:parts.extend(direction if hit else np.zeros(3))
+            if spec&4:parts.extend(origin)
+            if spec&8:parts.extend(point)
+            if spec&16:parts.extend(normal if hit else np.zeros(3))
+            if spec&32:parts.append(-float(np.dot(point-fields["camera_pos"],fields["camera_z"])) if hit else -1.)
+            values.extend(parts)
+          value=np.asarray(values)
+        else:
+          ex = Need("ray")
+          r = np.asarray(ex["ray"][w, i], dtype=np.float64)
+          dataspec = int(desc.sensor_intprm[i, 0])
+          sid = objid
+          origin = np.asarray(poses["site_pos"])[w, sid].copy()
+          sq = _unit(np.asarray(poses["site_quat"])[w, sid], "site quaternion")
+          direction = _quat_rot(sq, np.array([0.0, 0.0, 1.0]))
+          hit = float(r[0]) >= 0
+          parts = []
+          if dataspec & 1:
+            parts += [float(r[0])]
+          if dataspec & 2:
+            parts += list(direction if hit else np.zeros(3))
+          if dataspec & 4:
+            parts += list(origin)
+          point = origin + direction * float(r[0]) if hit else np.zeros(3)
+          if dataspec & 8:
+            parts += list(point)
+          if dataspec & 16:
+            parts += list(r[4:7] if hit else np.zeros(3))
+          if dataspec & 32:
+            parts += [float(r[0]) if hit else -1.0]
+          value = np.array(parts)
       elif typ in (int(S.mjSENS_GEOMDIST), int(S.mjSENS_GEOMNORMAL),
                     int(S.mjSENS_GEOMFROMTO)):
         ex = Need("geom")
@@ -1935,11 +1976,18 @@ class SensorProgram:
     self._sp_contact = partial(_dispatch_spatial, 2, "evaluate_contact_sensors")
     self._site_ray_program = None
     if np.any(np.asarray(model.sensor_type) == int(mujoco.mjtSensor.mjSENS_RANGEFINDER)):
-      from mujoco_metal.ray_queries import MetalRayQueries
+      from mujoco_metal.ray_queries import MetalRayQueries, lower_rangefinder_pixels
       self._site_ray_program = MetalRayQueries(model, self.batch_size)
+      pixels = lower_rangefinder_pixels(model)
+      self._site_ray_pixels = {name:torch.tensor(np.array(value,copy=True),device=self._device)
+                               for name,value in pixels.items()}
+      self._camera_ray_present = np.any(
+          (model.sensor_type == int(mujoco.mjtSensor.mjSENS_RANGEFINDER)) &
+          (model.sensor_objtype == int(mujoco.mjtObj.mjOBJ_CAMERA)))
       self._site_ray_dims = torch.tensor(
           [self.batch_size, self.descriptor.nsensor, self.descriptor.nsensordata,
-           ng, nsite, self.descriptor.disableflags], dtype=torch.int32, device=self._device)
+           ng, nsite, self.descriptor.disableflags,len(pixels['ray_entries']),nb],
+          dtype=torch.int32, device=self._device)
     self._sp_geomdist = partial(_dispatch_spatial, 4, "evaluate_geomdist")
     self._sp_tactile = partial(_dispatch_spatial, 1, "evaluate_tactile")
     self._build_tactile_constants(model)
@@ -2108,6 +2156,13 @@ class SensorProgram:
     self._ensure_spatial_constants()
     torch, d, b = self._torch, self.descriptor, self.batch_size
     self._sp_validate_poses(poses, need_geom_quat=True)
+    if getattr(self, "_camera_ray_present", False):
+      for key,width in (("body_pos",3),("body_quat",4),("inertial_pos",3)):
+        v=poses.get(key)
+        if (not isinstance(v,torch.Tensor) or v.device.type != "mps"
+            or v.dtype != torch.float32 or tuple(v.shape) != (b,d.nbody,width)
+            or not v.is_contiguous()):
+          raise ValueError(f"camera rays require contiguous {key} MPS poses")
     dest = self._s_state_out if out is None else out
     if dest.device.type != "mps" or tuple(dest.shape) != (b, d.nsensordata) \
         or dest.dtype != torch.float32 or not dest.is_contiguous():
@@ -2119,7 +2174,8 @@ class SensorProgram:
     self._stage_mask[0].fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
     if self._site_ray_program is not None:
       self._site_ray_program._run_sites_device(poses, self._rne_site_bodyid,
-          self._s_meta, self._s_intprm(), dest, self._stage_mask, self._site_ray_dims)
+          self._s_meta, self._s_intprm(), dest, self._stage_mask, self._site_ray_dims,
+          self._site_ray_pixels,self._rne_body_tree,self._rne_mass,self._s_dummy)
     return dest
 
   def run_geomdist_device(self, poses, hull, hull_info, out=None, *, world_mask=None):

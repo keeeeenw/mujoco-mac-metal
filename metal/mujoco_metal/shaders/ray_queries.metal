@@ -161,6 +161,57 @@ kernel void query_scene_rays(
   out_status[index]=status;
 }
 
+inline float3 qr_camera_unit(float3 v) {
+  float size=length(v);
+  return size<1e-15f ? float3(1,0,0) : v/size;
+}
+
+inline float4 qr_camera_qmul(float4 a,float4 b) {
+  return float4(a.x*b.x-dot(a.yzw,b.yzw),
+                a.x*b.yzw+b.x*a.yzw+cross(a.yzw,b.yzw));
+}
+
+inline float3 qr_camera_subtree(int root,int world,int nb,
+    device const float* inertial_pos,device const int* body_tree,
+    device const float* body_mass) {
+  float mass=0.0f;
+  float3 weighted=float3(0.0f);
+  for (int body=root;body<nb;++body) {
+    int parent=body;
+    while (parent>root) parent=body_tree[2*parent];
+    if (parent!=root) continue;
+    mass+=body_mass[body];
+    weighted+=body_mass[body]*sp_r3(inertial_pos,3*(world*nb+body));
+  }
+  return mass>1e-15f ? weighted/mass : sp_r3(inertial_pos,3*(world*nb+root));
+}
+
+inline void qr_camera_frame(int cam,int world,int nb,
+    device const int* meta,device const float* values,
+    device const float* body_pos,device const float* body_quat,
+    device const float* inertial_pos,device const int* body_tree,
+    device const float* body_mass,thread float3& pos,thread float3x3& mat) {
+  int body=meta[6*cam],mode=meta[6*cam+1],target=meta[6*cam+2];
+  float4 bq=sp_qunit(sp_r4(body_quat,4*(world*nb+body)));
+  pos=sp_r3(body_pos,3*(world*nb+body))+sp_qrot(bq,sp_r3(values,27*cam));
+  float4 q=sp_qunit(qr_camera_qmul(bq,sp_r4(values,27*cam+3)));
+  mat=float3x3(sp_qrot(q,float3(1,0,0)),sp_qrot(q,float3(0,1,0)),sp_qrot(q,float3(0,0,1)));
+  if (mode==1 || mode==2) {
+    mat=transpose(float3x3(sp_r3(values,27*cam+13),
+                          sp_r3(values,27*cam+16),sp_r3(values,27*cam+19)));
+    pos=(mode==1 ? sp_r3(body_pos,3*(world*nb+body)) :
+          qr_camera_subtree(body,world,nb,inertial_pos,body_tree,body_mass))
+        +sp_r3(values,27*cam+(mode==1 ? 7 : 10));
+  } else if ((mode==3 || mode==4) && target>=0) {
+    float3 look=mode==3 ? sp_r3(body_pos,3*(world*nb+target)) :
+        qr_camera_subtree(target,world,nb,inertial_pos,body_tree,body_mass);
+    float3 z=qr_camera_unit(pos-look);
+    float3 x=qr_camera_unit(cross(float3(0,0,1),z));
+    float3 y=qr_camera_unit(cross(z,x));
+    mat=float3x3(x,y,z);
+  }
+}
+
 kernel void evaluate_site_rays(
     device const float* geom_pos [[buffer(0)]],
     device const float* geom_quat [[buffer(1)]],
@@ -182,22 +233,59 @@ kernel void evaluate_site_rays(
     device float* output [[buffer(17)]],
     constant int* stage_mask [[buffer(18)]],
     constant int* dims [[buffer(19)]],
+    device const int* ray_entries [[buffer(20)]],
+    device const int* camera_meta [[buffer(21)]],
+    device const float* camera_values [[buffer(22)]],
+    device const float* body_pos [[buffer(23)]],
+    device const float* body_quat [[buffer(24)]],
+    device const float* inertial_pos [[buffer(25)]],
+    device const int* body_tree [[buffer(26)]],
+    device const float* body_mass [[buffer(27)]],
     uint index [[thread_position_in_grid]]) {
   uint batch=uint(dims[0]),nsensor=uint(dims[1]),ndata=uint(dims[2]);
-  if (index>=batch*nsensor || !(stage_mask[0] & (1<<1)) || (dims[5]&8192)) return;
-  uint world=index/nsensor,i=index%nsensor;
-  if (!stage_mask[1+batch*max(nsensor,1u)+world] || !stage_mask[1+index]) return;
+  uint nray=uint(dims[6]);
+  if (index>=batch*nray || !(stage_mask[0] & (1<<1)) || (dims[5]&8192)) return;
+  uint world=index/nray,entry=index%nray,i=uint(ray_entries[3*entry]);
+  if (!stage_mask[1+batch*max(nsensor,1u)+world] || !stage_mask[1+world*nsensor+i]) return;
   if (sensors[10*i]!=7 || sensors[10*i+2]!=1) return;
   uint site=uint(sensors[10*i+4]),nsite=uint(dims[4]);
   uint base=world*ndata+uint(sensors[10*i+6]);
-  float3 origin=sp_r3(site_pos,3*(world*nsite+site));
-  float4 quat=sp_qunit(sp_r4(site_quat,4*(world*nsite+site)));
-  float3 direction=sp_qrot(quat,float3(0,0,1));
+  bool camera=sensors[10*i+3]==7; // mjOBJ_CAMERA; sites are mjOBJ_SITE.
+  float3 origin,direction,cam_pos,cam_z;
+  int excluded;
+  if (camera) {
+    int cam=int(site),col=ray_entries[3*entry+1],row=ray_entries[3*entry+2];
+    float3x3 mat;
+    qr_camera_frame(cam,int(world),dims[7],camera_meta,camera_values,
+        body_pos,body_quat,inertial_pos,body_tree,body_mass,cam_pos,mat);
+    cam_z=mat[2];
+    float fx=camera_values[27*cam+22],fy=camera_values[27*cam+23];
+    float px=float(col)+0.5f-camera_values[27*cam+24];
+    float py=float(row)+0.5f-camera_values[27*cam+25];
+    if (camera_meta[6*cam+3]==0) {
+      origin=cam_pos;
+      direction=qr_camera_unit(mat*float3(px/fx,-py/fy,-1.0f));
+    } else {
+      float half_extent=camera_values[27*cam+26]/2.0f;
+      origin=cam_pos+mat*float3(px/fx*half_extent,-py/fy*half_extent,0.0f);
+      direction=-mat[2];
+    }
+    excluded=camera_meta[6*cam];
+    int spec=intprm[3*i],size=0;
+    for (int bit=0;bit<6;++bit) if (spec&(1<<bit)) size+=(bit==0 || bit==5) ? 1 : 3;
+    base+=uint((row*camera_meta[6*cam+4]+col)*size);
+  } else {
+    origin=sp_r3(site_pos,3*(world*nsite+site));
+    float4 quat=sp_qunit(sp_r4(site_quat,4*(world*nsite+site)));
+    direction=sp_qrot(quat,float3(0,0,1));
+    excluded=site_bodyid[site];
+  }
   int gid,status;
   float3 normal;
   float distance=qr_scene_hit(origin,direction,int(world),dims[3],geom_pos,geom_quat,
       metadata,sizes,hull,hull_info,octree,octinfo,sdf_kind,sdf_attributes,
-      sdf_attributes_low,rbound,nullptr,1,site_bodyid[site],-1,false,0.0f,false,
+      sdf_attributes_low,rbound,nullptr,1,excluded,-1,false,0.0f,
+      camera && camera_meta[6*int(site)+3]==0,
       gid,normal,status);
   bool hit=distance>=0.0f && status==0;
   float3 point=hit ? origin+direction*distance : float3(0.0f);
@@ -210,7 +298,8 @@ kernel void evaluate_site_rays(
   if (spec&4) for (int k=0;k<3;++k) output[base+offset++]=origin[k];
   if (spec&8) for (int k=0;k<3;++k) output[base+offset++]=point[k];
   if (spec&16) for (int k=0;k<3;++k) output[base+offset++]=hit ? normal[k] : 0.0f;
-  if (spec&32) output[base+offset++]=distance;
+  if (spec&32) output[base+offset++]=!hit ? -1.0f :
+      camera ? -dot(point-cam_pos,cam_z) : distance;
 }
 
 kernel void query_analytic_rays(
