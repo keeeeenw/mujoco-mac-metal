@@ -4858,7 +4858,9 @@ class MetalCoupledConstraints:
                  qfrc_smooth_low=None, world_mask=None):
     """Solve coupled contacts, limits, dry friction, and equalities on MPS.
 
-    `poses` is the dict of FK outputs from `MetalKinematics`.
+    `poses` is the dict of FK outputs from `MetalKinematics`. For differential
+    connect/weld rows, extend it with `root_com` from the same position-stage
+    `MetalSmoothDynamics` result; FK alone does not compute root COM positions.
     `mass` is batched generalized mass [batch, nv, nv] (including tendon armature).
     The PGS sparse path may pass ``mass=None`` together with a compiled
     component solver and block mass inputs; it assembles constraints first,

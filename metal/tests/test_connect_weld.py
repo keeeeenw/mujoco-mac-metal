@@ -240,10 +240,13 @@ def _native_connect_result(model, qpos, qvel):
     qvel_mps = torch.as_tensor(qvel, device="mps")
     md = load_model(model)
     poses = MetalKinematics(md, qpos.shape[0]).run_device(qpos_mps)
-    dyn = MetalSmoothDynamics(md, qpos.shape[0]).run_device(qpos_mps, qvel_mps)
+    dyn = MetalSmoothDynamics(md, qpos.shape[0]).run_device(
+        qpos_mps, qvel_mps, poses=poses
+    )
+    poses = {**poses, "root_com": dyn["root_com"]}
     res = MetalCoupledConstraints(model, qpos.shape[0]).run_device(
         poses, dyn["mass_matrix"], -dyn["qfrc_bias"], qpos_mps, qvel_mps,
-        cvel=dyn["cvel"],
+        cvel=dyn["cvel"], cdof=dyn["cdof"], cdof_dot=dyn["cdof_dot"],
     )
     return res, dyn
 
@@ -343,10 +346,13 @@ def _native_weld_result(model, qpos, qvel):
     qvel_mps = torch.as_tensor(qvel, device="mps")
     md = load_model(model)
     poses = MetalKinematics(md, qpos.shape[0]).run_device(qpos_mps)
-    dyn = MetalSmoothDynamics(md, qpos.shape[0]).run_device(qpos_mps, qvel_mps)
+    dyn = MetalSmoothDynamics(md, qpos.shape[0]).run_device(
+        qpos_mps, qvel_mps, poses=poses
+    )
+    poses = {**poses, "root_com": dyn["root_com"]}
     res = MetalCoupledConstraints(model, qpos.shape[0]).run_device(
         poses, dyn["mass_matrix"], -dyn["qfrc_bias"], qpos_mps, qvel_mps,
-        cvel=dyn["cvel"],
+        cvel=dyn["cvel"], cdof=dyn["cdof"], cdof_dot=dyn["cdof_dot"],
     )
     return res
 
