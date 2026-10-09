@@ -1537,7 +1537,11 @@ kernel void common_ccd_rigid_convex_candidates(
   FlexDD tolerance=FlexDD{mesh_hull[tolerance_base],
                           mesh_hull[tolerance_base+1],
                           mesh_hull[tolerance_base+2]};
-  bool source_multicontact=margin_value==0.0f && pair_dims[8]==0 &&
+  // Immutable model options specialize this pipeline before compilation.
+  // Keeping both heavy algorithms live in one runtime branch needlessly
+  // enlarges the compiled kernel; this selection changes no numerical inputs.
+  const bool libccd=COMMON_CCD_USE_LIBCCD!=0;
+  bool source_multicontact=!libccd && margin_value==0.0f && pair_dims[8]==0 &&
       (geom_type[a]==6 || geom_type[a]==7) && (geom_type[b]==6 || geom_type[b]==7);
   if (phase>0) {
     if (source_multicontact || pair_dims[8]!=0 ||
@@ -1560,7 +1564,10 @@ kernel void common_ccd_rigid_convex_candidates(
   FlexDD3 contact_position,contact_normal;
   int2 face_ids[3];
   int3 face_slots=int3(-1);
-  int found=common_ccd_production_one_rigid_pair(
+  int found=libccd ? common_libccd_penetration(
+      object_a,object_b,center_a,center_b,
+      FlexDD{margin_value,0.0f,0.0f},iterations,tolerance,mesh_hull,mesh_hull_info,
+      contact,contact_position,contact_normal) : common_ccd_production_one_rigid_pair(
       object_a,object_b,center_a,center_b,
       FlexDD{margin_value,0.0f,0.0f},iterations,tolerance,
       mesh_hull,mesh_hull_info,epa_vertices,epa_vertex_ids,epa_faces,epa_face_map,
@@ -1571,6 +1578,17 @@ kernel void common_ccd_rigid_convex_candidates(
     common_ccd_production_fail(world_status,world); return;
   }
   if (found<=0) return;
+  if (libccd) {
+    // Pinned mjc_fixNormal uses the original world geometry even on rotated
+    // restart queries. Construct those original poses before refining normal.
+    CommonCCDSupportObject original_a=object_a,original_b=object_b;
+    original_a.pos[0]=pa.x;original_a.pos[1]=pa.y;original_a.pos[2]=pa.z;
+    original_b.pos[0]=pb.x;original_b.pos[1]=pb.y;original_b.pos[2]=pb.z;
+    for (int i=0;i<9;i++) {original_a.mat[i]=ma[i];original_b.mat[i]=mb[i];}
+    contact_normal=common_libccd_fix_normal(original_a,original_b,contact_position,contact_normal);
+    contact.normal=flex_dd3_high(contact_normal);
+    contact.t1=float3(0);make_frame(contact.normal,contact.t1,contact.t2);
+  }
   if (phase==0) {
     ContactGeom contacts[5];contacts[0]=contact;
     int contact_count=1;

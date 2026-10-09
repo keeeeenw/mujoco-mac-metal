@@ -40,6 +40,7 @@ _SDF_SHADER = Path(__file__).parent / "shaders" / "sdf_narrowphase.metal"
 _COMMON_CCD_CORE_SHADER = Path(__file__).parent / "shaders" / "common_ccd_core.metal"
 _COMMON_CCD_SUPPORT_SHADER = Path(__file__).parent / "shaders" / "common_native_ccd_support.metal"
 _COMMON_CCD_PRODUCTION_SHADER = Path(__file__).parent / "shaders" / "common_ccd_production.metal"
+_LIBCCD_MPR_SHADER = Path(__file__).parent / "shaders" / "libccd_mpr.metal"
 
 
 def _expand_flex_equality_reference_coefficients(k0, b0, impedance):
@@ -65,7 +66,7 @@ _PLUGIN_SDF_SHADER = Path(__file__).parent / "shaders" / "plugin_sdf.metal"
 _SDF_STAGE_STATE_WORDS = 159
 
 
-def _coupled_shader_source(*, expected_root=None):
+def _coupled_shader_source(*, expected_root=None, libccd=False):
   """Build the exact production unit, also used by native solver witnesses.
 
   An expected root verifies source ownership; it never redirects compilation
@@ -74,13 +75,17 @@ def _coupled_shader_source(*, expected_root=None):
   if (expected_root is not None
       and Path(expected_root).resolve() != _SHADER.parent.resolve()):
     raise AssertionError("coupled shader unit resolves outside the expected source root")
+  if not isinstance(libccd, bool):
+    raise TypeError("libccd shader specialization must be boolean")
   return (
-      _COLLISION_SHADER.read_text() + "\n"
+      f"#define COMMON_CCD_USE_LIBCCD {int(libccd)}\n"
+      + _COLLISION_SHADER.read_text() + "\n"
       + _COMMON_CCD_CORE_SHADER.read_text() + "\n"
       + _COMMON_CCD_SUPPORT_SHADER.read_text() + "\n"
       + _CONVEX_SHADER.read_text() + "\n"
       + _PLUGIN_SDF_SHADER.read_text() + "\n"
       + _SDF_SHADER.read_text() + "\n"
+      + _LIBCCD_MPR_SHADER.read_text() + "\n"
       + _COMMON_CCD_PRODUCTION_SHADER.read_text()
       + "\n#define MUJOCO_METAL_EQUALITY_HELPERS_ONLY\n"
       + _EQUALITY_SHADER.read_text()
@@ -2263,7 +2268,9 @@ class MetalCoupledConstraints:
         int(self.descriptor.mesh_hull_info[9 * int(g) + 2])
         for g in sdf_geom_ids), default=0)
 
-    shader_source = _coupled_shader_source()
+    shader_source = (_coupled_shader_source(libccd=True)
+                     if int(d.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD)
+                     else _coupled_shader_source())
     self._library = torch.mps.compile_shader(shader_source)
     # Equality assembly is a standalone stage: compile it separately so its
     # entry point does not enlarge the collision/SDF/solver compilation unit.
