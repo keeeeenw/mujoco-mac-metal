@@ -885,6 +885,19 @@ kernel void evaluate_rays(
 // phase: canonical type-order flip, margin=cutoff, min over witnesses,
 // fromto split about the witness point).
 #if !defined(MUJOCO_METAL_SENSOR_ENTRY) || MUJOCO_METAL_SENSOR_ENTRY == 4
+// Keep the full dispatcher out of the nested body-pair loop's inline unit.
+// Every admitted geom-distance pair is non-SDF (validated at lowering).
+// Use the same non-SDF dispatcher as generic contact production; compiling
+// the unrelated monolithic SDF descent here expands this unit enormously.
+__attribute__((noinline)) int sp_geomdist_collide_pair(
+    int type1, float3 p1, float4 q1, float3 sz1, float rb1,
+    int type2, float3 p2, float4 q2, float3 sz2, float rb2,
+    float margin, int disable_multiccd, thread ContactGeom* con,
+    int gia, int gib, device const float* hull, device const int* hull_info) {
+  return collide_pair_without_sdf(type1,p1,q1,sz1,rb1,type2,p2,q2,sz2,rb2,
+                      margin,0.0f,disable_multiccd,con,gia,gib,hull,hull_info,16);
+}
+
 kernel void evaluate_geomdist(
     device const float* geom_pos [[buffer(0)]],
     device const float* geom_quat [[buffer(1)]],
@@ -925,22 +938,15 @@ kernel void evaluate_geomdist(
   float bsign=1.0f;
   bool have=false;
   int multiccd_off = dims[6];
-  // Expand both sides to geom lists (bounded: 32 each).
-  int ga[32], gb[32];
-  int na=0, nb=0;
-  if (otype==5) { ga[0]=oid; na=1; }
-  else {
-    int a0=body_geoms[oid*2+0], an=body_geoms[oid*2+1];
-    for (int k=0;k<an && na<32;++k) { ga[na]=a0+k; na++; }
-  }
-  if (rtype==5) { gb[0]=rid; nb=1; }
-  else {
-    int b0=body_geoms[rid*2+0], bn=body_geoms[rid*2+1];
-    for (int k=0;k<bn && nb<32;++k) { gb[nb]=b0+k; nb++; }
-  }
+  // Compiled body geoms are contiguous. Iterate the complete range without
+  // fixed local arrays or silently dropping geoms after the first 32.
+  int a0=otype==5 ? oid : body_geoms[oid*2];
+  int b0=rtype==5 ? rid : body_geoms[rid*2];
+  int na=otype==5 ? 1 : body_geoms[oid*2+1];
+  int nb=rtype==5 ? 1 : body_geoms[rid*2+1];
   for (int a=0;a<na;++a) {
     for (int b=0;b<nb;++b) {
-      int g1=ga[a], g2=gb[b];
+      int g1=a0+a, g2=b0+b;
       int t1=geom_type[g1], t2=geom_type[g2];
       bool flip = t1>t2;
       int s1 = flip?g2:g1, s2 = flip?g1:g2;
@@ -953,8 +959,8 @@ kernel void evaluate_geomdist(
       float3 sz1=sp_r3(geom_size,uint(s1)*3), sz2=sp_r3(geom_size,uint(s2)*3);
       float rb1=geom_rbound[s1], rb2=geom_rbound[s2];
       ContactGeom con[16];
-      int n=collide_pair(tt1,p1,q1,sz1,rb1,tt2,p2,q2,sz2,rb2,
-                         cutoff,0.0f,multiccd_off,con,s1,s2,hull,hull_info,16);
+      int n=sp_geomdist_collide_pair(tt1,p1,q1,sz1,rb1,tt2,p2,q2,sz2,rb2,
+                                   cutoff,multiccd_off,con,s1,s2,hull,hull_info);
       for (int k=0;k<n;++k) {
         if (con[k].dist<best) {
           best=con[k].dist;
