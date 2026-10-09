@@ -1,0 +1,41 @@
+<mujoco model="optical inspection carousel">
+  <compiler angle="radian"/>
+  <option timestep=".004" gravity="0 0 0"><flag contact="disable"/></option>
+  <visual><global offwidth="1200" offheight="720"/></visual>
+  <asset>
+    <texture name="checker" type="2d" builtin="checker" width="256" height="256"
+      rgb1=".12 .15 .20" rgb2=".22 .28 .35"/>
+    <material name="bench" texture="checker" texrepeat="6 6" reflectance=".1"/>
+  </asset>
+  <default><geom contype="0" conaffinity="0"/></default>
+  <worldbody>
+    <light directional="true" pos="0 -2 5" dir="0 .3 -1"
+      diffuse=".9 .9 .9" specular=".3 .3 .3"/>
+    <body name="bench">
+      <geom type="plane" pos="0 0 -.02" size="3 3 .1" material="bench"/>
+      <geom type="cylinder" pos="0 0 .08" size=".24 .1" rgba=".25 .32 .4 1"/>
+      <geom type="box" pos="0 .9 1.25" size=".035 .035 1.25" rgba=".35 .42 .5 1"/>
+      <geom type="box" pos="0 .4 2.45" size=".035 .5 .035" rgba=".35 .42 .5 1"/>
+      <geom type="box" pos="0 0 2.35" size=".12 .09 .06" rgba=".2 .7 .75 1"/>
+    </body>
+    <body name="carousel" pos="0 0 .25">
+      <joint name="turntable" type="hinge" axis="0 0 1"/>
+      <geom type="cylinder" size=".72 .04" mass="2" rgba=".25 .32 .4 1"/>
+      <geom type="box" pos=".35 .1 .21" size=".13 .1 .17" mass=".1" rgba=".95 .65 .15 1"/>
+      <geom type="sphere" pos="-.3 .25 .22" size=".18" mass=".1" rgba=".25 .85 .75 1"/>
+      <geom type="capsule" fromto="-.2 -.35 .12 .1 -.4 .3" size=".07"
+        mass=".1" rgba=".9 .2 .25 1"/>
+      <geom type="ellipsoid" pos=".34 -.3 .14" size=".15 .09 .1"
+        mass=".1" rgba=".2 .55 .95 1"/>
+    </body>
+    <!-- World cameras point down their negative z axes. -->
+    <camera name="perspective" pos="0 0 2.2" resolution="32 24" fovy="48"/>
+    <camera name="orthographic" pos="0 0 2.2" resolution="32 24"
+      projection="orthographic" fovy="1.8"/>
+  </worldbody>
+  <actuator><motor name="drive" joint="turntable"/></actuator>
+  <sensor>
+    <rangefinder name="perspective_depth" camera="perspective" data="depth"/>
+    <rangefinder name="orthographic_depth" camera="orthographic" data="depth"/>
+  </sensor>
+</mujoco>

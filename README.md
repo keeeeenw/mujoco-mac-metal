@@ -240,6 +240,12 @@ A pan/tilt scanner plots current-state pose and velocity measurements. The targe
 
 ![Sensor scanning rig: native Metal beside CPU MuJoCo](metal/examples/assets/scanning_rig.gif)
 
+### [Optical inspection carousel](metal/examples/optical_inspection.md)
+
+Colorful parts turn under perspective and orthographic depth cameras. The image panels show actual stored rangefinder samples computed on Metal and checked against CPU MuJoCo.
+
+![Rotating inspection carousel and native depth images](metal/examples/assets/optical_inspection.gif)
+
 ### [Tumbling toys](metal/examples/tumbling_toys.md)
 
 Asymmetric toys spin around different axes, demonstrating quaternion-aware RK4 integration.
