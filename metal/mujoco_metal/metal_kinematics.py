@@ -33,6 +33,7 @@ def _kinematics_shader_source():
   return ("#define MUJOCO_METAL_SOURCE_MATH_ONLY\n"
           + _SOURCE_MATH_SHADER.read_text()
           + "\n#undef MUJOCO_METAL_SOURCE_MATH_ONLY\n"
+          + _SHADER.with_name("position_math.metal").read_text()
           + _SHADER.read_text())
 
 
@@ -301,6 +302,7 @@ class MetalKinematics:
         batch_size,
         {
             "qpos": batch_size * m.nq,
+            "position_words": max(batch_size*2*m.nq,1),
             "body_pos": batch_size * m.nbody * 3,
             "body_pos_low": batch_size * m.nbody * 3,
             "body_pos_tail": batch_size * m.nbody * 3,
@@ -389,6 +391,7 @@ class MetalKinematics:
         {"auxiliary_words": auxiliary_words})
     outputs["auxiliary"] = torch.zeros(
         auxiliary_words, dtype=torch.float32, device=self._device)
+    outputs['position_words']=torch.zeros(max(batch_size*2*m.nq,1),dtype=torch.float32,device=self._device)
     outputs["qpos"] = torch.empty(
         max(batch_size * m.nq, 1), dtype=torch.float32, device=self._device)
     if int(m.nbody):
@@ -444,7 +447,7 @@ class MetalKinematics:
       raise ValueError(f"{name} must be contiguous")
 
   def run_device(self, qpos, mocap_pos=None, mocap_quat=None, *, tree_awake=None,
-                 world_mask=None):
+                 world_mask=None, qpos_words=None):
     """Run FK from a contiguous MPS float32 state without host readback.
 
     State values are trusted to be finite; free/ball quaternions must be
@@ -482,6 +485,12 @@ class MetalKinematics:
       self._check_device_tensor(
           mocap_quat, "mocap_quat", (batch, nmocap, 4), torch, self._device
       )
+    if qpos_words is None and getattr(self,'_position_words_provider',None) is not None:
+      qpos_words=self._position_words_provider(qpos)
+    if qpos_words is not None:
+      if (not isinstance(qpos_words,torch.Tensor) or qpos_words.dtype!=torch.float32
+          or qpos_words.device!=qpos.device or tuple(qpos_words.shape)!=(batch,2*self.model.nq)):
+        raise ValueError('qpos_words must be float32 [batch,2*nq] on the qpos device')
     workspace = self._workspace
     if workspace is None or workspace["batch_size"] != batch:
       raise ValueError(
@@ -521,6 +530,8 @@ class MetalKinematics:
       if tree_awake.dtype == torch.float32:
         out["tree_awake_cast"].copy_(tree_awake)
         awake = out["tree_awake_cast"]
+    if qpos_words is None: out['position_words'].zero_()
+    else: out['position_words'][:batch*2*self.model.nq].reshape(batch,2*self.model.nq).copy_(qpos_words)
     # Auxiliary inputs are copied on the device only for selected worlds.
     # They share the exact same predicate as the subsequent FK producer.
     zero = out["qpos"]
@@ -538,7 +549,7 @@ class MetalKinematics:
       qbuf = out["qpos"]
     self._kernel(
         self._arrays["static_int"], self._arrays["static_float"], qbuf,
-        out["pose_output"], world_mask, auxiliary, out["dims"],
+        out["pose_output"], world_mask, auxiliary, out["dims"],out["position_words"],
         threads=(batch,), group_size=(1,))
     result = {}
     for kind, count in (
@@ -620,20 +631,14 @@ class MetalKinematics:
     q = np.array(source, dtype=np.float32, order="C", copy=True)
     if not np.all(np.isfinite(q)):
       raise ValueError("qpos cannot be represented as finite float32")
-    for typ, qa in zip(self.model.jnt_type, self.model.jnt_qposadr):
-      start = int(qa) + (3 if int(typ) == 0 else 0)
-      width = 4 if int(typ) in (0, 1) else 0
-      if width:
-        norms = np.linalg.norm(
-            q[:, start : start + width].astype(np.float64), axis=1
-        )
-        if not np.all(np.isfinite(norms)) or np.any(norms <= 0):
-          raise ValueError(
-              "free/ball quaternion must be finite and nonzero in float32"
-          )
-        q[:, start : start + width] = (
-            q[:, start : start + width].astype(np.float64) / norms[:, None]
-        ).astype(np.float32)
+    from mujoco_metal.retained_state import pack_residuals
+    words=pack_residuals(source,np.empty((batch,0),dtype=np.float64))
+    for typ,qa in zip(self.model.jnt_type,self.model.jnt_qposadr):
+      if int(typ) in (0,1):
+        start=int(qa)+(3 if int(typ)==0 else 0)
+        norms=np.linalg.norm(source[:,start:start+4],axis=1)
+        if np.any(~np.isfinite(norms)) or np.any(norms<=0):
+          raise ValueError('free/ball quaternion must be finite and nonzero')
     torch = self._torch
     self.prepare_workspace(batch)
     q_tensor = torch.as_tensor(q, dtype=torch.float32, device=self._device).contiguous()
@@ -647,4 +652,5 @@ class MetalKinematics:
     else:
       mocap_pos_tensor = None
       mocap_quat_tensor = None
-    return self.run_device(q_tensor, mocap_pos_tensor, mocap_quat_tensor)
+    word_tensor=torch.as_tensor(words,device=self._device)
+    return self.run_device(q_tensor,mocap_pos_tensor,mocap_quat_tensor,qpos_words=word_tensor)

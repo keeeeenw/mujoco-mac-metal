@@ -796,6 +796,7 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       ("fk.tree_awake_cast", b * max(ntree, 1)),
       ("fk.all_world_mask", b),
       ("fk.qpos", max(b * nq, 1)),
+      ("fk.position_words",max(2*b*nq,1)),
       # Header (12), packed-int offsets (9), packed-float offsets (11), and
       # output-arena offsets (29). Every shader-read offset is signed int32.
       ("fk.dims", 61),

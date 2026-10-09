@@ -202,7 +202,7 @@ def test_source_quaternion_matrix_keeps_residual_and_exact_null_contract():
       q, tuple(delta * value for value in axis))
   assert source_slide != rotate_scaled_axis
   shader = Path(__file__).parents[1] / "mujoco_metal" / "shaders" / "kinematics.metal"
-  text = shader.read_text()
+  text = shader.with_name("position_math.metal").read_text()+shader.read_text()
   assert "bool identity=kinq_equal(q,kinq(float4(1.0f,0.0f,0.0f,0.0f)))" in text
   assert "kin_fma(q.z,q.z,kin_fma(q.y,q.y," in text
   assert "kin_fma(q.w,q.w,kin_mul(q.x,q.x))" in text
