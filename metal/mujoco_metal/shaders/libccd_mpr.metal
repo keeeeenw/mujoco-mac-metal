@@ -356,7 +356,8 @@ static __attribute__((noinline)) int common_libccd_penetration(
     thread CommonCCDSupportObject& a, thread CommonCCDSupportObject& b,
     FlexDD3 center_a,FlexDD3 center_b,FlexDD margin,int iterations,FlexDD tolerance,
     device const float* vertices,device const int* graph,
-    thread ContactGeom& contact,thread FlexDD3& position,thread FlexDD3& normal) {
+    thread ContactGeom& contact,thread FlexDD3& position,thread FlexDD3& normal,
+    thread FlexDD* retained_distance=nullptr) {
   CommonCCDVertex portal[4];
   portal[0].point_a=center_a;portal[0].point_b=center_b;
   portal[0].minkowski=mpr_sub(center_a,center_b);
@@ -436,7 +437,9 @@ static __attribute__((noinline)) int common_libccd_penetration(
   if (mpr_eq3(normal,origin)) return 0;
   if (!all(isfinite(flex_dd3_high(position))) || !all(isfinite(flex_dd3_high(normal))) ||
       !isfinite(depth.hi)) return -21;
-  contact.dist=flex_dd_source_sub(margin,depth).hi;
+  FlexDD distance=flex_dd_source_sub(margin,depth);
+  contact.dist=distance.hi;
+  if(retained_distance!=nullptr)*retained_distance=distance;
   contact.pos=flex_dd3_high(position);contact.normal=flex_dd3_high(normal);
   contact.t1=float3(0);make_frame(contact.normal,contact.t1,contact.t2);
   return 1;

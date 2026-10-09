@@ -886,8 +886,25 @@ kernel void contact_produce_generic(
   }
   ncon=clamp(ncon,0,max_con);
   contact_count[count_index]=ncon;
-  for (int k=0;k<ncon;++k)
-    contact_cache_store(contact_records,world*ncontacts_max+offset+k,con[k]);
+  for (int k=0;k<ncon;++k) {
+    int record=world*ncontacts_max+offset+k;
+    contact_cache_store(contact_records,record,con[k]);
+    if(common_ready) {
+      int output_base=mesh_hull_info[common_header+5]
+          +(world*npairs+pair_idx)*mesh_hull_info[common_header+6];
+      int precision=output_base+COMMON_CCD_CONTACT_PRECISION_BASE+14*k;
+      int target=record*37;
+      float sign=heightfield_mesh && ta!=1 ? -1.0f : 1.0f;
+      contact_records[target+9]=mesh_hull[precision];
+      contact_records[target+10]=mesh_hull[precision+1];
+      for(int axis=0;axis<3;axis++) {
+        contact_records[target+25+axis]=mesh_hull[precision+2+axis];
+        contact_records[target+31+axis]=mesh_hull[precision+5+axis];
+        contact_records[target+28+axis]=sign*mesh_hull[precision+8+axis];
+        contact_records[target+34+axis]=sign*mesh_hull[precision+11+axis];
+      }
+    }
+  }
 }
 
 struct SdfStagePairInput {

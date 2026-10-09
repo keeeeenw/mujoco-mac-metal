@@ -7,7 +7,8 @@
 #define COMMON_CCD_PRODUCTION_MAGIC 1128487732
 #define COMMON_CCD_GEOM_INFO_WORDS 9
 #define COMMON_CCD_HEADER_WORDS 35
-#define COMMON_CCD_OUTPUT_WORDS 802
+#define COMMON_CCD_CONTACT_PRECISION_BASE 802
+#define COMMON_CCD_OUTPUT_WORDS (802 + 50*14)
 #define COMMON_CCD_DIAG_PRODUCTION_CONTEXT_OFFSET 7330
 #define COMMON_CCD_DIAG_PRODUCTION_CONTEXT_WORDS 232
 
@@ -161,6 +162,10 @@ static inline void common_ccd_production_store_contact(
   mesh_hull[base+10]=contact.t2.x;
   mesh_hull[base+11]=contact.t2.y;
   mesh_hull[base+12]=contact.t2.z;
+  // Every ordinary producer initializes its residual payload. A source-wide
+  // producer overwrites it only after the high contact has been published.
+  int precision=output+COMMON_CCD_CONTACT_PRECISION_BASE+14*slot;
+  for(int k=0;k<14;k++) mesh_hull[precision+k]=0.0f;
 }
 
 static inline void common_ccd_production_fail(
@@ -537,7 +542,7 @@ kernel void common_ccd_hfield_mesh_candidates(
   int scratch_stride=mesh_hull_info[header+8];
   int iterations=mesh_hull_info[header+9];
   int tolerance_base=mesh_hull_info[header+10];
-  if (geom_records<0 || graph_base<0 || output_base<0 || output_stride<802 ||
+  if (geom_records<0 || graph_base<0 || output_base<0 || output_stride<COMMON_CCD_OUTPUT_WORDS ||
       scratch_base<0 || scratch_stride<=0 || iterations<=0 || tolerance_base<0)
     { common_ccd_production_fail(world_status,world); return; }
   int query=world*npairs+pair;
@@ -751,6 +756,7 @@ kernel void common_ccd_hfield_mesh_candidates(
             mesh_hull_info+mesh_hull_info[common_header+24]
             +2*(world*npairs+pair)*vertex_capacity);
         FlexDD3 retained_position,retained_normal;
+        FlexDD retained_distance=flex_dd(0);
         const bool libccd=COMMON_CCD_USE_LIBCCD!=0;
         const bool shrunk_primitive=!libccd && (geom_type[mesh_geom]==2 || geom_type[mesh_geom]==3);
         int3 face_slots=int3(-1);
@@ -758,7 +764,7 @@ kernel void common_ccd_hfield_mesh_candidates(
         if (libccd) {
           result=common_libccd_penetration(
               prism,mesh,center,local_pos,flex_dd(0),iterations,tolerance,
-              mesh_hull,mesh_hull_info,contact,retained_position,retained_normal);
+              mesh_hull,mesh_hull_info,contact,retained_position,retained_normal,&retained_distance);
         } else if (shrunk_primitive) {
           // mjc_ccd shrinks spheres/capsules before prism penetration. The
           // terrain caller has zero output margin, while the convex object's
@@ -793,6 +799,10 @@ kernel void common_ccd_hfield_mesh_candidates(
               Rh,(libccd || shrunk_primitive)?retained_normal:flex_dd3(contact.normal));
           if (libccd) world_normal=common_libccd_fix_normal(
               prism,original,world_pos,world_normal);
+          // Source mj_addContact normalizes the corrected world normal
+          // before constructing the remaining axes. Preserve that source
+          // normalization rather than normalizing its float32 projection.
+          if(libccd) world_normal=mpr_normalize(world_normal);
           contact.normal=flex_dd3_high(world_normal);
           // mjc_ConvexHField publishes only the world normal after
           // mjc_fixNormal. mj_addContact then builds a fresh world frame.
@@ -800,7 +810,29 @@ kernel void common_ccd_hfield_mesh_candidates(
           // with the corrected normal, changing the friction Jacobian.
           contact.t1=float3(0.0f);
           make_frame(contact.normal,contact.t1,contact.t2);
+          if(libccd) {
+            FlexDD3 seed=flex_dd3(float3(0,1,0));
+            if(flex_dd_compare_exact(world_normal.y,flex_dd(.5f))>=0 ||
+               flex_dd_compare_exact(world_normal.y,flex_dd(-.5f))<=0)
+              seed=flex_dd3(float3(0,0,1));
+            FlexDD3 tangent=mpr_normalize(mpr_sub(seed,mpr_scale(world_normal,mpr_dot(world_normal,seed))));
+            contact.t1=flex_dd3_high(tangent);
+            contact.t2=flex_dd3_high(mpr_cross(world_normal,tangent));
+          }
           common_ccd_production_store_contact(mesh_hull,out,ncontact,contact);
+          if(libccd) {
+            int precision=out+COMMON_CCD_CONTACT_PRECISION_BASE+14*ncontact;
+            mesh_hull[precision]=retained_distance.lo;
+            mesh_hull[precision+1]=retained_distance.tail;
+            FlexDD point[3]={world_pos.x,world_pos.y,world_pos.z};
+            FlexDD normal[3]={world_normal.x,world_normal.y,world_normal.z};
+            for(int axis=0;axis<3;axis++) {
+              mesh_hull[precision+2+axis]=point[axis].lo;
+              mesh_hull[precision+5+axis]=point[axis].tail;
+              mesh_hull[precision+8+axis]=normal[axis].lo;
+              mesh_hull[precision+11+axis]=normal[axis].tail;
+            }
+          }
           // Keep the source-order terrain prism that produced each witness
           // in the three currently unused contact-record words. The canonical
           // row consumer reads only words 0:13; these tags support exact
@@ -1511,7 +1543,7 @@ kernel void common_ccd_rigid_convex_candidates(
   int face_capacity=mesh_hull_info[header+12];
   int horizon_capacity=mesh_hull_info[header+13];
   int stack_capacity=mesh_hull_info[header+14];
-  if (geom_records<0 || graph_base<0 || output_base<0 || output_stride<802 ||
+  if (geom_records<0 || graph_base<0 || output_base<0 || output_stride<COMMON_CCD_OUTPUT_WORDS ||
       scratch_base<0 || scratch_stride<=0 || iterations<=0 ||
       tolerance_base<0 || vertex_capacity<6 || face_capacity<6 ||
       horizon_capacity<3 || stack_capacity<1) {

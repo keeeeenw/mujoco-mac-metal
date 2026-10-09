@@ -89,7 +89,7 @@ def production_ccd_layout(batch_size, pair_count, iterations):
       "face_map": faces,
       "horizon": 2 * _HORIZON_CAP,
       "horizon_stack": 6 * faces,
-      "contact_records_and_header": 2 + 50 * 16,
+      "contact_records_and_header": 2 + 50 * 16 + 50 * 14,
   }
   # epa_horizon is a typed int2 view into this float-word arena.  Metal
   # requires an 8-byte aligned base, so add one word after the face map when
