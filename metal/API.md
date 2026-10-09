@@ -804,3 +804,23 @@ pyramidal/elliptic contact cost gradients for condim3/4/6, including all three
 elliptic cost regions. Selected native inverse row and producer checks now
 pass; complete solver, integrator and flex compositions remain open.
 These changes describe development source and do not change the published wheel.
+
+### Development standalone geometry distance
+
+`native_api.mj_geomDistance(sim, geom1, geom2, distmax)` returns independent
+MPS tensors: `distance[B]`, `distance_low[B]`, `distance_tail[B]`,
+`fromto[B,6]` and int32 `status[B]`. The two geom IDs and bound are host
+configuration; a finite bound is rounded to the float32 query input, and
+negative bounds are accepted. The witnesses follow the caller's geom order;
+no witness returns zero endpoints and the bound. The query uses the same
+compiled scene operands and source CCD/SDF callback pipeline as geometry
+sensors, independently of physical masks and the sensor-disable flag.
+
+A dedicated retained-precision FK owner prevents distance calls from
+overwriting borrowed stepping transforms, mass/constraint stages, stored
+sensors, warm starts or histories. Optional `dynamics=` consumes a validated
+native smooth-stage record. All query/FK backings and the returned output
+are counted before allocation; aggregate package-owned memory is checked at
+the public boundary. Query configuration changes replace a single cache at
+a host boundary; the replacement peak includes its existing backing.
+This is a batched backend counterpart, not the upstream pointer signature.

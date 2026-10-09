@@ -258,6 +258,25 @@ def _fk_output_layout(model, batch_size):
   return offsets, cursor
 
 
+def kinematics_workspace_sizes(model, batch_size):
+  """Exact standalone FK backing sizes; pure host admission before MPS."""
+  from mujoco_metal.capacity import _integer_count, _check_i32_elements
+  batch_size=_integer_count('batch_size',batch_size,minimum=1)
+  arrays=_prepare_host_arrays(model)
+  integer,_=_pack_fk_constants(arrays,_FK_INT_INPUTS,np.int32)
+  floating,_=_pack_fk_constants(arrays,_FK_FLOAT_INPUTS,np.float32)
+  _,output=_fk_output_layout(model,batch_size)
+  ntree=max(int(np.max(np.asarray(model.body_treeid),initial=-1))+1,1)
+  sizes={'static_int':integer.size,'static_float':floating.size,
+      'pose_output':output,'dims':12+len(_FK_INT_INPUTS)+len(_FK_FLOAT_INPUTS)+len(_FK_OUTPUTS),
+      'auxiliary':_fk_auxiliary_words(batch_size,model.nmocap,model.nbody,ntree),
+      'position_words':max(2*batch_size*model.nq,1),'qpos':max(batch_size*model.nq,1),
+      'tree_awake':batch_size*ntree,'tree_awake_cast':batch_size*ntree,
+      'all_world_mask':batch_size}
+  for name,words in sizes.items():_check_i32_elements('query_fk.'+name,int(words))
+  return {name:int(words) for name,words in sizes.items()}
+
+
 class MetalKinematics:
   """Batched native MSL forward kinematics; construction initializes MPS."""
 

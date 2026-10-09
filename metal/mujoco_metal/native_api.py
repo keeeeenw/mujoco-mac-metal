@@ -1149,6 +1149,65 @@ def _ray_query(sim, origins, vectors, *, dynamics=None, **filters):
     return program.run_device(stage["poses"], origins, vectors, **filters)
 
 
+def _owned_native_backing_bytes(owner):
+  """Count package-owned MPS backings once; no numerical device readback."""
+  seen=set();storage={}
+  def visit(value):
+    if id(value) in seen:return
+    seen.add(id(value))
+    if isinstance(value,torch.Tensor):
+      if value.device.type=='mps':
+        backing=value.untyped_storage()
+        storage[backing.data_ptr()]=backing.nbytes()
+    elif isinstance(value,dict):
+      for item in value.values():visit(item)
+    elif isinstance(value,(tuple,list)):
+      for item in value:visit(item)
+    elif type(value).__module__.startswith('mujoco_metal.') and hasattr(value,'__dict__'):
+      for item in vars(value).values():visit(item)
+  visit(owner)
+  return sum(storage.values())
+
+
+def mj_geomDistance(sim, geom1, geom2, distmax, *, dynamics=None):
+  """Owned distance/status[B] and fromto[B,6] using source CCD on Metal.
+
+  Geom IDs and finite float32-representable distmax are host configuration;
+  distmax is rounded to the documented float32 query input. Negative bounds
+  are permitted. No witness returns zeros and the bound, matching upstream.
+  Physical collision masks and the SENSOR disable bit do not filter queries.
+  A dedicated pose and collision workspace preserves all prepared stepping
+  stages, stored sensors, retained state, warm starts and history.
+  """
+  from dataclasses import replace
+  from mujoco_metal.capacity import CapacityLimits, CapacityOverflow
+  from mujoco_metal.geometry_queries import lower_geometry_distance,GeometryDistanceQuery
+  model=prepared_model(sim)
+  limits=getattr(sim,'limits',None) or CapacityLimits()
+  # Validate identifiers, numeric options and total requested addressing
+  # before reading/changing any simulation state or entering MPS execution.
+  desc=lower_geometry_distance(model,sim.batch_size,geom1,geom2,distmax,
+      descriptor=sim.state._model,limits=limits)
+  if dynamics is not None:_validate_spatial_stage(sim,dynamics)
+  key=(id(model),int(geom1),int(geom2),desc['cutoff'])
+  cached=getattr(sim,'_geometry_distance_query',None)
+  if cached is None or cached[0]!=key:
+    owned=_owned_native_backing_bytes(sim)
+    if owned+desc['bytes_total']>limits.memory_budget_bytes:
+      raise CapacityOverflow(f'geometry-distance total owned memory {owned+desc["bytes_total"]} bytes exceeds budget {limits.memory_budget_bytes}')
+    remaining=replace(limits,memory_budget_bytes=limits.memory_budget_bytes-owned)
+    program=GeometryDistanceQuery(model,sim.batch_size,geom1,geom2,distmax,
+        descriptor=desc['descriptor'],limits=remaining)
+    sim._geometry_distance_query=(key,program)
+  else:program=cached[1]
+  # Returning owned data has a visible peak allocation on every call, even
+  # when the fixed query pipeline is reused.
+  peak=_owned_native_backing_bytes(sim)+44*sim.batch_size
+  if peak>limits.memory_budget_bytes:
+    raise CapacityOverflow(f'geometry-distance output peak {peak} bytes exceeds budget {limits.memory_budget_bytes}')
+  return program.run(sim,dynamics)
+
+
 def mj_ray(sim, pnt, vec, geomgroup=None, flg_static=True, bodyexclude=-1,
            *, dynamics=None):
   """Query one ray per world; return owned distance/geom ID/normal/status.

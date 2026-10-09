@@ -1549,7 +1549,10 @@ kernel void common_ccd_rigid_convex_candidates(
   int rec_a=geom_records+COMMON_CCD_GEOM_INFO_WORDS*a;
   int rec_b=geom_records+COMMON_CCD_GEOM_INFO_WORDS*b;
   float margin_value=pair_margin_gap[2*pair]+pair_margin_gap[2*pair+1];
-  if (!isfinite(margin_value) || margin_value<0.0f) {
+  // mj_geomDistance passes distmax directly as the collision margin. A
+  // negative finite bound is valid and must reach libccd's support mapping
+  // and depth correction unchanged, rather than becoming an empty query.
+  if (!isfinite(margin_value)) {
     mesh_hull[out+1]=4.0f;
     common_ccd_production_fail(world_status,world); return;
   }

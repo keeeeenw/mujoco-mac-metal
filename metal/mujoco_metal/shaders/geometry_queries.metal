@@ -126,6 +126,11 @@ kernel void geometry_query_pairs(
   else common_ccd_load_geom_matrix(mat,matlo,mattail,9*(world*ng+ga),ma);
   if (!has_matrix) gq_quat_matrix(qb,mb);
   else common_ccd_load_geom_matrix(mat,matlo,mattail,9*(world*ng+gb),mb);
+  if(!common_ccd_finite_pose(pa,ma) || !common_ccd_finite_pose(pb,mb)) {
+    results[base]=1.0f;results[base+1]=bound.hi;
+    for(int k=2;k<10;k++) results[base+k]=0.0f;
+    return;
+  }
   int records=info[header+1],sizes=info[header+34];
   CommonCCDSupportObject a=common_ccd_production_geom(ga,ta==8?7:ta,records+9*ga,info,hull,pa,ma,float3(0),0);
   CommonCCDSupportObject b=common_ccd_production_geom(gb,tb==8?7:tb,records+9*gb,info,hull,pb,mb,float3(0),0);

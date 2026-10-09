@@ -11374,6 +11374,12 @@
       "requirement": "REQ-TRN-001",
       "execution": "native_owned_query",
       "semantics": "Current-state POS query returning owned batched actuator lengths and explicit dense moment rows; velocities belong to VEL. Native qualification tracked separately."
+    },
+    "mj_geomDistance": {
+      "path": "mujoco_metal/native_api.py:mj_geomDistance",
+      "requirement": "REQ-GEO-001",
+      "execution": "native_gpu_query",
+      "semantics": "owned batch distance/status/witnesses; explicit float32 bound; independent native FK/CCD"
     }
   },
   "python_function_map": {
@@ -11786,12 +11792,12 @@
       "counterpart_kind": "public_wrapper"
     },
     "mj_geomDistance": {
-      "classification": "collision_or_raycast_stage",
+      "classification": "package_counterpart",
       "owner": "REQ-GEO-001",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_geomDistance.",
-      "counterpart_kind": null
+      "execution": "native GPU query with independently owned FK and CCD",
+      "counterpart": "mujoco_metal/native_api.py:mj_geomDistance",
+      "gap": null,
+      "counterpart_kind": "public_wrapper"
     },
     "mj_getCache": {
       "classification": "upstream_model_or_diagnostic_utility",

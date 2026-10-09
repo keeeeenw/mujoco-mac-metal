@@ -12,23 +12,43 @@ import mujoco
 import numpy as np
 
 
-def lower_geometry_queries(model, batch_size=1, limits=None):
+def lower_geometry_queries(model, batch_size=1, limits=None, *, query_pairs=None, cutoff=None):
   from mujoco_metal.capacity import CapacityLimits, CapacityOverflow
   from mujoco_metal.sensors import _sensor_geoms
   from mujoco_metal.coupled_constraints import lower_collision_geometry
   from mujoco_metal.common_ccd_bridge import production_upload_sizes, uses_pinned_mjc_convex
   if isinstance(batch_size,bool) or not isinstance(batch_size,(int,np.integer)) or batch_size<1:
     raise ValueError('geometry-query batch size must be a positive integer')
-  kinds={int(getattr(mujoco.mjtSensor,'mjSENS_'+name))
-         for name in ('GEOMDIST','GEOMNORMAL','GEOMFROMTO')}
-  pairs=[]; bounds=[]; spans=np.zeros((model.nsensor,2),np.int32)
-  for sensor in range(model.nsensor):
-    if int(model.sensor_type[sensor]) not in kinds: continue
-    start=len(pairs)
-    for a in _sensor_geoms(model,model.sensor_objtype[sensor],model.sensor_objid[sensor]):
-      for b in _sensor_geoms(model,model.sensor_reftype[sensor],model.sensor_refid[sensor]):
-        pairs.append((sensor,a,b)); bounds.append(float(model.sensor_cutoff[sensor]))
-    spans[sensor]=start,len(pairs)-start
+  if not isinstance(model,mujoco.MjModel):
+    raise TypeError('geometry queries require a compiled MuJoCo model')
+  direct=query_pairs is not None
+  if direct:
+    raw=np.asarray(query_pairs)
+    if raw.ndim!=2 or raw.shape[1]!=2 or raw.dtype.kind not in 'iu' or not len(raw):
+      raise ValueError('query_pairs must be a nonempty integer[N,2] array')
+    if np.any(raw<0) or np.any(raw>=model.ngeom):
+      raise ValueError('query_pairs must identify compiled geoms')
+    bounds=np.asarray(cutoff,dtype=np.float64)
+    if bounds.ndim==0:bounds=np.full(len(raw),bounds,dtype=np.float64)
+    if (bounds.shape!=(len(raw),) or not np.all(np.isfinite(bounds))
+        or np.any(np.abs(bounds)>np.finfo(np.float32).max)):
+      raise ValueError('cutoff must be finite float32-representable scalar or [N]')
+    pairs=[(k,int(a),int(b)) for k,(a,b) in enumerate(raw)]
+    nsensor=len(pairs);nsensordata=0
+    spans=np.column_stack((np.arange(nsensor,dtype=np.int32),np.ones(nsensor,np.int32)))
+  else:
+    if cutoff is not None:raise ValueError('cutoff requires explicit query_pairs')
+    kinds={int(getattr(mujoco.mjtSensor,'mjSENS_'+name))
+           for name in ('GEOMDIST','GEOMNORMAL','GEOMFROMTO')}
+    pairs=[];bounds=[];nsensor=model.nsensor;nsensordata=model.nsensordata
+    spans=np.zeros((nsensor,2),np.int32)
+    for sensor in range(nsensor):
+      if int(model.sensor_type[sensor]) not in kinds:continue
+      start=len(pairs)
+      for a in _sensor_geoms(model,model.sensor_objtype[sensor],model.sensor_objid[sensor]):
+        for b in _sensor_geoms(model,model.sensor_reftype[sensor],model.sensor_refid[sensor]):
+          pairs.append((sensor,a,b));bounds.append(float(model.sensor_cutoff[sensor]))
+      spans[sensor]=start,len(pairs)-start
   count=len(pairs)
   if batch_size*count*10 >= (1<<31):
     raise CapacityOverflow('geometry-query result storage exceeds int32 addressing')
@@ -50,7 +70,7 @@ def lower_geometry_queries(model, batch_size=1, limits=None):
       any(uses_pinned_mjc_convex(int(model.geom_type[a]),int(model.geom_type[b]))
           for _,a,b in pairs))
   workspace_sizes={**common_sizes,'pairs':3*count,'cutoff':count,
-      'spans':2*model.nsensor,'types':model.ngeom,'dims':6,
+      'spans':2*nsensor,'types':model.ngeom,'dims':6,
       'results':batch_size*count*10,'zeros':batch_size*max(model.ngeom,1)*9}
   if callbacks:
     workspace_sizes.update(terrain_dims=12+51*count+batch_size,
@@ -75,6 +95,7 @@ def lower_geometry_queries(model, batch_size=1, limits=None):
     raise CapacityOverflow(f'geometry-query workspace {bytes_total} bytes exceeds budget {budget}')
   return {'scene':scene,'pairs':np.asarray(pairs,np.int32).reshape(-1,3),
           'cutoff':np.asarray(bounds,np.float32),'spans':spans,
+          'nsensor':nsensor,'nsensordata':nsensordata,'direct':direct,
           'common_bytes':common_bytes,'bytes_total':bytes_total,'terrain':terrain,'callbacks':callbacks,
           'sdf':sdf,'analytic_sdf':analytic_sdf,'seed_tile':seed_tile,
           'workspace_sizes':workspace_sizes}
@@ -100,9 +121,9 @@ def _sdf_library(libccd):
 
 
 class GeometryQueryProgram:
-  def __init__(self,model,batch_size,limits=None):
+  def __init__(self,model,batch_size,limits=None, *, query_pairs=None,cutoff=None):
     # All addressing/memory admission precedes device allocation.
-    desc=lower_geometry_queries(model,batch_size,limits)
+    desc=lower_geometry_queries(model,batch_size,limits,query_pairs=query_pairs,cutoff=cutoff)
     from mujoco_metal.common_ccd_bridge import append_production_workspace
     scene=desc['scene']; count=len(desc['pairs'])
     hull,info,_=append_production_workspace(model,scene.mesh_hull,scene.mesh_hull_info,
@@ -119,8 +140,12 @@ class GeometryQueryProgram:
     self.hull=tensor(hull);self.info=tensor(info);self.pairs=tensor(desc['pairs'])
     self.cutoff=tensor(desc['cutoff']);self.spans=tensor(desc['spans'])
     self.types=tensor(np.asarray(model.geom_type,np.int32))
-    self.dims=tensor(np.asarray([batch_size,count,model.ngeom,model.nsensor,
-                                model.nsensordata,model.opt.disableflags],np.int32))
+    # Standalone distance is not a sensor operation: SENSOR disable affects
+    # neither the upstream function nor this independent query pipeline.
+    flags=int(model.opt.disableflags)
+    if desc['direct']:flags &= ~int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
+    self.dims=tensor(np.asarray([batch_size,count,model.ngeom,desc['nsensor'],
+                                desc['nsensordata'],flags],np.int32))
     self.results=torch.zeros((batch_size,count,10),dtype=torch.float32,device='mps')
     self.zeros=torch.zeros((batch_size,max(model.ngeom,1),9),dtype=torch.float32,device='mps')
     self._sdf=desc['sdf']; self._analytic_sdf=desc['analytic_sdf']
@@ -247,9 +272,70 @@ class GeometryQueryProgram:
             self._sdf_workspace['contact_pair_count'],
             self._sdf_workspace['contact_pair_records'],self.results.reshape(-1),
             stage_mask,self.dims,threads=(b*self.count,),group_size=(1,))
-    library.geometry_query_reduce(self.results.reshape(-1),self.spans.reshape(-1),
-        metadata,out.reshape(-1),stage_mask,self.dims,
-        threads=(b*max(self.model.nsensor,1),),group_size=(1,))
+    if metadata is not None:
+      library.geometry_query_reduce(self.results.reshape(-1),self.spans.reshape(-1),
+          metadata,out.reshape(-1),stage_mask,self.dims,
+          threads=(b*max(self.model.nsensor,1),),group_size=(1,))
     self._completion.record()
     self._completion.wait()
-    return out
+    return self.results if metadata is None else out
+
+
+def lower_geometry_distance(model, batch_size, geom1, geom2, distmax, *,
+                            limits=None, descriptor=None):
+  """Host-only admission for an independent public distance query."""
+  from numbers import Integral, Real
+  from mujoco_metal.capacity import CapacityLimits, CapacityOverflow, _check_i32_elements
+  from mujoco_metal.model import load_model
+  from mujoco_metal.metal_kinematics import kinematics_workspace_sizes
+  for name,geom in (('geom1',geom1),('geom2',geom2)):
+    if isinstance(geom,(bool,np.bool_)) or not isinstance(geom,Integral) or not 0<=geom<model.ngeom:
+      raise ValueError(f'{name} must identify a compiled geom')
+  if isinstance(distmax,(bool,np.bool_)) or not isinstance(distmax,Real):
+    raise ValueError('distmax must be a finite float32-representable scalar')
+  desc=lower_geometry_queries(model,batch_size,limits,
+      query_pairs=np.asarray([[geom1,geom2]],np.int32),cutoff=distmax)
+  descriptor=load_model(model) if descriptor is None else descriptor
+  sizes={**desc['workspace_sizes'],
+      **{'fk.'+name:words for name,words in kinematics_workspace_sizes(descriptor,batch_size).items()},
+      'stage_mask':1+2*batch_size}
+  # Owned returned outputs are independent of reusable query/FK scratch.
+  # Charge the full cloned ten-word row (status + retained distance + witness).
+  sizes['owned_result']=11*batch_size
+  for name,words in sizes.items():_check_i32_elements('geometry_distance.'+name,words)
+  required=4*sum(sizes.values())
+  budget=(CapacityLimits() if limits is None else limits).memory_budget_bytes
+  if required>budget:
+    raise CapacityOverflow(f'geometry-distance workspace {required} bytes exceeds budget {budget}')
+  return {'bytes_total':required,'workspace_sizes':sizes,'descriptor':descriptor,
+          'pairs':np.asarray([[geom1,geom2]],np.int32),'cutoff':float(np.float32(distmax))}
+
+
+class GeometryDistanceQuery:
+  """Independent source CCD/FK owners: queries never overwrite stepping stages."""
+  def __init__(self,model,batch_size,geom1,geom2,distmax,*,limits=None,descriptor=None):
+    desc=lower_geometry_distance(model,batch_size,geom1,geom2,distmax,
+        limits=limits,descriptor=descriptor)
+    from mujoco_metal.metal_kinematics import MetalKinematics
+    self.model=model;self.batch_size=batch_size;self.workspace_sizes=desc['workspace_sizes']
+    self.program=GeometryQueryProgram(model,batch_size,limits,
+        query_pairs=desc['pairs'],cutoff=desc['cutoff'])
+    self.fk=MetalKinematics(desc['descriptor'],batch_size)
+    self.mask=self.program._torch.ones(1+2*batch_size,dtype=self.program._torch.int32,device='mps')
+    self.mask[0]=2
+
+  def run(self,sim,dynamics=None):
+    if dynamics is None:
+      state=sim.state
+      words=sim._position_words_for(state._qpos)
+      poses=self.fk.run_device(state._qpos,
+          state._mpos if state._model.nmocap else None,
+          state._mquat if state._model.nmocap else None,qpos_words=words)
+    else:poses=dynamics['poses']
+    self.program.results.zero_()
+    result=self.program.run(poses,None,self.mask,None)[:,0].clone()
+    # Views of this independently owned clone survive subsequent queries,
+    # model changes, stepping and checkpoint replay.
+    return {'status':result[:,0].to(self.program._torch.int32), 'distance':result[:,1],
+            'distance_low':result[:,2], 'distance_tail':result[:,3],
+            'fromto':result[:,4:10]}
