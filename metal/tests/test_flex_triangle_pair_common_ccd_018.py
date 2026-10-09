@@ -144,6 +144,36 @@ def _dense_efc_jacobian(model, data):
 
 
 
+def _detector_input_reference(model, data):
+  """Pinned collision on the exact operands of the standalone f32 detector.
+
+  This deliberately does not replace a public simulation/dynamics oracle.
+  The helper rebuilds element/BVH bounds from represented vertex coordinates.
+  """
+  from test_flex_contact_rows import _cpu_collision_for_float32_detector_inputs
+  quat = np.tile(np.array([1, 0, 0, 0], np.float32), (model.ngeom, 1))
+  return _cpu_collision_for_float32_detector_inputs(
+      model, data, np.asarray(data.flexvert_xpos, np.float32),
+      np.zeros((model.ngeom, 3), np.float32), quat)
+
+
+def test_cpu_tetra_detector_rounding_changes_the_pinned_contact_oracle():
+  model, data = _tetra_pair_fixture()
+  represented = _detector_input_reference(model, data)
+  assert data.ncon == represented.ncon == 36
+  np.testing.assert_array_equal(represented.flexvert_xpos,
+                                data.flexvert_xpos.astype(np.float32).astype(np.float64))
+  original = {tuple(map(int, c.elem)): c.frame[:3].copy()
+              for c in data.contact[:data.ncon]}
+  rounded = {tuple(map(int, c.elem)): c.frame[:3].copy()
+             for c in represented.contact[:represented.ncon]}
+  assert set(original) == set(rounded)
+  # The previously failing detector operand changes even the CPU normal
+  # beyond the original gate's 6e-5 tolerance. Neither tolerance is relaxed.
+  assert np.max(np.abs(original[(0, 4)] - rounded[(0, 4)])) > 6e-5
+  assert np.max(np.abs(original[(4, 0)] - rounded[(4, 0)])) > .5
+
+
 def _expected_pair_contacts(model, data, descriptor):
   expected = {}
   for contact in data.contact[:data.ncon]:
@@ -236,7 +266,8 @@ def test_native_direct_tetra_pair_common_ccd_matches_pinned_B2():
     pytest.skip("direct tetra pair CCD requires MPS")
   model, data = _tetra_pair_fixture()
   descriptor = lower_flex_contacts(model)
-  expected = _expected_pair_contacts(model, data, descriptor)
+  reference = _detector_input_reference(model, data)
+  expected = _expected_pair_contacts(model, reference, descriptor)
   assert len(expected) == 36
   program = FlexContactProgram(model, batch_size=2, device="mps")
   assert program._has_native_flex_pair_candidates
@@ -283,7 +314,8 @@ def test_native_direct_mixed_simplex_pair_common_ccd_matches_pinned_B2(
     pytest.skip("mixed-order direct flex CCD requires MPS")
   model, data = _direct_simplex_pair_fixture(dim1, dim2)
   descriptor = lower_flex_contacts(model)
-  expected = _expected_pair_contacts(model, data, descriptor)
+  reference = _detector_input_reference(model, data)
+  expected = _expected_pair_contacts(model, reference, descriptor)
   assert len(expected) == count
   program = FlexContactProgram(model, batch_size=2, device="mps")
   assert program._has_native_flex_pair_candidates
