@@ -51,6 +51,49 @@ def _spatial_shader_library(entry):
 
 def _dispatch_spatial(entry, name, *args, **kwargs):
   return getattr(_spatial_shader_library(entry), name)(*args, **kwargs)
+
+
+def tactile_workspace_sizes(model):
+  """Physical immutable tactile buffers, including shared compiled octrees."""
+  taxels = sum(int(model.mesh_vertnum[int(model.sensor_objid[i])])
+               for i in range(int(model.nsensor))
+               if int(model.sensor_type[i]) == int(mujoco.mjtSensor.mjSENS_TACTILE))
+  meshes = set()
+  for g in range(int(model.ngeom)):
+    if int(model.geom_type[g]) in (int(mujoco.mjtGeom.mjGEOM_MESH),
+                                   int(mujoco.mjtGeom.mjGEOM_SDF)):
+      mesh = int(model.geom_dataid[g])
+      if mesh >= 0 and int(model.mesh_octadr[mesh]) >= 0:
+        meshes.add(mesh)
+  nodes = 0
+  for mesh in meshes:
+    count = int(model.mesh_octnum[mesh])
+    if count <= 0 or count >= 2**24:
+      raise ValueError("tactile octree must have a positive float32-exact node count")
+    nodes += count
+  return {"meta": 7 * max(taxels, 1), "frames": 10 * max(taxels, 1),
+          "oct_info": 2 * max(int(model.ngeom), 1), "oct": max(50 * nodes, 1),
+          "dims": 8}
+
+
+def _tactile_octree_block(model, adr, count):
+  """The shared SDF decoder consumes children and three source-word planes."""
+  from mujoco_metal.model import require_triple_word_domain
+  child = np.asarray(model.oct_child[adr:adr+count]).reshape(-1)
+  aabb = require_triple_word_domain(model.oct_aabb[adr:adr+count],
+                                   what="tactile octree AABB")
+  coeff = require_triple_word_domain(model.oct_coeff[adr:adr+count],
+                                    what="tactile octree coefficients")
+  if child.size != 8*count or aabb.size != 6*count or coeff.size != 8*count:
+    raise ValueError("invalid compiled tactile octree layout")
+  high = [v.astype(np.float32) for v in (aabb, coeff)]
+  low = [(v-h.astype(np.float64)).astype(np.float32)
+         for v, h in zip((aabb, coeff), high)]
+  tail = [(v-h.astype(np.float64)-l.astype(np.float64)).astype(np.float32)
+          for v, h, l in zip((aabb, coeff), high, low)]
+  return np.concatenate([child.astype(np.float32), *high, *low, *tail])
+
+
 _SUPPORTED = {
     int(mujoco.mjtSensor.mjSENS_JOINTPOS),
     int(mujoco.mjtSensor.mjSENS_JOINTVEL),
@@ -1957,12 +2000,7 @@ class SensorProgram:
         adr, count = int(model.mesh_octadr[mesh]), int(model.mesh_octnum[mesh])
         if count <= 0 or count >= 2**24:
           raise ValueError("tactile octree must have a positive float32-exact node count")
-        block = np.concatenate([
-            np.asarray(model.oct_child[adr:adr+count]).reshape(-1),
-            np.asarray(model.oct_aabb[adr:adr+count]).reshape(-1),
-            np.asarray(model.oct_coeff[adr:adr+count]).reshape(-1)]).astype(np.float32)
-        if block.size != 22*count or not np.all(np.isfinite(block)):
-          raise ValueError("invalid compiled tactile octree layout")
+        block = _tactile_octree_block(model, adr, count)
         offsets[mesh] = cursor, count
         cursor += block.size
         blocks.append(block)
