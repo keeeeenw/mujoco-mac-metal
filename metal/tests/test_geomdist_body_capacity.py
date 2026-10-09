@@ -96,3 +96,55 @@ def test_fromto_search_cutoff_does_not_clip_world_coordinates(native):
     actual = sensor_oracle(model, np.empty((2, 0)), np.empty((2, 0)),
                            np.zeros(2), poses, extra=extra)
     np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+
+def _overlap_fixture():
+  return mujoco.MjModel.from_xml_string("""<mujoco>
+    <default><geom contype="0" conaffinity="0"/></default>
+    <worldbody><body name="b"><freejoint/>
+      <geom name="a" type="sphere" size=".1"/>
+      <geom name="other" type="sphere" size=".1" pos=".35 0 0"/>
+    </body></worldbody><sensor>
+      <distance body1="b" geom2="a" cutoff="1"/>
+      <normal body1="b" geom2="a" cutoff="1"/>
+      <fromto body1="b" geom2="a" cutoff="1"/>
+      <distance geom1="a" body2="b" cutoff="1"/>
+      <normal geom1="a" body2="b" cutoff="1"/>
+      <fromto geom1="a" body2="b" cutoff="1"/>
+    </sensor></mujoco>""")
+
+
+def test_body_geom_overlap_keeps_every_pinned_query_pair():
+  from mujoco_metal.sensors import lower_sensors
+  from mujoco_metal.geometry_queries import lower_geometry_queries
+  model=_overlap_fixture();d=mujoco.MjData(model);mujoco.mj_forward(model,d)
+  assert lower_sensors(model).nsensor==6
+  desc=lower_geometry_queries(model,2)
+  assert desc['pairs'].shape==(12,3)
+  assert np.count_nonzero(desc['pairs'][:,1]==desc['pairs'][:,2])==6
+  np.testing.assert_allclose(d.sensordata[[0,10]],-.2,atol=1e-15)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",reason="native overlap qualification")
+def test_native_body_geom_overlap_uses_source_self_witnesses_and_replay():
+  import torch
+  from mujoco_metal.sensors import SensorProgram
+  model=_overlap_fixture();d=mujoco.MjData(model);p=SensorProgram(model,2)
+  positions=[];expected=[]
+  for x in (0.,.125):
+    d.qpos[:]=model.qpos0;d.qpos[0]=x;mujoco.mj_forward(model,d)
+    positions.append(d.geom_xpos.copy());expected.append(d.sensordata.copy())
+  poses={'geom_pos':torch.tensor(np.asarray(positions),dtype=torch.float32,device='mps'),
+         'geom_quat':torch.tensor(np.tile([1.,0.,0.,0.],(2,model.ngeom,1)),dtype=torch.float32,device='mps')}
+  actual=p.run_geomdist_device(poses,p._sp_hull,p._sp_hull_info)
+  np.testing.assert_allclose(actual.cpu().numpy(),expected,atol=2e-6,rtol=2e-6)
+  saved=actual.clone()
+  poses['geom_pos'][0].add_(.5)
+  p.run_geomdist_device(poses,p._sp_hull,p._sp_hull_info,
+      world_mask=torch.tensor([False,True],device='mps'))
+  torch.testing.assert_close(actual,saved,rtol=0,atol=0)
+  poses['geom_pos'][0].sub_(.5)
+  replay=p.run_geomdist_device(poses,p._sp_hull,p._sp_hull_info)
+  torch.testing.assert_close(replay,saved,rtol=0,atol=0)

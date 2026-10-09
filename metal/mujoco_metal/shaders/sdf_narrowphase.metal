@@ -426,10 +426,13 @@ inline SdfJet sdf_oct_pair_dist(device const float* hull, int co, int nn,
   SdfJet value = sj(0.0f);
   int fl = co + 28 * nn;
   int ct = co + 42 * nn;
+  // The pinned macOS binary contracts sdf += weight*coefficient. Keep
+  // its single rounding, as in the gradient accumulation below; separate
+  // mul/add can change a strict callback minimum between tied contacts.
   for (int i = 0; i < 8; ++i)
-    value = sjadd(value, sjmul(weights[i],
+    value = sjfma(weights[i],
         sjwide(SdfWide{hull[fb + 8 * node + i], hull[fl + 8 * node + i],
-                       hull[ct + 8 * node + i]})));
+                       hull[ct + 8 * node + i]}),value);
   return sjcompare(box_distance, sj(0.0f)) > 0
       ? sjadd(value, box_distance) : value;
 }
@@ -577,6 +580,17 @@ inline SdfPointPair sdf_pair_transform(float3x3 R, SdfPointPair p, float3 t);
 inline SdfPointPair sdf_pair_transform(SdfTransformWide T, SdfPointPair p);
 inline SdfTransformWide sdf_transform_transpose(SdfTransformWide T);
 inline SdfVectorPair sdf_vector_transform(SdfMatrixWide R, SdfVectorPair a);
+
+inline void sdf_matrix_set(thread SdfMatrixWide& A,int column,int row,SdfWide value);
+inline void sdf_quat_from_mat_wide(SdfWide m0,SdfWide m1,SdfWide m2,
+    SdfWide m3,SdfWide m4,SdfWide m5,SdfWide m6,SdfWide m7,SdfWide m8,
+    thread SdfWide& qw,thread SdfWide& qx,thread SdfWide& qy,thread SdfWide& qz);
+inline SdfTransformWide sdf_relative_transform_wide_wide(
+    SdfWide qw_from,SdfWide qx_from,SdfWide qy_from,SdfWide qz_from,
+    SdfWide qw_to,SdfWide qx_to,SdfWide qy_to,SdfWide qz_to,
+    SdfWide px_from,SdfWide py_from,SdfWide pz_from,
+    SdfWide px_to,SdfWide py_to,SdfWide pz_to);
+
 inline SdfJet sdf_side_pair_jet(SdfSide side, device const float* hull,
                                 SdfPointPair x);
 inline SdfVectorPair sdf_side_pair_grad(SdfSide side,
@@ -727,7 +741,7 @@ inline void sdf_mesh_face_candidates(int face_id,float3x3 R,float3 t,
 }
 
 
-inline void sdf_mesh_face_candidates_cached(int face_id,float3x3 R,float3 t,
+inline void sdf_mesh_face_candidates_cached(int face_id,SdfTransformWide T,
                                      int nstart,int iterations,
                                      SdfSide sdf,device const float* hull,
                                      int vertbase,int facebase,
@@ -736,15 +750,15 @@ inline void sdf_mesh_face_candidates_cached(int face_id,float3x3 R,float3 t,
   if(ncandidate>=SDF_MESH_MAX_CANDIDATES)return;
   int ib=facebase+3*face_id;
   int ia=int(hull[ib]),im=int(hull[ib+1]),ic=int(hull[ib+2]);
-  SdfPointPair a=sdf_pair_transform(R,SdfPointPair{
+  SdfPointPair a=sdf_pair_transform(T,SdfPointPair{
       float3(hull[vertbase+3*ia],hull[vertbase+3*ia+1],hull[vertbase+3*ia+2]),
-      float3(0)},t);
-  SdfPointPair b=sdf_pair_transform(R,SdfPointPair{
+      float3(0)});
+  SdfPointPair b=sdf_pair_transform(T,SdfPointPair{
       float3(hull[vertbase+3*im],hull[vertbase+3*im+1],hull[vertbase+3*im+2]),
-      float3(0)},t);
-  SdfPointPair c=sdf_pair_transform(R,SdfPointPair{
+      float3(0)});
+  SdfPointPair c=sdf_pair_transform(T,SdfPointPair{
       float3(hull[vertbase+3*ic],hull[vertbase+3*ic+1],hull[vertbase+3*ic+2]),
-      float3(0)},t);
+      float3(0)});
   if(!sdf_mesh_triangle_intersect(sdf,hull,sdf_pair_value(a),
                                   sdf_pair_value(b),sdf_pair_value(c)))return;
   for(int sp=0;sp<nstart && ncandidate<SDF_MESH_MAX_CANDIDATES;++sp) {
@@ -1007,7 +1021,11 @@ inline int collide_mesh_sdf_cached(int gi_mesh, int gi_sdf, float3 pmesh,
                             int maxn, int record_base, device float* records,
                             int scratch_base, device float* scratch,
                             device const float* hull,
-                            device const int* hull_info) {
+                            device const int* hull_info,
+    device const float* geom_pos,device const float* geom_pos_low,
+    device const float* geom_pos_tail,device const float* geom_xmat,
+    device const float* geom_xmat_low,device const float* geom_xmat_tail,
+    int geom_world_offset) {
   int mb = gi_mesh * 9, sb = gi_sdf * 9;
   SdfSide sdf = sdf_geom_side(gi_sdf, SDF_SDF, float3(0.0f), hull_info);
   int iterations = hull_info[sb + 2], nstart = max(1, hull_info[sb + 4]);
@@ -1018,14 +1036,28 @@ inline int collide_mesh_sdf_cached(int gi_mesh, int gi_sdf, float3 pmesh,
       (sdf.plugin_kind <= 0 || sdf.attribute_base < 0)) ||
       iterations <= 0 || nfaces <= 0 || vertbase < 0 || facebase < 0 ||
       bvhbase < 0 || nbvh <= 0) return 0;
-  float3x3 Rm = float3x3(rotate_q(qmesh, float3(1,0,0)),
-                         rotate_q(qmesh, float3(0,1,0)),
-                         rotate_q(qmesh, float3(0,0,1)));
-  float3x3 Rs = float3x3(rotate_q(qsdf, float3(1,0,0)),
-                         rotate_q(qsdf, float3(0,1,0)),
-                         rotate_q(qsdf, float3(0,0,1)));
-  float3x3 R = transpose(Rs) * Rm;
-  float3 t = transpose(Rs) * (pmesh - psdf);
+    // Pinned mjc_MeshSDF derives both quaternions from the source xmat,
+    // then mapPose builds the relative frame. Output uses xmat2 directly.
+    SdfWide ma[9],source_sdf_matrix[9],pa[3],pb[3];
+    for(int k=0;k<9;k++) {
+      int a=9*(geom_world_offset+gi_mesh)+k,b=9*(geom_world_offset+gi_sdf)+k;
+      ma[k]=SdfWide{geom_xmat[a],geom_xmat_low[a],geom_xmat_tail[a]};
+      source_sdf_matrix[k]=SdfWide{geom_xmat[b],geom_xmat_low[b],geom_xmat_tail[b]};
+    }
+    for(int k=0;k<3;k++) {
+      int a=3*(geom_world_offset+gi_mesh)+k,b=3*(geom_world_offset+gi_sdf)+k;
+      pa[k]=SdfWide{geom_pos[a],geom_pos_low[a],geom_pos_tail[a]};
+      pb[k]=SdfWide{geom_pos[b],geom_pos_low[b],geom_pos_tail[b]};
+    }
+    SdfWide aw,ax,ay,az,bw,bx,by,bz;
+    sdf_quat_from_mat_wide(ma[0],ma[1],ma[2],ma[3],ma[4],ma[5],ma[6],ma[7],ma[8],aw,ax,ay,az);
+    sdf_quat_from_mat_wide(source_sdf_matrix[0],source_sdf_matrix[1],source_sdf_matrix[2],source_sdf_matrix[3],source_sdf_matrix[4],source_sdf_matrix[5],source_sdf_matrix[6],source_sdf_matrix[7],source_sdf_matrix[8],bw,bx,by,bz);
+    SdfTransformWide T=sdf_relative_transform_wide_wide(aw,ax,ay,az,bw,bx,by,bz,
+        pa[0],pa[1],pa[2],pb[0],pb[1],pb[2]);
+    SdfTransformWide world;
+    for(int column=0;column<3;column++) for(int row=0;row<3;row++)
+      sdf_matrix_set(world.rotation,column,row,source_sdf_matrix[3*row+column]);
+    for(int k=0;k<3;k++) world.translation[k]=pb[k];
   int ncandidate = 0;
   int stack[64];
   int nstack = 1;
@@ -1037,10 +1069,11 @@ inline int collide_mesh_sdf_cached(int gi_mesh, int gi_sdf, float3 pmesh,
     int face_id = int(hull[rb]);
     float3 bc = float3(hull[rb + 3], hull[rb + 4], hull[rb + 5]);
     float3 bh = float3(hull[rb + 6], hull[rb + 7], hull[rb + 8]);
-    if (!sdf_mesh_box_intersect(sdf, hull, R, t, bc, bh)) continue;
+    SdfPointPair center=sdf_pair_transform(T,SdfPointPair{bc,float3(0),float3(0)});
+    if (!(sdf_side_dist(sdf,hull,sdf_pair_value(center)) < length(bh))) continue;
     if (face_id >= 0) {
       if (face_id < nfaces)
-        sdf_mesh_face_candidates_cached(face_id, R, t, nstart, iterations, sdf,
+        sdf_mesh_face_candidates_cached(face_id, T, nstart, iterations, sdf,
                                         hull, vertbase, facebase, scratch_base,
                                         scratch, ncandidate);
     } else {
@@ -1076,8 +1109,8 @@ inline int collide_mesh_sdf_cached(int gi_mesh, int gi_sdf, float3 pmesh,
     SdfVectorPair local_normal=sdf_vector_normalize(gradient);
     local_normal.hi=-local_normal.hi;local_normal.lo=-local_normal.lo;
     local_normal.tail=-local_normal.tail;
-    SdfVectorPair world_normal=sdf_vector_transform(Rs,local_normal);
-    SdfPointPair world_point=sdf_pair_transform(Rs,x,psdf);
+    SdfVectorPair world_normal=sdf_vector_transform(world.rotation,local_normal);
+    SdfPointPair world_point=sdf_pair_transform(world,x);
     world_point=sdf_pair_add_scaled(world_point,world_normal,
         sw_neg(sw_mul(sw(0.5f),SdfWide{scratch[candidate_base+9],
                                            scratch[candidate_base+10],
@@ -1093,8 +1126,16 @@ inline int collide_mesh_sdf_cached(int gi_mesh, int gi_sdf, float3 pmesh,
     float3 t1=float3(0),t2=float3(0);
     make_frame(normal,t1,t2);
     int output_base=accepted_base+12;
-    records[output_base+0]=sw_float32(SdfWide{scratch[candidate_base+9],
-        scratch[candidate_base+10],scratch[candidate_base+11]});
+    SdfWide depth=SdfWide{scratch[candidate_base+9],
+        scratch[candidate_base+10],scratch[candidate_base+11]};
+    float depth_hi=sw_float32(depth);
+    SdfWide depth_residual=sw_sub(depth,sw(depth_hi));
+    records[output_base+0]=depth_hi;
+    // Retain callback depth for strict minimum selection, independently of
+    // the published float32 contact distance and local candidate coordinates.
+    records[accepted_base+9]=depth_residual.hi;
+    records[accepted_base+10]=depth_residual.mid;
+    records[accepted_base+11]=depth_residual.lo;
     records[output_base+1]=point.x; records[output_base+2]=point.y;
     records[output_base+3]=point.z; records[output_base+4]=normal.x;
     records[output_base+5]=normal.y; records[output_base+6]=normal.z;
@@ -2419,7 +2460,10 @@ inline void sdf_stage_publish(int swapped, float3 p2, float4 q2,
   // wide descent distance. Distance is swap-independent (no negation).
   float dist_hi = sw_float32(dist);
   records[out + 12] = dist_hi;
-  records[out + 9] = sw_sub(dist, sw(dist_hi)).hi;
+  SdfWide dist_residual=sw_sub(dist,sw(dist_hi));
+  records[out + 9] = dist_residual.hi;
+  records[out + 10] = dist_residual.mid;
+  records[out + 11] = dist_residual.lo;
   records[out + 13] = point.x; records[out + 14] = point.y;
   records[out + 15] = point.z; records[out + 16] = contact_normal.x;
   records[out + 17] = contact_normal.y; records[out + 18] = contact_normal.z;

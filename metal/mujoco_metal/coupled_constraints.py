@@ -3433,6 +3433,8 @@ class MetalCoupledConstraints:
             self._constants["mesh_hull"], self._constants["mesh_hull_info"],
             w["contact_pair_count"], w["contact_pair_records"],
             w["contact_pair_scratch"],
+            poses["geom_pos_low"], poses["geom_pos_tail"],
+            poses["geom_xmat"], poses["geom_xmat_low"], poses["geom_xmat_tail"],
             threads=(b * d.npairs,), group_size=(1,))
       self._contact_kernel(
           self._constants["geom_bodyid"], poses["body_pos"], poses["body_quat"],

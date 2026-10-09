@@ -914,6 +914,7 @@ inline bool sdf_stage_decode(device const float* geom_pos,
   int ga = pair_geoms[pair_idx * 2], gb = pair_geoms[pair_idx * 2 + 1];
   int ta = geom_type[ga], tb = geom_type[gb];
   if ((ta != 8 && tb != 8) || ta == 7 || tb == 7) return false;
+  if (ta <= 1 || tb <= 1) return false;
   bool prune = (dims[9] & 1) != 0;
   if (prune && logical_to_packed[world * npairs + pair_idx] < 0)
     return false;
@@ -1276,6 +1277,7 @@ kernel void contact_finalize_sdf(
   int a=pair_geoms[pair_idx*2], b=pair_geoms[pair_idx*2+1];
   int ta=geom_type[a], tb=geom_type[b];
   if ((ta!=8 && tb!=8) || ta==7 || tb==7) return;
+  if (ta<=1 || tb<=1) return;
   bool prune=(dims[9]&1)!=0;
   if (prune && logical_to_packed[world*npairs+pair_idx]<0) return;
   int count_index=world*npairs+pair_idx;
@@ -1337,6 +1339,11 @@ kernel void contact_produce_mesh_sdf(
     device int* contact_count [[buffer(9)]],
     device float* contact_records [[buffer(10)]],
     device float* candidate_scratch [[buffer(11)]],
+    device const float* geom_pos_low [[buffer(12)]],
+    device const float* geom_pos_tail [[buffer(13)]],
+    device const float* geom_xmat [[buffer(14)]],
+    device const float* geom_xmat_low [[buffer(15)]],
+    device const float* geom_xmat_tail [[buffer(16)]],
     uint tid [[thread_position_in_grid]]) {
   int npairs=dims[1], ncontacts_max=dims[2], batch=dims[3];
   int world=int(tid)/max(npairs,1), pair_idx=int(tid)%max(npairs,1);
@@ -1366,7 +1373,8 @@ kernel void contact_produce_mesh_sdf(
   int ncon=collide_pair_mesh_sdf_cached(ta,pa,qa,tb,pb,qb,a,b,
       max_con,record_base,contact_records,(world*npairs+pair_idx)*50,
       candidate_scratch,
-      mesh_hull,mesh_hull_info);
+      mesh_hull,mesh_hull_info,geom_pos,geom_pos_low,geom_pos_tail,
+      geom_xmat,geom_xmat_low,geom_xmat_tail,go);
   contact_count[count_index]=clamp(ncon,0,max_con);
 }
 

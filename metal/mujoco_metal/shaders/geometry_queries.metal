@@ -131,13 +131,14 @@ kernel void geometry_query_pairs(
     device const int* pairs [[buffer(8)]],device const float* cutoffs [[buffer(9)]],
     device float* hull [[buffer(10)]],device int* info [[buffer(11)]],
     device float* results [[buffer(12)]],device const int* mask [[buffer(13)]],
-    constant int* dims [[buffer(14)]],uint index [[thread_position_in_grid]]) {
+    constant int* dims [[buffer(14)]],constant int& has_matrix [[buffer(15)]],
+    uint index [[thread_position_in_grid]]) {
   int batch=dims[0],np=dims[1],ng=dims[2],ns=dims[3];
   if (index>=uint(batch*np) || (mask[0]&2)==0 || (dims[5]&8192)!=0) return;
   int world=int(index)/np,pair=int(index)%np,sensor=pairs[3*pair];
   if (mask[1+world*max(ns,1)+sensor]==0 || mask[1+batch*max(ns,1)+world]==0) return;
   int ga=pairs[3*pair+1],gb=pairs[3*pair+2],ta=types[ga],tb=types[gb];
-  if (ta==1 || tb==1) return;
+  if (ta==1 || tb==1 || ((ta==8 || tb==8) && ta!=0 && tb!=0)) return;
   int header=9*ng,base=int(index)*10;
   FlexDD bound=flex_dd(cutoffs[pair]),dist=bound;
   FlexDD3 wa=flex_dd3(float3(0)),wb=wa;
@@ -147,19 +148,19 @@ kernel void geometry_query_pairs(
   float4 qa=float4(quat[4*(world*ng+ga)],quat[4*(world*ng+ga)+1],quat[4*(world*ng+ga)+2],quat[4*(world*ng+ga)+3]);
   float4 qb=float4(quat[4*(world*ng+gb)],quat[4*(world*ng+gb)+1],quat[4*(world*ng+gb)+2],quat[4*(world*ng+gb)+3]);
   FlexDD ma[9],mb[9];
-  if (mat[9*(world*ng+ga)]==0 && mat[9*(world*ng+ga)+4]==0 && mat[9*(world*ng+ga)+8]==0) gq_quat_matrix(qa,ma);
+  if (!has_matrix) gq_quat_matrix(qa,ma);
   else common_ccd_load_geom_matrix(mat,matlo,mattail,9*(world*ng+ga),ma);
-  if (mat[9*(world*ng+gb)]==0 && mat[9*(world*ng+gb)+4]==0 && mat[9*(world*ng+gb)+8]==0) gq_quat_matrix(qb,mb);
+  if (!has_matrix) gq_quat_matrix(qb,mb);
   else common_ccd_load_geom_matrix(mat,matlo,mattail,9*(world*ng+gb),mb);
   int records=info[header+1],sizes=info[header+34];
-  CommonCCDSupportObject a=common_ccd_production_geom(ga,ta,records+9*ga,info,hull,pa,ma,float3(0),0);
-  CommonCCDSupportObject b=common_ccd_production_geom(gb,tb,records+9*gb,info,hull,pb,mb,float3(0),0);
+  CommonCCDSupportObject a=common_ccd_production_geom(ga,ta==8?7:ta,records+9*ga,info,hull,pa,ma,float3(0),0);
+  CommonCCDSupportObject b=common_ccd_production_geom(gb,tb==8?7:tb,records+9*gb,info,hull,pb,mb,float3(0),0);
   for (int k=0;k<3;k++) {
     a.size[k]=FlexDD{hull[sizes+9*ga+3*k],hull[sizes+9*ga+3*k+1],hull[sizes+9*ga+3*k+2]};
     b.size[k]=FlexDD{hull[sizes+9*gb+3*k],hull[sizes+9*gb+3*k+1],hull[sizes+9*gb+3*k+2]};
   }
   bool convex=common_ccd_production_uses_mjc_convex(ta,tb);
-  if ((ta==0 && (tb==4 || tb==7)) || (tb==0 && (ta==4 || ta==7))) {
+  if ((ta==0 && (tb==4 || tb==7 || tb==8)) || (tb==0 && (ta==4 || ta==7 || ta==8))) {
     int g=ta==0?gb:ga;int rb=info[header+33]+3*g;
     FlexDD rbound=FlexDD{hull[rb],hull[rb+1],hull[rb+2]};
     if(ta==0) found=gq_plane_convex(a,b,bound,rbound,hull,info,dist,wa,wb);
@@ -229,7 +230,7 @@ kernel void geometry_query_prepare_terrain(device const float* quat [[buffer(0)]
     device const float* mattail [[buffer(3)]],device float* output [[buffer(4)]],
     device int* logical_map [[buffer(5)]],device const int* pairs [[buffer(6)]],
     device const int* mask [[buffer(7)]],constant int* dims [[buffer(8)]],
-    uint index [[thread_position_in_grid]]) {
+    constant int& has_matrix [[buffer(9)]],uint index [[thread_position_in_grid]]) {
   int batch=dims[0],np=dims[1],ng=dims[2],ns=dims[3],stride=batch*ng*9;
   if (index<uint(batch*np)) {
     int world=int(index)/np,pair=int(index)%np,sensor=pairs[3*pair];
@@ -239,7 +240,7 @@ kernel void geometry_query_prepare_terrain(device const float* quat [[buffer(0)]
   }
   if (index>=uint(batch*ng)) return;
   int base=9*int(index);FlexDD matrix[9];
-  if(mat[base]==0 && mat[base+4]==0 && mat[base+8]==0)
+  if(!has_matrix)
     gq_quat_matrix(float4(quat[4*index],quat[4*index+1],quat[4*index+2],quat[4*index+3]),matrix);
   else common_ccd_load_geom_matrix(mat,matlo,mattail,base,matrix);
   for(int k=0;k<9;k++) {output[base+k]=matrix[k].hi;output[stride+base+k]=matrix[k].lo;
@@ -273,6 +274,42 @@ kernel void geometry_query_finish_terrain(device const int* types [[buffer(0)]],
   float3 n=pick<0?float3(0):float3(hull[pick+1],hull[pick+2],hull[pick+3]);
   float sign=types[a]>types[b]?-1.0f:1.0f;
   float3 x1=p-.5f*sign*best*n,x2=p+.5f*sign*best*n;
+  results[base+4]=x1.x;results[base+5]=x1.y;results[base+6]=x1.z;
+  results[base+7]=x2.x;results[base+8]=x2.y;results[base+9]=x2.z;
+}
+
+// Source mjc_SDF / mjc_MeshSDF ignore the distance-query margin and publish
+// penetrating minima in callback order. HFieldSDF is a pinned empty callback.
+kernel void geometry_query_finish_sdf(device const int* types [[buffer(0)]],
+    device const int* pairs [[buffer(1)]],device const float* cutoffs [[buffer(2)]],
+    device const int* counts [[buffer(3)]],device const float* contacts [[buffer(4)]],
+    device float* results [[buffer(5)]],device const int* mask [[buffer(6)]],
+    constant int* dims [[buffer(7)]],uint index [[thread_position_in_grid]]) {
+  int batch=dims[0],np=dims[1],ns=dims[3];
+  if(index>=uint(batch*np) || (mask[0]&2)==0 || (dims[5]&8192)!=0) return;
+  int world=int(index)/np,pair=int(index)%np,sensor=pairs[3*pair];
+  if(mask[1+world*max(ns,1)+sensor]==0 || mask[1+batch*max(ns,1)+world]==0) return;
+  int a=pairs[3*pair+1],b=pairs[3*pair+2],ta=types[a],tb=types[b];
+  if((ta!=8 && tb!=8) || ta==0 || tb==0) return;
+  int count=(ta==1 || tb==1)?0:counts[index],base=int(index)*10;
+  results[base]=count<0?1:0;
+  FlexDD best=flex_dd(cutoffs[pair]);int pick=-1;
+  for(int k=0;k<count;k++) {int record=(int(index)*50+k)*37;
+    FlexDD dist=FlexDD{contacts[record+12],contacts[record+9],contacts[record+10]};
+    if(flex_dd_compare_exact(dist,best)<0) {best=dist;pick=record;}}
+  FlexDD3 p=flex_dd3(float3(0)),n=p;
+  if(pick>=0) {
+    p=FlexDD3{FlexDD{contacts[pick+13],contacts[pick+25],contacts[pick+31]},
+             FlexDD{contacts[pick+14],contacts[pick+26],contacts[pick+32]},
+             FlexDD{contacts[pick+15],contacts[pick+27],contacts[pick+33]}};
+    n=FlexDD3{FlexDD{contacts[pick+16],contacts[pick+28],contacts[pick+34]},
+             FlexDD{contacts[pick+17],contacts[pick+29],contacts[pick+35]},
+             FlexDD{contacts[pick+18],contacts[pick+30],contacts[pick+36]}};
+  }
+  FlexDD scale=flex_dd_source_mul(flex_dd(ta>tb?-.5f:.5f),best);
+  float3 x1=flex_dd3_high(flex_dd3_sub(p,flex_dd3_scale(n,scale)));
+  float3 x2=flex_dd3_high(flex_dd3_add(p,flex_dd3_scale(n,scale)));
+  results[base+1]=best.hi;results[base+2]=best.lo;results[base+3]=best.tail;
   results[base+4]=x1.x;results[base+5]=x1.y;results[base+6]=x1.z;
   results[base+7]=x2.x;results[base+8]=x2.y;results[base+9]=x2.z;
 }

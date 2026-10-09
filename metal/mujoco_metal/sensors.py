@@ -501,9 +501,9 @@ def lower_sensors(model) -> SensorDescriptor:
           raise ValueError(f"sensor {i}: geom sensors need body/geom pairs")
         if not 0 <= int(arrays[key][i]) < _object_count(t, nb, ng, nsite):
           raise ValueError(f"sensor {i}: invalid geom sensor id")
-      # Mirror the coupled pair matrix: unsupported narrow-phase pairs stay
-      # rejected here instead of silently reporting cutoff. SDF-involved
-      # pairs have plugin-defined ray/distance paths (019).
+      # Validate actual pinned dispatches. NULL callbacks and HFieldSDF's
+      # explicit empty callback return the requested cutoff; physical pair
+      # filtering does not restrict query operands.
       from mujoco_metal.coupled_constraints import pair_max_contacts
       _sdf_ip = int(model.opt.sdf_initpoints)
       _SDF_T = int(mujoco.mjtGeom.mjGEOM_SDF)
@@ -512,11 +512,6 @@ def lower_sensors(model) -> SensorDescriptor:
         for _gb in _sensor_geoms(model, int(arrays["sensor_reftype"][i]),
                                  int(arrays["sensor_refid"][i])):
           _ta, _tb = int(model.geom_type[_ga]), int(model.geom_type[_gb])
-          if _ga == _gb:
-            raise ValueError(f"sensor {i}: geom pair must be different")
-          if _ta == _SDF_T or _tb == _SDF_T:
-            raise ValueError(
-                f"sensor {i}: SDF geom distance is unsupported in 016")
           if (_ta, _tb) not in ((0,0),(0,1),(1,0),(1,1)):
             pair_max_contacts(_ta, _tb, _sdf_ip)
     if typ in (int(S.mjSENS_FRAMELINACC), int(S.mjSENS_FRAMEANGACC)):
@@ -1905,25 +1900,17 @@ class SensorProgram:
           if len(verts):
             rb[g] = max(float(rb[g]), float(_np.max(_np.linalg.norm(verts, axis=1))))
     self._sp_geom_rbound = ftensor(rb.reshape(max(ng, 1)), (max(ng, 1),))
-    self._sp_sdf_maxn = min(int(model.opt.sdf_initpoints), 8)
-    # Query assets are independent of physical candidate masks and motion.
-    # Pack the same compiled hull/terrain operands as native collision.
-    from mujoco_metal.coupled_constraints import lower_collision_geometry
+    # GeometryQueryProgram owns one complete scene and callback workspace.
+    # CONTACT/taxel/ray programs own their distinct operands; do not duplicate
+    # the distance scene or revive the legacy bounded distance dispatcher.
+    from mujoco_metal.geometry_queries import GeometryQueryProgram
     distance_types = [int(getattr(mujoco.mjtSensor, name)) for name in (
         "mjSENS_GEOMDIST", "mjSENS_GEOMNORMAL", "mjSENS_GEOMFROMTO")]
-    distance_pairs = []
-    for i in range(int(model.nsensor)):
-      if int(model.sensor_type[i]) not in distance_types:
-        continue
-      for a in _sensor_geoms(model, model.sensor_objtype[i], model.sensor_objid[i]):
-        for b in _sensor_geoms(model, model.sensor_reftype[i], model.sensor_refid[i]):
-          if a != b:
-            distance_pairs.append((a, b))
-    scene = lower_collision_geometry(model, distance_pairs)
-    self._sp_hull = torch.tensor(np.array(scene.mesh_hull, copy=True),
-                                dtype=torch.float32, device=self._device)
-    self._sp_hull_info = torch.tensor(np.array(scene.mesh_hull_info, copy=True),
-                                     dtype=torch.int32, device=self._device)
+    self._geometry_queries = None
+    if np.any(np.isin(model.sensor_type,distance_types)):
+      self._geometry_queries = GeometryQueryProgram(model,self.batch_size)
+      self._sp_hull = self._geometry_queries.hull
+      self._sp_hull_info = self._geometry_queries.info
     # Compile each independent query entry on first use. Rangefinders must
     # not compile the complete geometry collision dispatcher as a side effect.
     # All families remain available, including queries requested after setup.
@@ -1942,9 +1929,6 @@ class SensorProgram:
           [self.batch_size, self.descriptor.nsensor, self.descriptor.nsensordata,
            ng, nsite, self.descriptor.disableflags,len(pixels['ray_entries']),nb],
           dtype=torch.int32, device=self._device)
-    from mujoco_metal.geometry_queries import GeometryQueryProgram
-    self._geometry_queries = GeometryQueryProgram(model,self.batch_size)
-    self._sp_geomdist = partial(_dispatch_spatial, 4, "evaluate_geomdist")
     self._sp_tactile = partial(_dispatch_spatial, 1, "evaluate_tactile")
     self._build_tactile_constants(model)
 
@@ -2154,7 +2138,8 @@ class SensorProgram:
       dest = self._s_state_out
     self._set_world_mask(world_mask)
     self._stage_mask[0].fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
-    self._geometry_queries.run(poses,self._s_meta.reshape(-1),self._stage_mask,dest)
+    if self._geometry_queries is not None:
+      self._geometry_queries.run(poses,self._s_meta.reshape(-1),self._stage_mask,dest)
     return dest
 
   def run_acc_device(self, qpos, qvel, qacc, poses, *, qacc_low=None, xfrc=None,

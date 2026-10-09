@@ -27,7 +27,6 @@ def lower_geometry_queries(model, batch_size=1, limits=None):
     start=len(pairs)
     for a in _sensor_geoms(model,model.sensor_objtype[sensor],model.sensor_objid[sensor]):
       for b in _sensor_geoms(model,model.sensor_reftype[sensor],model.sensor_refid[sensor]):
-        if a==b: continue
         pairs.append((sensor,a,b)); bounds.append(float(model.sensor_cutoff[sensor]))
     spans[sensor]=start,len(pairs)-start
   count=len(pairs)
@@ -38,19 +37,30 @@ def lower_geometry_queries(model, batch_size=1, limits=None):
                                                scene.mesh_hull_info,batch_size,count)
   terrain = any(int(model.geom_type[a])==1 or int(model.geom_type[b])==1
                 for _,a,b in pairs)
-  callbacks = terrain or (bool(int(model.opt.disableflags)&131072) and
+  sdf = any(int(model.geom_type[a])==8 or int(model.geom_type[b])==8
+            for _,a,b in pairs)
+  analytic_sdf = any(8 in (int(model.geom_type[a]),int(model.geom_type[b]))
+      and min(int(model.geom_type[a]),int(model.geom_type[b]))>=2
+      and 7 not in (int(model.geom_type[a]),int(model.geom_type[b])) for _,a,b in pairs)
+  seed_tile=32 if analytic_sdf else 0
+  if batch_size*count*max(50*37,seed_tile*159) >= (1<<31):
+    raise CapacityOverflow("geometry-query SDF workspace exceeds int32 addressing")
+  from mujoco_metal.coupled_constraints import _pair_contact_cache_bytes
+  sdf_bytes=_pair_contact_cache_bytes(batch_size,50*count,count,seed_tile) if sdf else 0
+  callbacks = sdf or terrain or (bool(int(model.opt.disableflags)&131072) and
       any(uses_pinned_mjc_convex(int(model.geom_type[a]),int(model.geom_type[b]))
           for _,a,b in pairs))
   terrain_bytes = (4*(12+55*count+2*batch_size+batch_size*count+
                         4*model.ngeom+27*batch_size*model.ngeom) if callbacks else 0)
-  bytes_total=(terrain_bytes+common_bytes+batch_size*count*10*4+count*4*4+
+  bytes_total=(sdf_bytes+terrain_bytes+common_bytes+batch_size*count*10*4+count*4*4+
                spans.nbytes+model.ngeom*4+6*4+batch_size*max(model.ngeom,1)*9*4)
   budget=CapacityLimits().memory_budget_bytes if limits is None else limits.memory_budget_bytes
   if bytes_total>budget:
     raise CapacityOverflow(f'geometry-query workspace {bytes_total} bytes exceeds budget {budget}')
   return {'scene':scene,'pairs':np.asarray(pairs,np.int32).reshape(-1,3),
           'cutoff':np.asarray(bounds,np.float32),'spans':spans,
-          'common_bytes':common_bytes,'bytes_total':bytes_total,'terrain':terrain,'callbacks':callbacks}
+          'common_bytes':common_bytes,'bytes_total':bytes_total,'terrain':terrain,'callbacks':callbacks,
+          'sdf':sdf,'analytic_sdf':analytic_sdf,'seed_tile':seed_tile}
 
 
 @lru_cache(maxsize=2)
@@ -63,6 +73,13 @@ def _library(libccd):
                'common_ccd_production','geometry_queries'):
     source+='\n'+(root/(name+'.metal')).read_text()
   return torch.mps.compile_shader(source)
+
+
+@lru_cache(maxsize=2)
+def _sdf_library(libccd):
+  import torch
+  from mujoco_metal.coupled_constraints import _coupled_shader_source
+  return torch.mps.compile_shader(_coupled_shader_source(libccd=libccd))
 
 
 class GeometryQueryProgram:
@@ -88,13 +105,15 @@ class GeometryQueryProgram:
                                 model.nsensordata,model.opt.disableflags],np.int32))
     self.results=torch.zeros((batch_size,count,10),dtype=torch.float32,device='mps')
     self.zeros=torch.zeros((batch_size,max(model.ngeom,1),9),dtype=torch.float32,device='mps')
+    self._sdf=desc['sdf']; self._analytic_sdf=desc['analytic_sdf']
+    self._seed_tile=desc['seed_tile']
     self._terrain=desc['terrain']
     self._callbacks=desc['callbacks']
     if self._callbacks:
       from mujoco_metal.coupled_constraints import _pack_contact_dims_offsets
       flags=int(model.opt.disableflags)
       packed=_pack_contact_dims_offsets([model.nv,count,50*count,batch_size,0,
-          int(model.opt.cone),model.ngeom,0,int(bool(flags&(1<<19))),0],
+          int(model.opt.cone),model.ngeom,0,int(bool(flags&(1<<19))),1],
           np.arange(count+1,dtype=np.int32)*50,np.zeros(50*count,np.int32))
       # Query selection is carried by logical_map; the common kernel's world
       # mask remains all enabled. It never determines numerical results on CPU.
@@ -113,15 +132,31 @@ class GeometryQueryProgram:
       self._terrain_map=torch.zeros(batch_size*count,dtype=torch.int32,device='mps')
       self._terrain_status=torch.zeros(batch_size,dtype=torch.int32,device='mps')
       self._terrain_matrices=torch.zeros((3,batch_size,model.ngeom,9),dtype=torch.float32,device='mps')
+    if self._sdf:
+      self._sdf_count=max(0,int(model.opt.sdf_initpoints))
+      self._sdf_iterations=int(model.opt.sdf_iterations)
+      def empty(count,dtype=torch.float32):
+        return torch.zeros(max(count,1),dtype=dtype,device='mps')
+      slots=batch_size*count*self._seed_tile
+      self._sdf_workspace={
+          'contact_pair_count':empty(batch_size*count,torch.int32),
+          'contact_pair_records':empty(batch_size*count*50*37),
+          'contact_pair_scratch':empty(batch_size*count*50*12),
+          'contact_sdf_seed_records':empty(slots*37),
+          'contact_sdf_seed_valid':empty(slots,torch.int32),
+          'contact_sdf_seed_state':empty(slots*159),
+          'contact_sdf_seed_ctrl':empty(slots,torch.int32)}
+      self._sdf_stage_dims=empty(5,torch.int32)
     self._libccd=bool(int(model.opt.disableflags)&int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD))
 
   def run(self,poses,metadata,stage_mask,out):
     if not self.count: return out
     t=self._torch; b=self.batch_size; ng=self.model.ngeom
+    has_matrix=int(poses.get("geom_xmat") is not None)
     args=[]
     for name,width in (('geom_pos',3),('geom_pos_low',3),('geom_pos_tail',3),
                        ('geom_quat',4),('geom_xmat',9),('geom_xmat_low',9),
-                       ('geom_xmat_tail',9)):
+                       ('geom_xmat_tail',9),('geom_quat_low',4),('geom_quat_tail',4)):
       value=poses.get(name)
       if value is None:
         if name in ('geom_pos','geom_quat'): raise ValueError(f'missing {name}')
@@ -132,16 +167,17 @@ class GeometryQueryProgram:
         raise ValueError(f'{name} must be contiguous float32 MPS geometry poses')
       args.append(value.reshape(-1))
     # When no source xmat is supplied, form its retained-precision quaternion
-    # rotation in the shader; a zero matrix is only an explicit sentinel.
+    # rotation in the shader. Matrix presence is explicit: valid rotations
+    # can have three zero diagonal entries.
     library=_library(self._libccd)
-    library.geometry_query_pairs(*args,self.types,self.pairs.reshape(-1),self.cutoff,
-        self.hull,self.info,self.results.reshape(-1),stage_mask,self.dims,
+    library.geometry_query_pairs(*args[:7],self.types,self.pairs.reshape(-1),self.cutoff,
+        self.hull,self.info,self.results.reshape(-1),stage_mask,self.dims,has_matrix,
         threads=(b*self.count,),group_size=(1,))
     if self._callbacks:
       self._terrain_status.zero_()
       library.geometry_query_prepare_terrain(args[3],args[4],args[5],args[6],
           self._terrain_matrices.reshape(-1),self._terrain_map,self.pairs.reshape(-1),
-          stage_mask,self.dims,threads=(max(b*ng,b*self.count),),group_size=(1,))
+          stage_mask,self.dims,has_matrix,threads=(max(b*ng,b*self.count),),group_size=(1,))
       candidate_args=(args[0],args[3],args[1],args[2],
           *[self._terrain_matrices[i].reshape(-1) for i in range(3)],
           self._terrain_sizes,self.types,self._terrain_bounds,self._terrain_geoms,
@@ -158,6 +194,41 @@ class GeometryQueryProgram:
       library.geometry_query_finish_terrain(self.types,self.pairs.reshape(-1),self.cutoff,
           self.hull,self.info,self.results.reshape(-1),stage_mask,self.dims,
           threads=(b*self.count,),group_size=(1,))
+      if self._sdf:
+        self._completion.record()
+        self._completion.wait()
+        from mujoco_metal.sdf_dispatch import dispatch_staged_sdf,StagedSdfKernels
+        sdf_library=_sdf_library(self._libccd)
+        geometry={'geom_size':self._terrain_sizes,'geom_type':self.types,
+                  'pair_geoms':self._terrain_geoms,'mesh_hull':self.hull,
+                  'mesh_hull_info':self.info}
+        prepared=dict(zip(('geom_pos','geom_pos_low','geom_pos_tail',
+            'geom_quat','geom_xmat','geom_xmat_low','geom_xmat_tail',
+            'geom_quat_low','geom_quat_tail'),args))
+        for i,name in enumerate(('geom_xmat','geom_xmat_low','geom_xmat_tail')):
+          prepared[name]=self._terrain_matrices[i].reshape(-1)
+        self._sdf_workspace['contact_pair_count'].zero_()
+        self._completion.record()
+        self._completion.wait()
+        if self._analytic_sdf:
+          dispatch_staged_sdf(StagedSdfKernels.from_library(sdf_library),t,
+              prepared,geometry,self._terrain_dims,self._terrain_map,
+              self._sdf_workspace,self._sdf_stage_dims,batch_size=b,npairs=self.count,
+              seed_count=self._sdf_count,seed_tile=self._seed_tile,
+              max_iterations=self._sdf_iterations)
+        sdf_library.contact_produce_mesh_sdf(args[0],args[3],self._terrain_sizes,
+            self.types,self._terrain_geoms,self._terrain_dims,self._terrain_map,
+            self.hull,self.info,self._sdf_workspace['contact_pair_count'],
+            self._sdf_workspace['contact_pair_records'],
+            self._sdf_workspace['contact_pair_scratch'],args[1],args[2],
+            *[self._terrain_matrices[i].reshape(-1) for i in range(3)],
+            threads=(b*self.count,),group_size=(1,))
+        self._completion.record()
+        self._completion.synchronize()
+        library.geometry_query_finish_sdf(self.types,self.pairs.reshape(-1),self.cutoff,
+            self._sdf_workspace['contact_pair_count'],
+            self._sdf_workspace['contact_pair_records'],self.results.reshape(-1),
+            stage_mask,self.dims,threads=(b*self.count,),group_size=(1,))
     library.geometry_query_reduce(self.results.reshape(-1),self.spans.reshape(-1),
         metadata,out.reshape(-1),stage_mask,self.dims,
         threads=(b*max(self.model.nsensor,1),),group_size=(1,))

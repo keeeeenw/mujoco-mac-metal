@@ -308,7 +308,7 @@ def build_common_ccd_model_upload(model, legacy_vertices, legacy_info):
   ], dtype=np.int32)
   for geom in range(ngeom):
     rec = geom_base + 9 * geom
-    mesh_id = int(model.geom_dataid[geom]) if int(model.geom_type[geom]) == _mesh_type() else -1
+    mesh_id = int(model.geom_dataid[geom]) if int(model.geom_type[geom]) in (_mesh_type(), 8) else -1
     hf_id = int(model.geom_dataid[geom]) if int(model.geom_type[geom]) == _hfield_type() else -1
     if mesh_id >= 0:
       voff = vertex_base_float // 3 + int(model.mesh_vertadr[mesh_id])

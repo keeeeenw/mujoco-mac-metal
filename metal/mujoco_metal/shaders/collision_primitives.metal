@@ -1429,7 +1429,11 @@ inline int collide_mesh_sdf_cached(
     int gi_mesh, int gi_sdf, float3 pmesh, float4 qmesh,
     float3 psdf, float4 qsdf, int maxn, int record_base,
     device float* records, int scratch_base, device float* scratch,
-    device const float* hull, device const int* hull_info);
+    device const float* hull, device const int* hull_info,
+    device const float* geom_pos,device const float* geom_pos_low,
+    device const float* geom_pos_tail,device const float* geom_xmat,
+    device const float* geom_xmat_low,device const float* geom_xmat_tail,
+    int geom_world_offset);
 
 // Unified Pair Dispatcher
 
@@ -1489,7 +1493,11 @@ inline int collide_pair_mesh_sdf_cached(
     int type2, float3 p2, float4 q2,
     int gia, int gib, int maxn, int record_base, device float* records,
     int scratch_base, device float* scratch,
-    device const float* hull, device const int* hull_info) {
+    device const float* hull, device const int* hull_info,
+    device const float* geom_pos,device const float* geom_pos_low,
+    device const float* geom_pos_tail,device const float* geom_xmat,
+    device const float* geom_xmat_low,device const float* geom_xmat_tail,
+    int geom_world_offset) {
   bool swapped=(type1>type2);
   int t1=swapped?type2:type1, t2=swapped?type1:type2;
   float3 pos1=swapped?p2:p1, pos2=swapped?p1:p2;
@@ -1498,8 +1506,9 @@ inline int collide_pair_mesh_sdf_cached(
   int n=0;
   if (t1==7 && t2==8)
     n=collide_mesh_sdf_cached(gi1,gi2,pos1,quat1,pos2,quat2,
-                              maxn,record_base,records,scratch_base,scratch,
-                              hull,hull_info);
+        maxn,record_base,records,scratch_base,scratch,hull,hull_info,
+        geom_pos,geom_pos_low,geom_pos_tail,geom_xmat,geom_xmat_low,
+        geom_xmat_tail,geom_world_offset);
   if (swapped) {
     for (int k=0;k<n;++k) {
       int base=(record_base+k)*37+12;
