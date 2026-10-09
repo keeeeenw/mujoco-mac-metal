@@ -42,7 +42,7 @@ void triangle(const double *input, double *output) {
   src = tmp_path / "pinned_triangle.c"
   src.write_text(code)
   libpath = tmp_path / "pinned_triangle.dylib"
-  subprocess.run(["/usr/bin/clang", "-O3", "-ffp-contract=fast", "-shared",
+  subprocess.run(["/usr/bin/clang", "-O3", "-std=c11", "-shared",
                   "-I", str(pinned / "include"), str(src), "-o", str(libpath)],
                  check=True, capture_output=True, text=True, timeout=30)
   lib = ctypes.CDLL(str(libpath))

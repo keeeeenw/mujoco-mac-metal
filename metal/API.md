@@ -34,6 +34,16 @@ results when retaining them beyond the next invocation.
 
 `simulation.step()` returns a borrowed MPS status vector. Solver and integration failures are per-world; a failed world keeps its state and its first nonzero status remains sticky until reset or restore. State views are copies; snapshots and resets cross the host/device boundary and belong outside the hot step loop. Position, velocity, acceleration, and simulation time use float32 on device. In particular, time's representable increment gets coarser as elapsed time grows.
 
+Selected collision and frame calculations retain source-rounded values as three
+float32 words. Power-of-two scaling preserves intermediate product residuals and
+the original collision threshold branches at small and large geometric scales.
+This is not a general binary64 storage type: a result requiring bits below the
+smallest float32 subnormal cannot retain all 53 source significand bits. The
+scalar checks distinguish exact representable results from this storage floor;
+they do not establish physics qualification for arbitrary model scales. Public
+simulation state and time remain float32, and continuous trajectory qualification
+is separate from arithmetic or same-state contact comparisons.
+
 Run the opt-in GPU correctness tests only on an available Apple GPU with the pinned Torch extra installed: `MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 python -m pytest -m gpu`. CPU reference tests may require Torch on the host; disabling the opt-in flag alone is not a universal GPU exclusion for every historical test. Use an explicitly CPU-only test environment or availability guard for CPU-only qualification. `preflight` remains CPU-only: shader hashes and stage labels are inventory, not a device probe. The overall GPU-qualified field stays false because full-library physics coverage remains incomplete. The standalone source tree carries the Apache 2.0 license and notices.
 
 ## Applied forces, damping and basic motors

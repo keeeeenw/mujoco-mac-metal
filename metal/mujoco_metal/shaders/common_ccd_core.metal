@@ -117,6 +117,68 @@ static inline bool flex_float_is_subnormal(float value) {
   return (bits&0x7f800000u)==0u && (bits&0x007fffffu)!=0u;
 }
 
+// Exact power-of-two transport must preserve subnormal storage words even
+// though arithmetic on those words is flushed by Metal. Round an underflowing
+// word to binary32, ties to even, using its integer significand.
+static inline float flex_float_scalbn(float value, int shift) {
+  uint bits=as_type<uint>(value), sign=bits&0x80000000u;
+  int exponent=int((bits>>23)&255u);
+  uint mantissa=bits&0x007fffffu;
+  if (exponent==255 || (exponent==0 && mantissa==0u)) return value;
+  if (exponent==0) {
+    int normalize=int(clz(mantissa))-8;
+    mantissa<<=normalize;
+    exponent=1-normalize;
+  } else {
+    mantissa|=0x00800000u;
+  }
+  exponent+=shift;
+  if (exponent>=255) return as_type<float>(sign|0x7f800000u);
+  if (exponent>0)
+    return as_type<float>(sign|(uint(exponent)<<23)|(mantissa&0x007fffffu));
+  int right=1-exponent;
+  if (right>24) return as_type<float>(sign);
+  uint rounded=mantissa>>right;
+  uint discarded=mantissa&((1u<<right)-1u), halfway=1u<<(right-1);
+  if (discarded>halfway || (discarded==halfway && (rounded&1u))) rounded++;
+  return as_type<float>(sign|rounded);
+}
+
+static inline int flex_float_exponent(float value) {
+  uint bits=as_type<uint>(value)&0x7fffffffu;
+  int exponent=int(bits>>23);
+  if (exponent==0) {
+    uint mantissa=bits&0x007fffffu;
+    return mantissa==0u ? 0 : -125-(int(clz(mantissa))-8);
+  }
+  return exponent-126;
+}
+
+static inline FlexDD flex_dd_scalbn(FlexDD value, int shift) {
+  return FlexDD{flex_float_scalbn(value.hi,shift),
+                flex_float_scalbn(value.lo,shift),
+                flex_float_scalbn(value.tail,shift)};
+}
+
+static inline FlexDD3 flex_dd3_scalbn(FlexDD3 value, int shift) {
+  return FlexDD3{flex_dd_scalbn(value.x,shift),flex_dd_scalbn(value.y,shift),
+                 flex_dd_scalbn(value.z,shift)};
+}
+
+static inline float flex_dd3_max_magnitude(FlexDD3 value) {
+  return max(fabs(value.x.hi),max(fabs(value.y.hi),fabs(value.z.hi)));
+}
+
+static inline bool flex_gjk_plane_above_minval(FlexDD nn, int source_shift) {
+  // nn scales as the fourth power of a uniform simplex coordinate scale.
+  // Compare exponents first so an extremely small/large source threshold
+  // never needs to be materialized outside the three-word storage range.
+  int exponent=flex_float_exponent(nn.hi)-4*source_shift;
+  if (exponent!=-49) return exponent>-49;
+  FlexDD minval=FlexDD{1.0000000036274937e-15f,-3.627493647833322e-24f,0.0f};
+  return flex_dd_compare(flex_dd_scalbn(nn,-4*source_shift),minval)>0;
+}
+
 static __attribute__((noinline)) int flex_expansion_add(
     thread float* expansion, int count, float value,
     thread float* scratch) {
@@ -183,11 +245,22 @@ static __attribute__((noinline)) FlexProjection53 flex_expansion_round53(
     thread const float* expansion, int count) {
   FlexProjection53 result=FlexProjection53{0.0f,0.0f,0.0f};
   if (count<=0) return result;
-  result.hi=expansion[count-1];
+  // GrowExpansion preserves the exact sum, but cancellation can leave its
+  // highest word overlapping the remaining words. Compress the leading
+  // estimate before quantizing the tail: otherwise that tail can exceed
+  // 2^31 source quanta, overflowing parity casts and losing unit corrections.
+  result.hi=0.0f;
+  for (int i=count-1;i>=0;i--) result.hi+=expansion[i];
   if (count==1) return result;
+  thread float tail[32];
+  thread float tail_scratch[32];
+  int tail_count=0;
+  for (int i=0;i<count;i++)
+    tail_count=flex_expansion_add(tail,tail_count,expansion[i],tail_scratch);
+  tail_count=flex_expansion_add(tail,tail_count,-result.hi,tail_scratch);
   int exponent=0;
   float significand=frexp(fabs(result.hi),exponent);
-  int tail_sign=flex_expansion_sign(expansion,count-1);
+  int tail_sign=flex_expansion_sign(tail,tail_count);
   // At an exact power-of-two leading component, values just toward zero lie
   // in the lower binade, whose ulp is half as large. Choose that grid before
   // quantizing the complete tail (including negative projections).
@@ -202,10 +275,10 @@ static __attribute__((noinline)) FlexProjection53 flex_expansion_round53(
   // Quantize every component below `hi`, including a widely separated
   // second component. This pass is only an estimate: a much smaller term can
   // still decide which side of an exact halfway value the expansion lies on.
-  for (int i=0;i<count-1;i++) {
-    float scaled=ldexp(expansion[i],-quantum_exp);
+  for (int i=0;i<tail_count;i++) {
+    float scaled=ldexp(tail[i],-quantum_exp);
     residual_count=flex_expansion_add(residual,residual_count,
-                                      expansion[i],scratch);
+                                      tail[i],scratch);
     estimate+=scaled;
   }
   // Split the integer number of 2^(e-53) quanta into a float32 high part and
@@ -262,95 +335,13 @@ static __attribute__((noinline)) int flex_dd_compare_exact(
       FlexProjection53{b.hi,b.lo,b.tail});
 }
 
+// Strict support selection must include the low coordinate words in both
+// fused terms as well as the separately rounded middle product. Reuse the
+// source dot implementation so generic and flex supports share all operands.
 static inline FlexProjection53 flex_mju_dot3_projection53(
-    float3 point, FlexDD3 direction) {
-  thread float expansion[32];
-  thread float scratch[32];
-  int count=0;
-  FlexDD coordinate[3]={flex_dd(point.x),flex_dd(point.y),flex_dd(point.z)};
-  FlexDD axis[3]={direction.x,direction.y,direction.z};
-  FlexProjection53 product[3];
-  for (int i=0;i<3;i++) {
-    float high=coordinate[i].hi*axis[i].hi;
-    float high_error=fma(coordinate[i].hi,axis[i].hi,-high);
-    float cross1=coordinate[i].hi*axis[i].lo;
-    float cross1_error=fma(coordinate[i].hi,axis[i].lo,-cross1);
-    float cross2=coordinate[i].lo*axis[i].hi;
-    float cross2_error=fma(coordinate[i].lo,axis[i].hi,-cross2);
-    float cross3=coordinate[i].hi*axis[i].tail;
-    float cross3_error=fma(coordinate[i].hi,axis[i].tail,-cross3);
-    float cross4=coordinate[i].lo*axis[i].lo;
-    float cross4_error=fma(coordinate[i].lo,axis[i].lo,-cross4);
-    float cross5=coordinate[i].lo*axis[i].tail;
-    float cross5_error=fma(coordinate[i].lo,axis[i].tail,-cross5);
-    float cross6=coordinate[i].tail*axis[i].hi;
-    float cross6_error=fma(coordinate[i].tail,axis[i].hi,-cross6);
-    float cross7=coordinate[i].tail*axis[i].lo;
-    float cross7_error=fma(coordinate[i].tail,axis[i].lo,-cross7);
-    float low=coordinate[i].tail*axis[i].tail;
-    float low_error=fma(coordinate[i].tail,axis[i].tail,-low);
-    count=flex_expansion_add(expansion,count,high_error,scratch);
-    count=flex_expansion_add(expansion,count,high,scratch);
-    count=flex_expansion_add(expansion,count,cross1_error,scratch);
-    count=flex_expansion_add(expansion,count,cross1,scratch);
-    count=flex_expansion_add(expansion,count,cross2_error,scratch);
-    count=flex_expansion_add(expansion,count,cross2,scratch);
-    count=flex_expansion_add(expansion,count,cross3_error,scratch);
-    count=flex_expansion_add(expansion,count,cross3,scratch);
-    count=flex_expansion_add(expansion,count,cross4_error,scratch);
-    count=flex_expansion_add(expansion,count,cross4,scratch);
-    count=flex_expansion_add(expansion,count,cross5_error,scratch);
-    count=flex_expansion_add(expansion,count,cross5,scratch);
-    count=flex_expansion_add(expansion,count,cross6_error,scratch);
-    count=flex_expansion_add(expansion,count,cross6,scratch);
-    count=flex_expansion_add(expansion,count,cross7_error,scratch);
-    count=flex_expansion_add(expansion,count,cross7,scratch);
-    count=flex_expansion_add(expansion,count,low_error,scratch);
-    count=flex_expansion_add(expansion,count,low,scratch);
-    product[i]=flex_expansion_round53(expansion,count);
-    count=0;
-  }
-  // The pinned arm64 binary is:
-  //   p1 = round(point.y * direction.y)
-  //   acc = round(point.x * direction.x + p1)  // fused multiply-add
-  //   dot = round(point.z * direction.z + acc) // fused multiply-add
-  // Keep the exact x/z products until their FMA boundaries; the middle
-  // product alone is rounded before it enters the first FMA.
-  count=0;
-  count=flex_expansion_add(expansion,count,product[1].low,scratch);
-  count=flex_expansion_add(expansion,count,product[1].mid,scratch);
-  count=flex_expansion_add(expansion,count,product[1].hi,scratch);
-  // Replace rounded x/z products by their exact expansions for the fused
-  // source operations. Regenerate from float32 coordinate and three-word axis
-  // to retain every product residual until the corresponding rounding.
-  FlexDD scalar=coordinate[0];
-  FlexDD d=axis[0];
-  float p=scalar.hi*d.hi;
-  count=flex_expansion_add(expansion,count,fma(scalar.hi,d.hi,-p),scratch);
-  count=flex_expansion_add(expansion,count,p,scratch);
-  p=scalar.hi*d.lo;
-  count=flex_expansion_add(expansion,count,fma(scalar.hi,d.lo,-p),scratch);
-  count=flex_expansion_add(expansion,count,p,scratch);
-  p=scalar.hi*d.tail;
-  count=flex_expansion_add(expansion,count,fma(scalar.hi,d.tail,-p),scratch);
-  count=flex_expansion_add(expansion,count,p,scratch);
-  FlexProjection53 first_fma=flex_expansion_round53(expansion,count);
-
-  count=0;
-  scalar=coordinate[2]; d=axis[2];
-  p=scalar.hi*d.hi;
-  count=flex_expansion_add(expansion,count,fma(scalar.hi,d.hi,-p),scratch);
-  count=flex_expansion_add(expansion,count,p,scratch);
-  p=scalar.hi*d.lo;
-  count=flex_expansion_add(expansion,count,fma(scalar.hi,d.lo,-p),scratch);
-  count=flex_expansion_add(expansion,count,p,scratch);
-  p=scalar.hi*d.tail;
-  count=flex_expansion_add(expansion,count,fma(scalar.hi,d.tail,-p),scratch);
-  count=flex_expansion_add(expansion,count,p,scratch);
-  count=flex_expansion_add(expansion,count,first_fma.low,scratch);
-  count=flex_expansion_add(expansion,count,first_fma.mid,scratch);
-  count=flex_expansion_add(expansion,count,first_fma.hi,scratch);
-  return flex_expansion_round53(expansion,count);
+    FlexDD3 point, FlexDD3 direction) {
+  FlexDD value=flex_dd_source_dot3(point,direction);
+  return FlexProjection53{value.hi,value.lo,value.tail};
 }
 
 // Round the exact sum of float expansions back to the pinned source's
@@ -362,6 +353,20 @@ static inline FlexDD flex_dd_from_projection53(FlexProjection53 value) {
 }
 
 static inline FlexProjection53 flex_dd_product53(FlexDD a, FlexDD b) {
+  if (((as_type<uint>(a.hi)|as_type<uint>(a.lo)|as_type<uint>(a.tail))
+        &0x7fffffffu)==0u
+      || ((as_type<uint>(b.hi)|as_type<uint>(b.lo)|as_type<uint>(b.tail))
+        &0x7fffffffu)==0u) {
+    uint sign=(as_type<uint>(a.hi)^as_type<uint>(b.hi))&0x80000000u;
+    return FlexProjection53{as_type<float>(sign),0.0f,0.0f};
+  }
+  // Keep every product residual normal during expansion arithmetic. Without
+  // scaling, subnormal product errors can decide a source-rounding tie but
+  // disappear before the expansion receives them.
+  int a_shift=20-flex_float_exponent(a.hi);
+  int b_shift=20-flex_float_exponent(b.hi);
+  a=flex_dd_scalbn(a,a_shift);
+  b=flex_dd_scalbn(b,b_shift);
   thread float expansion[32];
   thread float scratch[32];
   int count=0;
@@ -392,7 +397,11 @@ static inline FlexProjection53 flex_dd_product53(FlexDD a, FlexDD b) {
   p=a.tail*b.tail;
   count=flex_expansion_add(expansion,count,fma(a.tail,b.tail,-p),scratch);
   count=flex_expansion_add(expansion,count,p,scratch);
-  return flex_expansion_round53(expansion,count);
+  FlexProjection53 rounded=flex_expansion_round53(expansion,count);
+  int undo=-a_shift-b_shift;
+  return FlexProjection53{flex_float_scalbn(rounded.hi,undo),
+                          flex_float_scalbn(rounded.mid,undo),
+                          flex_float_scalbn(rounded.low,undo)};
 }
 
 static inline FlexDD flex_dd_source_mulsub(FlexDD a, FlexDD b,
@@ -506,6 +515,21 @@ static __attribute__((noinline)) FlexDD flex_dd_product_residual(
 // Keep this separate from flex_dd_source_muladd, whose two source rounding
 // boundaries remain appropriate for non-fused multiply-then-add expressions.
 static __attribute__((noinline)) FlexDD flex_dd_source_fma(FlexDD a, FlexDD b, FlexDD c) {
+  if (((as_type<uint>(a.hi)|as_type<uint>(a.lo)|as_type<uint>(a.tail))
+        &0x7fffffffu)==0u
+      || ((as_type<uint>(b.hi)|as_type<uint>(b.lo)|as_type<uint>(b.tail))
+        &0x7fffffffu)==0u) return c;
+  int a_exponent=flex_float_exponent(a.hi);
+  int b_exponent=flex_float_exponent(b.hi);
+  int c_exponent=flex_float_exponent(c.hi);
+  int product_exponent=a_exponent+b_exponent;
+  int result_exponent=(as_type<uint>(c.hi)&0x7fffffffu)==0u
+      ? product_exponent : max(product_exponent,c_exponent);
+  int shift=40-result_exponent;
+  int a_shift=20-a_exponent;
+  a=flex_dd_scalbn(a,a_shift);
+  b=flex_dd_scalbn(b,shift-a_shift);
+  c=flex_dd_scalbn(c,shift);
   thread float expansion[32];
   thread float scratch[32];
   int count=0;
@@ -539,7 +563,8 @@ static __attribute__((noinline)) FlexDD flex_dd_source_fma(FlexDD a, FlexDD b, F
   count=flex_expansion_add(expansion,count,c.tail,scratch);
   count=flex_expansion_add(expansion,count,c.lo,scratch);
   count=flex_expansion_add(expansion,count,c.hi,scratch);
-  return flex_dd_from_projection53(flex_expansion_round53(expansion,count));
+  return flex_dd_scalbn(
+      flex_dd_from_projection53(flex_expansion_round53(expansion,count)),-shift);
 }
 
 static inline FlexDD flex_dd_source_dot3(FlexDD3 a, FlexDD3 b) {
@@ -567,6 +592,10 @@ static inline FlexDD3 flex_dd3_source_sub(FlexDD3 a, FlexDD3 b) {
 // exact product residuals between refinements. The final expansion is rounded
 // once to the source 53-bit boundary and retained in three float words.
 static inline FlexDD flex_dd_source_div(FlexDD a, FlexDD b) {
+  // Quotient refinement must retain residuals at small geometric scales.
+  int shift=20-flex_float_exponent(b.hi);
+  a=flex_dd_scalbn(a,shift);
+  b=flex_dd_scalbn(b,shift);
   float q0=a.hi/b.hi;
   FlexDD remainder=flex_dd_division_residual(a,b,q0,0.0f);
   float q1=((remainder.hi+remainder.lo)+remainder.tail)/b.hi;
@@ -802,14 +831,14 @@ static inline FlexDD3 flex_dd_project_origin_line(FlexDD3 a, FlexDD3 b) {
 
 static inline int flex_dd_project_origin_plane(thread FlexDD3& result,
                                                 FlexDD3 a, FlexDD3 b,
-                                                FlexDD3 c) {
+                                                FlexDD3 c, int source_shift=0) {
   FlexDD3 diff_ba=flex_dd3_sub(b,a), diff_ca=flex_dd3_sub(c,a);
   FlexDD3 diff_cb=flex_dd3_sub(c,b);
   FlexDD3 normal=flex_dd3_cross(diff_cb,diff_ba);
   FlexDD nv=flex_dd3_dot(normal,b), nn=flex_dd3_dot(normal,normal);
   if (flex_dd_compare(nn,flex_dd(0.0f))==0) return 1;
   if (flex_dd_compare(nv,flex_dd(0.0f))!=0
-      && flex_dd_compare(nn,flex_dd(1.0e-15f))>0) {
+      && flex_gjk_plane_above_minval(nn,source_shift)) {
     result=flex_dd3_scale(normal,flex_dd_div(nv,nn));
     return 0;
   }
@@ -817,7 +846,7 @@ static inline int flex_dd_project_origin_plane(thread FlexDD3& result,
   nv=flex_dd3_dot(normal,a); nn=flex_dd3_dot(normal,normal);
   if (flex_dd_compare(nn,flex_dd(0.0f))==0) return 1;
   if (flex_dd_compare(nv,flex_dd(0.0f))!=0
-      && flex_dd_compare(nn,flex_dd(1.0e-15f))>0) {
+      && flex_gjk_plane_above_minval(nn,source_shift)) {
     result=flex_dd3_scale(normal,flex_dd_div(nv,nn));
     return 0;
   }
@@ -855,48 +884,46 @@ static inline void flex_dd_s1d(thread FlexDD* lambda, FlexDD3 a, FlexDD3 b) {
 // Preserve triAffineCoord's compiled arm64 contraction and source order.
 // Reassociation changes witness points and can change later restart support ties.
 static inline FlexDD flex_epa_affine_minor(FlexDD2 a, FlexDD2 b, FlexDD2 c) {
-  FlexDD value=flex_dd_source_mul(b.x,c.y);
-  value=flex_dd_source_fma(flex_dd_neg(b.y),c.x,value);
+  FlexDD value=flex_dd_neg(flex_dd_source_mul(b.y,c.x));
+  value=flex_dd_source_fma(b.x,c.y,value);
   value=flex_dd_source_fma(flex_dd_neg(a.x),c.y,value);
   value=flex_dd_source_fma(a.y,c.x,value);
   value=flex_dd_source_fma(a.x,b.y,value);
-  return flex_dd_source_sub(value,flex_dd_source_mul(a.y,b.x));
+  return flex_dd_source_fma(flex_dd_neg(a.y),b.x,value);
 }
 
 static inline FlexDD flex_epa_affine_area(FlexDD2 p, FlexDD2 b, FlexDD2 c) {
-  FlexDD value=flex_dd_source_add(flex_dd_source_mul(p.x,b.y),
-                                  flex_dd_source_mul(p.y,c.x));
+  FlexDD value=flex_dd_source_mul(p.y,c.x);
+  value=flex_dd_source_fma(p.x,b.y,value);
   value=flex_dd_source_fma(b.x,c.y,value);
-  value=flex_dd_source_sub(value,flex_dd_source_mul(p.x,c.y));
-  value=flex_dd_source_sub(value,flex_dd_source_mul(p.y,b.x));
+  value=flex_dd_source_fma(flex_dd_neg(p.x),c.y,value);
+  value=flex_dd_source_fma(flex_dd_neg(p.y),b.x,value);
   return flex_dd_source_fma(flex_dd_neg(c.x),b.y,value);
 }
 
-// S2D reuses these products for its minors and projected cofactors. The
-// pinned arm64 compiler rounds the reused products before the lexical sums;
-// triAffineCoord has a different contraction and must keep its own helpers.
+// Under the pinned default C contraction mode, S2D and triAffineCoord
+// round the same lexical minors and cofactors. Keep one operation sequence.
 static inline FlexDD flex_gjk_triangle_minor(FlexDD2 a, FlexDD2 b, FlexDD2 c) {
-  FlexDD value=flex_dd_source_sub(flex_dd_source_mul(b.x,c.y),
-                                 flex_dd_source_mul(b.y,c.x));
-  value=flex_dd_source_sub(value,flex_dd_source_mul(a.x,c.y));
-  value=flex_dd_source_add(value,flex_dd_source_mul(a.y,c.x));
-  value=flex_dd_source_add(value,flex_dd_source_mul(a.x,b.y));
-  return flex_dd_source_sub(value,flex_dd_source_mul(a.y,b.x));
+  return flex_epa_affine_minor(a,b,c);
 }
 
 static inline FlexDD flex_gjk_triangle_area(FlexDD2 p, FlexDD2 b, FlexDD2 c) {
-  FlexDD value=flex_dd_source_add(flex_dd_source_mul(p.x,b.y),
-                                  flex_dd_source_mul(p.y,c.x));
-  value=flex_dd_source_add(value,flex_dd_source_mul(b.x,c.y));
-  value=flex_dd_source_sub(value,flex_dd_source_mul(p.x,c.y));
-  value=flex_dd_source_sub(value,flex_dd_source_mul(p.y,b.x));
-  return flex_dd_source_sub(value,flex_dd_source_mul(c.x,b.y));
+  return flex_epa_affine_area(p,b,c);
 }
 
 static inline void flex_dd_s2d(thread FlexDD* lambda, FlexDD3 a,
-                               FlexDD3 b, FlexDD3 c) {
+                               FlexDD3 b, FlexDD3 c, int source_shift=0) {
+  // Homogeneous source operations commute with exact power-of-two scaling.
+  // Keep intermediate areas/norms representable for small or large geometry;
+  // preserve projectOriginPlane's original (unscaled) mjMINVAL branches.
+  float magnitude=max(flex_dd3_max_magnitude(a),
+      max(flex_dd3_max_magnitude(b),flex_dd3_max_magnitude(c)));
+  int exponent=flex_float_exponent(magnitude);
+  int shift=(exponent < -10 || exponent > 10) ? -exponent : 0;
+  a=flex_dd3_scalbn(a,shift);b=flex_dd3_scalbn(b,shift);c=flex_dd3_scalbn(c,shift);
+  source_shift+=shift;
   FlexDD3 origin_projection;
-  if (flex_dd_project_origin_plane(origin_projection,a,b,c)) {
+  if (flex_dd_project_origin_plane(origin_projection,a,b,c,source_shift)) {
     flex_dd_s1d(lambda,a,b); lambda[2]=flex_dd(0.0f); return;
   }
   FlexDD m14=flex_gjk_triangle_minor(FlexDD2{a.y,a.z},
@@ -960,10 +987,17 @@ static inline void flex_dd_s2d(thread FlexDD* lambda, FlexDD3 a,
 
 static inline void flex_dd_s3d(thread FlexDD* lambda, FlexDD3 a,
                                FlexDD3 b, FlexDD3 c, FlexDD3 d) {
+  float magnitude=max(max(flex_dd3_max_magnitude(a),flex_dd3_max_magnitude(b)),
+      max(flex_dd3_max_magnitude(c),flex_dd3_max_magnitude(d)));
+  int exponent=flex_float_exponent(magnitude);
+  int shift=(exponent < -10 || exponent > 10) ? -exponent : 0;
+  a=flex_dd3_scalbn(a,shift);b=flex_dd3_scalbn(b,shift);
+  c=flex_dd3_scalbn(c,shift);d=flex_dd3_scalbn(d,shift);
   FlexDD c41=flex_dd_neg(flex_dd_det3(b,c,d));
   FlexDD c42=flex_dd_det3(a,c,d), c43=flex_dd_neg(flex_dd_det3(a,b,d));
   FlexDD c44=flex_dd_det3(a,b,c);
-  FlexDD det=flex_dd_add(flex_dd_add(c41,c42),flex_dd_add(c43,c44));
+  // Pinned S3D's cofactor sum is rounded after each lexical addition.
+  FlexDD det=flex_dd_add(flex_dd_add(flex_dd_add(c41,c42),c43),c44);
   bool comp1=flex_dd_same_sign(det,c41), comp2=flex_dd_same_sign(det,c42);
   bool comp3=flex_dd_same_sign(det,c43), comp4=flex_dd_same_sign(det,c44);
   if (comp1 && comp2 && comp3 && comp4) {
@@ -972,13 +1006,13 @@ static inline void flex_dd_s3d(thread FlexDD* lambda, FlexDD3 a,
   }
   FlexDD dmin=flex_dd(3.402823466e+38f), face[3];
   if (!comp1) {
-    flex_dd_s2d(face,b,c,d); FlexDD3 values[3]={b,c,d};
+    flex_dd_s2d(face,b,c,d,shift); FlexDD3 values[3]={b,c,d};
     FlexDD3 p=flex_dd3_lincomb_source(values,face,3);
     lambda[0]=flex_dd(0.0f); lambda[1]=face[0]; lambda[2]=face[1]; lambda[3]=face[2];
     dmin=flex_dd3_dot(p,p);
   }
   if (!comp2) {
-    flex_dd_s2d(face,a,c,d); FlexDD3 values[3]={a,c,d};
+    flex_dd_s2d(face,a,c,d,shift); FlexDD3 values[3]={a,c,d};
     FlexDD3 p=flex_dd3_lincomb_source(values,face,3);
     FlexDD dv=flex_dd3_dot(p,p);
     if (flex_dd_compare(dv,dmin)<0) {
@@ -986,7 +1020,7 @@ static inline void flex_dd_s3d(thread FlexDD* lambda, FlexDD3 a,
     }
   }
   if (!comp3) {
-    flex_dd_s2d(face,a,b,d); FlexDD3 values[3]={a,b,d};
+    flex_dd_s2d(face,a,b,d,shift); FlexDD3 values[3]={a,b,d};
     FlexDD3 p=flex_dd3_lincomb_source(values,face,3);
     FlexDD dv=flex_dd3_dot(p,p);
     if (flex_dd_compare(dv,dmin)<0) {
@@ -994,7 +1028,7 @@ static inline void flex_dd_s3d(thread FlexDD* lambda, FlexDD3 a,
     }
   }
   if (!comp4) {
-    flex_dd_s2d(face,a,b,c); FlexDD3 values[3]={a,b,c};
+    flex_dd_s2d(face,a,b,c,shift); FlexDD3 values[3]={a,b,c};
     FlexDD3 p=flex_dd3_lincomb_source(values,face,3);
     FlexDD dv=flex_dd3_dot(p,p);
     if (flex_dd_compare(dv,dmin)<0) {

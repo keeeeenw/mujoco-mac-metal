@@ -195,11 +195,13 @@ static __attribute__((noinline)) FlexDD3 mpr_segment_closest(FlexDD3 a,FlexDD3 b
 static __attribute__((noinline)) FlexDD3 mpr_triangle_closest(FlexDD3 a,FlexDD3 b,FlexDD3 c) {
   FlexDD3 d1=mpr_sub(b,a),d2=mpr_sub(c,a);
   FlexDD v=mpr_dot(d1,d1),w=mpr_dot(d2,d2),p=mpr_dot(a,d1),q=mpr_dot(a,d2),r=mpr_dot(d1,d2);
-  FlexDD determinant=flex_dd_source_sub(flex_dd_source_mul(w,v),flex_dd_source_mul(r,r));
+  // The pinned arm64 vec3.c contracts these C expressions. Rounding both
+  // products separately changes closest-point branches on narrow portals.
+  FlexDD determinant=flex_dd_source_fma(w,v,flex_dd_neg(flex_dd_source_mul(r,r)));
   FlexDD s=flex_dd(-1),t=flex_dd(-1);
   if (!mpr_zero(determinant)) {
-    s=flex_dd_source_div(flex_dd_source_sub(flex_dd_source_mul(q,r),flex_dd_source_mul(w,p)),determinant);
-    t=flex_dd_source_div(flex_dd_source_sub(flex_dd_neg(flex_dd_source_mul(s,r)),q),w);
+    s=flex_dd_source_div(flex_dd_source_fma(q,r,flex_dd_neg(flex_dd_source_mul(w,p))),determinant);
+    t=flex_dd_source_div(flex_dd_source_fma(flex_dd_neg(s),r,flex_dd_neg(q)),w);
   }
   FlexDD sum=flex_dd_source_add(s,t);
   if ((mpr_zero(s)||flex_dd_compare_exact(s,flex_dd(0))>0) &&

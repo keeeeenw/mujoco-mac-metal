@@ -94,7 +94,7 @@ def _camera_source_oracle(tmp_path):
   binary=package/"libmujoco.3.10.0.dylib"
   assert binary.is_file(),"camera helper/model ABI is pinned to MuJoCo 3.10.0"
   library=tmp_path/"pinned_camera.dylib"
-  subprocess.run(["/usr/bin/clang","-O3","-ffp-contract=fast","-shared",
+  subprocess.run(["/usr/bin/clang","-O3","-std=c11","-shared",
       "-I",str(package/"include"),str(source),str(binary),
       "-Wl,-rpath,"+str(package),"-o",str(library)],check=True,
       capture_output=True,text=True,timeout=30)

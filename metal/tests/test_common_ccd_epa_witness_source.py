@@ -48,7 +48,7 @@ def _pinned_oracle(tmp_path):
   path = tmp_path / "pinned_epa.c"
   path.write_text(code)
   library = tmp_path / "pinned_epa.dylib"
-  subprocess.run(["/usr/bin/clang", "-O3", "-ffp-contract=fast", "-shared",
+  subprocess.run(["/usr/bin/clang", "-O3", "-std=c11", "-shared",
                   str(path), "-o", str(library)], check=True,
                  capture_output=True, text=True, timeout=30)
   lib = ctypes.CDLL(str(library))
