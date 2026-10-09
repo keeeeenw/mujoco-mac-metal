@@ -31,6 +31,19 @@ _JOINT_SLIDE = 2
 _JOINT_HINGE = 3
 
 
+def integration_workspace_sizes(nq,nv,njnt,nbody,batch):
+  """Actual owned tensor backings; borrowed output views add no storage."""
+  return {
+      'joint_type':max(njnt,1),'joint_qposadr':max(njnt,1),'joint_dofadr':max(njnt,1),
+      'body_jntadr':max(nbody,1),'body_jntnum':max(nbody,1),'dims':5,'timestep':3,
+      'velocity_modes':4,'sleep_filter':1,'dummy_int':1,'empty_input':1,
+      'candidate_qpos':max(batch*nq,1),'candidate_qvel':max(batch*nv,1),'candidate_time':batch,
+      'output_qpos':max(batch*nq,1),'output_qvel':max(batch*nv,1),'output_time':batch,'output_status':batch,
+      'zero_words':batch*(2*nq+2*nv),'candidate_words':batch*(2*nq+2*nv),
+      'output_words':batch*(2*nq+2*nv),'zero_acc_low':batch*nv,'zero_override_words':batch*4*nv,
+  }
+
+
 class MetalEulerIntegration:
   """Reusable native MPS semi-implicit Euler stage for a fixed model/batch.
 
@@ -43,6 +56,13 @@ class MetalEulerIntegration:
   for a zero quaternion, and 12 for nonfinite arithmetic. Failed rows preserve
   their input state. Rows commit independently after the full candidate state
   passes validation.
+
+  ``precision_words`` optionally supplies packed per-world position low/tail
+  and velocity low/tail planes. ``qacc_low`` retains the accepted solver
+  correction. ``override_words`` supplies low/tail planes for explicit next
+  and position velocities. The corresponding borrowed output is
+  ``_output_words``; a persistent state owner must copy it on a successful
+  commit before reusing this stage. Failure rows retain all input words.
 
   The velocity update is ``qvel += dt*qacc``. Position integration follows
   MuJoCo 3.10 for hinge, slide, ball and free joints, using the updated
@@ -66,6 +86,7 @@ class MetalEulerIntegration:
     if isinstance(timestep, bool) or not isinstance(timestep, numbers.Real):
       raise TypeError("timestep must be a real number")
     dt = float(timestep)
+    source_dt = dt
     if not math.isfinite(dt) or dt <= 0:
       raise ValueError("timestep must be finite and positive")
     try:
@@ -79,6 +100,8 @@ class MetalEulerIntegration:
           "timestep must be representable as positive finite float32"
       )
 
+    from mujoco_metal.model import require_triple_word_domain
+    require_triple_word_domain([source_dt],what='timestep')
     self.model = snapshot_descriptor(model)
     if np.any(
         ~np.isin(
@@ -90,7 +113,7 @@ class MetalEulerIntegration:
           "integration supports only free, ball, slide, and hinge joints"
       )
     self.batch_size = batch_size
-    self.dt = dt
+    self.dt = source_dt
     self.nq = self.model.nq
     self.nv = self.model.nv
     self.njnt = self.model.njnt
@@ -104,6 +127,9 @@ class MetalEulerIntegration:
     if batch_size * max(self.nq, self.nv) > max_index:
       raise ValueError("state storage dimensions exceed shader indexing range")
 
+    from mujoco_metal.capacity import _check_i32_elements
+    for name,count in integration_workspace_sizes(self.nq,self.nv,self.njnt,self.nbody,batch_size).items():
+      _check_i32_elements('integration.'+name,count)
     import torch
 
     if not torch.backends.mps.is_available():
@@ -112,7 +138,11 @@ class MetalEulerIntegration:
       raise RuntimeError("PyTorch does not provide torch.mps.compile_shader")
     self._torch = torch
     self._device = torch.device("mps")
-    self._library = torch.mps.compile_shader(_SHADER.read_text())
+    from mujoco_metal.metal_kinematics import _SOURCE_MATH_SHADER
+    source=('#define MUJOCO_METAL_SOURCE_MATH_ONLY\n'+_SOURCE_MATH_SHADER.read_text()
+            +'\n#undef MUJOCO_METAL_SOURCE_MATH_ONLY\n'
+            +_SHADER.with_name('position_math.metal').read_text()+_SHADER.read_text())
+    self._library = torch.mps.compile_shader(source)
     self._kernel = self._library.semi_implicit_euler
     self._joint_type = self._device_array(self.model.jnt_type)
     self._joint_qposadr = self._device_array(self.model.jnt_qposadr)
@@ -124,7 +154,15 @@ class MetalEulerIntegration:
         dtype=torch.int32,
         device=self._device,
     )
-    self._dt = torch.tensor([dt], dtype=torch.float32, device=self._device)
+    dt_low=np.float32(source_dt-np.float32(source_dt))
+    dt_tail=np.float32(source_dt-float(np.float32(source_dt))-float(dt_low))
+    self._dt = torch.tensor([dt,float(dt_low),float(dt_tail)], dtype=torch.float32, device=self._device)
+    self._precision_width=2*self.nq+2*self.nv
+    self._zero_words=torch.zeros((batch_size,self._precision_width),dtype=torch.float32,device=self._device)
+    self._candidate_words=torch.empty_like(self._zero_words)
+    self._output_words=torch.empty_like(self._zero_words)
+    self._zero_override_words=torch.zeros((batch_size,4*self.nv),dtype=torch.float32,device=self._device)
+    self._zero_acc_low=torch.zeros((batch_size,self.nv),dtype=torch.float32,device=self._device)
     self._velocity_modes = tuple(
         torch.tensor([mode], dtype=torch.int32, device=self._device)
         for mode in range(4)
@@ -182,6 +220,7 @@ class MetalEulerIntegration:
       next_velocity=None,
       position_velocity=None,
       awake_lists=None,
+      precision_words=None, qacc_low=None, override_words=None,
   ):
     """Return candidate states, optionally restricted to current awake lists.
 
@@ -198,6 +237,12 @@ class MetalEulerIntegration:
         solve_status, "solve_status", (batch,), self._torch.int32
     )
 
+    if precision_words is None: precision_words=self._zero_words
+    self._validate_tensor(precision_words,'precision_words',(batch,self._precision_width),self._torch.float32)
+    if qacc_low is None:qacc_low=self._zero_acc_low
+    self._validate_tensor(qacc_low,'qacc_low',(batch,self.nv),self._torch.float32)
+    if override_words is None:override_words=self._zero_override_words
+    self._validate_tensor(override_words,'override_words',(batch,4*self.nv),self._torch.float32)
     for name, value in (
         ("next_velocity", next_velocity),
         ("position_velocity", position_velocity),
@@ -277,6 +322,11 @@ class MetalEulerIntegration:
         dof_ids.reshape(-1) if sleep_filter else self._dummy_int,
         counts,
         self._sleep_filter,
+        precision_words.reshape(-1) if self._precision_width else self._empty_input,
+        self._candidate_words.reshape(-1) if self._precision_width else self._empty_input,
+        self._output_words.reshape(-1) if self._precision_width else self._empty_input,
+        qacc_low.reshape(-1) if self.nv else self._empty_input,
+        override_words.reshape(-1) if self.nv else self._empty_input,
         threads=(batch,),
         group_size=(1,),
     )

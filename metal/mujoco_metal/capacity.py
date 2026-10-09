@@ -506,7 +506,19 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       ("flex_contact.filter_min_distance_words",
        b * nflexcontactslot * 3),
   ]
+  from mujoco_metal.integration import integration_workspace_sizes
+  integration_parts=integration_workspace_sizes(nq,nv,nj,nb,b)
+  parts.extend(('integration.'+name,count) for name,count in integration_parts.items())
   if is_rk4:
+    parts.extend(('rk4.integration.'+name,count) for name,count in integration_parts.items())
+    parts.extend((
+        ('rk4.initial_words',b*(2*nq+2*nv)),('rk4.stage_words',b*(2*nq+2*nv)),
+        ('rk4.stage_qpos',b*nq),('rk4.stage_qvel',b*nv),
+        ('rk4.velocities',4*b*nv),('rk4.velocity_words',8*b*nv),
+        ('rk4.accelerations',4*b*nv),('rk4.acceleration_low',4*b*nv),
+        ('rk4.rate',b*nv),('rk4.weighted_acc',b*nv),('rk4.weighted_acc_low',b*nv),
+        ('rk4.next_velocity',b*nv),('rk4.override_words',4*b*nv),
+        ('rk4.rate_dims',16),('rk4.weights',6)))
     parts.append(("rk4.zero", b * nv))
     parts.append(("rk4.initial_qvel", b * nv))
   if effective_edge_count is not None:
@@ -851,6 +863,7 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
   # created only by profiles that request implicit Euler damping; include the
   # conservative maximum because this estimator is profile-independent.
   for name, count in (
+      ("integration_qacc_low",b*nv),
       ("rhs", b * nv), ("forward_stage_zero_constraint", b * nv),
       ("rhs_low", b * nv),
       ("dense_pair_solution_low", b * nv if mass_storage == "dense" else 0),

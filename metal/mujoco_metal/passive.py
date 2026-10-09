@@ -116,6 +116,7 @@ def passive_workspace_sizes(meta, batch_size, *, validate=True):
     sizes[f"passive.fk.{name}"] = max(b * count * width, 1)
   sizes.update({
       "passive.fk.qpos": max(b * nq, 1),
+      "passive.fk.position_words": max(2*b*nq,1),
       "passive.fk.dims": 8,
       "passive.fk.auxiliary": max(
           (b * nmocap * 7 if nmocap else 1) + nb

@@ -218,7 +218,7 @@ def _inverse_query_workspaces(sim):
                    "_component_solution_low_vector",
                    "_forward_position_buffers",
                    "_component_tendon_J", "_component_damping_deriv", "_rhs", "_rhs_low",
-                   "_act_dot", "_actuator_velocity_derivative", "_sensordata",
+                   "_act_dot", "_integration_qacc_low", "_actuator_velocity_derivative", "_sensordata",
                    "_act_vel", "_sen_act_force", "_sen_qfrc_act",
                    "_raw_sensordata", "_energy", "_sensor_plugin_status",
                    "_legacy_canonical_rows", "_legacy_constraint_rhs", "_control",
@@ -1835,6 +1835,8 @@ def mj_setState(sim, values: dict[str, Any], env_ids=None):
   # Stage delegated warmstart inputs before any writes; this is the most
   # failure-prone external operation in the old implementation.
   ids_t = None if ids is None else torch.as_tensor(ids, dtype=torch.long, device=device)
+  precision=getattr(state,'_precision',None)
+  if precision is not None:precision.synchronize(state._qpos,state._qvel)
   with torch.no_grad():
     for name, (attr, value) in staged.items():
       live = state._qacc if attr == "_qacc" else (getattr(state, attr) if attr not in ("_control", "_applied_force", "_body_wrench") else getattr(sim, attr))
@@ -1850,6 +1852,13 @@ def mj_setState(sim, values: dict[str, Any], env_ids=None):
       else:
         live.index_copy_(0, ids_t, target)
   if staged:
+    if precision is not None:
+      nq=state._model.nq
+      for name,span in (('qpos',slice(0,2*nq)),('qvel',slice(2*nq,None))):
+        if name in staged:
+          if ids_t is None:precision.words[:,span].zero_()
+          else:precision.words[ids_t,span]=0.0
+      precision.bind(state._qpos,state._qvel)
     if "history" in staged:
       sim._sync_delay_from_history(None if ids_t is None else ids_t)
     sim._invalidate_after_state_write(staged)

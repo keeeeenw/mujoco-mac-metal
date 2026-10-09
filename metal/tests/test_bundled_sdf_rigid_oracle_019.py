@@ -257,6 +257,10 @@ def test_bundled_rigid_plugin_sdf_force_trajectory_checkpoint_matches_cpu(name):
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
   qpos = sim.state._qpos[0].cpu().numpy().astype(np.float64, copy=True)
   qvel = sim.state._qvel[0].cpu().numpy().astype(np.float64, copy=True)
+  # The public tensors are high projections. Explicitly reset both engines
+  # from those same float32 values so this original continuous-rollout gate
+  # remains a comparison of identical represented starting states.
+  sim.reset(qpos=qpos[None], qvel=qvel[None])
   cpu_data, cpu_J, contacts = _cpu_contacts(model, qpos, qvel)
   assert len(contacts) == 8
   _assert_contact_system_matches_cpu(model, sim, cpu_data, cpu_J, contacts)
@@ -301,6 +305,9 @@ def test_bundled_plugin_mesh_sdf_rigid_rows_force_and_replay_match_cpu():
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
   qpos = sim.state._qpos[0].cpu().numpy().astype(np.float64, copy=True)
   qvel = sim.state._qvel[0].cpu().numpy().astype(np.float64, copy=True)
+  # Keep the same represented input in both engines; fresh native qpos0
+  # additionally retains compiled residuals beyond the public high projection.
+  sim.reset(qpos=qpos[None], qvel=qvel[None])
   cpu_data, cpu_J, contacts = _cpu_contacts(model, qpos, qvel)
   assert len(contacts) == 2
   _assert_contact_system_matches_cpu(model, sim, cpu_data, cpu_J, contacts)

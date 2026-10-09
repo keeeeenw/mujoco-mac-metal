@@ -32,7 +32,7 @@ results when retaining them beyond the next invocation.
 
 `MetalSimulation(model, batch_size=1, qpos=None, qvel=None)` connects persistent MPS state, smooth dynamics, the native dense solve, and semi-implicit Euler for the bounded `contact_free_euler_v1` profile. A local Apple M1 GPU qualification passed on four rigid-body fixtures, three initial states, 1,000-step 1 ms rollouts, and reset/restore resume. This remains a narrow qualification, not general model support. The model must explicitly disable contacts and use Euler integration. The profile supports gravity and joint armature, assumes zero applied generalized force, and rejects actuators, tendons, limits, friction loss, passive/fluid forces, sensors, equality constraints, flexes, plugins, damping, springs, callbacks, mocap, and non-Euler integrators. A model may be accepted for kinematics or mass/bias queries and still be rejected for stepping. Construction validates the profile before initializing MPS.
 
-`simulation.step()` returns a borrowed MPS status vector. Solver and integration failures are per-world; a failed world keeps its state and its first nonzero status remains sticky until reset or restore. State views are copies; snapshots and resets cross the host/device boundary and belong outside the hot step loop. Position, velocity, acceleration, and simulation time use float32 on device. In particular, time's representable increment gets coarser as elapsed time grows.
+`simulation.step()` returns a borrowed MPS status vector. Solver and integration failures are per-world; a failed world keeps its state and its first nonzero status remains sticky until reset or restore. State views are copies; snapshots and resets cross the host/device boundary and belong outside the hot step loop. Public position, velocity and acceleration tensors and simulation time use float32 on device. Development source additionally owns two residual words for persistent position and velocity, propagates them through FK and Euler/RK4 position updates, and retains accepted acceleration corrections during integration. In particular, time's representable increment gets coarser as elapsed time grows.
 
 Selected collision and frame calculations retain source-rounded values as three
 float32 words. Power-of-two scaling preserves intermediate product residuals and
@@ -41,8 +41,22 @@ This is not a general binary64 storage type: a result requiring bits below the
 smallest float32 subnormal cannot retain all 53 source significand bits. The
 scalar checks distinguish exact representable results from this storage floor;
 they do not establish physics qualification for arbitrary model scales. Public
-simulation state and time remain float32, and continuous trajectory qualification
+simulation tensors remain float32 projections, while position and velocity residuals
+are separate owned state. Time remains float32. Continuous trajectory qualification
 is separate from arithmetic or same-state contact comparisons.
+
+Development `StateSnapshot` schema 7 carries immutable `precision_words` with
+per-world planes in the order position low, position tail, velocity low, velocity
+tail. Schemas 1–6 restore zero residuals. Restore validates all planes before
+committing any row; selected reset, restore, copying and masked recovery preserve
+unselected words. Direct tensor writes invalidate changed rows on device, even
+when the writer does not advance a Torch mutation counter. Replacement inputs
+begin a new high-only state; controlled integration commits explicitly retain
+matching residuals. An explicit packed-state API write also supersedes the old
+residuals, including when the new high bits match. Resetting from host arrays
+preserves their representable source words; comparing another engine with only
+the public high projection therefore requires explicitly matching starting
+inputs. These development contracts are not present in the released 0.4.0 wheel.
 
 Run the opt-in GPU correctness tests only on an available Apple GPU with the pinned Torch extra installed: `MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 python -m pytest -m gpu`. CPU reference tests may require Torch on the host; disabling the opt-in flag alone is not a universal GPU exclusion for every historical test. Use an explicitly CPU-only test environment or availability guard for CPU-only qualification. `preflight` remains CPU-only: shader hashes and stage labels are inventory, not a device probe. The overall GPU-qualified field stays false because full-library physics coverage remains incomplete. The standalone source tree carries the Apache 2.0 license and notices.
 

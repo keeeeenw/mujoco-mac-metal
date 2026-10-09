@@ -25,11 +25,34 @@ class MetalRungeKutta:
     # RK rate is formed from the same immutable pre-step value.
     self._initial_qvel = self._torch.empty(
         (batch_size, model.nv), dtype=self._torch.float32, device="mps")
+    width=2*model.nq+2*model.nv
+    self._initial_words=self._torch.zeros((batch_size,width),device='mps')
+    self._stage_words=self._torch.empty_like(self._initial_words)
+    self._stage_qpos=self._torch.empty((batch_size,model.nq),device='mps')
+    self._stage_qvel=self._torch.empty((batch_size,model.nv),device='mps')
+    self._stage_active=False
+    self._velocities=self._torch.empty((4,batch_size,model.nv),device='mps')
+    self._velocity_words=self._torch.empty((4,batch_size,2*model.nv),device='mps')
+    self._accelerations=self._torch.empty_like(self._velocities)
+    self._acceleration_low=self._torch.empty_like(self._velocities)
+    self._rate=self._torch.empty((batch_size,model.nv),device='mps')
+    self._weighted_acc=self._torch.empty_like(self._rate)
+    self._weighted_acc_low=self._torch.empty_like(self._rate)
+    self._next_velocity=self._torch.empty_like(self._rate)
+    self._override_words=self._torch.empty((batch_size,4*model.nv),device='mps')
+    self._rate_dims=tuple(self._torch.tensor([model.nq,model.nv,batch_size,stage],
+                          dtype=self._torch.int32,device='mps') for stage in (0,1,2,-1))
+    import numpy as np
+    coeff=np.array([1/6,1/3],np.float64);high=coeff.astype(np.float32)
+    low=(coeff-high.astype(float)).astype(np.float32)
+    tail=(coeff-high.astype(float)-low.astype(float)).astype(np.float32)
+    self._weights=self._torch.tensor(np.column_stack((high,low,tail)).ravel(),device='mps')
+    self._rates_kernel=self._position._library.rk4_combine_rates
     # ModelDescriptor snapshots omit actuator counts; raw models carry na.
     self._na = int(getattr(model, "na", 0))
 
   def run_device(self, qpos, qvel, act, time, status, acceleration, *,
-                 initial_stage=None, defer_integration=False):
+                 initial_stage=None, defer_integration=False, precision_words=None, acceleration_low=None, initial_acceleration_low=None):
     """Four RK4 stages with pinned stage structure (R06/D3).
 
     ``act`` is ``(batch, na)`` or None when the model has no activation
@@ -49,6 +72,11 @@ class MetalRungeKutta:
             and qvel.device.index != self._initial_qvel.device.index)
         or not qvel.is_contiguous()):
       raise ValueError("qvel must be contiguous float32 [batch,nv]")
+    if precision_words is None:self._initial_words.zero_()
+    else:
+      self._position._validate_tensor(precision_words,'precision_words',tuple(self._initial_words.shape),torch.float32)
+      self._initial_words.copy_(precision_words)
+    self._stage_active=False
     self._initial_qvel.copy_(qvel)
     qvel = self._initial_qvel
     # Select the supported callback arity once. Catching TypeError from an
@@ -66,7 +94,7 @@ class MetalRungeKutta:
       if act is None or tuple(act.shape) != (qpos.shape[0], na):
         raise ValueError(f"act must have shape ({qpos.shape[0]}, {na})")
       act = act.clone()
-    velocities, accelerations, act_dots = [], [], []
+    act_dots = []
     final_context = None
     q, v, cur_act = qpos, qvel, act
     stage_times = (time, time + 0.5 * self.dt, time + 0.5 * self.dt, time + self.dt)
@@ -86,8 +114,15 @@ class MetalRungeKutta:
       if stage == 3 and len(result) == 4:
         final_context = result[3]
       status = torch.where(status == 0, solve_status, status)
-      velocities.append(v.clone())
-      accelerations.append(a.clone())
+      self._velocities[stage].copy_(v)
+      nv=self._position.nv;nq=self._position.nq
+      current_words=self._initial_words if stage==0 else self._stage_words
+      self._velocity_words[stage].copy_(current_words[:,2*nq:])
+      self._accelerations[stage].copy_(a)
+      low=(initial_acceleration_low if stage==0 and initial_stage is not None
+           else None if acceleration_low is None else acceleration_low(a))
+      if low is None:self._acceleration_low[stage].zero_()
+      else:self._acceleration_low[stage].copy_(low)
       if na > 0:
         if adot is None or tuple(adot.shape) != (qpos.shape[0], na):
           raise ValueError("acceleration callback must return act_dot with activation state")
@@ -96,16 +131,16 @@ class MetalRungeKutta:
         act_dots.append(None)
       if stage < 3:
         fraction = (0.5, 0.5, 1.0)[stage]
-        q, _, _, position_status = self._position.run_device(
-            qpos,
-            v * fraction,
-            self._zero,
-            time,
-            status,
-        )
-        q = q.clone()
-        status = torch.where(status == 0, position_status, status)
-        v = qvel + (self.dt * fraction) * a
+        self._combine(stage)
+        q,v,_,position_status=self._position.run_device(
+            qpos,qvel,self._weighted_acc,time,status,
+            next_velocity=self._next_velocity,position_velocity=self._rate,
+            precision_words=self._initial_words,override_words=self._override_words)
+        self._stage_qpos.copy_(q);self._stage_qvel.copy_(v)
+        q,v=self._stage_qpos,self._stage_qvel
+        self._stage_words.copy_(self._position._output_words)
+        self._stage_active=True
+        status=torch.where(status==0,position_status,status)
         # The empty-DOF finite predicate is vacuously true. Avoid an empty
         # MPS reduction, whose result need not implement that identity.
         if v.numel():
@@ -121,16 +156,8 @@ class MetalRungeKutta:
               torch.full_like(status, 12),
               status,
           )
-    rate = (
-        velocities[0] + 2 * velocities[1] + 2 * velocities[2] + velocities[3]
-    ) / 6
-    weighted_acc = (
-        accelerations[0]
-        + 2 * accelerations[1]
-        + 2 * accelerations[2]
-        + accelerations[3]
-    ) / 6
-    next_v = qvel + self.dt * weighted_acc
+    self._combine(-1)
+    rate=self._rate;weighted_acc=self._weighted_acc;next_v=self._next_velocity
     if next_v.numel():
       status = torch.where(
           (status == 0) & ~torch.isfinite(next_v).all(dim=1),
@@ -164,22 +191,36 @@ class MetalRungeKutta:
           "position_velocity": rate,
           "weighted_acceleration": weighted_acc,
           "next_velocity": next_v,
-          "final_acceleration": accelerations[3],
+          "final_acceleration": self._accelerations[3],
           "act_dot": weighted_dot,
           "time": next_time,
           "status": status,
           "final_context": final_context,
+          "override_words": self._override_words,
+          "precision_words": self._initial_words,
       }
     q, _, next_t, status = self._position.run_device(
-        qpos, rate, self._zero, time, status
+        qpos, qvel, weighted_acc, time, status,
+        next_velocity=next_v,position_velocity=rate,
+        precision_words=self._initial_words,override_words=self._override_words
     )
     success = status == 0
     # MuJoCo leaves qacc from the final forward evaluation, not RK's weighted sum.
     return (
         torch.where(success[:, None], q, qpos),
         torch.where(success[:, None], next_v, qvel),
-        accelerations[3],
+        self._accelerations[3],
         weighted_dot,
         torch.where(success, next_t, time),
         status,
     )
+
+  def _combine(self,stage):
+    if not self._position.nv:return
+    self._rates_kernel(self._velocities.reshape(-1),self._velocity_words.reshape(-1),
+        self._accelerations.reshape(-1),self._acceleration_low.reshape(-1),
+        self._initial_qvel.reshape(-1),self._initial_words.reshape(-1),
+        self._rate.reshape(-1),self._weighted_acc.reshape(-1),self._weighted_acc_low.reshape(-1),
+        self._next_velocity.reshape(-1),self._override_words.reshape(-1),
+        self._rate_dims[3 if stage<0 else stage],self._position._dt,self._weights,
+        threads=(self._initial_qvel.numel(),),group_size=(1,))

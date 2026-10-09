@@ -597,9 +597,33 @@ def _cpu_stage_orchestrator():
   program._torch, program._na, program.dt = torch, 0, .002
   program._zero = torch.zeros((1, 1))
   program._initial_qvel = torch.empty((1, 1), dtype=torch.float32)
+  program._stage_qpos=torch.empty((1,1));program._stage_qvel=torch.empty((1,1))
+  program._initial_words=torch.zeros((1,4));program._stage_words=torch.empty((1,4))
+  program._velocities=torch.empty((4,1,1));program._velocity_words=torch.empty((4,1,2))
+  program._accelerations=torch.empty((4,1,1));program._acceleration_low=torch.empty((4,1,1))
+  program._rate=torch.empty((1,1));program._weighted_acc=torch.empty((1,1))
+  program._weighted_acc_low=torch.empty((1,1));program._next_velocity=torch.empty((1,1))
+  program._override_words=torch.zeros((1,4))
+  def combine(stage):
+    # CPU stand-in for the native rate producer, solely for callback ordering.
+    # Native source-order arithmetic is independently qualified elsewhere.
+    if stage<0:
+      weights=(1/6,1/3,1/3,1/6)
+      rate=sum(program._velocities[j]*weight for j,weight in enumerate(weights))
+      acc=sum(program._accelerations[j]*weight for j,weight in enumerate(weights))
+    else:
+      weight=.5 if stage<2 else 1.
+      rate=program._velocities[stage]*weight;acc=program._accelerations[stage]*weight
+    program._rate.copy_(rate);program._weighted_acc.copy_(acc)
+    program._next_velocity.copy_(program._initial_qvel+.002*acc)
+  program._combine=combine
   class Position:
-    def run_device(self, q, v, a, t, status):
-      return q+.002*v, v, t+.002, status
+    nq=nv=1
+    _output_words=torch.zeros((1,4))
+    def run_device(self,q,v,a,t,status,**kwargs):
+      pv=kwargs.get('position_velocity',v)
+      nv=kwargs.get('next_velocity',v)
+      return q+.002*pv,nv,t+.002,status
   program._position = Position()
   return program, (torch.zeros((1,1)),torch.ones((1,1)),None,
                    torch.zeros(1),torch.zeros(1,dtype=torch.int32))

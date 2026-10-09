@@ -1357,6 +1357,7 @@ class MetalSimulation:
     # same borrowed solver result planes. Preserve the source candidate's
     # low word across that nested, row-masked dispatch.
     self._check_qacc_low = torch.empty_like(self._state._qacc)
+    self._integration_qacc_low = torch.empty_like(self._state._qacc)
     self._next_time = torch.empty_like(self._state._time)
     self._next_status = torch.empty_like(self._state._status)
     na = int(getattr(self._state, "_na", 0))
@@ -1629,6 +1630,24 @@ class MetalSimulation:
       if self._actuators is None:
         raise ValueError("actuator USER callbacks require the native general actuator path")
       self._actuators.bind_user_callback_plugins(self._actuator_user_plugins)
+
+    self._bind_position_words()
+
+  def _position_words_for(self,qpos):
+    state=self._state
+    if qpos is state._qpos:
+      return state._precision.synchronize(state._qpos,state._qvel)[:,:2*state._model.nq]
+    rk4=getattr(self,'_rk4',None)
+    if rk4 is not None and getattr(rk4,'_stage_active',False) and rk4._stage_qpos is qpos:
+      return rk4._stage_words[:,:2*state._model.nq]
+    return None
+
+  def _bind_position_words(self):
+    # Both FK producers are explicitly owned by this simulation. Rebind after
+    # model lifecycle swaps so their providers never resolve a discarded state.
+    for stage in (self._smooth,self._passive):
+      fk=getattr(stage,'_fk',None)
+      if fk is not None:fk._position_words_provider=self._position_words_for
 
   @property
   def islands(self):
@@ -2574,6 +2593,7 @@ class MetalSimulation:
         setattr(self, key, value)
     self._state.adopt_descriptor(fresh._state)
     self._state.reset_model_history(fresh._state)
+    self._bind_position_words()
     scheduler = getattr(self, "_sleep_schedule", None)
     if scheduler is not None:
       # Contact/equality metadata changed with the model. The first current
@@ -6708,6 +6728,8 @@ class MetalSimulation:
                                           "qvel": step_qvel})
             fwd_acc, step_qvel, fwd_status, check_reset = (
                 self._check_step_acceleration(fwd_acc, step_qvel, fwd_status))
+            initial_low=self._qacc_low_for_sensor(fwd_acc)
+            initial_low=initial_low.clone() if initial_low is not None else None
             initial_stage = (fwd_acc.clone(),
                              self._act_dot.clone() if na_here > 0 else None,
                              fwd_status.clone())
@@ -6735,7 +6757,10 @@ class MetalSimulation:
             deferred = self._rk4.run_device(
                 state._qpos, step_qvel, rk4_act, state._time, state._status,
                 _rk4_sleep_accel, initial_stage=initial_stage,
-                defer_integration=True)
+                defer_integration=True,
+                precision_words=state._precision.synchronize(state._qpos,state._qvel),
+                acceleration_low=self._qacc_low_for_sensor,
+                initial_acceleration_low=initial_low)
             # run_device copied the already masked X0 velocity into its owned
             # reusable buffer before any intermediate callback could overwrite
             # the caller's sleep-mask output.
@@ -6772,7 +6797,9 @@ class MetalSimulation:
                 state._time, self._combined_status,
                 next_velocity=deferred["next_velocity"],
                 position_velocity=deferred["position_velocity"],
-                awake_lists=integration_awake)
+                awake_lists=integration_awake,
+                precision_words=deferred['precision_words'],
+                override_words=deferred['override_words'])
             status = torch.where(self._sensor_plugin_status == 0, status,
                                  self._sensor_plugin_status)
             success = status == 0
@@ -6782,6 +6809,7 @@ class MetalSimulation:
                      and na_here > 0 else None), time=time)
             state._qpos = torch.where(success[:, None], qpos, state._qpos)
             state._qvel = torch.where(success[:, None], qvel, state._qvel)
+            state._precision.commit(state._qpos,state._qvel,self._integrator._output_words,success)
             state._qacc = torch.where(success[:, None], acceleration,
                                       state._qacc)
             state._qacc_warmstart.copy_(torch.where(
@@ -6837,6 +6865,8 @@ class MetalSimulation:
                                         "qvel": step_qvel})
           fwd_acc, step_qvel, fwd_status, check_reset = (
               self._check_step_acceleration(fwd_acc, step_qvel, fwd_status))
+          initial_low=self._qacc_low_for_sensor(fwd_acc)
+          initial_low=initial_low.clone() if initial_low is not None else None
           initial_stage = (fwd_acc.clone(),
                            self._act_dot.clone() if na_here > 0 else None,
                            fwd_status.clone())
@@ -6860,6 +6890,9 @@ class MetalSimulation:
               state._status,
               _rk4_accel,
               initial_stage=initial_stage,
+              precision_words=state._precision.synchronize(state._qpos,state._qvel),
+              acceleration_low=self._qacc_low_for_sensor,
+              initial_acceleration_low=initial_low,
           )
           status = torch.where(self._sensor_plugin_status == 0, status,
                                self._sensor_plugin_status)
@@ -6879,6 +6912,7 @@ class MetalSimulation:
                    and na_here > 0 else None), time=time)
           state._qpos = torch.where(success.unsqueeze(1), qpos, state._qpos)
           state._qvel = torch.where(success.unsqueeze(1), qvel, state._qvel)
+          state._precision.commit(state._qpos,state._qvel,self._rk4._position._output_words,success)
           state._qacc = torch.where(success[:, None], acceleration, state._qacc)
           state._qacc_warmstart.copy_(torch.where(
               success[:, None], state._qacc, state._qacc_warmstart))
@@ -7173,6 +7207,9 @@ class MetalSimulation:
         self._success.copy_(self._combined_status == 0)
         if self._actuators is not None and getattr(state, "_na", 0) > 0:
           self._advance_activations(state)
+        integration_low=self._qacc_low_for_sensor(integration_acceleration)
+        if integration_low is None:self._integration_qacc_low.zero_()
+        else:self._integration_qacc_low.copy_(integration_low)
         integration_awake = self._prepare_sleep_integration(
             step_qvel, acceleration, self._success)
         if getattr(self, "_sleep_schedule", None) is not None:
@@ -7181,6 +7218,7 @@ class MetalSimulation:
           position_velocity = position_velocity.clone() if position_velocity is not None else None
         acceleration = self._refresh_sleep_velocity(
             state._qpos, step_qvel, acceleration, self._success)
+        precision_words=state._precision.synchronize(state._qpos,state._qvel)
         qpos, qvel, time, status = self._integrator.run_device(
             state._qpos,
             step_qvel,
@@ -7190,6 +7228,8 @@ class MetalSimulation:
             next_velocity=next_velocity,
             position_velocity=position_velocity,
             awake_lists=integration_awake,
+            precision_words=precision_words,
+            qacc_low=self._integration_qacc_low,
         )
         torch.eq(status, 0, out=self._success)
         torch.where(
@@ -7233,6 +7273,7 @@ class MetalSimulation:
         # invocation. DeviceState reset/restore may replace these references.
         state._qpos, self._next_qpos = self._next_qpos, state._qpos
         state._qvel, self._next_qvel = self._next_qvel, state._qvel
+        state._precision.commit(state._qpos,state._qvel,self._integrator._output_words,self._success)
         state._qacc, self._next_qacc = self._next_qacc, state._qacc
         state._qacc_warmstart.copy_(torch.where(
             self._success.unsqueeze(1), state._qacc,
