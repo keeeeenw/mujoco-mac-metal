@@ -89,7 +89,8 @@ def test_sdf_overflow_status_is_merged_before_solver_and_world_local():
   assert "contact_count[int(world) * npairs + pair_idx] < 0" in shader
   assert "candidate_world_mask[world] == 0" in shader
   normal = inspect.getsource(MetalCoupledConstraints.run_device)
-  reset = normal.index('w["out_status"].zero_()')
+  reset = normal.index(
+      'self._fill_world_masked(w["out_status"], world_mask, width=1, stride=1)')
   producer = normal.index("self.generate_candidates(", reset)
   merge = normal.index("self._merge_sdf_narrowphase_status_kernel(", producer)
   solver = normal.index("def dispatch_solver(", merge)

@@ -350,8 +350,11 @@ def test_default_dense_pgs_dispatch_binds_prepared_high_low_pair(monkeypatch):
       "out_status": i32(batch), "out_diagnostics": f32(10 * batch),
       "out_contact_force": f32(0), "out_joint_force": f32(0),
       "position_current_qvel": f32(batch * nv),
-      "position_current_cvel": f32(0), "position_current_cdof": f32(0),
-      "position_current_cdof_dot": f32(0),
+      # The current-input records have their real compiled widths even when
+      # optional motion inputs are absent. run_device clears these records.
+      "position_current_cvel": f32(batch * solver.descriptor.nbody * 6),
+      "position_current_cdof": f32(batch * nv * 6),
+      "position_current_cdof_dot": f32(batch * nv * 6),
       "position_current_body_pos": f32(3),
       "position_current_body_quat": f32(4),
       "position_current_root_com": f32(3),
