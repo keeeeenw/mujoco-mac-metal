@@ -794,10 +794,12 @@ kernel void common_ccd_hfield_mesh_candidates(
           if (libccd) world_normal=common_libccd_fix_normal(
               prism,original,world_pos,world_normal);
           contact.normal=flex_dd3_high(world_normal);
-          contact.t1=flex_dd3_high(
-              common_ccd_matrix_vector(Rh,flex_dd3(contact.t1)));
-          contact.t2=flex_dd3_high(
-              common_ccd_matrix_vector(Rh,flex_dd3(contact.t2)));
+          // mjc_ConvexHField publishes only the world normal after
+          // mjc_fixNormal. mj_addContact then builds a fresh world frame.
+          // Rotating pre-correction prism tangents leaves them inconsistent
+          // with the corrected normal, changing the friction Jacobian.
+          contact.t1=float3(0.0f);
+          make_frame(contact.normal,contact.t1,contact.t2);
           common_ccd_production_store_contact(mesh_hull,out,ncontact,contact);
           // Keep the source-order terrain prism that produced each witness
           // in the three currently unused contact-record words. The canonical
@@ -1789,7 +1791,7 @@ kernel void contact_produce_plane_sdf(
     float3 hi=flex_dd3_high(position),lo=float3(position.x.lo,position.y.lo,position.z.lo),
       tail=float3(position.x.tail,position.y.tail,position.z.tail);
     float3 nh=flex_dd3_high(normal),nl=float3(normal.x.lo,normal.y.lo,normal.z.lo),
-      nt=float3(normal.x.tail,normal.y.tail,normal.z.tail),t1,t2;
+      nt=float3(normal.x.tail,normal.y.tail,normal.z.tail),t1=float3(0),t2=float3(0);
     make_frame(nh,t1,t2);
     for(int j=0;j<3;j++) {
       records[dst+13+j]=hi[j];records[dst+25+j]=lo[j];records[dst+31+j]=tail[j];

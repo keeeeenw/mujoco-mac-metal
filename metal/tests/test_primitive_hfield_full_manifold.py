@@ -85,6 +85,16 @@ def test_full_primitive_terrain_contacts_forces_trajectory_and_restore(
                           for c in contacts], 2e-4)):
     np.testing.assert_allclose(host(system[field])[0, active[0]], expected,
                                rtol=0, atol=tolerance, err_msg=field)
+  normals = host(system['contact_normal'])[0, active[0]]
+  tangent1 = host(system['contact_tangent1'])[0, active[0]]
+  tangent2 = host(system['contact_tangent2'])[0, active[0]]
+  np.testing.assert_allclose(np.sum(normals * tangent1, axis=1), 0, atol=2e-6)
+  np.testing.assert_allclose(np.cross(normals, tangent1), tangent2, atol=2e-6)
+  for field, axis in (('contact_tangent1', slice(3, 6)),
+                      ('contact_tangent2', slice(6, 9))):
+    np.testing.assert_allclose(host(system[field])[0, active[0]],
+                               [c.frame[axis] for c in contacts],
+                               rtol=0, atol=2e-4, err_msg=field)
   np.testing.assert_allclose(host(system['qfrc_constraint']),
                              [d.qfrc_constraint for d in refs],
                              rtol=2e-3, atol=2e-3)
