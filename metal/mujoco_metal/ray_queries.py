@@ -130,6 +130,7 @@ def _ray_shader_source():
   directory = Path(__file__).parent / 'shaders'
   from mujoco_metal.sensors import _spatial_shader_source
   return '\n'.join((_spatial_shader_source(entry=None),
+                    (directory/'camera_frames.metal').read_text(),
                     (directory/'ray_queries.metal').read_text()))
 
 

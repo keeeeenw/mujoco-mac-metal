@@ -852,39 +852,59 @@ def _quat_mul(a, b):
                    *(a[0] * b[1:] + b[0] * a[1:] + np.cross(a[1:], b[1:]))])
 
 
-def _cam_project_reference(model, site_pos, body_pos, body_quat, camid):
-  """Exact host port of pinned ``cam_project`` (R07a, no rendering).
+def _camera_frame_reference(model, body_pos, body_quat, camid, inertial_pos=None):
+  """Explicit float64 camera-frame oracle; never called by native evaluation."""
+  body = int(model.cam_bodyid[camid])
+  bq = _unit(np.asarray(body_quat[body], dtype=np.float64), "body quaternion")
+  wq = _quat_mul(bq, np.asarray(model.cam_quat[camid], dtype=np.float64))
+  pos = np.asarray(body_pos[body]) + _quat_rot(bq, model.cam_pos[camid])
+  mat = _quat_mat(wq)
+  mode, target = int(model.cam_mode[camid]), int(model.cam_targetbodyid[camid])
+  def subtree(root):
+    if inertial_pos is None:
+      raise ValueError("COM camera frame requires explicit inertial positions")
+    mass, weighted = 0., np.zeros(3)
+    for body in range(root, model.nbody):
+      parent = body
+      while parent > root:
+        parent = int(model.body_parentid[parent])
+      if parent == root:
+        m = float(model.body_mass[body])
+        mass += m
+        weighted += m*np.asarray(inertial_pos[body])
+    return weighted/mass if mass > float(mujoco.mjMINVAL) else np.asarray(inertial_pos[root])
+  if mode in (1, 2):
+    mat = np.asarray(model.cam_mat0[camid]).reshape(3, 3)
+    pos = (np.asarray(body_pos[body])+model.cam_pos0[camid] if mode == 1 else
+           subtree(body)+model.cam_poscom0[camid])
+  elif mode in (3, 4) and target >= 0:
+    look = np.asarray(body_pos[target]) if mode == 3 else subtree(target)
+    def unit(vector):
+      norm = np.linalg.norm(vector)
+      return vector/norm if norm >= float(mujoco.mjMINVAL) else np.array([1., 0., 0.])
+    z = unit(pos-look)
+    x = unit(np.cross([0., 0., 1.], z))
+    y = unit(np.cross(z, x))
+    mat = np.stack([x, y, z], axis=1)
+  return pos, mat
 
-  Camera world frame composes the mount-body frame with the compiled
-  local offset, matching ``d->cam_xpos/xmat``; then the pinned
-  translation/rotation/focal/image chain projects the site target.
-  """
+
+def _cam_project_reference(model, site_pos, body_pos, body_quat, camid, inertial_pos=None):
+  """Pinned cam_project using the complete camera world frame, without rendering."""
   site_pos = np.asarray(site_pos, dtype=np.float64)
-  b = int(np.asarray(model.cam_bodyid[camid]))
-  bq = _unit(np.asarray(body_quat[b], dtype=np.float64), "body quaternion")
-  bp = np.asarray(body_pos[b], dtype=np.float64)
-  lq = _unit(np.asarray(model.cam_quat[camid], dtype=np.float64), "camera quaternion")
-  wq = _quat_mul(bq, lq)
-  campos = bp + _quat_rot(bq, np.asarray(model.cam_pos[camid], dtype=np.float64))
+  campos, xmat = _camera_frame_reference(model, body_pos, body_quat, camid, inertial_pos)
   res = np.asarray(model.cam_resolution[camid], dtype=np.float64)
   fovy = float(np.asarray(model.cam_fovy[camid]))
   intrinsic = np.asarray(model.cam_intrinsic[camid], dtype=np.float64)
   sensorsize = np.asarray(model.cam_sensorsize[camid], dtype=np.float64)
-  # Rotation block: rotation[i][j] = xmat[j*3+i] with column-major xmat.
-  x, y, z, w = wq[1], wq[2], wq[3], wq[0]
-  xmat = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-                   [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-                   [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
   if sensorsize[0] and sensorsize[1]:
-    fx = intrinsic[0] / sensorsize[0] * res[0]
-    fy = intrinsic[1] / sensorsize[1] * res[1]
+    fx = float(np.float32(intrinsic[0]) / np.float32(sensorsize[0])) * res[0]
+    fy = float(np.float32(intrinsic[1]) / np.float32(sensorsize[1])) * res[1]
   else:
     fx = fy = 0.5 / np.tan(fovy * np.pi / 360.0) * res[1]
-  # Direct chain evaluation: translation shifts by -campos, rotation
-  # (rotation[i][j] = xmat[j*3+i], i.e. the xmat matrix itself, verified
-  # against CPU sensordata) contracts it, focal scales, image centers.
+  # Pinned xmat storage is row-major; the projection contracts its transpose.
   p = site_pos - campos
-  q = xmat @ p
+  q = xmat.T @ p
   px = np.array([-fx * q[0], fy * q[1], q[2]])
   img = np.array([px[0] + res[0] / 2 * px[2], px[1] + res[1] / 2 * px[2], px[2]])
   denom = img[2]
@@ -982,7 +1002,7 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
         value = _cam_project_reference(
             model, np.asarray(poses["site_pos"])[w, objid],
             np.asarray(poses["body_pos"])[w], np.asarray(poses["body_quat"])[w],
-            int(desc.sensor_refid[i]))
+            int(desc.sensor_refid[i]), np.asarray(poses["inertial_pos"])[w])
       elif typ == int(S.mjSENS_SUBTREECOM):
         value = np.asarray(Need("subtree_com")["subtree_com"][w, objid]).copy()
       elif typ == int(S.mjSENS_SUBTREELINVEL):
@@ -1343,7 +1363,8 @@ class SensorProgram:
       raise RuntimeError("PyTorch MPS with compile_shader is required")
     self._torch, self.batch_size = torch, batch_size
     self._device = torch.device("mps")
-    self._library = torch.mps.compile_shader(_SHADER.read_text())
+    self._library = torch.mps.compile_shader(_SHADER.read_text().replace(
+        "// MUJOCO_METAL_CAMERA_FRAMES", (_SHADER.parent / "camera_frames.metal").read_text()))
     self._kernel = self._library.evaluate_sensors
     d = self.descriptor
     self._meta = {}
@@ -1438,10 +1459,9 @@ class SensorProgram:
                 np.asarray(model.jnt_stiffnesspoly, dtype=np.float64).reshape(nj, 2)[:, 0] if nj else np.zeros(0),
                 np.asarray(model.jnt_stiffnesspoly, dtype=np.float64).reshape(nj, 2)[:, 1] if nj else np.zeros(0)):
       ec += [float(v) for v in arr]
-    # R07a camera block for CAMPROJECTION (econst tail): [ncam] then per
-    # camera [bodyid, lpos(3), lquat(4), res(2), fovy, intrinsic(4),
-    # sensorsize(2)]. Kernel offset = 10 + nq + 3*njnt; zero cameras append
-    # only the count, bit-identical for existing models.
+    # CAMPROJECTION tail: [ncam], then34words per camera. Retain17lens/local
+    # words plus mode,target,pos0(3),poscom0(3),mat0(9). Shared frame evaluation
+    # also uses the existing body tree and5-word mass records.
     ncam = int(model.ncam)
     ec += [float(ncam)]
     for c in range(ncam):
@@ -1452,6 +1472,9 @@ class SensorProgram:
       ec += [float(model.cam_fovy[c])]
       ec += [float(v) for v in np.asarray(model.cam_intrinsic[c], dtype=np.float64).reshape(-1)]
       ec += [float(v) for v in np.asarray(model.cam_sensorsize[c], dtype=np.float64).reshape(-1)]
+      ec += [float(model.cam_mode[c]), float(model.cam_targetbodyid[c])]
+      for name in ("cam_pos0", "cam_poscom0", "cam_mat0"):
+        ec += np.asarray(getattr(model, name)[c], dtype=np.float64).reshape(-1).tolist()
     self._s_econst = torch.as_tensor(np.array(ec, dtype=np.float32), dtype=torch.float32, device=self._device)
     WJ = int(mujoco.mjtWrap.mjWRAP_JOINT)
     ten_lmap = np.zeros((max(nt, 1), max(nq, 1)), dtype=np.float32)

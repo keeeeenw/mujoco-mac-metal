@@ -497,6 +497,18 @@ The allocation inventory includes pixel topology, captured camera constants
 and the scene assets. These checks do not close all sensor/geometry/solver
 combinations or qualify a released wheel.
 
+The [optical inspection carousel](examples/optical_inspection.md) demonstrates
+stored perspective and orthographic depth images with independent CPU checks.
+
+`CAMPROJECTION` projects a site into a camera's pixel coordinates and shares
+the same native camera-frame construction, including every tracking mode.
+It reproduces pinned MuJoCo's `cam_project`: this function uses focal length
+and image center, ignores principal-point offsets, and applies its perspective
+projection formula even for a camera marked orthographic. These semantics
+are distinct from the camera RANGEFINDER lens model. Multiple-camera record
+layout, mount rotations, selected worlds, stored steps and checkpoint replay
+have separate native checks.
+
 ### Flex and skin rays in development source
 
 `mj_rayFlex(sim, flex_layer, flg_vert, flg_edge, flg_face, flg_skin, flexid,

@@ -223,6 +223,8 @@ kernel void evaluate_sensors(
   for (uint j=0;j<dim;j++) output[base+j]=value[j];
 }
 
+// MUJOCO_METAL_CAMERA_FRAMES
+
 // Milestone 016 state families: tendon/actuator/limit/subtree/insidesite/
 // energy/magnetometer. Tendon length/velocity = fixed linear maps plus the
 // spatial kinematics workspace (zero rows for fixed tendons); actuator
@@ -562,28 +564,19 @@ kernel void evaluate_state_sensors(
     }
   }
   else if (typ==8) {
-    // Pinned cam_project (R07a, no rendering): site target through the
-    // body-mounted camera frame. Camera constants ride the econst tail at
-    // 10+nq+3*njnt: [ncam] then per camera [bodyid, lpos(3), lquat(4),
-    // res(2), fovy, intrinsic(4), sensorsize(2)].
+    // Complete mj_camlight frame and pinned cam_project. Camera constants
+    // use34words per record, preserving all lens fields and tracking modes.
     float3 sp=read3(site_pos,(world*nsite+uint(objid))*3);
     uint cam=uint(meta[i*10+9]);
-    uint cb=uint(10+nq+3*njnt);
-    uint base=cb+1+cam*13;
-    uint cbody=uint(econst[base+0]);
-    if (cbody>=nbody) cbody=0;
-    float3 bpos=read3(body_pos,(world*nbody+cbody)*3);
-    float4 bq=qunit(read4(body_quat,(world*nbody+cbody)*4));
-    float4 lq=qunit(float4(econst[base+4],econst[base+5],econst[base+6],econst[base+7]));
-    float3 campos=bpos+qrot(bq,float3(econst[base+1],econst[base+2],econst[base+3]));
-    float4 wq=qunit(qmul(bq,lq));
-    float x=wq.y, y=wq.z, z=wq.w, w=wq.x;
-    // xmat rows (pinned rotation[i][j] = xmat[j*3+i] = R[i][j]).
-    float3 r0=float3(1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w));
-    float3 r1=float3(2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w));
-    float3 r2=float3(2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y));
-    float3 p=sp-campos;
-    float3 q=float3(dot(r0,p),dot(r1,p),dot(r2,p));
+    uint base=uint(11+nq+3*njnt)+cam*34;
+    float3 campos;
+    float3x3 camera_mat;
+    mm_camera_frame(int(econst[base]),int(econst[base+17]),int(econst[base+18]),
+        int(world),int(nbody),read3(econst,base+1),read4(econst,base+4),
+        read3(econst,base+19),read3(econst,base+22),
+        transpose(float3x3(read3(econst,base+25),read3(econst,base+28),read3(econst,base+31))),
+        body_pos,body_quat,inertial_pos,body_tree,massub,5,campos,camera_mat);
+    float3 q=transpose(camera_mat)*(sp-campos);
     float res0=econst[base+8], res1=econst[base+9], fovy=econst[base+10];
     float ss0=econst[base+15], ss1=econst[base+16];
     float fx, fy;

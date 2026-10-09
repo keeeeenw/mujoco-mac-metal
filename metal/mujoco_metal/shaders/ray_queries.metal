@@ -161,55 +161,16 @@ kernel void query_scene_rays(
   out_status[index]=status;
 }
 
-inline float3 qr_camera_unit(float3 v) {
-  float size=length(v);
-  return size<1e-15f ? float3(1,0,0) : v/size;
-}
-
-inline float4 qr_camera_qmul(float4 a,float4 b) {
-  return float4(a.x*b.x-dot(a.yzw,b.yzw),
-                a.x*b.yzw+b.x*a.yzw+cross(a.yzw,b.yzw));
-}
-
-inline float3 qr_camera_subtree(int root,int world,int nb,
-    device const float* inertial_pos,device const int* body_tree,
-    device const float* body_mass) {
-  float mass=0.0f;
-  float3 weighted=float3(0.0f);
-  for (int body=root;body<nb;++body) {
-    int parent=body;
-    while (parent>root) parent=body_tree[2*parent];
-    if (parent!=root) continue;
-    mass+=body_mass[body];
-    weighted+=body_mass[body]*sp_r3(inertial_pos,3*(world*nb+body));
-  }
-  return mass>1e-15f ? weighted/mass : sp_r3(inertial_pos,3*(world*nb+root));
-}
-
 inline void qr_camera_frame(int cam,int world,int nb,
     device const int* meta,device const float* values,
     device const float* body_pos,device const float* body_quat,
     device const float* inertial_pos,device const int* body_tree,
     device const float* body_mass,thread float3& pos,thread float3x3& mat) {
-  int body=meta[6*cam],mode=meta[6*cam+1],target=meta[6*cam+2];
-  float4 bq=sp_qunit(sp_r4(body_quat,4*(world*nb+body)));
-  pos=sp_r3(body_pos,3*(world*nb+body))+sp_qrot(bq,sp_r3(values,27*cam));
-  float4 q=sp_qunit(qr_camera_qmul(bq,sp_r4(values,27*cam+3)));
-  mat=float3x3(sp_qrot(q,float3(1,0,0)),sp_qrot(q,float3(0,1,0)),sp_qrot(q,float3(0,0,1)));
-  if (mode==1 || mode==2) {
-    mat=transpose(float3x3(sp_r3(values,27*cam+13),
-                          sp_r3(values,27*cam+16),sp_r3(values,27*cam+19)));
-    pos=(mode==1 ? sp_r3(body_pos,3*(world*nb+body)) :
-          qr_camera_subtree(body,world,nb,inertial_pos,body_tree,body_mass))
-        +sp_r3(values,27*cam+(mode==1 ? 7 : 10));
-  } else if ((mode==3 || mode==4) && target>=0) {
-    float3 look=mode==3 ? sp_r3(body_pos,3*(world*nb+target)) :
-        qr_camera_subtree(target,world,nb,inertial_pos,body_tree,body_mass);
-    float3 z=qr_camera_unit(pos-look);
-    float3 x=qr_camera_unit(cross(float3(0,0,1),z));
-    float3 y=qr_camera_unit(cross(z,x));
-    mat=float3x3(x,y,z);
-  }
+  mm_camera_frame(meta[6*cam],meta[6*cam+1],meta[6*cam+2],world,nb,
+      sp_r3(values,27*cam),sp_r4(values,27*cam+3),sp_r3(values,27*cam+7),
+      sp_r3(values,27*cam+10),transpose(float3x3(sp_r3(values,27*cam+13),
+          sp_r3(values,27*cam+16),sp_r3(values,27*cam+19))),
+      body_pos,body_quat,inertial_pos,body_tree,body_mass,1,pos,mat);
 }
 
 kernel void evaluate_site_rays(
@@ -264,7 +225,7 @@ kernel void evaluate_site_rays(
     float py=float(row)+0.5f-camera_values[27*cam+25];
     if (camera_meta[6*cam+3]==0) {
       origin=cam_pos;
-      direction=qr_camera_unit(mat*float3(px/fx,-py/fy,-1.0f));
+      direction=mm_cam_unit(mat*float3(px/fx,-py/fy,-1.0f));
     } else {
       float half_extent=camera_values[27*cam+26]/2.0f;
       origin=cam_pos+mat*float3(px/fx*half_extent,-py/fy*half_extent,0.0f);
