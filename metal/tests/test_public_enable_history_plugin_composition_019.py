@@ -193,7 +193,8 @@ def test_public_enable_history_plugin_state_and_inverse_composition():
     runtime = next(p for p in sim._native_plugins if p.name == name)
     prototype = registry.get(name, PluginType.FORCE)
     assert runtime is not prototype
-    assert runtime.model is model and runtime.batch_size == batch
+    assert runtime.model is sim._mjmodel and runtime.model is not model
+    assert runtime.batch_size == batch
     assert tuple(runtime.calls.shape) == (batch,)
     refs = [mujoco.MjData(model), mujoco.MjData(model)]
     for world, data in enumerate(refs):

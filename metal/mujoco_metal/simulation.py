@@ -505,6 +505,9 @@ class MetalSimulation:
       raise TypeError("batch_size must be an integer")
     if batch_size <= 0:
       raise ValueError("batch_size must be positive")
+    # Lowering and later option reads must refer to the same owned model.
+    # Caller mutations are adopted only through an explicit lifecycle rebuild.
+    model = copy.copy(model)
     # Select the mass representation from the caller's profile name before
     # the first capacity pass.  In particular, the scalable profile must not
     # be rejected for a dense nv-by-nv backing it never allocates.
@@ -1659,8 +1662,12 @@ class MetalSimulation:
 
   @property
   def model(self):
-    """The underlying MuJoCo MjModel."""
-    return self._mjmodel
+    """An owned inspection copy; apply changes through ``apply_lifecycle``.
+
+    Mutating this copy or the constructor input never changes live device
+    constants or host options. Internal stages share the prepared model owner.
+    """
+    return copy.copy(self._mjmodel)
 
   @property
   def device(self):

@@ -17,6 +17,7 @@ through the acceleration supplied by the constraint stage.
 from types import SimpleNamespace
 
 import mujoco
+from mujoco_metal.model_access import prepared_model
 import torch
 
 _I32_MAX = (1 << 31) - 1
@@ -189,7 +190,7 @@ def _velocity_cvel(dynamics):
 def _run_rne_post(program, sim, qvel, qacc, dynamics, qacc_low,
                   legacy_contact_result=None):
   """Run existing force-assembly and RNE-post pipelines; return borrowed data."""
-  model, torch = sim.model, program._torch
+  model, torch = prepared_model(sim), program._torch
   b, nb, nv = int(sim.batch_size), int(model.nbody), int(model.nv)
   dev = program._device
   _validate_mps(qvel, (b, nv), "qvel", dev)
@@ -368,13 +369,13 @@ def mj_rnePostConstraint(sim, *, forward_result=None, qacc=None):
   The query restores simulation and plugin workspaces on success or failure.
   It performs no host numerical physics and does not mutate persistent state.
   """
-  if not hasattr(sim, "_state") or not isinstance(sim.model, mujoco.MjModel):
+  if not hasattr(sim, "_state") or not isinstance(prepared_model(sim), mujoco.MjModel):
     raise TypeError("sim must be a MetalSimulation")
   if mujoco.__version__ != "3.10.0":
     raise RuntimeError("mj_rnePostConstraint requires pinned MuJoCo 3.10.0")
   from mujoco_metal.native_api import _inverse_query_workspaces
 
-  b, model, state = int(sim.batch_size), sim.model, sim.state
+  b, model, state = int(sim.batch_size), prepared_model(sim), sim.state
   nv = int(model.nv)
   if qacc is not None:
     if (not isinstance(qacc, torch.Tensor) or qacc.device.type != "mps"

@@ -3,6 +3,7 @@
 """Native device equivalents of MuJoCo 3.10 checkPos/checkVel/checkAcc."""
 
 import mujoco
+from mujoco_metal.model_access import prepared_model
 
 _MAXVAL = 1.0e10
 
@@ -11,7 +12,7 @@ def _awake_dof_mask(sim):
   """Return the source-ordered awake DOF mask, or None without sleep."""
   torch = sim.state._torch
   scheduler = getattr(sim, "_sleep_schedule", None)
-  nv = int(sim.model.nv)
+  nv = int(prepared_model(sim).nv)
   if scheduler is None or nv == 0:
     return None
   tree_ids = sim._sleep_dof_treeid
@@ -39,7 +40,7 @@ def _record_warning(sim, warning, bad_world, bad_index):
   state = sim.state
   torch = state._torch
   auto_reset = not bool(
-      int(sim.model.opt.disableflags)
+      int(prepared_model(sim).opt.disableflags)
       & int(mujoco.mjtDisableBit.mjDSBL_AUTORESET))
   if hasattr(state, "record_warning_rows"):
     if auto_reset:

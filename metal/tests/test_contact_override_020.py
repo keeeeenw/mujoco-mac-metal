@@ -498,10 +498,11 @@ def test_native_override_mutation_rejects_atomically_and_lifecycle_rebuilds():
   sim.step(5)
   completed = sim.snapshot()
 
-  source_options = (int(model.opt.enableflags), float(model.opt.o_margin),
-                    model.opt.o_solref.copy(), model.opt.o_solimp.copy(),
-                    model.opt.o_friction.copy())
-  model.opt.o_friction[0] += .1
+  owned = sim._mjmodel
+  source_options = (int(owned.opt.enableflags), float(owned.opt.o_margin),
+                    owned.opt.o_solref.copy(), owned.opt.o_solimp.copy(),
+                    owned.opt.o_friction.copy())
+  owned.opt.o_friction[0] += .1
   state_before = sim._state.snapshot()
   warm_before = sim._coupled_constraints.get_warmstart().copy()
   cache_before = sim._last_coupled
@@ -520,11 +521,11 @@ def test_native_override_mutation_rejects_atomically_and_lifecycle_rebuilds():
 
   # Restore the exact compiled options and prove the prior checkpoint remains
   # replayable. Then adopt changed options via the documented atomic rebuild.
-  model.opt.enableflags = source_options[0]
-  model.opt.o_margin = source_options[1]
-  model.opt.o_solref[:] = source_options[2]
-  model.opt.o_solimp[:] = source_options[3]
-  model.opt.o_friction[:] = source_options[4]
+  owned.opt.enableflags = source_options[0]
+  owned.opt.o_margin = source_options[1]
+  owned.opt.o_solref[:] = source_options[2]
+  owned.opt.o_solimp[:] = source_options[3]
+  owned.opt.o_friction[:] = source_options[4]
   sim.restore(checkpoint)
   sim.step(5)
   replayed = sim.snapshot()

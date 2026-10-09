@@ -12,6 +12,7 @@ the same position-stage length and moment convention.
 
 import torch
 import numpy as np
+from mujoco_metal.model_access import prepared_model
 
 _I32_MAX = (1 << 31) - 1
 
@@ -128,7 +129,7 @@ def mj_transmission(sim):
   ``actuator_moment`` has shape ``[B,nu,nv]``; its dense representation is
   equivalent to expanding upstream MuJoCo's packed moment rows.
   """
-  model = sim.model
+  model = prepared_model(sim)
   batch, nu, nv = int(sim.batch_size), int(model.nu), int(model.nv)
   _checked_counts(batch, nu, nv)
   actuators = getattr(sim, "_actuators", None)
@@ -196,7 +197,7 @@ def mj_transmission(sim):
       # ScalarMotorModel admits only fixed-gain direct hinge/slide joint
       # transmissions. MuJoCo's current transmission length is gear*qpos and
       # its moment row has one gear entry at the joint DOF.
-      model = sim.model
+      model = prepared_model(sim)
       qpos_address, gear, dense = _scalar_motor_static_map(
           model, scalar_motor.model)
       qpos_indices = torch.as_tensor(

@@ -29,6 +29,7 @@ from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
 from typing import Any
 import mujoco
+from mujoco_metal.model_access import prepared_model
 import numpy as np
 
 try:
@@ -1083,9 +1084,9 @@ def _spatial_query(sim, operation, dynamics=None):
   """Query current smooth state while preserving borrowed forward records."""
   from mujoco_metal.spatial_queries import DeviceSpatialQueries
   program = getattr(sim, "_spatial_queries", None)
-  if (program is None or program.model is not sim.model
+  if (program is None or program.model is not prepared_model(sim)
       or program.batch_size != sim.batch_size or program.device != sim.state._device):
-    program = DeviceSpatialQueries(sim.model, sim.batch_size, sim.state._device)
+    program = DeviceSpatialQueries(prepared_model(sim), sim.batch_size, sim.state._device)
     sim._spatial_queries = program
   if dynamics is not None:
     _validate_spatial_stage(sim, dynamics)
@@ -1135,8 +1136,8 @@ def _ray_tensor(sim, value, shape, name):
 def _ray_query(sim, origins, vectors, *, dynamics=None, **filters):
   from mujoco_metal.ray_queries import MetalRayQueries
   program = getattr(sim, "_ray_queries", None)
-  if program is None or program.model is not sim.model or program.batch_size != sim.batch_size:
-    program = MetalRayQueries(sim.model, sim.batch_size,
+  if program is None or program.model is not prepared_model(sim) or program.batch_size != sim.batch_size:
+    program = MetalRayQueries(prepared_model(sim), sim.batch_size,
         memory_budget_bytes=getattr(sim.limits, "memory_budget_bytes", 1 << 30))
     sim._ray_queries = program
   if dynamics is not None:
@@ -1187,9 +1188,9 @@ def mj_multiRay(sim, pnt, vec, geomgroup=None, flg_static=True,
 def _ray_asset(sim, geomid, kind, pnt, vec, dynamics):
   from numbers import Integral
   if (isinstance(geomid, (bool, np.bool_)) or not isinstance(geomid, Integral)
-      or not 0 <= geomid < sim.model.ngeom):
+      or not 0 <= geomid < prepared_model(sim).ngeom):
     raise ValueError("geomid must identify a compiled geom")
-  if int(sim.model.geom_type[geomid]) != int(kind):
+  if int(prepared_model(sim).geom_type[geomid]) != int(kind):
     raise ValueError("geomid has the wrong asset geometry type")
   origin = _ray_tensor(sim, pnt, (sim.batch_size, 3), "pnt")[:, None, :]
   vector = _ray_tensor(sim, vec, (sim.batch_size, 3), "vec")[:, None, :]
@@ -1262,7 +1263,7 @@ def mj_rayFlex(sim, flex_layer, flg_vert, flg_edge, flg_face, flg_skin,
   prepared stages and accepted state. It is not a flex collision detector.
   """
   from mujoco_metal.ray_queries import lower_ray_flex, MetalRaySurface
-  surface = lower_ray_flex(sim.model,flexid)
+  surface = lower_ray_flex(prepared_model(sim),flexid)
   if getattr(sim,'_flex',None) is None:
     raise ValueError('simulation has no native flex position pipeline')
   programs = getattr(sim,'_ray_flex',{})
@@ -1281,7 +1282,7 @@ def mj_rayFlex(sim, flex_layer, flg_vert, flg_edge, flg_face, flg_skin,
         getattr(sim.state,'_mpos',None),getattr(sim.state,'_mquat',None))
     sim._flex.update_kinematics(dict(stage['poses'],root_com=stage['root_com']),
                                stage['cvel'])
-    va = int(sim.model.flex_vertadr[flexid])
+    va = int(prepared_model(sim).flex_vertadr[flexid])
     vertices = sim._flex.flexvert_xpos[:,va:va+surface.nvert,:].contiguous()
     return program.run_device(vertices,origin,vector,flex_layer=flex_layer,
         flg_vert=flg_vert,flg_edge=flg_edge,flg_face=flg_face,flg_skin=flg_skin)
@@ -1290,11 +1291,11 @@ def mj_rayFlex(sim, flex_layer, flg_vert, flg_edge, flg_face, flg_skin,
 def _position_query_program(sim):
   from mujoco_metal.position_queries import MetalPositionQueries, lower_position_topology
   program = getattr(sim, '_position_queries', None)
-  topology = lower_position_topology(sim.model)
+  topology = lower_position_topology(prepared_model(sim))
   if (program is None or program.batch_size != sim.batch_size
       or program.nq != topology.nq or program.nv != topology.nv
       or not np.array_equal(program.topology.joints, topology.joints)):
-    program = MetalPositionQueries(sim.model, sim.batch_size,
+    program = MetalPositionQueries(prepared_model(sim), sim.batch_size,
         memory_budget_bytes=getattr(sim.limits, 'memory_budget_bytes', 1 << 30))
     sim._position_queries = program
   return program
@@ -1307,8 +1308,8 @@ def mj_integratePos(sim, qpos, qvel, dt):
   quaternion normalization and right multiplication follow pinned MuJoCo.
   """
   program = _position_query_program(sim)
-  return program.integrate(_ray_tensor(sim, qpos, (sim.batch_size, sim.model.nq), 'qpos'),
-      _ray_tensor(sim, qvel, (sim.batch_size, sim.model.nv), 'qvel'), dt)
+  return program.integrate(_ray_tensor(sim, qpos, (sim.batch_size, prepared_model(sim).nq), 'qpos'),
+      _ray_tensor(sim, qvel, (sim.batch_size, prepared_model(sim).nv), 'qvel'), dt)
 
 
 def mj_differentiatePos(sim, qpos1, qpos2, dt):
@@ -1319,8 +1320,8 @@ def mj_differentiatePos(sim, qpos1, qpos2, dt):
   """
   program = _position_query_program(sim)
   return program.differentiate(
-      _ray_tensor(sim, qpos1, (sim.batch_size, sim.model.nq), 'qpos1'),
-      _ray_tensor(sim, qpos2, (sim.batch_size, sim.model.nq), 'qpos2'), dt)
+      _ray_tensor(sim, qpos1, (sim.batch_size, prepared_model(sim).nq), 'qpos1'),
+      _ray_tensor(sim, qpos2, (sim.batch_size, prepared_model(sim).nq), 'qpos2'), dt)
 
 
 def mj_normalizeQuat(sim, qpos):
@@ -1330,7 +1331,7 @@ def mj_normalizeQuat(sim, qpos):
   caller inputs and simulation state are never overwritten.
   """
   return _position_query_program(sim).normalize(
-      _ray_tensor(sim, qpos, (sim.batch_size, sim.model.nq), 'qpos'))
+      _ray_tensor(sim, qpos, (sim.batch_size, prepared_model(sim).nq), 'qpos'))
 
 
 def mjd_subQuat(qa, qb, *, memory_budget_bytes=1 << 30):
@@ -1382,7 +1383,7 @@ def _owned_stage_query(sim, operation, dynamics=None):
   simultaneous output/scratch storage of the three Cartesian stage queries.
   """
   from mujoco_metal.finite_difference import estimate_transaction_bytes
-  model, b = sim.model, int(sim.batch_size)
+  model, b = prepared_model(sim), int(sim.batch_size)
   nb, nv, ng, ns, nj = (int(getattr(model, name)) for name in
                         ("nbody", "nv", "ngeom", "nsite", "njnt"))
   counts = (nb * max(nv, 1), b * (128*nb + 24*nv + 48*ng + 48*ns + 12*nj),
@@ -1526,7 +1527,7 @@ def mj_rne(sim, flg_acc=1, *, dynamics=None, qvel=None, qacc=None):
   """
   if not isinstance(flg_acc, (bool, int, np.integer)) or int(flg_acc) not in (0, 1):
     raise ValueError("flg_acc must be 0 or 1")
-  shape = (sim.batch_size, int(sim.model.nv))
+  shape = (sim.batch_size, int(prepared_model(sim).nv))
   velocity = _stage_tensor(sim, sim.state._qvel if qvel is None else qvel,
                            shape, "qvel")
   acceleration = _stage_tensor(sim, sim.state._qacc if qacc is None else qacc,
@@ -1581,9 +1582,9 @@ def mj_objectAcceleration(sim, objtype, objid, flg_local=0, *, dynamics=None, qv
   This evaluates a query; it does not perform a forward constraint solve.
   """
   local = _local_flag(flg_local)
-  qa = (_stage_tensor(sim, qacc, (sim.batch_size, sim.model.nv), "qacc")
+  qa = (_stage_tensor(sim, qacc, (sim.batch_size, prepared_model(sim).nv), "qacc")
         if qacc is not None else sim.state._qacc)
-  qv = (_stage_tensor(sim, qvel, (sim.batch_size, sim.model.nv), "qvel")
+  qv = (_stage_tensor(sim, qvel, (sim.batch_size, prepared_model(sim).nv), "qvel")
         if qvel is not None else sim.state._qvel)
   return _spatial_query(sim, lambda program, stage: program.object_acceleration(
       stage, qv, qa, objtype, objid, local), dynamics)

@@ -9,6 +9,12 @@ is intentionally narrower than the complete set of opt-in profiles.
 
 ## Inspection and computation primitives
 
+`MetalSimulation` owns a copy of its compiled model. `sim.model` returns a fresh
+host inspection copy; edits to that copy or the constructor's input do not alter
+live device constants or stepping options. Use `sim.apply_lifecycle(model_or_lifecycle)`
+to validate and atomically adopt model changes across the batch. This rebuild is
+an explicit host preparation operation, outside the device stepping loop.
+
 Run `python -m mujoco_metal preflight --model path/to/model.xml --json --inventory` to inspect runtime version, model dimensions, package and every bundled shader's path/hash, capability boundaries, and the versioned feature/API inventory. The overall `gpu_qualified` field remains false because the full backend is not qualified. Inventory completeness is explicitly false because the captured enum and Python binding inventory is not exhaustive.
 
 `load_model(xml_or_path)` returns an immutable, dimension-derived descriptor. `descriptor.forward_kinematics(qpos)` is a CPU reference for body, inertial, geom, site, and joint-anchor/axis world poses across hinge, slide, ball, and free joints. `MetalKinematics(descriptor).run(qpos_batch)` computes the same pose fields through the batched native Metal kinematics kernel. GPU checks have passed on an Apple M1 for empty and fixed worlds, mixed hinge/slide/ball/free models with off-center joints and multiple free roots, world-attached sites/geoms, and a 32-DOF chain. This is a narrow correctness qualification, not a general model-support or performance claim. Constructing `MetalKinematics` initializes MPS and compiles the bundled shader.
