@@ -137,6 +137,15 @@ def _compile_ray_library(torch):
   return torch.mps.compile_shader(_ray_shader_source())
 
 
+def site_ray_workspace_sizes(model):
+  """All scene operands and dimensions owned by the site rangefinder route."""
+  if not np.any(np.asarray(model.sensor_type) == int(mujoco.mjtSensor.mjSENS_RANGEFINDER)):
+    return {}
+  scene = lower_ray_scene(model)
+  return {**{name: value.size for name, value in vars(scene).items()
+             if isinstance(value, np.ndarray)}, "dimensions": 6}
+
+
 class MetalRayQueries:
   """Owned batched hit distance, geom ID, normal and per-ray status outputs.
 
@@ -175,6 +184,18 @@ class MetalRayQueries:
         or not value.is_contiguous()):
       raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
     return value
+
+  def _run_sites_device(self, poses, site_bodyid, sensor_meta, intprm,
+                        output, stage_mask, dimensions):
+    """Internal stored-sensor entry; consumes the caller's selection and output."""
+    c = self._constants
+    self._library.evaluate_site_rays(
+        poses['geom_pos'], poses['geom_quat'], c['metadata'], c['sizes'],
+        c['hull'], c['hull_info'], c['octree'], c['octree_info'], c['sdf_kind'],
+        c['sdf_attributes'], c['sdf_attributes_low'], c['rbound'],
+        poses['site_pos'], poses['site_quat'], site_bodyid, sensor_meta,
+        intprm, output, stage_mask, dimensions,
+        threads=(output.shape[0]*sensor_meta.shape[0],), group_size=(1,))
 
   def run_device(self, poses, origins, vectors, *, geomgroup=None,
                  flg_static=True, bodyexclude=-1, geomid=-1, cutoff=None,

@@ -74,6 +74,52 @@ inline float qr_sdf(float3 pos, float3x3 mat, float3 size,
   return -1.0f;
 }
 
+// Both public scene rays and stored site sensors consume these exact scene
+// filters, triangle/heightfield intersections and SDF march.
+inline float qr_scene_hit(float3 origin,float3 direction,int world,int ng,
+    device const float* geom_pos,device const float* geom_quat,
+    device const int* metadata,device const float* sizes,
+    device const float* hull,device const int* hull_info,
+    device const float* octree,device const int* octinfo,
+    device const int* sdf_kind,device const float* sdf_attributes,
+    device const float* sdf_attributes_low,device const float* rbound,
+    device const int* groups,int flg_static,int bodyexclude,int geomid,
+    bool has_cutoff,float cutoff,bool multiray,
+    thread int& nearest,thread float3& best_normal,thread int& status) {
+  float best=-1.0f;
+  nearest=-1;best_normal=float3(0.0f);status=0;
+  // The upstream single and multiple ray APIs intentionally differ here.
+  if (!all(isfinite(origin)) || !all(isfinite(direction))
+      || (multiray ? dot(direction,direction)<1e-15f : length(direction)<1e-15f))
+    status=1;
+  for (int g=0;g<ng && status==0;++g) {
+    int type=metadata[6*g],body=metadata[6*g+1];
+    if (geomid>=0) { if (g!=geomid) continue; }
+    else if (body==bodyexclude || !metadata[6*g+4]
+             || (!flg_static && metadata[6*g+2])
+             || (groups && !groups[metadata[6*g+3]])) continue;
+    float3 pos=sp_r3(geom_pos,3*(world*ng+g));
+    float4 quat=sp_r4(geom_quat,4*(world*ng+g));
+    if (!all(isfinite(pos)) || !all(isfinite(quat)) || length(quat)<1e-15f) {
+      status=1;break;
+    }
+    if (has_cutoff && metadata[6*g+5] && length(pos-origin)>cutoff+rbound[g]) continue;
+    float3x3 mat=float3x3(sp_qrot(quat,float3(1,0,0)),
+                         sp_qrot(quat,float3(0,1,0)),sp_qrot(quat,float3(0,0,1)));
+    float3 size=sp_r3(sizes,3*g),n=float3(0.0f);
+    float candidate;
+    if (type==7) candidate=qr_mesh(pos,mat,size,origin,direction,hull,hull_info,g,n);
+    else if (type==1) candidate=rg_hfield(pos,mat,hull,hull_info,g,origin,direction,n);
+    else if (type==8) candidate=qr_sdf(pos,mat,size,origin,direction,g,sdf_kind,
+        sdf_attributes,sdf_attributes_low,octree,octinfo,n,status);
+    else candidate=rg_analytic(type,pos,mat,size,origin,direction,n);
+    if (candidate>=0.0f && (best<0.0f || candidate<best)) {
+      best=candidate;nearest=g;best_normal=n;
+    }
+  }
+  return status==0 ? best : -1.0f;
+}
+
 kernel void query_scene_rays(
     device const float* geom_pos [[buffer(0)]],
     device const float* geom_quat [[buffer(1)]],
@@ -102,43 +148,69 @@ kernel void query_scene_rays(
   int world=int(index)/nray;
   float3 origin=sp_r3(origins,3*index), direction=sp_r3(vectors,3*index);
   int status=0, nearest=-1;
-  float best=-1.0f;
   float3 best_normal=float3(0.0f);
-  // mj_ray checks norm against mjMINVAL; mj_multiRay checks squared norm.
-  // Preserve that intentional upstream difference for non-unit directions.
-  if (!all(isfinite(origin)) || !all(isfinite(direction))
-      || (dims[7] ? dot(direction,direction)<1e-15f : length(direction)<1e-15f))
-    status=1;
-  for (int g=0;g<ng && status==0;++g) {
-    int type=metadata[6*g], body=metadata[6*g+1];
-    if (dims[5]>=0) { if (g!=dims[5]) continue; }
-    else if (body==dims[4] || !metadata[6*g+4]
-             || (!dims[3] && metadata[6*g+2]) || !groups[metadata[6*g+3]]) continue;
-    float3 pos=sp_r3(geom_pos,3*(world*ng+g));
-    float4 quat=sp_r4(geom_quat,4*(world*ng+g));
-    if (!all(isfinite(pos)) || !all(isfinite(quat)) || length(quat)<1e-15f) {
-      status=1; break;
-    }
-    if (dims[6] && metadata[6*g+5] && length(pos-origin)>cutoff[0]+rbound[g]) continue;
-    float3x3 mat=float3x3(sp_qrot(quat,float3(1,0,0)),
-                         sp_qrot(quat,float3(0,1,0)),sp_qrot(quat,float3(0,0,1)));
-    float3 size=sp_r3(sizes,3*g), n=float3(0.0f);
-    float candidate;
-    if (type==7) candidate=qr_mesh(pos,mat,size,origin,direction,hull,hull_info,g,n);
-    else if (type==1) candidate=rg_hfield(pos,mat,hull,hull_info,g,origin,direction,n);
-    else if (type==8) candidate=qr_sdf(pos,mat,size,origin,direction,g,sdf_kind,
-        sdf_attributes,sdf_attributes_low,octree,octinfo,n,status);
-    else candidate=rg_analytic(type,pos,mat,size,origin,direction,n);
-    if (candidate>=0.0f && (best<0.0f || candidate<best)) {
-      best=candidate; nearest=g; best_normal=n;
-    }
-  }
+  float best=qr_scene_hit(origin,direction,world,ng,geom_pos,geom_quat,
+      metadata,sizes,hull,hull_info,octree,octinfo,sdf_kind,sdf_attributes,
+      sdf_attributes_low,rbound,groups,dims[3],dims[4],dims[5],bool(dims[6]),
+      cutoff[0],bool(dims[7]),nearest,best_normal,status);
   distance[index]=status==0 ? best : -1.0f;
   hit[index]=status==0 ? nearest : -1;
   normal[3*index]=status==0 ? best_normal.x : 0.0f;
   normal[3*index+1]=status==0 ? best_normal.y : 0.0f;
   normal[3*index+2]=status==0 ? best_normal.z : 0.0f;
   out_status[index]=status;
+}
+
+kernel void evaluate_site_rays(
+    device const float* geom_pos [[buffer(0)]],
+    device const float* geom_quat [[buffer(1)]],
+    device const int* metadata [[buffer(2)]],
+    device const float* sizes [[buffer(3)]],
+    device const float* hull [[buffer(4)]],
+    device const int* hull_info [[buffer(5)]],
+    device const float* octree [[buffer(6)]],
+    device const int* octinfo [[buffer(7)]],
+    device const int* sdf_kind [[buffer(8)]],
+    device const float* sdf_attributes [[buffer(9)]],
+    device const float* sdf_attributes_low [[buffer(10)]],
+    device const float* rbound [[buffer(11)]],
+    device const float* site_pos [[buffer(12)]],
+    device const float* site_quat [[buffer(13)]],
+    device const int* site_bodyid [[buffer(14)]],
+    device const int* sensors [[buffer(15)]],
+    device const int* intprm [[buffer(16)]],
+    device float* output [[buffer(17)]],
+    constant int* stage_mask [[buffer(18)]],
+    constant int* dims [[buffer(19)]],
+    uint index [[thread_position_in_grid]]) {
+  uint batch=uint(dims[0]),nsensor=uint(dims[1]),ndata=uint(dims[2]);
+  if (index>=batch*nsensor || !(stage_mask[0] & (1<<1)) || (dims[5]&8192)) return;
+  uint world=index/nsensor,i=index%nsensor;
+  if (!stage_mask[1+batch*max(nsensor,1u)+world] || !stage_mask[1+index]) return;
+  if (sensors[10*i]!=7 || sensors[10*i+2]!=1) return;
+  uint site=uint(sensors[10*i+4]),nsite=uint(dims[4]);
+  uint base=world*ndata+uint(sensors[10*i+6]);
+  float3 origin=sp_r3(site_pos,3*(world*nsite+site));
+  float4 quat=sp_qunit(sp_r4(site_quat,4*(world*nsite+site)));
+  float3 direction=sp_qrot(quat,float3(0,0,1));
+  int gid,status;
+  float3 normal;
+  float distance=qr_scene_hit(origin,direction,int(world),dims[3],geom_pos,geom_quat,
+      metadata,sizes,hull,hull_info,octree,octinfo,sdf_kind,sdf_attributes,
+      sdf_attributes_low,rbound,nullptr,1,site_bodyid[site],-1,false,0.0f,false,
+      gid,normal,status);
+  bool hit=distance>=0.0f && status==0;
+  float3 point=hit ? origin+direction*distance : float3(0.0f);
+  int spec=intprm[3*i],offset=0;
+  if (spec&1) output[base+offset++]=distance;
+  if (spec&2) {
+    float3 v=hit ? direction : float3(0.0f);
+    for (int k=0;k<3;++k) output[base+offset++]=v[k];
+  }
+  if (spec&4) for (int k=0;k<3;++k) output[base+offset++]=origin[k];
+  if (spec&8) for (int k=0;k<3;++k) output[base+offset++]=point[k];
+  if (spec&16) for (int k=0;k<3;++k) output[base+offset++]=hit ? normal[k] : 0.0f;
+  if (spec&32) output[base+offset++]=distance;
 }
 
 kernel void query_analytic_rays(

@@ -457,6 +457,10 @@ are packed dynamically; non-convex mesh rays do not require convex contact
 hulls. Model compilation and asset preprocessing remain host operations.
 The constructor captures model constants; rebuild it after model edits. Runtime
 rays and nearest-hit decisions execute on Metal without CPU physics fallback.
+Site rangefinder sensors use the same scene intersections and filters,
+including bundled and plugin-free SDFs, non-convex meshes and dynamically
+packed heightfields. Their output fields and selected-world writes follow the
+stored sensor contract. Camera rangefinders still require separate support.
 Plugin-free SDF meshes retain all three compiled octree word planes in the
 shared decoder layout, with one captured block for each shared mesh asset.
 The query memory budget covers its captured assets, owned outputs and shader

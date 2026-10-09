@@ -83,9 +83,8 @@ def test_camprojection_bad_reference_rejected_cpu():
 
 
 def test_sdf_ray_plugin_boundary_parity_cpu():
-  # Pinned SDF ray casting goes through the SDF plugin (mjc_getSDF); with
-  # no plugin registered both engines skip SDF geoms (pinned reports
-  # no-hit -1). Native matches that boundary; WITH-plugin scenes stay 019.
+  # The site's positive z-axis points away from this lower octree geom.
+  # This is a no-hit fixture, not proof that plugin-free SDFs are skipped.
   from mujoco_metal.sensors import lower_sensors
   V = ("-0.05 -0.05 -0.04 0.05 -0.05 -0.04 0.05 0.05 -0.04 -0.05 0.05 -0.04 "
        "-0.05 -0.05 0.04 0.05 -0.05 0.04 0.05 0.05 0.04 -0.05 0.05 0.04")
@@ -100,7 +99,7 @@ def test_sdf_ray_plugin_boundary_parity_cpu():
   d = mujoco.MjData(m)
   d.qpos[:] = np.asarray(m.qpos0)
   mujoco.mj_forward(m, d)
-  assert float(np.asarray(d.sensordata)[0]) == -1.0  # pinned no-hit, no plugin
+  assert float(np.asarray(d.sensordata)[0]) == -1.0  # pinned ray points away
 
 
 def _needs_gpu():

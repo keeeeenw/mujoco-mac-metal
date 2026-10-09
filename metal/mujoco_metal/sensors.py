@@ -1840,18 +1840,19 @@ class SensorProgram:
             rb[g] = max(float(rb[g]), float(_np.max(_np.linalg.norm(verts, axis=1))))
     self._sp_geom_rbound = ftensor(rb.reshape(max(ng, 1)), (max(ng, 1),))
     self._sp_sdf_maxn = min(int(model.opt.sdf_initpoints), 8)
-    # Sensor hull store for rays/geomdist: same layout as the coupled
-    # mesh/hfield sections, but built for ALL scene meshes/hfields (rays
-    # need occlusion hulls even for contype-0 geoms that never appear in
-    # contact pairs). SDF section omitted: SDF spatial queries are rejected.
+    # Geometry-distance operands retain the coupled layout. Rangefinders use
+    # the complete, dynamically packed public scene-ray operands instead.
     from mujoco_metal.coupled_constraints import (
         _HF_MAX_DATA, _HF_MAX_GEOMS, _HF_MAX_N, _MESH_DATA_FLOATS,
         _MESH_MAX_FACES, _MESH_MAX_TOTAL, _MESH_MAX_VERTS,
         mesh_hull_is_convex)
     _MESH_T = int(mujoco.mjtGeom.mjGEOM_MESH)
     _HF_T = int(mujoco.mjtGeom.mjGEOM_HFIELD)
-    _mesh_used = sorted(g for g in range(ng) if int(model.geom_type[g]) == _MESH_T)
-    _hf_used = sorted(g for g in range(ng) if int(model.geom_type[g]) == _HF_T)
+    distance_types = [int(getattr(mujoco.mjtSensor, name)) for name in (
+        "mjSENS_GEOMDIST", "mjSENS_GEOMNORMAL", "mjSENS_GEOMFROMTO")]
+    has_distances = np.any(np.isin(model.sensor_type, distance_types))
+    _mesh_used = sorted(g for g in range(ng) if has_distances and int(model.geom_type[g]) == _MESH_T)
+    _hf_used = sorted(g for g in range(ng) if has_distances and int(model.geom_type[g]) == _HF_T)
     if _mesh_used or _hf_used:
       if len(_hf_used) > _HF_MAX_GEOMS:
         raise ValueError(f"at most {_HF_MAX_GEOMS} heightfield geoms; found {len(_hf_used)}")
@@ -1932,7 +1933,13 @@ class SensorProgram:
     # not compile the complete geometry collision dispatcher as a side effect.
     # All families remain available, including queries requested after setup.
     self._sp_contact = partial(_dispatch_spatial, 2, "evaluate_contact_sensors")
-    self._sp_rays = partial(_dispatch_spatial, 3, "evaluate_rays")
+    self._site_ray_program = None
+    if np.any(np.asarray(model.sensor_type) == int(mujoco.mjtSensor.mjSENS_RANGEFINDER)):
+      from mujoco_metal.ray_queries import MetalRayQueries
+      self._site_ray_program = MetalRayQueries(model, self.batch_size)
+      self._site_ray_dims = torch.tensor(
+          [self.batch_size, self.descriptor.nsensor, self.descriptor.nsensordata,
+           ng, nsite, self.descriptor.disableflags], dtype=torch.int32, device=self._device)
     self._sp_geomdist = partial(_dispatch_spatial, 4, "evaluate_geomdist")
     self._sp_tactile = partial(_dispatch_spatial, 1, "evaluate_tactile")
     self._build_tactile_constants(model)
@@ -2110,21 +2117,9 @@ class SensorProgram:
       dest = self._s_state_out
     self._set_world_mask(world_mask)
     self._stage_mask[0].fill_(1 << int(mujoco.mjtStage.mjSTAGE_POS))
-    rdims = torch.tensor(
-        [b, d.nsensor, d.nsensordata, d.ngeom, d.nsite, self._sp_nmat,
-         d.disableflags, 0],
-        dtype=torch.int32, device=self._device)
-    self._sp_rays(
-        poses["site_pos"].reshape(-1), poses["site_quat"].reshape(-1),
-        poses["geom_pos"].reshape(-1), poses["geom_quat"].reshape(-1),
-        self._sp_geom_type.reshape(-1), self._sp_geom_size.reshape(-1),
-        self._rne_geom_bodyid,
-        self._sp_geom_matid.reshape(-1), self._sp_geom_rgba.reshape(-1),
-        self._sp_mat_rgba.reshape(-1), hull.reshape(-1), hull_info.reshape(-1),
-        self._rne_site_bodyid,
-        self._s_meta.reshape(-1), self._s_intprm(),
-        dest.reshape(-1), self._stage_mask, rdims,
-        threads=(b * max(d.nsensor, 1),), group_size=(1,))
+    if self._site_ray_program is not None:
+      self._site_ray_program._run_sites_device(poses, self._rne_site_bodyid,
+          self._s_meta, self._s_intprm(), dest, self._stage_mask, self._site_ray_dims)
     return dest
 
   def run_geomdist_device(self, poses, hull, hull_info, out=None, *, world_mask=None):

@@ -1003,6 +1003,9 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
   from mujoco_metal.sensors import tactile_workspace_sizes
   parts.extend((f"sensor.tactile.{name}", count) for name, count in
                tactile_workspace_sizes(model).items())
+  from mujoco_metal.ray_queries import site_ray_workspace_sizes
+  parts.extend((f"sensor.site_rays.{name}", count) for name, count in
+               site_ray_workspace_sizes(model).items())
   if touch_grid_contact_capacity is not None and int(model.nplugin):
     from mujoco_metal.bundled_plugins import lower_bundled_plugins
     from mujoco_metal.bundled_touch_grid import touch_grid_workspace_sizes
