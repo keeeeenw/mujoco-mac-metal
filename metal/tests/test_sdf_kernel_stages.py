@@ -83,6 +83,7 @@ def test_cpu_active_51_seed_pair_gets_50_output_slots():
   assert int(descriptor.pair_max_contacts.max()) == 50
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_staged_sdf_contact_selector():
   from mujoco_metal.simulation import MetalSimulation
@@ -94,6 +95,7 @@ def test_native_staged_sdf_contact_selector():
   assert int(result["status"].detach().cpu().numpy().reshape(-1)[0]) == 0
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_staged_51_seed_44_source_contacts():
   """Exercise all 51 configured seeds against pinned CPU's 44 contacts."""
@@ -123,6 +125,7 @@ def test_native_staged_51_seed_44_source_contacts():
   _check("staged-51-seed", "press", cpu, contacts)
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_staged_sdf_zero_and_large_seed_selectors():
   from mujoco_metal.capacity import CapacityLimits

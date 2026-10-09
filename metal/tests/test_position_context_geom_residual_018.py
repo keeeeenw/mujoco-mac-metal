@@ -167,6 +167,7 @@ def test_velocity_dispatch_validates_cached_residual_and_mask_before_bias():
   assert not calls
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="opt-in GPU")
 def test_native_public_smooth_pose_cache_retains_rotation_residuals_atomically():

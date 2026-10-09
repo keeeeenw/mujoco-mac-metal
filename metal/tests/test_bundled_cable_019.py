@@ -172,6 +172,7 @@ def test_cable_public_admission_and_lowering_cover_integrator_matrix(
   assert "bundled elasticity.cable" in " ".join(decision.supported)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="opt-in MPS bundled cable trajectory")
 def test_native_bundled_cable_trajectory_matches_pinned_steps():

@@ -333,6 +333,7 @@ def _assert_native_step_state_equal(a, b):
       torch.testing.assert_close(a[key], b[key], rtol=0, atol=0, msg=key)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("profile", [
     "integrated_euler_v1", "integrated_rk4_v1", "integrated_implicit_v1",
 ])
@@ -371,6 +372,7 @@ def test_native_typed_actuator_step_commit_checkpoint_replay(profile):
     _unregister_step_plugin(name)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("profile", [
     "integrated_euler_v1", "integrated_rk4_v1", "integrated_implicit_v1",
 ])

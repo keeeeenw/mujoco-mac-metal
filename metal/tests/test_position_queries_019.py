@@ -59,6 +59,7 @@ def test_position_topology_is_complete_owned_and_budgeted_before_mps_allocation(
     lower_position_topology(fake)
 
 
+@pytest.mark.gpu
 @_GPU
 @pytest.mark.parametrize('dt',[0.,.02,-.02,1.,-1.])
 def test_native_integrate_and_normalize_match_every_joint_and_pinned_zero_quat(dt):
@@ -81,6 +82,7 @@ def test_native_integrate_and_normalize_match_every_joint_and_pinned_zero_quat(d
   np.testing.assert_array_equal(normalized['status'].cpu(),0)
 
 
+@pytest.mark.gpu
 @_GPU
 @pytest.mark.parametrize('dt',[.02,-.02,.5])
 def test_native_differentiate_uses_local_quaternion_tangent_and_shortest_rotation(dt):
@@ -112,6 +114,7 @@ def test_native_differentiate_uses_local_quaternion_tangent_and_shortest_rotatio
   np.testing.assert_allclose(same['qvel'].cpu(),0,rtol=0,atol=5e-6)
 
 
+@pytest.mark.gpu
 @_GPU
 def test_position_queries_empty_model_invalid_rows_admission_and_owned_outputs():
   torch = pytest.importorskip('torch')
@@ -152,6 +155,7 @@ def test_position_queries_empty_model_invalid_rows_admission_and_owned_outputs()
     program.normalize(torch.zeros((3,model.nq*2),device='mps')[:,::2])
 
 
+@pytest.mark.gpu
 @_GPU
 def test_public_position_queries_preserve_simulation_and_prepared_records():
   torch = pytest.importorskip('torch')

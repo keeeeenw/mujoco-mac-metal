@@ -466,6 +466,7 @@ def test_pid_integrator_profiles_validate_with_pinned_derivative_semantics(
   assert "MuJoCo 3.10 bundled PID actuator force and activation callbacks" in descriptor.supported
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("integrator_profile", [
     ("mjINT_EULER", "integrated_euler_v1"),
     ("mjINT_RK4", "integrated_rk4_v1"),
@@ -576,6 +577,7 @@ def test_native_pid_mixed_rows_limits_and_integrators_match_pinned(
         msg=lambda error, name=name: f"implicit replay differs in {name}: {error}")
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="serialized public bundled-PID MPS trajectory")
 @pytest.mark.parametrize("integrator", ["euler", "rk4", "implicit", "implicitfast"])
@@ -675,6 +677,7 @@ def test_native_bundled_pid_step_and_checkpoint_replay_matches_pinned(integrator
     torch.testing.assert_close(current.detach().cpu(), value, rtol=0, atol=0)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("dyntype", ["filter", "filterexact"])
 @pytest.mark.skipif(os.environ.get("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="serialized actearly/filter PID MPS trajectory")
@@ -1013,6 +1016,7 @@ def test_rigid_sdf_high_low_attributes_match_all_pinned_plugin_configs():
     assert np.any(lowered.plugin_attributes_low[row] != 0), name
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="explicit serialized MPS qualification")
 def test_native_sdf_query_matches_pinned_callbacks_for_all_plugin_classes():
@@ -1099,6 +1103,7 @@ def test_native_sdf_query_matches_pinned_callbacks_for_all_plugin_classes():
   np.testing.assert_array_equal(gradients[20:], [[0, 0, 0]])
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="explicit serialized MPS qualification")
 def test_native_sdf_custom_attributes_and_periodic_creases_match_callbacks():
@@ -1179,6 +1184,7 @@ def test_native_sdf_custom_attributes_and_periodic_creases_match_callbacks():
   np.testing.assert_array_equal(native_gradient[~valid], 0)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1",
                     reason="explicit serialized MPS qualification")
 def test_native_sdf_signed_zero_axes_match_pinned_callbacks():

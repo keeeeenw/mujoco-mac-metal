@@ -39,6 +39,7 @@ def _native_three_dof_component_solver(batch=2):
       model, layout, batch_size=batch, rhs_capacity=1), layout
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_native_restarted_gmres_b2_residual_failure_isolation_and_recovery():
   import torch
@@ -94,6 +95,7 @@ def test_native_restarted_gmres_b2_residual_failure_isolation_and_recovery():
                              rtol=3e-5, atol=2e-6)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_native_gmres_happy_breakdown_small_rhs_diagonal_operator():
   import torch
@@ -177,6 +179,7 @@ def test_native_gmres_tiny_preconditioned_residual_uses_physical_residual():
                              rtol=0, atol=1e-6)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_native_restarted_gmres_budget_failure_is_world_local_and_recovers():
   import torch
@@ -222,6 +225,7 @@ def test_native_restarted_gmres_budget_failure_is_world_local_and_recovers():
                              rtol=2e-5, atol=2e-6)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_native_restarted_gmres_zero_dof_returns_empty_success():
   import mujoco

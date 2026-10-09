@@ -128,6 +128,7 @@ def test_analytic_sdf_zero_seed_budget_lowers_without_output_slots():
   assert data.ncon == 0
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_mixed_generic_analytic_and_mesh_sdf_producer_selectors():
   from mujoco_metal.coupled_constraints import MetalCoupledConstraints
@@ -157,6 +158,7 @@ def test_native_mixed_generic_analytic_and_mesh_sdf_producer_selectors():
   assert stage._contact_kernel is not None
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_default_and_large_seed_budgets_use_tiled_workspace():
   from mujoco_metal.coupled_constraints import MetalCoupledConstraints
@@ -169,7 +171,7 @@ def test_native_default_and_large_seed_budgets_use_tiled_workspace():
     assert stage._sdf_seed_count == budget
     assert stage._sdf_seed_tile == 32
     scratch = stage._workspace["contact_sdf_seed_records"]
-    assert scratch.numel() == 2 * stage.descriptor.npairs * 32 * 25
+    assert scratch.numel() == 2 * stage.descriptor.npairs * 32 * 37
     state = stage._workspace["contact_sdf_seed_state"]
     assert state.numel() == 2 * stage.descriptor.npairs * 32 * 159
     assert stage.descriptor.ncontacts_max == min(budget, 50)
@@ -181,6 +183,7 @@ def test_native_default_and_large_seed_budgets_use_tiled_workspace():
   assert int(zero._coupled_constraints._workspace["contact_pair_count"].sum().item()) == 0
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_no_hit_disabled_pruned_worldmask_repeat_and_restore():
   import torch
@@ -235,6 +238,7 @@ def test_native_no_hit_disabled_pruned_worldmask_repeat_and_restore():
   assert not bool((count[:2 * npairs] != 0).any().item())
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_finalizer_sets_overflow_sentinel_before_any_consumer():
   import torch
@@ -261,8 +265,8 @@ def test_native_finalizer_sets_overflow_sentinel_before_any_consumer():
     stage._sdf_stage_dims.copy_(torch.tensor(
         [count, start, 32, 0, 0], dtype=torch.int32, device="mps"))
     for i in range(count):
-      slot = i * 25
-      records[slot:slot + 25].zero_()
+      slot = i * 37
+      records[slot:slot + 37].zero_()
       records[slot] = (start + i) * 0.01
       valid[i] = 1
     stage._contact_sdf_finalize_producer(
@@ -272,6 +276,7 @@ def test_native_finalizer_sets_overflow_sentinel_before_any_consumer():
   assert int(pair_count[0].item()) == -1
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_overflow_public_status_is_world_local():
   from mujoco_metal.simulation import MetalSimulation
@@ -303,6 +308,7 @@ def test_native_overflow_public_status_is_world_local():
   assert status[1] == 0
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_overflow_status_normal_and_cached_public_paths_restore():
   """Both public constraint entry points preserve fail-closed SDF status."""
@@ -370,6 +376,7 @@ def test_native_overflow_status_normal_and_cached_public_paths_restore():
       cached_healthy["status"].detach().cpu().numpy().reshape(-1), [0, 0])
 
 
+@pytest.mark.gpu
 @_GPU
 def test_native_sdf_overflow_status_respects_mask_and_reenable():
   import torch
