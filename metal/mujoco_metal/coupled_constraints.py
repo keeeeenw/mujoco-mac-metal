@@ -5238,7 +5238,7 @@ class MetalCoupledConstraints:
       row_context = w["position_assembly_context"].view(b, nr_val, 5)
       for eid in range(d.neq):
         et = int(d.eq_type[eid])
-        if et not in flex_eq_types:
+        if et not in flex_eq_types or int(d.eq_rownum[eid]) == 0:
           continue
         if et == _EQ_FLEX:
           # This legacy producer evaluates all flex edges together.  Its raw
@@ -5265,6 +5265,8 @@ class MetalCoupledConstraints:
         dbg_w = w["workspace_debug"].view(b, -1)
         is_active = (eq_active_tensor[:, eid] != 0).float()
         impedance = rows["impedance"]
+        k0, b0 = _expand_flex_equality_reference_coefficients(
+            rows["k0"], rows["b0"], impedance)
         for k in range(row_span):
           r = row_start + k
           source_row = k
@@ -5282,8 +5284,11 @@ class MetalCoupledConstraints:
           dbg_w[:, nr_val * nr_val + 4 * nr_val + r] = -float("inf")
           dbg_w[:, nr_val * nr_val + 5 * nr_val + r] = float("inf")
           dbg_w[:, nr_val * nr_val + 6 * nr_val + r] = is_active
-          row_context[:, r, 0] = rows["k0"][:, source_row] / impedance[:, source_row]
-          row_context[:, r, 1] = rows["b0"][:, source_row] / impedance[:, source_row]
+          # This producer publishes an unpaired aref. Its residual plane
+          # must not retain a previous generic/velocity-stage value.
+          dbg_w[:, self._aref_low_debug_offset + r].zero_()
+          row_context[:, r, 0] = k0[:, source_row]
+          row_context[:, r, 1] = b0[:, source_row]
           row_context[:, r, 2] = impedance[:, source_row]
           row_context[:, r, 3] = rows["pos"][:, source_row]
           row_context[:, r, 4].zero_()

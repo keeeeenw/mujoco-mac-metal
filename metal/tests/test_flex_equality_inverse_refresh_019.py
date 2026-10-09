@@ -185,7 +185,14 @@ def test_public_flex_equalities_full_and_split_inverse_match_pinned_cpu(kind, ja
 
   # Rebuild only POS, then query a distinct VEL. The changed velocity makes
   # B*J*qvel observable while the retained position/impedance remains fixed.
+  cc = sim._coupled_constraints
+  debug = cc._workspace["workspace_debug"].view(1, -1)
+  equality_rows = int(cc.descriptor.n_eq_rows)
+  debug[:, cc._aref_low_debug_offset:cc._aref_low_debug_offset + equality_rows].fill_(1.25)
   pos_record = mj_fwdPosition(sim, return_record=True, skipsensor=True)
+  np.testing.assert_array_equal(
+      cc._assembly_views(include_optimizer_outputs=False)["ar_low"][:, :equality_rows].cpu().numpy(),
+      np.zeros((1, equality_rows), dtype=np.float32))
   query_qvel = native_qvel + np.linspace(.013, -.009, model.nv,
                                          dtype=np.float32)
   query_qvel_t = torch.as_tensor(query_qvel[None, :], dtype=torch.float32,
