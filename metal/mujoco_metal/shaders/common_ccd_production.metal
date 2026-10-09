@@ -1523,7 +1523,9 @@ kernel void common_ccd_rigid_convex_candidates(
   int horizon_alignment=vertex_words&1;
   device FlexDDVertex* epa_vertices=reinterpret_cast<device FlexDDVertex*>(
       mesh_hull+scratch);
-  int idbase=mesh_hull_info[header+24]+query*vertex_capacity;
+  // The descriptor addresses int32 words, while the typed arena stores
+  // int2 support pairs. Each query therefore owns two words per vertex.
+  int idbase=mesh_hull_info[header+24]+2*query*vertex_capacity;
   device int2* epa_vertex_ids=reinterpret_cast<device int2*>(mesh_hull_info+idbase);
   device FlexEpaFace* epa_faces=reinterpret_cast<device FlexEpaFace*>(
       mesh_hull+scratch+vertex_words);
