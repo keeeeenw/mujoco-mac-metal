@@ -16,7 +16,7 @@ def lower_geometry_queries(model, batch_size=1, limits=None):
   from mujoco_metal.capacity import CapacityLimits, CapacityOverflow
   from mujoco_metal.sensors import _sensor_geoms
   from mujoco_metal.coupled_constraints import lower_collision_geometry
-  from mujoco_metal.common_ccd_bridge import estimate_production_upload_bytes, uses_pinned_mjc_convex
+  from mujoco_metal.common_ccd_bridge import production_upload_sizes, uses_pinned_mjc_convex
   if isinstance(batch_size,bool) or not isinstance(batch_size,(int,np.integer)) or batch_size<1:
     raise ValueError('geometry-query batch size must be a positive integer')
   kinds={int(getattr(mujoco.mjtSensor,'mjSENS_'+name))
@@ -33,8 +33,9 @@ def lower_geometry_queries(model, batch_size=1, limits=None):
   if batch_size*count*10 >= (1<<31):
     raise CapacityOverflow('geometry-query result storage exceeds int32 addressing')
   scene=lower_collision_geometry(model,[(a,b) for _,a,b in pairs],limits=limits)
-  common_bytes=estimate_production_upload_bytes(model,scene.mesh_hull,
-                                               scene.mesh_hull_info,batch_size,count)
+  common_sizes=production_upload_sizes(model,scene.mesh_hull,
+                                      scene.mesh_hull_info,batch_size,count)
+  common_bytes=4*sum(common_sizes.values())
   terrain = any(int(model.geom_type[a])==1 or int(model.geom_type[b])==1
                 for _,a,b in pairs)
   sdf = any(int(model.geom_type[a])==8 or int(model.geom_type[b])==8
@@ -45,22 +46,38 @@ def lower_geometry_queries(model, batch_size=1, limits=None):
   seed_tile=32 if analytic_sdf else 0
   if batch_size*count*max(50*37,seed_tile*159) >= (1<<31):
     raise CapacityOverflow("geometry-query SDF workspace exceeds int32 addressing")
-  from mujoco_metal.coupled_constraints import _pair_contact_cache_bytes
-  sdf_bytes=_pair_contact_cache_bytes(batch_size,50*count,count,seed_tile) if sdf else 0
   callbacks = sdf or terrain or (bool(int(model.opt.disableflags)&131072) and
       any(uses_pinned_mjc_convex(int(model.geom_type[a]),int(model.geom_type[b]))
           for _,a,b in pairs))
-  terrain_bytes = (4*(12+55*count+2*batch_size+batch_size*count+
-                        4*model.ngeom+27*batch_size*model.ngeom) if callbacks else 0)
-  bytes_total=(sdf_bytes+terrain_bytes+common_bytes+batch_size*count*10*4+count*4*4+
-               spans.nbytes+model.ngeom*4+6*4+batch_size*max(model.ngeom,1)*9*4)
+  workspace_sizes={**common_sizes,'pairs':3*count,'cutoff':count,
+      'spans':2*model.nsensor,'types':model.ngeom,'dims':6,
+      'results':batch_size*count*10,'zeros':batch_size*max(model.ngeom,1)*9}
+  if callbacks:
+    workspace_sizes.update(terrain_dims=12+51*count+batch_size,
+        terrain_geoms=2*count,terrain_margins=2*count,
+        terrain_sizes=3*model.ngeom,terrain_bounds=model.ngeom,
+        terrain_map=batch_size*count,terrain_status=batch_size,
+        terrain_matrices=27*batch_size*model.ngeom)
+  if sdf:
+    slots=batch_size*count*seed_tile
+    workspace_sizes.update(contact_pair_count=max(batch_size*count,1),
+        contact_pair_records=max(batch_size*count*50*37,1),
+        contact_pair_scratch=max(batch_size*count*50*12,1),
+        contact_sdf_seed_records=max(slots*37,1),
+        contact_sdf_seed_valid=max(slots,1),contact_sdf_seed_state=max(slots*159,1),
+        contact_sdf_seed_ctrl=max(slots,1),sdf_stage_dims=5)
+  from mujoco_metal.capacity import _check_i32_elements
+  for name,elements in workspace_sizes.items():
+    _check_i32_elements('geometry_query.'+name,elements)
+  bytes_total=4*sum(workspace_sizes.values())
   budget=CapacityLimits().memory_budget_bytes if limits is None else limits.memory_budget_bytes
   if bytes_total>budget:
     raise CapacityOverflow(f'geometry-query workspace {bytes_total} bytes exceeds budget {budget}')
   return {'scene':scene,'pairs':np.asarray(pairs,np.int32).reshape(-1,3),
           'cutoff':np.asarray(bounds,np.float32),'spans':spans,
           'common_bytes':common_bytes,'bytes_total':bytes_total,'terrain':terrain,'callbacks':callbacks,
-          'sdf':sdf,'analytic_sdf':analytic_sdf,'seed_tile':seed_tile}
+          'sdf':sdf,'analytic_sdf':analytic_sdf,'seed_tile':seed_tile,
+          'workspace_sizes':workspace_sizes}
 
 
 @lru_cache(maxsize=2)
@@ -95,6 +112,7 @@ class GeometryQueryProgram:
     import torch
     if not torch.backends.mps.is_available() or not hasattr(torch.mps,'compile_shader'):
       raise RuntimeError('geometry queries require native MPS compile_shader')
+    self.workspace_sizes=desc["workspace_sizes"]
     self._completion=torch.mps.Event()
     self._torch=torch; self.model=model; self.batch_size=batch_size; self.count=count
     tensor=lambda a:torch.tensor(np.asarray(a),device='mps')

@@ -864,7 +864,7 @@ class MetalSimulation:
                               if self._component_mass_enabled else None))
       if plan.is_stage_enabled("sensor_query"):
         from mujoco_metal.sensors import SensorProgram
-        self._sensors = SensorProgram(model, batch_size)
+        self._sensors = SensorProgram(model, batch_size, limits=self.limits)
     else:
       if with_transmissions and model.nu:
         from mujoco_metal.transmissions import MetalTransmissions
@@ -901,7 +901,7 @@ class MetalSimulation:
             velocity_derivative_layout=velocity_derivative_layout)
       if "sensor" in profile.name:
         from mujoco_metal.sensors import SensorProgram
-        self._sensors = SensorProgram(model, batch_size)
+        self._sensors = SensorProgram(model, batch_size, limits=self.limits)
       if profile.name == "joint_constraints_euler_v1":
         from mujoco_metal.joint_constraints import JointConstraintProgram
         self._joint_constraints = JointConstraintProgram(model, batch_size)
@@ -1532,7 +1532,7 @@ class MetalSimulation:
       reference = copy.copy(model)
       reference.opt.disableflags &= ~int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
       from mujoco_metal.sensors import SensorProgram
-      self._raw_sensor_program = SensorProgram(reference, batch_size)
+      self._raw_sensor_program = SensorProgram(reference, batch_size, limits=self.limits)
     self._delay = None  # Legacy snapshot key; no duplicate ring is maintained.
 
     from mujoco_metal.islands import IslandManager

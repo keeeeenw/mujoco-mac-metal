@@ -1346,7 +1346,7 @@ def sensor_workspace_sizes(descriptor, batch_size):
 class SensorProgram:
   """Batched MSL sensor evaluator. Constructor is the explicit MPS boundary."""
 
-  def __init__(self, model, batch_size=1):
+  def __init__(self, model, batch_size=1, limits=None):
     self.descriptor = lower_sensors(model)
     if isinstance(batch_size, (bool, np.bool_)) or not isinstance(batch_size, (int, np.integer)) or batch_size <= 0:
       raise ValueError("batch_size must be a positive integer")
@@ -1354,6 +1354,9 @@ class SensorProgram:
     if batch_size > (1 << 31) - 1 or batch_size * max(self.descriptor.nsensor, 1) > (1 << 31) - 1:
       raise ValueError("sensor dispatch exceeds the Metal int32 thread limit")
     self._workspace_sizes = sensor_workspace_sizes(self.descriptor, batch_size)
+    from mujoco_metal.sensor_capacity import preflight_sensor_workspace
+    self._owned_workspace_sizes=preflight_sensor_workspace(model,batch_size,limits)
+    self._capacity_limits=limits
     import torch
     if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
       raise RuntimeError("PyTorch MPS with compile_shader is required")
@@ -1908,7 +1911,7 @@ class SensorProgram:
         "mjSENS_GEOMDIST", "mjSENS_GEOMNORMAL", "mjSENS_GEOMFROMTO")]
     self._geometry_queries = None
     if np.any(np.isin(model.sensor_type,distance_types)):
-      self._geometry_queries = GeometryQueryProgram(model,self.batch_size)
+      self._geometry_queries = GeometryQueryProgram(model,self.batch_size,limits=self._capacity_limits)
       self._sp_hull = self._geometry_queries.hull
       self._sp_hull_info = self._geometry_queries.info
     # Compile each independent query entry on first use. Rangefinders must

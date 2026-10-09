@@ -980,32 +980,20 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
   parts.extend((name, max(int(count), 1)) for name, count in
                transmission_workspace_sizes(model, b, validate=False).items())
 
-  # Sensor-owned buffers including the 128-byte-per-body subtree record,
-  # RNE derivatives, and their shared scratch. Optional sensor families still
-  # have the common output/runtime allocations below.
-  parts.extend((
-      ("sensor.stage_mask", 1 + b * max(nsensor, 1) + b),
-      ("sensor.output", max(b * nsensordata, 1)),
-      ("sensor.output_low", max(b * nsensordata, 1)),
-      ("sensor.sensor_meta", max(nsensor, 1) * 10),
-      ("sensor.subtree_runtime", 4 + b * nb * 32 + b * max(nsensor, 1)),
-      ("sensor.state_dims", 15 + b),
-      ("sensor.rne_assemble_dims", 8 + b),
-      ("sensor.rne_post_dims", 5 + b),
-      ("sensor.rne_acc_dims", 14 + b),
-      ("sensor.rne_com_scratch", b * max(nb, 1) * 12),
-      ("sensor.rne_cacc_pair", 2 * b * max(nb, 1) * 6),
-      ("sensor.rne_qacc_low_zero", b * max(nv, 1)),
-      ("sensor.rne_cfrc", b * max(nb, 1) * 6),
-      ("sensor.rne_scom", b * max(nb, 1) * 3),
-      ("sensor.rne_ext", b * max(nb, 1) * 6),
-  ))
-  from mujoco_metal.sensors import tactile_workspace_sizes
-  parts.extend((f"sensor.tactile.{name}", count) for name, count in
-               tactile_workspace_sizes(model).items())
-  from mujoco_metal.ray_queries import site_ray_workspace_sizes
-  parts.extend((f"sensor.site_rays.{name}", count) for name, count in
-               site_ray_workspace_sizes(model).items())
+  # Count actual independent sensor constants and persistent buffers. Views
+  # of paired outputs and shared distance scenes do not own extra storage.
+  from mujoco_metal.sensor_capacity import sensor_owned_workspace_sizes
+  sensor_sizes=sensor_owned_workspace_sizes(
+      model,b,CapacityLimits(memory_budget_bytes=1 << 62))
+  parts.extend(('sensor.'+name,count) for name,count in sensor_sizes.items())
+  parts.extend((('sensor.state_dims',15+b),('sensor.rne_assemble_dims',8+b),
+                ('sensor.rne_post_dims',5+b),('sensor.rne_acc_dims',14+b),
+                ('sensor.initial_hull_info_peak',9)))
+  if (int(model.opt.disableflags)&int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
+      and np.any(np.asarray(model.sensor_delay)>0)):
+    # Disabled stored sensors still require independently owned raw samples
+    # for delayed history. The constructor clears SENSOR only for that copy.
+    parts.extend(('sensor.raw.'+name,count) for name,count in sensor_sizes.items())
   if touch_grid_contact_capacity is not None and int(model.nplugin):
     from mujoco_metal.bundled_plugins import lower_bundled_plugins
     from mujoco_metal.bundled_touch_grid import touch_grid_workspace_sizes

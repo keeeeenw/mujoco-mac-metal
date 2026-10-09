@@ -133,7 +133,7 @@ def test_estimate_is_deterministic_and_counts_memory():
   assert runtime["spatial_plugin_force.site_feedback_parameters"] == 14 * 4
   assert runtime["spatial_plugin_force.magnetic_body_ids"] == max(
       model.nbody - 1, 1) * 4
-  assert runtime["sensor.sensor_meta"] == max(model.nsensor, 1) * 10 * 4
+  assert runtime["sensor.sensor_meta"] == model.nsensor * 10 * 4
   assert runtime["sensor.subtree_runtime"] == (
       4 + 2 * model.nbody * 32 + 2 * max(model.nsensor, 1)) * 4
   from mujoco_metal.model import actuator_tendon_inheritance

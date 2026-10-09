@@ -220,9 +220,9 @@ def append_production_workspace(model, legacy_vertices, legacy_info,
   return (np.ascontiguousarray(vertices), np.ascontiguousarray(info), layout)
 
 
-def estimate_production_upload_bytes(model, legacy_vertices, legacy_info,
-                                     batch_size, pair_count):
-  """Compute final common-CCD upload bytes without allocating its buffers.
+def production_upload_sizes(model, legacy_vertices, legacy_info,
+                            batch_size, pair_count):
+  """Compute each final common-CCD backing size without allocating buffers.
 
   This is used before ``append_production_workspace`` so the configured memory
   budget can reject the exact final model+runtime upload before constructing
@@ -267,7 +267,7 @@ def estimate_production_upload_bytes(model, legacy_vertices, legacy_info,
                       ("common info words", info_words)):
     if value > _INT32_MAX:
       raise ValueError(f"{name} exceeds signed-32-bit addressing")
-  return 4 * (hull_words + info_words)
+  return {"hull": hull_words, "info": info_words}
 
 
 def build_common_ccd_model_upload(model, legacy_vertices, legacy_info):
@@ -652,3 +652,10 @@ def compiled_mesh_source_support_index(vertices, local_direction,
     if candidate > best_score:
       best, best_score = index, candidate
   return best
+
+
+def estimate_production_upload_bytes(model, legacy_vertices, legacy_info,
+                                     batch_size, pair_count):
+  """Exact final upload bytes from the separately addressable backings."""
+  return 4 * sum(production_upload_sizes(model, legacy_vertices, legacy_info,
+                                        batch_size, pair_count).values())
