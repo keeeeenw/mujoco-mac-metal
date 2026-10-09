@@ -647,6 +647,8 @@ static inline FlexDD3 flex_dd3_div(FlexDD3 value, FlexDD divisor) {
                  flex_dd_source_div(value.z,divisor)};
 }
 
+#ifndef MUJOCO_METAL_SOURCE_MATH_ONLY
+
 // Pinned engine_collision_primitive.c:mjraw_SphereSphere and
 // mjraw_CapsuleCapsule on source-rounded geometry.  The capsule-axis vectors
 // are built directly from compiled endpoints, avoiding the lossy quaternion
@@ -1262,3 +1264,5 @@ static inline int flex_epa_horizon_visit_dd(
   }
   return result ? 1 : 0;
 }
+
+#endif  // MUJOCO_METAL_SOURCE_MATH_ONLY

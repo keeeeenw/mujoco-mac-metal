@@ -25,6 +25,17 @@ from mujoco_metal.model import snapshot_descriptor
 from mujoco_metal.capacity import _fk_auxiliary_words
 
 _SHADER = Path(__file__).parent / "shaders" / "kinematics.metal"
+_SOURCE_MATH_SHADER = _SHADER.with_name("common_ccd_core.metal")
+
+
+def _kinematics_shader_source():
+  """Share the qualified source scalar arithmetic without detector helpers."""
+  return ("#define MUJOCO_METAL_SOURCE_MATH_ONLY\n"
+          + _SOURCE_MATH_SHADER.read_text()
+          + "\n#undef MUJOCO_METAL_SOURCE_MATH_ONLY\n"
+          + _SHADER.read_text())
+
+
 _INT32_MAX = (1 << 31) - 1
 _UINT32_CAPACITY = 1 << 32
 _FK_INT_INPUTS = (
@@ -262,7 +273,7 @@ class MetalKinematics:
     if not hasattr(torch.mps, "compile_shader"):
       raise RuntimeError("PyTorch does not provide torch.mps.compile_shader")
     self._device = torch.device("mps")
-    self._library = torch.mps.compile_shader(_SHADER.read_text())
+    self._library = torch.mps.compile_shader(_kinematics_shader_source())
     self._kernel = self._library.forward_kinematics
     self._prepare_rows_kernel = self._library.prepare_fk_rows
     packed_i, offsets_i = _pack_fk_constants(

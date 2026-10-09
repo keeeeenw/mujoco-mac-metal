@@ -204,8 +204,9 @@ def test_source_quaternion_matrix_keeps_residual_and_exact_null_contract():
   shader = Path(__file__).parents[1] / "mujoco_metal" / "shaders" / "kinematics.metal"
   text = shader.read_text()
   assert "bool identity=kinq_equal(q,kinq(float4(1.0f,0.0f,0.0f,0.0f)))" in text
-  assert "kin_add(kin_add(kin_add(kin_mul(q.w,q.w),kin_mul(q.x,q.x))," in text
-  assert "kin_mul(delta,axis_pair.x)" in text
+  assert "kin_fma(q.z,q.z,kin_fma(q.y,q.y," in text
+  assert "kin_fma(q.w,q.w,kin_mul(q.x,q.x))" in text
+  assert "kin_fma(axis_pair.x,delta,pos_pair.x)" in text
   assert "kinq_rotate(quat,axis_shift)" not in text
   assert "KinDD norm_inv=kin_div(kin_dd(1.0f),n);" in text
   assert "kin_mul(q.w,norm_inv),kin_mul(q.x,norm_inv)" in text

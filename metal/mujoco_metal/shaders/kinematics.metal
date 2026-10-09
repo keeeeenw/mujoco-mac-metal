@@ -32,33 +32,22 @@ struct KinDD3 { KinDD x; KinDD y; KinDD z; };
 struct KinQ { KinDD w; KinDD x; KinDD y; KinDD z; };
 struct KinMat { KinDD m[9]; };
 inline KinDD kin_dd(float x) { return KinDD{x, 0.0f, 0.0f}; }
+inline FlexDD kin_source(KinDD value) {
+  return FlexDD{value.hi,value.lo,value.tail};
+}
+inline KinDD kin_retained(FlexDD value) {
+  return KinDD{value.hi,value.lo,value.tail};
+}
 inline KinDD kin_add(KinDD a, KinDD b) {
-  float s=a.hi+b.hi;
-  float bv=s-a.hi;
-  float e=(a.hi-(s-bv))+(b.hi-bv);
-  float t=a.lo+b.lo;
-  float tv=t-a.lo;
-  float te=(a.lo-(t-tv))+(b.lo-tv);
-  float u=e+t;
-  float uv=u-e;
-  float ue=(e-(u-uv))+(t-uv);
-  float h=s+u;
-  float hv=h-s;
-  float he=(s-(h-hv))+(u-hv);
-  return KinDD{h,he,ue+te+a.tail+b.tail};
+  return kin_retained(flex_dd_source_add(kin_source(a),kin_source(b)));
 }
 inline KinDD kin_neg(KinDD a) { return KinDD{-a.hi,-a.lo,-a.tail}; }
 inline KinDD kin_sub(KinDD a, KinDD b) { return kin_add(a,kin_neg(b)); }
 inline KinDD kin_mul(KinDD a, KinDD b) {
-  KinDD out=kin_dd(0.0f);
-  float av[3]={a.hi,a.lo,a.tail};
-  float bv[3]={b.hi,b.lo,b.tail};
-  for (int i=0;i<3;i++) for (int j=0;j<3;j++) {
-    float p=av[i]*bv[j];
-    float e=fma(av[i],bv[j],-p);
-    out=kin_add(out,KinDD{p,e,0.0f});
-  }
-  return out;
+  return kin_retained(flex_dd_source_mul(kin_source(a),kin_source(b)));
+}
+inline KinDD kin_fma(KinDD a, KinDD b, KinDD c) {
+  return kin_retained(flex_dd_source_fma(kin_source(a),kin_source(b),kin_source(c)));
 }
 inline KinDD kin_scale(KinDD a, float b) { return kin_mul(a,kin_dd(b)); }
 inline KinDD kin_sub(KinDD a, KinDD b);
@@ -78,26 +67,10 @@ inline bool kin_equal(KinDD a, KinDD b) {
   return d.hi==0.0f && d.lo==0.0f && d.tail==0.0f;
 }
 inline KinDD kin_div(KinDD a, KinDD b) {
-  float q0=a.hi/b.hi;
-  KinDD r0=kin_sub(a,kin_mul(b,kin_dd(q0)));
-  KinDD q1=kin_add(kin_dd(r0.hi/b.hi),kin_dd(r0.lo/b.hi));
-  q1=kin_add(q1,kin_dd(r0.tail/b.hi));
-  KinDD q=kin_add(kin_dd(q0),q1);
-  KinDD r1=kin_sub(a,kin_mul(b,q));
-  KinDD q2=kin_add(kin_dd(r1.hi/b.hi),kin_dd(r1.lo/b.hi));
-  q2=kin_add(q2,kin_dd(r1.tail/b.hi));
-  return kin_add(q,q2);
+  return kin_retained(flex_dd_source_div(kin_source(a),kin_source(b)));
 }
 inline KinDD kin_sqrt(KinDD a) {
-  float r0=sqrt(max(a.hi,0.0f));
-  if (r0==0.0f) return kin_dd(0.0f);
-  KinDD root=kin_dd(r0);
-  KinDD residual=kin_sub(a,kin_mul(root,root));
-  KinDD correction=kin_div(residual,kin_dd(2.0f*r0));
-  root=kin_add(root,correction);
-  residual=kin_sub(a,kin_mul(root,root));
-  correction=kin_div(residual,kin_dd(2.0f*r0));
-  return kin_add(root,correction);
+  return kin_retained(flex_dd_source_sqrt(kin_source(a)));
 }
 inline KinDD3 kin3(float3 hi, float3 lo, float3 tail) {
   return KinDD3{KinDD{hi.x,lo.x,tail.x},KinDD{hi.y,lo.y,tail.y},
@@ -137,23 +110,22 @@ inline bool kinq_equal(KinQ a, KinQ b) {
       && kin_equal(a.y,b.y) && kin_equal(a.z,b.z);
 }
 inline KinQ kinq_mul(KinQ a, KinQ b) {
-  KinQ out;
-  out.w=kin_sub(kin_sub(kin_sub(kin_mul(a.w,b.w),kin_mul(a.x,b.x)),
-                        kin_mul(a.y,b.y)),kin_mul(a.z,b.z));
-  out.x=kin_sub(kin_add(kin_add(kin_mul(a.w,b.x),kin_mul(a.x,b.w)),
-                        kin_mul(a.y,b.z)),kin_mul(a.z,b.y));
-  out.y=kin_add(kin_add(kin_sub(kin_mul(a.w,b.y),kin_mul(a.x,b.z)),
-                        kin_mul(a.y,b.w)),kin_mul(a.z,b.x));
-  out.z=kin_add(kin_sub(kin_add(kin_mul(a.w,b.z),kin_mul(a.x,b.y)),
-                        kin_mul(a.y,b.x)),kin_mul(a.z,b.w));
-  return out;
+  // Match pinned arm64 mju_mulQuat contractions, including the rounded
+  // second product that seeds each row. Do not compute in excess precision.
+  return KinQ{
+    kin_fma(kin_neg(a.z),b.z,kin_fma(kin_neg(a.y),b.y,
+        kin_fma(a.w,b.w,kin_neg(kin_mul(a.x,b.x))))),
+    kin_fma(kin_neg(a.z),b.y,kin_fma(a.y,b.z,
+        kin_fma(a.w,b.x,kin_mul(a.x,b.w)))),
+    kin_fma(a.z,b.x,kin_fma(a.y,b.w,
+        kin_fma(a.w,b.y,kin_neg(kin_mul(a.x,b.z))))),
+    kin_fma(a.z,b.w,kin_fma(kin_neg(a.y),b.x,
+        kin_fma(a.w,b.z,kin_mul(a.x,b.y))))};
 }
 inline KinQ kinq_norm(KinQ q) {
-  // Match engine_util_blas.c:mju_normalize4's left-to-right binary64
-  // expression: (((w*w + x*x) + y*y) + z*z). Pairwise grouping changes the
-  // final source-rounded norm for compiled quaternions with small residuals.
-  KinDD n2=kin_add(kin_add(kin_add(kin_mul(q.w,q.w),kin_mul(q.x,q.x)),
-                           kin_mul(q.y,q.y)),kin_mul(q.z,q.z));
+  // The pinned norm rounds x*x, fuses w*w into it, then y*y and z*z.
+  KinDD n2=kin_fma(q.z,q.z,kin_fma(q.y,q.y,
+      kin_fma(q.w,q.w,kin_mul(q.x,q.x))));
   KinDD n=kin_sqrt(n2);
   // mjMINVAL is a binary64 constant. Keep its residual so the source
   // normalize/no-op branch is decided from represented words, not float32.
@@ -177,16 +149,13 @@ inline KinDD3 kinq_rotate(KinQ q, KinDD3 v) {
   // Keep engine_inline.h:mji_rotVecQuat's component operation order. This
   // helper is used for joint axes/anchors; body and attached-frame placement
   // instead uses the already-published xmat as mj_local2Global does.
-  KinDD tx=kin_sub(kin_add(kin_mul(q.w,v.x),kin_mul(q.y,v.z)),
-                   kin_mul(q.z,v.y));
-  KinDD ty=kin_sub(kin_add(kin_mul(q.w,v.y),kin_mul(q.z,v.x)),
-                   kin_mul(q.x,v.z));
-  KinDD tz=kin_sub(kin_add(kin_mul(q.w,v.z),kin_mul(q.x,v.y)),
-                   kin_mul(q.y,v.x));
+  KinDD tx=kin_fma(kin_neg(q.z),v.y,kin_fma(q.w,v.x,kin_mul(q.y,v.z)));
+  KinDD ty=kin_fma(kin_neg(q.x),v.z,kin_fma(q.w,v.y,kin_mul(q.z,v.x)));
+  KinDD tz=kin_fma(kin_neg(q.y),v.x,kin_fma(q.w,v.z,kin_mul(q.x,v.y)));
   return KinDD3{
-    kin_add(v.x,kin_scale(kin_sub(kin_mul(q.y,tz),kin_mul(q.z,ty)),2.0f)),
-    kin_add(v.y,kin_scale(kin_sub(kin_mul(q.z,tx),kin_mul(q.x,tz)),2.0f)),
-    kin_add(v.z,kin_scale(kin_sub(kin_mul(q.x,ty),kin_mul(q.y,tx)),2.0f))};
+    kin_fma(kin_fma(q.y,tz,kin_neg(kin_mul(q.z,ty))),kin_dd(2),v.x),
+    kin_fma(kin_fma(q.z,tx,kin_neg(kin_mul(q.x,tz))),kin_dd(2),v.y),
+    kin_fma(kin_fma(q.x,ty,kin_neg(kin_mul(q.y,tx))),kin_dd(2),v.z)};
 }
 inline KinMat kinq_matrix(KinQ q) {
   KinMat out;
@@ -217,10 +186,12 @@ inline KinMat kinq_matrix(KinQ q) {
   return out;
 }
 inline KinDD3 kinmat_mul(KinMat m, KinDD3 v) {
+  // Pinned arm64 mji_mulMatVec3 rounds the middle product before the
+  // first and last products are contracted into it.
   return KinDD3{
-    kin_add(kin_add(kin_mul(m.m[0],v.x),kin_mul(m.m[1],v.y)),kin_mul(m.m[2],v.z)),
-    kin_add(kin_add(kin_mul(m.m[3],v.x),kin_mul(m.m[4],v.y)),kin_mul(m.m[5],v.z)),
-    kin_add(kin_add(kin_mul(m.m[6],v.x),kin_mul(m.m[7],v.y)),kin_mul(m.m[8],v.z))};
+    kin_fma(m.m[2],v.z,kin_fma(m.m[0],v.x,kin_mul(m.m[1],v.y))),
+    kin_fma(m.m[5],v.z,kin_fma(m.m[3],v.x,kin_mul(m.m[4],v.y))),
+    kin_fma(m.m[8],v.z,kin_fma(m.m[6],v.x,kin_mul(m.m[7],v.y)))};
 }
 inline float3 kin3_value(KinDD3 a) {
   return float3(kin_value(a.x),kin_value(a.y),kin_value(a.z));
@@ -515,10 +486,9 @@ kernel void forward_kinematics(
         // engine_core_smooth.c transforms the local slide axis to xaxis
         // before mji_addToScl3(xpos, xaxis, delta). Keep that operation order
         // rather than rotating a locally scaled vector.
-        KinDD3 slide_shift=KinDD3{kin_mul(delta,axis_pair.x),
-                                  kin_mul(delta,axis_pair.y),
-                                  kin_mul(delta,axis_pair.z)};
-        pos_pair=kin3_add(pos_pair,slide_shift);
+        pos_pair=KinDD3{kin_fma(axis_pair.x,delta,pos_pair.x),
+                        kin_fma(axis_pair.y,delta,pos_pair.y),
+                        kin_fma(axis_pair.z,delta,pos_pair.z)};
         pos=kin3_value(pos_pair);
       } else if (typ == 3) {
         float angle=kin_value(kin_sub(kin_dd(qpos[qa]),
