@@ -1302,14 +1302,6 @@ class MetalSimulation:
       self._has_geomdist_sensors = bool(np.any(np.isin(types, [
           int(ST.mjSENS_GEOMDIST), int(ST.mjSENS_GEOMNORMAL),
           int(ST.mjSENS_GEOMFROMTO)])))
-      if (self._has_ray_sensors or self._has_geomdist_sensors) and profile.name != "integrated_euler_v1":
-        GT = mujoco.mjtGeom
-        stock = {int(GT.mjGEOM_MESH), int(GT.mjGEOM_HFIELD), int(GT.mjGEOM_SDF)}
-        if bool(np.any(np.isin(np.asarray(model.geom_type), list(stock)))):
-          raise ValueError(
-              f"{profile.name} supports rays/geom-distance only for analytic "
-              "scenes; mesh/heightfield/SDF spatial queries require "
-              "integrated_euler_v1")
       cc = getattr(self, "_coupled_constraints", None)
       if cc is not None:
         d = cc.descriptor
@@ -1340,15 +1332,6 @@ class MetalSimulation:
         self._sen_slot_pair = self._state._torch.as_tensor(
             slot.copy(), dtype=self._state._torch.int32,
             device=self._state._device)
-      if profile.name != "integrated_euler_v1":
-        S = mujoco.mjtSensor
-        gated = {int(S.mjSENS_TOUCH), int(S.mjSENS_CONTACT),
-                 int(S.mjSENS_JOINTLIMITFRC), int(S.mjSENS_TENDONLIMITFRC)}
-        if bool(np.any(np.isin(np.asarray(
-                self._sensors.descriptor.sensor_type), list(gated)))):
-          raise ValueError(
-              f"{profile.name} supports touch/contact/limit-force sensors "
-              "only under integrated_euler_v1")
     self._combined_status = torch.empty_like(self._state._status)
     self._next_qpos = torch.empty_like(self._state._qpos)
     self._next_qvel = torch.empty_like(self._state._qvel)
