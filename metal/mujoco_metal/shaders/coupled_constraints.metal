@@ -1434,8 +1434,14 @@ kernel void contact_normal(
     for (int k = 0; k < max_con; ++k) {
       int slot = offset + k;
       if (slot >= ncontacts_max) break;
-      int fb = (world * ncontacts_max + slot) * 12;
-      frame[fb] = 1234.0f;
+      int out = world * ncontacts_max + slot;
+      // Broadphase rejection publishes an empty slot, never a diagnostic
+      // sentinel or the prior frame. Detected-but-inactive contacts remain
+      // distinct and are filled by the normal candidate path below.
+      for (int i=0;i<42;i++) row_data[out*42+i]=0.0f;
+      for (int i=0;i<12;i++) frame[out*12+i]=0.0f;
+      if (!packed_rows)
+        for (int i=0;i<6*nv;i++) jacobian[out*6*nv+i]=0.0f;
     }
     return;
   }

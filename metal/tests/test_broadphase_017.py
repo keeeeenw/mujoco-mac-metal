@@ -154,9 +154,9 @@ def test_pruning_on_off_physics_equivalence_gpu():
   np.testing.assert_array_equal(results[True][2], results[False][2])
 
 
-def test_pruned_slots_carry_sentinel_gpu():
-  # R08/F1: pruned pairs stamp the finite sentinel (skip path executed);
-  # active contact slots never carry it. Non-vacuous both ways.
+def test_pruned_slots_publish_empty_records_and_frames_gpu():
+  # Prove pruning with its actual map/counts, without poisoning frames that
+  # contact queries use to distinguish detection from solver activation.
   from mujoco_metal.simulation import MetalSimulation
   m = _press_scene()
   sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
@@ -171,19 +171,18 @@ def test_pruned_slots_carry_sentinel_gpu():
   rows = cc._workspace["contact_row_data"][:nc * 42].cpu().numpy().reshape(nc, 6, 7)
   active = rows[:, 0, 0] > 0.5
   assert int(active.sum()) >= 1  # the pressed pair is active
-  sentinel = frame[:, 0] == np.float32(1234.0)
-  assert int((~active & sentinel).sum()) >= 1  # pruned slots stamped
-  assert int((active & sentinel).sum()) == 0  # active slots never stamped
-  # Every inactive unstamped slot belongs to a plane-involved pair (planes
-  # always overlap: never pruned, correctly left to the narrowphase).
-  import mujoco as _mj
-  plane = int(_mj.mjtGeom.mjGEOM_PLANE)
-  gtype = np.asarray(m.geom_type)
-  pair_geoms = cc._constants["pair_geoms"].cpu().numpy().reshape(-1, 2)
+  assert np.all(frame[~active] == 0)
+  assert np.all(rows[~active] == 0)
+  np.testing.assert_allclose(np.linalg.norm(frame[active, :3], axis=1), 1.0, atol=2e-6)
   offsets = cc._constants["pair_contact_offset"].cpu().numpy()
-  for s in np.flatnonzero(~active & ~sentinel):
-    pair = int(np.searchsorted(offsets[1:], s, side="right"))
-    assert plane in (int(gtype[pair_geoms[pair, 0]]), int(gtype[pair_geoms[pair, 1]])), s
+  pair_map = cc._workspace["pair_maps"].logical_to_packed.cpu().numpy().reshape(-1)
+  pruned = np.flatnonzero(pair_map < 0)
+  assert pruned.size > 0
+  for pair in pruned:
+    lo, hi = int(offsets[pair]), int(offsets[pair+1])
+    assert hi > lo
+    np.testing.assert_array_equal(frame[lo:hi], 0)
+    np.testing.assert_array_equal(rows[lo:hi], 0)
   # Mask agreement: slot-active pairs are mask-active (superset), and the
   # mask sees strictly fewer than all pairs (pruning is live).
   mask_active, slot_active = cc.broadphase_counts()[0]
