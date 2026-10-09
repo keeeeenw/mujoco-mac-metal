@@ -407,6 +407,22 @@ avoids that evaluation; its borrowed inputs must still describe the requested
 state. Host arrays are staged at the explicit input boundary. Math remains on
 the simulation device, and temporary forward storage is restored after queries.
 
+### Contact sensors in development source
+
+The current source CONTACT evaluator supports all compiled output slots and the
+`found`, `force`, `torque`, `dist`, `pos`, `normal` and `tangent` fields. It follows
+the pinned engine's object filters and `none`, `mindist`, `maxforce` and
+`netforce` reductions. Detected contacts without active solver rows contribute
+to the found count and geometry outputs, with zero force. Net force and torque
+are reduced in world coordinates about the force-weighted contact centroid.
+Empty and broadphase-rejected candidate slots publish empty records.
+
+Native query gates cover 30 matching contacts, four output slots, all fields
+and reductions, both cones, condim 1/3/6, inactive gap contacts and selected
+world preservation against pinned CPU contact data. Original spatial sensor
+trajectory and tactile gates also pass. These are scoped source checks, not
+complete sensor/contact/integrator qualification or released-wheel evidence.
+
 ### Global scene rays in development source
 
 `native_api.mj_ray` accepts one origin/direction `[B,3]` per world;

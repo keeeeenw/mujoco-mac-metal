@@ -580,12 +580,11 @@ def _contact_dim(model, dataspec, arrays, i):
   size = sum(s for b, s in enumerate(_CONDATA_SIZE) if dataspec & (1 << b))
   if size <= 0:
     raise ValueError(f"sensor {i}: empty contact dataspec")
-  # The 3.10 compiler emits exactly one slot (dim == slot size); reductions
-  # select or aggregate matches into it.
-  if int(arrays["sensor_dim"][i]) != size:
-    raise ValueError(
-        f"sensor {i}: multi-slot contact sensors are unsupported")
-  return size
+  dim = int(arrays["sensor_dim"][i])
+  slots = int(arrays["sensor_intprm"][i, 2])
+  if slots <= 0 or dim != size * slots:
+    raise ValueError(f"sensor {i}: invalid compiled contact slot layout")
+  return dim
 
 
 def _transform_spatial(vec, newpos, oldpos, flg_force):
@@ -778,7 +777,7 @@ def _match_contact(desc, poses, w, ex, j, type1, id1, type2, id2):
 
 def _fill_contact_slot(value, dataspec, nfound, force, torque, dist, pos,
                        normal, tangent, flip=1):
-  # Pinned copySensorData single-slot layout with flip handling.
+  # Pinned copySensorData layout with flip handling.
   off = 0
   if dataspec & 1:
     value[off] = nfound
@@ -799,9 +798,12 @@ def _fill_contact_slot(value, dataspec, nfound, force, torque, dist, pos,
     value[off] = dist
     off += 1
   if dataspec & 16:
-    value[off:off + 3] = normal
+    value[off:off + 3] = pos
     off += 3
   if dataspec & 32:
+    value[off:off + 3] = normal
+    off += 3
+  if dataspec & 64:
     value[off:off + 3] = tangent
     off += 3
 
@@ -1051,11 +1053,8 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
         reduce = int(desc.sensor_intprm[i, 1])
         reftype, refid = int(desc.sensor_reftype[i]), int(desc.sensor_refid[i])
         otype, oid = int(desc.sensor_objtype[i]), objid
-        BEST = None
         order = []
         for j in range(int(ex["ncon"][w])):
-          if int(ex["contact_efc"][w, j]) < 0:
-            continue
           m = _match_contact(desc, poses, w, ex, j, otype, oid, reftype, refid)
           if not m:
             continue
@@ -1081,10 +1080,10 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
             f = np.asarray(ex["contact_force"][w, j], dtype=np.float64)[:3]
             t = np.asarray(ex["contact_force"][w, j], dtype=np.float64)[3:6]
             fr = np.asarray(ex["contact_frame"][w, j]).reshape(3, 3)
-            F += fr.T @ f
-            T += fr.T @ t
+            F += m * (fr.T @ f)
+            T += m * (fr.T @ t)
             p = np.asarray(ex["contact_pos"][w, j], dtype=np.float64)
-            wgt = float(np.linalg.norm(np.concatenate((f, t))))
+            wgt = float(np.linalg.norm(f))
             P += wgt * p
             tot += wgt
           if tot > 0:
@@ -1094,30 +1093,29 @@ def sensor_oracle(model, qpos, qvel, time, poses, sensordata=None, stages=(_POS,
             t = np.asarray(ex["contact_force"][w, j], dtype=np.float64)[3:6]
             fr = np.asarray(ex["contact_frame"][w, j]).reshape(3, 3)
             T += np.cross(np.asarray(ex["contact_pos"][w, j], dtype=np.float64) - P,
-                          fr.T @ f)
-          _fill_contact_slot(value, dataspec, len(order), F, T, 0.0, P,
+                          m * (fr.T @ f))
+          slot_size = sum(s for bit, s in enumerate(_CONDATA_SIZE)
+                          if dataspec & (1 << bit))
+          _fill_contact_slot(value[:slot_size], dataspec, len(order), F, T, 0.0, P,
                              np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]))
         else:
-          pick = None
-          if order and reduce == 0:
-            pick = order[0]
-          elif order:
-            k = int(np.argmin(np.asarray(crit)))
-            pick = order[k]
           nmatch = len(order)
-          if pick is not None:
-            j, m = pick
+          indices = list(range(nmatch))
+          if reduce in (1, 2):
+            indices.sort(key=lambda k: (crit[k], order[k][0]))
+          slot_size = sum(s for bit, s in enumerate(_CONDATA_SIZE)
+                          if dataspec & (1 << bit))
+          for slot, k in enumerate(indices[:len(value)//slot_size]):
+            j, m = order[k]
             f = np.asarray(ex["contact_force"][w, j], dtype=np.float64)
             _fill_contact_slot(
-                value, dataspec, nmatch, f[:3].copy(), f[3:6].copy(),
+                value[slot*slot_size:(slot+1)*slot_size], dataspec,
+                nmatch, f[:3].copy(), f[3:6].copy(),
                 float(ex["contact_dist"][w, j]),
                 np.asarray(ex["contact_pos"][w, j], dtype=np.float64),
                 np.asarray(ex["contact_frame"][w, j]).reshape(3, 3)[0] * m,
                 np.asarray(ex["contact_frame"][w, j]).reshape(3, 3)[1] * m,
                 flip=m)
-          else:
-            _fill_contact_slot(value, dataspec, 0, np.zeros(3), np.zeros(3),
-                               0.0, np.zeros(3), np.zeros(3), np.zeros(3))
       elif typ == int(S.mjSENS_TOUCH):
         ex = Need("contact_geom", "contact_frame", "contact_pos",
                   "contact_dist", "contact_force", "contact_efc", "ncon")

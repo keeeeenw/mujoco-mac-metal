@@ -524,6 +524,7 @@ inline void sp_contact_wrench(int cdim, int cone,
     device const float* force, uint foff, device const float* mu, uint muoff,
     thread float* out6) {
   for (int k=0;k<6;++k) out6[k]=0.0f;
+  if (cdim==1) { out6[0]=force[foff]; return; }
   if (cone==0) {
     float fn=0.0f;
     int ne2=2*(cdim-1);
@@ -537,7 +538,7 @@ inline void sp_contact_wrench(int cdim, int cone,
 }
 
 // CONTACT sensor matching (pinned matchContact/checkMatch + copySensorData,
-// single compiler slot, all four reductions).
+// all compiled slots, fields and four reductions).
 inline bool sp_check_match(int body, int geom, int type, int id,
     device const int* body_tree) {
   if (type==0) return true;
@@ -550,6 +551,62 @@ inline bool sp_check_match(int body, int geom, int type, int id,
     return b==id;
   }
   return false;
+}
+
+// Match detected contacts independently of whether they have solver rows.
+inline int sp_contact_match(uint world,uint nc,uint nsite,uint slot,
+    int t1,int id1,int t2,int id2,
+    device const float* frame,device const int* slot_pair,
+    device const int* pair_geoms,device const int* geom_body,
+    device const int* body_tree,device const float* site_pos,
+    device const float* site_quat,device const float* site_geom) {
+  float3 normal=sp_r3(frame,(world*nc+slot)*12);
+  if (!(dot(normal,normal)>0.5f)) return 0;
+  uint pair=uint(slot_pair[slot]);
+  int g1=pair_geoms[2*pair],g2=pair_geoms[2*pair+1];
+  int b1=g1>=0 ? geom_body[g1] : -1;
+  int b2=g2>=0 ? geom_body[g2] : -1;
+  if (t1==6) {
+    float3 origin=sp_r3(site_pos,(world*nsite+uint(id1))*3);
+    float4 quat=sp_qunit(sp_r4(site_quat,(world*nsite+uint(id1))*4));
+    float3 local=sp_qrot(sp_qconj(quat),sp_r3(frame,(world*nc+slot)*12+9)-origin);
+    float3 size=sp_r3(site_geom,uint(id1)*4);
+    int type=int(site_geom[uint(id1)*4+3]);
+    bool inside=false;
+    if (type==2) inside=dot(local,local)<size.x*size.x;
+    else if (type==3) {
+      float z=local.z-clamp(local.z,-size.y,size.y);
+      inside=local.x*local.x+local.y*local.y+z*z<size.x*size.x;
+    } else if (type==4) inside=dot(local/size,local/size)<1.0f;
+    else if (type==5) inside=fabs(local.z)<size.y &&
+        local.x*local.x+local.y*local.y<size.x*size.x;
+    else if (type==6) inside=all(abs(local)<size);
+    else if (type==0) inside=local.z<0.0f;
+    if (!inside) return 0;
+  }
+  bool m11=sp_check_match(b1,g1,t1,id1,body_tree);
+  bool m12=sp_check_match(b2,g2,t1,id1,body_tree);
+  bool m21=sp_check_match(b1,g1,t2,id2,body_tree);
+  bool m22=sp_check_match(b2,g2,t2,id2,body_tree);
+  if (!(m11||m12) || !(m21||m22)) return 0;
+  if (t1==0 && t2==0) return 1;
+  if (t1!=0 && t2!=0) {
+    bool regular=m11&&m22,reverse=m12&&m21;
+    return regular ? 1 : reverse ? -1 : 0;
+  }
+  return t1!=0 ? (m11 ? 1 : -1) : (m22 ? 1 : -1);
+}
+
+inline void sp_write_contact(device float* output,uint base,int spec,int found,
+    float3 force,float3 torque,float distance,float3 point,float3 normal,float3 tangent) {
+  uint o=0;
+  if (spec&1) output[base+o++]=float(found);
+  if (spec&2) { output[base+o]=force.x;output[base+o+1]=force.y;output[base+o+2]=force.z;o+=3; }
+  if (spec&4) { output[base+o]=torque.x;output[base+o+1]=torque.y;output[base+o+2]=torque.z;o+=3; }
+  if (spec&8) output[base+o++]=distance;
+  if (spec&16) { output[base+o]=point.x;output[base+o+1]=point.y;output[base+o+2]=point.z;o+=3; }
+  if (spec&32) { output[base+o]=normal.x;output[base+o+1]=normal.y;output[base+o+2]=normal.z;o+=3; }
+  if (spec&64) { output[base+o]=tangent.x;output[base+o+1]=tangent.y;output[base+o+2]=tangent.z; }
 }
 
 #if !defined(MUJOCO_METAL_SENSOR_ENTRY) || MUJOCO_METAL_SENSOR_ENTRY == 2
@@ -629,158 +686,96 @@ kernel void evaluate_contact_sensors(
   int t1=meta[i*10+3], id1=meta[i*10+4];
   int t2=meta[i*10+8], id2=meta[i*10+9];
   int dataspec=intprm[i*3+0], reduce=intprm[i*3+1];
-  int mid[24];
-  int mflip[24];
-  float mcrit[24];
-  int nmatch=0;
-  for (uint s=0;s<nc && nmatch<24;++s) {
-    if (contact_row_data[(world*nc+s)*42]<=0.5f) continue;
-    if (pair_live[slot_pair[s]]==0) continue;
-    uint pair=uint(slot_pair[s]);
-    int g1=pair_geoms[pair*2+0], g2=pair_geoms[pair*2+1];
-    int b1=g1>=0 ? geom_bodyid[g1] : -1;
-    int b2=g2>=0 ? geom_bodyid[g2] : -1;
-    int m=0;
-    if (t1==0 && t2==0) m=1;
-    else {
-      if (t1==6) {
-        float3 sp=sp_r3(site_pos,(world*nsite+uint(id1))*3);
-        float4 sq=sp_qunit(sp_r4(site_quat,(world*nsite+uint(id1))*4));
-        float3 cp=sp_r3(contact_frame,(world*nc+s)*12+9);
-        float st=site_geom[uint(id1)*4+3];
-        float3 vec=cp-sp;
-        float3 pl=sp_qrot(sp_qconj(sq),vec);
-        float sx=site_geom[uint(id1)*4+0], sy=site_geom[uint(id1)*4+1], sz=site_geom[uint(id1)*4+2];
-        bool inside=false;
-        if (st==2.0f) inside=dot(vec,vec)<sx*sx;
-        else if (st==3.0f) {
-          float zc=clamp(pl.z,-sy,sy);
-          inside=pl.x*pl.x+pl.y*pl.y+(pl.z-zc)*(pl.z-zc)<sx*sx;
-        }
-        else if (st==4.0f) inside=(pl.x*pl.x/(sx*sx)+pl.y*pl.y/(sy*sy)+pl.z*pl.z/(sz*sz))<1.0f;
-        else if (st==5.0f) inside=(abs(pl.z)<sy && pl.x*pl.x+pl.y*pl.y<sx*sx);
-        else if (st==6.0f) inside=(abs(pl.x)<sx && abs(pl.y)<sy && abs(pl.z)<sz);
-        else if (st==0.0f) inside=(pl.z<0.0f);
-        if (!inside) continue;
-      }
-      bool m11=sp_check_match(b1,g1,t1,id1,body_tree);
-      bool m12=sp_check_match(b2,g2,t1,id1,body_tree);
-      bool m21=sp_check_match(b1,g1,t2,id2,body_tree);
-      bool m22=sp_check_match(b2,g2,t2,id2,body_tree);
-      if (!(m11||m12) || !(m21||m22)) continue;
-      if (t1!=0 && t2!=0) {
-        bool reg=m11&&m22, rev=m12&&m21;
-        if (reg&&!rev) m=1;
-        else if (rev&&!reg) m=-1;
-        else if (reg&&rev) m=1;
-        else continue;
-      } else if (t1!=0) m=m11 ? 1 : -1;
-      else if (t2!=0) m=m22 ? 1 : -1;
-      else continue;
-    }
-    if (!m) continue;
-    mid[nmatch]=int(s);
-    mflip[nmatch]=m;
-    mcrit[nmatch]=contact_row_data[(world*nc+s)*42+1];
+  int size=0;
+  for (int field=0;field<7;field++)
+    if (dataspec&(1<<field)) size+=(field==0 || field==3) ? 1 : 3;
+  int num=int(dim)/size, nmatch=0;
+  float3 F=float3(0), T=float3(0), P=float3(0);
+  float total=0.0f;
+  for (uint slot=0;slot<nc;slot++) {
+    int flip=sp_contact_match(world,nc,nsite,slot,t1,id1,t2,id2,
+        contact_frame,slot_pair,pair_geoms,geom_bodyid,body_tree,
+        site_pos,site_quat,site_geom);
+    if (!flip) continue;
     nmatch++;
-  }
-  for (int k=0;k<nmatch;++k) {
-    uint s=uint(mid[k]);
-    if (reduce==2) {
-      int cdim=contact_packed[s*3+0], cone=contact_packed[s*3+2];
-      float w6[6];
-      sp_contact_wrench(cdim,cone,contact_force,(world*nc+s)*11,contact_mu,s*5,w6);
-      mcrit[k]=-(w6[0]*w6[0]+w6[1]*w6[1]+w6[2]*w6[2]);
+    if (reduce==3) {
+      float wrench[6];
+      sp_contact_wrench(contact_packed[3*slot],contact_packed[3*slot+2],
+          contact_force,(world*nc+slot)*11,contact_mu,slot*5,wrench);
+      float3 n=sp_r3(contact_frame,(world*nc+slot)*12);
+      float3 u=sp_r3(contact_frame,(world*nc+slot)*12+3);
+      float3 v=sp_r3(contact_frame,(world*nc+slot)*12+6);
+      float3 point=sp_r3(contact_frame,(world*nc+slot)*12+9);
+      float3 force=float(flip)*(n*wrench[0]+u*wrench[1]+v*wrench[2]);
+      float3 torque=float(flip)*(n*wrench[3]+u*wrench[4]+v*wrench[5]);
+      float weight=length(float3(wrench[0],wrench[1],wrench[2]));
+      F+=force;T+=torque;P+=weight*point;total+=weight;
     }
   }
-  // NOTE: dist criterion for MINDIST filled in the selection below.
-  int pick=-1;
   if (reduce==3) {
-    // Net-force aggregation over all matches.
-    float3 F=float3(0.0f), T=float3(0.0f), P=float3(0.0f);
-    float tot=0.0f;
-    for (int k=0;k<nmatch;++k) {
-      uint s=uint(mid[k]);
-      int cdim=contact_packed[s*3+0], cone=contact_packed[s*3+2];
-      float w6[6];
-      sp_contact_wrench(cdim,cone,contact_force,(world*nc+s)*11,contact_mu,s*5,w6);
-      float3 n=sp_r3(contact_frame,(world*nc+s)*12);
-      float3 t1v=sp_r3(contact_frame,(world*nc+s)*12+3);
-      float3 t2v=sp_r3(contact_frame,(world*nc+s)*12+6);
-      float3 ppos=sp_r3(contact_frame,(world*nc+s)*12+9);
-      float3 fj=n*w6[0]+t1v*w6[1]+t2v*w6[2];
-      float3 tj=n*w6[3]+t1v*w6[4]+t2v*w6[5];
-      if (mflip[k]<0) { fj=-fj; tj=-tj; }
-      F+=fj; T+=tj;
-      float wgt=length(fj);
-      P+=wgt*ppos; tot+=wgt;
+    P/=max(total,1e-15f);
+    for (uint slot=0;slot<nc;slot++) {
+      int flip=sp_contact_match(world,nc,nsite,slot,t1,id1,t2,id2,
+          contact_frame,slot_pair,pair_geoms,geom_bodyid,body_tree,
+          site_pos,site_quat,site_geom);
+      if (!flip) continue;
+      float wrench[6];
+      sp_contact_wrench(contact_packed[3*slot],contact_packed[3*slot+2],
+          contact_force,(world*nc+slot)*11,contact_mu,slot*5,wrench);
+      float3 n=sp_r3(contact_frame,(world*nc+slot)*12);
+      float3 u=sp_r3(contact_frame,(world*nc+slot)*12+3);
+      float3 v=sp_r3(contact_frame,(world*nc+slot)*12+6);
+      float3 point=sp_r3(contact_frame,(world*nc+slot)*12+9);
+      float3 force=float(flip)*(n*wrench[0]+u*wrench[1]+v*wrench[2]);
+      T+=cross(point-P,force);
     }
-    if (tot>0.0f) P/=tot;
-    // Induced torques about the centroid (second pass for positions).
-    for (int k=0;k<nmatch;++k) {
-      uint s=uint(mid[k]);
-      int cdim=contact_packed[s*3+0], cone=contact_packed[s*3+2];
-      float w6[6];
-      sp_contact_wrench(cdim,cone,contact_force,(world*nc+s)*11,contact_mu,s*5,w6);
-      float3 n=sp_r3(contact_frame,(world*nc+s)*12);
-      float3 t1v=sp_r3(contact_frame,(world*nc+s)*12+3);
-      float3 t2v=sp_r3(contact_frame,(world*nc+s)*12+6);
-      float3 ppos=sp_r3(contact_frame,(world*nc+s)*12+9);
-      float3 fj=n*w6[0]+t1v*w6[1]+t2v*w6[2];
-      if (mflip[k]<0) fj=-fj;
-      T+=cross(ppos-P,fj);
-    }
-    uint o=0;
-    if (dataspec&1) output[base+o++]=float(nmatch);
-    if (dataspec&2) { output[base+o]=F.x; output[base+o+1]=F.y; output[base+o+2]=F.z; o+=3; }
-    if (dataspec&4) { output[base+o]=T.x; output[base+o+1]=T.y; output[base+o+2]=T.z; o+=3; }
-    if (dataspec&8) { output[base+o]=0.0f; o+=1; }
-    if (dataspec&16) { output[base+o]=0.0f; output[base+o+1]=0.0f; output[base+o+2]=0.0f; o+=3; }
-    if (dataspec&32) { output[base+o]=1.0f; output[base+o+1]=0.0f; output[base+o+2]=0.0f; o+=3; }
-    if (dataspec&64) { output[base+o]=0.0f; output[base+o+1]=1.0f; output[base+o+2]=0.0f; o+=3; }
+    sp_write_contact(output,base,dataspec,nmatch,F,T,0.0f,P,
+                     float3(1,0,0),float3(0,1,0));
     return;
   }
-  if (nmatch>0 && reduce==0) pick=0;
-  else if (nmatch>0) {
-    pick=0;
-    float best=mcrit[0];
-    for (int k=1;k<nmatch;++k) {
-      if (mcrit[k]<best) { best=mcrit[k]; pick=k; }
+  // Select complete source-order matches without a fixed local array. The
+  // pinned partial sort uses (criterion, contact id), including tie order.
+  int previous=-1;
+  float previous_criterion=0.0f;
+  for (int outslot=0;outslot<min(num,nmatch);outslot++) {
+    int pick=-1, pick_flip=0;
+    float best=0.0f;
+    for (uint slot=0;slot<nc;slot++) {
+      int flip=sp_contact_match(world,nc,nsite,slot,t1,id1,t2,id2,
+          contact_frame,slot_pair,pair_geoms,geom_bodyid,body_tree,
+          site_pos,site_quat,site_geom);
+      if (!flip) continue;
+      float criterion=0.0f;
+      if (reduce==1) criterion=contact_row_data[(world*nc+slot)*42+1];
+      else if (reduce==2) {
+        float wrench[6];
+        sp_contact_wrench(contact_packed[3*slot],contact_packed[3*slot+2],
+            contact_force,(world*nc+slot)*11,contact_mu,slot*5,wrench);
+        float3 force=float3(wrench[0],wrench[1],wrench[2]);
+        criterion=-dot(force,force);
+      }
+      if (previous>=0 && (criterion<previous_criterion ||
+          (criterion==previous_criterion && int(slot)<=previous))) continue;
+      if (pick<0 || criterion<best || (criterion==best && int(slot)<pick)) {
+        pick=int(slot);pick_flip=flip;best=criterion;
+      }
     }
+    if (pick<0) break;
+    previous=pick;previous_criterion=best;
+    uint slot=uint(pick);
+    float wrench[6];
+    sp_contact_wrench(contact_packed[3*slot],contact_packed[3*slot+2],
+        contact_force,(world*nc+slot)*11,contact_mu,slot*5,wrench);
+    float3 force=float3(wrench[0],wrench[1],wrench[2]);
+    float3 torque=float3(wrench[3],wrench[4],wrench[5]);
+    if (pick_flip<0) { force.z=-force.z;torque.z=-torque.z; }
+    sp_write_contact(output,base+uint(outslot*size),dataspec,nmatch,force,torque,
+        contact_row_data[(world*nc+slot)*42+1],
+        sp_r3(contact_frame,(world*nc+slot)*12+9),
+        float(pick_flip)*sp_r3(contact_frame,(world*nc+slot)*12),
+        float(pick_flip)*sp_r3(contact_frame,(world*nc+slot)*12+3));
   }
-  if (pick>=0) {
-    uint s=uint(mid[pick]);
-    int flip=mflip[pick];
-    int cdim=contact_packed[s*3+0], cone=contact_packed[s*3+2];
-    float w6[6];
-    sp_contact_wrench(cdim,cone,contact_force,(world*nc+s)*11,contact_mu,s*5,w6);
-    float3 n=sp_r3(contact_frame,(world*nc+s)*12);
-    float3 t1v=sp_r3(contact_frame,(world*nc+s)*12+3);
-    float3 pp=sp_r3(contact_frame,(world*nc+s)*12+9);
-    float dd=contact_row_data[(world*nc+s)*42+1];
-    uint o=0;
-    if (dataspec&1) output[base+o++]=float(nmatch);
-    if (dataspec&2) {
-      float3 f=float3(w6[0],w6[1],w6[2]);
-      // Contact-frame force (no world rotation, like pinned).
-      if (flip<0) f.z*=-1.0f;
-      output[base+o]=f.x; output[base+o+1]=f.y; output[base+o+2]=f.z; o+=3;
-    }
-    if (dataspec&4) {
-      float3 t=float3(w6[3],w6[4],w6[5]);
-      if (flip<0) t.z*=-1.0f;
-      output[base+o]=t.x; output[base+o+1]=t.y; output[base+o+2]=t.z; o+=3;
-    }
-    if (dataspec&8) { output[base+o]=dd; o+=1; }
-    if (dataspec&16) {
-      float3 nn = flip<0 ? -n : n;
-      output[base+o]=nn.x; output[base+o+1]=nn.y; output[base+o+2]=nn.z; o+=3;
-    }
-    if (dataspec&32) {
-      float3 tt = flip<0 ? -t1v : t1v;
-      output[base+o]=tt.x; output[base+o+1]=tt.y; output[base+o+2]=tt.z; o+=3;
-    }
-  }
+  (void)pair_live;
 }
 
 #endif
