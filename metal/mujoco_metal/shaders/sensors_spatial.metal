@@ -604,7 +604,7 @@ kernel void evaluate_contact_sensors(
     int stype=int(site_geom[s*4+3]);
     float total=0.0f;
     for (uint c=0;c<nc;++c) {
-      if (contact_row_data[(world*nc+c)*36]<=0.5f) continue;
+      if (contact_row_data[(world*nc+c)*42]<=0.5f) continue;
       if (pair_live[slot_pair[c]]==0) continue;
       uint pair=uint(slot_pair[c]);
       int g1=pair_geoms[pair*2+0], g2=pair_geoms[pair*2+1];
@@ -634,7 +634,7 @@ kernel void evaluate_contact_sensors(
   float mcrit[24];
   int nmatch=0;
   for (uint s=0;s<nc && nmatch<24;++s) {
-    if (contact_row_data[(world*nc+s)*36]<=0.5f) continue;
+    if (contact_row_data[(world*nc+s)*42]<=0.5f) continue;
     if (pair_live[slot_pair[s]]==0) continue;
     uint pair=uint(slot_pair[s]);
     int g1=pair_geoms[pair*2+0], g2=pair_geoms[pair*2+1];
@@ -681,7 +681,7 @@ kernel void evaluate_contact_sensors(
     if (!m) continue;
     mid[nmatch]=int(s);
     mflip[nmatch]=m;
-    mcrit[nmatch]=contact_row_data[(world*nc+s)*36+1];
+    mcrit[nmatch]=contact_row_data[(world*nc+s)*42+1];
     nmatch++;
   }
   for (int k=0;k<nmatch;++k) {
@@ -757,7 +757,7 @@ kernel void evaluate_contact_sensors(
     float3 n=sp_r3(contact_frame,(world*nc+s)*12);
     float3 t1v=sp_r3(contact_frame,(world*nc+s)*12+3);
     float3 pp=sp_r3(contact_frame,(world*nc+s)*12+9);
-    float dd=contact_row_data[(world*nc+s)*36+1];
+    float dd=contact_row_data[(world*nc+s)*42+1];
     uint o=0;
     if (dataspec&1) output[base+o++]=float(nmatch);
     if (dataspec&2) {

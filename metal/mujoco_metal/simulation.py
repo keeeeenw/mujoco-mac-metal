@@ -3686,6 +3686,10 @@ class MetalSimulation:
         "force": w["out_contact_force"][: b * nc * 11].reshape(b, nc, 11),
         "contact_mask": row_data[:, :, 0, 0],
         "row": row_data[:, :, 0, 0],
+        # Spatial contact sensors also consume the source distance. Keep the
+        # complete contiguous canonical record distinct from the compact
+        # activity view consumed by RNE and touch-grid paths.
+        "records": row_data.reshape(b, nc, 42),
         "packed": cc._constants["contact_condim"].reshape(-1),
         "contact_condim": cc._constants["contact_condim"].reshape(nc, 3),
         "mu": cc._constants["contact_friction"].reshape(nc, 5),

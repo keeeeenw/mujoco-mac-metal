@@ -2047,7 +2047,7 @@ class SensorProgram:
       pge = torch.zeros(2, dtype=torch.int32, device=self._device)
     else:
       cfr, cfo = contact["frame"].reshape(-1), contact["force"].reshape(-1)
-      crow, cpk = contact["row"].reshape(-1), contact["packed"].reshape(-1)
+      crow, cpk = contact["records"].reshape(-1), contact["packed"].reshape(-1)
       cmu = contact["mu"].reshape(-1)
       slot, live = contact["slot_pair"].reshape(-1), contact["pair_live"].reshape(-1)
       pge = contact["pair_geoms"].reshape(-1)
