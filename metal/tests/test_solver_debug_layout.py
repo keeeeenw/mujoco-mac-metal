@@ -24,7 +24,7 @@ def test_component_tail_does_not_move_per_world_scratch_offsets():
     assert sparse["high_low_debug_offset"] == sparse["base_stride"] + 2 * 31 + 56
     assert sparse["high_low_workspace_offset"] == (
         sparse["high_low_debug_offset"] - sparse["debug_prefix"])
-    assert sparse["high_low_workspace_length"] == 8 * 7 + 3 * 23 + 7 * 23
+    assert sparse["high_low_workspace_length"] == 8 * 7 + 9 * 23 + 7 * 23
     assert sparse["final_stride"] == (
         sparse["high_low_debug_offset"]
         + sparse["high_low_workspace_length"])
@@ -137,7 +137,7 @@ def test_high_low_tail_is_world_local_and_after_all_existing_regions():
       tail_words = layout["high_low_workspace_length"]
       assert tail_start == layout["component_original_mass_offset"] + nnz
       assert layout["component_original_mass_offset"] == layout["component_layout_offset"] + layout_words
-      assert tail_words == 8 * max(nv, 1) + 3 * max(nr, 1) + nv * nr
+      assert tail_words == 8 * max(nv, 1) + 9 * max(nr, 1) + nv * nr
       assert tail_start + tail_words == layout["final_stride"]
       assert layout["high_low_workspace_offset"] == (
           tail_start - layout["debug_prefix"])

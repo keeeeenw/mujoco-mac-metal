@@ -669,7 +669,7 @@ kernel void evaluate_contact_sensors(
     int stype=int(site_geom[s*4+3]);
     float total=0.0f;
     for (uint c=0;c<nc;++c) {
-      if (contact_row_data[(world*nc+c)*42]<=0.5f) continue;
+      if (contact_row_data[(world*nc+c)*60]<=0.5f) continue;
       if (pair_live[slot_pair[c]]==0) continue;
       uint pair=uint(slot_pair[c]);
       int g1=pair_geoms[pair*2+0], g2=pair_geoms[pair*2+1];
@@ -755,7 +755,7 @@ kernel void evaluate_contact_sensors(
           site_pos,site_quat,site_geom);
       if (!flip) continue;
       float criterion=0.0f;
-      if (reduce==1) criterion=contact_row_data[(world*nc+slot)*42+1];
+      if (reduce==1) criterion=contact_row_data[(world*nc+slot)*60+1];
       else if (reduce==2) {
         float wrench[6];
         sp_contact_wrench(contact_packed[3*slot],contact_packed[3*slot+2],
@@ -779,7 +779,7 @@ kernel void evaluate_contact_sensors(
     float3 torque=float3(wrench[3],wrench[4],wrench[5]);
     if (pick_flip<0) { force.z=-force.z;torque.z=-torque.z; }
     sp_write_contact(output,base+uint(outslot*size),dataspec,nmatch,force,torque,
-        contact_row_data[(world*nc+slot)*42+1],
+        contact_row_data[(world*nc+slot)*60+1],
         sp_r3(contact_frame,(world*nc+slot)*12+9),
         float(pick_flip)*sp_r3(contact_frame,(world*nc+slot)*12),
         float(pick_flip)*sp_r3(contact_frame,(world*nc+slot)*12+3));

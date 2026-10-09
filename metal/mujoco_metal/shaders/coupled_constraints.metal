@@ -63,10 +63,10 @@ kernel void clear_contact_candidate_workspace(
     constant int* dims [[buffer(2)]],
     uint tid [[thread_position_in_grid]]) {
   int ncontacts=dims[2], batch=dims[3];
-  int width=max(ncontacts,1)*42;
+  int width=max(ncontacts,1)*60;
   int world=int(tid)/width, lane=int(tid)%width;
   if(world>=batch || !pair_contact_world_enabled(dims,world)) return;
-  if(lane<ncontacts*42) row_data[world*ncontacts*42+lane]=0.0f;
+  if(lane<ncontacts*60) row_data[world*ncontacts*60+lane]=0.0f;
   if(lane<ncontacts*12) frame[world*ncontacts*12+lane]=0.0f;
 }
 
@@ -1466,7 +1466,7 @@ kernel void contact_normal(
       // Broadphase rejection publishes an empty slot, never a diagnostic
       // sentinel or the prior frame. Detected-but-inactive contacts remain
       // distinct and are filled by the normal candidate path below.
-      for (int i=0;i<42;i++) row_data[out*42+i]=0.0f;
+      for (int i=0;i<60;i++) row_data[out*60+i]=0.0f;
       for (int i=0;i<12;i++) frame[out*12+i]=0.0f;
       if (!packed_rows)
         for (int i=0;i<6*nv;i++) jacobian[out*6*nv+i]=0.0f;
@@ -1486,7 +1486,7 @@ kernel void contact_normal(
   if (raw_ncon<0) {
     int overflow_slot=offset;
     if (overflow_slot<ncontacts_max) {
-      int rb=(world*ncontacts_max+overflow_slot)*42;
+      int rb=(world*ncontacts_max+overflow_slot)*60;
       row_data[rb]=1.0f; row_data[rb+1]=NAN;
       row_data[rb+2]=NAN; row_data[rb+3]=NAN;
       row_data[rb+4]=NAN; row_data[rb+5]=NAN;
@@ -1521,7 +1521,7 @@ kernel void contact_normal(
     if (slot >= ncontacts_max) break;
     int out = world * ncontacts_max + slot;
     int jbase = out * 6 * nv;
-    int rb = out * 6 * 7;
+    int rb = out * 60;
     int fb = out * 12;
     int row_start = pair_contact_offsets_dims[slot_rows_base + slot];
 
@@ -1541,7 +1541,7 @@ kernel void contact_normal(
                          contact_records[contact_base+3]);
 
     // Zero out buffers
-    for (int i = 0; i < 6 * 7; ++i) row_data[rb + i] = 0.0f;
+    for (int i = 0; i < 60; ++i) row_data[rb + i] = 0.0f;
     if (!packed_rows)
       for (int i = 0; i < 6 * nv; ++i) jacobian[jbase + i] = 0.0f;
     for (int i = 0; i < 12; ++i) frame[fb + i] = 0.0f;
@@ -1680,9 +1680,9 @@ kernel void contact_normal(
     if (slot >= ncontacts_max) break;
     int out = world * ncontacts_max + slot;
     int jbase = out * 6 * nv;
-    int rb = out * 6 * 7;
+    int rb = out * 60;
     int fb = out * 12;
-    for (int i = 0; i < 6 * 7; ++i) row_data[rb + i] = 0.0f;
+    for (int i = 0; i < 60; ++i) row_data[rb + i] = 0.0f;
     if (!packed_rows)
       for (int i = 0; i < 6 * nv; ++i) jacobian[jbase + i] = 0.0f;
     for (int i = 0; i < 12; ++i) frame[fb + i] = 0.0f;
@@ -2323,7 +2323,7 @@ kernel void contact_jacobian_low(
   // TRUE - f32 stored hi (pinned preprocessing mirrored on host), so hi+lo
   // recovers the pinned CPU constants. Friction residuals follow, with
   // a final flag identifying source fresh zero-tangent frames.
-  int clo = pair_idx * 17;
+  int clo = pair_idx * 23;
   PrimalFloatPair pK, pB;
   if (lr0 > 0.0f) {
     PrimalFloatPair r0p = {lr0, pair_const_lo[clo + 0]};
@@ -2565,7 +2565,7 @@ kernel void contact_jacobian_low(
           // (slot row starts shared with the assembly table by
           // construction), gated by the same row-activity flags. J_hi
           // comes from the hot kernel's unpacked blocks.
-          int crbase = (world * ncontacts_max + slot) * 42;
+          int crbase = (world * ncontacts_max + slot) * 60;
           if (contact_row_data[crbase] > 0.5f) {
             if (dim == 1) {
               float Jhi = jacobian[jbase + 0 * nv + dof_outer];
@@ -2610,11 +2610,13 @@ kernel void contact_jacobian_low(
     // row_data[...+6] = E_aref - aref_hi; canonical assembly carries it
     // into the aref_low plane. Nonfinite hi (overflow slots) writes 0.
     {
-      int slotbase42 = (world * ncontacts_max + slot) * 42;
+      int slotbase = (world * ncontacts_max + slot) * 60;
+      for (int axis=0;axis<5;axis++)
+        contact_row_data[slotbase+54+axis] = pair_const_lo[clo+11+axis];
       float d_hi = contact_records[contact_base + 0];
       float d_lo = contact_records[res + 9] + contact_records[res + 10];
       for (int row = 0; row < 6; ++row) {
-        int rr = slotbase42 + row * 7;
+        int rr = slotbase + row * 7;
         float aref_hi = contact_row_data[rr + 3];
         float alo = 0.0f;
         if (isnan(aref_hi) || !isfinite(aref_hi)) alo = 0.0f;
@@ -2684,6 +2686,30 @@ kernel void contact_jacobian_low(
           }
           alo = (eAref.hi - aref_hi) + eAref.lo;
           alo = alo + 0.0f;
+          // Pinned mj_makeImpedance: form R from retained source constants,
+          // then apply the cone's friction impedance adjustment. The sidecar
+          // leaves the original seven-word axis API unchanged.
+          PrimalFloatPair tran = {pair_const_lo[clo+17],pair_const_lo[clo+18]};
+          PrimalFloatPair reg = primal_pair_divide(primal_pair_product(
+              primal_pair_add({1,0},primal_pair_multiply(impP,-1)),tran),impP);
+          if (!(reg.hi > 1e-15f)) reg = {1e-15f,0};
+          PrimalFloatPair ratio = {pair_const_lo[clo+21],pair_const_lo[clo+22]};
+          if (!(ratio.hi > 1e-15f)) ratio = {1e-15f,0};
+          PrimalFloatPair mu0 = {pair_friction[pair_idx*5],pair_const_lo[clo+11]};
+          PrimalFloatPair mu0sq = primal_pair_product(mu0,mu0);
+          if (dim > 1 && cone > .5f && row > 0 && row < dim) {
+            PrimalFloatPair mu = {pair_friction[pair_idx*5+row-1],pair_const_lo[clo+11+row-1]};
+            reg = primal_pair_divide(primal_pair_product(
+                primal_pair_divide(reg,ratio),mu0sq),primal_pair_product(mu,mu));
+          } else if (dim > 1 && cone < .5f) {
+            PrimalFloatPair master = primal_pair_product(mu0,
+                primal_pair_sqrt(primal_pair_divide({1,0},ratio)));
+            reg = primal_pair_multiply(primal_pair_product(
+                primal_pair_product(master,master),primal_pair_product(reg,
+                    primal_pair_add({1,0},mu0sq))),2);
+          }
+          contact_row_data[slotbase+42+row] = reg.hi;
+          contact_row_data[slotbase+48+row] = reg.lo;
         }
         contact_row_data[rr + 6] = alo;
       }
@@ -3046,6 +3072,21 @@ inline device const float* primal_aref_low_view(device const float* debug,
   return pair_tail + 8 * max(nv, 1) + 2 * max(nr, 1);
 }
 
+inline device const float* primal_regularizer_low_view(device const float* debug,
+    constant int* dims, int nv, int nr) {
+  return primal_aref_low_view(debug,dims,nv,nr)+max(nr,1)+nv*nr;
+}
+inline device const float* primal_friction_low_view(device const float* debug,
+    constant int* dims, int nv, int nr) {
+  return primal_regularizer_low_view(debug,dims,nv,nr)+max(nr,1);
+}
+inline PrimalFloatPair primal_positive_entry_pair(device const float* hi,
+    device const float* lo, int index, float minimum) {
+  PrimalFloatPair value = {hi[index],lo ? lo[index] : 0};
+  return value.hi > minimum || (value.hi == minimum && value.lo >= 0)
+      ? value : PrimalFloatPair{minimum,0};
+}
+
 inline bool primal_pair_less_float(PrimalFloatPair value, float scalar) {
   if (value.hi < scalar) return true;
   if (value.hi > scalar) return false;
@@ -3097,19 +3138,20 @@ inline PrimalFloatPair primal_pair_sqrt(PrimalFloatPair value) {
 inline void primal_elliptic_force_pair(
     thread const float* residual_hi, thread const float* residual_low,
     device const float* R, device const float* friction, int dim,
-    thread float* force_hi, thread float* force_low) {
+    thread float* force_hi, thread float* force_low,
+    device const float* R_low = nullptr, device const float* friction_low = nullptr) {
   for (int j = 0; j < 6; ++j) force_hi[j] = force_low[j] = 0.0f;
-  PrimalFloatPair mu = primal_pair_multiply(
+  PrimalFloatPair mu = primal_pair_product(
       primal_pair_sqrt(primal_pair_divide(
-          {max(R[1], 0.0f), 0.0f}, {max(R[0], 1e-15f), 0.0f})),
-      friction[0]);
+          primal_positive_entry_pair(R,R_low,1,0), primal_positive_entry_pair(R,R_low,0,1e-15f))),
+      primal_positive_entry_pair(friction,friction_low,0,0));
   PrimalFloatPair normal = {residual_hi[0], residual_low[0]};
   PrimalFloatPair mu_abs = primal_pair_abs(mu);
   if (mu_abs.hi < 1e-12f
       || (mu_abs.hi == 1e-12f && mu_abs.lo <= 0.0f)) {
     if (primal_pair_negative(normal)) {
       PrimalFloatPair f = primal_pair_multiply(normal, -1.0f);
-      f = primal_pair_divide(f, {max(R[0], 1e-15f), 0.0f});
+      f = primal_pair_divide(f, primal_positive_entry_pair(R,R_low,0,1e-15f));
       force_hi[0] = f.hi;
       force_low[0] = f.lo;
     }
@@ -3119,7 +3161,7 @@ inline void primal_elliptic_force_pair(
   PrimalFloatPair a[6];
   for (int j = 0; j < 6; ++j) a[j] = {0.0f, 0.0f};
   for (int j = 1; j < dim; ++j) {
-    PrimalFloatPair fj = {max(friction[j - 1], 0.0f), 0.0f};
+    PrimalFloatPair fj = primal_positive_entry_pair(friction,friction_low,j-1,0);
     PrimalFloatPair rj = {residual_hi[j], residual_low[j]};
     PrimalFloatPair scaled = primal_pair_product(fj, rj);
     tangent_sq = primal_pair_add(tangent_sq,
@@ -3135,7 +3177,7 @@ inline void primal_elliptic_force_pair(
       for (int j = 0; j < dim; ++j) {
         PrimalFloatPair f = primal_pair_divide(
             primal_pair_multiply({residual_hi[j], residual_low[j]}, -1.0f),
-            {max(R[j], 1e-15f), 0.0f});
+            primal_positive_entry_pair(R,R_low,j,1e-15f));
         force_hi[j] = f.hi;
         force_low[j] = f.lo;
       }
@@ -3146,7 +3188,7 @@ inline void primal_elliptic_force_pair(
     for (int j = 0; j < dim; ++j) {
       PrimalFloatPair f = primal_pair_divide(
           primal_pair_multiply({residual_hi[j], residual_low[j]}, -1.0f),
-          {max(R[j], 1e-15f), 0.0f});
+          primal_positive_entry_pair(R,R_low,j,1e-15f));
       force_hi[j] = f.hi;
       force_low[j] = f.lo;
     }
@@ -3156,7 +3198,7 @@ inline void primal_elliptic_force_pair(
       primal_pair_multiply(tangent, -1.0f));
   if (!primal_pair_negative(gap)) return;
   PrimalFloatPair scale = primal_pair_divide(
-      primal_pair_divide({1.0f, 0.0f}, {max(R[0], 1e-15f), 0.0f}),
+      primal_pair_divide({1.0f, 0.0f}, primal_positive_entry_pair(R,R_low,0,1e-15f)),
       primal_pair_add({1.0f, 0.0f}, mu_sq));
   PrimalFloatPair f0 = primal_pair_multiply(
       primal_pair_product(scale, gap), -1.0f);
@@ -3178,18 +3220,19 @@ inline void primal_elliptic_force_pair(
 inline void primal_elliptic_hessian_pair(
     thread const float* residual_hi, thread const float* residual_low,
     device const float* R, device const float* friction, int dim,
-    thread float* hessian_hi, thread float* hessian_low) {
+    thread float* hessian_hi, thread float* hessian_low,
+    device const float* R_low = nullptr, device const float* friction_low = nullptr) {
   for (int i = 0; i < 36; ++i) hessian_hi[i] = hessian_low[i] = 0.0f;
-  PrimalFloatPair mu = primal_pair_multiply(
+  PrimalFloatPair mu = primal_pair_product(
       primal_pair_sqrt(primal_pair_divide(
-          {max(R[1], 0.0f), 0.0f}, {max(R[0], 1e-15f), 0.0f})),
-      friction[0]);
+          primal_positive_entry_pair(R,R_low,1,0), primal_positive_entry_pair(R,R_low,0,1e-15f))),
+      primal_positive_entry_pair(friction,friction_low,0,0));
   PrimalFloatPair mu_abs = primal_pair_abs(mu);
   if (mu_abs.hi < 1e-12f
       || (mu_abs.hi == 1e-12f && mu_abs.lo <= 0.0f)) {
     if (primal_pair_negative({residual_hi[0], residual_low[0]})) {
       PrimalFloatPair inverse = primal_pair_divide({1.0f, 0.0f},
-          {max(R[0], 1e-15f), 0.0f});
+          primal_positive_entry_pair(R,R_low,0,1e-15f));
       hessian_hi[0] = inverse.hi;
       hessian_low[0] = inverse.lo;
     }
@@ -3200,7 +3243,7 @@ inline void primal_elliptic_hessian_pair(
   for (int j = 0; j < 6; ++j) a[j] = {0.0f, 0.0f};
   for (int j = 1; j < dim; ++j) {
     PrimalFloatPair r = {residual_hi[j], residual_low[j]};
-    PrimalFloatPair f = {max(friction[j - 1], 0.0f), 0.0f};
+    PrimalFloatPair f = primal_positive_entry_pair(friction,friction_low,j-1,0);
     PrimalFloatPair scaled = primal_pair_product(f, r);
     tangent_sq = primal_pair_add(tangent_sq,
         primal_pair_product(scaled, scaled));
@@ -3215,7 +3258,7 @@ inline void primal_elliptic_hessian_pair(
     if (primal_pair_negative(normal)) {
       for (int j = 0; j < dim; ++j) {
         PrimalFloatPair inverse = primal_pair_divide({1.0f, 0.0f},
-            {max(R[j], 1e-15f), 0.0f});
+            primal_positive_entry_pair(R,R_low,j,1e-15f));
         hessian_hi[j * 6 + j] = inverse.hi;
         hessian_low[j * 6 + j] = inverse.lo;
       }
@@ -3227,7 +3270,7 @@ inline void primal_elliptic_hessian_pair(
   if (primal_pair_less_equal_float(bottom_test, 0.0f)) {
     for (int j = 0; j < dim; ++j) {
       PrimalFloatPair inverse = primal_pair_divide({1.0f, 0.0f},
-          {max(R[j], 1e-15f), 0.0f});
+          primal_positive_entry_pair(R,R_low,j,1e-15f));
       hessian_hi[j * 6 + j] = inverse.hi;
       hessian_low[j * 6 + j] = inverse.lo;
     }
@@ -3236,14 +3279,14 @@ inline void primal_elliptic_hessian_pair(
   if (!primal_pair_negative(normal_minus_tangent)) return;
 
   PrimalFloatPair scale = primal_pair_divide(
-      primal_pair_divide({1.0f, 0.0f}, {max(R[0], 1e-15f), 0.0f}),
+      primal_pair_divide({1.0f, 0.0f}, primal_positive_entry_pair(R,R_low,0,1e-15f)),
       primal_pair_add({1.0f, 0.0f}, mu_sq));
   hessian_hi[0] = scale.hi;
   hessian_low[0] = scale.lo;
   PrimalFloatPair tangent_sq_den = primal_pair_product(tangent, tangent);
   PrimalFloatPair tangent_cube = primal_pair_product(tangent_sq_den, tangent);
   for (int j = 1; j < dim; ++j) {
-    PrimalFloatPair fj = {max(friction[j - 1], 0.0f), 0.0f};
+    PrimalFloatPair fj = primal_positive_entry_pair(friction,friction_low,j-1,0);
     PrimalFloatPair fj_sq = primal_pair_product(fj, fj);
     PrimalFloatPair h0j = primal_pair_multiply(
         primal_pair_divide(primal_pair_product(scale, a[j]), tangent), -1.0f);
@@ -3327,14 +3370,16 @@ inline void primal_refresh_pair_state(device const float* mass,
     row_residual[row] = r.hi;
     row_residual_low[row] = r.lo;
     if (elliptic_member[row]) continue;
-    float reg = max(R[row], 1e-15f);
-    float D = 1.0f / reg;
+    PrimalFloatPair reg_pair = primal_positive_entry_pair(R,
+        primal_regularizer_low_view(debug,dims,nv,nr),row,1e-15f);
+    PrimalFloatPair D_pair = primal_pair_divide({1,0},reg_pair);
+    float reg = primal_pair_value(reg_pair), D = primal_pair_value(D_pair);
     bool friction = lo[row] < 0.0f && hi[row] > 0.0f
         && isfinite(lo[row]) && isfinite(hi[row])
         && abs(lo[row] + hi[row]) <= 1e-5f * max(1.0f, abs(hi[row]));
     float residual_value = r.hi + r.lo;
     if (row < n_eq_rows) {
-      PrimalFloatPair f = primal_pair_multiply(r, -D);
+      PrimalFloatPair f = primal_pair_multiply(primal_pair_product(r,D_pair),-1);
       force[row] = f.hi;
       force_low[row] = f.lo;
       row_hessian[row] = D;
@@ -3343,13 +3388,13 @@ inline void primal_refresh_pair_state(device const float* mass,
       if (residual_value <= -bound) force[row] = hi[row];
       else if (residual_value >= bound) force[row] = -hi[row];
       else {
-        PrimalFloatPair f = primal_pair_multiply(r, -D);
+        PrimalFloatPair f = primal_pair_multiply(primal_pair_product(r,D_pair),-1);
         force[row] = f.hi;
         force_low[row] = f.lo;
         row_hessian[row] = D;
       }
     } else if (residual_value < 0.0f) {
-      PrimalFloatPair f = primal_pair_multiply(r, -D);
+      PrimalFloatPair f = primal_pair_multiply(primal_pair_product(r,D_pair),-1);
       force[row] = f.hi;
       force_low[row] = f.lo;
       row_hessian[row] = D;
@@ -3368,7 +3413,9 @@ inline void primal_refresh_pair_state(device const float* mass,
     }
     primal_elliptic_force_pair(local_residual, local_residual_low,
         R + start, elliptic_friction + block * 5, dim,
-        local_force, local_force_low);
+        local_force, local_force_low,
+        primal_regularizer_low_view(debug,dims,nv,nr)+start,
+        primal_friction_low_view(debug,dims,nv,nr)+block*5);
     for (int k = 0; k < dim; ++k) {
       if (!enabled[start + k]) continue;
       force[start + k] = local_force[k];
@@ -3513,11 +3560,13 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
           J, row, vector_low, nv);
       PrimalFloatPair jd = primal_pair_add(jd_hi, jd_low);
       PrimalFloatPair coefficient = primal_pair_product(
-          {row_hessian[row], 0.0f}, {ccj_get(J, row, dof, nv), 0.0f});
+          primal_pair_divide({1,0},primal_positive_entry_pair(R,
+              primal_regularizer_low_view(debug,dims,nv,dims[9]),row,1e-15f)), {ccj_get(J, row, dof, nv), 0.0f});
       float Jlo_c = ccj_get_lo(J, row, dof, nv);
       if (Jlo_c != 0.0f)
         coefficient = primal_pair_add(coefficient, primal_pair_product(
-            {row_hessian[row], 0.0f}, {Jlo_c, 0.0f}));
+            primal_pair_divide({1,0},primal_positive_entry_pair(R,
+              primal_regularizer_low_view(debug,dims,nv,dims[9]),row,1e-15f)), {Jlo_c, 0.0f}));
       PrimalFloatPair contribution = primal_pair_product(coefficient, jd);
       primal_compensated_product_add(contribution.hi, 1.0f, value, correction);
       primal_compensated_product_add(contribution.lo, 1.0f, value, correction);
@@ -3567,7 +3616,9 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
       }
       primal_elliptic_hessian_pair(local_residual, local_residual_low,
           R + start, elliptic_friction + block * 5, dim,
-          local_hessian, local_hessian_low);
+          local_hessian, local_hessian_low,
+          primal_regularizer_low_view(debug,dims,nv,dims[9])+start,
+          primal_friction_low_view(debug,dims,nv,dims[9])+block*5);
       for (int a = 0; a < dim; ++a) {
         PrimalFloatPair hv_pair = {0.0f, 0.0f};
         for (int b = 0; b < dim; ++b) {
@@ -7341,7 +7392,7 @@ inline PrimalFloatPair pgs_delassus_pair(device const float* J,
   return value;
 }
 
-inline int solve_pgs_device(device const float* W, device const float* R,
+inline int solve_pgs_device(device const float* W, device const float* R, device const float* R_low,
     device const float* rhs, device const float* rhs_low,
     device const float* ar,
     device const float* lo, device const float* hi,
@@ -7377,10 +7428,11 @@ inline int solve_pgs_device(device const float* W, device const float* R,
           res = primal_pair_add(res,
               primal_pair_product(wij, {lam[col], lam_low[col]}));
         }
-        res = primal_pair_fma(R[row], {lam[row], lam_low[row]}, res);
+        res = primal_pair_add(res,primal_pair_product(
+            {R[row],R_low[row]},{lam[row],lam_low[row]}));
         PrimalFloatPair diag_pair = primal_pair_add(
             pgs_delassus_pair(J, Z, Z_low, mass, dims, batch, world,
-                              nr, nv, row, row), {R[row], 0.0f});
+                              nr, nv, row, row), {R[row], R_low[row]});
         if (!(diag_pair.hi > 1e-15f)) diag_pair = {1e-15f, 0.0f};
         PrimalFloatPair old_force = {lam[row], lam_low[row]};
         PrimalFloatPair next_force = primal_pair_add(old_force,
@@ -7425,8 +7477,8 @@ inline int solve_pgs_device(device const float* W, device const float* R,
               primal_pair_product(pgs_delassus_pair(
                   J, Z, Z_low, mass, dims, batch, world, nr, nv, row, col),
                   {lam[col], lam_low[col]}));
-        residual_pair = primal_pair_fma(R[row],
-            {lam[row], lam_low[row]}, residual_pair);
+        residual_pair = primal_pair_add(residual_pair,primal_pair_product(
+            {R[row],R_low[row]},{lam[row],lam_low[row]}));
         res_pair_local[i] = residual_pair;
         res[i] = primal_pair_value(residual_pair);
         for (int j = 0; j < dim; ++j) {
@@ -7434,7 +7486,7 @@ inline int solve_pgs_device(device const float* W, device const float* R,
           A_pair[i * dim + j] = primal_pair_add(
               pgs_delassus_pair(J, Z, Z_low, mass, dims, batch, world,
                                 nr, nv, row, col),
-              {i == j ? R[row] : 0.0f, 0.0f});
+              {i == j ? R[row] : 0.0f, i == j ? R_low[row] : 0.0f});
           A[i * dim + j] = primal_pair_value(A_pair[i * dim + j]);
         }
       }
@@ -7738,6 +7790,8 @@ kernel void solve_coupled_constraints(
   device float* pgs_lambda_low = pgs_rhs_low + max(nr, 1);
   device float* Z_low = pgs_pair_tail + 8 * max(nv, 1) + 3 * max(nr, 1);
   device const float* aref_low = pgs_lambda_low + max(nr, 1);
+  device float* regularizer_low = Z_low + nv*nr;
+  device float* elliptic_friction_low = regularizer_low + max(nr,1);
   // Writable alias of the aref_low plane for fresh contact assembly below:
   // the low kernel stages per-row aref corrections in row_data[+6] and
   // canonical assembly publishes them here next to ar (same row mapping).
@@ -7934,14 +7988,17 @@ kernel void solve_coupled_constraints(
       int cdim = contact_condim[s * 3 + 0];
       int row_offset = contact_condim[s * 3 + 1];
       int row_start = base_contact + row_offset;
-      int crbase = (world * ncontacts_max + s) * 42;
+      int crbase = (world * ncontacts_max + s) * 60;
       if (contact_row_data[crbase] <= 0.5f) continue;
       if (cone_type == 1 && cdim > 1) {
         if (elliptic_count < nr) {
           elliptic_start[elliptic_count] = row_start;
           elliptic_dim[elliptic_count] = cdim;
-          for (int k = 0; k < 5; ++k)
+          for (int k = 0; k < 5; ++k) {
             elliptic_friction[elliptic_count * 5 + k] = contact_friction[s * 5 + k];
+            elliptic_friction_low[elliptic_count*5+k] =
+                contact_row_data[(world*ncontacts_max+s)*60+54+k];
+          }
           ++elliptic_count;
         }
         for (int k = 0; k < cdim; ++k)
@@ -7960,7 +8017,7 @@ kernel void solve_coupled_constraints(
       int row_start = base_contact + row_offset;
       int cb = world * ncontacts_max + s;
       int cjbase = cb * 6 * nv;
-      int crbase = cb * 6 * 7;
+      int crbase = cb * 60;
 
       if (cdim == 1) {
         int r = crbase;
@@ -7972,6 +8029,10 @@ kernel void solve_coupled_constraints(
           float imp = clamp(contact_row_data[r + 4], 1e-6f, 0.999999f);
           float diag_approx = max(contact_row_data[r + 5], 1e-15f);
           R[row] = max(1e-15f, (1.0f - imp) * diag_approx / imp);
+          if (contact_row_data[crbase+42] > 0) {
+            R[row] = contact_row_data[crbase+42];
+            regularizer_low[row] = contact_row_data[crbase+48];
+          }
           if (dims[20] == -1) dbg_pre[nr * nr + 2 * nr + row] = imp;
           ar[row] = contact_row_data[r + 3];
           aref_low_published[row] = contact_row_data[r + 6];
@@ -7990,7 +8051,10 @@ kernel void solve_coupled_constraints(
           if (elliptic_count < nr) {
             elliptic_start[elliptic_count] = row_start;
             elliptic_dim[elliptic_count] = cdim;
-            for (int k = 0; k < 5; ++k) elliptic_friction[elliptic_count * 5 + k] = contact_friction[s * 5 + k];
+            for (int k = 0; k < 5; ++k) {
+              elliptic_friction[elliptic_count * 5 + k] = contact_friction[s * 5 + k];
+              elliptic_friction_low[elliptic_count*5+k] = contact_row_data[crbase+54+k];
+            }
             ++elliptic_count;
           }
           for (int k = 0; k < cdim; ++k) {
@@ -8012,6 +8076,10 @@ kernel void solve_coupled_constraints(
               if (dims[20] == -1) dbg_pre[nr * nr + 2 * nr + row] = imp;
               lo[row] = -INFINITY;
               hi[row] = INFINITY;
+            }
+            if (contact_row_data[crbase+42+k] > 0) {
+              R[row] = contact_row_data[crbase+42+k];
+              regularizer_low[row] = contact_row_data[crbase+48+k];
             }
             ar[row] = contact_row_data[r + 3];
             aref_low_published[row] = contact_row_data[r + 6];
@@ -8043,6 +8111,10 @@ kernel void solve_coupled_constraints(
                   ccj_set(J_world, row, i, contact_jacobian[cjbase + i] + sign * mu * contact_jacobian[cjbase + (axis + 1) * nv + i], nv);
                 }
               R[row] = pyramid_R;
+              if (contact_row_data[crbase+42] > 0) {
+                R[row] = contact_row_data[crbase+42];
+                regularizer_low[row] = contact_row_data[crbase+48];
+              }
               if (dims[20] == -1) dbg_pre[nr * nr + 2 * nr + row] = imp;
               // For condim=3 the contact producer has already formed the
               // pyramid edge velocity and reference (including the single
@@ -8409,7 +8481,7 @@ kernel void solve_coupled_constraints(
         PrimalFloatPair a = primal_pair_add(
             pgs_delassus_pair(J_world, Z, Z_low, mass, dims, batch, world,
                               nr, nv, row, col),
-            {row == col ? R[row] : 0.0f, 0.0f});
+            {row == col ? R[row] : 0.0f, row == col ? regularizer_low[row] : 0.0f});
         PrimalFloatPair term = primal_pair_product(
             primal_pair_product({lam[row], pgs_lambda_low[row]}, a),
             {lam[col], pgs_lambda_low[col]});
@@ -8498,7 +8570,7 @@ kernel void solve_coupled_constraints(
       for (int row = 0; row < total_nr; ++row)
         enabled[row] = solver_row_island[row] == island;
       float island_residual = 0.0f;
-      used += solve_pgs_device(W, R, rhs, pgs_rhs_low, ar, lo, hi, enabled,
+      used += solve_pgs_device(W, R, regularizer_low, rhs, pgs_rhs_low, ar, lo, hi, enabled,
           elliptic_member, lam, pgs_lambda_low, J_world, Z, Z_low, mass, dims,
           batch, world, nv, nr, total_nr, maxiter, tol,
           pgs_improvement_scale, elliptic_count,
@@ -10025,6 +10097,8 @@ kernel void solve_coupled_constraints_block(
   device float* pgs_lambda_low = pgs_rhs_low + max(nr, 1);
   device float* Z_low = pgs_pair_tail + 8 * max(nv, 1) + 3 * max(nr, 1);
   device const float* aref_low = pgs_lambda_low + max(nr, 1);
+  device float* regularizer_low = Z_low + nv*nr;
+  device float* elliptic_friction_low = regularizer_low + max(nr,1);
   device float* aref_low_published = pgs_lambda_low + max(nr, 1);
   int row_workspace = dims[metadata_header + 8];
   device int* row_meta = reinterpret_cast<device int*>(solver_scratch)
@@ -10201,14 +10275,17 @@ kernel void solve_coupled_constraints_block(
       int cdim = contact_condim[s * 3 + 0];
       int row_offset = contact_condim[s * 3 + 1];
       int row_start = base_contact + row_offset;
-      int crbase = (world * ncontacts_max + s) * 42;
+      int crbase = (world * ncontacts_max + s) * 60;
       if (contact_row_data[crbase] <= 0.5f) continue;
       if (cone_type == 1 && cdim > 1) {
         if (elliptic_count < nr) {
           elliptic_start[elliptic_count] = row_start;
           elliptic_dim[elliptic_count] = cdim;
-          for (int k = 0; k < 5; ++k)
+          for (int k = 0; k < 5; ++k) {
             elliptic_friction[elliptic_count * 5 + k] = contact_friction[s * 5 + k];
+            elliptic_friction_low[elliptic_count*5+k] =
+                contact_row_data[(world*ncontacts_max+s)*60+54+k];
+          }
           ++elliptic_count;
         }
         for (int k = 0; k < cdim; ++k)
@@ -10229,7 +10306,7 @@ kernel void solve_coupled_constraints_block(
       int row_start = base_contact + row_offset;
       int cb = world * ncontacts_max + s;
       int cjbase = cb * 6 * nv;
-      int crbase = cb * 6 * 7;
+      int crbase = cb * 60;
 
       if (cdim == 1) {
         int r = crbase;
@@ -10241,6 +10318,10 @@ kernel void solve_coupled_constraints_block(
           float imp = clamp(contact_row_data[r + 4], 1e-6f, 0.999999f);
           float diag_approx = max(contact_row_data[r + 5], 1e-15f);
           R[row] = max(1e-15f, (1.0f - imp) * diag_approx / imp);
+          if (contact_row_data[crbase+42] > 0) {
+            R[row] = contact_row_data[crbase+42];
+            regularizer_low[row] = contact_row_data[crbase+48];
+          }
           if (dims[20] == -1) rhs[row] = imp;
           ar[row] = contact_row_data[r + 3];
           aref_low_published[row] = contact_row_data[r + 6];
@@ -10261,7 +10342,10 @@ kernel void solve_coupled_constraints_block(
           if (elliptic_count < nr) {
             elliptic_start[elliptic_count] = row_start;
             elliptic_dim[elliptic_count] = cdim;
-            for (int k = 0; k < 5; ++k) elliptic_friction[elliptic_count * 5 + k] = contact_friction[s * 5 + k];
+            for (int k = 0; k < 5; ++k) {
+              elliptic_friction[elliptic_count * 5 + k] = contact_friction[s * 5 + k];
+              elliptic_friction_low[elliptic_count*5+k] = contact_row_data[crbase+54+k];
+            }
             ++elliptic_count;
           }
           for (int k = 0; k < cdim; ++k) {
@@ -10283,6 +10367,10 @@ kernel void solve_coupled_constraints_block(
               if (dims[20] == -1) rhs[row] = imp;
               lo[row] = -INFINITY;
               hi[row] = INFINITY;
+            }
+            if (contact_row_data[crbase+42+k] > 0) {
+              R[row] = contact_row_data[crbase+42+k];
+              regularizer_low[row] = contact_row_data[crbase+48+k];
             }
             ar[row] = contact_row_data[r + 3];
           aref_low_published[row] = contact_row_data[r + 6];
@@ -10314,6 +10402,10 @@ kernel void solve_coupled_constraints_block(
                   ccj_set(J_world, row, i, contact_jacobian[cjbase + i] + sign * mu * contact_jacobian[cjbase + (axis + 1) * nv + i], nv);
                 }
               R[row] = pyramid_R;
+              if (contact_row_data[crbase+42] > 0) {
+                R[row] = contact_row_data[crbase+42];
+                regularizer_low[row] = contact_row_data[crbase+48];
+              }
               if (dims[20] == -1) rhs[row] = imp;
               ar[row] = cdim == 3
                   ? contact_row_data[crbase + (k + 1) * 7 + 3]
@@ -10608,7 +10700,7 @@ kernel void solve_coupled_constraints_block(
         PrimalFloatPair a = primal_pair_add(
             pgs_delassus_pair(J_world, Z, Z_low, mass, dims, batch,
                               int(world), nr, nv, row, col),
-            {row == col ? R[row] : 0.0f, 0.0f});
+            {row == col ? R[row] : 0.0f, row == col ? regularizer_low[row] : 0.0f});
         PrimalFloatPair term = primal_pair_product(
             primal_pair_product({lam[row], pgs_lambda_low[row]}, a),
             {lam[col], pgs_lambda_low[col]});
@@ -10692,7 +10784,7 @@ kernel void solve_coupled_constraints_block(
       for (int row = 0; row < nr; ++row)
         enabled[row] = solver_row_island[row] == island;
       float island_residual = 0.0f;
-      used += solve_pgs_device(W, R, rhs, pgs_rhs_low, ar, lo, hi, enabled,
+      used += solve_pgs_device(W, R, regularizer_low, rhs, pgs_rhs_low, ar, lo, hi, enabled,
           elliptic_member, lam, pgs_lambda_low, J_world, Z, Z_low, mass, dims,
           batch, int(world), nv, nr, nr, maxiter, tol,
           pgs_improvement_scale, elliptic_count,

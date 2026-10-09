@@ -280,8 +280,8 @@ def test_inverse_contact_friction_cone_matches_pinned_force_gradient(cone, condi
   np.testing.assert_array_equal(packed_pairs[:pair_count],
                                 np.flatnonzero(mask.reshape(1, -1)[0]))
   slot_flags = _host(cc._workspace["contact_row_data"][:
-      cc.batch_size * cc.descriptor.ncontacts_max * 36]).reshape(
-          cc.batch_size, cc.descriptor.ncontacts_max, 36)[:, :, 0]
+      cc.batch_size * cc.descriptor.ncontacts_max * 60]).reshape(
+          cc.batch_size, cc.descriptor.ncontacts_max, 60)[:, :, 0]
   np.testing.assert_array_equal(packed_slots[:slot_count],
                                 np.flatnonzero(slot_flags[0]))
   assert np.all(np.diff(packed_pairs[:pair_count]) >= 0)

@@ -60,6 +60,10 @@ def test_actual_contact_jacobian_reference_and_inverse_mass_rows(profile,solver)
     np.testing.assert_allclose(ar[rows],cpu.efc_aref[source_rows],rtol=2e-11,atol=2e-10)
     np.testing.assert_array_equal(_effective_rows(cc,1),0)
     nr=cc.descriptor.nr;debug=cc._workspace['workspace_debug'].cpu().numpy().reshape(2,-1)[0].astype(float)
+    regularizer_low=debug[cc._regularizer_low_debug_offset:cc._regularizer_low_debug_offset+nr]
+    regularizer=result['R'][0].cpu().numpy().astype(float)+regularizer_low
+    np.testing.assert_allclose(regularizer[rows],cpu.efc_R[source_rows],rtol=2e-12,atol=2e-12)
+    np.testing.assert_array_equal(cc._workspace['workspace_debug'].cpu().numpy().reshape(2,-1)[1,cc._regularizer_low_debug_offset:cc._regularizer_low_debug_offset+nr],0)
     prefix=nr*nr+7*nr
     zbase=prefix+cc._z_workspace_offset
     zlowbase=prefix+cc._high_low_workspace_offset+8*max(nv,1)+3*max(nr,1)

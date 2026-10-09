@@ -167,7 +167,7 @@ def solver_debug_layout(nv, nr, solver_type, ntree=0, nbody=0,
   # per-world offset to the current debug record base.
   # The final nv plane retains the immutable smooth-acceleration low word while
   # primal islands update their own accepted acceleration pairs.
-  high_low_workspace_length = 8 * max(v, 1) + 3 * max(r, 1) + nv * nr
+  high_low_workspace_length = 8 * max(v, 1) + 9 * max(r, 1) + nv * nr
   final_stride = high_low_debug_offset + high_low_workspace_length
   if min(qacc_offset, equality_scratch_offset) < prefix:
     raise ValueError("solver scratch layout overlaps the debug prefix")
@@ -1302,15 +1302,15 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
                             if jacobian_kind == "dense" else 1)
   blocks = max((int(nr) + 255) // 256, 1)
   parts = (
-      ("contact_row_data", _bytes(guarded(b * nc * 6 * 7))),
+      ("contact_row_data", _bytes(guarded(b * nc * 60))),
       ("contact_velocity_words", _bytes(guarded(2 * b * nv))),
       ("contact_frame", _bytes(guarded(b * nc * 12))),
       ("contact_jacobian", _bytes(guarded(contact_jacobian_words))),
       ("pair_mask", _bytes(guarded(b * max(int(npairs), 1)))),
       # Double-precision constant residuals for paired aref, per pair
       # [solref(2), solimp(5), margin/gap(2), solreffriction(2),
-      # friction(5), source-frame flag(1)] = 17 words, shared across worlds.
-      ("pair_const_lo", _bytes(max(int(npairs) * 17, 17))),
+      # friction(5), source-frame flag(1), weights/impratio pairs(6)] = 23 words, shared across worlds.
+      ("pair_const_lo", _bytes(max(int(npairs) * 23, 23))),
       ("workspace_J", _bytes(guarded(b * jacobian_words))),
       ("position_context_zero", _bytes(guarded(b * int(nr)))),
       ("position_context", _bytes(guarded(b * int(nr) * 5))),
@@ -1327,10 +1327,11 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
       ("position_cache_rows", _bytes(guarded(b * 7 * int(nr)))),
       ("position_current_aref_low", _bytes(guarded(b * int(nr)))),
       ("position_cache_aref_low", _bytes(guarded(b * int(nr)))),
+      ("position_cache_contact_precision", _bytes(guarded(b * 6 * max(int(nr),1)))),
       ("position_cache_qvel", _bytes(guarded(b * int(nv)))),
       ("position_refresh_old_extra_aref", _bytes(guarded(b * int(nr)))),
       ("position_cache_impedance", _bytes(guarded(b * int(nr)))),
-      ("position_cache_contact_data", _bytes(guarded(b * nc * 42))),
+      ("position_cache_contact_data", _bytes(guarded(b * nc * 60))),
       ("position_cache_contact_frame", _bytes(guarded(b * nc * 12))),
       ("position_cache_contact_jacobian",
        _bytes(guarded(contact_jacobian_words))),
@@ -1398,7 +1399,7 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
                   + 3 * nv
                   if mass_storage == "block_sparse" and component_configured
                   else 0)
-               + 8 * max(int(nv), 1) + 3 * max(int(nr), 1)
+               + 8 * max(int(nv), 1) + 9 * max(int(nr), 1)
                + int(nv) * int(nr))))),
       # One constructor-owned signed-int32 tensor contains the 22 scalar
       # dimensions, six island offsets, dof-tree map (guarded at nv=0), ten

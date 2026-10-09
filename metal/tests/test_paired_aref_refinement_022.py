@@ -6,7 +6,7 @@ checks the paired reference chain end to end using step-internal state
 with nonzero aref corrections, tight same-state E_aref match against the
 pinned CPU oracle, and tight same-state constraint-force match (exercises
 J pairing, aref pairing, dual refinement and pair force reconstruction).
-Component/block routes keep exact-zero low planes (coherently high-only).
+Component/block routes retain the same source corrections as dense routes.
 """
 import os
 
@@ -44,13 +44,16 @@ def test_paired_aref_chain_matches_cpu_reference_gpu():
   # unambiguous state the recomputed contacts agree with step contacts;
   # the assertions below fail loudly if that ever stops holding.
   s = sim.assembled_system(recompute=True)
-  rd = cc._workspace["contact_row_data"].cpu().numpy().reshape(8, 6, 7)
+  rd = cc._workspace["contact_row_data"].cpu().numpy().reshape(8, 60)[:, :42].reshape(8, 6, 7)
   assert rd.shape == (8, 6, 7)
   # aref corrections are really exercised (nonzero low words).
   assert float(np.max(np.abs(rd[:, 0, 6]))) > 1e-7
   # Same-state CPU reference.
-  qpos = np.asarray(sim.state._qpos[0].cpu().numpy(), dtype=np.float64)
-  qvel = np.asarray(sim.state._qvel[0].cpu().numpy(), dtype=np.float64)
+  snapshot = sim.state.snapshot()
+  nq, nv = model.nq, model.nv
+  words = snapshot.precision_words[0].astype(np.float64)
+  qpos = snapshot.qpos[0].astype(np.float64) + words[:nq] + words[nq:2*nq]
+  qvel = snapshot.qvel[0].astype(np.float64) + words[2*nq:2*nq+nv] + words[2*nq+nv:]
   d = mujoco.MjData(model)
   d.qpos[:] = qpos
   d.qvel[:] = qvel
@@ -88,7 +91,7 @@ def test_record_dist_lo_and_const_lo_present_gpu():
   nslots = 8
   los = [float(rec[i * 37 + 9]) for i in range(nslots)]
   assert any(v != 0.0 for v in los), los
-  clo = cc._constants["pair_const_lo"].cpu().numpy().reshape(-1, 17)
+  clo = cc._constants["pair_const_lo"].cpu().numpy().reshape(-1, 23)
   assert clo.shape[0] >= 1
   assert float(np.max(np.abs(clo))) > 0.0
   # Independent oracle: lo = f64 TRUE - f32 hi. This fixture resolves to
@@ -115,8 +118,11 @@ def test_same_state_force_tight_gpu():
   # Re-solve at the current state (see paired-aref test for why the
   # retained step views cannot be used for same-state force comparison).
   s = sim.assembled_system(recompute=True)
-  qpos = np.asarray(sim.state._qpos[0].cpu().numpy(), dtype=np.float64)
-  qvel = np.asarray(sim.state._qvel[0].cpu().numpy(), dtype=np.float64)
+  snapshot = sim.state.snapshot()
+  nq, nv = model.nq, model.nv
+  words = snapshot.precision_words[0].astype(np.float64)
+  qpos = snapshot.qpos[0].astype(np.float64) + words[:nq] + words[nq:2*nq]
+  qvel = snapshot.qvel[0].astype(np.float64) + words[2*nq:2*nq+nv] + words[2*nq+nv:]
   d = mujoco.MjData(model)
   d.qpos[:] = qpos
   d.qvel[:] = qvel
@@ -133,7 +139,7 @@ def test_same_state_force_tight_gpu():
 @_needs_gpu()
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
-def test_block_sparse_route_keeps_zero_low_planes_gpu():
+def test_block_sparse_route_retains_source_low_planes_gpu():
   from mujoco_metal.simulation import MetalSimulation
   model = _torus_model()
   sim = MetalSimulation(model, batch_size=1, profile="integrated_scalable_v1")
@@ -146,8 +152,26 @@ def test_block_sparse_route_keeps_zero_low_planes_gpu():
   lay = cc._jacobian_layout
   W = cc._workspace["workspace_J"].cpu().numpy()
   lo = W[lay.lo_values_offset():lay.lo_values_offset() + lay.nnz]
-  assert float(np.max(np.abs(lo))) == 0.0
+  assert float(np.max(np.abs(lo))) > 0.0
   rd = cc._workspace["contact_row_data"].cpu().numpy()
   nslots = int(cc.descriptor.ncontacts_max)
-  rd = rd.reshape(nslots, 6, 7)
-  assert float(np.max(np.abs(rd[:, :, 6]))) == 0.0
+  rd = rd.reshape(nslots, 60)[:, :42].reshape(nslots, 6, 7)
+  assert float(np.max(np.abs(rd[:, :, 6]))) > 0.0
+  # The represented operator is checked against the pinned engine, rather
+  # than accepting nonzero helper output as physics evidence.
+  import mujoco
+  from test_contact_operator_precision import _effective_rows
+  snapshot = sim.state.snapshot()
+  words = snapshot.precision_words[0].astype(np.float64)
+  nq, nv = model.nq, model.nv
+  source = mujoco.MjData(model)
+  source.qpos[:] = snapshot.qpos[0].astype(np.float64) + words[:nq] + words[nq:2*nq]
+  source.qvel[:] = snapshot.qvel[0].astype(np.float64) + words[2*nq:2*nq+nv] + words[2*nq+nv:]
+  mujoco.mj_forward(model, source)
+  sim.assembled_system(recompute=True)
+  native_J = _effective_rows(cc)
+  offsets = np.asarray(cc.descriptor.contact_condim_packed).reshape(-1, 3)
+  rows = cc.descriptor.nr_joint + offsets[:source.ncon, 1]
+  np.testing.assert_allclose(native_J[rows],
+                             np.asarray(source.efc_J).reshape(source.nefc, nv),
+                             rtol=2e-6, atol=2e-6)

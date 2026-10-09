@@ -1169,7 +1169,7 @@ def test_batched_second_pair_contact_routing():
   # broadphase/narrowphase row cannot be hidden by a plausible qacc result.
   coupled.generate_candidates(dynamics["poses"], qvel_device)
   candidate = coupled._workspace["contact_row_data"].reshape(
-      batch, coupled.descriptor.ncontacts_max, 6, 7)[:, :, 0, 0]
+      batch, coupled.descriptor.ncontacts_max, 60)[:, :, :42].reshape(batch, coupled.descriptor.ncontacts_max, 6, 7)[:, :, 0, 0]
   refs = []
   for world in range(batch):
     data = mujoco.MjData(model)
@@ -1339,7 +1339,7 @@ def test_pair_header_routes_after_four_slot_first_pair(pruning):
   dynamics = smooth.run_device(qpos_device, qvel)
   coupled.generate_candidates(dynamics["poses"], qvel)
   rows = coupled._workspace["contact_row_data"].reshape(
-      batch, coupled.descriptor.ncontacts_max, 6, 7)[:, :, 0, 0]
+      batch, coupled.descriptor.ncontacts_max, 60)[:, :, :42].reshape(batch, coupled.descriptor.ncontacts_max, 6, 7)[:, :, 0, 0]
   second_pair = slice(int(offsets[1]), int(offsets[2]))
   assert torch.any(rows[0, second_pair] > 0.5)
   assert not torch.any(rows[1] > 0.5)

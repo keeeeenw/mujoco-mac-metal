@@ -30,6 +30,7 @@ import mujoco
 import numpy as np
 
 from mujoco_metal.model import require_triple_word_domain
+from mujoco_metal.contact_precision import RECORD_WORDS, axis_data
 
 _SHADER = Path(__file__).parent / "shaders" / "coupled_constraints.metal"
 _BROADPHASE_SHADER = Path(__file__).parent / "shaders" / "broadphase.metal"
@@ -1837,10 +1838,17 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
         _frlo = (_fr64 - _frhi.astype(np.float64)).astype(np.float32)
         _zero_tangent = float(_HFIELD in (geoms[int(_p[0])], geoms[int(_p[1])])
                               or 8 in (geoms[int(_p[0])], geoms[int(_p[1])]))
-        _clo_rows.append(np.concatenate((*_clo, _frlo, [_zero_tangent])).astype(np.float32))
-      pair_const_lo = np.stack(_clo_rows).reshape(-1, 17)
+        _weights = np.asarray(model.body_invweight0, dtype=np.float64)[
+            np.asarray(model.geom_bodyid)[[int(_p[0]), int(_p[1])]]].sum(axis=0)
+        _source = np.asarray([_weights[0], _weights[1], float(model.opt.impratio)])
+        _source_hi = _source.astype(np.float32)
+        _source_lo = (_source - _source_hi.astype(np.float64)).astype(np.float32)
+        _weight_words = np.column_stack((_source_hi, _source_lo)).reshape(-1)
+        _clo_rows.append(np.concatenate((*_clo, _frlo, [_zero_tangent],
+                                         _weight_words)).astype(np.float32))
+      pair_const_lo = np.stack(_clo_rows).reshape(-1, 23)
     else:
-      pair_const_lo = np.empty((0, 17), dtype=np.float32)
+      pair_const_lo = np.empty((0, 23), dtype=np.float32)
     cd = np.array([p[4] for p in pairs], dtype=np.int32)
     fr = np.array([p[5] for p in pairs], dtype=np.float32).reshape(-1, 5)
     r1 = np.where(geoms[g1] == _PLANE, -1.0, model.geom_size[g1, 0]).astype(np.float32)
@@ -1855,7 +1863,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     g1 = g2 = np.empty(0, dtype=np.int32)
     sr = np.empty((0, 2), dtype=np.float32)
     si = np.empty((0, 5), dtype=np.float32)
-    pair_const_lo = np.empty((0, 17), dtype=np.float32)
+    pair_const_lo = np.empty((0, 23), dtype=np.float32)
     cd = np.empty(0, dtype=np.int32)
     fr = np.empty((0, 5), dtype=np.float32)
     srfr = np.empty((0, 2), dtype=np.float32)
@@ -2560,7 +2568,7 @@ class MetalCoupledConstraints:
         "pair_const_lo": self._tensor(
             np.asarray(getattr(d, "pair_const_lo", None)).reshape(-1)
             if (d.npairs and getattr(d, "pair_const_lo", None) is not None)
-            else np.zeros(17, dtype=np.float32)),
+            else np.zeros(23, dtype=np.float32)),
         "pair_condim": self._tensor(d.condim if d.npairs else np.zeros(1, dtype=np.int32)),
         "pair_friction": self._tensor(d.friction.reshape(-1) if d.npairs else np.zeros(5, dtype=np.float32)),
         "pair_solreffriction": self._tensor(d.solreffriction.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
@@ -2700,6 +2708,8 @@ class MetalCoupledConstraints:
     self._aref_low_debug_offset = (
         nr * nr + 7 * nr + self._high_low_workspace_offset
         + 8 * max(nv, 1) + 2 * max(nr, 1))
+    self._regularizer_low_debug_offset = (
+        self._aref_low_debug_offset + max(nr, 1) + nv * nr)
     core_scratch = (primal_scratch_floats(
                         nv, nr, d.solver_type, 0, 0,
                         self._component_mass_storage)
@@ -2997,6 +3007,10 @@ class MetalCoupledConstraints:
     self._z_workspace_offset = debug_layout["z_workspace_offset"]
     self._high_low_workspace_offset = debug_layout["high_low_workspace_offset"]
     self._high_low_workspace_length = debug_layout["high_low_workspace_length"]
+    self._aref_low_debug_offset = (nr*nr + 7*nr + self._high_low_workspace_offset
+                                    + 8*max(nv,1) + 2*max(nr,1))
+    self._regularizer_low_debug_offset = (self._aref_low_debug_offset
+                                         + max(nr,1) + nv*nr)
     self._debug_stride = debug_layout["final_stride"]
     if self._component_operator_layout_device is not None:
       self._component_operator_armature_offset = (
@@ -3031,7 +3045,7 @@ class MetalCoupledConstraints:
     contact_jacobian_size = (b * nc * 6 * nv
                              if jacobian_layout.mode == 0 else 1)
     self._workspace = {
-        "contact_row_data": empty(b * nc * 6 * 7),
+        "contact_row_data": empty(b * nc * RECORD_WORDS),
         "contact_velocity_words": empty(2 * b * nv),
         "contact_frame": empty(b * nc * 12),
         "contact_pair_count": torch.zeros(
@@ -3096,13 +3110,14 @@ class MetalCoupledConstraints:
         "position_cache_rows": empty(b * 7 * nr),
         "position_current_aref_low": empty(b * nr),
         "position_cache_aref_low": empty(b * nr),
+        "position_cache_contact_precision": empty(b * 6 * max(nr, 1)),
         "position_cache_qvel": empty(b * nv),
         "position_refresh_old_extra_aref": empty(b * nr),
         # Source impedance is kept independently from the canonical RHS
         # slice. The latter is reused by solver dispatches and is borrowed
         # from a padded per-world debug stride.
         "position_cache_impedance": empty(b * nr),
-        "position_cache_contact_data": empty(b * nc * 42),
+        "position_cache_contact_data": empty(b * nc * RECORD_WORDS),
         "position_cache_contact_frame": empty(b * nc * 12),
         "position_cache_contact_jacobian": empty(contact_jacobian_size),
         "position_cache_slot_packed": torch.full(
@@ -3361,7 +3376,7 @@ class MetalCoupledConstraints:
         self._library.clear_contact_candidate_workspace(
             w["contact_row_data"], w["contact_frame"],
             self._constants["pair_contact_offsets_dims"],
-            threads=(b * max(nc, 1) * 42,), group_size=(128,))
+            threads=(b * max(nc, 1) * RECORD_WORDS,), group_size=(128,))
         if self._jacobian_layout.mode == 0:
           contact_width = int(nc) * 6 * int(d.nv)
           if contact_width:
@@ -3536,7 +3551,7 @@ class MetalCoupledConstraints:
             self._constants["pair_const_lo"], velocity_words,
             threads=(b * d.npairs,), group_size=(1,),
         )
-      slot_flags = w["contact_row_data"][:b * nc * 42].reshape(b, nc, 42)[:, :, 0]
+      slot_flags = axis_data(w["contact_row_data"], b, nc)[:, :, 0, 0]
       slot_maps = self._slot_compaction.run(slot_flags,
                                              world_mask=candidate_world_mask)
       w["slot_maps"] = slot_maps
@@ -3625,7 +3640,7 @@ class MetalCoupledConstraints:
     w, d = self._workspace, self.descriptor
     b, npairs, nc = self.batch_size, d.npairs, d.ncontacts_max
     mask = w["pair_mask"][: b * max(npairs, 1)].detach().cpu().numpy().reshape(b, max(npairs, 1))
-    rows = w["contact_row_data"][: b * max(nc, 1) * 42].detach().cpu().numpy().reshape(b, max(nc, 1), 6, 7)
+    rows = axis_data(w["contact_row_data"], b, max(nc, 1)).detach().cpu().numpy()
     out = []
     for env in range(b):
       m = int(np.sum(mask[env, :npairs] > 0.5)) if npairs else 0
@@ -3640,7 +3655,7 @@ class MetalCoupledConstraints:
     w = self._workspace
     nc = d.ncontacts_max
     cone_type = int(self._mjmodel_ref.opt.cone)
-    rows = w["contact_row_data"][: self.batch_size * max(nc, 1) * 42].detach().cpu().numpy().reshape(self.batch_size, max(nc, 1), 6, 7)
+    rows = axis_data(w["contact_row_data"], self.batch_size, max(nc, 1)).detach().cpu().numpy()
     out = []
     for env in range(self.batch_size):
       mask_act, slot_act = counts[env]
@@ -4011,6 +4026,11 @@ class MetalCoupledConstraints:
         width=nr, source_stride=nr, destination_stride=self._debug_stride,
         destination_offset=self._aref_low_debug_offset)
     self._copy_world_masked(
+        w["workspace_debug"], w["position_cache_contact_precision"], world_mask,
+        width=6*max(nr,1), source_stride=6*max(nr,1),
+        destination_stride=self._debug_stride,
+        destination_offset=self._regularizer_low_debug_offset)
+    self._copy_world_masked(
         w["position_current_aref_low"], w["workspace_debug"], world_mask,
         width=nr, source_stride=self._debug_stride,
         destination_stride=nr, source_offset=self._aref_low_debug_offset)
@@ -4251,6 +4271,9 @@ class MetalCoupledConstraints:
                      self._aref_low_debug_offset + nr]
     w["position_current_aref_low"].view(b, nr).copy_(low_aref)
     w["position_cache_aref_low"].view(b, nr).copy_(low_aref)
+    precision_offset = self._regularizer_low_debug_offset
+    w["position_cache_contact_precision"].view(b,6*max(nr,1)).copy_(
+        debug[:,precision_offset:precision_offset+6*max(nr,1)])
     w["position_cache_contact_data"].copy_(w["contact_row_data"])
     w["position_cache_contact_frame"].copy_(w["contact_frame"])
     if getattr(getattr(self, "_jacobian_layout", None), "mode", 0) == 0:
@@ -4465,6 +4488,11 @@ class MetalCoupledConstraints:
         w["workspace_debug"], w["position_cache_aref_low"], world_mask,
         width=nr, source_stride=nr, destination_stride=self._debug_stride,
         destination_offset=self._aref_low_debug_offset)
+    self._copy_world_masked(
+        w["workspace_debug"], w["position_cache_contact_precision"], world_mask,
+        width=6*max(nr,1), source_stride=6*max(nr,1),
+        destination_stride=self._debug_stride,
+        destination_offset=self._regularizer_low_debug_offset)
     self._copy_world_masked(
         w["position_current_aref_low"], w["workspace_debug"], world_mask,
         width=nr, source_stride=self._debug_stride,
@@ -4783,7 +4811,7 @@ class MetalCoupledConstraints:
         "contact_condim": self._constants["contact_condim"][:nc * 3],
     })
     if nc:
-      contact_rows = w["contact_row_data"][:b * nc * 42].reshape(b, nc, 6, 7)
+      contact_rows = axis_data(w["contact_row_data"], b, nc)
       contact_frames = w["contact_frame"][:b * nc * 12].reshape(b, nc, 12)
       contact_forces = w["out_contact_force"][:b * nc * 11].reshape(b, nc, 11)
       contact_jacobians = (
@@ -5115,6 +5143,9 @@ class MetalCoupledConstraints:
       self._fill_world_masked(
           w["workspace_debug"], world_mask, width=nr,
           stride=self._debug_stride, offset=self._aref_low_debug_offset)
+    self._fill_world_masked(w["workspace_debug"], world_mask,
+        width=6*max(nr,1), stride=self._debug_stride,
+        offset=self._regularizer_low_debug_offset)
     # Activity in this slice marks rows preassembled by the current tendon,
     # equality, or flex producers. It also feeds the solver's tendon-row
     # ownership test. Clear the previous assembly's bitmap before any
@@ -5635,7 +5666,7 @@ class MetalCoupledConstraints:
         "contact_condim": self._constants["contact_condim"][:nc * 3],
     })
     if nc > 0:
-      contact_rows = w["contact_row_data"][: b * nc * 6 * 7].reshape(b, nc, 6, 7)
+      contact_rows = axis_data(w["contact_row_data"], b, nc)
       contact_frames = w["contact_frame"][: b * nc * 12].reshape(b, nc, 12)
       contact_forces = w["out_contact_force"][: b * nc * 11].reshape(b, nc, 11)
       contact_jacobians = (
@@ -5737,6 +5768,8 @@ class MetalCoupledConstraints:
         impratio=float(d.impratio))
     debug = w["workspace_debug"].reshape(b, self._debug_stride)
     debug[:, nr * nr:nr * nr + nr].copy_(result["R"])
+    debug[:,self._regularizer_low_debug_offset:
+          self._regularizer_low_debug_offset+max(nr,1)].zero_()
     # Normalize the component solver's per-component failures to the
     # world-status ABI consumed by the prepared stage coordinator.
     return {**result, "mass_status": mass_status,
@@ -5946,7 +5979,7 @@ class MetalCoupledConstraints:
         "contact_condim": self._constants["contact_condim"][:nc * 3],
     })
     if nc:
-      rows = w["contact_row_data"][:b * nc * 42].reshape(b, nc, 6, 7)
+      rows = axis_data(w["contact_row_data"], b, nc)
       frames = w["contact_frame"][:b * nc * 12].reshape(b, nc, 12)
       result.update({
           "contact_mask": rows[:, :, 0, 0],

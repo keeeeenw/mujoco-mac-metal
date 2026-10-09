@@ -36,7 +36,7 @@ def test_workspace_mirror_is_byte_exact_cpu():
   parts, total = estimate_workspace(nv=1, npairs=1, nslots=2, nr=3,
                                     nr_joint=1, neq=0, batch=2)
   by_name = dict(parts)
-  assert by_name["contact_row_data"] == 2 * 2 * 42 * 4
+  assert by_name["contact_row_data"] == 2 * 2 * 60 * 4
   assert by_name["contact_frame"] == 2 * 2 * 12 * 4
   assert by_name["contact_jacobian"] == 2 * 2 * 6 * 1 * 4
   assert by_name["pair_mask"] == 2 * 1 * 4
@@ -52,10 +52,10 @@ def test_workspace_mirror_is_byte_exact_cpu():
   # This is a one-DOF, three-row PGS fixture.  The tail includes the dynamic
   # row/cone metadata (12 words per row), the retained J-transpose solve
   # block (nv*nr), island/equality workspaces, and the dense factor backing.
-  # The independent high/low tail adds 8*nv + 3*nr words (17 here),
+  # The independent high/low tail adds 8*nv + 9*nr words (35 here),
   # including the retained aref residual row. Keep this expected
   # arithmetic independent of the estimator helper.
-  assert by_name["workspace_debug"] == 2 * (9 + 21 + 107 + 17 + 3) * 4
+  assert by_name["workspace_debug"] == 2 * (9 + 21 + 107 + 35 + 3) * 4
   assert by_name["out_force"] == 2 * 1 * 4
   assert by_name["out_acc"] == 2 * 2 * 1 * 4
   assert by_name["out_status"] == 2 * 4
@@ -379,7 +379,7 @@ def test_runtime_paired_buffers_match_estimates_gpu():
 def test_pair_const_lo_envelope_host_cpu():
   # Host-only envelope proof (no device): lowering owns the per-pair
   # constant residuals (17 words: solref/solimp/margin-gap/solreffriction
-  # lows); the estimate must count exactly max(npairs*17, 17) words with
+  # lows); the estimate must count exactly max(npairs*23, 23) words with
   # an 17-word sentinel at zero pairs, batch-independently, and a budget
   # below the full envelope must reject before allocation.
   import sys
@@ -392,14 +392,14 @@ def test_pair_const_lo_envelope_host_cpu():
     model = _plugin_sphere_model(name)
     desc = lower_coupled_constraints(model)
     assert desc.pair_const_lo is not None
-    assert desc.pair_const_lo.shape == (int(desc.npairs), 17)
+    assert desc.pair_const_lo.shape == (int(desc.npairs), 23)
     assert desc.pair_const_lo.dtype == np.float32
     for batch in (1, 2):
       est = estimate_capacity(
           model, batch, desc.npairs, desc.ncontacts_max, desc.nr)
       by_name = dict(est.memory_breakdown)
       assert by_name["pair_const_lo"] == max(
-          int(desc.npairs) * 17, 17) * 4
+          int(desc.npairs) * 23, 23) * 4
       parts, _ = estimate_workspace(
           nv=6, npairs=int(desc.npairs), nslots=8, nr=16,
           nr_joint=8, neq=0, batch=batch)
@@ -410,9 +410,9 @@ def test_pair_const_lo_envelope_host_cpu():
       "</worldbody></mujoco>")
   desc0 = lower_coupled_constraints(m)
   assert desc0.npairs == 0
-  assert desc0.pair_const_lo.shape == (0, 17)
+  assert desc0.pair_const_lo.shape == (0, 23)
   est0 = estimate_capacity(m, 1, 0, 0, 0)
-  assert dict(est0.memory_breakdown)["pair_const_lo"] == 68
+  assert dict(est0.memory_breakdown)["pair_const_lo"] == 92
   # Budget below full envelope rejects (covers the new words).
   full = est0.memory_bytes
   with pytest.raises(CapacityOverflow, match="memory"):
@@ -444,10 +444,10 @@ def test_pair_const_lo_runtime_inventory_matches_estimates_gpu():
       by_name = dict(est.memory_breakdown)
       actual = cc._constants["pair_const_lo"].numel() * 4
       assert by_name["pair_const_lo"] == actual == max(
-          int(cc.descriptor.npairs) * 17, 17) * 4
+          int(cc.descriptor.npairs) * 23, 23) * 4
   # Zero-pair sentinel runtime padding.
   m = mujoco.MjModel.from_xml_string(
       "<mujoco><worldbody><geom name='floor' type='plane' size='5 5 0.1'/>"
       "</worldbody></mujoco>")
   cc0 = MetalCoupledConstraints(m, batch_size=1)
-  assert cc0._constants["pair_const_lo"].numel() == 17
+  assert cc0._constants["pair_const_lo"].numel() == 23

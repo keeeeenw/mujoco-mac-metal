@@ -62,7 +62,7 @@ def test_pgs_rhs_delassus_multiplier_and_force_pairs_match_float64_oracle():
 def test_pgs_pair_rows_use_disjoint_accounted_solver_tail():
   nv, nr = 9, 37
   layout = solver_debug_layout(nv, nr, 0)
-  expected_length = 8 * nv + 3 * nr + nv * nr
+  expected_length = 8 * nv + 9 * nr + nv * nr
   assert layout["high_low_workspace_length"] == expected_length
   start = layout["high_low_workspace_offset"]
   qacc_smooth_low = (start + 7 * nv, nv)
@@ -72,7 +72,7 @@ def test_pgs_pair_rows_use_disjoint_accounted_solver_tail():
   assert qacc_smooth_low[0] + qacc_smooth_low[1] == rhs_low[0]
   assert rhs_low[0] + rhs_low[1] == lambda_low[0]
   assert lambda_low[0] + lambda_low[1] == aref_low[0]
-  assert aref_low[0] + aref_low[1] + nv * nr == start + expected_length
+  assert aref_low[0] + aref_low[1] + nv * nr + 6 * nr == start + expected_length
 
   shader = Path(__file__).parents[1] / "mujoco_metal" / "shaders" / "coupled_constraints.metal"
   source = shader.read_text()
@@ -217,6 +217,7 @@ def test_cached_dense_pgs_dispatch_binds_prepared_high_low_pair(monkeypatch):
   solver._primal_scratch_floats = nv
   solver._qacc_warmstart_offset = 0
   solver._aref_low_debug_offset = 0
+  solver._regularizer_low_debug_offset = 0
   solver._jacobian_layout = SimpleNamespace(mode=1)
   solver._jacobian_pattern = None
   solver._line_search_iterations = 6
@@ -237,6 +238,7 @@ def test_cached_dense_pgs_dispatch_binds_prepared_high_low_pair(monkeypatch):
       "position_cache_qvel": f32(batch * nv),
       "position_cache_rows": f32(0), "position_cache_impedance": f32(0),
       "position_cache_aref_low": f32(0),
+      "position_cache_contact_precision": f32(6),
       "position_current_aref_low": f32(0),
       "position_context_zero": f32(0),
       "position_extra_aref": f32(0),
@@ -329,6 +331,7 @@ def test_default_dense_pgs_dispatch_binds_prepared_high_low_pair(monkeypatch):
   solver._primal_scratch_floats = nv
   solver._qacc_warmstart_offset = 0
   solver._aref_low_debug_offset = 0
+  solver._regularizer_low_debug_offset = 0
   solver._jacobian_layout = SimpleNamespace(mode=1)
   solver._jacobian_pattern = None
   solver._line_search_iterations = 6

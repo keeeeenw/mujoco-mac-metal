@@ -528,7 +528,8 @@ def test_cached_constraint_position_backings_have_exact_capacity_rows():
   assert sizes["position_cache_J"] == 2 * (12 + 2 * 5 * 4) * 4
   assert sizes["position_cache_rows"] == 2 * 7 * 5 * 4
   assert sizes["position_cache_impedance"] == 2 * 5 * 4
-  assert sizes["position_cache_contact_data"] == 2 * 3 * 42 * 4
+  assert sizes["position_cache_contact_data"] == 2 * 3 * 60 * 4
+  assert sizes["position_cache_contact_precision"] == 2 * 6 * 5 * 4
   assert sizes["position_cache_contact_frame"] == 2 * 3 * 12 * 4
   assert sizes["position_cache_contact_jacobian"] == 2 * 3 * 6 * 4 * 4
   assert sizes["position_cache_cvel"] == 2 * 2 * 6 * 4
@@ -759,14 +760,14 @@ def estimate_workspace_expected(model, batch, npairs, nslots, nr,
   b, v = batch, max(int(model.nv), 1)
   nc = nslots
   sizes = (
-      max(b * nc * 42, 1), max(b * nc * 12, 1),
+      max(b * nc * 60, 1), max(b * nc * 12, 1),
       max(b * nc * 6 * v, 1), max(b * max(npairs, 1), 1),
       # Production coupled records are always paired (high + low planes).
       max(b * (12 + 2 * nr * v), 1), max(b * nr, 1), max(b * (nr * nr + 7 * nr
                                     + primal_scratch_floats(
                                         v, nr, model.opt.solver, model.ntree,
                                         model.nbody, mass_storage)
-                                    + 8 * v + 3 * max(nr, 1) + int(model.nv) * nr), 1),
+                                    + 8 * v + 9 * max(nr, 1) + int(model.nv) * nr), 1),
       22 + 6 + v + 10 * nr + 20,
       max(b * v, 1), max(2 * b * int(model.nv), 1), b, max(b * 10, 1),
       max(b * nc * 11, 1), max(b, 1), max(b, 1), max(b, 1),

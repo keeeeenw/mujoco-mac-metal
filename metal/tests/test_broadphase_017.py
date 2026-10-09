@@ -76,7 +76,7 @@ def test_mask_matches_cpu_sphere_superset_and_deterministic_gpu():
         expect = float(np.linalg.norm(xp[a] - xp[b]) <= R)
       assert float(mask[w, p] > 0.5) == expect, (w, p)
   # Superset: every slot-active pair is mask-active.
-  rows = cc._workspace["contact_row_data"][: 2 * d.ncontacts_max * 42].cpu().numpy().reshape(2, d.ncontacts_max, 6, 7)
+  rows = cc._workspace["contact_row_data"][: 2 * d.ncontacts_max * 60].cpu().numpy().reshape(2,d.ncontacts_max,60)[:, :, :42].reshape(2,d.ncontacts_max,6,7)
   off = np.asarray(d.pair_contact_offset, dtype=int)
   for w in range(2):
     for p in range(d.npairs):
@@ -168,7 +168,7 @@ def test_pruned_slots_publish_empty_records_and_frames_gpu():
   cc = sim._coupled_constraints
   nc = cc.descriptor.ncontacts_max
   frame = cc._workspace["contact_frame"][:nc * 12].cpu().numpy().reshape(nc, 12)
-  rows = cc._workspace["contact_row_data"][:nc * 42].cpu().numpy().reshape(nc, 6, 7)
+  rows = cc._workspace["contact_row_data"][:nc * 60].cpu().numpy().reshape(nc,60)[:, :42].reshape(nc,6,7)
   active = rows[:, 0, 0] > 0.5
   assert int(active.sum()) >= 1  # the pressed pair is active
   assert np.all(frame[~active] == 0)

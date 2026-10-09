@@ -32,7 +32,7 @@ def test_tail_structure_and_refinement_footprint_cpu():
       # Pair tail is exactly rhs_lo(nr) + lambda_lo(nr) + aref_lo(nr) after
       # eight DOF planes; Newton/CG refinement needs 3nv words of the
       # Newton core (v pair + temp pair) for every solver type it runs on.
-      assert lay["high_low_workspace_length"] == 8 * v + 3 * r + nv * nr
+      assert lay["high_low_workspace_length"] == 8 * v + 9 * r + nv * nr
       if int(solver) in (int(mujoco.mjtSolver.mjSOL_CG),
                          int(mujoco.mjtSolver.mjSOL_NEWTON)):
         core = {"CG": 13 * v + 5 * r, "Newton": 16 * v + 5 * r}[
@@ -43,7 +43,7 @@ def test_tail_structure_and_refinement_footprint_cpu():
       assert lay["base_stride"] > 0 and lay["final_stride"] > lay["base_stride"]
   # Zero-row/contact guards stay nonzero (one-element sentinels).
   lay = solver_debug_layout(0, 0, int(mujoco.mjtSolver.mjSOL_NEWTON))
-  assert lay["high_low_workspace_length"] == 8 + 3
+  assert lay["high_low_workspace_length"] == 8 + 9
   # Signed-int32 overflow still fails closed.
   with pytest.raises(Exception):
     solver_debug_layout(50000, 50000, int(mujoco.mjtSolver.mjSOL_NEWTON))
@@ -79,7 +79,7 @@ def test_aref_low_survives_newton_solve_gpu():
   cc = sim._coupled_constraints
   nv, nr = model.nv, cc.descriptor.nr
   nslots = int(cc.descriptor.ncontacts_max)
-  rd = cc._workspace["contact_row_data"].cpu().numpy().reshape(nslots, 6, 7)
+  rd = cc._workspace["contact_row_data"].cpu().numpy().reshape(nslots,60)[:, :42].reshape(nslots,6,7)
   dbg = cc._workspace["workspace_debug"].cpu().numpy()
   base = (nr * nr + 7 * nr + cc._high_low_workspace_offset
           + 8 * max(nv, 1) + 2 * max(nr, 1))

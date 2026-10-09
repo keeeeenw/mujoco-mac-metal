@@ -2754,7 +2754,7 @@ class MetalSimulation:
       ])
       if d.nc > 0:
         entries.extend([
-            {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max}, 6, 7)", "dtype": "float32"},
+            {"name": "contact_row_data", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max}, 60)", "dtype": "float32"},
             {"name": "contact_jacobian", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max}, 5, {d.nv})", "dtype": "float32"},
             {"name": "out_contact_force", "residency": "MPS device-resident", "lifetime": "preallocated workspace", "shape": f"({b}, {d.ncontacts_max * 5})", "dtype": "float32"},
         ])
@@ -3680,7 +3680,8 @@ class MetalSimulation:
       return None
     w = cc._workspace
     b = self.batch_size
-    row_data = w["contact_row_data"][: b * nc * 42].reshape(b, nc, 6, 7)
+    from mujoco_metal.contact_precision import RECORD_WORDS, axis_data
+    row_data = axis_data(w["contact_row_data"], b, nc)
     return {
         "frame": w["contact_frame"][: b * nc * 12].reshape(b, nc, 12),
         "force": w["out_contact_force"][: b * nc * 11].reshape(b, nc, 11),
@@ -3689,7 +3690,7 @@ class MetalSimulation:
         # Spatial contact sensors also consume the source distance. Keep the
         # complete contiguous canonical record distinct from the compact
         # activity view consumed by RNE and touch-grid paths.
-        "records": row_data.reshape(b, nc, 42),
+        "records": w["contact_row_data"][:b*nc*RECORD_WORDS].reshape(b,nc,RECORD_WORDS),
         "packed": cc._constants["contact_condim"].reshape(-1),
         "contact_condim": cc._constants["contact_condim"].reshape(nc, 3),
         "mu": cc._constants["contact_friction"].reshape(nc, 5),

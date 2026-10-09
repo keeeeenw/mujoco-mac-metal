@@ -79,7 +79,7 @@ def _check_variant(xml, qpos=None, qvel=None, batch=1, etier=5e-9,
           int(d.contact[c].efc_address)) for c in range(d.ncon)]
   assert len(cpu) == d.ncon and d.ncon > 0
   rdb = cc._workspace["contact_row_data"].cpu().numpy().reshape(
-      batch, nslots, 6, 7)
+      batch, nslots, 60)[:, :, :42].reshape(batch, nslots, 6, 7)
   rec = cc._workspace["contact_pair_records"].cpu().numpy().reshape(
       batch, nslots, 37)
   worst = 0.0
@@ -329,7 +329,7 @@ def _check_variant_xml(model, etier, ftier=1e-4):
       sim.state.status.cpu().numpy()).ravel()[0]) == 0
   cc = sim._coupled_constraints
   nslots = int(cc.descriptor.ncontacts_max)
-  rd = cc._workspace["contact_row_data"].cpu().numpy().reshape(nslots, 6, 7)
+  rd = cc._workspace["contact_row_data"].cpu().numpy().reshape(nslots,60)[:, :42].reshape(nslots,6,7)
   npos = np.asarray(s["contact_position"][0].cpu().numpy())
   mask = np.asarray(s["contact_mask"][0].cpu().numpy())
   d = mujoco.MjData(model)
@@ -397,7 +397,7 @@ def _check_shallow(model, etier):
       sim.state.status.cpu().numpy()).ravel()[0]) == 0
   cc = sim._coupled_constraints
   nslots = int(cc.descriptor.ncontacts_max)
-  rd = cc._workspace["contact_row_data"].cpu().numpy().reshape(nslots, 6, 7)
+  rd = cc._workspace["contact_row_data"].cpu().numpy().reshape(nslots,60)[:, :42].reshape(nslots,6,7)
   npos = np.asarray(s["contact_position"][0].cpu().numpy())
   mask = np.asarray(s["contact_mask"][0].cpu().numpy())
   d.qpos[:] = qp32

@@ -92,6 +92,7 @@ def _run_device_cpu_standin(torch, kind, endpoint):
   cc._line_search_iterations = 3
   cc._debug_stride = 40
   cc._aref_low_debug_offset = nr * nr + 7 * nr + 8 * max(nv, 1) + 2 * max(nr, 1)
+  cc._regularizer_low_debug_offset = cc._aref_low_debug_offset + max(nr, 1) + nv * nr
   cc._debug_prefix = nr * nr + 7 * nr
   cc._primal_scratch_floats = 4
   cc._solver_island_awake_offset = 0
@@ -243,8 +244,9 @@ def test_refresh_velocity_context_restores_captured_rows_without_a_solver():
   cc._position_context_valid = True
   cc._position_context_epoch = 4
   cc._position_context_eq_jdot_inputs_valid = False
-  cc._debug_stride = 12
+  cc._debug_stride = 18
   cc._aref_low_debug_offset = 8
+  cc._regularizer_low_debug_offset = 12
   cc._constants = {
       "row_velocity_scale_low": torch.zeros((1,)),
       "solver_dims": torch.zeros((32,), dtype=torch.int32),
@@ -252,9 +254,10 @@ def test_refresh_velocity_context_restores_captured_rows_without_a_solver():
   cc._workspace = {
       "workspace_J": torch.full((1,), -1.0),
       "position_cache_J": torch.tensor([2.0]),
-      "workspace_debug": torch.full((12,), -3.0),
+      "workspace_debug": torch.full((18,), -3.0),
       "position_cache_rows": torch.tensor([1., 2., 3., 4., 5., 6., 7.]),
       "position_cache_aref_low": torch.tensor([.125]),
+      "position_cache_contact_precision": torch.arange(6, dtype=torch.float32),
       "position_current_aref_low": torch.tensor([0.]),
       "position_cache_qvel": torch.tensor([.1]),
       "position_qvel": torch.tensor([0.]),
@@ -300,6 +303,8 @@ def test_refresh_velocity_context_restores_captured_rows_without_a_solver():
   torch.testing.assert_close(cc._workspace["workspace_debug"][1:8],
                              torch.tensor([1., 2., 3., 4., 5., 6., 7.]))
   torch.testing.assert_close(cc._workspace["contact_row_data"], torch.tensor([8.]))
+  torch.testing.assert_close(cc._workspace["workspace_debug"][12:18],
+                             torch.arange(6, dtype=torch.float32))
   torch.testing.assert_close(cc._workspace["contact_frame"], torch.tensor([9.]))
   torch.testing.assert_close(cc._workspace["contact_jacobian"], torch.tensor([10.]))
 
@@ -313,9 +318,10 @@ def test_cached_aref_low_refresh_uses_new_velocity_delta_and_retained_pos():
   cc._device = torch.device("cpu")
   cc.batch_size = 1
   cc.descriptor = SimpleNamespace(nv=2, nr=1)
-  cc._debug_stride = 32
+  cc._debug_stride = 40
   cc._aref_low_debug_offset = 24
-  debug = torch.zeros((32,), dtype=torch.float32)
+  cc._regularizer_low_debug_offset = 28
+  debug = torch.zeros((40,), dtype=torch.float32)
   debug[1] = 1.0  # canonical row active
   debug[2] = .65  # refreshed high-word ar
   cc._workspace = {
@@ -325,6 +331,7 @@ def test_cached_aref_low_refresh_uses_new_velocity_delta_and_retained_pos():
       "position_context": torch.tensor([1., 1.5, .9, .2, 0.]),
       "position_cache_rows": torch.tensor([2., .75, 0., 0., -1., 1., 1.]),
       "position_cache_aref_low": torch.tensor([.125]),
+      "position_cache_contact_precision": torch.arange(6, dtype=torch.float32),
       "position_current_aref_low": torch.zeros((1,)),
   }
   cc._constants = {
@@ -471,11 +478,13 @@ def test_capture_position_context_retains_aref_low_and_current_qvel():
   cc._position_context_epoch = 3
   cc._position_context_eq_jdot_inputs_valid = False
   cc._position_current_eq_jdot_inputs_valid = False
-  cc._debug_stride = 32
+  cc._debug_stride = 40
   cc._aref_low_debug_offset = 24
-  debug = torch.zeros((32,), dtype=torch.float32)
+  cc._regularizer_low_debug_offset = 28
+  debug = torch.zeros((40,), dtype=torch.float32)
   debug[2] = .625
   debug[24] = .125
+  debug[28:34] = torch.arange(6, dtype=torch.float32) * .03125
   w = {
       "position_current_qvel": torch.tensor([.25, -.5]),
       "position_qvel": torch.zeros((2,)),
@@ -507,6 +516,7 @@ def test_capture_position_context_retains_aref_low_and_current_qvel():
       "position_cache_impedance": torch.zeros((1,)),
       "position_current_aref_low": torch.zeros((1,)),
       "position_cache_aref_low": torch.zeros((1,)),
+      "position_cache_contact_precision": torch.zeros((6,)),
       "position_cache_qvel": torch.zeros((2,)),
       "contact_row_data": torch.zeros((6,)),
       "position_cache_contact_data": torch.zeros((6,)),
@@ -533,6 +543,8 @@ def test_capture_position_context_retains_aref_low_and_current_qvel():
   assert cc._position_context_valid
   torch.testing.assert_close(w["position_cache_qvel"], torch.tensor([.25, -.5]))
   torch.testing.assert_close(w["position_cache_aref_low"], torch.tensor([.125]))
+  torch.testing.assert_close(w["position_cache_contact_precision"],
+                             torch.arange(6, dtype=torch.float32) * .03125)
   torch.testing.assert_close(w["position_current_aref_low"], torch.tensor([.125]))
   torch.testing.assert_close(context["position_context"], position)
   torch.testing.assert_close(context["surface_velocity"], surface)
