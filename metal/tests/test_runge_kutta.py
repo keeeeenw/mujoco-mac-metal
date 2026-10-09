@@ -251,6 +251,9 @@ def test_cpu_reset_orchestration_matches_pinned_cold_defaults_without_torch():
     def view(self, *shape):
       return TensorView(self.array.reshape(*shape))
 
+    def __getitem__(self, index):
+      return TensorView(self.array[index])
+
     def expand_as(self, other):
       return TensorView(np.broadcast_to(self.array, other.array.shape))
 

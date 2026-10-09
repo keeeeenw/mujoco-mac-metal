@@ -1584,6 +1584,18 @@ class MetalSimulation:
       self._sleep_reset_body_quat = torch.as_tensor(
           np.asarray(reset_data.xquat, dtype=np.float32).copy(),
           dtype=torch.float32, device=self._state._device)
+      # Retained FK comparisons consume all three words. Seed the residual
+      # planes too: the output arena is uninitialized and compiled reference
+      # poses need not be exactly representable by a single float32 word.
+      for name, values in (("pos", reset_data.xpos),
+                           ("quat", reset_data.xquat)):
+        source = np.asarray(values, dtype=np.float64)
+        high = source.astype(np.float32).astype(np.float64)
+        low = (source - high).astype(np.float32)
+        tail = (source - high - low.astype(np.float64)).astype(np.float32)
+        for suffix, plane in (("low", low), ("tail", tail)):
+          setattr(self, f"_sleep_reset_body_{name}_{suffix}", torch.as_tensor(
+              plane.copy(), dtype=torch.float32, device=self._state._device))
       self._seed_sleep_fk_reference()
       self._sleep_dof_treeid = torch.as_tensor(
           np.asarray(model.dof_treeid, dtype=np.int32).copy(),
@@ -6332,20 +6344,26 @@ class MetalSimulation:
     if scheduler is None or not hasattr(self, "_sleep_reset_body_pos"):
       return
     outputs = self._smooth._fk._workspace["outputs"]
-    body_pos = outputs["body_pos"].view(
-        self.batch_size, int(self._mjmodel.nbody), 3)
-    body_quat = outputs["body_quat"].view(
-        self.batch_size, int(self._mjmodel.nbody), 4)
     if env_ids is None:
-      body_pos.copy_(self._sleep_reset_body_pos.expand_as(body_pos))
-      body_quat.copy_(self._sleep_reset_body_quat.expand_as(body_quat))
-      return
-    rows = np.asarray(env_ids, dtype=np.int64).reshape(-1)
-    if rows.size and (np.any(rows < 0) or np.any(rows >= self.batch_size)):
-      raise IndexError("sleep FK reference environment index is outside batch")
-    for world in rows.tolist():
-      body_pos[world].copy_(self._sleep_reset_body_pos)
-      body_quat[world].copy_(self._sleep_reset_body_quat)
+      rows = None
+    else:
+      rows = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+      if rows.size and (np.any(rows < 0) or np.any(rows >= self.batch_size)):
+        raise IndexError("sleep FK reference environment index is outside batch")
+    for name, width in (("pos", 3), ("quat", 4)):
+      for suffix in ("", "_low", "_tail"):
+        key = f"body_{name}{suffix}"
+        if key not in outputs:
+          continue  # High-only host test doubles do not own residual planes.
+        destination = outputs[key].view(
+            self.batch_size, int(self._mjmodel.nbody), width)
+        source = getattr(self, f"_sleep_reset_body_{name}{suffix}", None)
+        selected = (range(self.batch_size) if rows is None else rows.tolist())
+        for world in selected:
+          if source is None:
+            destination[world].zero_()
+          else:
+            destination[world].copy_(source)
 
   def _probe_sleep_pose_mismatch(self, qpos, qvel, *, mocap_pos=None,
                                  mocap_quat=None, pose_status=None):

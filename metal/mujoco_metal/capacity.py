@@ -919,6 +919,9 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
     # model-sized and reused by full and selected-environment resets.
     parts.append(("simulation.sleep_reset_body_pos", max(nb * 3, 1)))
     parts.append(("simulation.sleep_reset_body_quat", max(nb * 4, 1)))
+    for suffix in ("low", "tail"):
+      parts.append((f"simulation.sleep_reset_body_pos_{suffix}", max(nb * 3, 1)))
+      parts.append((f"simulation.sleep_reset_body_quat_{suffix}", max(nb * 4, 1)))
 
   # The signed Euler LDL helper has a private dense factor/solve workspace;
   # its awake IDs and [B,3] counts are prepared once and passed to the shader

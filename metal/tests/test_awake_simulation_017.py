@@ -321,6 +321,11 @@ def test_sleep_refresh_gates_stateful_plugins_by_world_and_sensor_stage():
       import torch
       self.calls.copy_(torch.where(mask, self.calls, value['calls']))
       self.stage_error.copy_(torch.where(mask, self.stage_error, value['stage_error']))
+    def reset_masked(self, mask):
+      import torch
+      self.calls.copy_(torch.where(mask, torch.zeros_like(self.calls), self.calls))
+      self.stage_error.copy_(torch.where(mask, torch.zeros_like(self.stage_error),
+                                        self.stage_error))
   xml = SENSOR_SLEEP_XML.replace('</sensor>',
       '<user name="sleep_pos" dim="1" needstage="pos"/>'
       '<user name="sleep_vel" dim="1" needstage="vel"/>'
@@ -350,3 +355,38 @@ def test_sleep_refresh_gates_stateful_plugins_by_world_and_sensor_stage():
   finally:
     for plugin in plugins:
       default_registry.unregister(plugin.name, plugin.plugin_type)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+def test_sleep_reference_reseeds_all_words_and_only_selected_worlds():
+  from mujoco_metal import MetalSimulation
+  xml = SENSOR_SLEEP_XML.replace('</worldbody>',
+      '<body sleep="init" pos="2.01 .31 -.17" euler="13 27 -19">'
+      '<joint type="slide"/><geom size=".1" mass="1"/>'
+      '</body></worldbody>')
+  model = mujoco.MjModel.from_xml_string(xml)
+  cpu = mujoco.MjData(model)
+  sim = MetalSimulation(model, 2, qvel=np.zeros((2, model.nv), np.float32),
+                        profile="integrated_scalable_v1")
+  outputs = sim._smooth._fk._workspace["outputs"]
+  for name, width, expected in (("pos", 3, cpu.xpos), ("quat", 4, cpu.xquat)):
+    buffers = [outputs[f"body_{name}" + suffix].view(2, model.nbody, width)
+               for suffix in ("", "_low", "_tail")]
+    # Deterministically reproduce stale arena words, independent of allocator
+    # contents. Reseeding must replace every word, not just the high plane.
+    for buffer in buffers:
+      buffer.fill_(.125)
+    sim._seed_sleep_fk_reference(env_ids=[0])
+    represented = sum(buffer[0].cpu().double().numpy() for buffer in buffers)
+    np.testing.assert_array_equal(represented, expected)
+    for buffer in buffers:
+      np.testing.assert_array_equal(buffer[1].cpu().numpy(), .125)
+  sim._seed_sleep_fk_reference()
+  sim.step()
+  mujoco.mj_step(model,cpu)
+  np.testing.assert_array_equal(sim._sleep_schedule.tree_state.cpu().numpy(),
+                                np.stack([cpu.tree_asleep, cpu.tree_asleep]))
+  np.testing.assert_allclose(sim.step_sensordata(),
+                             np.stack([cpu.sensordata, cpu.sensordata]),
+                             atol=2e-6,rtol=2e-5)
