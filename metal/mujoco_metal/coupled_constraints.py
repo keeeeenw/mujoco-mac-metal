@@ -3713,7 +3713,8 @@ class MetalCoupledConstraints:
         "dims": self._constants["body_dims"],
     }
 
-  def _write_jacobian_rows(self, row_start, source_rows, *, active=None):
+  def _write_jacobian_rows(self, row_start, source_rows, *, active=None,
+                           world_mask=None):
     """Copy one producer-local row block into canonical J storage.
 
     Sparse profiles gather only compiled support columns from the producer's
@@ -3738,20 +3739,30 @@ class MetalCoupledConstraints:
       packed_jacobian_scatter_rows_torch(
           torch, w["workspace_J"], b, self._jacobian_layout,
           self._jacobian_pattern, source_rows, row_start,
-          row_count=count, active=active)
-      self._zero_jacobian_lo_rows(
-          torch, w, b, self._jacobian_layout, self._jacobian_pattern,
-          row_start, row_start + count)
+          row_count=count, active=active, world_mask=world_mask)
+      if world_mask is None:
+        self._zero_jacobian_lo_rows(
+            torch, w, b, self._jacobian_layout, self._jacobian_pattern,
+            row_start, row_start + count)
+      elif self._jacobian_layout.paired:
+        first = int(self._jacobian_pattern.row_offsets[row_start])
+        last = int(self._jacobian_pattern.row_offsets[row_start + count])
+        self._fill_world_masked(
+            w["workspace_J"], world_mask, width=last - first,
+            stride=self._jacobian_layout.stride_words,
+            offset=self._jacobian_layout.lo_values_offset() + first)
       return
     values = source_rows if active is None else source_rows * active.unsqueeze(-1)
     layout = self._jacobian_layout
-    for world in range(b):
-      base = world * layout.stride_words + layout.values_offset
-      begin = base + row_start * nv
-      end = begin + count * nv
-      w["workspace_J"][begin:end].copy_(values[world].reshape(-1))
-      if layout.paired:
-        w["workspace_J"][begin + layout.nnz:end + layout.nnz].zero_()
+    self._copy_world_masked(
+        w["workspace_J"], values.contiguous(), world_mask, width=count * nv,
+        source_stride=count * nv, destination_stride=layout.stride_words,
+        destination_offset=layout.values_offset + row_start * nv)
+    if layout.paired:
+      self._fill_world_masked(
+          w["workspace_J"], world_mask, width=count * nv,
+          stride=layout.stride_words,
+          offset=layout.lo_values_offset() + row_start * nv)
     return
 
   @staticmethod
@@ -5063,7 +5074,9 @@ class MetalCoupledConstraints:
     # Snapshot current assembly inputs only after all motion and equality
     # inputs pass host-side validation. These writes are isolated from an
     # already retained position_cache_* epoch.
-    self._workspace["position_current_qvel"].view(b, nv).copy_(qvel)
+    self._copy_world_masked(
+        w["position_current_qvel"], qvel, world_mask, width=nv,
+        source_stride=nv, destination_stride=nv)
     for source, current, shape in (
         (cvel, "position_current_cvel", (b, d.nbody, 6)),
         (cdof, "position_current_cdof", (b, d.nv, 6)),
@@ -5076,12 +5089,18 @@ class MetalCoupledConstraints:
     ):
       destination = self._workspace[current]
       count = int(np.prod(shape))
-      if source is None or count == 0:
-        destination.zero_()
-      else:
-        destination[:count].copy_(source.reshape(-1))
-    self._workspace["position_current_eq_active"].copy_(
-        eq_active_tensor.reshape(-1))
+      width = count // b
+      if source is None:
+        self._fill_world_masked(
+            destination, world_mask, width=width, stride=width)
+      elif width:
+        self._copy_world_masked(
+            destination, source.contiguous(), world_mask, width=width,
+            source_stride=width, destination_stride=width)
+    eq_width = int(eq_active_tensor.numel()) // b
+    self._copy_world_masked(
+        w["position_current_eq_active"], eq_active_tensor, world_mask,
+        width=eq_width, source_stride=eq_width, destination_stride=eq_width)
     self._position_current_eq_jdot_inputs_valid = bool(
         has_differential_eq and cvel is not None and cdof is not None
         and cdof_dot is not None)
@@ -5093,36 +5112,60 @@ class MetalCoupledConstraints:
         + self._primal_scratch_floats - max(nv, 1))
     tail = scratch[:, warm_offset:warm_offset + nv]
     if qacc_warmstart is None:
-      tail.zero_()
+      self._fill_world_masked(
+          w["workspace_debug"], world_mask, width=nv,
+          stride=self._debug_stride, offset=warm_offset)
     else:
-      tail.copy_(qacc_warmstart)
-    self._workspace["position_assembly_context"].zero_()
-    self._workspace["position_surface_velocity"].zero_()
+      self._copy_world_masked(
+          w["workspace_debug"], qacc_warmstart, world_mask, width=nv,
+          source_stride=nv, destination_stride=self._debug_stride,
+          destination_offset=warm_offset)
+    self._fill_world_masked(
+        w["position_assembly_context"], world_mask, width=nr * 5, stride=nr * 5)
+    self._fill_world_masked(
+        w["position_surface_velocity"], world_mask, width=nr, stride=nr)
     # All fresh row producers start with an exact zero correction unless they
     # explicitly publish an aref low word. The equality kernel also clears
     # this tail, but it is not dispatched for contact-only/flex-only models;
     # do the reset here so reusing a solver cannot inherit cached row words.
-    _clear_current_aref_low(
-        self._workspace["workspace_debug"], b, nr, self._debug_stride,
-        self._aref_low_debug_offset)
+    if world_mask is None:
+      _clear_current_aref_low(
+          w["workspace_debug"], b, nr, self._debug_stride,
+          self._aref_low_debug_offset)
+    else:
+      self._fill_world_masked(
+          w["workspace_debug"], world_mask, width=nr,
+          stride=self._debug_stride, offset=self._aref_low_debug_offset)
     # Activity in this slice marks rows preassembled by the current tendon,
     # equality, or flex producers. It also feeds the solver's tendon-row
     # ownership test. Clear the previous assembly's bitmap before any
     # current producer runs; otherwise a disappeared contact can be mistaken
     # for a still-owned tendon row and replay its retained multiplier.
-    _clear_current_row_ownership(
-        self._workspace["workspace_debug"], b, nr, self._debug_stride)
+    if world_mask is None:
+      _clear_current_row_ownership(
+          w["workspace_debug"], b, nr, self._debug_stride)
+    else:
+      self._fill_world_masked(
+          w["workspace_debug"], world_mask, width=nr,
+          stride=self._debug_stride, offset=nr * nr + 6 * nr)
     awake_offset = prefix + self._solver_island_awake_offset
     debug_i32 = scratch.view(torch.int32)
     awake_view = debug_i32[:, awake_offset:
                            awake_offset + max(self._solver_island_ntree, 1)]
+    awake_width = max(self._solver_island_ntree, 1)
     if awake_tree is None:
-      awake_view.fill_(1)
+      self._fill_world_masked(
+          w["workspace_debug"].view(torch.int32), world_mask,
+          width=awake_width, stride=self._debug_stride,
+          offset=awake_offset, value=1)
     else:
-      awake_view.copy_(awake_tree)
+      self._copy_world_masked(
+          w["workspace_debug"].view(torch.int32), awake_tree, world_mask,
+          width=awake_width, source_stride=awake_width,
+          destination_stride=self._debug_stride, destination_offset=awake_offset)
 
     # 1. Contact normal kernel (if candidate contact pairs exist)
-    w["out_status"].zero_()
+    self._fill_world_masked(w["out_status"], world_mask, width=1, stride=1)
     if candidate_token is None:
       self.generate_candidates(
           poses, qvel, eq_active_tensor if d.neq > 0 else None,
@@ -5199,7 +5242,10 @@ class MetalCoupledConstraints:
             assembly_current=True, eq_active=eq_active_tensor)
         debug = w["workspace_debug"].reshape(b, self._debug_stride)
         ar = debug[:, nr * nr + nr:nr * nr + nr + d.n_eq_rows]
-        ar.add_(jdot_aref[:, :d.n_eq_rows])
+        self._copy_world_masked(
+            w["workspace_debug"], jdot_aref, world_mask, width=d.n_eq_rows,
+            source_stride=nr, destination_stride=self._debug_stride,
+            destination_offset=nr * nr + nr, add=True)
     # 1b. Tendon constraint rows (limits, friction loss, tendon equalities).
     # Runs after equality assembly (which reserves zeros for tendon
     # equalities) and before the coupled solve (which reads flagged rows).
@@ -5283,24 +5329,27 @@ class MetalCoupledConstraints:
             break
           self._write_jacobian_rows(
               r, rows["J"][:, source_row:source_row + 1, :nv],
-              active=is_active[:, None])
-          dbg_w[:, nr_val * nr_val + r] = torch.where(
-              is_active > 0, rows["R"][:, source_row], 0.0)
-          dbg_w[:, nr_val * nr_val + nr_val + r] = (
-              rows["aref"][:, source_row] * is_active)
-          dbg_w[:, nr_val * nr_val + 2 * nr_val + r] = (
-              impedance[:, source_row] * is_active)
-          dbg_w[:, nr_val * nr_val + 4 * nr_val + r] = -float("inf")
-          dbg_w[:, nr_val * nr_val + 5 * nr_val + r] = float("inf")
-          dbg_w[:, nr_val * nr_val + 6 * nr_val + r] = is_active
-          # This producer publishes an unpaired aref. Its residual plane
-          # must not retain a previous generic/velocity-stage value.
-          dbg_w[:, self._aref_low_debug_offset + r].zero_()
-          row_context[:, r, 0] = k0[:, source_row]
-          row_context[:, r, 1] = b0[:, source_row]
-          row_context[:, r, 2] = impedance[:, source_row]
-          row_context[:, r, 3] = rows["pos"][:, source_row]
-          row_context[:, r, 4].zero_()
+              active=is_active[:, None], world_mask=world_mask)
+          for plane, source in (
+              (0, torch.where(is_active > 0, rows["R"][:, source_row], 0.0)),
+              (1, rows["aref"][:, source_row] * is_active),
+              (2, impedance[:, source_row] * is_active),
+              (4, torch.full_like(is_active, -float("inf"))),
+              (5, torch.full_like(is_active, float("inf"))), (6, is_active)):
+            self._copy_world_masked(
+                w["workspace_debug"], source.contiguous(), world_mask,
+                width=1, source_stride=1, destination_stride=self._debug_stride,
+                destination_offset=nr_val * nr_val + plane * nr_val + r)
+          self._fill_world_masked(
+              w["workspace_debug"], world_mask, width=1,
+              stride=self._debug_stride, offset=self._aref_low_debug_offset + r)
+          context = torch.stack((k0[:, source_row], b0[:, source_row],
+                                 impedance[:, source_row], rows["pos"][:, source_row],
+                                 torch.zeros_like(is_active)), dim=1)
+          self._copy_world_masked(
+              w["position_assembly_context"], context, world_mask,
+              width=5, source_stride=5, destination_stride=nr_val * 5,
+              destination_offset=r * 5)
 
     # 1d. Fixed canonical flex-contact rows. The flex-owned producer writes
     # every candidate's complete descriptor span, including inactive slots;
@@ -5316,14 +5365,19 @@ class MetalCoupledConstraints:
           raise RuntimeError("flex contact candidate rows were not generated")
         # No runtime flex object means these statically reserved candidates are
         # inactive. Keep every owned row and cached source coefficient zero.
-        self._clear_jacobian_rows(start, stop)
-        dbg_w = w["workspace_debug"].view(b, -1)
+        self._clear_jacobian_rows(start, stop, world_mask=world_mask)
         for offset in (nr * nr, nr * nr + nr, nr * nr + 2 * nr,
                        nr * nr + 4 * nr,
                        nr * nr + 5 * nr, nr * nr + 6 * nr):
-          dbg_w[:, offset + start:offset + stop].zero_()
-        w["position_assembly_context"].view(b, nr, 5)[:, start:stop, :].zero_()
-        w["position_surface_velocity"].view(b, nr)[:, start:stop].zero_()
+          self._fill_world_masked(
+              w["workspace_debug"], world_mask, width=stop - start,
+              stride=self._debug_stride, offset=offset + start)
+        self._fill_world_masked(
+            w["position_assembly_context"], world_mask, width=(stop - start) * 5,
+            stride=nr * 5, offset=start * 5)
+        self._fill_world_masked(
+            w["position_surface_velocity"], world_mask, width=stop - start,
+            stride=nr, offset=start)
       else:
         rows = bundle["rows"]
         count = int(d.n_flex_contact_rows)
@@ -5348,23 +5402,28 @@ class MetalCoupledConstraints:
             torch, self._device, "flex rows.position_context",
             rows.get("position_context"), (b, count, 5), torch.float32)
         if nv and self._jacobian_layout.mode == 0:
-          self._write_jacobian_rows(start, rows["workspace_J"])
-        debug = w["workspace_debug"].view(b, -1)
-        debug[:, nr * nr + start:nr * nr + stop].copy_(rows["R"])
-        debug[:, nr * nr + nr + start:nr * nr + nr + stop].copy_(rows["aref"])
-        debug[:, nr * nr + 4 * nr + start:nr * nr + 4 * nr + stop].copy_(rows["lo"])
-        debug[:, nr * nr + 5 * nr + start:nr * nr + 5 * nr + stop].copy_(rows["hi"])
-        debug[:, nr * nr + 6 * nr + start:nr * nr + 6 * nr + stop].copy_(
-            (rows["active"] != 0).to(dtype=torch.float32))
-        # Stage -1 uses the RHS slice as a source-impedance channel. Keep the
-        # raw flex material value there until the exact M^-1 contraction.
-        debug[:, nr * nr + 2 * nr + start:
-              nr * nr + 2 * nr + stop].copy_(
-                  rows["position_context"][:, :, 2])
-        w["position_assembly_context"].view(b, nr, 5)[:, start:stop, :].copy_(
-            rows["position_context"])
-        w["position_surface_velocity"].view(b, nr)[:, start:stop].copy_(
-            rows["surface_velocity"])
+          self._write_jacobian_rows(
+              start, rows["workspace_J"], world_mask=world_mask)
+        # A masked recovery may borrow healthy producer rows. Publish only
+        # selected worlds; in particular, the impedance channel shares the
+        # normal solve's RHS backing and must not overwrite retained RHS data.
+        for plane, source in ((0, rows["R"]), (1, rows["aref"]),
+                              (4, rows["lo"]), (5, rows["hi"]),
+                              (6, (rows["active"] != 0).to(torch.float32)),
+                              (2, rows["position_context"][:, :, 2])):
+          self._copy_world_masked(
+              w["workspace_debug"], source.contiguous(), world_mask,
+              width=count, source_stride=count,
+              destination_stride=self._debug_stride,
+              destination_offset=nr * nr + plane * nr + start)
+        self._copy_world_masked(
+            w["position_assembly_context"], rows["position_context"], world_mask,
+            width=count * 5, source_stride=count * 5,
+            destination_stride=nr * 5, destination_offset=start * 5)
+        self._copy_world_masked(
+            w["position_surface_velocity"], rows["surface_velocity"], world_mask,
+            width=count, source_stride=count,
+            destination_stride=nr, destination_offset=start)
 
     # 2. Coupled constraint solver kernel
     solve_fn = self._solve_kernel if self.descriptor.dense_path else self._solve_block_kernel
@@ -5484,7 +5543,7 @@ class MetalCoupledConstraints:
                   component_rhs.reshape(b, rhs_capacity, nv),
                   dof_ids=awake_dof_ids, counts=awake_counts,
                   tendon_armature_blocks=tendon_armature_blocks,
-                  rhs_low=low_force)))
+                  rhs_low=low_force, world_mask=world_mask)))
       with _solver_dimension_stage(
           solver_dims, -2, self._line_search_iterations):
         if exact_data is None:
@@ -5492,7 +5551,8 @@ class MetalCoupledConstraints:
         else:
           with _preassembled_rows_stage(solver_dims):
             dispatch_solver(component_solver.paired_output)
-      component_solver.merge_world_status(component_status, w["out_status"])
+      component_solver.merge_world_status(
+          component_status, w["out_status"], world_mask=world_mask)
       exact_world_status = None if exact_data is None else exact_data["status"]
     elif exact_impedance is not None:
       solver_dims = self._constants["solver_dims"]

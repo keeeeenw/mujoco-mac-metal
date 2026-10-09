@@ -569,8 +569,12 @@ kernel void equality_assembly(
   int nsite = dims[13];
   int n_eq_rows = dims[14];
   if (world >= uint(batch)) return;
-  device float* dbg = workspace_debug + int(world) * max(dims[21], nr * nr + 7 * nr);
   int solver_metadata = dims[24] + dims[9] * 10;
+  int mask_offset = dims[solver_metadata + 20];
+  // Equality assembly shares the constraint stage's recovery predicate.
+  // Return before clearing J, aref residuals, or any retained healthy row.
+  if (mask_offset < 0 || dims[mask_offset + int(world)] == 0) return;
+  device float* dbg = workspace_debug + int(world) * max(dims[21], nr * nr + 7 * nr);
   device float* solver_scratch = dbg + nr * nr + 7 * nr;
   device float* pair_tail = solver_scratch + dims[solver_metadata + 15];
   // The third row-vector in the paired tail is the immutable low word of

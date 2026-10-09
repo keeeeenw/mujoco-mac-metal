@@ -241,7 +241,7 @@ def materialize_packed_jacobian_torch(torch, storage, batch_size, layout,
 def packed_jacobian_scatter_rows_torch(torch, storage, batch_size, layout,
                                        pattern, source_rows, row_start,
                                        *, source_row_start=0, row_count=None,
-                                       active=None):
+                                       active=None, world_mask=None):
   """Scatter a producer-local dense row block into the packed global CSR.
 
   ``source_rows`` may be only the producer's bounded row block (for example
@@ -290,6 +290,10 @@ def packed_jacobian_scatter_rows_torch(torch, storage, batch_size, layout,
       destination_slots.append(slot)
       destination_rows.append(local)
   records = storage.view(torch.int32).reshape(b, layout.stride_words)
+  if world_mask is not None:
+    if tuple(world_mask.shape) != (b,):
+      raise ValueError("world mask does not match packed Jacobian batch")
+    unsupported = torch.where(world_mask != 0, unsupported, 0)
   records[:, 10].bitwise_or_(unsupported)
   if not destination_slots:
     return
@@ -304,7 +308,10 @@ def packed_jacobian_scatter_rows_torch(torch, storage, batch_size, layout,
     gathered = gathered * active.index_select(1, row_id_tensor).to(gathered.dtype)
   for world in range(b):
     base = world * layout.stride_words + layout.values_offset
-    storage[base + dst] = gathered[world]
+    value = gathered[world]
+    if world_mask is not None:
+      value = torch.where(world_mask[world] != 0, value, storage[base + dst])
+    storage[base + dst] = value
 
 
 def packed_jacobian_read(record_f32, layout, row, column):
