@@ -296,7 +296,7 @@ def test_warning_statistics_reset_copy_snapshot_and_legacy_restore():
       "</worldbody></mujoco>"
   )
   state = _state(model, batch_size=2)
-  assert state.snapshot().schema_version == 6
+  assert state.snapshot().schema_version == 7
   badqpos = int(mujoco.mjtWarning.mjWARN_BADQPOS)
   badqvel = int(mujoco.mjtWarning.mjWARN_BADQVEL)
   state._warning_number[0, badqpos] = 3

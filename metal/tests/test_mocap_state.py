@@ -100,7 +100,7 @@ def test_mocap_reset_snapshot_restore_cpu():
   st = DeviceState(m, profile, 2, device="cpu")
   st.set_mocap(np.array([[0.4, 0, 1.0]]), np.array([[1., 0, 0, 0]]), env_ids=[0])
   snap = st.snapshot()
-  assert snap.schema_version == 6 and snap.nmocap == 1
+  assert snap.schema_version == 7 and snap.nmocap == 1
   st.set_mocap(np.array([[0.9, 0, 1.2]]), np.array([[1., 0, 0, 0]]))
   st.restore(snap)
   np.testing.assert_allclose(st.mocap_pos.numpy()[0, 0], [0.4, 0, 1.0], atol=1e-6)
@@ -248,7 +248,7 @@ def test_mocap_keyframe_copy_snapshot_gpu():
   # Unselected world untouched by the keyframe.
   assert abs(float(sim.state.time.cpu().numpy()[1]) - 0.006) < 1e-3
   snap = sim.state.snapshot()
-  assert snap.schema_version == 6
+  assert snap.schema_version == 7
   sim.set_mocap(np.array([[0.9, 0, 1.3]]), np.array([[1., 0, 0, 0]]), env_ids=[0])
   sim.state.restore(snap)
   np.testing.assert_allclose(sim.state.mocap_pos.cpu().numpy()[0, 0], [0.2, 0, 1.1], atol=1e-6)

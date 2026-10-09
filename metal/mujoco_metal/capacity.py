@@ -410,6 +410,10 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
   # DeviceState fields. Zero-sized tensors use a one-element backing buffer
   # where torch.empty/zeros is called directly; optional tensors are absent.
   parts = [
+      ("state.precision.words",b*(2*nq+2*nv)),
+      ("state.precision.qpos_shadow",b*nq),("state.precision.qvel_shadow",b*nv),
+      ("state.precision.dims",4),("state.precision.dummy",1),
+      ("state.precision.defaults",2*nq+2*nv),
       ("state.qpos", max(b * nq, 1)),
       ("state.qvel", max(b * nv, 1)),
       ("state.qacc", max(b * nv, 1)),

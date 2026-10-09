@@ -22,6 +22,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from mujoco_metal.retained_state import RetainedState, pack_residuals, validate_residuals
 from mujoco_metal.lifecycle import _fingerprint
 
 
@@ -81,7 +82,7 @@ def _state_fingerprint(profile):
 
 @dataclass(frozen=True)
 class StateSnapshot:
-  """Detached float32 checkpoint tied to one model/profile and batch size."""
+  """Detached checkpoint with float32 projections and schema7 residual words."""
 
   model_fingerprint: str
   profile_fingerprint: str
@@ -113,9 +114,10 @@ class StateSnapshot:
   warning_lastinfo: np.ndarray | None = None
   # Internal selected-row reset epochs used by borrowed stage records.
   row_reset_epoch: np.ndarray | None = None
+  precision_words: np.ndarray | None = None
 
   def __post_init__(self):
-    if self.schema_version not in (1, 2, 3, 4, 5, 6):
+    if self.schema_version not in (1, 2, 3, 4, 5, 6, 7):
       raise ValueError("unsupported state snapshot schema")
     if self.batch_size <= 0 or self.nq < 0 or self.nv < 0 or self.neq < 0:
       raise ValueError("invalid state snapshot dimensions")
@@ -282,6 +284,13 @@ class StateSnapshot:
           np.frombuffer(np.asarray(raw_epoch, dtype=np.int32, order="C").tobytes(),
                         dtype=np.int32).reshape((batch,)))
 
+    if self.schema_version < 7:
+      object.__setattr__(self, 'precision_words', None)
+    else:
+      words,_,_=validate_residuals(self.qpos,self.qvel,self.precision_words)
+      object.__setattr__(self,'precision_words',
+          np.frombuffer(words.tobytes(),dtype=np.float32).reshape(words.shape))
+
 
 class DeviceState:
   """Own persistent batched state tensors for one validated stepping profile.
@@ -397,14 +406,14 @@ class DeviceState:
     ).copy()
     initial_qvel = np.zeros((self.batch_size, descriptor.nv), dtype=np.float64)
     if qpos is not None:
-      initial_qpos = self._host_values(qpos, initial_qpos.shape, "qpos")
+      initial_qpos = self._host_values(qpos, initial_qpos.shape, "qpos", retain=True)
     if qvel is not None:
-      initial_qvel = self._host_values(qvel, initial_qvel.shape, "qvel")
+      initial_qvel = self._host_values(qvel, initial_qvel.shape, "qvel", retain=True)
     initial_qpos = self._validate_qpos(
-        self._host_values(initial_qpos, initial_qpos.shape, "qpos")
+        self._host_values(initial_qpos, initial_qpos.shape, "qpos", retain=True)
     )
     initial_qvel = self._host_values(
-        initial_qvel, initial_qvel.shape, "qvel"
+        initial_qvel, initial_qvel.shape, "qvel", retain=True
     )
 
     import torch
@@ -425,6 +434,10 @@ class DeviceState:
     self._qvel = torch.as_tensor(
         initial_qvel, dtype=torch.float32, device=self._device
     ).clone()
+    self._precision = RetainedState(self._qpos,self._qvel,initial_qpos,initial_qvel)
+    self._precision_default=torch.as_tensor(pack_residuals(
+        np.asarray(descriptor.qpos0,dtype=np.float64).reshape(1,-1),
+        np.zeros((1,descriptor.nv))),dtype=torch.float32,device=self._device)
     self._qacc = torch.zeros(
         (self.batch_size, descriptor.nv), dtype=torch.float32, device=self._device
     )
@@ -592,7 +605,7 @@ class DeviceState:
     return self._eq_active.detach().clone()
 
   @staticmethod
-  def _host_values(value, shape, name):
+  def _host_values(value, shape, name, *, retain=False):
     array = np.asarray(value)
     if array.shape != shape or array.dtype.kind not in "fiu":
       raise ValueError(f"{name} must be numeric with shape {shape}")
@@ -600,6 +613,10 @@ class DeviceState:
       array = np.asarray(array, dtype=np.float32, order="C")
     if not np.all(np.isfinite(array)):
       raise ValueError(f"{name} must be finite and representable as float32")
+    if retain:
+      from mujoco_metal.model import require_triple_word_domain
+      raw=np.asarray(value,dtype=np.float64)
+      return require_triple_word_domain(raw,what=name).reshape(shape).copy()
     return array.copy()
 
   def _validate_qpos(self, qpos):
@@ -643,6 +660,7 @@ class DeviceState:
       raise ValueError("descriptor dimensions (nq/nv) do not match")
     if self.batch_size != other.batch_size:
       raise ValueError("batch sizes do not match")
+    self._precision_default.copy_(other._precision_default)
     self._model = other._model
     self.profile = other.profile
     # The model owns the default contents/layout for these compiled state
@@ -942,6 +960,8 @@ class DeviceState:
     for index in (src_i, dst_i):
       if not 0 <= index < self.batch_size:
         raise ValueError("environment index out of range")
+    self._precision.synchronize(self._qpos,self._qvel)
+    self._precision.words[dst_i] = self._precision.words[src_i].clone()
     for tensor_name in ("_qpos", "_qvel", "_qacc", "_time", "_status", "_warning_number", "_warning_lastinfo", "_history", "_qacc_warmstart", "_userdata", "_plugin_state"):
       current = getattr(self, tensor_name)
       if current.numel() == 0:
@@ -949,6 +969,7 @@ class DeviceState:
       tensor = current.clone()
       tensor[dst_i] = current[src_i]
       setattr(self, tensor_name, tensor)
+    self._precision.bind(self._qpos,self._qvel)
     self._row_reset_epoch[dst_i] = self._row_reset_epoch[src_i]
     if self._eq_active is not None:
       tensor = self._eq_active.clone()
@@ -986,14 +1007,14 @@ class DeviceState:
       arr = np.asarray(qpos)
       if arr.shape == (self._model.nq,):
         arr = np.broadcast_to(arr, (count, self._model.nq)).copy()
-      pos = self._host_values(arr, pos_default.shape, "qpos")
+      pos = self._host_values(arr, pos_default.shape, "qpos", retain=True)
     if qvel is None:
       vel = vel_default
     else:
       arr = np.asarray(qvel)
       if arr.shape == (self._model.nv,):
         arr = np.broadcast_to(arr, (count, self._model.nv)).copy()
-      vel = self._host_values(arr, vel_default.shape, "qvel")
+      vel = self._host_values(arr, vel_default.shape, "qvel", retain=True)
     pos = self._validate_qpos(pos)
     if self._nmocap == 0:
       if mocap_pos is not None or mocap_quat is not None:
@@ -1066,6 +1087,7 @@ class DeviceState:
       return self._generation
     count = ids.size
 
+    precision_host=pack_residuals(pos,vel)
     index = self._torch.as_tensor(ids, dtype=self._torch.int64, device=self._device)
     pos_tensor = self._torch.as_tensor(
         pos, dtype=self._torch.float32, device=self._device
@@ -1081,6 +1103,7 @@ class DeviceState:
         (count,), dtype=self._torch.int32, device=self._device
     )
 
+    self._precision.synchronize(self._qpos,self._qvel)
     next_qpos = self._qpos.clone()
     next_qvel = self._qvel.clone()
     next_qacc = self._qacc.clone()
@@ -1096,6 +1119,9 @@ class DeviceState:
     next_warning_number.index_fill_(0, index, 0)
     next_warning_lastinfo.index_fill_(0, index, 0)
     self._qpos, self._qvel = next_qpos, next_qvel
+    self._precision.words.index_copy_(0,index,self._torch.as_tensor(
+        precision_host,dtype=self._torch.float32,device=self._device))
+    self._precision.bind(self._qpos,self._qvel)
     self._qacc, self._time, self._status = next_qacc, next_time, next_status
     self._warning_number = next_warning_number
     self._warning_lastinfo = next_warning_lastinfo
@@ -1153,6 +1179,8 @@ class DeviceState:
         or not mask.is_contiguous()):
       raise ValueError("mask must be contiguous bool[batch_size] on the state device")
 
+    self._precision.synchronize(self._qpos,self._qvel)
+    self._precision.words.copy_(torch.where(mask[:,None],self._precision_default,self._precision.words))
     if self._reset_shader is not None:
       # Raw MSL writes avoid changing Torch's tensor mutation counters. The
       # shader itself predicates every store and advances only selected row
@@ -1179,6 +1207,7 @@ class DeviceState:
           device_buffer(self._plugin_state, dummy_f), device_buffer(defaults["plugin0"], dummy_f),
           self._row_reset_epoch, self._reset_dims,
           threads=(self.batch_size,), group_size=(min(self.batch_size, 128),))
+      self._precision.bind(self._qpos,self._qvel)
       if hasattr(self, "_on_masked_reset") and callable(self._on_masked_reset):
         self._on_masked_reset(mask=mask)
       return self._generation
@@ -1229,6 +1258,7 @@ class DeviceState:
             np.broadcast_to(default_np, tuple(current.shape)).copy(),
             dtype=current.dtype, device=self._device)
       setattr(self, name, select(current, default_tensor))
+    self._precision.bind(self._qpos,self._qvel)
     self._row_reset_epoch.copy_(self._row_reset_epoch + mask.to(torch.int32))
     if hasattr(self, "_on_masked_reset") and callable(self._on_masked_reset):
       self._on_masked_reset(mask=mask)
@@ -1549,6 +1579,7 @@ class DeviceState:
     per-call inputs and stored sensor samples are NOT included. Use
     :meth:`MetalSimulation.snapshot` for full replayable checkpoints (R03).
     """
+    self._precision.synchronize(self._qpos,self._qvel)
     snap = StateSnapshot(
         model_fingerprint=self._model_fingerprint,
         profile_fingerprint=self._profile_fingerprint,
@@ -1561,7 +1592,8 @@ class DeviceState:
         qacc=self._qacc.detach().cpu().numpy(),
         time=self._time.detach().cpu().numpy(),
         status=self._status.detach().cpu().numpy(),
-        schema_version=6,
+        schema_version=7,
+        precision_words=self._precision.words.detach().cpu().numpy(),
         neq=self._neq,
         eq_active=self._eq_active.detach().cpu().numpy() if self._neq else None,
         nmocap=self._nmocap,
@@ -1590,6 +1622,8 @@ class DeviceState:
 
     probe = copy.copy(self)
     probe._device = torch.device("cpu")
+    probe._precision = RetainedState(torch.zeros_like(self._qpos,device='cpu'),
+                                    torch.zeros_like(self._qvel,device='cpu'))
     for name, value in vars(self).items():
       if isinstance(value, torch.Tensor):
         setattr(probe, name, torch.empty(
@@ -1608,7 +1642,7 @@ class DeviceState:
     """Restore a matching checkpoint only after validating every field."""
     if not isinstance(snapshot, StateSnapshot):
       raise TypeError("snapshot must be a StateSnapshot")
-    if snapshot.schema_version not in (1, 2, 3, 4, 5, 6):
+    if snapshot.schema_version not in (1, 2, 3, 4, 5, 6, 7):
       raise ValueError("unsupported state snapshot schema")
     if (
         snapshot.model_fingerprint != self._model_fingerprint
@@ -1722,6 +1756,13 @@ class DeviceState:
     else:
       row_epoch = np.zeros((self.batch_size,), dtype=np.int32)
 
+    if snapshot.schema_version >= 7:
+      precision,pos_represented,_=validate_residuals(qpos,qvel,snapshot.precision_words)
+      self._validate_qpos(pos_represented)
+    else:
+      precision=np.zeros((self.batch_size,2*self._model.nq+2*self._model.nv),np.float32)
+    precision_tensor=self._torch.as_tensor(precision,dtype=self._torch.float32,device=self._device)
+    self._precision.synchronize(self._qpos,self._qvel)
     tensors = (
         self._torch.as_tensor(qpos, dtype=self._torch.float32, device=self._device),
         self._torch.as_tensor(qvel, dtype=self._torch.float32, device=self._device),
@@ -1738,6 +1779,7 @@ class DeviceState:
                               device=self._device),
     )
     if ids is None:
+      self._precision.words.copy_(precision_tensor)
       (self._qpos, self._qvel, self._qacc, self._time, self._status,
        self._warning_number, self._warning_lastinfo) = tensors
       self._row_reset_epoch = self._torch.as_tensor(
@@ -1751,6 +1793,7 @@ class DeviceState:
         self._act = self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device)
     else:
       index = self._torch.as_tensor(ids, dtype=self._torch.int64, device=self._device)
+      self._precision.words[index] = precision_tensor[index]
       self._qpos[index] = tensors[0][index]
       self._qvel[index] = tensors[1][index]
       self._qacc[index] = tensors[2][index]
@@ -1768,6 +1811,7 @@ class DeviceState:
       if self._na > 0:
         self._act[index] = self._torch.as_tensor(act_checked, dtype=self._torch.float32, device=self._device)[index]
     self._generation += 1
+    self._precision.bind(self._qpos,self._qvel)
     if hasattr(self, "_on_restore") and callable(self._on_restore):
       self._on_restore(snapshot, env_ids=ids)
     return self._generation
