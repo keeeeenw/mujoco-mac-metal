@@ -1692,3 +1692,110 @@ kernel void common_ccd_rigid_convex_candidates(
   common_ccd_store_wide3(mesh_hull,out+COMMON_CCD_RIGID_WIDE_BASE+9*count,contact_position);
   mesh_hull[out]=float(count+1);
 }
+
+// Pinned engine_collision_convex.c::mjc_PlaneConvex and addplanemesh.
+// Depths and unprojected solid witnesses retain source arithmetic. The first
+// contact position is the source separation reference for ordered neighbors.
+static inline int common_ccd_source_plane_convex(
+    thread CommonCCDSupportObject& plane,thread CommonCCDSupportObject& convex,
+    FlexDD margin,FlexDD rbound,device float* hull,device int* info,
+    thread FlexDD* depths,thread FlexDD3* points,thread FlexDD3& normal) {
+  normal=FlexDD3{plane.mat[2],plane.mat[5],plane.mat[8]};
+  FlexDD3 origin=FlexDD3{plane.pos[0],plane.pos[1],plane.pos[2]};
+  CommonCCDSupportResult support=mpr_object_support(convex,flex_dd3_neg(normal),hull,info);
+  if(support.status) return -support.status;
+  depths[0]=flex_dd_source_dot3(normal,flex_dd3_source_sub(support.point,origin));
+  if(flex_dd_compare_exact(depths[0],margin)>0) return 0;
+  points[0]=support.point;
+  FlexDD3 first=flex_dd3_sub(points[0],flex_dd3_scale(normal,
+      flex_dd_source_mul(flex_dd(.5f),depths[0])));
+  if(convex.geom_type!=7) return 1;
+  FlexDD3 pos=FlexDD3{convex.pos[0],convex.pos[1],convex.pos[2]};
+  FlexDD3 direction=common_ccd_matrix_transpose_vector(convex.mat,flex_dd3_neg(normal));
+  FlexDD threshold=flex_dd_source_sub(flex_dd_source_dot3(normal,
+      flex_dd3_source_sub(pos,origin)),margin);
+  int count=1,edge=0,graph=convex.graph_offset,n=convex.graph_vertex_count;
+  if(graph>=0) {
+    if(convex.cached_vertex<0) return count;
+    edge=info[graph+2+convex.cached_vertex];
+  }
+  for(int visit=0;visit<convex.vertex_count && count<3;visit++) {
+    int candidate_vertex=visit;
+    if(graph>=0) {int local=info[graph+2+2*n+edge++];if(local<0) break;
+      candidate_vertex=info[graph+2+n+local];}
+    else if(candidate_vertex==support.selected_vertex) continue;
+    device const float* source=hull+3*(convex.vertex_offset+candidate_vertex);
+    FlexDD projection=common_ccd_mesh_projection(direction,source);
+    if(flex_dd_compare_exact(projection,threshold)<=0) continue;
+    FlexDD3 point=common_ccd_local_to_world(convex.mat,convex.pos,
+        flex_dd3(float3(source[0],source[1],source[2])));
+    FlexDD3 delta=flex_dd3_source_sub(point,first);
+    FlexDD separation=flex_dd_source_sqrt(flex_dd_source_dot3(delta,delta));
+    // The pinned decimal is a double, not a rounded float literal.
+    FlexDD threshold_distance=flex_dd_source_mul(
+        FlexDD{0.30000001192092896f,-1.1920929132713809e-08f,1.6653345369377348e-16f},rbound);
+    if(flex_dd_compare_exact(separation,threshold_distance)<0) continue;
+    points[count]=point;
+    depths[count]=flex_dd_source_dot3(normal,flex_dd3_source_sub(point,origin));
+    count++;
+  }
+  return count;
+}
+
+kernel void contact_produce_plane_sdf(
+    device const float* geom_pos [[buffer(0)]],
+    device const float* geom_pos_low [[buffer(1)]],
+    device const float* geom_pos_tail [[buffer(2)]],
+    device const float* geom_xmat [[buffer(3)]],
+    device const float* geom_xmat_low [[buffer(4)]],
+    device const float* geom_xmat_tail [[buffer(5)]],
+    device const int* types [[buffer(6)]],device const int* pairs [[buffer(7)]],
+    device const float* margins [[buffer(8)]],device const int* dims [[buffer(9)]],
+    device const int* logical_map [[buffer(10)]],device float* hull [[buffer(11)]],
+    device int* info [[buffer(12)]],device int* counts [[buffer(13)]],
+    device float* records [[buffer(14)]],device atomic_int* status [[buffer(15)]],
+    uint tid [[thread_position_in_grid]]) {
+  int np=dims[1],nc=dims[2],batch=dims[3],ng=dims[6];
+  if(np<=0 || tid>=uint(batch*np)) return;
+  int world=int(tid)/np,pair=int(tid)%np,a=pairs[2*pair],b=pairs[2*pair+1];
+  if(!((types[a]==0 && types[b]==8)||(types[a]==8 && types[b]==0))) return;
+  int ptr=10+np+1+nc,mask_offset=dims[ptr];
+  if(dims[mask_offset+world]==0 || logical_map[tid]<0) return;
+  counts[tid]=0;
+  bool flip=types[a]!=0;int plane=flip?b:a,solid=flip?a:b,header=9*ng;
+  FlexDD ma[9],mb[9];
+  FlexDD3 pa=common_ccd_load_geom_position(geom_pos,geom_pos_low,geom_pos_tail,3*(world*ng+plane));
+  FlexDD3 pb=common_ccd_load_geom_position(geom_pos,geom_pos_low,geom_pos_tail,3*(world*ng+solid));
+  common_ccd_load_geom_matrix(geom_xmat,geom_xmat_low,geom_xmat_tail,9*(world*ng+plane),ma);
+  common_ccd_load_geom_matrix(geom_xmat,geom_xmat_low,geom_xmat_tail,9*(world*ng+solid),mb);
+  if(!common_ccd_finite_pose(pa,ma)||!common_ccd_finite_pose(pb,mb)) {
+    common_ccd_production_fail(status,world);return;
+  }
+  int base=info[header+1],rb=info[header+33]+3*solid;
+  CommonCCDSupportObject p=common_ccd_production_geom(plane,0,base+9*plane,info,hull,pa,ma,float3(0),0);
+  CommonCCDSupportObject c=common_ccd_production_geom(solid,7,base+9*solid,info,hull,pb,mb,float3(0),0);
+  FlexDD depths[3];FlexDD3 points[3],normal;
+  int count=common_ccd_source_plane_convex(p,c,flex_dd(margins[2*pair]+margins[2*pair+1]),
+      FlexDD{hull[rb],hull[rb+1],hull[rb+2]},hull,info,depths,points,normal);
+  int offset=dims[10+pair],capacity=dims[11+pair]-offset;
+  if(count<0 || count>capacity) {common_ccd_production_fail(status,world);return;}
+  if(flip) normal=flex_dd3_neg(normal);
+  for(int k=0;k<count;k++) {
+    int dst=(world*nc+offset+k)*37;
+    for(int j=0;j<37;j++) records[dst+j]=0;
+    records[dst+12]=depths[k].hi;records[dst+9]=depths[k].lo;records[dst+10]=depths[k].tail;
+    FlexDD3 position=flex_dd3_sub(points[k],flex_dd3_scale(flip?flex_dd3_neg(normal):normal,
+        flex_dd_source_mul(flex_dd(.5f),depths[k])));
+    float3 hi=flex_dd3_high(position),lo=float3(position.x.lo,position.y.lo,position.z.lo),
+      tail=float3(position.x.tail,position.y.tail,position.z.tail);
+    float3 nh=flex_dd3_high(normal),nl=float3(normal.x.lo,normal.y.lo,normal.z.lo),
+      nt=float3(normal.x.tail,normal.y.tail,normal.z.tail),t1,t2;
+    make_frame(nh,t1,t2);
+    for(int j=0;j<3;j++) {
+      records[dst+13+j]=hi[j];records[dst+25+j]=lo[j];records[dst+31+j]=tail[j];
+      records[dst+16+j]=nh[j];records[dst+28+j]=nl[j];records[dst+34+j]=nt[j];
+      records[dst+19+j]=t1[j];records[dst+22+j]=t2[j];
+    }
+  }
+  counts[tid]=count;
+}

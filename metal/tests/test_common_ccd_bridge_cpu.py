@@ -96,7 +96,8 @@ def test_compiled_mesh_adapter_uses_exact_model_graph_offsets_and_counts():
   assert int(info[header]) == 1128487732
   assert int(info[geom_info]) == layout["source_vertex_base"] + int(model.mesh_vertadr[mid])
   assert int(info[geom_info + 1]) == record[4]
-  assert int(info[geom_info + 2]) == -1
+  assert int(info[geom_info + 2]) == (layout["graph_base"]
+      + int(model.mesh_graphadr[mid]))
   packed_vertex = int(info[geom_info])
   assert np.array_equal(vertices[3 * packed_vertex:3 * (packed_vertex + record[4])],
                         model.mesh_vert[int(model.mesh_vertadr[mid]):

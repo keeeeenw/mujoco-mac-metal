@@ -605,7 +605,9 @@ def pair_max_contacts(t1: int, t2: int, sdf_initpoints: int = 40) -> int:
       # Pinned mjc_MeshSDF collects penetrating face samples up to the
       # mjMAXCONPAIR candidate bound, then emits at most that many witnesses.
       return 50
-    if t_min == _PLANE or t_min == _HFIELD:
+    if t_min == _PLANE:
+      return 3  # pinned mjc_PlaneConvex maxplanemesh
+    if t_min == _HFIELD:
       return 0
     return min(max(0, int(sdf_initpoints)), _SDF_MAX_PER_PAIR)
   if _HFIELD in (t_min, t_max):
@@ -2227,10 +2229,11 @@ class MetalCoupledConstraints:
     pair_types = [(int(model.geom_type[int(a)]), int(model.geom_type[int(b)]))
                   for a, b in zip(self.descriptor.geom1, self.descriptor.geom2)]
     self._has_mesh_sdf_pairs = any(set(pair) == {7, 8} for pair in pair_types)
+    self._has_plane_sdf_pairs=any(set(pair)=={0,8} for pair in pair_types)
     self._has_analytic_sdf_pairs = any(
-        8 in pair and 7 not in pair for pair in pair_types)
+        8 in pair and min(pair)>=2 and 7 not in pair for pair in pair_types)
     self._has_sdf_contact_pairs = (
-        self._has_mesh_sdf_pairs or self._has_analytic_sdf_pairs)
+        self._has_mesh_sdf_pairs or self._has_analytic_sdf_pairs or self._has_plane_sdf_pairs)
     self._has_generic_contact_pairs = any(8 not in pair for pair in pair_types)
     self.solver_settings = self.descriptor.solver_settings
     self._line_search_iterations = int(self.descriptor.line_search_iterations)
@@ -2254,7 +2257,8 @@ class MetalCoupledConstraints:
                                int(d.geom_type[int(b)]))
         for a, b in zip(d.geom1, d.geom2))
     self._common_ccd_requested = (
-        self._common_ccd_hfield_mesh_requested or self._common_ccd_rigid_requested)
+        self._common_ccd_hfield_mesh_requested or self._common_ccd_rigid_requested
+        or self._has_plane_sdf_pairs)
     if self._common_ccd_requested:
       from mujoco_metal.common_ccd_bridge import (
           append_production_workspace, estimate_production_upload_bytes)
@@ -2331,6 +2335,8 @@ class MetalCoupledConstraints:
     self._common_ccd_rigid_kernel = (
         self._library.common_ccd_rigid_convex_candidates
         if self._common_ccd_rigid_requested else None)
+    self._contact_plane_sdf_producer=(
+        self._library.contact_produce_plane_sdf if self._has_plane_sdf_pairs else None)
     self._clear_contact_pair_counts = self._library.clear_contact_pair_counts
     self._contact_generic_producer = (
         self._library.contact_produce_generic
@@ -3270,8 +3276,7 @@ class MetalCoupledConstraints:
     w, d = self._workspace, self.descriptor
     b, nc = self.batch_size, d.ncontacts_max
     if (d.npairs > 0 and nc > 0
-        and (self._common_ccd_hfield_mesh_kernel is not None
-             or self._common_ccd_rigid_kernel is not None)):
+        and self._common_ccd_requested):
       # Validate borrowed source-precision poses before clearing persistent
       # masks, rows or status. A rejected input must not partially mutate the
       # preceding assembly or dispatch a kernel with a foreign-device buffer.
@@ -3356,7 +3361,7 @@ class MetalCoupledConstraints:
           w["pair_mask"][:b * d.npairs].reshape(b, d.npairs),
           world_mask=world_mask)
       w["pair_maps"] = pair_maps
-      if self._common_ccd_hfield_mesh_kernel is not None or self._common_ccd_rigid_kernel is not None:
+      if self._common_ccd_requested:
         self._fill_world_masked(
             w["out_status"], world_mask, width=1, stride=1, value=0)
       if self._common_ccd_hfield_mesh_kernel is not None:
@@ -3388,8 +3393,17 @@ class MetalCoupledConstraints:
               self._constants["mesh_hull"], self._constants["mesh_hull_info"],
               w["out_status"], restart_pass,
               threads=(b * d.npairs,), group_size=(1,))
-      if (self._common_ccd_hfield_mesh_kernel is not None
-          or self._common_ccd_rigid_kernel is not None):
+      if self._contact_plane_sdf_producer is not None:
+        self._contact_plane_sdf_producer(
+            poses['geom_pos'],poses['geom_pos_low'],poses['geom_pos_tail'],
+            poses['geom_xmat'],poses['geom_xmat_low'],poses['geom_xmat_tail'],
+            self._constants['geom_type'],self._constants['pair_geoms'],
+            self._constants['pair_margin_gap'],self._constants['pair_contact_offsets_dims'],
+            pair_maps.logical_to_packed.reshape(-1),self._constants['mesh_hull'],
+            self._constants['mesh_hull_info'],w['contact_pair_count'],
+            w['contact_pair_records'],w['out_status'],
+            threads=(b*d.npairs,),group_size=(1,))
+      if self._common_ccd_requested:
         self._mask_failed_candidate_worlds_kernel(
             w["out_status"], self._pair_contact_world_mask,
             self._constants["pair_contact_offsets_dims"],

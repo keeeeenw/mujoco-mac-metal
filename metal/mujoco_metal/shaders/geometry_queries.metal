@@ -80,46 +80,20 @@ static __attribute__((noinline)) int gq_source_distance(
   return 1;
 }
 
-// PlaneConvex uses the libccd support callback even when native CCD is
-// enabled. Preserve its initial support tie and up to two ordered neighbor
-// contacts; the legacy hull manifold sorts those witnesses and changes ties.
+// Distance queries reduce the same source-ordered plane manifold used by
+// physical contacts, preserving the first strict minimum and its witnesses.
 static inline int gq_plane_convex(thread CommonCCDSupportObject& plane,
     thread CommonCCDSupportObject& convex,FlexDD cutoff,FlexDD rbound,
     device float* hull,device int* info,thread FlexDD& distance,
     thread FlexDD3& wa,thread FlexDD3& wb) {
-  FlexDD3 normal=FlexDD3{plane.mat[2],plane.mat[5],plane.mat[8]};
-  FlexDD3 origin=FlexDD3{plane.pos[0],plane.pos[1],plane.pos[2]};
-  CommonCCDSupportResult support=mpr_object_support(convex,flex_dd3_neg(normal),hull,info);
-  if(support.status) return -support.status;
-  distance=flex_dd_source_dot3(normal,flex_dd3_source_sub(support.point,origin));
-  if(flex_dd_compare_exact(distance,cutoff)>0) return 0;
-  FlexDD3 point=support.point;
-  FlexDD3 first=flex_dd3_sub(point,flex_dd3_scale(normal,flex_dd_source_mul(flex_dd(.5f),distance)));
-  if(convex.geom_type==7) {
-    FlexDD3 pos=FlexDD3{convex.pos[0],convex.pos[1],convex.pos[2]};
-    FlexDD3 local_dir=common_ccd_matrix_transpose_vector(convex.mat,flex_dd3_neg(normal));
-    FlexDD threshold=flex_dd_source_sub(flex_dd_source_dot3(normal,flex_dd3_source_sub(pos,origin)),cutoff);
-    int count=1,edge=0,graph=convex.graph_offset,n=convex.graph_vertex_count;
-    if(graph>=0) edge=info[graph+2+convex.cached_vertex];
-    for(int visit=0;visit<convex.vertex_count && count<3;visit++) {
-      int candidate_vertex=visit;
-      if(graph>=0) {int local=info[graph+2+2*n+edge++];if(local<0) break;
-        candidate_vertex=info[graph+2+n+local];}
-      else if(candidate_vertex==support.selected_vertex) continue;
-      device const float* source=hull+3*(convex.vertex_offset+candidate_vertex);
-      FlexDD projection=common_ccd_mesh_projection(local_dir,source);
-      if(flex_dd_compare_exact(projection,threshold)<=0) continue;
-      FlexDD3 world=common_ccd_local_to_world(convex.mat,convex.pos,
-          flex_dd3(float3(source[0],source[1],source[2])));
-      FlexDD3 delta=flex_dd3_source_sub(world,first);
-      FlexDD separation=flex_dd_source_sqrt(flex_dd_source_dot3(delta,delta));
-      if(flex_dd_compare_exact(separation,flex_dd_source_mul(flex_dd(.3f),rbound))<0) continue;
-      count++;
-      FlexDD candidate=flex_dd_source_dot3(normal,flex_dd3_source_sub(world,origin));
-      if(flex_dd_compare_exact(candidate,distance)<0) {distance=candidate;point=world;}
-    }
-  }
-  wa=flex_dd3_sub(point,flex_dd3_scale(normal,distance));wb=point;
+  FlexDD depths[3]; FlexDD3 points[3],normal;
+  int count=common_ccd_source_plane_convex(plane,convex,cutoff,rbound,hull,info,
+                                          depths,points,normal);
+  if(count<=0) return count;
+  int pick=0;
+  for(int k=1;k<count;k++) if(flex_dd_compare_exact(depths[k],depths[pick])<0) pick=k;
+  distance=depths[pick];wb=points[pick];
+  wa=flex_dd3_sub(wb,flex_dd3_scale(normal,distance));
   return 1;
 }
 

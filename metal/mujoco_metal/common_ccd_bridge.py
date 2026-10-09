@@ -314,7 +314,9 @@ def build_common_ccd_model_upload(model, legacy_vertices, legacy_info):
       voff = vertex_base_float // 3 + int(model.mesh_vertadr[mesh_id])
       vcount = int(model.mesh_vertnum[mesh_id])
       goff = int(model.mesh_graphadr[mesh_id])
-      if _source_uses_mesh_graph(vcount, goff):
+      # PlaneConvex traverses the compiled graph even below the support
+      # hill-climb threshold. Support callbacks select their own strategy.
+      if goff >= 0:
         if goff + 2 > source_graph.size:
           raise ValueError("compiled mesh graph header exceeds its source storage")
         graph_vertices = int(source_graph[goff])

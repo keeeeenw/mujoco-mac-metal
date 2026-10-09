@@ -745,13 +745,15 @@ def test_sdf_admission_and_rejections_cpu():
       m.bvh_nodeid[int(m.mesh_bvhadr[mesh_asset]):
                    int(m.mesh_bvhadr[mesh_asset]) +
                    int(m.mesh_bvhnum[mesh_asset])])
-  # plane-SDF and hfield-SDF reserve zero slots.
+  # Both geoms below belong to the static world body, so no physical
+  # candidate is admitted. Dynamic plane-SDF uses pinned PlaneConvex.
   m = mujoco.MjModel.from_xml_string(
       f'<mujoco>{ASSETS}{OPT}<worldbody>'
       '<geom name="pp" type="plane" size="1 1 0.1" contype="1" conaffinity="1"/>'
       '<geom name="sdf" type="sdf" mesh="b" pos="0 0 0.5" contype="1" conaffinity="1"/>'
       '</worldbody></mujoco>')
   desc = lower_coupled_constraints(m)
+  assert desc.npairs == 0
   assert desc.ncontacts_max == 0, desc.ncontacts_max
 
 
