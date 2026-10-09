@@ -207,16 +207,17 @@ def test_rigid_sdf_norm2_uses_pinned_fma_order():
   assert "sw_sqrt(sw_add(sw_mul(x, x), sw_mul(y, y)))" not in helper
 
 
-def test_sqrt_rounds_the_same_approximation_used_by_second_residual():
+def test_sqrt_retains_the_same_unrounded_approximation_used_by_second_residual():
   source = _shader_source()
   start = source.index("[[clang::noinline]] inline SdfWide sw_sqrt_core(")
   end = source.index("\n}", start) + 2
   helper = source[start:end]
-  assert "SdfWide approximation=sw_source_add(q0_value,sw(q1));" in helper
+  assert "SdfWide approximation={q0,q1,0.0f};" in helper
   assert "sw_product_residual(a,approximation,approximation)" in helper
-  assert "sw_expansion_add(expansion,count,approximation.hi,scratch)" in helper
-  assert "sw_expansion_add(expansion,count,q0,scratch)" not in helper
-  assert "sw_expansion_add(expansion,count,q1,scratch)" not in helper
+  assert "sw_expansion_add(expansion,count,q0,scratch)" in helper
+  assert "sw_expansion_add(expansion,count,q1,scratch)" in helper
+  assert "sw_expansion_add(expansion,count,q2,scratch)" in helper
+  assert "sw_source_add(q0_value,sw(q1))" not in helper
 
 
 @pytest.mark.gpu
