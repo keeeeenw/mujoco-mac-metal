@@ -49,7 +49,10 @@ _XML_REVERSED = _XML.replace(
 
 
 def _sorted_contacts(position, distance, normal):
-  order = np.lexsort((position[:, 2], position[:, 1], position[:, 0]))
+  # Sub-ULP position noise must not swap distinct corners in a manifold.
+  # This quantization is far below the unchanged 2e-4 position tolerance.
+  keys = np.round(position, decimals=6)
+  order = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
   return position[order], distance[order], normal[order]
 
 
@@ -129,6 +132,9 @@ def test_common_mjc_convex_mesh_box_multicontact_public_native_gate():
     model = mujoco.MjModel.from_xml_string(xml)
     sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
     cpu = mujoco.MjData(model)
+    # Compare the exact pose represented by the native float32 state. The
+    # symmetric fixture selects a different CPU EPA face after rounding.
+    cpu.qpos[:] = np.asarray(model.qpos0, dtype=np.float32)
     mujoco.mj_forward(model, cpu)
     native = sim.assembled_system(recompute=True)
 
@@ -190,6 +196,7 @@ def test_common_mjc_convex_pair_matrix_matches_contact_rows_and_solver():
   for pair in _CONVEX_PAIRS:
     model = mujoco.MjModel.from_xml_string(_pair_xml(*pair))
     cpu = mujoco.MjData(model)
+    cpu.qpos[:] = np.asarray(model.qpos0, dtype=np.float32)
     mujoco.mj_forward(model, cpu)
     assert cpu.ncon > 0, pair
     sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
@@ -204,8 +211,10 @@ def test_common_mjc_convex_pair_matrix_matches_contact_rows_and_solver():
     cpu_dist = np.asarray([cpu.contact[i].dist for i in range(cpu.ncon)])
     cpu_normal = np.asarray([cpu.contact[i].frame[:3] for i in range(cpu.ncon)])
     cpu_J = np.asarray(cpu.efc_J).reshape(cpu.nefc, model.nv)[cpu_addr]
-    order_native = np.lexsort((native_pos[:, 2], native_pos[:, 1], native_pos[:, 0]))
-    order_cpu = np.lexsort((cpu_pos[:, 2], cpu_pos[:, 1], cpu_pos[:, 0]))
+    native_keys = np.round(native_pos, decimals=6)
+    cpu_keys = np.round(cpu_pos, decimals=6)
+    order_native = np.lexsort((native_keys[:, 2], native_keys[:, 1], native_keys[:, 0]))
+    order_cpu = np.lexsort((cpu_keys[:, 2], cpu_keys[:, 1], cpu_keys[:, 0]))
     assert int(mask.sum()) == cpu.ncon, pair
     np.testing.assert_allclose(native_pos[order_native], cpu_pos[order_cpu], rtol=0.0, atol=2e-4)
     np.testing.assert_allclose(native_dist[order_native], cpu_dist[order_cpu], rtol=0.0, atol=2e-5)
