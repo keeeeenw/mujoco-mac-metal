@@ -1318,11 +1318,26 @@ def test_sphere_flex_deep_epa_uses_dynamic_device_workspace():
   witness_start = shader.index("static inline void flex_epa_write_witness_dd(")
   witness_stop = shader.index("static inline int flex_epa_face_vertex", witness_start)
   witness = shader[witness_start:witness_stop]
-  # These are the signed minors from pinned engine_collision_gjk.c's
-  # triAffineCoord. Keep the -v1 cross terms negative in the DD lane.
-  assert "flex_dd_sub(flex_dd_mul(s1.z,s3.y),flex_dd_mul(s1.y,s3.z))" in witness
-  assert "flex_dd_sub(flex_dd_mul(s1.z,s3.x),flex_dd_mul(s1.x,s3.z))" in witness
-  assert "flex_dd_sub(flex_dd_mul(s1.y,s3.x),flex_dd_mul(s1.x,s3.y))" in witness
+  # Both compilation units must retain the same source-order witness code.
+  # Native arithmetic and physics qualification live in the C-oracle and
+  # public collision gates; this host guard only prevents copy drift.
+  shared = (Path(__file__).parents[1] / "mujoco_metal" / "shaders"
+            / "common_ccd_core.metal").read_text()
+  for name, result_type in (("flex_epa_affine_minor", "FlexDD"),
+                            ("flex_epa_affine_area", "FlexDD"),
+                            ("flex_epa_write_witness_dd", "void")):
+    bodies = []
+    for source in (shader, shared):
+      start = source.index(f"static inline {result_type} {name}(")
+      end = source.index("{", start) + 1
+      depth = 1
+      while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+      bodies.append(source[start:end])
+    assert bodies[0] == bodies[1], name
+  assert "flex_epa_affine_minor(FlexDD2{s1.y,s1.z}" in witness
+  assert "flex_dd3_lincomb_source(values_a,weights,3)" in witness
 
 
 def test_optional_ccd_iteration_trace_is_bounded_and_disjoint():

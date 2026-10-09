@@ -1404,6 +1404,26 @@ static inline bool flex_project_origin_plane_dd(
   return true;
 }
 
+// Preserve triAffineCoord's compiled arm64 contraction and source order.
+// Reassociation changes witness points and can change later restart support ties.
+static inline FlexDD flex_epa_affine_minor(FlexDD2 a, FlexDD2 b, FlexDD2 c) {
+  FlexDD value=flex_dd_source_mul(b.x,c.y);
+  value=flex_dd_source_fma(flex_dd_neg(b.y),c.x,value);
+  value=flex_dd_source_fma(flex_dd_neg(a.x),c.y,value);
+  value=flex_dd_source_fma(a.y,c.x,value);
+  value=flex_dd_source_fma(a.x,b.y,value);
+  return flex_dd_source_sub(value,flex_dd_source_mul(a.y,b.x));
+}
+
+static inline FlexDD flex_epa_affine_area(FlexDD2 p, FlexDD2 b, FlexDD2 c) {
+  FlexDD value=flex_dd_source_add(flex_dd_source_mul(p.x,b.y),
+                                  flex_dd_source_mul(p.y,c.x));
+  value=flex_dd_source_fma(b.x,c.y,value);
+  value=flex_dd_source_sub(value,flex_dd_source_mul(p.x,c.y));
+  value=flex_dd_source_sub(value,flex_dd_source_mul(p.y,b.x));
+  return flex_dd_source_fma(flex_dd_neg(c.x),b.y,value);
+}
+
 static inline void flex_epa_write_witness_dd(
     const thread FlexEpaFace& face, device const FlexDDVertex* vertices,
     thread ContactGeom& contact,
@@ -1411,18 +1431,12 @@ static inline void flex_epa_write_witness_dd(
     thread FlexDD3* source_normal=nullptr) {
   FlexDD3 s1=vertices[face.a].m, s2=vertices[face.b].m;
   FlexDD3 s3=vertices[face.c].m, p=face.v_dd;
-  FlexDD m14=flex_dd_add(
-      flex_dd_sub(flex_dd_mul(s2.y,s3.z),flex_dd_mul(s2.z,s3.y)),
-      flex_dd_add(flex_dd_sub(flex_dd_mul(s1.z,s3.y),flex_dd_mul(s1.y,s3.z)),
-                  flex_dd_sub(flex_dd_mul(s1.y,s2.z),flex_dd_mul(s1.z,s2.y))));
-  FlexDD m24=flex_dd_add(
-      flex_dd_sub(flex_dd_mul(s2.x,s3.z),flex_dd_mul(s2.z,s3.x)),
-      flex_dd_add(flex_dd_sub(flex_dd_mul(s1.z,s3.x),flex_dd_mul(s1.x,s3.z)),
-                  flex_dd_sub(flex_dd_mul(s1.x,s2.z),flex_dd_mul(s1.z,s2.x))));
-  FlexDD m34=flex_dd_add(
-      flex_dd_sub(flex_dd_mul(s2.x,s3.y),flex_dd_mul(s2.y,s3.x)),
-      flex_dd_add(flex_dd_sub(flex_dd_mul(s1.y,s3.x),flex_dd_mul(s1.x,s3.y)),
-                  flex_dd_sub(flex_dd_mul(s1.x,s2.y),flex_dd_mul(s1.y,s2.x))));
+  FlexDD m14=flex_epa_affine_minor(FlexDD2{s1.y,s1.z},
+      FlexDD2{s2.y,s2.z},FlexDD2{s3.y,s3.z});
+  FlexDD m24=flex_epa_affine_minor(FlexDD2{s1.x,s1.z},
+      FlexDD2{s2.x,s2.z},FlexDD2{s3.x,s3.z});
+  FlexDD m34=flex_epa_affine_minor(FlexDD2{s1.x,s1.y},
+      FlexDD2{s2.x,s2.y},FlexDD2{s3.x,s3.y});
   FlexDD abs14=flex_dd_abs(m14), abs24=flex_dd_abs(m24), abs34=flex_dd_abs(m34);
   FlexDD mmax; FlexDD2 a2,b2,c2,q2;
   if (flex_dd_compare(abs14,abs24)>=0 && flex_dd_compare(abs14,abs34)>=0) {
@@ -1435,37 +1449,19 @@ static inline void flex_epa_write_witness_dd(
     mmax=m34; a2=FlexDD2{s1.x,s1.y}; b2=FlexDD2{s2.x,s2.y};
     c2=FlexDD2{s3.x,s3.y}; q2=FlexDD2{p.x,p.y};
   }
-  FlexDD c31=flex_dd_add(
-      flex_dd_sub(flex_dd_add(flex_dd_mul(q2.x,b2.y),
-                              flex_dd_mul(q2.y,c2.x)),
-                  flex_dd_mul(q2.x,c2.y)),
-      flex_dd_sub(flex_dd_mul(b2.x,c2.y),flex_dd_mul(q2.y,b2.x)));
-  c31=flex_dd_sub(c31,flex_dd_mul(c2.x,b2.y));
-  FlexDD c32=flex_dd_add(
-      flex_dd_sub(flex_dd_add(flex_dd_mul(q2.x,c2.y),
-                              flex_dd_mul(q2.y,a2.x)),
-                  flex_dd_mul(q2.x,a2.y)),
-      flex_dd_sub(flex_dd_mul(c2.x,a2.y),flex_dd_mul(q2.y,c2.x)));
-  c32=flex_dd_sub(c32,flex_dd_mul(a2.x,c2.y));
-  FlexDD c33=flex_dd_add(
-      flex_dd_sub(flex_dd_add(flex_dd_mul(q2.x,a2.y),
-                              flex_dd_mul(q2.y,b2.x)),
-                  flex_dd_mul(q2.x,b2.y)),
-      flex_dd_sub(flex_dd_mul(a2.x,b2.y),flex_dd_mul(q2.y,a2.x)));
-  c33=flex_dd_sub(c33,flex_dd_mul(b2.x,a2.y));
-  FlexDD u=flex_dd_div(c31,mmax), v=flex_dd_div(c32,mmax);
-  FlexDD w=flex_dd_div(c33,mmax);
-  FlexDD3 xa=flex_dd3_add(flex_dd3_madd(vertices[face.a].a,u,
-                                        flex_dd3(float3(0.0f))),
-      flex_dd3_add(flex_dd3_scale(vertices[face.b].a,v),
-                   flex_dd3_scale(vertices[face.c].a,w)));
-  FlexDD3 xb=flex_dd3_add(flex_dd3_scale(vertices[face.a].b,u),
-      flex_dd3_add(flex_dd3_scale(vertices[face.b].b,v),
-                   flex_dd3_scale(vertices[face.c].b,w)));
+  FlexDD weights[3]={
+      flex_dd_source_div(flex_epa_affine_area(q2,b2,c2),mmax),
+      flex_dd_source_div(flex_epa_affine_area(q2,c2,a2),mmax),
+      flex_dd_source_div(flex_epa_affine_area(q2,a2,b2),mmax)};
+  FlexDD3 values_a[3]={vertices[face.a].a,vertices[face.b].a,vertices[face.c].a};
+  FlexDD3 values_b[3]={vertices[face.a].b,vertices[face.b].b,vertices[face.c].b};
+  FlexDD3 xa=flex_dd3_lincomb_source(values_a,weights,3);
+  FlexDD3 xb=flex_dd3_lincomb_source(values_b,weights,3);
   FlexDD3 witness_delta=flex_dd3_sub(xa,xb);
   FlexDD witness_norm=flex_dd_sqrt(flex_dd3_dot(witness_delta,witness_delta));
   FlexDD3 normal=flex_dd_compare(witness_norm,flex_dd(0.0f))>0
-      ? flex_dd3_div(witness_delta,witness_norm) : flex_dd3(float3(0.0f));
+      ? flex_dd3_scale(witness_delta,
+          flex_dd_source_div(flex_dd(1.0f),witness_norm)) : flex_dd3(float3(0.0f));
   contact.normal=flex_dd3_high(normal);
   FlexDD distance=flex_dd_sqrt(face.dist2_dd);
   contact.dist=-((distance.hi+distance.lo)+distance.tail);
