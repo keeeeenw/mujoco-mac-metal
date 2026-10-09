@@ -21,6 +21,7 @@ inline float3 sp_qrot(float4 q, float3 v) {
 // One thread owns one taxel. Opposing geom eligibility and SDF/velocity
 // reductions stay on device; each opposing geom contributes at most once.
 // Mirrors engine_sensor.c tactile_taxel_batch and geomDistance (3.10.0).
+#if !defined(MUJOCO_METAL_SENSOR_ENTRY) || MUJOCO_METAL_SENSOR_ENTRY == 1
 kernel void evaluate_tactile(
     device const float* geom_pos [[buffer(0)]],
     device const float* geom_quat [[buffer(1)]],
@@ -105,6 +106,7 @@ kernel void evaluate_tactile(
   if (channels>=2) output[adr+nvert]=v1;
   if (channels>=3) output[adr+2*nvert]=v2;
 }
+#endif
 // Copyright 2026 The MuJoCo Metal contributors
 // Licensed under the Apache License, Version 2.0.
 //
@@ -550,6 +552,7 @@ inline bool sp_check_match(int body, int geom, int type, int id,
   return false;
 }
 
+#if !defined(MUJOCO_METAL_SENSOR_ENTRY) || MUJOCO_METAL_SENSOR_ENTRY == 2
 kernel void evaluate_contact_sensors(
     device const float* contact_frame [[buffer(0)]],
     device const float* contact_force [[buffer(1)]],
@@ -780,8 +783,10 @@ kernel void evaluate_contact_sensors(
   }
 }
 
+#endif
 // Site rangefinder rays (pinned site path: origin = site pos, dir = site
 // z-axis, bodyexclude = site body, static included, geomgroup NULL).
+#if !defined(MUJOCO_METAL_SENSOR_ENTRY) || MUJOCO_METAL_SENSOR_ENTRY == 3
 kernel void evaluate_rays(
     device const float* site_pos [[buffer(0)]],
     device const float* site_quat [[buffer(1)]],
@@ -875,9 +880,11 @@ kernel void evaluate_rays(
   (void)dim;
 }
 
+#endif
 // Geom-distance witnesses (pinned mj_geomDistance over the same narrow
 // phase: canonical type-order flip, margin=cutoff, min over witnesses,
 // fromto split about the witness point).
+#if !defined(MUJOCO_METAL_SENSOR_ENTRY) || MUJOCO_METAL_SENSOR_ENTRY == 4
 kernel void evaluate_geomdist(
     device const float* geom_pos [[buffer(0)]],
     device const float* geom_quat [[buffer(1)]],
@@ -974,3 +981,4 @@ kernel void evaluate_geomdist(
   }
   (void)dim;
 }
+#endif

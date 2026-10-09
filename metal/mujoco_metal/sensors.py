@@ -16,11 +16,41 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from functools import lru_cache, partial
 
 import mujoco
 import numpy as np
 
 _SHADER = Path(__file__).parent / "shaders" / "sensors.metal"
+
+
+def _spatial_shader_source(entry=0):
+  """Build the complete sensor ray/distance unit from this package's sources."""
+  root = _SHADER.parent
+  # SDF octree and transform operations consume the shared retained-precision
+  # helpers, including plugin-free queries. Define them before either user.
+  if entry not in (0, 1, 2, 3, 4):
+    raise ValueError("unknown spatial sensor entry")
+  selector = "" if entry == 0 else f"#define MUJOCO_METAL_SENSOR_ENTRY {entry}"
+  return "\n".join((
+      selector,
+      (root / "collision_primitives.metal").read_text(),
+      (root / "convex_narrowphase.metal").read_text(),
+      "#define MUJOCO_METAL_SDF_HELPERS_ONLY",
+      (root / "plugin_sdf.metal").read_text(),
+      "#undef MUJOCO_METAL_SDF_HELPERS_ONLY",
+      (root / "sdf_narrowphase.metal").read_text(),
+      (root / "sensors_spatial.metal").read_text()))
+
+
+@lru_cache(maxsize=4)
+def _spatial_shader_library(entry):
+  import torch
+  return torch.mps.compile_shader(_spatial_shader_source(entry))
+
+
+def _dispatch_spatial(entry, name, *args, **kwargs):
+  return getattr(_spatial_shader_library(entry), name)(*args, **kwargs)
 _SUPPORTED = {
     int(mujoco.mjtSensor.mjSENS_JOINTPOS),
     int(mujoco.mjtSensor.mjSENS_JOINTVEL),
@@ -1873,18 +1903,13 @@ class SensorProgram:
     else:
       self._sp_hull = torch.zeros(1, dtype=torch.float32, device=self._device)
       self._sp_hull_info = torch.zeros(9, dtype=torch.int32, device=self._device)
-    from pathlib import Path as _Path
-    _base = _Path(__file__).parent / "shaders"
-    from mujoco_metal.coupled_constraints import (
-        _COLLISION_SHADER, _CONVEX_SHADER, _SDF_SHADER)
-    src = (_COLLISION_SHADER.read_text() + "\n" + _CONVEX_SHADER.read_text()
-           + "\n" + _SDF_SHADER.read_text() + "\n"
-           + (_base / "sensors_spatial.metal").read_text())
-    self._sp_lib = torch.mps.compile_shader(src)
-    self._sp_contact = self._sp_lib.evaluate_contact_sensors
-    self._sp_rays = self._sp_lib.evaluate_rays
-    self._sp_geomdist = self._sp_lib.evaluate_geomdist
-    self._sp_tactile = self._sp_lib.evaluate_tactile
+    # Compile each independent query entry on first use. Rangefinders must
+    # not compile the complete geometry collision dispatcher as a side effect.
+    # All families remain available, including queries requested after setup.
+    self._sp_contact = partial(_dispatch_spatial, 2, "evaluate_contact_sensors")
+    self._sp_rays = partial(_dispatch_spatial, 3, "evaluate_rays")
+    self._sp_geomdist = partial(_dispatch_spatial, 4, "evaluate_geomdist")
+    self._sp_tactile = partial(_dispatch_spatial, 1, "evaluate_tactile")
     self._build_tactile_constants(model)
 
   def _build_tactile_constants(self, model):

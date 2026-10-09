@@ -1758,6 +1758,7 @@ inline float3 plugin_sdf_device_gradient(int kind, float3 p,
   return plugin_sdf_gradient(kind, p, attributes, attributes_low);
 }
 
+#ifndef MUJOCO_METAL_SDF_HELPERS_ONLY
 kernel void query_bundled_plugin_sdf(
     device const float* points [[buffer(0)]],
     device const int* plugin_instance [[buffer(1)]],
@@ -1800,3 +1801,4 @@ kernel void query_bundled_plugin_sdf(
   gradient[3 * index + 2] = valid ? g.z : 0.0f;
   status[index] = valid ? 0 : 1;
 }
+#endif
