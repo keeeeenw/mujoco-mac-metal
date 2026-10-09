@@ -157,7 +157,8 @@ def solver_debug_layout(nv, nr, solver_type, ntree=0, nbody=0,
   operator_offset = base_stride
   armature_offset = operator_offset
   layout_offset = armature_offset + values["component_nnz"]
-  high_low_debug_offset = layout_offset + values["component_layout_words"]
+  original_mass_offset = layout_offset + values["component_layout_words"]
+  high_low_debug_offset = original_mass_offset + values["component_nnz"]
   # Unlike the component metadata offsets, high/low vectors are addressed
   # from the solver_scratch pointer (debug base + debug_prefix).
   high_low_workspace_offset = high_low_debug_offset - prefix
@@ -166,7 +167,7 @@ def solver_debug_layout(nv, nr, solver_type, ntree=0, nbody=0,
   # per-world offset to the current debug record base.
   # The final nv plane retains the immutable smooth-acceleration low word while
   # primal islands update their own accepted acceleration pairs.
-  high_low_workspace_length = 8 * max(v, 1) + 3 * max(r, 1)
+  high_low_workspace_length = 8 * max(v, 1) + 3 * max(r, 1) + nv * nr
   final_stride = high_low_debug_offset + high_low_workspace_length
   if min(qacc_offset, equality_scratch_offset) < prefix:
     raise ValueError("solver scratch layout overlaps the debug prefix")
@@ -184,6 +185,7 @@ def solver_debug_layout(nv, nr, solver_type, ntree=0, nbody=0,
       "component_operator_offset": operator_offset,
       "component_armature_offset": armature_offset,
       "component_layout_offset": layout_offset,
+      "component_original_mass_offset": original_mass_offset,
       "high_low_debug_offset": high_low_debug_offset,
       "high_low_workspace_offset": high_low_workspace_offset,
       "high_low_workspace_length": high_low_workspace_length,
@@ -1301,13 +1303,14 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
   blocks = max((int(nr) + 255) // 256, 1)
   parts = (
       ("contact_row_data", _bytes(guarded(b * nc * 6 * 7))),
+      ("contact_velocity_words", _bytes(guarded(2 * b * nv))),
       ("contact_frame", _bytes(guarded(b * nc * 12))),
       ("contact_jacobian", _bytes(guarded(contact_jacobian_words))),
       ("pair_mask", _bytes(guarded(b * max(int(npairs), 1)))),
       # Double-precision constant residuals for paired aref, per pair
-      # [solref(2), solimp(5), margin/gap(2), solreffriction(2)] = 11 words
-      # shared across worlds (batch-independent); 11-word sentinel at zero.
-      ("pair_const_lo", _bytes(max(int(npairs) * 11, 11))),
+      # [solref(2), solimp(5), margin/gap(2), solreffriction(2),
+      # friction(5), source-frame flag(1)] = 17 words, shared across worlds.
+      ("pair_const_lo", _bytes(max(int(npairs) * 17, 17))),
       ("workspace_J", _bytes(guarded(b * jacobian_words))),
       ("position_context_zero", _bytes(guarded(b * int(nr)))),
       ("position_context", _bytes(guarded(b * int(nr) * 5))),
@@ -1378,6 +1381,9 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
       ("component_mass_rhs", _bytes(
           guarded(b * (int(nr) + 1) * int(nv))
           if int(solver_type) == int(mujoco.mjtSolver.mjSOL_PGS) else 0)),
+      ("component_mass_rhs_low", _bytes(
+          guarded(b * (int(nr) + 1) * int(nv))
+          if int(solver_type) == int(mujoco.mjtSolver.mjSOL_PGS) else 0)),
       ("component_smooth_acceleration_pair", _bytes(
           guarded(2 * b * int(nv))
           if (int(nv) > 0 and (
@@ -1388,11 +1394,12 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
       # binding to preserve Metal's 31-buffer ABI.
       ("workspace_debug", _bytes(guarded(
           b * (int(nr) * int(nr) + 7 * int(nr) + primal_scratch
-               + (int(component_nnz) + 2 * int(ncomponent) + 1
+               + (2 * int(component_nnz) + 2 * int(ncomponent) + 1
                   + 3 * nv
                   if mass_storage == "block_sparse" and component_configured
                   else 0)
-               + 8 * max(int(nv), 1) + 3 * max(int(nr), 1))))),
+               + 8 * max(int(nv), 1) + 3 * max(int(nr), 1)
+               + int(nv) * int(nr))))),
       # One constructor-owned signed-int32 tensor contains the 22 scalar
       # dimensions, six island offsets, dof-tree map (guarded at nv=0), ten
       # canonical row words per row, and 20 appended solver/component

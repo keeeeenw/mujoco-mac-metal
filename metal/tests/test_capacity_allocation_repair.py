@@ -55,7 +55,7 @@ def test_workspace_mirror_is_byte_exact_cpu():
   # The independent high/low tail adds 8*nv + 3*nr words (17 here),
   # including the retained aref residual row. Keep this expected
   # arithmetic independent of the estimator helper.
-  assert by_name["workspace_debug"] == 2 * (9 + 21 + 107 + 17) * 4
+  assert by_name["workspace_debug"] == 2 * (9 + 21 + 107 + 17 + 3) * 4
   assert by_name["out_force"] == 2 * 1 * 4
   assert by_name["out_acc"] == 2 * 2 * 1 * 4
   assert by_name["out_status"] == 2 * 4
@@ -319,28 +319,20 @@ def test_budget_between_old_and_actual_paired_totals_rejects_cpu():
   check_capacity(est, CapacityLimits(memory_budget_bytes=full))
 
 
-def test_paired_correction_uses_existing_tail_without_new_words_cpu():
-  # Paired W/solver correction introduces no new global words: J low
-  # planes are counted above; multiplier/rhs low words reuse the existing
-  # 8*nv+3*nr tail (pgs_rhs_low/lambda_low/aref_low for all solver
-  # types); accumulation beyond that is thread-local compensated
-  # arithmetic. Assert the tail formula still covers exactly three row
-  # planes and eight DOF planes.
+def test_paired_correction_accounts_independent_inverse_row_low_cpu():
+  # Inverse-row lows need a persistent nv*nr plane after the eight DOF
+  # and three row planes, so primal/PGS scratch cannot overwrite them.
   parts, _ = estimate_workspace(nv=6, npairs=1, nslots=8, nr=16,
                                 nr_joint=8, neq=0, batch=1)
   by_name = dict(parts)
-  # Tail length is embedded in workspace_debug; verify the 8*nv+3*nr
-  # structure by comparing two nv values with nr fixed (difference is
-  # exactly 8 words per DOF, no hidden paired-W plane).
+  # Hold nr fixed while changing nv. Both inverse-J planes must grow.
   parts2, _ = estimate_workspace(nv=7, npairs=1, nslots=8, nr=16,
                                  nr_joint=8, neq=0, batch=1)
   d1 = dict(parts2)["workspace_debug"] - by_name["workspace_debug"]
-  # nv 6->7 changes dense mass factor (v^2+2v: 48->63 = +15), the v*r
-  # Delassus-transpose block (96->112 = +16), equality scratch (12v:
-  # 72->84 = +12), qacc pair (2v: +2), and tail 8v (+8): total +53 words
-  # = +212 bytes. No hidden paired-W plane (that correction reuses the
-  # existing tail + thread-local arithmetic).
-  assert d1 == (15 + 16 + 12 + 2 + 8) * 4
+  # Independent arithmetic: dense factor +15, high/low inverse rows
+  # +16 each, equality scratch +12, qacc pair +2 and DOF tail +8 words.
+  assert d1 == (15 + 16 + 16 + 12 + 2 + 8) * 4
+
 
 
 @_needs_gpu()
@@ -386,9 +378,9 @@ def test_runtime_paired_buffers_match_estimates_gpu():
 
 def test_pair_const_lo_envelope_host_cpu():
   # Host-only envelope proof (no device): lowering owns the per-pair
-  # constant residuals (11 words: solref/solimp/margin-gap/solreffriction
-  # lows); the estimate must count exactly max(npairs*11, 11) words with
-  # an 11-word sentinel at zero pairs, batch-independently, and a budget
+  # constant residuals (17 words: solref/solimp/margin-gap/solreffriction
+  # lows); the estimate must count exactly max(npairs*17, 17) words with
+  # an 17-word sentinel at zero pairs, batch-independently, and a budget
   # below the full envelope must reject before allocation.
   import sys
   sys.path.insert(0, "metal/tests")
@@ -400,14 +392,14 @@ def test_pair_const_lo_envelope_host_cpu():
     model = _plugin_sphere_model(name)
     desc = lower_coupled_constraints(model)
     assert desc.pair_const_lo is not None
-    assert desc.pair_const_lo.shape == (int(desc.npairs), 11)
+    assert desc.pair_const_lo.shape == (int(desc.npairs), 17)
     assert desc.pair_const_lo.dtype == np.float32
     for batch in (1, 2):
       est = estimate_capacity(
           model, batch, desc.npairs, desc.ncontacts_max, desc.nr)
       by_name = dict(est.memory_breakdown)
       assert by_name["pair_const_lo"] == max(
-          int(desc.npairs) * 11, 11) * 4
+          int(desc.npairs) * 17, 17) * 4
       parts, _ = estimate_workspace(
           nv=6, npairs=int(desc.npairs), nslots=8, nr=16,
           nr_joint=8, neq=0, batch=batch)
@@ -418,9 +410,9 @@ def test_pair_const_lo_envelope_host_cpu():
       "</worldbody></mujoco>")
   desc0 = lower_coupled_constraints(m)
   assert desc0.npairs == 0
-  assert desc0.pair_const_lo.shape == (0, 11)
+  assert desc0.pair_const_lo.shape == (0, 17)
   est0 = estimate_capacity(m, 1, 0, 0, 0)
-  assert dict(est0.memory_breakdown)["pair_const_lo"] == 44
+  assert dict(est0.memory_breakdown)["pair_const_lo"] == 68
   # Budget below full envelope rejects (covers the new words).
   full = est0.memory_bytes
   with pytest.raises(CapacityOverflow, match="memory"):
@@ -433,7 +425,7 @@ def test_pair_const_lo_envelope_host_cpu():
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_pair_const_lo_runtime_inventory_matches_estimates_gpu():
   # GPU-gated inventory proof: runtime-owned pair_const_lo allocation
-  # equals the pre-allocation estimate (11 words per pair, 11-word
+  # equals the pre-allocation estimate (17 words per pair, 17-word
   # sentinel), batch-independently.
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -452,10 +444,10 @@ def test_pair_const_lo_runtime_inventory_matches_estimates_gpu():
       by_name = dict(est.memory_breakdown)
       actual = cc._constants["pair_const_lo"].numel() * 4
       assert by_name["pair_const_lo"] == actual == max(
-          int(cc.descriptor.npairs) * 11, 11) * 4
+          int(cc.descriptor.npairs) * 17, 17) * 4
   # Zero-pair sentinel runtime padding.
   m = mujoco.MjModel.from_xml_string(
       "<mujoco><worldbody><geom name='floor' type='plane' size='5 5 0.1'/>"
       "</worldbody></mujoco>")
   cc0 = MetalCoupledConstraints(m, batch_size=1)
-  assert cc0._constants["pair_const_lo"].numel() == 11
+  assert cc0._constants["pair_const_lo"].numel() == 17

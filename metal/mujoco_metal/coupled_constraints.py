@@ -1832,10 +1832,15 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
           else:
             _clo.append((_true - np.asarray(
                 [margin[_k], gap[_k]], dtype=np.float64)).astype(np.float32))
-        _clo_rows.append(np.concatenate(_clo).astype(np.float32))
-      pair_const_lo = np.stack(_clo_rows).reshape(-1, 11)
+        _fr64 = np.asarray(_p[5], dtype=np.float64)
+        _frhi = _fr64.astype(np.float32)
+        _frlo = (_fr64 - _frhi.astype(np.float64)).astype(np.float32)
+        _zero_tangent = float(_HFIELD in (geoms[int(_p[0])], geoms[int(_p[1])])
+                              or 8 in (geoms[int(_p[0])], geoms[int(_p[1])]))
+        _clo_rows.append(np.concatenate((*_clo, _frlo, [_zero_tangent])).astype(np.float32))
+      pair_const_lo = np.stack(_clo_rows).reshape(-1, 17)
     else:
-      pair_const_lo = np.empty((0, 11), dtype=np.float32)
+      pair_const_lo = np.empty((0, 17), dtype=np.float32)
     cd = np.array([p[4] for p in pairs], dtype=np.int32)
     fr = np.array([p[5] for p in pairs], dtype=np.float32).reshape(-1, 5)
     r1 = np.where(geoms[g1] == _PLANE, -1.0, model.geom_size[g1, 0]).astype(np.float32)
@@ -1850,7 +1855,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     g1 = g2 = np.empty(0, dtype=np.int32)
     sr = np.empty((0, 2), dtype=np.float32)
     si = np.empty((0, 5), dtype=np.float32)
-    pair_const_lo = np.empty((0, 11), dtype=np.float32)
+    pair_const_lo = np.empty((0, 17), dtype=np.float32)
     cd = np.empty(0, dtype=np.int32)
     fr = np.empty((0, 5), dtype=np.float32)
     srfr = np.empty((0, 2), dtype=np.float32)
@@ -2555,7 +2560,7 @@ class MetalCoupledConstraints:
         "pair_const_lo": self._tensor(
             np.asarray(getattr(d, "pair_const_lo", None)).reshape(-1)
             if (d.npairs and getattr(d, "pair_const_lo", None) is not None)
-            else np.zeros(11, dtype=np.float32)),
+            else np.zeros(17, dtype=np.float32)),
         "pair_condim": self._tensor(d.condim if d.npairs else np.zeros(1, dtype=np.int32)),
         "pair_friction": self._tensor(d.friction.reshape(-1) if d.npairs else np.zeros(5, dtype=np.float32)),
         "pair_solreffriction": self._tensor(d.solreffriction.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
@@ -2646,7 +2651,7 @@ class MetalCoupledConstraints:
       raise TypeError("component mass layout must be a mapping")
     ncomponent, nnz, packed = plan.ncomponent, plan.nnz, plan.packed
     batch = int(self.batch_size)
-    tail_words = nnz + int(packed.size)
+    tail_words = 2 * nnz + int(packed.size)
     if max(batch * tail_words, 1) > np.iinfo(np.int32).max:
       raise ValueError("component operator tail exceeds Metal int32 addressing")
     self._component_operator_ncomponent = ncomponent
@@ -3027,6 +3032,7 @@ class MetalCoupledConstraints:
                              if jacobian_layout.mode == 0 else 1)
     self._workspace = {
         "contact_row_data": empty(b * nc * 6 * 7),
+        "contact_velocity_words": empty(2 * b * nv),
         "contact_frame": empty(b * nc * 12),
         "contact_pair_count": torch.zeros(
             max(b * d.npairs, 1), dtype=torch.int32, device=self._device),
@@ -3112,6 +3118,9 @@ class MetalCoupledConstraints:
         "position_cache_pair_count": torch.zeros(b, dtype=torch.int32, device=self._device),
         "position_cache_pair_overflow": torch.zeros(b, dtype=torch.int32, device=self._device),
         "component_mass_rhs": (
+            empty(b * (nr + 1) * nv)
+            if d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS) else None),
+        "component_mass_rhs_low": (
             empty(b * (nr + 1) * nv)
             if d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS) else None),
         # Cached component-PGS solves consume a high/low smooth-acceleration
@@ -3303,6 +3312,25 @@ class MetalCoupledConstraints:
           raise ValueError(
               f"common source CCD pose field {pose_name} must be contiguous "
               "float32 on the geometry pose device")
+    paired_contact_rows = bool(d.npairs > 0 and nc > 0 and (
+        getattr(self, "_has_analytic_sdf_pairs", False)
+        or (getattr(self, "_common_ccd_hfield_mesh_requested", False)
+            and int(getattr(d, "disableflags", 0))
+                & int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD))))
+    retained = None
+    if paired_contact_rows:
+      for pose_name in ("body_pos_low", "body_pos_tail",
+                        "body_quat_low", "body_quat_tail"):
+        pose_value = poses.get(pose_name)
+        expect = ((b, int(d.nbody), 3) if "pos" in pose_name
+                  else (b, int(d.nbody), 4))
+        _validate_cached_tensor(self._torch, self._device, pose_name,
+                                pose_value, expect, self._torch.float32)
+      provider = getattr(self, "_velocity_words_provider", None)
+      retained = provider(qvel) if provider is not None else None
+      if retained is not None:
+        _validate_cached_tensor(self._torch, self._device, "retained state words",
+            retained, (b, 2 * (int(d.nq) + int(d.nv))), self._torch.float32)
     if world_mask is None:
       self._pair_contact_world_mask.fill_(1)
     else:
@@ -3468,28 +3496,20 @@ class MetalCoupledConstraints:
           w["contact_pair_count"], w["contact_pair_records"],
           threads=(b * d.npairs,), group_size=(1,),
       )
-      if (self._has_analytic_sdf_pairs
-          and self._component_mass_storage == "dense"
-          and bool(getattr(self.descriptor, "dense_path", True))):
-        # Low-word Jacobian/aref corrections only on the coherent dense
-        # route (paired records, dense mass solve). Models without SDF
-        # pairs skip this dispatch entirely, so their behavior cannot
-        # change. Component/block routes keep exact-zero low planes and a
-        # consistently high-only operator (see capacity notes). Triple FK
+      if paired_contact_rows:
+
+        # Source-wide Jacobian/reference rows share the same effective
+        # operator across dense and component mass routes. Triple FK
         # poses are required; a missing plane fails closed instead of
         # silently degrading.
-        for pose_name in ("body_pos_low", "body_pos_tail",
-                          "body_quat_low", "body_quat_tail"):
-          pose_value = poses.get(pose_name)
-          if pose_value is None:
-            raise ValueError(
-                f"contact Jacobian correction requires FK pose {pose_name}")
-          expect = ((b, int(d.nbody), 3) if "pos" in pose_name
-                    else (b, int(d.nbody), 4))
-          if tuple(pose_value.shape) != expect:
-            raise ValueError(
-                f"FK pose {pose_name} has shape {tuple(pose_value.shape)}; "
-                f"expected {expect}")
+        velocity_words = w["contact_velocity_words"]
+        if retained is None:
+          self._fill_world_masked(velocity_words, world_mask,
+                                  width=2 * int(d.nv), stride=2 * int(d.nv))
+        else:
+          self._copy_world_masked(velocity_words, retained, world_mask,
+              width=2 * int(d.nv), source_stride=2 * (int(d.nq) + int(d.nv)),
+              destination_stride=2 * int(d.nv), source_offset=2 * int(d.nq))
         self._contact_jacobian_low_kernel(
             self._constants["geom_bodyid"], poses["body_pos"],
             poses["body_pos_low"], poses["body_pos_tail"],
@@ -3513,7 +3533,7 @@ class MetalCoupledConstraints:
             self._constants["pair_solref"], self._constants["pair_solimp"],
             self._constants["pair_margin_gap"],
             self._constants["pair_solreffriction"],
-            self._constants["pair_const_lo"],
+            self._constants["pair_const_lo"], velocity_words,
             threads=(b * d.npairs,), group_size=(1,),
         )
       slot_flags = w["contact_row_data"][:b * nc * 42].reshape(b, nc, 42)[:, :, 0]
@@ -4666,6 +4686,7 @@ class MetalCoupledConstraints:
     else:
       rhs_capacity = nr + 1
       component_rhs = w["component_mass_rhs"][:b * rhs_capacity * nv]
+      component_rhs_low = w["component_mass_rhs_low"][:b * rhs_capacity * nv]
       def prepare_component_rhs():
         if exact_impedance is not None:
           # The exact mass-row solve borrows component_solver's prepared output
@@ -4683,6 +4704,7 @@ class MetalCoupledConstraints:
           self._pack_component_mass_rhs(
               w["workspace_J"], qfrc_smooth.reshape(-1),
               w["workspace_debug"], component_rhs, solver_dims,
+              component_rhs_low, w["component_smooth_acceleration_pair"][b * nv:2 * b * nv],
               threads=(b,), group_size=(1,))
         return exact
 
@@ -4694,9 +4716,7 @@ class MetalCoupledConstraints:
                   component_rhs.reshape(b, rhs_capacity, nv),
                   dof_ids=awake_dof_ids, counts=awake_counts,
                   tendon_armature_blocks=tendon_armature_blocks,
-                  rhs_low=(None if qacc_smooth is not None
-                           else (w["component_smooth_acceleration_pair"]
-                                 [b * nv:2 * b * nv].reshape(b, nv))))))
+                  rhs_low=component_rhs_low.reshape(b, rhs_capacity, nv))))
       with _cached_position_stage(
           solver_dims, d.refsafe,
           bool(getattr(self, "_iteration_trace_enabled", False)),
@@ -5475,6 +5495,7 @@ class MetalCoupledConstraints:
         dispatch_solver(assembly_mass)
       rhs_capacity = nr + 1
       component_rhs = w["component_mass_rhs"][:b * rhs_capacity * nv]
+      component_rhs_low = w["component_mass_rhs_low"][:b * rhs_capacity * nv]
       smooth_pair = w.get("component_smooth_acceleration_pair")
       if d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS):
         if smooth_pair is None:
@@ -5491,7 +5512,8 @@ class MetalCoupledConstraints:
         self._pack_component_mass_rhs(
             w["workspace_J"], qfrc_smooth.reshape(-1),
             w["workspace_debug"], component_rhs,
-            solver_dims, threads=(b,), group_size=(1,))
+            solver_dims, component_rhs_low, low_force,
+            threads=(b,), group_size=(1,))
         return exact
 
       exact_data, (component_result, component_status) = (
@@ -5502,7 +5524,8 @@ class MetalCoupledConstraints:
                   component_rhs.reshape(b, rhs_capacity, nv),
                   dof_ids=awake_dof_ids, counts=awake_counts,
                   tendon_armature_blocks=tendon_armature_blocks,
-                  rhs_low=low_force, world_mask=world_mask)))
+                  rhs_low=component_rhs_low.reshape(b, rhs_capacity, nv),
+                  world_mask=world_mask)))
       with _solver_dimension_stage(
           solver_dims, -2, self._line_search_iterations):
         if exact_data is None:

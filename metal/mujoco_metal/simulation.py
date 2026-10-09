@@ -1625,12 +1625,25 @@ class MetalSimulation:
       return rk4._stage_words[:,:2*state._model.nq]
     return None
 
+  def _velocity_words_for(self, qvel):
+    state = self._state
+    if qvel is state._qvel:
+      return state._precision.synchronize(state._qpos, state._qvel)
+    rk4 = getattr(self, '_rk4', None)
+    if (rk4 is not None and getattr(rk4, '_stage_active', False)
+        and rk4._stage_qvel is qvel):
+      return rk4._stage_words
+    return None
+
   def _bind_position_words(self):
     # Both FK producers are explicitly owned by this simulation. Rebind after
     # model lifecycle swaps so their providers never resolve a discarded state.
     for stage in (self._smooth,self._passive):
       fk=getattr(stage,'_fk',None)
       if fk is not None:fk._position_words_provider=self._position_words_for
+    coupled = getattr(self, '_coupled_constraints', None)
+    if coupled is not None:
+      coupled._velocity_words_provider = self._velocity_words_for
 
   @property
   def islands(self):

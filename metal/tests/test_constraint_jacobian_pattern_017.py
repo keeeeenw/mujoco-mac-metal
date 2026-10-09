@@ -672,7 +672,8 @@ def test_primal_coupled_shader_never_treats_packed_record_as_dense_rows():
   assert "J + row * nv" not in curvature
   assert "J + (start + k) * nv" not in curvature
   assert "primal_ccj_compensated_dot_pair" in curvature
-  assert "component_row_rhs[dof] = ccj_get(J_world" in source
+  assert "scratch[dof] = ccj_get(J, row, dof, nv)" in source
+  assert "scratch[nv+dof] = ccj_get_lo(J, row, dof, nv)" in source
   assert "J_world + row * nv" not in source
   assert "J_world + b * nv" not in source
 

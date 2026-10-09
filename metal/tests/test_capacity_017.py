@@ -211,7 +211,7 @@ def test_estimate_is_deterministic_and_counts_memory():
   layout_words = 2 * layout["ncomponent"] + 1 + 3 * model.nv
   assert solver_breakdown["workspace_debug"] == (
       sparse_solver["workspace_debug"]
-      + 2 * (layout["nnz"] + layout_words) * 4)
+      + 2 * (2 * layout["nnz"] + layout_words) * 4)
 
 
 def test_component_pgs_capacity_counts_smooth_acceleration_pair():
@@ -766,7 +766,7 @@ def estimate_workspace_expected(model, batch, npairs, nslots, nr,
                                     + primal_scratch_floats(
                                         v, nr, model.opt.solver, model.ntree,
                                         model.nbody, mass_storage)
-                                    + 8 * v + 3 * max(nr, 1)), 1),
+                                    + 8 * v + 3 * max(nr, 1) + int(model.nv) * nr), 1),
       22 + 6 + v + 10 * nr + 20,
       max(b * v, 1), max(2 * b * int(model.nv), 1), b, max(b * 10, 1),
       max(b * nc * 11, 1), max(b, 1), max(b, 1), max(b, 1),

@@ -40,9 +40,9 @@ def test_contact_cancellation_uses_retained_multipliers_across_mass_routes(solve
       jlo[row, columns[span]] = lows[span]
   else:
     jhi = values.reshape(nr, nv); jlo = lows.reshape(nr, nv)
-  # The source pose is shared by both storage routes. In this fixture J lows
-  # are zero, isolating retained multipliers from changes to the mass operator.
-  np.testing.assert_array_equal(jlo, 0)
+  # The same effective operator must drive accepted acceleration and force.
+  # Terrain witnesses and FK now retain nonzero Jacobian residuals.
+  assert np.any(jlo != 0)
   debug = cc._workspace['workspace_debug'].cpu().numpy().reshape(2, -1)[0]
   low_base = (nr * nr + 7 * nr + cc._high_low_workspace_offset
               + 8 * max(nv, 1) + max(nr, 1))
@@ -51,7 +51,7 @@ def test_contact_cancellation_uses_retained_multipliers_across_mass_routes(solve
   if solver != mujoco.mjtSolver.mjSOL_PGS:
     assert np.any(lamlo != 0)
   assert np.count_nonzero(result['contact_mask'][0].cpu().numpy()) > 8
-  expected = jhi.T @ (lamhi + lamlo)
+  expected = (jhi + jlo).T @ (lamhi + lamlo)
   actual = result['qfrc_constraint'][0].cpu().numpy().astype(float)
   np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
   np.testing.assert_array_equal(result['qfrc_constraint'][1].cpu().numpy(), 0)

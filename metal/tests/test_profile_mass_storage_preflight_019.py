@@ -439,3 +439,35 @@ def test_generate_candidates_rejects_invalid_pose_before_any_mutation(
     np.testing.assert_array_equal(program._workspace[name].array, expected)
   for name, expected in constant_before.items():
     np.testing.assert_array_equal(program._constants[name].array, expected)
+
+
+@pytest.mark.parametrize("invalid", ["missing_pose", "pose_dtype", "retained_shape", "retained_dtype"])
+def test_paired_contact_preflight_rejects_before_candidate_mutation(invalid):
+  import torch
+  program, poses, mask = _candidate_dispatch_fixture()
+  program._common_ccd_requested = False
+  program._has_analytic_sdf_pairs = True
+  program._torch = torch
+  program._device = torch.device('cpu')
+  program.descriptor.nbody = 1
+  program.descriptor.nq = 1
+  for name,width in (("body_pos_low",3),("body_pos_tail",3),
+                     ("body_quat_low",4),("body_quat_tail",4)):
+    poses[name] = torch.zeros((2,1,width))
+  retained = torch.zeros((2,4))
+  if invalid == "missing_pose": del poses['body_pos_low']
+  elif invalid == "pose_dtype": poses['body_pos_low'] = poses['body_pos_low'].to(torch.float64)
+  elif invalid == "retained_shape": retained = torch.zeros((2,3))
+  else: retained = retained.to(torch.float64)
+  program._velocity_words_provider = lambda _: retained
+  before = {name: value.array.copy() for name,value in program._workspace.items()}
+  mask_before = program._pair_contact_world_mask.array.copy()
+  calls = []
+  program._reset_jacobian_write_status = lambda **_: calls.append('status')
+  program._clear_jacobian_rows = lambda *_,**__: calls.append('rows')
+  with pytest.raises(ValueError,match='body_pos_low|retained state words'):
+    program.generate_candidates(poses,torch.zeros((2,1)),world_mask=mask)
+  assert calls == []
+  np.testing.assert_array_equal(program._pair_contact_world_mask.array,mask_before)
+  for name,value in before.items():
+    np.testing.assert_array_equal(program._workspace[name].array,value)

@@ -32,7 +32,7 @@ def test_tail_structure_and_refinement_footprint_cpu():
       # Pair tail is exactly rhs_lo(nr) + lambda_lo(nr) + aref_lo(nr) after
       # eight DOF planes; Newton/CG refinement needs 3nv words of the
       # Newton core (v pair + temp pair) for every solver type it runs on.
-      assert lay["high_low_workspace_length"] == 8 * v + 3 * r
+      assert lay["high_low_workspace_length"] == 8 * v + 3 * r + nv * nr
       if int(solver) in (int(mujoco.mjtSolver.mjSOL_CG),
                          int(mujoco.mjtSolver.mjSOL_NEWTON)):
         core = {"CG": 13 * v + 5 * r, "Newton": 16 * v + 5 * r}[

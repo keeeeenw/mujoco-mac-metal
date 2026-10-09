@@ -62,7 +62,7 @@ def test_pgs_rhs_delassus_multiplier_and_force_pairs_match_float64_oracle():
 def test_pgs_pair_rows_use_disjoint_accounted_solver_tail():
   nv, nr = 9, 37
   layout = solver_debug_layout(nv, nr, 0)
-  expected_length = 8 * nv + 3 * nr
+  expected_length = 8 * nv + 3 * nr + nv * nr
   assert layout["high_low_workspace_length"] == expected_length
   start = layout["high_low_workspace_offset"]
   qacc_smooth_low = (start + 7 * nv, nv)
@@ -72,14 +72,14 @@ def test_pgs_pair_rows_use_disjoint_accounted_solver_tail():
   assert qacc_smooth_low[0] + qacc_smooth_low[1] == rhs_low[0]
   assert rhs_low[0] + rhs_low[1] == lambda_low[0]
   assert lambda_low[0] + lambda_low[1] == aref_low[0]
-  assert aref_low[0] + aref_low[1] == start + expected_length
+  assert aref_low[0] + aref_low[1] + nv * nr == start + expected_length
 
   shader = Path(__file__).parents[1] / "mujoco_metal" / "shaders" / "coupled_constraints.metal"
   source = shader.read_text()
   assert "{ar[row], aref_low[row]}" in source
   assert "device float* pgs_rhs_low = pgs_pair_tail + 8 * max(nv, 1);" in source
   assert "device float* pgs_lambda_low = pgs_rhs_low + max(nr, 1);" in source
-  assert "pgs_delassus_pair(J, Z, mass, dims" in source
+  assert "pgs_delassus_pair(J, Z, Z_low, mass, dims" in source
   assert "{lam[row], solver_type == 0 ? pgs_lambda_low[row] : 0.0f}" in source
 
 
