@@ -595,6 +595,12 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
         # Paired-coordinate residuals supplement, but do not replace, the
         # established float32 pose/material buffers. They remain live through
         # common flex support and the frozen POS context.
+        ("flex.vertex_equality_operands",
+         9 * int(np.asarray(model.flex_vertedge).size)
+         + 15 * int(model.nflexvert)),
+        ("flex.vertex_equality_topology",
+         4 + int(model.nflexvert)
+         + 2 * int(np.asarray(model.flex_vertedge).size)),
         ("flex.vertex_position_low", b * int(getattr(model, "nflexvert", 0)) * 3),
         ("flex.vertex_position_tail", b * int(getattr(model, "nflexvert", 0)) * 3),
         ("flex.node_position_low",

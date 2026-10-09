@@ -1061,11 +1061,19 @@ class MetalFlex:
     # local edge index within its owning flex. Freeze the exact endpoint,
     # reference metric, half-size and MuJoCo mass weights for flexvert rows.
     vertex_neighbors = []
+    vertex_neighbors_source = []
+    neighbor_offsets, neighbor_pairs, neighbor_operands = [0], [], []
+    reference_vertices = np.asarray(model.flex_vert0, dtype=np.float64)
+    reference_sizes = np.asarray(model.flex_size, dtype=np.float64)
+    reference_masses = np.asarray(model.body_mass, dtype=np.float64)
+    reference_metrics = np.asarray(model.flex_vertmetric, dtype=np.float64)
+    vertex_operands = []
     for v in range(d.nflexvert):
       f = int(vert_flexid[v])
       local_edges = d.vertedge[int(d.vertedgeadr[v]):
                                int(d.vertedgeadr[v] + d.vertedgenum[v])]
       records = []
+      source_records = []
       for local_edge in local_edges:
         ge = int(d.edgeadr[f]) + int(local_edge)
         v1, v2 = map(int, d.edge[ge])
@@ -1074,14 +1082,38 @@ class MetalFlex:
         neighbor = v2 if v == v1 else v1
         # MuJoCo's flexvert formulation is a 2D metric and passes the first
         # two scaled rest-coordinate components to its 3x2 products.
-        dx = ((d.vert0[v2] - d.vert0[v1]) * (2.0 * d.size[f]))[:2]
+        dx = ((reference_vertices[v2] - reference_vertices[v1])
+              * (2.0 * reference_sizes[f]))[:2]
         body = int(d.vertbodyid[neighbor])
-        weight = max(float(d.body_mass[body]), 1e-15) if body >= 0 else 1.0
+        weight = max(float(reference_masses[body]), 1e-15) if body >= 0 else 1.0
         dx_tensor = torch.as_tensor(np.asarray(dx, dtype=np.float32),
                                     dtype=torch.float32, device=self._device)
         records.append((v1, v2, dx_tensor, weight))
+        source_records.append((v1, v2, np.array(dx, copy=True), weight))
+        neighbor_pairs.extend((v1, v2))
+        neighbor_operands.extend((dx[0], dx[1], weight))
       vertex_neighbors.append(tuple(records))
+      vertex_neighbors_source.append(tuple(source_records))
+      neighbor_offsets.append(len(neighbor_pairs) // 2)
+      body = int(d.vertbodyid[v])
+      mass = float(reference_masses[body]) if body >= 0 else 0.0
+      scale = math.sqrt(mass) if mass > 1e-15 else 1.0
+      vertex_operands.extend((*reference_metrics[v], scale))
     self._vertex_neighbors_host = tuple(vertex_neighbors)
+    self._vertex_neighbors_source = tuple(vertex_neighbors_source)
+    self._vertex_metric_source = np.array(reference_metrics, copy=True)
+    self._vertex_scale_source = np.asarray(vertex_operands, dtype=np.float64).reshape(-1, 5)[:, 4].copy()
+    source = np.asarray(neighbor_operands + vertex_operands, dtype=np.float64)
+    high = source.astype(np.float32)
+    residual = source - high.astype(np.float64)
+    low = residual.astype(np.float32)
+    tail = (residual - low.astype(np.float64)).astype(np.float32)
+    self._vertex_equality_operands = torch.as_tensor(
+        np.stack((high, low, tail), axis=-1).copy(),
+        dtype=torch.float32, device=self._device).contiguous()
+    self._vertex_equality_topology = torch.tensor(
+        [b, d.nflexvert, nv] + neighbor_offsets + neighbor_pairs,
+        dtype=torch.int32, device=self._device)
     self._vertmetric = torch.as_tensor(
         np.array(d.vertmetric, copy=True), dtype=torch.float32, device=self._device)
     self._flexvert_eq_pos = torch.zeros(
@@ -2221,7 +2253,8 @@ class MetalFlex:
                  "_flexedge_dir", "_flexedge_J"):
       buffers[name].copy_(getattr(self, name))
     self._compute_flexvert_equalities(
-        buffers["_flexvert_xpos"], buffers["_flexvert_J"])
+        buffers["_flexvert_xpos"], buffers["_flexvert_J"],
+        buffers["_flexvert_xpos_low"], buffers["_flexvert_xpos_tail"])
     buffers["_flexvert_eq_pos"].copy_(self._flexvert_eq_pos)
     buffers["_flexvert_eq_J"].copy_(self._flexvert_eq_J)
     for eqid, name in self._flexstrain_context_names.items():
@@ -2396,7 +2429,8 @@ class MetalFlex:
         or not world_mask.is_contiguous()):
       raise ValueError("world_mask must be contiguous int32[B] on the flex device")
 
-  def _compute_flexvert_equalities(self, xpos=None, point_jacobian=None):
+  def _compute_flexvert_equalities(self, xpos=None, point_jacobian=None,
+                                 xpos_low=None, xpos_tail=None):
     """Compute pinned two-invariant cloth rows and their analytic Jacobian.
 
     This is the ``mjEQ_FLEXVERT`` law from MuJoCo 3.10: each vertex averages
@@ -2407,22 +2441,37 @@ class MetalFlex:
     """
     xpos = self._flexvert_xpos if xpos is None else xpos
     point_jacobian = self._flexvert_J if point_jacobian is None else point_jacobian
+    xpos_low = self._flexvert_xpos_low if xpos_low is None else xpos_low
+    xpos_tail = self._flexvert_xpos_tail if xpos_tail is None else xpos_tail
     out_pos = self._flexvert_eq_pos
     out_jac = self._flexvert_eq_J
     out_pos.zero_()
     out_jac.zero_()
     nv = self.descriptor.nv
+    if self._material_shader is not None:
+      self._material_shader.flexvert_invariant_rows(
+          xpos.reshape(-1), xpos_low.reshape(-1), xpos_tail.reshape(-1),
+          point_jacobian.reshape(-1), self._vertex_equality_operands.reshape(-1),
+          self._vertex_equality_topology, out_pos.reshape(-1), out_jac.reshape(-1),
+          threads=(self.batch_size * self.descriptor.nflexvert,), group_size=(32,))
+      return out_pos, out_jac[..., :nv]
     if nv == 0:
       return out_pos, out_jac[..., :0]
-    for v, records in enumerate(self._vertex_neighbors_host):
+    # This host adapter is for CPU qualification. Native execution above never
+    # reads a tensor back or invokes a CPU arithmetic fallback.
+    xpos = xpos.to(torch.float64) + xpos_low.to(torch.float64) + xpos_tail.to(torch.float64)
+    point_jacobian = point_jacobian.to(torch.float64)
+    for v, records in enumerate(self._vertex_neighbors_source):
       if not records:
         continue
       A = torch.zeros((self.batch_size, 3, 2),
-                      dtype=torch.float32, device=self._device)
+                      dtype=torch.float64, device=self._device)
       for v1, v2, dx, weight in records:
+        dx = torch.as_tensor(dx, dtype=torch.float64, device=self._device)
         dy = xpos[:, v2, :] - xpos[:, v1, :]
         A.add_(weight * dy.unsqueeze(-1) * dx.view(1, 1, 2))
-      metric = self._vertmetric[v].reshape(2, 2)
+      metric = torch.as_tensor(self._vertex_metric_source[v], dtype=torch.float64,
+                               device=self._device).reshape(2, 2)
       F = torch.matmul(A, metric)
       f00, f01 = F[:, 0, 0], F[:, 0, 1]
       f10, f11 = F[:, 1, 0], F[:, 1, 1]
@@ -2431,15 +2480,14 @@ class MetalFlex:
       c01 = f00 * f01 + f10 * f11 + f20 * f21
       c10 = c01
       c11 = f01.square() + f11.square() + f21.square()
-      body = int(self.descriptor.vertbodyid[v])
-      mass = float(self.descriptor.body_mass[body]) if body >= 0 else 0.0
-      scale = math.sqrt(mass) if mass > 1e-15 else 1.0
+      scale = float(self._vertex_scale_source[v])
       out_pos[:, v, 0].copy_((c00 + c11 - 2.0) * scale)
       out_pos[:, v, 1].copy_((c00 * c11 - c01 * c10 - 1.0) * scale)
       FB = torch.matmul(F, metric)
       adj = torch.stack((c11, -c01, -c10, c00), dim=-1).reshape(-1, 2, 2)
       FadjBinv = torch.matmul(torch.matmul(F, adj), metric)
       for v1, v2, dx, weight in records:
+        dx = torch.as_tensor(dx, dtype=torch.float64, device=self._device)
         dI1dy1 = -2.0 * weight * torch.matmul(FB, dx)
         dI2dy1 = -2.0 * weight * torch.matmul(FadjBinv, dx)
         J1 = point_jacobian[:, v1, :, :nv]

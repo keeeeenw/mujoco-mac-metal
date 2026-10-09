@@ -70,6 +70,93 @@ inline float2 fp_residual_pair(FPDD a, float high) {
   return float2(d.hi,d.lo+d.tail);
 }
 
+// Compiled cloth reference metrics and neighbor mass weights retain all three
+// source words. Subtracting two already-rounded world positions loses the
+// resting invariant before the large equality stiffness is applied.
+inline FPDD flexvert_operand(device const float* p, int i) {
+  return FPDD{p[3*i],p[3*i+1],p[3*i+2]};
+}
+inline FPDD flexvert_coordinate(device const float* h, device const float* l,
+                               device const float* t, int i) {
+  return FPDD{h[i],l[i],t[i]};
+}
+inline void flexvert_mat322(thread FPDD* out, thread const FPDD* a,
+                           thread const FPDD* b) {
+  for (int r=0;r<3;r++) for (int c=0;c<2;c++)
+    out[2*r+c]=fpadd(fpmul(a[2*r],b[c]),fpmul(a[2*r+1],b[2+c]));
+}
+kernel void flexvert_invariant_rows(
+    device const float* xpos [[buffer(0)]],
+    device const float* xpos_low [[buffer(1)]],
+    device const float* xpos_tail [[buffer(2)]],
+    device const float* point_jac [[buffer(3)]],
+    device const float* operands [[buffer(4)]],
+    constant int* topology [[buffer(5)]],
+    device float* position [[buffer(6)]],
+    device float* jacobian [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]) {
+  int batch=topology[0], nvert=topology[1], nv=topology[2];
+  if (int(tid)>=batch*nvert) return;
+  int v=int(tid)%nvert, world=int(tid)/nvert;
+  int start=topology[3+v], end=topology[4+v];
+  int nneighbor=topology[3+nvert], pairbase=4+nvert;
+  int stride=max(nv,1), out=int(tid)*2;
+  position[out]=0.0f; position[out+1]=0.0f;
+  for (int j=0;j<stride;j++) {
+    jacobian[out*stride+j]=0.0f;
+    jacobian[(out+1)*stride+j]=0.0f;
+  }
+  if (start==end || nv==0) return;
+  FPDD A[6], F[6], metric[4], C[4], FB[6], adj[4], Fadj[6], FadjB[6];
+  for (int i=0;i<6;i++) A[i]=fpdd(0.0f);
+  for (int k=start;k<end;k++) {
+    int v1=topology[pairbase+2*k], v2=topology[pairbase+2*k+1];
+    FPDD dx[2]={flexvert_operand(operands,3*k),flexvert_operand(operands,3*k+1)};
+    FPDD weight=flexvert_operand(operands,3*k+2);
+    for (int r=0;r<3;r++) {
+      FPDD dy=fpsub(flexvert_coordinate(xpos,xpos_low,xpos_tail,(world*nvert+v2)*3+r),
+                    flexvert_coordinate(xpos,xpos_low,xpos_tail,(world*nvert+v1)*3+r));
+      FPDD weighted=fpmul(weight,dy);
+      for (int c=0;c<2;c++) A[2*r+c]=fpadd(A[2*r+c],fpmul(weighted,dx[c]));
+    }
+  }
+  for (int i=0;i<4;i++) metric[i]=flexvert_operand(operands,3*nneighbor+5*v+i);
+  FPDD scale=flexvert_operand(operands,3*nneighbor+5*v+4);
+  flexvert_mat322(F,A,metric);
+  for (int r=0;r<2;r++) for (int c=0;c<2;c++)
+    C[2*r+c]=fpadd(fpadd(fpmul(F[r],F[c]),fpmul(F[2+r],F[2+c])),fpmul(F[4+r],F[4+c]));
+  FPDD i1=fpmul(fpsub(fpadd(C[0],C[3]),fpdd(2.0f)),scale);
+  FPDD i2=fpmul(fpsub(fpsub(fpmul(C[0],C[3]),fpmul(C[1],C[2])),fpdd(1.0f)),scale);
+  position[out]=i1.hi+(i1.lo+i1.tail);
+  position[out+1]=i2.hi+(i2.lo+i2.tail);
+  flexvert_mat322(FB,F,metric);
+  adj[0]=C[3]; adj[1]=fpneg(C[1]); adj[2]=fpneg(C[2]); adj[3]=C[0];
+  flexvert_mat322(Fadj,F,adj); flexvert_mat322(FadjB,Fadj,metric);
+  for (int j=0;j<nv;j++) {
+    FPDD J[2]={fpdd(0.0f),fpdd(0.0f)};
+    for (int k=start;k<end;k++) {
+      int v1=topology[pairbase+2*k], v2=topology[pairbase+2*k+1];
+      FPDD dx0=flexvert_operand(operands,3*k), dx1=flexvert_operand(operands,3*k+1);
+      FPDD factor=fpmul(fpdd(-2.0f),flexvert_operand(operands,3*k+2));
+      for (int row=0;row<2;row++) {
+        FPDD dot1=fpdd(0.0f), dot2=fpdd(0.0f);
+        for (int r=0;r<3;r++) {
+          FPDD derivative=fpadd(fpmul(row==0?FB[2*r]:FadjB[2*r],dx0),
+                                fpmul(row==0?FB[2*r+1]:FadjB[2*r+1],dx1));
+          derivative=fpmul(derivative,factor);
+          dot1=fpadd(dot1,fpmul(derivative,fpdd(point_jac[((world*nvert+v1)*3+r)*stride+j])));
+          dot2=fpadd(dot2,fpmul(fpneg(derivative),fpdd(point_jac[((world*nvert+v2)*3+r)*stride+j])));
+        }
+        J[row]=fpadd(J[row],fpadd(dot1,dot2));
+      }
+    }
+    for (int row=0;row<2;row++) {
+      FPDD value=fpmul(J[row],scale);
+      jacobian[(out+row)*stride+j]=value.hi+(value.lo+value.tail);
+    }
+  }
+}
+
 kernel void flex_paired_point_position_low(
     device const float* body_pos [[buffer(0)]],
     device const float* body_pos_low [[buffer(1)]],
