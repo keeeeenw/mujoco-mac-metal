@@ -78,3 +78,34 @@ def test_unrepresentable_source_words_fail_before_mutating_any_live_state():
   np.testing.assert_array_equal(s.snapshot().precision_words,good.precision_words)
   with pytest.raises(ValueError,match='exact hi\\+lo\\+tail'):
     _state(qvel=np.full((3,1),1e-100))
+
+
+def test_signed_zero_high_projections_round_trip_without_changing_state_bits():
+  from mujoco_metal.retained_state import validate_residuals
+  q = np.array([[-0.0], [0.0], [-0.0]], dtype=np.float32)
+  v = np.array([[0.0], [-0.0], [-0.0]], dtype=np.float32)
+  words = pack_residuals(q, v)
+  accepted, represented_q, represented_v = validate_residuals(q, v, words)
+  np.testing.assert_array_equal(accepted.view(np.uint32), words.view(np.uint32))
+  np.testing.assert_array_equal(represented_q.astype(np.float32).view(np.uint32), q.view(np.uint32))
+  np.testing.assert_array_equal(represented_v.astype(np.float32).view(np.uint32), v.view(np.uint32))
+  state = _state(qpos=q, qvel=v)
+  saved = state.snapshot()
+  state.reset([1], qpos=[.1], qvel=[.2])
+  state.restore(saved)
+  np.testing.assert_array_equal(state.snapshot().qpos.view(np.uint32), q.view(np.uint32))
+  np.testing.assert_array_equal(state.snapshot().qvel.view(np.uint32), v.view(np.uint32))
+
+
+def test_signed_zero_admission_still_rejects_nonzero_projection_and_noncanonical_words():
+  from mujoco_metal.retained_state import validate_residuals
+  q = np.array([[-0.0]], dtype=np.float32)
+  v = np.zeros_like(q)
+  words = pack_residuals(q, v)
+  words[0, 0] = .125
+  with pytest.raises(ValueError, match="projection"):
+    validate_residuals(q, v, words)
+  words.fill(0)
+  words[0, 1] = -.0
+  with pytest.raises(ValueError, match="canonical"):
+    validate_residuals(q, v, words)

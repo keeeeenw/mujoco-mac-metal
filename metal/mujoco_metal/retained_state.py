@@ -38,6 +38,12 @@ def validate_residuals(qpos, qvel, words):
   if not np.all(np.isfinite(pos)) or not np.all(np.isfinite(vel)):
     raise ValueError('represented state must be finite')
   for value,high in ((pos,qpos),(vel,qvel)):
+    # Adding canonical +0 residuals to a -0 public high tensor produces +0
+    # on the host. Exact zero has no discarded magnitude; retain its owned
+    # sign instead of rejecting a valid native quaternion/state checkpoint.
+    # Nonzero represented values still undergo the original bitwise check.
+    exact_zero = (value == 0) & (high == 0)
+    value[exact_zero] = np.copysign(0.0, high[exact_zero])
     if not np.array_equal(value.astype(np.float32).view(np.uint32),high.view(np.uint32)):
       raise ValueError('precision_words do not preserve the high projection')
   if not np.array_equal(pack_residuals(pos,vel).view(np.uint32),raw.view(np.uint32)):
