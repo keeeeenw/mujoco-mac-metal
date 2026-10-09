@@ -1475,18 +1475,16 @@ inline int sw_sign(SdfWide a) {
   SdfWide q0_value=sw(q0);
   SdfWide remainder=sw_product_residual(a,q0_value,q0_value);
   float q1=((remainder.hi+remainder.mid)+remainder.lo)/(2.0f*q0);
-  SdfWide approximation=sw_source_add(q0_value,sw(q1));
+  // Keep the Newton correction unrounded until the final source boundary.
+  // A rounded temporary loses the second-order sign at midpoint roots.
+  SdfWide approximation={q0,q1,0.0f};
   remainder=sw_product_residual(a,approximation,approximation);
   float q2=((remainder.hi+remainder.mid)+remainder.lo)/(2.0f*q0);
   thread float expansion[24];
   thread float scratch[24];
   int count=0;
-  // q2 corrects the rounded 53-bit approximation, not the unrounded q0+q1
-  // pair. Re-summing q0 and q1 here would add back the rounding residual
-  // already included when q2 was computed.
-  count=sw_expansion_add(expansion,count,approximation.lo,scratch);
-  count=sw_expansion_add(expansion,count,approximation.mid,scratch);
-  count=sw_expansion_add(expansion,count,approximation.hi,scratch);
+  count=sw_expansion_add(expansion,count,q0,scratch);
+  count=sw_expansion_add(expansion,count,q1,scratch);
   count=sw_expansion_add(expansion,count,q2,scratch);
   SdfProjection53 rounded=sw_expansion_round53(expansion,count);
   return {rounded.hi,rounded.mid,rounded.low};
@@ -1498,16 +1496,11 @@ inline int sw_sign(SdfWide a) {
   if (!has_subnormal_leading &&
       a.hi==0.0f && a.mid==0.0f && a.lo==0.0f) return sw(0.0f);
   int exponent=sw_float_power_floor(a.hi);
-  // q1 is roughly one float32 ulp below sqrt(a); q1*q1 enters the second
-  // residual. Raise small inputs to the even binade near 2^-48 so that this
-  // square and the residual division stay normal, then undo half the scale.
-  if (exponent < -78) {
-    int scale=-48-exponent;
-    if (scale&1) ++scale;
-    return sw_scale_wide_pow2(
-        sw_sqrt_core(sw_scale_wide_pow2(a,scale)),-scale/2);
-  }
-  return sw_sqrt_core(a);
+  // Normalize every input with an exact even power of two. Squaring the
+  // small correction must stay normal to retain a binary64 midpoint sign.
+  int root_exponent=(exponent+1)/2;
+  return sw_scale_wide_pow2(
+      sw_sqrt_core(sw_scale_wide_pow2(a,-2*root_exponent)),root_exponent);
 }
 inline SdfWide sw_abs(SdfWide a) { return sw_sign(a) < 0 ? sw_neg(a) : a; }
 inline float sw_value(SdfWide a) { return (a.hi + a.mid) + a.lo; }
