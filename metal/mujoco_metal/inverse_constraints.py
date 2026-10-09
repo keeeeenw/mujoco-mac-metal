@@ -9,6 +9,39 @@ forward optimizer, rebuild rows, or reconstruct the generalized mass matrix.
 import mujoco
 import numpy as np
 import torch
+from functools import lru_cache
+from pathlib import Path
+
+
+@lru_cache(maxsize=1)
+def _native_reduction_library():
+  source = Path(__file__).parent / "shaders" / "inverse_reductions.metal"
+  return torch.mps.compile_shader(source.read_text())
+
+
+def _native_csr_map(layout, pattern, batch, device):
+  """Own one validated immutable topology payload; never read device data."""
+  if max(batch * layout.stride_words, batch * layout.nr,
+         batch * layout.nv, 9 + layout.nr + layout.nnz) > np.iinfo(np.int32).max:
+    raise ValueError("native inverse addressing exceeds signed int32")
+  offsets = np.asarray(pattern.row_offsets)
+  columns = np.asarray(pattern.columns)
+  if (offsets.shape != (layout.nr + 1,) or columns.shape != (layout.nnz,)
+      or offsets[0] != 0 or offsets[-1] != layout.nnz
+      or np.any(offsets[1:] < offsets[:-1])
+      or np.any(columns < 0) or np.any(columns >= layout.nv)):
+    raise ValueError("compiled CSR pattern is invalid")
+  for begin, end in zip(offsets[:-1], offsets[1:]):
+    row_columns = columns[int(begin):int(end)]
+    if np.any(row_columns[1:] <= row_columns[:-1]):
+      raise ValueError("compiled CSR columns are not strictly sorted")
+  header = [batch, layout.nr, layout.nv, layout.nnz, layout.stride_words,
+            layout.values_offset, layout.lo_values_offset() if layout.paired else 0,
+            int(layout.paired)]
+  values = np.concatenate((np.asarray(header, dtype=np.int64), offsets, columns))
+  if np.any(values < 0) or np.any(values > np.iinfo(np.int32).max):
+    raise ValueError("native inverse map exceeds signed int32 addressing")
+  return torch.tensor(values.astype(np.int32), dtype=torch.int32, device=device)
 
 
 def inverse_constraint_force(rows, qacc, descriptor, *, qacc_low=None,
@@ -285,6 +318,14 @@ def _packed_jacobian_pair_matvec(packed, layout, pattern, qacc):
   batch = qacc.shape[0]
   hi = torch.zeros((batch, layout.nr), dtype=qacc.dtype, device=qacc.device)
   low = torch.zeros_like(hi)
+  if qacc.device.type == "mps":
+    metadata = _native_csr_map(layout, pattern, batch, qacc.device)
+    if batch * layout.nr:
+      _native_reduction_library().inverse_csr_pair_matvec(
+          packed.reshape(-1), qacc.contiguous().reshape(-1), metadata,
+          hi.reshape(-1), low.reshape(-1),
+          threads=(batch * layout.nr,), group_size=(64,))
+    return hi, low
   for row in range(layout.nr):
     begin, end = int(pattern.row_offsets[row]), int(pattern.row_offsets[row+1])
     if begin < 0 or end < begin or end > layout.nnz:
@@ -333,6 +374,15 @@ def _packed_jacobian_transpose_pair_matvec(packed, layout, pattern,
   batch = force_hi.shape[0]
   hi = torch.zeros((batch, layout.nv), dtype=force_hi.dtype, device=force_hi.device)
   low = torch.zeros_like(hi)
+  if force_hi.device.type == "mps":
+    metadata = _native_csr_map(layout, pattern, batch, force_hi.device)
+    if batch * layout.nv:
+      _native_reduction_library().inverse_csr_transpose_pair_matvec(
+          packed.reshape(-1), force_hi.contiguous().reshape(-1),
+          force_low.contiguous().reshape(-1), live.contiguous().reshape(-1),
+          metadata, hi.reshape(-1), low.reshape(-1),
+          threads=(batch * layout.nv,), group_size=(64,))
+    return hi, low
   for row in range(layout.nr):
     begin, end = int(pattern.row_offsets[row]), int(pattern.row_offsets[row+1])
     if begin < 0 or end < begin or end > layout.nnz:
