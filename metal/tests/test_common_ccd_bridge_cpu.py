@@ -435,6 +435,9 @@ def test_restart_capacity_covers_all_five_convex_witnesses():
                 geom.mjGEOM_BOX, geom.mjGEOM_MESH):
     assert pair_max_contacts(int(first), int(geom.mjGEOM_MESH)) == 5
     assert pair_max_contacts(int(geom.mjGEOM_MESH), int(first)) == 5
-  assert pair_max_contacts(int(geom.mjGEOM_PLANE), int(geom.mjGEOM_MESH)) == 4
+  # Pinned mjc_PlaneConvex stops after three source-ordered vertices. The
+  # physical/query producer shares that manifold, rather than PlaneBox's four.
+  assert pair_max_contacts(int(geom.mjGEOM_PLANE), int(geom.mjGEOM_MESH)) == 3
+  assert pair_max_contacts(int(geom.mjGEOM_MESH), int(geom.mjGEOM_PLANE)) == 3
   assert pair_max_contacts(int(geom.mjGEOM_SPHERE), int(geom.mjGEOM_MESH)) == 1
   assert pair_max_contacts(int(geom.mjGEOM_ELLIPSOID), int(geom.mjGEOM_MESH)) == 1
