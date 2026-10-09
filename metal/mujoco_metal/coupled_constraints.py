@@ -613,20 +613,14 @@ def pair_max_contacts(t1: int, t2: int, sdf_initpoints: int = 40) -> int:
       # Pinned mjCOLLISIONFUNC has no heightfield-heightfield entry (NULL):
       # rejection matches the engine, it is not a coverage gap.
       raise ValueError("heightfield-heightfield pairs are unsupported")
-    if t_max == _MESH:
-      # Pinned mjc_ConvexHField traverses the overlapping triangular terrain
-      # prisms and runs one convex penetration query per prism. The common
-      # source-order GJK/EPA bridge consumes the compiled mesh support map.
-      return 50
     if t_min == _PLANE:
       # Pinned mjCOLLISIONFUNC has no plane-heightfield entry (NULL):
       # zero slots match the engine, not a coverage gap.
       return 0
-    if t_max == _SPHERE or t_max == _ELLIPSOID:
-      return 8
-    if t_max == _BOX:
-      return 16
-    return 8
+    # Every admitted convex shape visits the overlapping terrain prisms.
+    # Even a sphere can produce mjMAXCONPAIR contacts on a fine grid; a
+    # primitive-specific 8/16 allocation silently truncates that manifold.
+    return 50
   if _SPHERE in (t_min, t_max) or _ELLIPSOID in (t_min, t_max):
     # Pinned rule: any pair involving a sphere or an ellipsoid yields one
     # contact (sphere/python sphere pairs and all ellipsoid pairs). Checked
@@ -1502,8 +1496,24 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     raise ValueError("mesh-SDF BVH data exceeds exact float-index capacity")
   plugin_sdf_float_count = 15 * len(sdf_plugin_geoms)
   sdf_geom_tail_floats = 15 * int(model.ngeom) if sdf_geoms else 0
+  # Terrain descriptors already carry per-geom dimensions and offsets.
+  # Reserve the compiled grids exactly; former 8-geom/64x64/4096-sample
+  # ceilings were allocation policy, not a device algorithm restriction.
+  hf_used = sorted({g for pr in pairs for g in pr[:2]
+                    if int(geoms[g]) == _HFIELD})
+  hf_data_count = 0
+  for g in hf_used:
+    hid = int(model.geom_dataid[g])
+    if hid < 0:
+      raise ValueError(f"heightfield geom {g} has no asset")
+    nrow, ncol = int(model.hfield_nrow[hid]), int(model.hfield_ncol[hid])
+    if nrow < 2 or ncol < 2:
+      raise ValueError(f"heightfield geom {g} needs at least two rows and columns")
+    hf_data_count += nrow * ncol
+  hf_size_count = 4 * len(hf_used)
+  terrain_end = _MESH_DATA_FLOATS + hf_size_count + hf_data_count
   geometry_upload_floats = (
-      _MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA +
+      terrain_end +
       # Octree blocks carry a third residual word per aabb/coeff entry
       # (50 floats/node) so razor mesh-SDF vertex selections reproduce
       # pinned float64 ties bitwise.
@@ -1523,7 +1533,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
         "estimated device memory including collision geometry upload "
         f"({geometry_upload_bytes} bytes) exceeds "
         f"budget {memory_budget} bytes")
-  mesh_hull = np.zeros((_MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA +
+  mesh_hull = np.zeros((terrain_end +
                       50 * sdf_oct_total + (18 * int(model.ngeom) if sdf_geoms else 0) +
                       sdf_geom_tail_floats +
                       mesh_sdf_float_count + plugin_sdf_float_count,),
@@ -1596,26 +1606,17 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
   # Milestone 012: heightfield store. Per hfield geom: 4 size floats plus
   # the compiled (normalized, row-flipped) data block. Like meshes, the
   # world height is data*size2 over the grid; prism bottoms sit at -size3.
-  hf_used = sorted({g for pr in pairs for g in (pr[0], pr[1])
-                    if int(geoms[g]) == _HFIELD})
-  if len(hf_used) > _HF_MAX_GEOMS:
-    raise ValueError(f"at most {_HF_MAX_GEOMS} heightfield geoms; found "
-                     f"{len(hf_used)}")
   scursor = _MESH_DATA_FLOATS
-  dcursor = _MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS
+  dcursor = _MESH_DATA_FLOATS + hf_size_count
   for g in hf_used:
     hid = int(model.geom_dataid[g])
     if hid < 0:
       raise ValueError(f"heightfield geom {g} has no asset")
     nrow = int(model.hfield_nrow[hid])
     ncol = int(model.hfield_ncol[hid])
-    if not (2 <= nrow <= _HF_MAX_N and 2 <= ncol <= _HF_MAX_N):
-      raise ValueError(f"heightfield dims {(nrow, ncol)} outside 012 "
-                       f"bounds [2, {_HF_MAX_N}]")
     ndata = nrow * ncol
-    if dcursor + ndata > len(mesh_hull):
-      raise ValueError("total heightfield data exceeds 012 capacity "
-                       f"{_HF_MAX_DATA}")
+    if dcursor + ndata > terrain_end:
+      raise ValueError("heightfield upload exceeds its exact compiled allocation")
     size = np.asarray(model.hfield_size[hid], dtype=np.float32)
     mesh_hull[scursor:scursor + 4] = size
     adr = int(model.hfield_adr[hid])
@@ -1636,7 +1637,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
   # per-SDF-geom info holds child base, node
   # count and sdf_iterations. Local AABBs (compiled, center+half) upload
   # for every geom at a fixed stride for the seed-box computation.
-  oct_base = _MESH_DATA_FLOATS + 4 * _HF_MAX_GEOMS + _HF_MAX_DATA
+  oct_base = terrain_end
   sdf_aabb_base = oct_base + 50 * sdf_oct_total
   ocursor = oct_base
   mesh_oct_base = {}
@@ -2200,7 +2201,10 @@ class MetalCoupledConstraints:
     self._common_ccd_mesh_hull = d.mesh_hull
     self._common_ccd_mesh_hull_info = d.mesh_hull_info
     self._common_ccd_hfield_mesh_requested = any(
-        {int(d.geom_type[int(a)]), int(d.geom_type[int(b)])} == {_HFIELD, _MESH}
+        (_HFIELD in (int(d.geom_type[int(a)]), int(d.geom_type[int(b)]))
+         and (int(d.geom_type[int(b)]) if int(d.geom_type[int(a)]) == _HFIELD
+              else int(d.geom_type[int(a)])) in
+         (_SPHERE, _CAPSULE, _ELLIPSOID, _CYLINDER, _BOX, _MESH))
         for a, b in zip(d.geom1, d.geom2))
     from mujoco_metal.common_ccd_bridge import uses_pinned_mjc_convex
     self._common_ccd_rigid_requested = any(

@@ -8,7 +8,7 @@ a sine rock garden, a catch flat and a stop berm; gravity plus a small launch
 push drive the cart across multiple terrain cells with Coulomb friction.
 Wheel/terrain contacts exercise native per-prism heightfield narrow phase;
 the thin axle is intentionally collision-free (contype 0, documented) so the
-pair budget covers the two 8-slot wheel pairs. Rest equilibria with friction
+pair budget reserves all fifty source witnesses per wheel pair. Rest equilibria with friction
 are non-unique, so checks gate traverse distance, clearance, impact
 transients and settle envelopes plus early parity, not exact rest poses.
 
@@ -22,7 +22,11 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from mujoco_metal.capacity import CapacityLimits
+
 PROFILE = "integrated_euler_v1"
+# Two source terrain manifolds, with complete friction-row reservations.
+DEMO_LIMITS = CapacityLimits(max_slots=100, max_rows=408)
 
 
 def _load_model():
@@ -57,7 +61,7 @@ def run(steps=800, mode="metal", check=False, record=None):
     from mujoco_metal import MetalSimulation
     native = MetalSimulation(
         model, batch_size=1, qpos=qpos[None], qvel=qvel[None],
-        profile=PROFILE)
+        profile=PROFILE, limits=DEMO_LIMITS)
 
   recorder = None
   if record:

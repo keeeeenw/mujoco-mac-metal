@@ -383,13 +383,13 @@ static inline int common_ccd_production_one_rigid_pair(
   FlexDD full_a=flex_dd(0.0f), full_b=flex_dd(0.0f);
   if (shrink_a) {
     full_a=flex_dd_source_add(a.size[0],
-        flex_dd_mul(margin,flex_dd(0.5f)));
+        flex_dd_source_mul(a.margin,flex_dd(0.5f)));
     solve_a.kind=a.geom_type==2 ? COMMON_CCD_POINT : COMMON_CCD_LINE;
     solve_a.geom=-1; solve_a.margin=flex_dd(0.0f);
   }
   if (shrink_b) {
     full_b=flex_dd_source_add(b.size[0],
-        flex_dd_mul(margin,flex_dd(0.5f)));
+        flex_dd_source_mul(b.margin,flex_dd(0.5f)));
     solve_b.kind=b.geom_type==2 ? COMMON_CCD_POINT : COMMON_CCD_LINE;
     solve_b.geom=-1; solve_b.margin=flex_dd(0.0f);
   }
@@ -472,6 +472,17 @@ static inline int common_ccd_production_one_rigid_pair(
   return 1;
 }
 
+// Grid boundaries use the full source scalar, including a residual that
+// crosses an integral high word. The bounded grid coordinate needs at most
+// one correction to the float32 estimate, without dropping that residual.
+static inline int common_ccd_grid_bound(FlexDD value, bool upper) {
+  int result=int(floor(value.hi));
+  if (flex_dd_compare_exact(value,flex_dd(float(result)))<0) result--;
+  else if (flex_dd_compare_exact(value,flex_dd(float(result+1)))>=0) result++;
+  if (upper && flex_dd_compare_exact(value,flex_dd(float(result)))>0) result++;
+  return result;
+}
+
 kernel void common_ccd_hfield_mesh_candidates(
     device const float* geom_pos [[buffer(0)]],
     device const float* geom_quat [[buffer(1)]],
@@ -506,10 +517,11 @@ kernel void common_ccd_hfield_mesh_candidates(
       ? mesh_hull+diagnostic_base : nullptr;
   if (trace_query && diagnostic!=nullptr) diagnostic[0]=0.0f;
   int a=pair_geoms[2*pair], b=pair_geoms[2*pair+1];
-  bool reversed=(geom_type[a]==7 && geom_type[b]==1);
+  bool reversed=(geom_type[b]==1);
   int hfield_geom=reversed ? b : a;
   int mesh_geom=reversed ? a : b;
-  if (geom_type[hfield_geom]!=1 || geom_type[mesh_geom]!=7) return;
+  if (geom_type[hfield_geom]!=1 || geom_type[mesh_geom]<2 ||
+      geom_type[mesh_geom]>7) return;
   int mask_pointer=10+npairs+1+pair_dims[2];
   int mask_offset=pair_dims[mask_pointer];
   if (mask_offset<0 || pair_dims[mask_offset+world]==0) return;
@@ -574,8 +586,24 @@ kernel void common_ccd_hfield_mesh_candidates(
       Rh,flex_dd3_source_sub(pm,ph));
   FlexDD local_mat[9];
   common_ccd_matrix_transpose_product(Rh,Rm,local_mat);
-  CommonCCDSupportObject mesh=common_ccd_production_mesh(
-      mesh_geom,rec_mesh,mesh_hull_info,mesh_hull,local_pos,local_mat,size_mesh,margin);
+  CommonCCDSupportObject mesh=common_ccd_production_geom(
+      mesh_geom,geom_type[mesh_geom],rec_mesh,mesh_hull_info,mesh_hull,
+      local_pos,local_mat,size_mesh,margin);
+  CommonCCDSupportObject original=common_ccd_production_geom(
+      mesh_geom,geom_type[mesh_geom],rec_mesh,mesh_hull_info,mesh_hull,
+      pm,Rm,size_mesh,margin);
+  int source_sizes=mesh_hull_info[header+34];
+  int source_bounds=mesh_hull_info[header+33];
+  if (source_sizes<0 || source_bounds<0 || mesh.kind<0 ||
+      (geom_type[mesh_geom]==7 && (mesh.vertex_offset<0 || mesh.vertex_count<=0))) {
+    mesh_hull[out+1]=3.0f;
+    common_ccd_production_fail(world_status,world); return;
+  }
+  for (int axis=0;axis<3;axis++) {
+    mesh.size[axis]=common_ccd_production_size(
+        mesh_hull,source_sizes+9*mesh_geom,axis);
+    original.size[axis]=mesh.size[axis];
+  }
   int vertex_capacity=mesh_hull_info[header+11];
   int face_capacity=mesh_hull_info[header+12];
   int horizon_capacity=mesh_hull_info[header+13];
@@ -609,15 +637,14 @@ kernel void common_ccd_hfield_mesh_candidates(
       horizon_words);
   device float* prism_vertices=mesh_hull+3*prism_vertex_offset;
 
-  float size0f=mesh_hull[size_base], size1f=mesh_hull[size_base+3];
-  float size2f=mesh_hull[size_base+6], size3f=mesh_hull[size_base+9];
-  float fx=float(ncol-1)/max(2.0f*size0f,1.0e-30f);
-  float fy=float(nrow-1)/max(2.0f*size1f,1.0e-30f);
-  float rb=geom_rbound[mesh_geom]+margin;
-  float3 local_pos_hi=flex_dd3_high(local_pos);
-  if (local_pos_hi.x < -size0f-rb || local_pos_hi.x > size0f+rb ||
-      local_pos_hi.y < -size1f-rb || local_pos_hi.y > size1f+rb ||
-      local_pos_hi.z < -size3f-rb || local_pos_hi.z > size2f+rb) return;
+  FlexDD rb=flex_dd_source_add(
+      common_ccd_production_size(mesh_hull,source_bounds,mesh_geom),flex_dd(margin));
+  if (flex_dd_compare_exact(size0,flex_dd_source_sub(local_pos.x,rb))<0 ||
+      flex_dd_compare_exact(flex_dd_neg(size0),flex_dd_source_add(local_pos.x,rb))>0 ||
+      flex_dd_compare_exact(size1,flex_dd_source_sub(local_pos.y,rb))<0 ||
+      flex_dd_compare_exact(flex_dd_neg(size1),flex_dd_source_add(local_pos.y,rb))>0 ||
+      flex_dd_compare_exact(size2,flex_dd_source_sub(local_pos.z,rb))<0 ||
+      flex_dd_compare_exact(flex_dd_neg(size3),flex_dd_source_add(local_pos.z,rb))>0) return;
   mesh.margin=flex_dd(0.0f);
   FlexDD3 unit_x=FlexDD3{flex_dd(1),flex_dd(0),flex_dd(0)};
   FlexDD3 unit_y=FlexDD3{flex_dd(0),flex_dd(1),flex_dd(0)};
@@ -632,16 +659,23 @@ kernel void common_ccd_hfield_mesh_candidates(
     mesh_hull[out+1]=3.0f;
     common_ccd_production_fail(world_status,world); return;
   }
-  float xmin=nx.point.x.hi, xmax=sx.point.x.hi;
-  float ymin=ny.point.y.hi, ymax=sy.point.y.hi;
-  float zmin=nz.point.z.hi, zmax=sz.point.z.hi;
-  if (xmin-margin>size0f || xmax+margin< -size0f ||
-      ymin-margin>size1f || ymax+margin< -size1f ||
-      zmin-margin>size2f || zmax+margin< -size3f) return;
-  int cmin=max(0,int(floor((xmin+size0f)*fx)));
-  int cmax=min(ncol-1,int(ceil((xmax+size0f)*fx)));
-  int rmin=max(0,int(floor((ymin+size1f)*fy)));
-  int rmax=min(nrow-1,int(ceil((ymax+size1f)*fy)));
+  FlexDD margin_source=flex_dd(margin);
+  if (flex_dd_compare_exact(flex_dd_source_sub(nx.point.x,margin_source),size0)>0 ||
+      flex_dd_compare_exact(flex_dd_source_add(sx.point.x,margin_source),flex_dd_neg(size0))<0 ||
+      flex_dd_compare_exact(flex_dd_source_sub(ny.point.y,margin_source),size1)>0 ||
+      flex_dd_compare_exact(flex_dd_source_add(sy.point.y,margin_source),flex_dd_neg(size1))<0 ||
+      flex_dd_compare_exact(flex_dd_source_sub(nz.point.z,margin_source),size2)>0 ||
+      flex_dd_compare_exact(flex_dd_source_add(sz.point.z,margin_source),flex_dd_neg(size3))<0) return;
+  FlexDD span_x=flex_dd_source_mul(flex_dd(2),size0);
+  FlexDD span_y=flex_dd_source_mul(flex_dd(2),size1);
+  int cmin=max(0,common_ccd_grid_bound(flex_dd_source_mul(flex_dd_source_div(
+      flex_dd_source_add(nx.point.x,size0),span_x),flex_dd(float(ncol-1))),false));
+  int cmax=min(ncol-1,common_ccd_grid_bound(flex_dd_source_mul(flex_dd_source_div(
+      flex_dd_source_add(sx.point.x,size0),span_x),flex_dd(float(ncol-1))),true));
+  int rmin=max(0,common_ccd_grid_bound(flex_dd_source_mul(flex_dd_source_div(
+      flex_dd_source_add(ny.point.y,size1),span_y),flex_dd(float(nrow-1))),false));
+  int rmax=min(nrow-1,common_ccd_grid_bound(flex_dd_source_mul(flex_dd_source_div(
+      flex_dd_source_add(sy.point.y,size1),span_y),flex_dd(float(nrow-1))),true));
   mesh.margin=flex_dd(margin);
   // mjc_ConvexHField forms grid spacing from mjtNum size values, not float
   // geom-size highs. Keep the complete compiled source size expansion and
@@ -697,14 +731,15 @@ kernel void common_ccd_hfield_mesh_candidates(
             else residual.z=tail;
           }
           prism.hfield_residual[v]=residual;
-          center=flex_dd3_add(center,FlexDD3{x,y,z});
+          center=mpr_add(center,FlexDD3{x,y,z});
         }
         bool below_prism=true;
         for (int v=3;v<6;v++) {
           if (flex_dd_compare(top_z[v-3],nz.point.z)>=0) below_prism=false;
         }
         if (below_prism) continue;
-        center=flex_dd3_scale(center,flex_dd_source_div(flex_dd(1.0f),flex_dd(6.0f)));
+        FlexDD reciprocal_six=flex_dd_source_div(flex_dd(1.0f),flex_dd(6.0f));
+        center=mpr_scale(center,reciprocal_six);
         ContactGeom contact;
         contact.dist=3.402823466e+38f; contact.pos=float3(0);
         contact.normal=float3(0); contact.t1=float3(0); contact.t2=float3(0);
@@ -715,12 +750,33 @@ kernel void common_ccd_hfield_mesh_candidates(
         device int2* vertex_id_base_ptr=reinterpret_cast<device int2*>(
             mesh_hull_info+mesh_hull_info[common_header+24]
             +2*(world*npairs+pair)*vertex_capacity);
-        int result=common_ccd_production_one_prism(
-            prism,mesh,center,local_pos,
-            iterations,tolerance,mesh_hull,mesh_hull_info,
-            epa_vertices,vertex_id_base_ptr,epa_faces,epa_face_map,epa_horizon,epa_stack,
-            vertex_capacity,face_capacity,horizon_capacity,stack_capacity,contact,face_ids,
-            prism_diagnostic,r,c,tri);
+        FlexDD3 retained_position,retained_normal;
+        const bool libccd=COMMON_CCD_USE_LIBCCD!=0;
+        const bool shrunk_primitive=!libccd && (geom_type[mesh_geom]==2 || geom_type[mesh_geom]==3);
+        int3 face_slots=int3(-1);
+        int result;
+        if (libccd) {
+          result=common_libccd_penetration(
+              prism,mesh,center,local_pos,flex_dd(0),iterations,tolerance,
+              mesh_hull,mesh_hull_info,contact,retained_position,retained_normal);
+        } else if (shrunk_primitive) {
+          // mjc_ccd shrinks spheres/capsules before prism penetration. The
+          // terrain caller has zero output margin, while the convex object's
+          // own margin still contributes to its source inflation radius.
+          result=common_ccd_production_one_rigid_pair(
+              prism,mesh,center,local_pos,flex_dd(0),iterations,tolerance,
+              mesh_hull,mesh_hull_info,epa_vertices,vertex_id_base_ptr,
+              epa_faces,epa_face_map,epa_horizon,epa_stack,
+              vertex_capacity,face_capacity,horizon_capacity,stack_capacity,
+              contact,face_ids,face_slots,&retained_position,&retained_normal);
+        } else {
+          result=common_ccd_production_one_prism(
+              prism,mesh,center,local_pos,
+              iterations,tolerance,mesh_hull,mesh_hull_info,
+              epa_vertices,vertex_id_base_ptr,epa_faces,epa_face_map,epa_horizon,epa_stack,
+              vertex_capacity,face_capacity,horizon_capacity,stack_capacity,contact,face_ids,
+              prism_diagnostic,r,c,tri);
+        }
         if (result<0) {
           status=-result;
           common_ccd_production_fail(world_status,world);
@@ -729,11 +785,15 @@ kernel void common_ccd_hfield_mesh_candidates(
         if (result>0) {
           // Contact is expressed in the hfield frame. Preserve the common
           // source witness, then map to world once at the production boundary.
-          FlexDD3 world_pos=common_ccd_matrix_vector(Rh,flex_dd3(contact.pos));
-          world_pos=flex_dd3_add(world_pos,ph);
+          FlexDD3 world_pos=common_ccd_matrix_vector(
+              Rh,(libccd || shrunk_primitive)?retained_position:flex_dd3(contact.pos));
+          world_pos=mpr_add(world_pos,ph);
           contact.pos=flex_dd3_high(world_pos);
-          contact.normal=flex_dd3_high(
-              common_ccd_matrix_vector(Rh,flex_dd3(contact.normal)));
+          FlexDD3 world_normal=common_ccd_matrix_vector(
+              Rh,(libccd || shrunk_primitive)?retained_normal:flex_dd3(contact.normal));
+          if (libccd) world_normal=common_libccd_fix_normal(
+              prism,original,world_pos,world_normal);
+          contact.normal=flex_dd3_high(world_normal);
           contact.t1=flex_dd3_high(
               common_ccd_matrix_vector(Rh,flex_dd3(contact.t1)));
           contact.t2=flex_dd3_high(

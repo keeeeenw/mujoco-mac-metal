@@ -198,6 +198,25 @@ native dense/component tests cover distinct worlds, articulated and fixed
 bodies, state mutation/restoration and output ownership. These focused checks
 do not qualify the remaining solver, flex or distribution work.
 
+### Terrain manifold and compiled-grid storage
+
+Terrain collision reserves the pinned fifty-contact bound per candidate pair
+for sphere, capsule, ellipsoid, cylinder, box and compiled mesh hulls. Explicit
+budgets must cover every reserved contact and its friction rows. The rover
+example declares a two-pair budget rather than truncating each wheel manifold.
+Grid dimensions and sample counts determine the terrain upload allocation;
+there is no eight-geometry, 64-square or 4096-sample allocation ceiling. Signed
+addressing and explicit memory budgets still constrain admission.
+
+A native two-world 80×96 grid check passes both CCD choices, including contacts,
+forces, nonzero steps and exact checkpoint replay. Host checks preserve every
+sample and descriptor with nine terrain geometries. These scoped checks do not
+qualify every terrain/integrator combination. Cylinder full-double CPU trajectory
+comparison remains open on a branch-sensitive fixture, although contacts and
+acceleration match at identical represented poses. State integration remains
+float32. Heightfield–heightfield collision is absent from the pinned dispatcher;
+plane–heightfield emits no contacts.
+
 ### Native stages and state APIs
 
 Development integrators distinguish the forward acceleration from the temporary

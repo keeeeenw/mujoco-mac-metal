@@ -845,7 +845,8 @@ kernel void contact_produce_generic(
   }
   int ngeom=dims[6];
   int ncon=0;
-  bool heightfield_mesh = (ta == 1 && tb == 7) || (ta == 7 && tb == 1);
+  bool heightfield_mesh = (ta == 1 && tb >= 2 && tb <= 7)
+                      || (tb == 1 && ta >= 2 && ta <= 7);
   bool common_rigid_convex = common_ccd_production_uses_mjc_convex(ta, tb);
   int common_header = 9 * ngeom;
   bool common_ready = (heightfield_mesh || common_rigid_convex) &&
@@ -868,7 +869,7 @@ kernel void contact_produce_generic(
                            mesh_hull[src + 9]);
         con[k].t2 = float3(mesh_hull[src + 10], mesh_hull[src + 11],
                            mesh_hull[src + 12]);
-        if (heightfield_mesh && ta == 7) {
+        if (heightfield_mesh && ta != 1) {
           con[k].normal = -con[k].normal;
           con[k].t1 = -con[k].t1;
           con[k].t2 = cross(con[k].normal, con[k].t1);

@@ -35,15 +35,17 @@ def test_all_demo_models_admit_or_documented():
   assert examples.is_dir()
   failures = {}
   admitted = {}
+  capacities = {}
   for path in sorted(examples.glob("*.xml")):
     name = path.stem
     try:
       model = mujoco.MjModel.from_xml_path(str(path))
-      # The gripper declares an explicit row budget for capsule manifolds.
-      # Read its actual entry-point constant, rather than enlarging defaults
-      # or copying a second independent value into this admission gate.
-      limits = (runpy.run_path(str(path.with_suffix(".py")))["DEMO_LIMITS"]
-                if name == "muscle_gripper" else None)
+      # Read an explicit model budget from the actual demo entry point.
+      # Terrain and capsule manifolds must retain their complete source bounds.
+      script = path.with_suffix(".py")
+      limits = (runpy.run_path(str(script)).get("DEMO_LIMITS")
+                if script.is_file() else None)
+      capacities[name] = limits
       validate_stepping_profile(model, profile=_PROFILE, limits=limits)
       desc = lower_coupled_constraints(model, limits=limits)
       admitted[name] = (desc.npairs, desc.ncontacts_max)
@@ -55,4 +57,7 @@ def test_all_demo_models_admit_or_documented():
       f"{sorted(set(_NON_EULER_DEMOS) - set(failures))}: {failures}")
   from mujoco_metal.capacity import BASE_MAX_PAIRS, BASE_MAX_SLOTS
   for name, counts in sorted(admitted.items()):
-    assert counts[0] <= BASE_MAX_PAIRS and counts[1] <= BASE_MAX_SLOTS, (name, counts)
+    limits = capacities[name]
+    max_pairs = BASE_MAX_PAIRS if limits is None else limits.max_pairs
+    max_slots = BASE_MAX_SLOTS if limits is None else limits.max_slots
+    assert counts[0] <= max_pairs and counts[1] <= max_slots, (name, counts)

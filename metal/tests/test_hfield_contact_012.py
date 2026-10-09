@@ -6,9 +6,10 @@ Native per-prism terrain collision (pinned mjc_ConvexHField) against the
 admitted pair matrix (hfield vs sphere/capsule/box/cylinder/ellipsoid).
 Each overlapped terrain prism yields one witness on both engines in the
 same traversal order, so comparison pairs BY INDEX (same prism), unlike
-mesh singles-vs-manifolds. Mesh-hfield and hfield-hfield pairs are
-rejected at lowering (documented restrictions); plane-hfield reserves
-zero slots. Margin qualified at 0 only.
+mesh singles-vs-manifolds. Mesh-hfield uses the shared source pipeline;
+hfield-hfield is absent from the pinned dispatcher and remains rejected.
+Plane-hfield reserves zero slots. This older matrix uses zero margin;
+test_primitive_hfield_full_manifold also qualifies nonzero margin.
 """
 
 import os
@@ -40,7 +41,7 @@ KINDS = {
     "cylinder": '<geom name="o" type="cylinder" size="0.05 0.04" contype="1" conaffinity="1"/>',
     "ellipsoid": '<geom name="o" type="ellipsoid" size="0.06 0.05 0.04" contype="1" conaffinity="1"/>',
 }
-SLOTS = {"sphere": 8, "capsule": 8, "box": 16, "cylinder": 8, "ellipsoid": 8}
+SLOTS = {kind: 50 for kind in KINDS}
 
 SPOTS = [(0.1, 0.05), (-0.15, 0.1), (0.0, -0.2), (0.36, 0.3)]
 
@@ -226,7 +227,7 @@ def test_hfield_admit_cpu():
 
 
 def test_hfield_rejections_cpu():
-  # Oversize dims.
+  # Compiled terrain dimensions are dynamically allocated.
   m = mujoco.MjModel.from_xml_string(
       '<mujoco><asset><hfield name="big" nrow="80" ncol="80" '
       'size="1 1 0.2 0.05"/></asset>'
@@ -235,8 +236,10 @@ def test_hfield_rejections_cpu():
       '<body pos="0 0 1"><freejoint/>'
       '<geom name="o" type="sphere" size="0.06" contype="1" conaffinity="1"/></body>'
       '</worldbody></mujoco>')
-  with pytest.raises(ValueError, match="bounds"):
-    lower_coupled_constraints(m)
+  desc = lower_coupled_constraints(m)
+  assert desc.ncontacts_max == 50
+  g = int(mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "terrain"))
+  assert desc.mesh_hull_info[9*g+6:9*g+8].tolist() == [80, 80]
   # hfield-hfield.
   m = mujoco.MjModel.from_xml_string(
       f'<mujoco>{HF}{OPT}<worldbody>'
