@@ -172,9 +172,10 @@ static inline CommonCCDSupportResult common_ccd_support(
           flex_dd_mul(scaled.z,flex_dd_mul(norm_inv,object.size[2]))};
     }
   } else if (object.kind==COMMON_CCD_CYLINDER) {
-    FlexDD norm2=flex_dd_source_add(
-        flex_dd_mul(local_direction.x,local_direction.x),
-        flex_dd_mul(local_direction.y,local_direction.y));
+    // The installed cylinder callback fuses x*x into the rounded y*y.
+    // Separately rounding both squares changes EPA's smooth support ties.
+    FlexDD norm2=flex_dd_source_fma(local_direction.x,local_direction.x,
+        flex_dd_source_mul(local_direction.y,local_direction.y));
     FlexDD tiny=FlexDD{1.0000000031710769e-30f,-3.171076767634631e-39f,0.0f};
     FlexDD scl=flex_dd_compare_exact(norm2,tiny)>=0
         ? flex_dd_source_div(object.size[0],flex_dd_sqrt(norm2))
@@ -1278,11 +1279,14 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
     p2seed[0]=local_seed[0]; p2seed[1]=local_seed[1];
     for (int i=0;i<3;i++) {
       CommonCCDVertex support;
-      if (common_ccd_support_unit_pair(a,b,directions[i],mesh_vertices,
-                                       mesh_graph,support,epa_support_trace,
-                                       epa_support_count)) {
+      // The shared P2 helper already performs epaSupport's component
+      // divisions. A second normalization perturbs strict support/face ties.
+      if (common_ccd_support_pair(a,b,directions[i],mesh_vertices,
+                                  mesh_graph,support)) {
         out.status=2; return out;
       }
+      common_ccd_diag_epa_support(epa_support_trace,epa_support_count,
+                                  directions[i],support);
       p2seed[2+i]=support;
       vertices[vertex_count++]=common_ccd_flex_vertex(support);
       if (vertex_ids!=nullptr) vertex_ids[vertex_count-1]=int2(support.index_a,support.index_b);
