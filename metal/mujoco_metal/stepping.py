@@ -561,10 +561,8 @@ def validate_stepping_profile(
     from mujoco_metal.coupled_constraints import lower_coupled_constraints
     lim = limits
     if lim is None and profile == "integrated_scalable_v1":
-      from mujoco_metal.capacity import CapacityLimits
-      lim = CapacityLimits(
-          max_nv=max(int(model.nv), 1), max_pairs=64, max_slots=64,
-          max_rows=256)
+      from mujoco_metal.capacity import model_component_capacity_limits
+      lim = model_component_capacity_limits(model, batch_size=1)
     coupled_mass_storage = (
         "block_sparse" if profile == "integrated_scalable_v1" else "dense")
     coupled_desc = lower_coupled_constraints(
@@ -575,9 +573,9 @@ def validate_stepping_profile(
     implicit_euler_damping = bool(np.any(_euler_damping_dofs(model)))
     passive_damping_enabled = not bool(int(opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_DAMPER))
 
-    execution_plan = _build_integrated_execution_plan(
+    execution_plan = replace(_build_integrated_execution_plan(
         model, float(native_dt), implicit_euler_damping, passive_damping_enabled, coupled_desc
-    )
+    ), profile_name=profile)
 
     return SteppingProfile(
         name=profile,
@@ -618,9 +616,7 @@ def validate_stepping_profile(
         else ("contact_free_transmission_euler_v1" if model.ntendon else "contact_free_passive_euler_v1")
     )
     if profile == "integrated_implicitfast_v1":
-      base_name = ("integrated_scalable_v1"
-                   if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_SLEEP)
-                   else "integrated_euler_v1")
+      base_name = "integrated_scalable_v1"
     base = validate_stepping_profile(
         reference, timestep, base_name, limits=limits,
     )
@@ -631,7 +627,8 @@ def validate_stepping_profile(
         descriptor_fingerprint=_fingerprint(load_model(model)),
         implicit_euler_damping=False,
         execution_plan=_implicit_execution_plan(base.execution_plan, profile),
-        supported=base.supported
+        supported=tuple(item for item in base.supported
+                        if item != "semi-implicit Euler integration")
         + (
             "bounded implicitfast velocity solve and eligible free-body midpoint",
         ),
@@ -648,9 +645,7 @@ def validate_stepping_profile(
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
     reference.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
     if profile == "integrated_implicit_v1":
-      base_name = ("integrated_scalable_v1"
-                   if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_SLEEP)
-                   else "integrated_euler_v1")
+      base_name = "integrated_scalable_v1"
       base = validate_stepping_profile(
           reference, timestep, base_name, limits=limits
       )
@@ -670,7 +665,8 @@ def validate_stepping_profile(
         descriptor_fingerprint=_fingerprint(load_model(model)),
         implicit_euler_damping=False,
         execution_plan=_implicit_execution_plan(base.execution_plan, profile),
-        supported=base.supported
+        supported=tuple(item for item in base.supported
+                        if item != "semi-implicit Euler integration")
         + (
             "nonsymmetric implicit velocity solve with automatic force derivatives",
         ),
@@ -737,12 +733,8 @@ def validate_stepping_profile(
     # R06/D3: native RK4 integrates activation state and stage-correct delayed control at every stage.
     reference = copy.copy(model)
     reference.opt.integrator = mujoco.mjtIntegrator.mjINT_EULER
-    sleep_enabled = bool(
-        int(model.opt.enableflags)
-        & int(mujoco.mjtEnableBit.mjENBL_SLEEP))
     base_profile = (
-        "integrated_scalable_v1"
-        if profile == "integrated_rk4_v1" and sleep_enabled
+        "integrated_scalable_v1" if profile == "integrated_rk4_v1"
         else profile.replace("rk4", "euler"))
     result = validate_stepping_profile(
         reference, timestep, base_profile, limits=limits
@@ -752,8 +744,11 @@ def validate_stepping_profile(
         name=profile,
         model_fingerprint=_fingerprint(model),
         implicit_euler_damping=False,
+        execution_plan=(replace(result.execution_plan, profile_name=profile)
+                        if result.execution_plan is not None else None),
         supported=tuple(
-            "four-stage Runge-Kutta" if item == "semi-implicit Euler" else item
+            "four-stage Runge-Kutta integration"
+            if item == "semi-implicit Euler integration" else item
             for item in result.supported
         ),
         rejected=tuple(

@@ -204,29 +204,9 @@ def _compiled_sparse_mass_nnz(model):
 
 
 def _model_component_capacity_limits(model, batch_size):
-  """Build a default scalable budget from exact compiled model counts.
-
-  These are admission ceilings, not kernel-local truncation values. The
-  separate memory-budget and signed-int32 checks remain in ``capacity.py``.
-  """
-  from mujoco_metal.capacity import CapacityLimits
-  from mujoco_metal.coupled_constraints import lower_coupled_constraints
-  nv = max(int(model.nv), 1)
-  # Coupled lowering uses max_nv to select the dynamic descriptor path; its
-  # other model dimensions are compiled and returned without fixed caps.
-  signed_max = int(np.iinfo(np.int32).max)
-  seed = CapacityLimits(
-      max_nv=nv, max_pairs=signed_max, max_slots=signed_max,
-      max_rows=signed_max, max_batch=max(int(batch_size), 1),
-      memory_budget_bytes=(1 << 62))
-  lowered = lower_coupled_constraints(model, limits=seed)
-  return CapacityLimits(
-      max_nv=nv,
-      max_pairs=max(int(lowered.npairs), 1),
-      max_slots=max(int(lowered.ncontacts_max), 1),
-      max_rows=max(int(lowered.nr), 1),
-      max_batch=max(int(batch_size), 1),
-  )
+  """Compatibility alias for the shared model-sized host admission path."""
+  from mujoco_metal.capacity import model_component_capacity_limits
+  return model_component_capacity_limits(model, batch_size)
 
 
 def _restore_system_buffers(current, saved):
