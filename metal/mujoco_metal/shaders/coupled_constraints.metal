@@ -7212,7 +7212,9 @@ inline int solve_pgs_thread(thread const float* W, thread const float* R,
 
 // Corrected mass-inverse action for dual refinement: u0 = L^-T L^-1 v_hi
 // (float preconditioner factors) into u, residual r = v - M u0 in pair
-// against real mass entries, du = L^-T L^-1 r_hi, u += du. Sleeping DOFs
+// against real mass entries, du = L^-T L^-1 r in pair precision. Return
+// the renormalized result in u/t_lo; dropping that low word before J*u
+// turns a compensated operator back into a rounded one. Sleeping DOFs
 // stay zero. Accumulation is thread-local except caller scratch: v (hi/lo),
 // u and the pair temp t (hi/lo) with nv entries each.
 inline void refine_minv_pair(device const float* L,
@@ -7245,17 +7247,28 @@ inline void refine_minv_pair(device const float* L,
     t_hi[i] = racc.hi; t_lo[i] = racc.lo;
   }
   for (int i = 0; i < nv; ++i) {
-    float t = solver_dof_awake(dims, awake_tree, i) ? t_hi[i] : 0.0f;
-    for (int k = 0; k < i; ++k) t -= L[i * nv + k] * t_hi[k];
-    t_hi[i] = t / L[i * nv + i];
+    PrimalFloatPair t = solver_dof_awake(dims, awake_tree, i)
+        ? PrimalFloatPair{t_hi[i], t_lo[i]} : PrimalFloatPair{0.0f, 0.0f};
+    for (int k = 0; k < i; ++k)
+      t = primal_pair_add(t, primal_pair_product(
+          {-L[i * nv + k], 0.0f}, {t_hi[k], t_lo[k]}));
+    t = primal_pair_divide(t, {L[i * nv + i], 0.0f});
+    t_hi[i] = t.hi; t_lo[i] = t.lo;
   }
   for (int i = nv - 1; i >= 0; --i) {
-    float t = t_hi[i];
-    for (int k = i + 1; k < nv; ++k) t -= L[k * nv + i] * t_hi[k];
-    t_hi[i] = t / L[i * nv + i];
+    PrimalFloatPair t = {t_hi[i], t_lo[i]};
+    for (int k = i + 1; k < nv; ++k)
+      t = primal_pair_add(t, primal_pair_product(
+          {-L[k * nv + i], 0.0f}, {t_hi[k], t_lo[k]}));
+    t = primal_pair_divide(t, {L[i * nv + i], 0.0f});
+    t_hi[i] = t.hi; t_lo[i] = t.lo;
   }
-  for (int i = 0; i < nv; ++i)
-    if (solver_dof_awake(dims, awake_tree, i)) u[i] += t_hi[i];
+  for (int i = 0; i < nv; ++i) {
+    PrimalFloatPair result = solver_dof_awake(dims, awake_tree, i)
+        ? primal_pair_add({u[i], 0.0f}, {t_hi[i], t_lo[i]})
+        : PrimalFloatPair{0.0f, 0.0f};
+    u[i] = result.hi; t_lo[i] = result.lo;
+  }
 }
 
 
@@ -8641,9 +8654,9 @@ kernel void solve_coupled_constraints(
               PrimalFloatPair jp = {ccj_get(J_world, row, i, nv),
                                     ccj_get_lo(J_world, row, i, nv)};
               wlam = primal_pair_add(wlam, primal_pair_product(
-                  jp, {x[i], 0.0f}));
+                  jp, {x[i], tlo2[i]}));
               ja = primal_pair_add(ja, primal_pair_product(
-                  jp, {q0smooth[i], 0.0f}));
+                  jp, {q0smooth[i], qacc_smooth_low[i]}));
             }
             PrimalFloatPair bpair = primal_pair_add(
                 {ar[row], aref_low[row]},
@@ -9289,10 +9302,9 @@ kernel void solve_coupled_constraints(
             if (!solver_dof_awake(dims, solver_awake_tree, k)) continue;
             float mik = solver_mass_entry(mass_world, dbg_pre, dims,
                 solver_awake_tree, world, nv, i, k);
-            float qk = qfrc[qb + k] + (paired_qfrc_input
-                ? qfrc[batch * nv + qb + k] : 0.0f);
             tpair = primal_pair_add(tpair, primal_pair_product(
-                {mik, 0.0f}, {qk, 0.0f}));
+                {mik, 0.0f}, {qfrc[qb + k], paired_qfrc_input
+                    ? qfrc[batch * nv + qb + k] : 0.0f}));
           }
         } else {
           PrimalFloatPair smooth = {qfrc[qb + i], paired_qfrc_input
@@ -9311,32 +9323,38 @@ kernel void solve_coupled_constraints(
         float m = abs(rpi.hi) + abs(rpi.lo);
         res_pre = m > res_pre ? m : res_pre;
       }
+      device float* recon_scratch = solver_scratch
+          + dims[dims[24] + dims[9] * 10 + 9];
+      device float* target_low = recon_scratch;
+      device float* solve_temp = recon_scratch + max(nv, 1);
+      device float* candidate_low = recon_scratch + 2 * max(nv, 1);
       for (int i = 0; i < nv; ++i) {
-        if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
-        PrimalFloatPair smooth = {qfrc[qb + i], paired_qfrc_input
-            ? qfrc[batch * nv + qb + i] : 0.0f};
-        PrimalFloatPair both = primal_pair_add(
-            smooth, {out_force[qb + i], pgs_pair_tail[i]});
-        float target = both.hi + both.lo;
-        if (provided_qacc_smooth) {
-          float smooth_acc = 0.0f;
-          for (int k = 0; k < nv; ++k)
-            smooth_acc += solver_mass_entry(mass_world, dbg_pre, dims,
-                solver_awake_tree, world, nv, i, k)
-                * (solver_dof_awake(dims, solver_awake_tree, k)
-                   ? (qfrc[qb + k] + (paired_qfrc_input
-                      ? qfrc[batch * nv + qb + k] : 0.0f)) : 0.0f);
-          target = smooth_acc + out_force[qb + i] + pgs_pair_tail[i];
+        PrimalFloatPair target = {0.0f, 0.0f};
+        if (solver_dof_awake(dims, solver_awake_tree, i)) {
+          target = {out_force[qb + i], pgs_pair_tail[i]};
+          if (provided_qacc_smooth) {
+            for (int k = 0; k < nv; ++k) {
+              if (!solver_dof_awake(dims, solver_awake_tree, k)) continue;
+              float mik = solver_mass_entry(mass_world, dbg_pre, dims,
+                  solver_awake_tree, world, nv, i, k);
+              target = primal_pair_add(target, primal_pair_product(
+                  {mik, 0.0f}, {qfrc[qb + k], paired_qfrc_input
+                      ? qfrc[batch * nv + qb + k] : 0.0f}));
+            }
+          } else {
+            target = primal_pair_add(target,
+                {qfrc[qb + i], paired_qfrc_input
+                    ? qfrc[batch * nv + qb + i] : 0.0f});
+          }
         }
-        float v = solver_dof_awake(dims, solver_awake_tree, i) ? target : 0.0f;
-        for (int k = 0; k < i; ++k) v -= L[i * nv + k] * y[k];
-        y[i] = v / L[i * nv + i];
+        y[i] = target.hi; target_low[i] = target.lo;
       }
-      for (int i = nv - 1; i >= 0; --i) {
-        float v = y[i];
-        for (int k = i + 1; k < nv; ++k) v -= L[k * nv + i] * x[k];
-        x[i] = v / L[i * nv + i];
-      }
+      // Keep the accepted force and candidate acceleration in the same
+      // effective operator. Rounding the target and candidate before the
+      // residual check can reject a correct rotational correction because
+      // larger translational rows dominate the global residual norm.
+      refine_minv_pair(L, mass_world, dbg_pre, dims, solver_awake_tree,
+          world, nv, y, target_low, x, solve_temp, candidate_low);
       // Publish only on verified improvement (finite, no worse than the
       // primal iterate in the real operator); otherwise keep primal.
       for (int i = 0; i < nv; ++i) {
@@ -9348,10 +9366,9 @@ kernel void solve_coupled_constraints(
             if (!solver_dof_awake(dims, solver_awake_tree, k)) continue;
             float mik = solver_mass_entry(mass_world, dbg_pre, dims,
                 solver_awake_tree, world, nv, i, k);
-            float qk = qfrc[qb + k] + (paired_qfrc_input
-                ? qfrc[batch * nv + qb + k] : 0.0f);
             tpair = primal_pair_add(tpair, primal_pair_product(
-                {mik, 0.0f}, {qk, 0.0f}));
+                {mik, 0.0f}, {qfrc[qb + k], paired_qfrc_input
+                    ? qfrc[batch * nv + qb + k] : 0.0f}));
           }
         } else {
           PrimalFloatPair smooth = {qfrc[qb + i], paired_qfrc_input
@@ -9365,7 +9382,7 @@ kernel void solve_coupled_constraints(
           float mik = solver_mass_entry(mass_world, dbg_pre, dims,
               solver_awake_tree, world, nv, i, k);
           rpi = primal_pair_add(rpi, primal_pair_product(
-              {mik, 0.0f}, {-x[k], 0.0f}));
+              {mik, 0.0f}, {-x[k], -candidate_low[k]}));
         }
         float m = abs(rpi.hi) + abs(rpi.lo);
         res_post = m > res_post ? m : res_post;
@@ -9376,7 +9393,7 @@ kernel void solve_coupled_constraints(
         if (!solver_dof_awake(dims, solver_awake_tree, i)) continue;
         if (recon_accept) {
           out_acc[qb + i] = x[i];
-          out_acc[batch * nv + qb + i] = 0.0f;
+          out_acc[batch * nv + qb + i] = candidate_low[i];
         }
       }
     }
