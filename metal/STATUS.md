@@ -33,15 +33,17 @@ see [producing revisions and scope](QUALIFICATION.md).
 
 A local line-search correction passed 43 focused native checks and the original
 alternate-cylinder heightfield trajectory/restore case without altered bounds
-or solver budgets. The complete terrain matrix finished with **34 passed,
-6 failed**; zero-margin cylinder and box trajectories remain correction gates.
+or solver budgets. The earlier complete terrain matrix finished with **34 passed,
+6 failed** at its separately recorded producing revision.
 Neither heightfields nor the full solver milestone is accepted from this result.
 
 A subsequent native-prism publication correction passed seven affected native
 checks and the original native-CCD cylinder trajectory/restore case. A separate
 constraint-row consumer correction then passed 14 dense/component and alternate
 CCD operator checks and the original native-CCD box trajectory. The complete
-terrain matrix has not been rerun at the latest revision. The four rejected-seed
+40-case terrain matrix at `10d9bf136` then finished with **38 passed, 2 failed**.
+All former native-CCD cylinder/box failures pass; zero-margin alternate-CCD box
+trajectories in both geom orders remain correction gates. The four rejected-seed
 warm-selection failures were subsequently corrected by retaining equality
 regularizers and comparing original-operator paired objectives. All eight native
 accepted/rejected boundary cases now pass; further groups passed 85 native

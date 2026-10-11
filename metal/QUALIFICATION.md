@@ -1,5 +1,37 @@
 # Development qualification — 2026-10-11
 
+## Complete primitive-terrain matrix — 2026-10-11
+
+The unchanged 40-case native terrain matrix at producing revision
+`10d9bf13676b766ddb936b19876ffeab8b9827af` finished with **38 passed,
+2 failed, 10 host tests deselected in 1,863.01 seconds**, exit 1. It covers
+sphere, capsule, ellipsoid, cylinder and box, both CCD algorithms, both geom
+orders, zero/positive margin, a contact-free neighboring environment, four
+trajectory steps and checkpoint replay. The original `rtol=atol=2e-3`
+trajectory bounds and solver budgets were retained.
+
+All four previously failing native-CCD cylinder/box cases now pass. The
+remaining failures are the zero-margin **alternate-CCD box** cases in both
+geom orders; rotational acceleration differs by up to `2.81290692` on the
+original trajectory. This is not complete heightfield qualification or full
+milestone closure. The preceding 34-pass/6-failure result below belongs to
+its earlier producing revision.
+
+An observer of the ordinary step sequence reproduces this failure. At the
+identical represented state, native witnesses match the pinned CPU engine
+and native acceleration agrees to about `1.2e-11`; the independent CPU
+trajectory later selects a different alternate-CCD contact result after a
+tiny accumulated state difference. That evidence identifies a precision and
+trajectory gate still requiring correction. It does not justify removing the
+original gate or replacing trajectory qualification with same-state checks.
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -m gpu -p no:cacheprovider \
+  metal/tests/test_primitive_hfield_full_manifold.py
+```
+
 ## Original-operator warm selection — 2026-10-11
 
 Local producing revision `c77851c9072295d014f1c015c8c9efa36a0da476`
