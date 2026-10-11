@@ -874,6 +874,9 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       # once after admission; the accumulator never grows it.
       ("twosum_float", 8 * max(b * nv, 1)),
       ("twosum_mask", max(b, 1)),
+      # Owned damping-product workspace for the passive-damping force term
+      # (replaces a per-forward batch-sized temporary on both routes).
+      ("twosum_damped_qvel", max(b * nv, 1)),
       ("dense_pair_solution_low", b * nv if mass_storage == "dense" else 0),
       ("dense_pair_zero_low", b * nv if mass_storage == "dense" else 0),
       ("dense_pair_work", 6 * b * max(nv, 1)

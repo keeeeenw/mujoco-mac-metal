@@ -662,6 +662,25 @@ class MetalSimulation:
     else:
       self._effective_gmres_dimension = None
       self._effective_gmres_iterations = None
+    if is_integrated and not (
+        needs_touch_grid_preflight or needs_cable_preflight):
+      # Whole-model memory admission with actual lowered counts for every
+      # integrated profile, before DeviceState touches MPS or any shader
+      # compiles. Reuses the preflight lowering when it already ran above.
+      from mujoco_metal.capacity import CapacityLimits, check_capacity
+      from mujoco_metal.capacity import estimate_capacity
+      from mujoco_metal.coupled_constraints import lower_coupled_constraints
+      admission_rows = lowered_rows if (
+          needs_component_row_preflight or needs_dense_diag_preflight
+      ) else lower_coupled_constraints(
+          model, limits=self.limits, mass_storage=requested_mass_storage)
+      check_capacity(estimate_capacity(
+          model, batch_size, int(admission_rows.npairs),
+          int(admission_rows.ncontacts_max), int(admission_rows.nr),
+          neq=int(admission_rows.neq),
+          nr_joint=int(admission_rows.nr_joint),
+          mass_storage=requested_mass_storage),
+          self.limits or CapacityLimits())
     is_integrated = profile.name in ("integrated_euler_v1", "integrated_rk4_v1", "integrated_implicit_v1", "integrated_implicitfast_v1", "integrated_scalable_v1")
     legacy_joint_rows = (
         int(model.neq) + int(model.nv) + 2 * int(model.njnt)
@@ -1086,6 +1105,11 @@ class MetalSimulation:
     self._twosum_mask = torch.zeros(
         (_twosum_rows, 1), dtype=torch.bool, device=self._state._device)
     self._twosum_mask_rows = _twosum_rows
+    # Owned workspace for the passive-damping product term shared by the
+    # masked/unmasked accumulation routes (no per-forward temporary).
+    self._damped_qvel = torch.empty(
+        (int(batch_size), int(descriptor.nv)), dtype=torch.float32,
+        device=self._state._device)
     self._forward_stage_zero_constraint = torch.zeros_like(self._rhs)
     self._forward_stage_passive_force = torch.empty_like(self._rhs)
     self._forward_stage_actuator_force = torch.empty_like(self._rhs)
@@ -4776,6 +4800,38 @@ class MetalSimulation:
     self._forward_stages.publish(record, ForwardStage.ACT, result)
     return result
 
+  @staticmethod
+  def _storage_intervals_overlap(t, u):
+    """Whether two tensors share any live storage byte.
+
+    Compares untyped-storage identity plus data-pointer intervals, so
+    different-offset slices, dtype views and exact aliases are all caught.
+    Empty tensors occupy no bytes and never overlap. Different devices never
+    share storage.
+    """
+    if int(t.numel()) == 0 or int(u.numel()) == 0:
+      return False
+    if t.device != u.device:
+      return False
+    try:
+      same = (t.untyped_storage().data_ptr()
+              == u.untyped_storage().data_ptr())
+    except Exception:
+      return False
+    if not same:
+      return False
+    a0, b0 = int(t.data_ptr()), int(u.data_ptr())
+    a1 = a0 + int(t.numel()) * int(t.element_size())
+    b1 = b0 + int(u.numel()) * int(u.element_size())
+    return a0 < b1 and b0 < a1
+
+  def _rhs_scratch_overlaps(self, tensor):
+    """Whether a caller tensor touches owned TwoSum scratch storage."""
+    for owned in (self._twosum_float, self._twosum_mask):
+      if owned is not None and self._storage_intervals_overlap(tensor, owned):
+        return True
+    return False
+
   def _rhs_accumulate(self, hi, lo, value, *, sign=1, mask=None):
     """Error-free ``hi + sign*value`` with the rounding error kept in ``lo``.
 
@@ -4788,14 +4844,17 @@ class MetalSimulation:
     Every intermediate lands in owned `_twosum_*` scratch via out= writes;
     no batch-sized temporary is allocated. The scratch is pre-allocated
     once at construction against the admitted simulation.twosum_float /
-    simulation.twosum_mask budget and never grown; oversized requests and
-    hi/lo storage aliasing are rejected before any write. Unselected worlds
-    keep their exact input words (including signed zeros): the masked
-    publish copies the computed-or-retained words instead of adding
-    positive zero. A `value` that views `hi`/`lo` storage is safe (all
-    writes land in separate scratch first).
-    Inputs are validated before any write; failures leave ``hi``/``lo``
-    untouched.
+    simulation.twosum_mask budget and never grown.
+    Overlap contract (checked before any write): `hi`/`lo` must not overlap
+    each other or owned scratch; `value` may view `hi`/`lo` storage (all
+    reads complete into separate scratch before `hi`/`lo` are published)
+    but must not touch owned scratch either. Nonfinite inputs are allowed
+    and propagate per float32 rules (failure rows are handled downstream);
+    `sign` must be exactly 1 or -1. Unselected worlds keep their exact
+    input words (including signed zeros): the masked publish copies the
+    computed-or-retained words instead of adding positive zero.
+    Inputs are validated before any write; failures leave ``hi``/``lo``,
+    retained caches and owned working buffers untouched.
     """
     torch = self._state._torch
     device = self._state._device
@@ -4809,14 +4868,27 @@ class MetalSimulation:
         raise ValueError(
             f"rhs accumulation {name} must be a contiguous float32 tensor "
             f"on {device}")
-    if tuple(hi.shape) != tuple(lo.shape) or value.numel() != hi.numel():
+    # Exact shapes: no rank/broadcast reinterpretation is admitted. All
+    # production callers use (batch, nv).
+    if tuple(hi.shape) != tuple(lo.shape) or tuple(value.shape) != tuple(hi.shape):
       raise ValueError(
-          "rhs accumulation hi/lo shapes must agree and value must match")
+          "rhs accumulation hi/lo/value shapes must agree exactly")
+    if hi.dim() != 2:
+      raise ValueError("rhs accumulation hi must have shape (batch, nv)")
+    if sign != 1 and sign != -1:
+      raise ValueError("rhs accumulation sign must be 1 or -1")
     count = int(hi.numel())
-    rows = int(hi.shape[0]) if hi.dim() > 0 else 0
-    if count and hi.data_ptr() == lo.data_ptr():
+    rows = int(hi.shape[0])
+    if self._storage_intervals_overlap(hi, lo):
       raise ValueError(
-          "rhs accumulation hi and lo must not alias the same storage")
+          "rhs accumulation hi and lo must not overlap in storage")
+    for name, tensor in (("hi", hi), ("lo", lo), ("value", value)):
+      if self._rhs_scratch_overlaps(tensor):
+        raise ValueError(
+            f"rhs accumulation {name} must not view owned TwoSum scratch")
+    # Mask contract: any dtype is accepted with nonzero selecting the world;
+    # the mask needs one entry per world and touches no output storage.
+    # It is validated (with selector capacity) before any scratch write.
     if mask is not None:
       if (not isinstance(mask, torch.Tensor) or mask.device.type != device.type
           or (device.index is not None
@@ -4826,6 +4898,12 @@ class MetalSimulation:
         raise ValueError(
             "rhs accumulation mask must be a contiguous tensor on "
             f"{device} with one entry per world")
+      if self._rhs_scratch_overlaps(mask):
+        raise ValueError(
+            "rhs accumulation mask must not view owned TwoSum scratch")
+      if rows > self._twosum_mask_rows:
+        raise ValueError(
+            "rhs accumulation mask exceeds the admitted selector capacity")
     pool = self._twosum_float
     # Model-bounded scratch: pre-allocated at construction against the
     # admitted budget. Never grow here (growth would escape admission);
@@ -4851,11 +4929,7 @@ class MetalSimulation:
       hi.copy_(s_buf)
       lo.add_(err_buf)
       return
-    sel = self._twosum_mask
-    if rows > self._twosum_mask_rows:
-      raise ValueError(
-          "rhs accumulation mask exceeds the admitted selector capacity")
-    sel = sel[:rows].reshape(-1, 1)
+    sel = self._twosum_mask[:rows].reshape(-1, 1)
     torch.ne(mask.reshape(-1, 1), 0, out=sel)
     torch.where(sel, s_buf, hi, out=tmp_buf)
     hi.copy_(tmp_buf)
@@ -4890,8 +4964,10 @@ class MetalSimulation:
                            mask=world_mask_i32)
       if (self._passive is None and self.profile.passive_damping_enabled
           and rhs.numel()):
+        torch.mul(velocity["qvel"], self._damping.unsqueeze(0),
+                  out=self._damped_qvel)
         self._rhs_accumulate(
-            rhs, rhs_low, velocity["qvel"] * self._damping.unsqueeze(0),
+            rhs, rhs_low, self._damped_qvel,
             sign=-1, mask=world_mask_i32)
     else:
       torch.neg(velocity["qfrc_bias"], out=rhs)
@@ -4899,9 +4975,10 @@ class MetalSimulation:
       self._rhs_accumulate(rhs, rhs_low, velocity["qfrc_passive"])
       if (self._passive is None and self.profile.passive_damping_enabled
           and rhs.numel()):
+        torch.mul(velocity["qvel"], self._damping.unsqueeze(0),
+                  out=self._damped_qvel)
         self._rhs_accumulate(
-            rhs, rhs_low, velocity["qvel"] * self._damping.unsqueeze(0),
-            sign=-1)
+            rhs, rhs_low, self._damped_qvel, sign=-1)
     force = self._applied_force if qfrc_applied is None else qfrc_applied
     if force is not None:
       self._rhs_accumulate(rhs, rhs_low, force, mask=world_mask_i32)
@@ -6016,8 +6093,9 @@ class MetalSimulation:
         if forward_mask is None:
           self._rhs.addcmul_(qvel, self._damping.unsqueeze(0), value=-1.0)
         else:
-          damped = -qvel * self._damping.unsqueeze(0)
-          self._state.update_masked_rows(self._rhs, damped, forward_mask)
+          torch.mul(qvel, self._damping.unsqueeze(0), out=self._damped_qvel)
+          self._damped_qvel.neg_()
+          self._state.update_masked_rows(self._rhs, self._damped_qvel, forward_mask)
       add_rhs(applied_force)
     if self._passive is not None:
       passive, self._damping_tangent = self._passive.run_device(
