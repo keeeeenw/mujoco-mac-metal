@@ -316,6 +316,14 @@ inline EqFloatPair eq_pair_div(EqFloatPair a, EqFloatPair b) {
   return eq_pair_renormalize(q0, q1);
 }
 
+inline EqFloatPair eq_regularizer_pair(EqFloatPair impedance, EqFloatPair weight) {
+  EqFloatPair value = eq_pair_div(eq_pair_mul(
+      eq_pair_add({1.0f, 0.0f}, eq_pair_neg(impedance)), weight), impedance);
+  if (value.hi < 1e-15f || (value.hi == 1e-15f && value.lo < 0))
+    return {1e-15f, 0.0f};
+  return value;
+}
+
 inline EqVec3Pair eq_vec_pair_add(EqVec3Pair a, EqVec3Pair b) {
   EqFloatPair x = eq_pair_add({a.hi.x, a.lo.x}, {b.hi.x, b.lo.x});
   EqFloatPair y = eq_pair_add({a.hi.y, a.lo.y}, {b.hi.y, b.lo.y});
@@ -580,6 +588,7 @@ kernel void equality_assembly(
   // The third row-vector in the paired tail is the immutable low word of
   // aref; the first two are residual-low and force-low solver state.
   device float* aref_low = pair_tail + 8 * max(nv, 1) + 2 * max(nr, 1);
+  device float* regularizer_low = aref_low + max(nr, 1) + nv * nr;
   for (int row = 0; row < nr; ++row) aref_low[row] = 0.0f;
   if (neq == 0 || n_eq_rows == 0) return;
 
@@ -670,6 +679,7 @@ kernel void equality_assembly(
       pos_pair = eq_pair_add(pos_pair, {-data0, 0.0f});
       EqFloatPair vel_pair = {vel, 0.0f};
       float diag = dof_invweight[d1];
+      EqFloatPair diag_pair = {diag, dof_invweight[max(nv, 1) + d1]};
       int row = rowadr;
       ccj_zero_row(J_world, row, nv);
       if (j2 >= 0) {
@@ -698,17 +708,21 @@ kernel void equality_assembly(
         vel_pair = eq_pair_add(vel_pair, eq_pair_neg(eq_pair_mul(
             {deriv, 0.0f}, {qvel[qb + d2], 0.0f})));
         diag += dof_invweight[d2];
+        diag_pair = eq_pair_add(diag_pair,
+            {dof_invweight[d2], dof_invweight[max(nv, 1) + d2]});
       } else {
         ccj_set(J_world, row, d1, 1.0f, nv);
       }
       // Reference params (same as solver's reference_params).
       float imp = eq_impedance(eq_sol, e, pos, 0.0f);
       EqFloatPair imp_pair = eq_impedance_pair(eq_sol, e, pos, 0.0f);
-      float R = max(1e-15f, (1.0f - imp) * diag / imp);
+      EqFloatPair R_pair = eq_regularizer_pair(imp_pair, diag_pair);
+      float R = R_pair.hi;
       EqFloatPair ar_pair = eq_aref_pair(eq_sol, e, pos_pair,
           vel_pair, imp_pair, 0.0f, refsafe, timestep);
       float ar = ar_pair.hi;
       dbg[nr * nr + row] = R;
+      regularizer_low[row] = R_pair.lo;
       dbg[nr * nr + nr + row] = ar;
       dbg[nr * nr + 2 * nr + row] = imp;
       aref_low[row] = ar_pair.lo;
@@ -771,13 +785,17 @@ kernel void equality_assembly(
       if (b1 >= 0 && b1 < nbody) w1 = body_invweight[b1 * 2];
       if (b2 >= 0 && b2 < nbody) w2 = body_invweight[b2 * 2];
       float diag = max(w1 + w2, 1e-15f);
+      EqFloatPair diag_pair = eq_pair_add(
+          {w1, b1 >= 0 && b1 < nbody ? body_invweight[2 * nbody + b1 * 2] : 0},
+          {w2, b2 >= 0 && b2 < nbody ? body_invweight[2 * nbody + b2 * 2] : 0});
 
       // Impedance from norm(cpos), margin 0.
       float pos_norm = length(cpos);
       float imp = eq_impedance(eq_sol, e, pos_norm, 0.0f);
       EqFloatPair imp_pair = eq_impedance_pair(eq_sol, e, pos_norm, 0.0f);
       imp = clamp(imp, 1e-6f, 0.999999f);
-      float R = max(1e-15f, (1.0f - imp) * diag / imp);
+      EqFloatPair R_pair = eq_regularizer_pair(imp_pair, diag_pair);
+      float R = R_pair.hi;
 
       // Degenerate empty Jacobian with zero inverse weight (e.g. both sides
       // mocap/world-fixed) matches MuJoCo skipping the constraint: force all
@@ -789,7 +807,7 @@ kernel void equality_assembly(
         jmax = max(jmax, abs(Jp1[2 * nv + i] - Jp2[2 * nv + i]));
       }
       bool degenerate = (jmax == 0.0f && (w1 + w2) == 0.0f);
-      if (degenerate) R = 0.0f;
+      if (degenerate) { R = 0.0f; R_pair = {0, 0}; }
 
       for (int k = 0; k < 3; ++k) {
         int row = rowadr + k;
@@ -806,6 +824,7 @@ kernel void equality_assembly(
           ccj_set(J_world, row, i, j1v - j2v, nv);
         }
         dbg[nr * nr + row] = R;
+        regularizer_low[row] = R_pair.lo;
         dbg[nr * nr + nr + row] = ar;
         dbg[nr * nr + 2 * nr + row] = imp;
         aref_low[row] = ar_pair.lo;
@@ -902,8 +921,14 @@ kernel void equality_assembly(
       float imp = eq_impedance(eq_sol, e, pos_norm, 0.0f);
       EqFloatPair imp_pair = eq_impedance_pair(eq_sol, e, pos_norm, 0.0f);
       imp = clamp(imp, 1e-6f, 0.999999f);
-      float R_t = max(1e-15f, (1.0f - imp) * diag_t / imp);
-      float R_r = max(1e-15f, (1.0f - imp) * diag_r / imp);
+      EqFloatPair R_t_pair = eq_regularizer_pair(imp_pair, eq_pair_add(
+          {w1t, b1 >= 0 && b1 < nbody ? body_invweight[2 * nbody + b1 * 2] : 0},
+          {w2t, b2 >= 0 && b2 < nbody ? body_invweight[2 * nbody + b2 * 2] : 0}));
+      EqFloatPair R_r_pair = eq_regularizer_pair(imp_pair, eq_pair_add(
+          {w1r, b1 >= 0 && b1 < nbody ? body_invweight[2 * nbody + b1 * 2 + 1] : 0},
+          {w2r, b2 >= 0 && b2 < nbody ? body_invweight[2 * nbody + b2 * 2 + 1] : 0}));
+      float R_t = R_t_pair.hi;
+      float R_r = R_r_pair.hi;
 
       // Degenerate empty Jacobian with zero inverse weight on both sides
       // (e.g. both-mocap weld) matches MuJoCo skipping the constraint.
@@ -921,7 +946,7 @@ kernel void equality_assembly(
         jmax = max(jmax, max(abs(jrot.x), max(abs(jrot.y), abs(jrot.z))));
       }
       bool degenerate = (jmax == 0.0f && (w1t + w2t) == 0.0f && (w1r + w2r) == 0.0f);
-      if (degenerate) { R_t = 0.0f; R_r = 0.0f; }
+      if (degenerate) { R_t = 0.0f; R_r = 0.0f; R_t_pair = R_r_pair = {0, 0}; }
 
       for (int k = 0; k < 3; ++k) {
         int row = rowadr + k;
@@ -938,6 +963,7 @@ kernel void equality_assembly(
           ccj_set(J_world, row, i, a - b_, nv);
         }
         dbg[nr * nr + row] = R_t;
+        regularizer_low[row] = R_t_pair.lo;
         dbg[nr * nr + nr + row] = ar;
         dbg[nr * nr + 2 * nr + row] = degenerate ? 0.0f : imp;
         aref_low[row] = ar_pair.lo;
@@ -965,6 +991,7 @@ kernel void equality_assembly(
               k == 0 ? jrot.x : (k == 1 ? jrot.y : jrot.z), nv);
         }
         dbg[nr * nr + row] = R_r;
+        regularizer_low[row] = R_r_pair.lo;
         dbg[nr * nr + nr + row] = ar;
         dbg[nr * nr + 2 * nr + row] = degenerate ? 0.0f : imp;
         aref_low[row] = ar_pair.lo;

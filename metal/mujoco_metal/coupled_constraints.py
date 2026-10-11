@@ -863,6 +863,8 @@ class CoupledConstraintDescriptor:
   # Double-precision constant residuals for paired aref, per pair
   # [solref_lo(2), solimp_lo(5), margin_lo(2)]: lo = f64 TRUE - f32 hi.
   pair_const_lo: np.ndarray = None
+  dof_invweight0_low: np.ndarray = None
+  body_invweight0_low: np.ndarray = None
 
 
 def _mix_contact_parameters(model, g1, g2):
@@ -1991,6 +1993,8 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
       joint_sol_params=_frozen(joint_sol_params, np.float32),
       dof_frictionloss=_frozen(model.dof_frictionloss, np.float32),
       dof_invweight0=_frozen(model.dof_invweight0, np.float32),
+      dof_invweight0_low=_frozen(np.asarray(model.dof_invweight0, dtype=np.float64)
+          - np.asarray(model.dof_invweight0, dtype=np.float32).astype(np.float64), np.float32),
       dof_sol_params=_frozen(dof_sol_params, np.float32),
       eq_obj=_frozen(eq_obj, np.int32),
       eq_data=_frozen(eq_data, np.float32),
@@ -2030,6 +2034,8 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
       body_jntadr=_frozen(model.body_jntadr, np.int32),
       body_jntnum=_frozen(model.body_jntnum, np.int32),
       body_invweight0=_frozen(model.body_invweight0.reshape(-1, 2), np.float32),
+      body_invweight0_low=_frozen(np.asarray(model.body_invweight0, dtype=np.float64)
+          - np.asarray(model.body_invweight0, dtype=np.float32).astype(np.float64), np.float32),
       dense_path=bool(nr <= DENSE_ROW_THRESHOLD and int(model.nv) <= 32),
   )
   from mujoco_metal.capacity import selected_jacobian_kind
@@ -2536,7 +2542,11 @@ class MetalCoupledConstraints:
         "joint_limit_params": self._tensor(joint_limit_params.reshape(-1)),
         "joint_sol_params": self._tensor(d.joint_sol_params.reshape(-1)),
         "dof_frictionloss": self._tensor(d.dof_frictionloss if d.nv else np.zeros(1, dtype=np.float32)),
-        "dof_invweight0": self._tensor(d.dof_invweight0 if d.nv else np.zeros(1, dtype=np.float32)),
+        "dof_invweight0": self._tensor(np.concatenate((
+            d.dof_invweight0 if d.nv else np.zeros(1, dtype=np.float32),
+            np.asarray(d.dof_invweight0_low).reshape(-1)
+            if d.nv and d.dof_invweight0_low is not None
+            else np.zeros(max(d.nv, 1), dtype=np.float32)))),
         "dof_sol_params": self._tensor(d.dof_sol_params.reshape(-1)),
         "eq_obj": self._tensor(d.eq_obj.reshape(-1) if d.neq else np.zeros(2, dtype=np.int32)),
         "eq_data": self._tensor(d.eq_data.reshape(-1) if d.neq else np.zeros(11, dtype=np.float32)),
@@ -2561,7 +2571,10 @@ class MetalCoupledConstraints:
         "body_jntnum": self._tensor(d.body_jntnum),
         "jnt_type": self._tensor(d.joint_type if d.njnt else np.zeros(1, dtype=np.int32)),
         "jnt_dofadr": self._tensor(d.joint_dofadr if d.njnt else np.zeros(1, dtype=np.int32)),
-        "body_invweight0": self._tensor(d.body_invweight0.reshape(-1)),
+        "body_invweight0": self._tensor(np.concatenate((d.body_invweight0.reshape(-1),
+            np.asarray(d.body_invweight0_low).reshape(-1)
+            if d.body_invweight0_low is not None
+            else np.zeros(d.nbody * 2, dtype=np.float32)))),
         "site_bodyid": self._tensor(
             np.asarray(model.site_bodyid, dtype=np.int32) if model.nsite else np.zeros(1, dtype=np.int32)
         ),
