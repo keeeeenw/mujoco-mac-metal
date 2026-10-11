@@ -1683,6 +1683,7 @@ class MetalSimulation:
     coupled = getattr(self, '_coupled_constraints', None)
     if coupled is not None:
       coupled._velocity_words_provider = self._velocity_words_for
+    self._smooth._velocity_words_provider = self._velocity_words_for
 
   @property
   def islands(self):

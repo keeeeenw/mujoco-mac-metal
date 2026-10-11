@@ -315,6 +315,7 @@ class MetalSmoothDynamics:
             "crb": batch_size * nb * 36,
             "local_inertia": batch_size * nb * 36,
             "qvel": batch_size * nv,
+            "bias_velocity_words": 3 * batch_size * nv,
             "bias": batch_size * nv,
             "bias_low": batch_size * nv,
             "cvel_low": batch_size * nb * 6,
@@ -361,6 +362,7 @@ class MetalSmoothDynamics:
         "crb": buffer(batch_size * nb * 36),
         "local_inertia": buffer(batch_size * nb * 36),
         "qvel": buffer(batch_size * nv),
+        "bias_velocity_words": buffer(3 * batch_size * nv),
         "bias": buffer(batch_size * nv),
         "bias_low": buffer(batch_size * nv),
         "cvel_low": buffer(batch_size * nb * 6),
@@ -588,12 +590,38 @@ class MetalSmoothDynamics:
     return w["mass_armature"][:batch * self._tree_mass_nnz].reshape(
         batch, self._tree_mass_nnz)
 
+  def _pack_bias_velocity(self, qvel):
+    """Stage high/low/tail planes without adding another MSL binding.
+
+    Simulation-owned providers resolve the represented velocity for ordinary
+    and RK4 stage state. An unrelated standalone device tensor has zero
+    residuals. Validate provider metadata before changing any bias scratch.
+    """
+    batch, nv, nq = self._workspace['batch_size'], self.model.nv, self.model.nq
+    provider = getattr(self, '_velocity_words_provider', None)
+    words = provider(qvel) if provider is not None else None
+    if words is not None and (
+        not isinstance(words, self._torch.Tensor)
+        or tuple(words.shape) != (batch, 2*nq+2*nv)
+        or words.dtype != self._torch.float32 or words.device != qvel.device
+        or not words.is_contiguous()):
+      raise ValueError('retained velocity words have invalid tensor metadata')
+    output = self._workspace['bias_velocity_words']
+    planes = output[:3*batch*nv].reshape(3, batch, nv)
+    planes[0].copy_(qvel)
+    if words is None:
+      planes[1:].zero_()
+    else:
+      planes[1].copy_(words[:, 2*nq:2*nq+nv])
+      planes[2].copy_(words[:, 2*nq+nv:])
+    return output
+
   def _run_velocity_bias(self, qvel, lists, *, cdof, local_inertia,
                          world_mask=None):
     """Refresh only comVel/RNE; position-dependent CRBA inputs stay cached."""
     w, arrays = self._workspace, self._arrays
     batch = int(w["batch_size"])
-    qvel_flat = qvel.reshape(-1) if self.model.nv else w["qvel"]
+    qvel_flat = self._pack_bias_velocity(qvel)
     if world_mask is None:
       world_mask = self._fk._workspace["outputs"]["all_world_mask"]
     bias_args = [
@@ -1267,8 +1295,12 @@ class MetalSmoothDynamics:
     computed = self._compute_mass_matrix(qpos)
     batch, nb, nv = computed["batch"], self.model.nbody, self.model.nv
     torch = self._torch
-    qvel_flat = qvel32.reshape(-1)
-    if qvel_flat.size == 0:
+    # The explicit host entry retains supplied source velocity. Device entry
+    # points use their simulation-owned residual provider instead.
+    low = (qvel-qvel32.astype(np.float64)).astype(np.float32)
+    tail = (qvel-qvel32.astype(np.float64)-low.astype(np.float64)).astype(np.float32)
+    qvel_flat = np.stack([qvel32, low, tail]).reshape(-1)
+    if not qvel_flat.size:
       qvel_flat = np.zeros(1, dtype=np.float32)
     qvel_tensor = torch.from_numpy(qvel_flat).to(self._fk._device)
     bias = torch.empty(
@@ -1349,6 +1381,7 @@ class MetalSmoothDynamics:
         "mass_matrix": computed["mass_matrix"],
         "mass_matrix_low": computed["mass_matrix_low"],
         "qfrc_bias": bias[: batch * nv].reshape(batch, nv),
+        "qfrc_bias_low": bias_low[: batch * nv].reshape(batch, nv),
     }
 
   def bias_derivative_device(self, qpos, qvel, dynamics=None, *,

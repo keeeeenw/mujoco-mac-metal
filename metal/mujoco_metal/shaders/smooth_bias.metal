@@ -48,6 +48,14 @@ inline float bias_dd_residual(float2 value, float legacy) {
   float2 diff = bias_dd_add_words(value, float2(-legacy, 0.0f));
   return diff.x + diff.y;
 }
+// Buffer 12 keeps the established high plane followed by low/tail planes.
+// Compensated RNE uses all represented velocity words; legacy public high
+// intermediates still use qvel[index] and keep their original float32 ABI.
+inline float2 bias_velocity_words(device const float* qvel, uint index,
+                                  uint size) {
+  return bias_dd_add_words(float2(qvel[index], qvel[size+index]),
+                           float2(qvel[2*size+index], 0.0f));
+}
 inline float2 bias_dd_cross_component(float2 ax, float2 ay,
                                       float2 bx, float2 by) {
   float2 result = bias_dd_add_word_product(float2(0.0f), ax, by);
@@ -219,8 +227,9 @@ kernel void smooth_bias(
             for (uint r=0;r<6;++r)
               velocity[r]+=cdof[dof6+(d+k)*6+r]*qvel[vb+d+k];
             for (uint r=0;r<6;++r)
-              velocity_dd[r]=bias_dd_add_product(
-                  velocity_dd[r], cdof[dof6+(d+k)*6+r], qvel[vb+d+k]);
+              velocity_dd[r]=bias_dd_add_word_product(
+                  velocity_dd[r], float2(cdof[dof6+(d+k)*6+r], 0.0f),
+                  bias_velocity_words(qvel, vb+d+k, batch*nv));
           }
         }
         float derivatives[18];
@@ -240,9 +249,9 @@ kernel void smooth_bias(
           for (uint r=0;r<6;++r)
             velocity[r]+=cdof[dof6+(d+skip+k)*6+r]*qvel[vb+d+skip+k];
           for (uint r=0;r<6;++r)
-            velocity_dd[r]=bias_dd_add_product(
-                velocity_dd[r], cdof[dof6+(d+skip+k)*6+r],
-                qvel[vb+d+skip+k]);
+            velocity_dd[r]=bias_dd_add_word_product(
+                velocity_dd[r], float2(cdof[dof6+(d+skip+k)*6+r], 0.0f),
+                bias_velocity_words(qvel, vb+d+skip+k, batch*nv));
         }
       } else {
         float derivative[6];
@@ -254,8 +263,9 @@ kernel void smooth_bias(
           cdof_dot_low[dof6+d*6+r]=bias_dd_residual(
               derivative_dd[r], derivative[r]);
           velocity[r]+=cdof[dof6+d*6+r]*qvel[vb+d];
-          velocity_dd[r]=bias_dd_add_product(
-              velocity_dd[r], cdof[dof6+d*6+r], qvel[vb+d]);
+          velocity_dd[r]=bias_dd_add_word_product(
+              velocity_dd[r], float2(cdof[dof6+d*6+r], 0.0f),
+              bias_velocity_words(qvel, vb+d, batch*nv));
         }
       }
     }
@@ -293,7 +303,7 @@ kernel void smooth_bias(
             acceleration_dd,
             float2(cdof_dot[dof6+(first+d)*6+k],
                    cdof_dot_low[dof6+(first+d)*6+k]),
-            float2(qvel[vb+first+d], 0.0f));
+            bias_velocity_words(qvel, vb+first+d, batch*nv));
       }
       cacc[body6+b*6+k]=acceleration;
       cacc_low[body6+b*6+k]=bias_dd_residual(acceleration_dd, acceleration);
