@@ -33,6 +33,12 @@ Newton/CG solver layouts, across dense/sparse Jacobians and island modes.
 These are scoped corrections; the full milestone acceptance count remains
 unchanged. See [API](API.md) and [qualification](QUALIFICATION.md).
 
+Raw sensor and adapter diagnostics now participate in selected checkpoint,
+reset, keyframe and environment-copy operations. Actual post-write and late
+publication restore faults have passing rollback checks, including prepared
+record and old-buffer ownership. The reviewed port passes a combined 209-check
+native/mixed gate. This does not close the full lifecycle or API milestones.
+
 Prepared potential/kinetic energy APIs, computed-stage metadata and current flex
 queries have separate passing native correction gates. A 100-case source-order
 matrix checks five integrators, automatic energy and sensors enabled/disabled,

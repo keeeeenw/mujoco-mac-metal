@@ -75,7 +75,7 @@ The earlier host publication check passed **2,163 tests, with 1,615
 native-dependent tests skipped**. More recent development corrections preserve
 retained precision in inertial bias, inverse derivatives and elastic forces,
 with independent trajectory, energy and lifecycle checks. The latest CPU
-selection passed **2,996 tests, with 99 skipped** in its prepared development
+selection passed **3,000 tests, with 99 skipped** in its prepared development
 environment. These are separate source/environment results, not a full GPU or
 installed-wheel qualification. The development source has not been released
 to PyPI.

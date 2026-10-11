@@ -96,6 +96,33 @@ No tolerances or iteration limits were relaxed. The broader backend regression,
 remaining public stage contracts, final clean-wheel and creative demo gates
 remain open. These results do not establish performance or complete milestones.
 
+The complete backend discovery at `35bb85072` stopped after **1,001 passes**
+on a contact-sensor fixture supplying an obsolete 42-word record layout.
+`dcf382464` uses the canonical production layout and rejects malformed views
+before dispatch. The original complete 20-case query matrix passes unchanged
+physics bounds. A subsequent RNE fixture read preserved previous-step scratch
+after a current query; `f669bc2d7` instead compares the owned public query with
+the independent CPU oracle at full retained inputs and asserts the old buffers
+stay unchanged. The complete seven-file selection passes **288 checks in
+407.62 seconds**; the explicit native-only RNE guard passes **1 in 48.18 seconds**.
+Full host checks pass **3,000 tests, 99 skipped, 2,974 deselected in 102.80 seconds**.
+
+Raw sensor and adapter diagnostic lifecycle ownership is corrected in
+`3a4bf4a76`. A stronger test reproduced partial physical restoration after
+a post-write exception, with position error up to `0.1157316`. The correction
+adds admitted rollback across owned state, caches, storage bindings and adapter
+payloads, without running physics for recovery. **34 new native checks pass
+in 19.86 seconds**, including actual post-write/publication faults, exact
+restoration, old buffer identity and valid/stale prepared-record classification.
+The full ten-file affected selection passes **326 in 215.98 seconds**, with no
+failures or skips. Full host checks pass **3,000 tests, 99 skipped, 3,004
+deselected in 107.23 seconds**. After porting the exact source, a combined
+contact/RNE/sensor/lifecycle gate passes **209 checks in 178.66 seconds**.
+
+These scopes overlap and must not be summed. The complete backend discovery
+was a failed run, not full qualification; all original milestone, API, wheel
+and full-timeline creative demo acceptance remains required.
+
 Current flex-energy queries are corrected at `ba8c2097c`. Real tensor mutation
 previously left flex geometry stale, producing a potential-energy error of
 `0.704` in a retained fixture. Eight new native cases cover dense/component

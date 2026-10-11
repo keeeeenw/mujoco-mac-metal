@@ -1041,6 +1041,32 @@ this explicit API boundary, not the ordinary step loop. Input validation can
 synchronize; numerical evaluation and history reads execute on Metal. Complete
 sensor/extension/model composition and installed-wheel qualification remain open.
 
+Development snapshots now include `sensor_diagnostics_version=1`, separate
+`raw_sensordata` and `sensor_plugin_status`, in addition to stored samples and
+history. Raw samples can differ from delayed/interpolated stored readings.
+Restore validates complete payloads before extension callbacks, admits staging
+and rollback storage, and publishes owned mutable diagnostic bindings. Legacy
+snapshots initialize raw high samples from their saved stored samples and clear
+adapter diagnostics; they never retain raw samples from a later trajectory.
+An explicitly uninitialized raw buffer remains lazy on full restore; selected
+restore clears only its selected rows and preserves the other worlds.
+
+Cold reset, keyframe reset and full environment-row copying also cover raw
+samples and adapter diagnostics. Restore failures after actual state writes or
+diagnostic publication roll back physical state, storage identities, histories,
+adapters and prepared caches. A valid old record remains valid after rollback;
+an already stale record remains stale. These explicit lifecycle transactions
+can serialize adapter state on the host, copy numerical storage on its owning
+device and incur snapshot allocation cost. They do not run CPU physics or
+belong in a per-step training loop. Broader lifecycle/extension combinations
+remain under qualification.
+
+Low-level contact sensor views require the canonical record layout exported by
+`contact_precision.RECORD_WORDS`, with contiguous MPS arrays of the documented
+shape and dtype. Invalid legacy record widths and payload shapes are rejected
+before spatial scratch allocation or output writes. These trusted native views
+are separate from the upstream host contact structure.
+
 ### Component implicitfast midpoint and monolithic solver scaling
 
 Eligible standalone free bodies use MuJoCo's midpoint position velocity after
