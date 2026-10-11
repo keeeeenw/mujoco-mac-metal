@@ -1,5 +1,48 @@
 # Development qualification — 2026-10-11
 
+## Compiled simple-inertia correction — 2026-10-11
+
+Local revision `3d38fd35f` on `implementation/mac-milestone-completion`
+retains MuJoCo's compiled `dof_simplenum` and `dof_M0` constants. Its native
+mass stage uses the source constant diagonal and exact zero couplings for
+simple rows, before the separate tendon-armature projection. Dense, component
+and standalone query routes follow the same rule. The standalone query now
+also supplies the complete mass-layout ABI, including the world-mask words.
+
+The constants are owned and included in device memory admission. Lifecycle
+recomputation supplies fresh source constants; direct descriptor edits invalidate
+the shortcut and continue through generic native CRBA. No stepping operation
+calls CPU physics. Native tests execute arbitrary free/ball rotations, hinge and
+slide rows mixed with a nonsimple body, inherited motor armature, masked worlds,
+sleeping rows and stale-constant invalidation.
+
+The complete host selection passed **2,422 tests, 99 skipped, 2,208 deselected
+in 100.60 seconds**. The final native group passed **5 tests, 3 deselected in
+118.67 seconds**, including the original strict PGS/Euler contact-J rollout
+gate and the four new mass tests. A separate existing awake/sparse/force group
+plus the original zero-margin cylinder-terrain trajectory finished with
+**21 passed and 1 failed in 35.56 seconds**. The failing trajectory retains its
+original maximum violating acceleration difference `1.85741866`; no tolerance
+or solver budget was changed.
+
+Same-state diagnostics now show exact zero off-diagonal mass entries for the
+isolated simple body. Its diagonal still has a float32 rounding difference
+`2.9802322762395583e-10`, and the initial full retained acceleration differs by
+approximately `2.5e-9`. Independently integrated trajectories still choose
+different terrain witnesses. This is a structural mass correction, **not full
+mass/solver precision, trajectory parity, milestone closure or speed evidence**.
+Previous test counts below retain their original producing revisions.
+
+Reproduce the new native execution tests and unchanged strict gate:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -m gpu -p no:cacheprovider \
+  metal/tests/test_compiled_simple_mass.py \
+  'metal/tests/test_contact_operator_precision.py::test_actual_contact_jacobian_reference_and_inverse_mass_rows[solver0-integrated_euler_v1]'
+```
+
 Current `main` publishes the experimental development backend. See
 [milestone status](STATUS.md): **0/16 milestones 005–020 have full-composition
 sign-off**. Earlier bounded capabilities and individual regression groups retain
