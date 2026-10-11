@@ -1072,14 +1072,20 @@ class MetalSimulation:
     )
     self._rhs_low = torch.zeros_like(self._rhs)
     # Owned scratch for compensated RHS accumulation (see _rhs_accumulate):
-    # eight b*nv float32 buffers plus one b-row bool selector, grown only on
-    # demand. Every TwoSum intermediate lands here via out= writes, so
-    # accumulation performs no batch-sized hidden allocations. Admitted
-    # footprint: 8*count float32 words + count//nv bool words.
-    self._twosum_float = None
-    self._twosum_float_count = 0
-    self._twosum_mask = None
-    self._twosum_mask_rows = 0
+    # eight b*nv float32 buffers plus one bool selector row per world,
+    # pre-allocated once here against the admitted
+    # simulation.twosum_float / simulation.twosum_mask budget. The
+    # accumulator never grows these; oversized requests are rejected before
+    # any write. Every TwoSum intermediate lands here via out= writes, so
+    # accumulation performs no batch-sized hidden allocations.
+    _twosum_count = max(int(batch_size) * int(descriptor.nv), 1)
+    self._twosum_float = torch.zeros(
+        (8, _twosum_count), dtype=torch.float32, device=self._state._device)
+    self._twosum_float_count = _twosum_count
+    _twosum_rows = max(int(batch_size), 1)
+    self._twosum_mask = torch.zeros(
+        (_twosum_rows, 1), dtype=torch.bool, device=self._state._device)
+    self._twosum_mask_rows = _twosum_rows
     self._forward_stage_zero_constraint = torch.zeros_like(self._rhs)
     self._forward_stage_passive_force = torch.empty_like(self._rhs)
     self._forward_stage_actuator_force = torch.empty_like(self._rhs)
@@ -4780,9 +4786,14 @@ class MetalSimulation:
     precision contract. ``mask`` is a per-world nonzero selector.
 
     Every intermediate lands in owned `_twosum_*` scratch via out= writes;
-    no batch-sized temporary is allocated. Unselected worlds keep their exact
-    input words (including signed zeros): the masked publish copies the
-    computed-or-retained words instead of adding positive zero.
+    no batch-sized temporary is allocated. The scratch is pre-allocated
+    once at construction against the admitted simulation.twosum_float /
+    simulation.twosum_mask budget and never grown; oversized requests and
+    hi/lo storage aliasing are rejected before any write. Unselected worlds
+    keep their exact input words (including signed zeros): the masked
+    publish copies the computed-or-retained words instead of adding
+    positive zero. A `value` that views `hi`/`lo` storage is safe (all
+    writes land in separate scratch first).
     Inputs are validated before any write; failures leave ``hi``/``lo``
     untouched.
     """
@@ -4803,6 +4814,9 @@ class MetalSimulation:
           "rhs accumulation hi/lo shapes must agree and value must match")
     count = int(hi.numel())
     rows = int(hi.shape[0]) if hi.dim() > 0 else 0
+    if count and hi.data_ptr() == lo.data_ptr():
+      raise ValueError(
+          "rhs accumulation hi and lo must not alias the same storage")
     if mask is not None:
       if (not isinstance(mask, torch.Tensor) or mask.device.type != device.type
           or (device.index is not None
@@ -4813,11 +4827,13 @@ class MetalSimulation:
             "rhs accumulation mask must be a contiguous tensor on "
             f"{device} with one entry per world")
     pool = self._twosum_float
-    if pool is None or self._twosum_float_count < count:
-      pool = torch.zeros((8, max(count, 1)), dtype=torch.float32,
-                         device=device)
-      self._twosum_float = pool
-      self._twosum_float_count = max(count, 1)
+    # Model-bounded scratch: pre-allocated at construction against the
+    # admitted budget. Never grow here (growth would escape admission);
+    # reject oversized requests before any write so failures leave hi/lo
+    # and retained caches untouched.
+    if count > self._twosum_float_count:
+      raise ValueError(
+          "rhs accumulation request exceeds the admitted TwoSum scratch")
     bufs = [pool[i, :count].reshape(hi.shape) for i in range(8)]
     (s_buf, bb_buf, t_buf, u_buf, w_buf, err_buf, tmp_buf,
      neg_buf) = bufs
@@ -4836,10 +4852,9 @@ class MetalSimulation:
       lo.add_(err_buf)
       return
     sel = self._twosum_mask
-    if sel is None or self._twosum_mask_rows < rows:
-      sel = torch.zeros((max(rows, 1), 1), dtype=torch.bool, device=device)
-      self._twosum_mask = sel
-      self._twosum_mask_rows = max(rows, 1)
+    if rows > self._twosum_mask_rows:
+      raise ValueError(
+          "rhs accumulation mask exceeds the admitted selector capacity")
     sel = sel[:rows].reshape(-1, 1)
     torch.ne(mask.reshape(-1, 1), 0, out=sel)
     torch.where(sel, s_buf, hi, out=tmp_buf)

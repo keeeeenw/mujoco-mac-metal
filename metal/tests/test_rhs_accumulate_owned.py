@@ -88,35 +88,119 @@ def test_accumulate_validates_before_any_write():
 @_GPU
 @_NEEDS_GPU
 def test_accumulate_reuses_owned_scratch_without_reallocation():
-  """Second same-shape accumulate must reuse the admitted pool."""
+  """Pre-allocated pool is reused; repeated calls never reallocate."""
   import torch
   from mujoco_metal.simulation import MetalSimulation
   model = _model()
   sim = MetalSimulation(model, 2, profile="integrated_euler_v1")
   device = sim._state._device
+  # Pre-allocated once at construction against the admitted budget.
+  assert sim._twosum_float is not None
+  assert sim._twosum_float.shape == (8, max(2 * model.nv, 1))
+  assert sim._twosum_mask is not None
+  assert sim._twosum_mask.shape == (2, 1)
+  assert sim._twosum_mask.dtype == torch.bool
+  first_id = id(sim._twosum_float)
+  first_count = sim._twosum_float_count
   hi = torch.zeros((2, model.nv), dtype=torch.float32, device=device)
   lo = torch.zeros((2, model.nv), dtype=torch.float32, device=device)
   val = torch.ones((2, model.nv), dtype=torch.float32, device=device)
-  assert sim._twosum_float is None
   sim._rhs_accumulate(hi, lo, val)
-  first_id = id(sim._twosum_float)
-  first_count = sim._twosum_float_count
-  assert first_count >= int(hi.numel())
-  assert sim._twosum_float.shape[0] == 8
   hi2 = torch.zeros((2, model.nv), dtype=torch.float32, device=device)
   lo2 = torch.zeros((2, model.nv), dtype=torch.float32, device=device)
   sim._rhs_accumulate(hi2, lo2, val)
   assert id(sim._twosum_float) == first_id
   assert sim._twosum_float_count == first_count
-  # Admitted footprint: 8 float words per element + bool selector rows.
   assert sim._twosum_float.numel() == 8 * first_count
 
 
 @_GPU
 @_NEEDS_GPU
+def test_native_scratch_bytes_match_admitted_breakdown():
+  """Actual device bytes equal the capacity inventory (bool is 1 byte)."""
+  from mujoco_metal.capacity import estimate_capacity
+  from mujoco_metal.simulation import MetalSimulation
+  model = _model()
+  batch = 2
+  sim = MetalSimulation(model, batch, profile="integrated_euler_v1")
+  est = estimate_capacity(model, batch, npairs=0, nslots=0, nr=0)
+  table = dict(est.memory_breakdown)
+  assert sim._twosum_float.numel() * 4 == table["simulation.twosum_float"]
+  assert sim._twosum_mask.numel() * 1 == table["simulation.twosum_mask"]
+  assert table["simulation.twosum_float"] == 8 * max(batch * model.nv, 1) * 4
+
+
+@_GPU
+@_NEEDS_GPU
+def test_oversized_request_rejected_before_any_write():
+  """Requests beyond the admitted scratch fail with hi/lo untouched."""
+  import torch
+  from mujoco_metal.simulation import MetalSimulation
+  model = _model()
+  sim = MetalSimulation(model, 2, profile="integrated_euler_v1")
+  device = sim._state._device
+  nv = int(model.nv)
+  hi = torch.ones((3, nv), dtype=torch.float32, device=device)
+  lo = torch.zeros((3, nv), dtype=torch.float32, device=device)
+  val = torch.ones((3, nv), dtype=torch.float32, device=device)
+  hi_before, lo_before = hi.clone(), lo.clone()
+  with pytest.raises(ValueError, match="admitted"):
+    sim._rhs_accumulate(hi, lo, val)
+  assert torch.equal(hi, hi_before) and torch.equal(lo, lo_before)
+
+
+@_GPU
+@_NEEDS_GPU
+def test_hi_lo_alias_rejected_value_alias_is_safe():
+  """hi/lo sharing storage is rejected; value viewing hi is documented-safe."""
+  import torch
+  from mujoco_metal.simulation import MetalSimulation
+  model = _model()
+  sim = MetalSimulation(model, 2, profile="integrated_euler_v1")
+  device = sim._state._device
+  nv = int(model.nv)
+  shared = torch.ones((2, nv), dtype=torch.float32, device=device)
+  val = torch.ones((2, nv), dtype=torch.float32, device=device)
+  before = shared.clone()
+  with pytest.raises(ValueError, match="alias"):
+    sim._rhs_accumulate(shared, shared, val)
+  assert torch.equal(shared, before)
+  # Value aliasing hi accumulates hi+hi exactly (writes land in scratch first).
+  hi = torch.ones((2, nv), dtype=torch.float32, device=device)
+  lo = torch.zeros((2, nv), dtype=torch.float32, device=device)
+  sim._rhs_accumulate(hi, lo, hi)
+  assert torch.equal(hi, torch.full((2, nv), 2.0, device=device))
+  assert torch.equal(lo, torch.zeros((2, nv), device=device))
+
+
+@_GPU
+@_NEEDS_GPU
+def test_zero_dof_construction_carries_guarded_scratch():
+  """nv==0 sims admit minimum backings and reject nothing valid."""
+  import torch
+  from mujoco_metal.simulation import MetalSimulation
+  model = mujoco.MjModel.from_xml_string(
+      '<mujoco><worldbody><geom type="sphere" size=".1"/></worldbody></mujoco>')
+  assert int(model.nv) == 0
+  sim = MetalSimulation(model, 2, profile="integrated_scalable_v1")
+  device = sim._state._device
+  assert sim._twosum_float.shape == (8, 1)
+  assert sim._twosum_mask.shape == (2, 1)
+  hi = torch.zeros((2, 0), dtype=torch.float32, device=device)
+  lo = torch.zeros((2, 0), dtype=torch.float32, device=device)
+  val = torch.zeros((2, 0), dtype=torch.float32, device=device)
+  sim._rhs_accumulate(hi, lo, val)  # empty no-op, must not raise
+
+
+@_GPU
+@_NEEDS_GPU
 @pytest.mark.parametrize("solver", ["PGS", "CG", "Newton"])
-def test_cancellation_survives_masked_step_and_restore(solver):
-  """1 + 2**24 - 2**24 cancellation with world mask, step and restore."""
+def test_cancellation_survives_two_world_step_and_restore(solver):
+  """1 + 2**24 - 2**24 cancellation through ordinary two-world step/restore.
+
+  No production mask is involved here (both worlds step together); masked
+  recovery coverage lives in the selected-world tests below.
+  """
   import torch
   from mujoco_metal.simulation import MetalSimulation
   model = mujoco.MjModel.from_xml_string(f"""<mujoco>

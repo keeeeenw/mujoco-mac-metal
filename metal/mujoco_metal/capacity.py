@@ -868,6 +868,12 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       ("integration_qacc_low",b*nv),
       ("rhs", b * nv), ("forward_stage_zero_constraint", b * nv),
       ("rhs_low", b * nv),
+      # Owned TwoSum scratch for compensated force accumulation: eight
+      # float32 planes over the full b*nv force vector (minimum one word)
+      # plus one bool selector row per world (minimum one). Pre-allocated
+      # once after admission; the accumulator never grows it.
+      ("twosum_float", 8 * max(b * nv, 1)),
+      ("twosum_mask", max(b, 1)),
       ("dense_pair_solution_low", b * nv if mass_storage == "dense" else 0),
       ("dense_pair_zero_low", b * nv if mass_storage == "dense" else 0),
       ("dense_pair_work", 6 * b * max(nv, 1)
@@ -1572,7 +1578,10 @@ def estimate_capacity(model, batch_size, npairs, nslots, nr, *, neq=0,
       magnetic_force_plugins=magnetic_force_plugins,
       site_feedback_plugins=site_feedback_plugins,
       native_actuator_user_workspace_bytes=native_actuator_user_workspace_bytes):
-    runtime_parts.append((name, _bytes(elements)))
+    # Bool selectors occupy one physical byte per element, not one float32
+    # word; every other runtime buffer is float32/int32 (four bytes).
+    runtime_parts.append((name, elements if name == "simulation.twosum_mask"
+                            else _bytes(elements)))
   parts = parts + tuple(runtime_parts)
   total += sum(size for _, size in runtime_parts)
   return CapacityEstimate(
