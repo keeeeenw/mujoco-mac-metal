@@ -1077,3 +1077,30 @@ def test_nonfinite_world_fails_independently_and_zeroes_all_derivative_rows():
       assert not _host(value)[0].any(), key
   assert any(_host(value)[1].any() for key, value in result.items()
              if key != "status" and _host(value)[1].size)
+
+
+def test_inverse_acceleration_derivative_keeps_mass_product_residual_native():
+  """A nonzero baseline makes rounded Ma samples lose a small force stencil."""
+  model = mujoco.MjModel.from_xml_string('''<mujoco>
+    <option gravity="0 0 0"/>
+    <worldbody><body><joint type="hinge" axis="0 0 1"/>
+      <inertial pos="0 0 0" mass="1" diaginertia=".2 .25 .3333333333333333"/>
+    </body></worldbody>
+  </mujoco>''')
+  sim = MetalSimulation(model, batch_size=2, profile="integrated_euler_v1")
+  sim.reset(qvel=np.zeros((2, 1), dtype=np.float32))
+  sim._state._qacc.copy_(torch.tensor([[1.], [-1.]], device=sim.device))
+  before = _device_snapshot(sim)
+  eps = 2.**-12  # Both qacc perturbations are exactly representable.
+  result = mjd_inverseFD(sim, eps=eps, flg_actuation=False)
+  for world, acceleration in enumerate((1., -1.)):
+    data = mujoco.MjData(model)
+    data.qacc[:] = acceleration
+    expected = np.empty((1, 1))
+    mujoco.mjd_inverseFD(model, data, eps, 0, None, None, expected,
+                         None, None, None, None)
+    assert expected[0, 0] != 0.
+    np.testing.assert_allclose(_host(result["DfDa"])[world], expected,
+                               rtol=2e-6, atol=1e-7)
+  assert _host(result["status"]).tolist() == [0, 0]
+  _assert_snapshots_equal(_device_snapshot(sim), before)

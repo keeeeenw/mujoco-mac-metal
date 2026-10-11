@@ -255,6 +255,17 @@ def test_inverse_force_delta_preserves_small_constituent_changes():
                              rtol=0, atol=0)
 
 
+
+@pytest.mark.parametrize("missing", ["base", "candidate"])
+def test_inverse_force_delta_rejects_unpaired_mass_residual(missing):
+  fields = ("mass_qacc", "bias", "bias_low", "passive", "constraint")
+  base = {name: torch.zeros((1, 1)) for name in fields}
+  candidate = {name: value.clone() for name, value in base.items()}
+  (candidate if missing == "base" else base)["mass_qacc_low"] = torch.zeros((1, 1))
+  with pytest.raises(ValueError, match="inverse mass low words"):
+    _inverse_force_delta(base, candidate)
+
+
 def test_compensated_bias_dot_words_track_binary64_reference():
   # CPU transcription of the Metal two-word product/sum used by smooth_bias.
   # Product residuals are exact for float32 operands and the two_sum sequence

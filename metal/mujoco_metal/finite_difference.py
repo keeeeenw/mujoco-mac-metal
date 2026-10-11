@@ -498,6 +498,15 @@ def _inverse_force_delta(base_components, candidate_components, *,
   """Difference inverse force constituents before combining common values."""
   delta = (candidate_components["mass_qacc"] -
            base_components["mass_qacc"])
+  # inverse_skip publishes a compensated Ma pair. Its residual must be
+  # differenced before division by eps, just like the bias and constraint
+  # words; independently rounded high samples lose a small force stencil.
+  base_mass_low = base_components.get("mass_qacc_low")
+  candidate_mass_low = candidate_components.get("mass_qacc_low")
+  if base_mass_low is not None or candidate_mass_low is not None:
+    if base_mass_low is None or candidate_mass_low is None:
+      raise ValueError("inverse mass low words must be present for both samples")
+    delta.add_(candidate_mass_low - base_mass_low)
   delta.add_(candidate_components["bias"] - base_components["bias"])
   delta.add_(candidate_components["bias_low"] - base_components["bias_low"])
   delta.sub_(candidate_components["passive"] - base_components["passive"])
