@@ -316,7 +316,14 @@ runs after the POS/VEL prefix and may return controls for step2; it is not GPU
 native code. With `mjENBL_ENERGY` enabled, development `sim.energy` returns owned
 `[batch,2]` potential/kinetic samples from the latest evaluated stages. Selected
 native split-step and energy tests pass; broad integrator-composition
-qualification remains pending.
+qualification remains pending. Full simulation copies and checkpoints carry
+stored energy with the same rows as state and sensor samples. Restoring full
+or selected rows preserves their stored samples without recomputing physics.
+Malformed energy is rejected before state writes or extension callbacks. Older
+simulation schema-1 checkpoints without the optional `energy` key clear the
+selected stored energy rows; the next forward evaluation computes fresh values.
+Disabled diagnostics carry `energy=None`. Full simulation restore rejects an
+empty environment selection before mutation.
 
 Explicit inverse queries also preserve pending split-step records, sleep
 scheduling, stored sensor status and plugin device state. Registered plugins
@@ -753,7 +760,7 @@ sim.restore(checkpoint)
 - `set_mocap` accepts host arrays or contiguous float32 MPS tensors: `(nmocap, 3/4)` broadcast to the selected worlds or `(len(env_ids), nmocap, 3/4)` per world, or a single `(…, nmocap, 7)` posquat array with `quat=None`. Inputs are copied, validation is atomic, sticky failure is preserved, changes take effect on the next step/assembly.
 - `reset_to_keyframe` mirrors pinned `mj_resetDataKeyframe`: time to `key_time`, qpos/qvel/mocap to the key values, qacc/status cleared, equality activity to compiled defaults, held controls to `key_ctrl` for the selected worlds. Invalid key ids fail atomically.
 - `copy_environment` copies every state row (qpos/qvel/qacc/time/status/eq/mocap) src to dst and bumps generation.
-- `DeviceState.snapshot()` captures device-state rows and is not a full trajectory checkpoint. Use `MetalSimulation.snapshot()` and `restore()` for exact replay: they also carry acceleration and constraint warm starts, held inputs, sensor/history storage, delay rings and extension state. Restoring only kinematic rows cannot reproduce the rounding of a later solve with different retained seeds.
+- `DeviceState.snapshot()` captures device-state rows and is not a full trajectory checkpoint. Use `MetalSimulation.snapshot()` and `restore()` for exact replay: they also carry acceleration and constraint warm starts, held inputs, stored energy, sensor/history storage, delay rings and extension state. Restoring only kinematic rows cannot reproduce the rounding of a later solve with different retained seeds.
 - Development device-state snapshots use schema version 7, including canonical residual words for position and velocity, warning statistics and reset epochs, plus equality/mocap/activation fields when present. Older schemas remain validated on restore: a version-1 snapshot cannot restore a model with equalities, versions below 3 cannot restore mocap bodies, and versions below 4 cannot restore activation storage. Schemas below 7 initialize zero position/velocity residual words; schema-7 words must preserve the float32 projection and canonical residual representation. Schemas below 5 restore zero warning history and schemas below 6 restore legacy reset epochs. Model/profile/dimension mismatches are rejected before writes. Simulation-level snapshots have their own schema and include the nested device-state snapshot.
 - Model changes are shared by the batch, not per environment: `ModelLifecycle.recompute_body_masses` (via `mj_setConst`) and `update_geom_contact` (friction/solref/solimp/margin/gap) are host preparation utilities with transactional validation; reference poses/shapes/types are recompile-required. `MetalSimulation.apply_lifecycle` adopts a rebuilt lifecycle/model into a live simulation atomically (structural-count compatibility required): device stages are rebuilt and swapped, live state and held inputs preserved, fingerprints/generation advance, caches invalidate. On any failure the simulation is untouched and keeps stepping. Development device state owns activation, history, userdata, warm-start acceleration, controls and applied forces. Registered extensions must provide the documented lifecycle and device rollback hooks; this does not imply support for arbitrary upstream plugins. Explicit state/query boundaries may synchronize for validation. Profile/model admission and source qualification remain separate from state storage.
 - A failed physics step rolls back physical state/time for that world and stays sticky until reset/restore; an accepted activity change is persistent input state, not a partially applied step.

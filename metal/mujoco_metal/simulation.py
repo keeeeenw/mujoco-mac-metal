@@ -1911,6 +1911,9 @@ class MetalSimulation:
       w[dst_i, nr * nr + 3 * nr:nr * nr + 4 * nr] = w[src_i, nr * nr + 3 * nr:nr * nr + 4 * nr].clone()
     if getattr(self, "_sensordata", None) is not None:
       self._sensordata[dst_i] = self._sensordata[src_i].clone()
+    energy = getattr(self, "_energy", None)
+    if energy is not None:
+      energy[dst_i] = energy[src_i].clone()
     seen_low = set()
     for program in (getattr(self, "_sensors", None),
                     getattr(self, "_raw_sensor_program", None)):
@@ -1959,8 +1962,8 @@ class MetalSimulation:
     """Capture a versioned simulation-level checkpoint (host, immutable).
 
     Covers everything needed for exact replay: the device state, retained
-    constraint multipliers, held per-call inputs, stored sensor samples
-    and actuator delay rings. The narrower :meth:`DeviceState.snapshot`
+    constraint multipliers, held per-call inputs, stored sensor samples,
+    enabled stage energy and actuator delay rings. The narrower :meth:`DeviceState.snapshot`
     owns only kinematic/equality/mocap/activation rows; use this method
     for full trajectory replay.
     """
@@ -2001,6 +2004,9 @@ class MetalSimulation:
     snap["held"] = held
     snap["sensordata"] = (self._sensordata.detach().cpu().numpy().copy()
                           if getattr(self, "_sensordata", None) is not None else None)
+    energy = getattr(self, "_energy", None)
+    snap["energy"] = (energy.detach().cpu().numpy().copy()
+                      if energy is not None else None)
     snap["sensordata_low"] = self._sensor_output_low_snapshot(
         getattr(self, "_sensors", None))
     raw_program = getattr(self, "_raw_sensor_program", None)
@@ -2027,8 +2033,8 @@ class MetalSimulation:
 
     Every field is validated before anything is committed: a bad snapshot
     (or bad env selection) raises with all live state untouched. Warm
-    starts, held inputs and stored sensor samples follow the same rows as
-    the device state. Restoring never clears retained seeds beyond what the
+    starts, held inputs, stored sensor samples and enabled energy follow
+    the same rows as the device state. Restoring never clears retained seeds beyond what the
     snapshot carries; use :meth:`reset` for a cold start.
     """
     self._assert_contact_override_binding()
@@ -2065,6 +2071,27 @@ class MetalSimulation:
             or int(snapshot.get("nv", -1)) != int(self._mjmodel.nv)
             or int(snapshot.get("nbody", -1)) != int(self._mjmodel.nbody)):
       raise ValueError("snapshot model dimensions do not match")
+    # Stored energy is an evaluated-stage output, not a value to recompute
+    # during restore. Validate it before any extension callback or state write.
+    energy = getattr(self, "_energy", None)
+    energy_checked = None
+    if energy is None:
+      if snapshot.get("energy") is not None:
+        raise ValueError("snapshot energy does not match disabled diagnostics")
+    elif "energy" not in snapshot:
+      # Older schema-1 snapshots did not carry this optional field. Clear
+      # selected rows instead of retaining output from an unrelated trajectory.
+      energy_checked = _np.zeros((self.batch_size, 2), dtype=_np.float32)
+    else:
+      arr = _np.asarray(snapshot["energy"], dtype=_np.float64)
+      if (arr.shape != (self.batch_size, 2)
+          or not _np.all(_np.isfinite(arr))):
+        raise ValueError("snapshot energy has an invalid shape or nonfinite values")
+      with _np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        energy_checked = _np.asarray(arr, dtype=_np.float32)
+      if not _np.all(_np.isfinite(energy_checked)):
+        raise ValueError("snapshot energy values overflow float32")
+      energy_checked = energy_checked.copy()
     # Validate all device state before any extension restore callback.
     self._state.validate_snapshot(snapshot.get("device"), env_ids=ids)
     plugins = snapshot.get("plugins")
@@ -2166,6 +2193,13 @@ class MetalSimulation:
     # Commit boundary: DeviceState validates its fields atomically before mutating.
     self._state.restore(snapshot["device"], env_ids=ids)
     torch = self._state._torch
+    if energy_checked is not None:
+      restored_energy = torch.as_tensor(
+          energy_checked, dtype=torch.float32, device=self._state._device)
+      if ids is None:
+        energy.copy_(restored_energy)
+      else:
+        energy[ids] = restored_energy[ids]
     for name, attr in (("history", "_history"),
                        ("qacc_warmstart", "_qacc_warmstart"),
                        ("userdata", "_userdata"),

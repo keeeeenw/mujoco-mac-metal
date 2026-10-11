@@ -1054,7 +1054,8 @@ REQUIREMENTS = (
         Stage.API, Implementation.NATIVE_GPU, Qualification.UNQUALIFIED,
         Execution.DEVICE, "global contact overrides and retained energy paths are implemented; complete option and feature composition remains unqualified",
         "mujoco_metal/coupled_constraints.py", "validate compiled override payload and profile-specific energy paths",
-        "MetalSimulation", "020", ("test_contact_override_020.py", "test_public_enable_history_plugin_composition_019.py"),
+        "MetalSimulation", "020", ("test_contact_override_020.py", "test_public_enable_history_plugin_composition_019.py",
+         "test_energy_lifecycle_006.py"),
         enums=("mjtEnableBit.mjENBL_OVERRIDE", "mjtEnableBit.mjENBL_ENERGY"),
     ),
     Requirement(
