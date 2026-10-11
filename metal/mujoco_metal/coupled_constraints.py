@@ -4401,9 +4401,11 @@ class MetalCoupledConstraints:
     b, nv, nr = int(self.batch_size), int(d.nv), int(d.nr)
     if poses is not None:
       _validate_geom_pose_residuals(torch, self._device, poses, b, int(d.ngeom))
-    if not d.dense_path and component_solver is None:
-      raise NotImplementedError(
-          "cached velocity stages require dense mass or a component solver")
+    # Row storage and mass storage are independent. The block-row solver also
+    # accepts a generalized dense mass; validate that input below rather than
+    # requiring a component solver merely because the row count is large.
+    if component_solver is None and mass is None:
+      raise ValueError("cached velocity stages require dense mass or a component solver")
     expected_q = (b, nv)
     _validate_cached_tensor(torch, self._device, "qvel", qvel, expected_q,
                             torch.float32)
@@ -4464,8 +4466,6 @@ class MetalCoupledConstraints:
                               and d.solver_type != int(mujoco.mjtSolver.mjSOL_PGS))
     if component_primal_route and self._component_operator_layout_device is None:
       raise ValueError("cached sparse primal solve requires a configured component layout")
-    if component_solver is None and mass is None:
-      raise ValueError("cached dense velocity solve requires the generalized mass")
     if component_solver is not None:
       if mass_blocks is None or awake_dof_ids is None or awake_counts is None:
         raise ValueError("cached component solve requires mass blocks and awake DOF lists")

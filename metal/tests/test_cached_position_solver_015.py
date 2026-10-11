@@ -98,7 +98,7 @@ def test_failed_replacement_capture_invalidates_the_previous_epoch_before_writes
   assert prior["_epoch"] != solver._position_context_epoch
 
 
-def test_cached_stage_requires_dense_dispatch_before_mutation():
+def test_cached_stage_requires_mass_dispatch_before_mutation():
   solver = MetalCoupledConstraints.__new__(MetalCoupledConstraints)
   solver._assembly_generation = 1
   solver._position_context_epoch = 1
@@ -107,7 +107,7 @@ def test_cached_stage_requires_dense_dispatch_before_mutation():
   solver.descriptor = SimpleNamespace(nv=1, nr=1, dense_path=False)
   solver.batch_size = 1
   context = {"_owner": solver, "_epoch": 1}
-  with pytest.raises(NotImplementedError, match="dense mass or a component solver"):
+  with pytest.raises(ValueError, match="dense mass or a component solver"):
     solver.run_velocity_device(context, None, None, None, None, None, None)
 
 
