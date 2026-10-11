@@ -33,8 +33,17 @@ see [producing revisions and scope](QUALIFICATION.md).
 
 A local line-search correction passed 43 focused native checks and the original
 alternate-cylinder heightfield trajectory/restore case without altered bounds
-or solver budgets. The broader terrain matrix has additional failures. Neither
-heightfields nor the full solver milestone is accepted from this scoped result.
+or solver budgets. The complete terrain matrix finished with **34 passed,
+6 failed**; zero-margin cylinder and box trajectories remain correction gates.
+Neither heightfields nor the full solver milestone is accepted from this result.
+
+A subsequent native-prism publication correction passed seven affected native
+checks and the original native-CCD cylinder trajectory/restore case. A separate
+constraint-row consumer correction then passed 14 dense/component and alternate
+CCD operator checks and the original native-CCD box trajectory. The complete
+terrain matrix has not been rerun at the latest revision. Four rejected-seed warm-selection cases also fail against the
+pinned zero-iteration source oracle. See the qualification record for the
+separate source revisions and their limits.
 
 Selected source compositions passed 94 Newton regression checks (including the
 original 300-step slope fixture), 69 contact-override checks and 11 retained

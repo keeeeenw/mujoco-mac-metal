@@ -85,6 +85,15 @@ unilateral entering-zone polynomial includes its constant term. Initial
 cold/warm objective comparisons and Huber force-zone predicates still need
 consistent retained precision; the complete solver/terrain matrix is unqualified.
 
+Native heightfield prism EPA preserves computed witness words through world
+transformation and contact publication. Scoped gates compare retained cylinder/
+box positions, normals and distances at `2e-12`. Both terrain CCD algorithms
+consume those retained words in constraint assembly; scoped dense/component
+gates also compare the actual Jacobians, regularizers and reference accelerations.
+The native-CCD cylinder and box rollouts pass their original trajectory/restore
+gates. The complete terrain matrix remains unqualified. This does not establish full terrain
+qualification or complete native sphere/capsule shrink-distance precision.
+
 
 ## Applied forces, damping and basic motors
 

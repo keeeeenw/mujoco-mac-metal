@@ -1,5 +1,84 @@
 # Development qualification — 2026-10-11
 
+## Retained native terrain constraint rows — 2026-10-11
+
+Local producing revision `fdcff2d80f9ee0159f3df29ceb76b6e5f6c259d7`
+enables the retained contact-row consumer for both terrain CCD algorithms.
+The preceding publication correction preserved accurate native witnesses, but
+the host enabled precise Jacobian/reference/regularizer assembly only when
+native CCD was disabled. The same-state box trace isolated that consumer loss.
+
+The dense/component native witness and existing alternate-CCD PGS/CG/Newton
+operator group passed **14 tests in 360.15 seconds**, exit 0. The native
+cylinder/box witness cases cover both geom orders, actual canonical Jacobians
+and regularizers at `2e-12`, reference accelerations at `rtol=2e-11,
+atol=2e-10`, and an adjacent contact-free world. CPU forward/mass calls are
+forbidden during native assembly. The unchanged original native box trajectory
+and four strict component cases passed **5 tests in 57.31 seconds**, exit 0.
+No model, solver budget or original trajectory bound was altered.
+
+The full host selection passed **2,433 tests, 99 skipped, 2,313 deselected in
+99.98 seconds**. Four host checks belong to the uncommitted warm-boundary
+regression under development; the committed host subset is 2,429 checks.
+The complete terrain matrix has not been rerun at this revision. The separate
+scalar-equality regularizer and initial warm-objective defects remain open.
+This is scoped numerical qualification, not whole-milestone completion.
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -p no:cacheprovider \
+  metal/tests/test_hfield_native_prism_precision.py \
+  metal/tests/test_contact_operator_precision.py
+```
+
+## Native prism witness publication — 2026-10-11
+
+Local producing revision `d97f75a5e9615e380e2c091b10394ab7f66a7284`
+preserves the position, normal and distance words already computed by native
+prism GJK/EPA. Previously the heightfield publisher transformed projected
+float32 witnesses and left their precision sidecar zero. Native prism witnesses
+now reach the world transform, frame construction and existing owned contact
+payload without that projection loss. No collision algorithm, model, tolerance,
+solver budget, shader binding or allocation was added or changed.
+
+The affected native publication/pose group passed **7 tests, 4 deselected in
+32.16 seconds**, exit 0. Four new cases compare actual retained cylinder/box
+contact position, normal and distance with pinned CPU contacts at `2e-12`,
+in both geom orders and with a second contact-free world. CPU forward/mass
+calls are forbidden during the native publication. Existing retained pose and
+world-transform tests also pass. An initial test reconstructed the distance
+from incorrect record indices; the corrected test uses the canonical high/low/
+tail fields and retains its original bounds.
+
+The unchanged original native-CCD cylinder trajectory/restore case passes.
+At this producing revision the native-CCD box trajectory still failed, with a maximum violating velocity
+error of `0.01710173`; the expanded terrain matrix has not been rerun at this
+revision. Initial witness precision passing is not full trajectory or terrain
+qualification. Native sphere/capsule shrink-distance precision and complete
+solver compositions also remain open.
+
+The full development host run passed **2,433 tests, 99 skipped, 2,309 deselected
+in 99.25 seconds**. This includes 2,429 checks in the producing commit and four
+additional CPU boundary-oracle checks under development. The latter do not
+qualify native warm selection: the rejected-seed native matrix separately
+failed all four dense/component CG/Newton cases at the preceding source. A
+scalar-equality regularizer precision gap and rounded objective selection need
+correction. No whole milestone, wheel or performance claim is made.
+
+Reproduce the committed native publication group with the pinned runtime and
+fallback disabled:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -m gpu -p no:cacheprovider \
+  metal/tests/test_hfield_native_prism_precision.py \
+  metal/tests/test_hfield_geom_xmat_transport_018.py \
+  metal/tests/test_hfield_fk_geom_xmat_source_witness.py \
+  metal/tests/test_hfield_represented_state_019.py
+```
+
 ## Consistent primal line coefficients — 2026-10-11
 
 Local producing revision `8f105983b9e52c6a2afbfd119256355c81e736be`
@@ -18,9 +97,13 @@ with cost/derivative/curvature bounds of `2e-12`.
 
 The original zero-margin alternate cylinder-heightfield trajectory and restore
 case now **passes in 57.77 seconds**, with its model, `rtol=atol=2e-3`, solver
-budget, independent four-step rollout and bitwise replay unchanged. The expanded
-terrain matrix has additional failures, so this result does **not** qualify all
-terrain shapes, CCD modes, margins or geom orders. Initial cold/warm objectives
+budget, independent four-step rollout and bitwise replay unchanged. The complete
+40-case terrain matrix finished with **34 passed, 6 failed, 10 host tests
+deselected in 1,803.19 seconds**, exit 1. The failures are zero-margin cylinder
+trajectories with native CCD and zero-margin box trajectories with either CCD
+mode, each in both geom orders. Initial contacts, frames and forces passed;
+later velocity or acceleration comparisons failed. This result does **not**
+qualify all terrain shapes, CCD modes, margins or geom orders. Initial cold/warm objectives
 and Huber force-zone predicates also retain precision gaps; complete solver
 qualification remains open. The earlier failures below belong to their recorded
 producing revisions, rather than proving the corrected case still fails.
@@ -37,6 +120,15 @@ python -m pytest -q -m gpu -p no:cacheprovider \
   metal/tests/test_primal_line_coefficient_residuals.py \
   metal/tests/test_primal_elliptic_line_pair_014.py \
   metal/tests/test_primal_line_alpha_014.py
+```
+
+The full terrain matrix uses the same environment and GPU flags:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -m gpu -p no:cacheprovider \
+  metal/tests/test_primitive_hfield_full_manifold.py
 ```
 
 ## Original-mass residuals in coupled solvers — 2026-10-11
