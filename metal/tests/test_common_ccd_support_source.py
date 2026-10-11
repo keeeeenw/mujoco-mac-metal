@@ -15,7 +15,7 @@ from test_common_ccd_matrix_source import _words
 from test_common_ccd_rigid_native import _pair_xml
 
 
-def _oracle(tmp_path):
+def _oracle(tmp_path, *, libccd=False):
   root = os.getenv("MUJOCO_METAL_TRACE_ROOT")
   if not root:
     pytest.skip("pinned source root required for the callback ABI")
@@ -24,6 +24,10 @@ def _oracle(tmp_path):
   code = header[:header.index("#ifndef")] + "#include <mujoco/mujoco.h>\n"
   code += struct + ";\ntypedef struct _mjCCDObj mjCCDObj;\n"
   code += """
+  typedef struct { double v[3]; } ccd_vec3_t;
+  extern void mjccd_support(const void*,const ccd_vec3_t*,ccd_vec3_t*);
+  """
+  code += """
   extern void mjc_initCCDObj(mjCCDObj*,const mjModel*,const mjData*,int,mjtNum);
   void query(const mjModel* m,const mjData* d,int geom,
              const double* dirs,int count,double* output) {
@@ -31,6 +35,11 @@ def _oracle(tmp_path):
     for(int i=0;i<count;i++) object.support(output+3*i,&object,dirs+3*i);
   }
   """
+  if libccd:
+    code = code.replace(
+        "object.support(output+3*i,&object,dirs+3*i)",
+        "mjccd_support(&object,(const ccd_vec3_t*)(dirs+3*i),"
+        "(ccd_vec3_t*)(output+3*i))")
   source = tmp_path / "installed_support.c"
   source.write_text(code)
   package = Path(mujoco.__file__).parent
@@ -52,7 +61,8 @@ def _oracle(tmp_path):
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 @pytest.mark.parametrize("rotation", [None, "17 31 -23"])
-def test_native_cylinder_support_matches_installed_callback(tmp_path, rotation):
+@pytest.mark.parametrize("libccd", [False, True], ids=["native", "libccd"])
+def test_native_cylinder_support_matches_installed_callback(tmp_path, rotation, libccd):
   import torch
   from mujoco_metal.coupled_constraints import _coupled_shader_source
   model = mujoco.MjModel.from_xml_string(_pair_xml(5,5,rotation=rotation))
@@ -66,11 +76,11 @@ def test_native_cylinder_support_matches_installed_callback(tmp_path, rotation):
       [.9999952938095764,.0030679567629247314,0],
       [1,0,0],[-1,0,0],[0,1,0],[0,0,1],[0,0,-1]],np.float64)))
   expected = np.zeros_like(directions)
-  _oracle(tmp_path).query(model._address,data._address,1,directions,
+  _oracle(tmp_path, libccd=libccd).query(model._address,data._address,1,directions,
                          len(directions),expected)
   packed = np.concatenate((_words(np.concatenate((data.geom_xpos[1],
       data.geom_xmat[1],model.geom_size[1],[0]))),np.zeros(36,np.float32)))
-  source = _coupled_shader_source() + r"""
+  source = _coupled_shader_source(libccd=libccd) + r"""
   kernel void installed_support_query(device const int* meta [[buffer(0)]],
       device const float* object [[buffer(1)]],device const float* dirs [[buffer(2)]],
       device float* output [[buffer(3)]],uint tid [[thread_position_in_grid]]) {
