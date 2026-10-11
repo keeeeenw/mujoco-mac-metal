@@ -84,6 +84,50 @@ def _word(tensor, row=1, col=0):
 
 @_GPU
 @_NEEDS_GPU
+@pytest.mark.parametrize("paired", [False, True])
+def test_first_masked_dense_solve_has_defined_retained_outputs(monkeypatch, paired):
+  """Allocator contents cannot become an inactive world's solution/status."""
+  import torch
+  from mujoco_metal.smooth_solve import MetalDenseSolve
+  original_empty = torch.empty
+
+  def poisoned_empty(*args, **kwargs):
+    tensor = original_empty(*args, **kwargs)
+    if tensor.device.type == "mps":
+      tensor.fill_(37)
+    return tensor
+
+  with monkeypatch.context() as patch:
+    patch.setattr(torch, "empty", poisoned_empty)
+    solver = MetalDenseSolve(1, 2)
+  mass = torch.ones((2, 1, 1), device="mps")
+  rhs = torch.tensor([[2.], [9.]], device="mps")
+  mask = torch.tensor([1, 0], dtype=torch.int32, device="mps")
+
+  def solve(selector):
+    if paired:
+      hi, lo, status = solver.run_pair_device(
+          mass, rhs, torch.zeros_like(rhs), world_mask=selector)
+      return hi, lo, status
+    hi, status = solver.run_device(mass, rhs, world_mask=selector)
+    return hi, None, status
+
+  hi, lo, status = solve(mask)
+  np.testing.assert_array_equal(hi.cpu().numpy(), [[2.], [0.]])
+  np.testing.assert_array_equal(status.cpu().numpy(), [0, 0])
+  if lo is not None:
+    np.testing.assert_array_equal(lo.cpu().numpy(), 0)
+  # Once produced, an inactive world's real failure status is retained,
+  # rather than cleared as a side effect of another world's recovery.
+  mass[1].fill_(-1)
+  _, _, status = solve(torch.ones_like(mask))
+  np.testing.assert_array_equal(status.cpu().numpy(), [0, 3])
+  _, _, status = solve(mask)
+  np.testing.assert_array_equal(status.cpu().numpy(), [0, 3])
+
+
+@_GPU
+@_NEEDS_GPU
 @pytest.mark.parametrize("profile", _PROFILES)
 def test_acceleration_forward_mask_preserves_inactive_and_matches_oracle(profile):
   """Masked `_acceleration` (the recovery body) keeps inactive words bitwise.

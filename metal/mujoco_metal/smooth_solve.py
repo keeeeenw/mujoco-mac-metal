@@ -78,10 +78,12 @@ class MetalDenseSolve:
     self._factor = torch.empty(
         max(batch_size * nv * nv, 1), dtype=torch.float32, device=self._device
     )
-    self._solution = torch.empty(
+    # A first solve may select only part of the batch. Unselected worlds
+    # retain these buffers, so their initial solution/status must be defined.
+    self._solution = torch.zeros(
         max(batch_size * nv * nrhs, 1), dtype=torch.float32, device=self._device
     )
-    self._solution_low = torch.empty(
+    self._solution_low = torch.zeros(
         max(batch_size * nv, 1), dtype=torch.float32, device=self._device)
     self._zero_pair_low = torch.zeros(
         max(batch_size * nv, 1), dtype=torch.float32, device=self._device)
@@ -91,7 +93,7 @@ class MetalDenseSolve:
     self._pair_dims = torch.tensor(
         [nv, batch_size, 0, 0], dtype=torch.int32, device=self._device)
     self._empty_int = torch.zeros(1, dtype=torch.int32, device=self._device)
-    self._status = torch.empty(
+    self._status = torch.zeros(
         batch_size, dtype=torch.int32, device=self._device
     )
     self._all_world_mask = torch.ones(
