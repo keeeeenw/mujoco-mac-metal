@@ -11440,6 +11440,24 @@
       "requirement": "REQ-SENS-002",
       "execution": "device_or_host_validation",
       "semantics": "Selected transactional energy publication from coherent prepared POS/VEL; independent of automatic ENERGY; no CPU physics or geometry/mass recomputation."
+    },
+    "mj_sensorPos": {
+      "path": "mujoco_metal/native_api.py:mj_sensorPos",
+      "requirement": "REQ-SENS-002",
+      "execution": "device_or_host_validation",
+      "semantics": "Selected transactional Pos sensor-address publication from a coherent prepared record; owned output; no forward redispatch, CPU physics or history insertion."
+    },
+    "mj_sensorVel": {
+      "path": "mujoco_metal/native_api.py:mj_sensorVel",
+      "requirement": "REQ-SENS-002",
+      "execution": "device_or_host_validation",
+      "semantics": "Selected transactional Vel sensor-address publication from a coherent prepared record; owned output; no forward redispatch, CPU physics or history insertion."
+    },
+    "mj_sensorAcc": {
+      "path": "mujoco_metal/native_api.py:mj_sensorAcc",
+      "requirement": "REQ-SENS-002",
+      "execution": "device_or_host_validation",
+      "semantics": "Selected transactional Acc sensor-address publication from a coherent prepared record; owned output; no forward redispatch, CPU physics or history insertion."
     }
   },
   "python_function_map": {
@@ -12396,28 +12414,28 @@
       "counterpart_kind": null
     },
     "mj_sensorAcc": {
-      "classification": "sensor_or_energy_stage",
+      "classification": "package_counterpart",
       "owner": "REQ-SENS-002",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_sensorAcc.",
-      "counterpart_kind": null
+      "execution": "native sensors from prepared device stages with host admission",
+      "counterpart": "mujoco_metal/native_api.py:mj_sensorAcc",
+      "counterpart_kind": "public_wrapper",
+      "gap": "Full sleep, extension and lifecycle-combination qualification remains open; backend record/selection signature differs from the upstream MjData API."
     },
     "mj_sensorPos": {
-      "classification": "sensor_or_energy_stage",
+      "classification": "package_counterpart",
       "owner": "REQ-SENS-002",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_sensorPos.",
-      "counterpart_kind": null
+      "execution": "native sensors from prepared device stages with host admission",
+      "counterpart": "mujoco_metal/native_api.py:mj_sensorPos",
+      "counterpart_kind": "public_wrapper",
+      "gap": "Full sleep, extension and lifecycle-combination qualification remains open; backend record/selection signature differs from the upstream MjData API."
     },
     "mj_sensorVel": {
-      "classification": "sensor_or_energy_stage",
+      "classification": "package_counterpart",
       "owner": "REQ-SENS-002",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_sensorVel.",
-      "counterpart_kind": null
+      "execution": "native sensors from prepared device stages with host admission",
+      "counterpart": "mujoco_metal/native_api.py:mj_sensorVel",
+      "counterpart_kind": "public_wrapper",
+      "gap": "Full sleep, extension and lifecycle-combination qualification remains open; backend record/selection signature differs from the upstream MjData API."
     },
     "mj_setCacheCapacity": {
       "classification": "upstream_model_or_diagnostic_utility",

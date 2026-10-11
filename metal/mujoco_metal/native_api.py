@@ -235,7 +235,7 @@ def _inverse_query_workspaces(sim):
            "_solver", "_implicit", "_implicitfast", "_effective_implicit",
            "_velocity_derivative_values", "_flex_implicit", "_sparse_flex_implicit",
            "_actuators", "_transmissions",
-           "_motor", "_sensors", "_state", "_sleep_schedule", "_contact",
+           "_motor", "_sensors", "_raw_sensor_program", "_state", "_sleep_schedule", "_contact",
            "_joint_constraints", "_touch_grid", "_cable", "_history_program",
            "_delay")
   seen, saved, memo = set(), [], {}
@@ -1758,6 +1758,24 @@ def mj_energyVel(sim, record=None, *, env_ids=None):
   """Publish owned kinetic energy from an already prepared velocity record."""
   from mujoco_metal.energy import update_energy
   return update_energy(sim, 1, record, env_ids=env_ids)
+
+
+def mj_sensorPos(sim, record=None, *, env_ids=None):
+  """Publish POS sensor addresses from prepared physics; return owned samples."""
+  from mujoco_metal.sensor_stages import publish_sensor_stage
+  return publish_sensor_stage(sim, mujoco.mjtStage.mjSTAGE_POS, record, env_ids)
+
+
+def mj_sensorVel(sim, record=None, *, env_ids=None):
+  """Publish VEL sensor addresses without recomputing position or dynamics."""
+  from mujoco_metal.sensor_stages import publish_sensor_stage
+  return publish_sensor_stage(sim, mujoco.mjtStage.mjSTAGE_VEL, record, env_ids)
+
+
+def mj_sensorAcc(sim, record=None, *, env_ids=None):
+  """Publish ACC sensor addresses from an accepted prepared constraint stage."""
+  from mujoco_metal.sensor_stages import publish_sensor_stage
+  return publish_sensor_stage(sim, mujoco.mjtStage.mjSTAGE_ACC, record, env_ids)
 
 
 def mj_copyState(src, dst, spec=StateSpec.ALL, *, src_env_ids=None, dst_env_ids=None):

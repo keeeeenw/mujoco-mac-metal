@@ -3046,7 +3046,8 @@ class MetalSimulation:
 
   def _run_state_sensors(self, qpos, qvel, poses, dynamics, out, *, program=None,
                          stages=(mujoco.mjtStage.mjSTAGE_POS, mujoco.mjtStage.mjSTAGE_VEL),
-                         position_context=None, world_mask=None):
+                         position_context=None, world_mask=None,
+                         finalize_energy=True):
     """Evaluate milestone-016 state families into ``out`` (borrowed)."""
     program = self._sensors if program is None else program
     producer_mask = world_mask
@@ -3082,7 +3083,8 @@ class MetalSimulation:
     if self._energy is not None:
       from mujoco_metal.energy import sample_sensor_energy
       sample_sensor_energy(self, program, result, qpos, qvel, dynamics,
-                           position_context, stages, world_mask)
+                           position_context, stages, world_mask,
+                           finish_forward=finalize_energy)
     return result
 
   def assembled_system(self, *, ctrl=None, qfrc_applied=None, recompute=False):
@@ -7666,7 +7668,8 @@ class MetalSimulation:
                                   mujoco.mjtStage.mjSTAGE_ACC),
                           compute_worlds=None, sleep_counts=None,
                           sleep_tree_awake=None, act_override=None,
-                          position_context=None, include_spatial=True):
+                          position_context=None, include_spatial=True,
+                          finalize_energy=True):
     """Evaluate position/velocity (+ACC, when present) stages into storage."""
     import mujoco as _mj
     torch = self._state._torch
@@ -7704,7 +7707,8 @@ class MetalSimulation:
     merged = self._run_state_sensors(qpos, qvel, poses, dynamics, out=old,
                                      program=program, stages=ordinary_stages,
                                      position_context=position_context,
-                                     world_mask=compute_worlds)
+                                     world_mask=compute_worlds,
+                                     finalize_energy=finalize_energy)
     if self._has_acc_sensors and qacc is not None and _mj.mjtStage.mjSTAGE_ACC in stages:
       # _acceleration just ran at this exact state; its cached actuator
       # rows plus the solved constraint rows feed the ACC kernel.

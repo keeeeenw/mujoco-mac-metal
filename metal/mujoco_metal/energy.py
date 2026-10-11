@@ -219,7 +219,8 @@ def prepare_forward_energy(sim, qpos, qvel, dynamics, context=None, *,
 
 
 def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
-                         context, stages, world_mask, *, history_advance=False):
+                         context, stages, world_mask, *, history_advance=False,
+                         finish_forward=True):
     """Sample canonical native energies before sensor cutoff/history.
 
     Both energy sensors belong to the pinned POS stage. Kinetic energy uses
@@ -228,7 +229,8 @@ def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
     """
     selected_stages = tuple(int(s) for s in stages)
     if int(mujoco.mjtStage.mjSTAGE_POS) not in selected_stages:
-        if not history_advance and int(mujoco.mjtStage.mjSTAGE_VEL) in selected_stages:
+        if (finish_forward and not history_advance
+            and int(mujoco.mjtStage.mjSTAGE_VEL) in selected_stages):
             finish_energy_velocity(sim, qvel, dynamics, world_mask)
         return
     torch, model = sim.state._torch, sim._mjmodel
@@ -270,7 +272,7 @@ def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
         if cutoff > 0:
             value = value.clamp(-cutoff, cutoff)
         output[:, adr] = torch.where(mask, value, output[:, adr])
-    if not history_advance:
+    if finish_forward and not history_advance:
         finish_energy_position(sim, qpos, dynamics, context, world_mask)
         if int(mujoco.mjtStage.mjSTAGE_VEL) in selected_stages:
             finish_energy_velocity(sim, qvel, dynamics, world_mask)
