@@ -1071,6 +1071,15 @@ class MetalSimulation:
         device=self._state._device,
     )
     self._rhs_low = torch.zeros_like(self._rhs)
+    # Owned scratch for compensated RHS accumulation (see _rhs_accumulate):
+    # eight b*nv float32 buffers plus one b-row bool selector, grown only on
+    # demand. Every TwoSum intermediate lands here via out= writes, so
+    # accumulation performs no batch-sized hidden allocations. Admitted
+    # footprint: 8*count float32 words + count//nv bool words.
+    self._twosum_float = None
+    self._twosum_float_count = 0
+    self._twosum_mask = None
+    self._twosum_mask_rows = 0
     self._forward_stage_zero_constraint = torch.zeros_like(self._rhs)
     self._forward_stage_passive_force = torch.empty_like(self._rhs)
     self._forward_stage_actuator_force = torch.empty_like(self._rhs)
@@ -4769,21 +4778,75 @@ class MetalSimulation:
     float32 operands up to the precision of ``lo``'s own accumulation. This
     compensates accumulation only; each force producer keeps its own
     precision contract. ``mask`` is a per-world nonzero selector.
+
+    Every intermediate lands in owned `_twosum_*` scratch via out= writes;
+    no batch-sized temporary is allocated. Unselected worlds keep their exact
+    input words (including signed zeros): the masked publish copies the
+    computed-or-retained words instead of adding positive zero.
+    Inputs are validated before any write; failures leave ``hi``/``lo``
+    untouched.
     """
     torch = self._state._torch
+    device = self._state._device
+    for name, tensor in (("hi", hi), ("lo", lo), ("value", value)):
+      if (not isinstance(tensor, torch.Tensor)
+          or tensor.dtype != torch.float32
+          or tensor.device.type != device.type
+          or (device.index is not None
+              and tensor.device.index != device.index)
+          or not tensor.is_contiguous()):
+        raise ValueError(
+            f"rhs accumulation {name} must be a contiguous float32 tensor "
+            f"on {device}")
+    if tuple(hi.shape) != tuple(lo.shape) or value.numel() != hi.numel():
+      raise ValueError(
+          "rhs accumulation hi/lo shapes must agree and value must match")
+    count = int(hi.numel())
+    rows = int(hi.shape[0]) if hi.dim() > 0 else 0
+    if mask is not None:
+      if (not isinstance(mask, torch.Tensor) or mask.device.type != device.type
+          or (device.index is not None
+              and mask.device.index != device.index)
+          or not mask.is_contiguous()
+          or int(mask.numel()) != rows):
+        raise ValueError(
+            "rhs accumulation mask must be a contiguous tensor on "
+            f"{device} with one entry per world")
+    pool = self._twosum_float
+    if pool is None or self._twosum_float_count < count:
+      pool = torch.zeros((8, max(count, 1)), dtype=torch.float32,
+                         device=device)
+      self._twosum_float = pool
+      self._twosum_float_count = max(count, 1)
+    bufs = [pool[i, :count].reshape(hi.shape) for i in range(8)]
+    (s_buf, bb_buf, t_buf, u_buf, w_buf, err_buf, tmp_buf,
+     neg_buf) = bufs
     v = value.reshape(hi.shape)
     if sign < 0:
-      v = torch.neg(v)
-    s = torch.add(hi, v)
-    bb = torch.sub(s, hi)
-    err = torch.add(torch.sub(hi, torch.sub(s, bb)), torch.sub(v, bb))
+      torch.neg(v, out=neg_buf)
+      v = neg_buf
+    torch.add(hi, v, out=s_buf)
+    torch.sub(s_buf, hi, out=bb_buf)
+    torch.sub(s_buf, bb_buf, out=t_buf)
+    torch.sub(hi, t_buf, out=u_buf)
+    torch.sub(v, bb_buf, out=w_buf)
+    torch.add(u_buf, w_buf, out=err_buf)
     if mask is None:
-      hi.copy_(s)
-      lo.add_(err)
-    else:
-      m = (mask != 0).reshape(-1, 1)
-      hi.copy_(torch.where(m, s, hi))
-      lo.add_(torch.where(m, err, torch.zeros_like(err)))
+      hi.copy_(s_buf)
+      lo.add_(err_buf)
+      return
+    sel = self._twosum_mask
+    if sel is None or self._twosum_mask_rows < rows:
+      sel = torch.zeros((max(rows, 1), 1), dtype=torch.bool, device=device)
+      self._twosum_mask = sel
+      self._twosum_mask_rows = max(rows, 1)
+    sel = sel[:rows].reshape(-1, 1)
+    torch.ne(mask.reshape(-1, 1), 0, out=sel)
+    torch.where(sel, s_buf, hi, out=tmp_buf)
+    hi.copy_(tmp_buf)
+    torch.add(lo, err_buf, out=tmp_buf)
+    torch.where(sel, tmp_buf, lo, out=err_buf)
+    lo.copy_(err_buf)
 
   def prepare_forward_acceleration(self, record, *, qfrc_applied=None):
     """Solve unconstrained acceleration from already published force stages."""
