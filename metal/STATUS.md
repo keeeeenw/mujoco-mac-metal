@@ -26,7 +26,7 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
-The latest local development host selection passed **2,442 tests, 99 skipped**;
+The latest local development host selection at `ed74d3fa0` passed **2,460 tests, 99 skipped**;
 it does not qualify the skipped native cases. The historical host publication
 check passed **2,163 tests, 1,615 skipped** at its separately recorded revision;
 see [producing revisions and scope](QUALIFICATION.md).
@@ -86,6 +86,10 @@ forces, four-step trajectories and exact replay. No bounds or budgets changed.
 Separately, a
 34-case active simplex work/energy/stability gate at `15787fa29` covers two
 stiffnesses, two timesteps and all four integrators with deformed free carriers.
+Articulated COM publication and stable nonzero material damping corrections at
+`abf0bde7c`/`ed74d3fa0` pass 16 native damping cases and 27 native
+COM/spatial/recovery/invariant regressions. Original force, derivative,
+trajectory and replay bounds remain unchanged.
 These are source-specific results; full heightfield/deformable composition,
 final wheel/demo checks and milestones 005–020 remain open.
 

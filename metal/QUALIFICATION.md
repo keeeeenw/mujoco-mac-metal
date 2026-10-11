@@ -1,5 +1,29 @@
 # Development qualification — 2026-10-11
 
+## Articulated COM and nonzero elastic damping — 2026-10-11
+
+Revision `abf0bde7c` publishes each articulated root's center of mass into its
+awake descendants' slots, matching the point-velocity consumer's body indexing.
+Previously those descendant slots were zero, producing false edge extension
+under rigid motion. Revision `ed74d3fa0` evaluates the pinned squared-length
+Rayleigh term as `damping * rate * (2 * length - timestep * rate)`, avoiding
+cancellation without changing the material law, derivative or solver budget.
+
+At that combined source, **16 native cases passed in 94.16 seconds**: 2D/3D
+simplexes, damping 0.1/0.4 and all four integrators. These compare nonzero passive
+forces, dissipative work, independent velocity derivatives, four-step states
+and exact checkpoint replay with the pinned CPU oracle. CPU physics calls are
+forbidden during native evaluation. A separate dense/sparse COM, prepared
+POS/VEL, spatial-query, sleep, selected reset, recovery and invariant group
+passed **27 native tests in 16.68 seconds**. No bounds were relaxed.
+
+The complete CPU selection at `ed74d3fa0` passed **2,460 tests, 99 skipped,
+2,379 deselected in 99.93 seconds**, with MPS availability hidden. This does not
+qualify skipped GPU cases. The earlier 90-case material/integrator/equality
+matrix belongs to `88aed2063`; its current-source rerun, broader compositions,
+long-horizon behavior, demos and final wheel remain required. These results
+are scoped correctness evidence, not full milestone closure or a speed claim.
+
 ## Retained velocity in inertial bias — 2026-10-11
 
 Revision `ff659a24e` feeds the simulator's represented high/low/tail velocity

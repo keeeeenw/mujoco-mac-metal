@@ -704,7 +704,9 @@ REQUIREMENTS = (
          "test_flex_implicit_simulation.py", "test_flex_material_parity.py",
          "test_flex_integrator_lifecycle.py",
          "test_active_material_invariants_018.py",
-         "test_active_material_energy_018.py"),
+         "test_active_material_energy_018.py",
+         "test_active_material_damping_018.py",
+         "test_flex_root_com_velocity_018.py"),
     ),
     Requirement(
         "REQ-FLEX-002", "flex rigid, self and cross-flex collision",
