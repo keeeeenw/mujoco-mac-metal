@@ -61,6 +61,55 @@ Full API and milestone acceptance still require the execution inventory,
 remaining feature combinations, final wheel and demo gates. The two terrain
 trajectory failures below remain open. No new performance result is claimed.
 
+## Derivative residuals and active elastic materials — 2026-10-11
+
+Revision `88aed2063` retains the low word of the inverse mass-product term
+when forming finite-difference force derivatives. The complete native derivative
+file, a new nonbinary-inertia public inverse-derivative regression, and affected
+CPU algorithm/inverse contracts passed **82 tests in 56.49 seconds**. This is
+a mixed host/native group. The new native case compares two nonzero acceleration
+worlds with the independent pinned CPU derivative and requires exact query
+rollback; helpers alone are not its physics evidence.
+
+The five-file original material/integrator/equality native group at that revision
+passed **90 tests, 107 deselected in 2,435.07 seconds**, with no failures or
+skips. It includes all four integrators, two timesteps, Q1/Q2 volume and shell
+materials, and dense/sparse flex equalities. The stiff larger-step Q2 RK4 fixture
+checks pinned warning/reset behavior; it is not stable-integration evidence.
+
+Stronger active-material checks then exposed false elastic forces after rigid
+transformation: **three failed and one passed**. Revision `15787fa29` preserves
+retained vertex and compiled rest-length residuals in stretch forces and uses
+the same geometry for their analytic tangents. All **four physical invariant
+cases passed in 7.29 seconds**; the affected material, baseline flex, memory
+accounting and invariant group passed **90 tests in 39.16 seconds**. That second
+90-test result combines host and native execution and is distinct from the
+earlier all-native group.
+
+The new fixtures exercise active 2D/3D elasticity at two stiffnesses,
+undeformed/deformed and translated/rotated worlds, nonzero free-carrier reactions,
+linear/angular momentum balance and exact replay. The rest-length residual
+planes and conservative temporary geometry bound are included in capacity
+accounting, with a test of actual allocated storage. These results do not close
+the full deformable geometry, contact, energy and stability scope.
+
+The added `test_active_material_energy_018.py` passed **34 checks in 236.36
+seconds** with the same production source: two independent CPU generalized-work
+gradient cases and 32 native trajectories. The matrix spans triangular/tetrahedral
+materials, stiffnesses 1,000/4,000, timesteps 20/200 microseconds and all four
+integrators, with deformed free carriers in two frames and exact replay.
+Over six steps, maximum relative total-energy drift was **0.09235%** in both
+engines; maximum native/CPU energy disagreement relative to initial energy was
+**5.01e-10**. These are short-window correctness/stability measurements, not
+long-horizon stability or performance results. Elastic plus kinetic energy is
+evaluated by an independent test oracle from the represented native state;
+this does not add elasticity to upstream's potential-energy sensor contract.
+No native simulation path receives oracle forces, states or energy values.
+
+The two unchanged alternate-CCD box terrain cases were repeated at `15787fa29`:
+**both failed, 48 tests deselected in 52.10 seconds**, with the same maximum
+acceleration violation of `2.81290692`. They remain correction gates.
+
 ## Complete primitive-terrain matrix — 2026-10-11
 
 The unchanged 40-case native terrain matrix at producing revision

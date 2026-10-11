@@ -61,6 +61,16 @@ sphere-contact fixture passes assembled contacts, nonzero passive forces,
 four-step force/state comparisons, exact checkpoint replay and reset. Other
 interpolation/geometry variants and wider deformable combinations remain open.
 
+An additional inverse-derivative correction retains mass-product residuals:
+82 affected host/native checks pass at `88aed2063`, including a nonbinary-inertia
+CPU-oracle derivative and exact rollback. The original material/integrator/
+equality native group passes 90 cases at that revision. Active elastic
+rigid-motion, stiffness-scaling, carrier-reaction and momentum-balance tests
+subsequently exposed retained-geometry errors; `15787fa29` fixes them and passes
+four new physical cases plus 90 affected host/native regressions. The full
+deformable contact, energy and stability qualification remains open, as do the
+two original alternate-CCD box terrain trajectories.
+
 These results cover preserved source compositions, not the entire current
 checkout. See [publication qualification](QUALIFICATION.md) and [milestone status](STATUS.md). Native warning/autoreset semantics, final native
 regression, complete installed-wheel qualification, and demo visual checks remain

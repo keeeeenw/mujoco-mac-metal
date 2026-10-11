@@ -67,6 +67,15 @@ three-world inverse-force fixture and exact query rollback.
 The later force/recovery fixes passed 39 and 58 affected checks; these combine
 host contracts with real native physics and lifecycle execution.
 
+Additional inverse-derivative residual correction passes 82 affected host/native
+checks at `88aed2063`. The original material/integrator/equality native group
+passes 90 cases at that revision. Stronger active 2D/3D elastic invariants exposed
+false forces after rigid transformation; `15787fa29` corrects their retained
+geometry, passing all four new physical cases and 90 affected host/native checks.
+These demonstrate nonzero carrier reaction, momentum balance and replay, not
+complete deformable coverage. Both alternate-CCD box terrain cases still fail
+at that source with their original trajectory bounds.
+
 The original rigid-SDF deadline and mesh/bowl/torus failures are historical
 evidence. The seven original bundled rigid-SDF fixtures now pass in the
 117-test group, including strict five-provider force/trajectory/replay,
