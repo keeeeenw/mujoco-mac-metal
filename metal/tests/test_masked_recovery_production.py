@@ -43,14 +43,38 @@ def _model(profile="integrated_euler_v1"):
     <actuator><motor joint="j"/></actuator></mujoco>""")
 
 
-def _tendon_model():
-  return mujoco.MjModel.from_xml_string("""<mujoco>
+def _tendon_model(stiffness=50.0, damping=2.0):
+  return mujoco.MjModel.from_xml_string(f"""<mujoco>
     <option gravity="0 0 0" timestep="0.001"><flag contact="disable"/></option>
     <worldbody><body pos="0 0 1">
       <joint name="j" type="slide" axis="1 0 0"/>
       <geom type="sphere" size=".1" mass="1"/></body></worldbody>
-    <tendon><fixed name="t"><joint joint="j" coef="1"/></fixed></tendon>
+    <tendon><fixed name="t" stiffness="{stiffness}" damping="{damping}">
+      <joint joint="j" coef="1"/></fixed></tendon>
     <actuator><motor joint="j"/></actuator></mujoco>""")
+
+
+def _spatial_tendon_model():
+  return mujoco.MjModel.from_xml_string("""<mujoco>
+    <option gravity="0 0 0" timestep="0.001"><flag contact="disable"/></option>
+    <worldbody>
+      <body pos="0 0 0"><joint name="j" type="slide" axis="1 0 0"/>
+        <geom type="sphere" size=".1" mass="1"/>
+        <site name="s0" pos="0.3 0 0"/></body>
+      <site name="anchor" pos="1 0 0"/>
+    </worldbody>
+    <tendon><spatial name="t" stiffness="30">
+      <site site="s0"/><site site="anchor"/></spatial></tendon>
+    <actuator><motor joint="j"/></actuator></mujoco>""")
+
+
+def _fluid_model():
+  return mujoco.MjModel.from_xml_string("""<mujoco>
+    <option gravity="0 0 0" timestep="0.001" density="1.2" integrator="implicit"><flag contact="disable"/></option>
+    <worldbody><body pos="0 0 1">
+      <joint name="j" type="slide" axis="1 0 0"/>
+      <geom type="ellipsoid" size=".3 .2 .2" mass="1"/></body></worldbody>
+    </mujoco>""")
 
 
 def _word(tensor, row=1, col=0):
@@ -103,14 +127,28 @@ def test_acceleration_forward_mask_preserves_inactive_and_matches_oracle(profile
 @pytest.mark.parametrize("profile", ["integrated_euler_v1",
                                      "integrated_scalable_v1"])
 def test_tendon_force_flows_through_masked_accumulation(profile):
-  """Tendon forces accumulate under a recovery mask without cross-talk."""
+  """A sprung fixed tendon contributes nonzero force under a recovery mask.
+
+  The tendon spring (stiffness 50, displaced 0.4) carries -20 passive force
+  against the +0.5 motor force. The pinned ten_length/qfrc guards prove the
+  term is live; the motor-only negative control proves the comparison is
+  sensitive to it (its qacc differs by ~20).
+  """
   import torch
   from mujoco_metal.simulation import MetalSimulation
   model = _tendon_model()
   sim = MetalSimulation(model, 2, profile=profile)
   device = sim._state._device
-  sim.reset(qpos=np.array([[0.4], [0.4]], dtype=np.float32))
+  sim.reset(qpos=np.array([[0.4], [0.4]], dtype=np.float32),
+            qvel=np.array([[0.1], [0.1]], dtype=np.float32))
   sim._prepare_control(torch.tensor([[0.5], [0.5]], device=device))
+  cpu = mujoco.MjData(model)
+  cpu.qpos[:] = [0.4]
+  cpu.qvel[:] = [0.1]
+  cpu.ctrl[:] = [0.5]
+  mujoco.mj_forward(model, cpu)
+  assert abs(float(cpu.ten_length[0])) > 1e-6
+  assert abs(float(cpu.qfrc_passive[0])) > 1.0
   sim._rhs[1, 0] = -1.75
   sim._rhs_low.view(torch.int32)[1, 0] = -2147483648
   mask = torch.tensor([True, False], dtype=torch.bool, device=device)
@@ -121,11 +159,72 @@ def test_tendon_force_flows_through_masked_accumulation(profile):
   assert _word(sim._rhs) == int(np.frombuffer(
       np.array([-1.75], dtype=np.float32).tobytes(), dtype=np.uint32)[0])
   assert _word(sim._rhs_low) == 0x80000000
+  mujoco.mj_step(model, cpu)
+  np.testing.assert_allclose(
+      acc.cpu().numpy()[0], np.asarray(cpu.qacc), rtol=1e-5, atol=1e-7)
+  # Negative control: the same geometry without the tendon is motor-only;
+  # its oracle differs by the tendon term, so a dropped term cannot pass.
+  bare = mujoco.MjModel.from_xml_string("""<mujoco>
+    <option gravity="0 0 0" timestep="0.001"><flag contact="disable"/></option>
+    <worldbody><body pos="0 0 1">
+      <joint name="j" type="slide" axis="1 0 0"/>
+      <geom type="sphere" size=".1" mass="1"/></body></worldbody>
+    <actuator><motor joint="j"/></actuator></mujoco>""")
+  plain = mujoco.MjData(bare)
+  plain.qpos[:] = [0.4]
+  plain.qvel[:] = [0.1]
+  plain.ctrl[:] = [0.5]
+  mujoco.mj_step(bare, plain)
+  assert abs(float(cpu.qacc[0] - plain.qacc[0])) > 1.0
+  sim_bare = MetalSimulation(bare, 1, profile=profile)
+  sim_bare.reset(qpos=np.array([[0.4]], dtype=np.float32),
+                 qvel=np.array([[0.1]], dtype=np.float32))
+  sim_bare._prepare_control(torch.tensor([[0.5]], device=device))
+  acc_bare, _, _ = sim_bare._acceleration(
+      sim_bare.state._qpos.detach().clone(),
+      sim_bare.state._qvel.detach().clone())
+  np.testing.assert_allclose(
+      acc_bare.cpu().numpy()[0], np.asarray(plain.qacc),
+      rtol=1e-5, atol=1e-7)
+
+
+@_GPU
+@_NEEDS_GPU
+@pytest.mark.parametrize("kind", ["spatial", "fluid"])
+def test_spatial_tendon_and_fluid_flow_through_masked_accumulation(kind):
+  """Spatial-tendon and fluid forces are nonzero and survive masking."""
+  import torch
+  from mujoco_metal.simulation import MetalSimulation
+  if kind == "spatial":
+    model = _spatial_tendon_model()
+    profile, qp, qv = "integrated_euler_v1", [[0.2], [0.2]], [[0.0], [0.0]]
+  else:
+    model = _fluid_model()
+    profile, qp, qv = "integrated_implicit_v1", [[0.0], [0.0]], [[2.0], [2.0]]
+  sim = MetalSimulation(model, 2, profile=profile)
+  device = sim._state._device
+  sim.reset(qpos=np.array(qp, dtype=np.float32),
+            qvel=np.array(qv, dtype=np.float32))
   cpu = mujoco.MjData(model)
-  cpu.qpos[:] = [0.4]
-  cpu.qvel[:] = [0]
-  cpu.ctrl[:] = [0.5]
+  cpu.qpos[:] = qp[0]
+  cpu.qvel[:] = qv[0]
   mujoco.mj_forward(model, cpu)
+  if kind == "spatial":
+    assert abs(float(cpu.ten_length[0])) > 1e-6
+    assert abs(float(cpu.qfrc_passive[0])) > 1e-6
+  else:
+    assert abs(float(cpu.qfrc_fluid[0])) > 1e-6
+  sim._rhs[1, 0] = 2.5
+  sim._rhs_low.view(torch.int32)[1, 0] = -2147483648
+  mask = torch.tensor([True, False], dtype=torch.bool, device=device)
+  acc, status, _ = sim._acceleration(
+      sim.state._qpos.detach().clone(), sim.state._qvel.detach().clone(),
+      forward_mask=mask)
+  assert status.cpu().numpy().tolist() == [0, 0]
+  assert _word(sim._rhs) == int(np.frombuffer(
+      np.array([2.5], dtype=np.float32).tobytes(), dtype=np.uint32)[0])
+  assert _word(sim._rhs_low) == 0x80000000
+  mujoco.mj_step(model, cpu)
   np.testing.assert_allclose(
       acc.cpu().numpy()[0], np.asarray(cpu.qacc), rtol=1e-5, atol=1e-7)
 
@@ -133,7 +232,8 @@ def test_tendon_force_flows_through_masked_accumulation(profile):
 @_GPU
 @_NEEDS_GPU
 @pytest.mark.parametrize("profile", ["integrated_euler_v1",
-                                     "integrated_scalable_v1"])
+                                     "integrated_scalable_v1",
+                                     "integrated_rk4_v1"])
 def test_split_stage_masked_reset_recovery_matches_oracle_and_replays(profile):
   """In-flight record + autorecovery `reset_mask` runs the masked split path.
 
