@@ -86,6 +86,36 @@ def test_missing_mutation_counters_allow_fresh_pos_but_reject_cached_reuse():
     stages.consume(record, Stage.POS, generation=0)
 
 
+@pytest.mark.parametrize('name,attr', [('qpos', '_qpos'), ('qvel', '_qvel'),
+    ('mocap_pos', '_mpos'), ('mocap_quat', '_mquat')])
+def test_real_owner_storage_replacement_rejects_captured_state_alias(name, attr):
+  from types import SimpleNamespace
+  torch = pytest.importorskip('torch')
+  state = SimpleNamespace(**{key: torch.zeros(1, 2) for key in
+                            ('_qpos', '_qvel', '_mpos', '_mquat')})
+  stages = ForwardStageCoordinator(SimpleNamespace(_state=state))
+  record = stages.begin(generation=0, qpos=state._qpos,
+      mocap_pos=state._mpos, mocap_quat=state._mquat, position={'poses': object()})
+  stages.publish(record, Stage.VEL, {'qvel': state._qvel})
+  setattr(state, attr, getattr(state, attr).clone())
+  with pytest.raises(ValueError, match='simulation storage was replaced'):
+    stages.consume(record, Stage.VEL, generation=0)
+
+
+def test_external_prepared_inputs_do_not_bind_unrelated_owner_storage():
+  from types import SimpleNamespace
+  torch = pytest.importorskip('torch')
+  state = SimpleNamespace(_qpos=torch.zeros(1, 2), _qvel=torch.zeros(1, 2))
+  stages = ForwardStageCoordinator(SimpleNamespace(_state=state))
+  external_q = torch.ones(1, 2)
+  external_v = torch.ones(1, 2)
+  record = stages.begin(generation=0, qpos=external_q, position={'poses': object()})
+  stages.publish(record, Stage.VEL, {'qvel': external_v})
+  state._qpos = state._qpos.clone()
+  state._qvel = state._qvel.clone()
+  assert stages.consume(record, Stage.VEL, generation=0)['qvel'] is external_v
+
+
 def test_real_torch_mutation_and_inference_tensor_counters():
   torch = pytest.importorskip('torch')
   stages = ForwardStageCoordinator(object())

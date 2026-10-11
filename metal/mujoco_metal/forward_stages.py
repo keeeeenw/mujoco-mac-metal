@@ -34,6 +34,7 @@ class ForwardStageRecord:
   mocap_quat: object
   input_tensors: dict = field(default_factory=dict)
   input_versions: dict = field(default_factory=dict)
+  state_bindings: dict = field(default_factory=dict)
   row_epochs: object = None
   row_valid: object = None
   stage: ForwardStage = ForwardStage.NONE
@@ -138,12 +139,23 @@ class ForwardStageCoordinator:
       raise ValueError("cannot bind an input to a stale forward-stage record")
     record.input_tensors[name] = value
     record.input_versions[name] = self._version(value)
+    attr = {"qpos": "_qpos", "qvel": "_qvel",
+            "mocap_pos": "_mpos", "mocap_quat": "_mquat"}.get(name)
+    state = getattr(self._owner, "_state", None)
+    if attr is not None and state is not None and getattr(state, attr, None) is value:
+      record.state_bindings[name] = attr
+    else:
+      record.state_bindings.pop(name, None)
 
   def validate_input(self, record, name, value=None):
     """Reject replacement or in-place mutation of cached stage inputs."""
     captured = record.input_tensors.get(name)
     if captured is None:
       raise ValueError(f"forward-stage input {name} was not captured")
+    binding = record.state_bindings.get(name)
+    if binding is not None and getattr(
+        getattr(self._owner, "_state", None), binding, None) is not captured:
+      raise ValueError(f"cached {name} simulation storage was replaced")
     if name in ("qpos", "mocap_pos", "mocap_quat"):
       if getattr(record, name) is not captured:
         raise ValueError(f"cached {name} input identity was replaced")
@@ -213,6 +225,7 @@ class ForwardStageCoordinator:
       if qvel is None:
         current.input_tensors.pop("qvel", None)
         current.input_versions.pop("qvel", None)
+        current.state_bindings.pop("qvel", None)
       else:
         self.capture_input(current, "qvel", qvel)
     for later in tuple(current.values):
