@@ -39,6 +39,73 @@ except ImportError:
 
 
 # -------------------------------------------------------------------------
+# Host model-only utilities (no state-dependent physics)
+# -------------------------------------------------------------------------
+
+def mj_maxContact(model, geom1, geom2, has_margin=-1):
+  """Pinned per-pair model-only contact bound; no collision is dispatched.
+
+  ``model`` is an upstream compiled ``MjModel``. Geometry IDs must be valid
+  integers. A negative ``has_margin`` selects the model's margin precedence;
+  zero selects no margin and any positive integer selects a margin. This
+  mirrors MuJoCo 3.10.0 ``mj_maxContact`` rather than the backend's conservative
+  batch-workspace allocation. It neither accesses simulation state nor proves
+  that a particular collider or complete model is qualified on Metal.
+  """
+  import numbers
+
+  if not isinstance(model, mujoco.MjModel):
+    raise TypeError("model must be a compiled mujoco.MjModel")
+  values = []
+  for name, value in (("geom1", geom1), ("geom2", geom2),
+                      ("has_margin", has_margin)):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
+      raise ValueError(f"{name} must be an integer, not a boolean")
+    if not -(1 << 31) <= int(value) < (1 << 31):
+      raise ValueError(f"{name} must fit in int32")
+    values.append(int(value))
+  g1, g2, margin = values
+  if not (0 <= g1 < model.ngeom and 0 <= g2 < model.ngeom):
+    raise ValueError("geometry IDs must be in [0, model.ngeom)")
+  t1, t2 = int(model.geom_type[g1]), int(model.geom_type[g2])
+  geom = mujoco.mjtGeom
+  if geom.mjGEOM_SDF in (t1, t2):
+    return int(model.opt.sdf_initpoints)
+  if geom.mjGEOM_HFIELD in (t1, t2):
+    other = t2 if t1 == geom.mjGEOM_HFIELD else t1
+    return 0 if other in (geom.mjGEOM_PLANE, geom.mjGEOM_HFIELD) else 50
+  if geom.mjGEOM_SPHERE in (t1, t2) or geom.mjGEOM_ELLIPSOID in (t1, t2):
+    return 1
+  if t1 == t2 == geom.mjGEOM_BOX:
+    return 8
+  if t1 == t2 == geom.mjGEOM_CAPSULE:
+    return 2
+  if {t1, t2} == {geom.mjGEOM_CAPSULE, geom.mjGEOM_BOX}:
+    return 4
+  if geom.mjGEOM_PLANE in (t1, t2):
+    other = t2 if t1 == geom.mjGEOM_PLANE else t1
+    return {geom.mjGEOM_CAPSULE: 2, geom.mjGEOM_CYLINDER: 4,
+            geom.mjGEOM_BOX: 4, geom.mjGEOM_MESH: 3}.get(other, 0)
+  disabled = int(model.opt.disableflags)
+  if disabled & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD):
+    return 1
+  if geom.mjGEOM_CAPSULE in (t1, t2) or geom.mjGEOM_CYLINDER in (t1, t2):
+    return 5
+  if disabled & int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD):
+    return 5
+  if margin < 0:
+    if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_OVERRIDE):
+      margin = int(model.opt.o_margin > 0)
+    else:
+      pair = next((i for i in range(model.npair)
+                   if (int(model.pair_geom1[i]), int(model.pair_geom2[i]))
+                   in ((g1, g2), (g2, g1))), None)
+      margin = (int(model.pair_margin[pair] > 0) if pair is not None
+                else int(model.geom_margin[g1] > 0 or model.geom_margin[g2] > 0))
+  return 5 if margin else 4
+
+
+# -------------------------------------------------------------------------
 # Native MPS Math Utilities
 # -------------------------------------------------------------------------
 

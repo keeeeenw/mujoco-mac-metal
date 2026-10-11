@@ -313,6 +313,17 @@ query boundary. These copies are not added to ordinary stepping. Returned
 systems describe a new current-state forward evaluation, not the previous
 accepted integration step; use `sim.accepted_step` for that stored result.
 
+`api.mj_maxContact(model, geom1, geom2, has_margin=-1)` is a host model-only
+utility for an upstream compiled `mujoco.MjModel`. It implements the pinned
+3.10.0 per-pair contact-count bound without accessing simulation state or
+dispatching collision/physics. Both geometry IDs must be in range; IDs and
+`has_margin` accept signed int32 integers and reject booleans. Negative margins
+select model precedence (global override, explicit pair, then geom margins);
+zero selects no margin and positive values select a margin. All pinned geometry
+types, both pair orders, multiccd/nativeccd flags and SDF seed counts are
+included. This allocation query is distinct from the backend's manifold-specific
+`pair_max_contacts` and total batch capacity, and does not qualify a collider.
+
 Development split stepping is available as `api.mj_step1(sim)` followed by
 `api.mj_step2(sim, ctrl=controls)`. Step1 evaluates POS/VEL, their sensors and
 enabled energy diagnostics; step2 evaluates ACT/ACC/constraints and advances

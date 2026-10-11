@@ -11416,6 +11416,12 @@
       "requirement": "REQ-STATE-006",
       "execution": "device_or_host_validation",
       "semantics": "owned_history_read_or_atomic_selected_initialization"
+    },
+    "mj_maxContact": {
+      "path": "mujoco_metal/native_api.py:mj_maxContact",
+      "requirement": "REQ-GEO-001",
+      "execution": "host_model_metadata",
+      "semantics": "Pinned MuJoCo 3.10.0 per-geom-pair bound; no runtime collision, state access or GPU dispatch."
     }
   },
   "python_function_map": {
@@ -12100,12 +12106,12 @@
       "gap": "prepared mass construction; no direct upstream API alias"
     },
     "mj_maxContact": {
-      "classification": "collision_or_raycast_stage",
+      "classification": "public_host_metadata_wrapper",
       "owner": "REQ-GEO-001",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_maxContact.",
-      "counterpart_kind": null
+      "execution": "host model-only metadata arithmetic; no CPU or GPU physics",
+      "counterpart": "mujoco_metal/native_api.py:mj_maxContact",
+      "counterpart_kind": "public_wrapper",
+      "gap": null
     },
     "mj_mulJacTVec": {
       "classification": "package_counterpart",

@@ -83,7 +83,7 @@ def test_pinned_runtime_fields_and_api_surface_match_without_support_claims():
   assert surface["feature_mapping_complete"] is False
   assert surface["python_class_count"] == 69
   assert surface["option_field_count"] == 29
-  assert surface["package_entrypoint_count"] == 72
+  assert surface["package_entrypoint_count"] == 73
   assert surface["function_mapping_count"] == 317
   assert surface["function_mapping_complete"] is False
   assert package_entrypoint_drift() == ()
