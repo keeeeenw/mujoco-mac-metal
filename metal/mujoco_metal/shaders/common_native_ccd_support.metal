@@ -205,10 +205,10 @@ static inline CommonCCDSupportResult common_ccd_support(
     }
   } else if (object.kind==COMMON_CCD_CYLINDER) {
 #if COMMON_CCD_USE_LIBCCD
-    // mjccd_support cylinder adapter order: separate squares, sqrt, strict
-    // mjMINVAL test on the root, (local/tmp)*size order, mju_sign axial.
-    FlexDD cyl_n2=flex_dd_source_add(
-        flex_dd_source_mul(local_direction.x,local_direction.x),
+    // mjccd_support cylinder adapter order: fused squares (measured: the
+    // installed binary contracts dx*dx+dy*dy), sqrt, strict mjMINVAL test
+    // on the root, (local/tmp)*size order, mju_sign axial.
+    FlexDD cyl_n2=flex_dd_source_fma(local_direction.x,local_direction.x,
         flex_dd_source_mul(local_direction.y,local_direction.y));
     FlexDD cyl_tmp=flex_dd_source_sqrt(cyl_n2);
     FlexDD cyl_minval=FlexDD{1.0000000036274937e-15f,-3.627493647833322e-24f,0.0f};
