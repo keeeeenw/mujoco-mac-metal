@@ -1,5 +1,25 @@
 # Development qualification — 2026-10-11
 
+## Split-step integration with solved constraints
+
+Split-step integration now includes the solved constraint force in its total
+force RHS, after prepared acceleration sensors and forward/inverse diagnostics
+consume their stage results. The complete affected split-stage, inverse,
+observational-query and component-mocap selection passes **25 native tests,
+26 deselected in 11.75 seconds**, with CPU fallback disabled.
+
+Six new cases compare three consecutive split updates and exact checkpoint
+replay against pinned MuJoCo, with active contact, connect equality, moving
+mocap, delayed controls/sensors and retained state. Euler, implicit and
+implicitfast cover dense and sparse Jacobian settings; both implicit profiles
+use component mass independently of Jacobian layout. Original `rtol=4e-5`,
+`atol=6e-6` physics bounds and exact replay remain unchanged. Before correction,
+Euler passed while both sparse implicit cases exposed missing constraint force
+in integration despite correct forward acceleration. The initial dense-Jacobian
+implicit fixtures also contained an incorrect mass-layout assumption, corrected
+separately. This qualifies the defect and affected selection, not a complete
+milestone or whole-suite pass.
+
 ## Component assembly with mocap
 
 Component assembly now passes prepared poses to smooth dynamics without

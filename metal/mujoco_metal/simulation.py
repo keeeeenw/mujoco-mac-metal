@@ -7241,6 +7241,11 @@ class MetalSimulation:
             self._solver_fwdinv.copy_(self.compare_forward_inverse(
                 record, {"record": record, "constraint": constraint,
                          "actuation": record.values[ForwardStage.ACT]}))
+          # Like the ordinary acceleration path, implicit integration uses
+          # smooth + solved constraint force. Keep the prepared forward ACC
+          # result unchanged until sensors and fwd/inv comparison consume it;
+          # only this integration boundary turns the RHS into total force.
+          self._rhs.add_(constraint["qfrc_constraint"])
           pending_step1 = None
           self._step1_record = None
         scheduler = getattr(self, "_sleep_schedule", None)
