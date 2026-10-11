@@ -533,3 +533,91 @@ def test_explicit_energy_retains_static_gravity_and_filters_real_sleeping_spring
     _native_only(guard, lambda: mj_energyVel(sim, record))
   np.testing.assert_allclose(_host(sim.energy), [d.energy for d in refs],
                              rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize('integrator,profile', _METHODS)
+@pytest.mark.parametrize('enabled', [False, True])
+def test_static_energy_sensors_and_storage_match_zero_dof_source(
+    integrator, profile, enabled, monkeypatch):
+  from mujoco_metal import MetalSimulation
+  from mujoco_metal.native_api import mj_forward
+  model = mujoco.MjModel.from_xml_string(f'''<mujoco>
+    <option integrator="{integrator}"><flag energy="{'enable' if enabled else 'disable'}"/></option>
+    <worldbody><body pos="0 0 1"><geom type="sphere" size=".1" mass="2"/></body>
+    </worldbody><sensor><e_potential/><e_kinetic/></sensor></mujoco>''')
+  ref = mujoco.MjData(model)
+  mujoco.mj_forward(model, ref)
+  assert model.nv == 0 and ref.energy[0] > 10 and ref.energy[1] == 0
+  sim = MetalSimulation(model, 3, profile=profile)
+  _native_only(monkeypatch, lambda: mj_forward(sim))
+  np.testing.assert_allclose(sim.step_sensordata(), np.tile(ref.sensordata, (3, 1)),
+                             rtol=2e-5, atol=2e-6)
+  np.testing.assert_allclose(_host(sim.energy), np.tile(ref.energy, (3, 1)),
+                             rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize('input_name', ['qpos', 'qvel'])
+def test_native_energy_reuse_without_mutation_counter_rejects_before_allocation(
+    input_name, monkeypatch):
+  import torch
+  _, sim, _ = _fixture()
+  with torch.inference_mode():
+    value = torch.tensor([[.1], [.2], [.3]], dtype=torch.float32,
+                         device=sim.state._qpos.device)
+  if input_name == 'qpos':
+    record = _native_only(monkeypatch, lambda: mj_fwdPosition(
+        sim, value, skipsensor=True, return_record=True))
+    call = lambda: mj_energyPos(sim, record)
+  else:
+    record = _native_only(monkeypatch, lambda: mj_fwdPosition(
+        sim, skipsensor=True, return_record=True))
+    _native_only(monkeypatch, lambda: mj_fwdVelocity(
+        sim, qvel=value, record=record, skipsensor=True))
+    call = lambda: mj_energyVel(sim, record)
+  with pytest.raises(ValueError, match='mutation counter'):
+    _native_only(monkeypatch, call)
+  assert sim._energy is None
+
+
+@pytest.mark.parametrize('integrator,profile', [
+    ('Euler', 'integrated_scalable_v1'), ('RK4', 'integrated_rk4_v1')])
+def test_sleeping_and_static_tendon_springs_match_source_filter(integrator, profile, monkeypatch):
+  import copy
+  from mujoco_metal import MetalSimulation
+  model = mujoco.MjModel.from_xml_string(f'''<mujoco>
+    <option integrator="{integrator}"><flag sleep="enable" contact="disable"/></option><worldbody>
+      <site name="anchor" pos="0 0 2"/>
+      <site name="static_a" pos="0 1 0"/><site name="static_b" pos="0 1 1"/>
+      <body pos="-1 0 1" sleep="init"><joint name="sleep" type="slide" axis="0 0 1"/>
+        <geom type="sphere" size=".1" mass="2"/><site name="load" pos="1 0 0"/></body>
+      <body pos="1 0 .5" sleep="allowed"><joint type="slide" axis="1 0 0"/>
+        <geom type="sphere" size=".1" mass="1"/></body>
+    </worldbody><tendon>
+      <fixed stiffness="4" springlength=".3 .4"><joint joint="sleep" coef="1"/></fixed>
+      <spatial stiffness="4" springlength=".6 .8"><site site="anchor"/><site site="load"/></spatial>
+      <spatial stiffness="2" springlength=".4 .5"><site site="static_a"/><site site="static_b"/></spatial>
+    </tendon></mujoco>''')
+  q = np.array([[0., .1], [0., .2], [0., .3]])
+  v = np.array([[0., .2], [0., .3], [0., .4]])
+  refs = []
+  counter = copy.copy(model)
+  counter.opt.enableflags &= ~int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+  for pos, vel in zip(q, v):
+    d = mujoco.MjData(model)
+    d.qpos[:], d.qvel[:] = pos, vel
+    mujoco.mj_forward(model, d)
+    mujoco.mj_energyPos(model, d)
+    mujoco.mj_energyVel(model, d)
+    assert d.tree_asleep[0] >= 0 and d.nbody_awake < model.nbody
+    other = mujoco.MjData(counter)
+    other.qpos[:], other.qvel[:] = pos, vel
+    mujoco.mj_forward(counter, other)
+    mujoco.mj_energyPos(counter, other)
+    np.testing.assert_allclose(other.energy[0]-d.energy[0], .51, rtol=0, atol=1e-12)
+    refs.append(d)
+  sim = MetalSimulation(model, 3, qpos=q, qvel=v, profile=profile)
+  record = _prepare(sim, monkeypatch)
+  _native_only(monkeypatch, lambda: mj_energyPos(sim, record))
+  _native_only(monkeypatch, lambda: mj_energyVel(sim, record))
+  np.testing.assert_allclose(_host(sim.energy), [d.energy for d in refs],
+                             rtol=2e-5, atol=2e-6)
