@@ -43,6 +43,9 @@ def _simulation():
     _inverse_discrete_mass_pair_product = MetalSimulation._inverse_discrete_mass_pair_product
     validate_forward_stage_record = MetalSimulation.validate_forward_stage_record
     prepare_forward_acceleration = MetalSimulation.prepare_forward_acceleration
+    _rhs_accumulate = MetalSimulation._rhs_accumulate
+    _rhs_scratch_overlaps = MetalSimulation._rhs_scratch_overlaps
+    _storage_intervals_overlap = staticmethod(MetalSimulation._storage_intervals_overlap)
 
     def __init__(self):
       self._mjmodel = self.model = model
@@ -60,6 +63,11 @@ def _simulation():
       # The CPU producer stand-in has no double residual to contribute, but it
       # implements the current ACC ABI explicitly instead of omitting it.
       self._rhs_low = torch.zeros_like(self._rhs)
+      self._twosum_float_count = max(self.batch_size * model.nv, 1)
+      self._twosum_float = torch.zeros((8, self._twosum_float_count))
+      self._twosum_mask_rows = self.batch_size
+      self._twosum_mask = torch.zeros((self.batch_size, 1), dtype=torch.bool)
+      self._damped_qvel = torch.empty_like(self._rhs)
       self._applied_force = torch.tensor([[.5]])
       self._control = torch.tensor([[.8]])
       self._component_mass_enabled = False
@@ -75,12 +83,13 @@ def _simulation():
                 torch.zeros(1, dtype=torch.int32))
 
       def solve_dense_pair(M, rhs_hi, rhs_low, **kwargs):
-        solution, status = solve_dense(M, rhs_hi, **kwargs)
-        # This CPU stand-in's declared RHS low plane is exactly zero in every
-        # fixture; keep the production three-result dense-pair ABI explicit.
-        if torch.count_nonzero(rhs_low).item() != 0:
-          raise AssertionError("CPU stand-in cannot discard a nonzero RHS low")
-        return solution, torch.zeros_like(solution), status
+        # Preserve the real accumulator's residual in the CPU oracle solve.
+        exact = torch.linalg.solve(
+            M.double(), (rhs_hi.double() + rhs_low.double()).unsqueeze(-1)
+        ).squeeze(-1)
+        solution = exact.float()
+        residual = (exact - solution.double()).float()
+        return solution, residual, torch.zeros(1, dtype=torch.int32)
 
       self._solver = SimpleNamespace(run_device=solve_dense,
                                      run_pair_device=solve_dense_pair)

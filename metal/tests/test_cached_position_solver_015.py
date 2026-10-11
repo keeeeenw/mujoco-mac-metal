@@ -267,7 +267,9 @@ def test_equality_producer_publishes_cached_row_ownership_and_bilateral_bounds()
   refresh = refresh_shader.split(
       "kernel void refresh_cached_constraint_aref(", 1)[1]
   refresh = refresh.split("kernel void ", 1)[0]
-  assert "workspace_debug[debug_base + active_offset] <= 0.5f" in refresh
+  assert "workspace_debug[debug_base + active_offset] > 0.5f" in refresh
+  assert "|| (retained_R > 0.0f) || (retained_ar != 0.0f)" in refresh
+  assert "if (!row_active)" in refresh
   assert "workspace_debug[debug_base + aref_offset] = 0.0f" in refresh
 
 
