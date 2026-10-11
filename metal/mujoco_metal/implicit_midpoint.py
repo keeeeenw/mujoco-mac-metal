@@ -9,8 +9,6 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from mujoco_metal.implicit import lower_implicitfast
-
 _SHADER = Path(__file__).parent / "shaders" / "implicit_midpoint.metal"
 _MAX_NEWTON = 100
 _MAX_LINESEARCH = 20
@@ -120,7 +118,17 @@ def lower_free_body_midpoints(model):
   assembly at runtime. Sleeping eligible bodies remain in the descriptor but
   are not dispatched. Other free joints use ordinary implicitfast integration.
   """
-  lower_implicitfast(model)
+  # Eligibility is independent of the dense or component velocity solver and
+  # of unrelated actuator/plugin derivative admission. The caller owns those
+  # contracts; this stage only needs compiled free-body constants.
+  if not isinstance(model, mujoco.MjModel):
+    raise TypeError("midpoint lowering requires a MuJoCo MjModel")
+  if mujoco.__version__ != "3.10.0":
+    raise RuntimeError("midpoint lowering requires MuJoCo 3.10.0")
+  if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST):
+    raise ValueError("midpoint stage requires MuJoCo's implicitfast integrator")
+  if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
+    raise ValueError("midpoint timestep must be finite and positive")
   eligible = []
   inverse_discrete = bool(
       int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_INVDISCRETE)
@@ -157,6 +165,23 @@ def lower_free_body_midpoints(model):
           np.all(np.asarray(model.body_ipos)[bodies] == 0, axis=1), np.uint8
       ),
   )
+
+
+def midpoint_workspace_sizes(descriptor, batch_size):
+  """Four-byte admission words for constants, outputs and eligibility scratch.
+
+  The byte-sized aligned flags are conservatively charged as four-byte words.
+  Eligibility reserve also covers the transient boolean selection operations.
+  """
+  if (isinstance(batch_size, (bool, np.bool_))
+      or not isinstance(batch_size, (int, np.integer)) or batch_size <= 0):
+    raise ValueError("batch_size must be a positive integer")
+  batch, count = int(batch_size), max(int(descriptor.nfree), 1)
+  return dict(dofadr=count, bodyid=count, mass=count, inertia=3*count,
+      ipos=3*count, iquat=4*count, aligned=count, gravity=3, dims=5,
+      timestep=1, empty=1, qvel_next=batch*descriptor.nv,
+      position_velocity=batch*descriptor.nv, qacc=batch*descriptor.nv,
+      status=batch, eligibility=batch*count, eligibility_temporaries=4*batch*count)
 
 
 def _rotate(q, v):
@@ -356,6 +381,8 @@ class FreeBodyMidpointProgram:
         "status": torch.empty((self.batch_size,), dtype=torch.int32, device=self._device),
     }
     self._empty = torch.zeros(1, dtype=torch.float32, device=self._device)
+    self._eligibility = torch.empty((self.batch_size, max(d.nfree, 1)),
+                                    dtype=torch.int32, device=self._device)
 
   def run_device(self, qvel, effective_acceleration, physical_qacc,
                  qfrc_total, body_quat, *, eligible_mask=None):
@@ -375,13 +402,15 @@ class FreeBodyMidpointProgram:
         raise ValueError(f"{name} must be contiguous float32 MPS with shape {shape}")
     nv = d.nv
     if eligible_mask is None:
-      eligible_mask = torch.ones((b, max(d.nfree, 1)), dtype=torch.bool, device=self._device)
+      self._eligibility.fill_(1)
     elif (not isinstance(eligible_mask, torch.Tensor) or eligible_mask.device.type != "mps"
           or eligible_mask.dtype != torch.bool or tuple(eligible_mask.shape) != (b, d.nfree)):
       raise ValueError("eligible_mask must be bool MPS[batch,nfree]")
-    eligibility = eligible_mask.to(torch.int32).contiguous().reshape(-1)
-    if not eligibility.numel():
-      eligibility = torch.ones(1, dtype=torch.int32, device=self._device)
+    elif d.nfree:
+      self._eligibility.copy_(eligible_mask)
+    else:
+      self._eligibility.fill_(1)
+    eligibility = self._eligibility.reshape(-1)
     state_buffers = [x.reshape(-1) if x.numel() else self._empty for x in
                      (qvel, effective_acceleration, physical_qacc, qfrc_total, body_quat)]
     outputs = [self._outputs[n].reshape(-1) if nv else self._empty for n in

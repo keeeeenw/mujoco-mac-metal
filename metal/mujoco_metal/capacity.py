@@ -516,6 +516,13 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
   from mujoco_metal.integration import integration_workspace_sizes
   integration_parts=integration_workspace_sizes(nq,nv,nj,nb,b)
   parts.extend(('integration.'+name,count) for name,count in integration_parts.items())
+  if int(model.opt.integrator) == int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST):
+    from mujoco_metal.implicit_midpoint import (
+        lower_free_body_midpoints, midpoint_workspace_sizes)
+    midpoint_descriptor = lower_free_body_midpoints(model)
+    if midpoint_descriptor.nfree:
+      parts.extend(('midpoint.'+name,count) for name,count in
+                   midpoint_workspace_sizes(midpoint_descriptor, b).items())
   if is_rk4:
     parts.extend(('rk4.integration.'+name,count) for name,count in integration_parts.items())
     parts.extend((

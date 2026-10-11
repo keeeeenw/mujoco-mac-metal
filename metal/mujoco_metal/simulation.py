@@ -1037,15 +1037,18 @@ class MetalSimulation:
       from mujoco_metal.implicit import ImplicitFastProgram
 
       self._implicitfast = ImplicitFastProgram(model, batch_size)
+    elif profile.name in ("contact_free_implicit_v1", "integrated_implicit_v1") and not uses_sparse_implicit:
+      from mujoco_metal.implicit import ImplicitProgram
+
+      self._implicit = ImplicitProgram(model, batch_size)
+    # Pinned midpoint advancement applies to eligible free bodies on either
+    # mass representation, after the ordinary implicitfast velocity solve.
+    if profile.name in ("contact_free_implicitfast_v1", "integrated_implicitfast_v1"):
       from mujoco_metal.implicit_midpoint import FreeBodyMidpointProgram
       from mujoco_metal.implicit_midpoint import lower_free_body_midpoints
 
       if lower_free_body_midpoints(model).nfree:
         self._midpoint = FreeBodyMidpointProgram(model, batch_size)
-    elif profile.name in ("contact_free_implicit_v1", "integrated_implicit_v1") and not uses_sparse_implicit:
-      from mujoco_metal.implicit import ImplicitProgram
-
-      self._implicit = ImplicitProgram(model, batch_size)
     self._flex_implicit = None
     if self._flex is not None and (self._implicit is not None or self._implicitfast is not None):
       from mujoco_metal.flex_implicit import (
@@ -6635,13 +6638,14 @@ class MetalSimulation:
   def _midpoint_eligibility(self):
     from mujoco_metal.implicit_midpoint import midpoint_eligibility
     current = getattr(self, "_last_coupled", None)
-    jacobian = (current.get("J") if current is not None
-                and getattr(self, "_last_coupled_generation", None) == self._state.generation
-                else None)
+    valid_current = (current if isinstance(current, dict)
+        and getattr(self, "_last_coupled_generation", None) == self._state.generation else {})
+    jacobian = valid_current.get("J")
     # The native sleep scheduler, when installed, owns the authoritative awake
     # mask. A host mirror must never decide a per-world integration path.
     scheduler = getattr(self, "_sleep_schedule", None)
-    valid_current = (current if jacobian is not None else {})
+    # Packed sparse rows do not expose a dense J. Their native island labels
+    # and structural masks still determine eligibility and must be consumed.
     return midpoint_eligibility(
         self._midpoint.descriptor, self.batch_size, torch=self._state._torch,
         device=self._state._device, constraint_jacobian=jacobian,
