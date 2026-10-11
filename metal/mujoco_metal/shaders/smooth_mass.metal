@@ -398,6 +398,49 @@ kernel void dense_mass_matrix(
   }
 }
 
+// mj_crb uses mj_setM0's constant diagonal for compiled simple DOFs instead
+// of projecting world-space CRBA products. Preserve those exact zero couplings
+// on both storage routes, before the separate tendon-armature projection.
+// Only selected awake rows/worlds are owned by this dispatch.
+kernel void compiled_simple_mass(
+    device float* mass [[buffer(0)]],
+    device const int* dof_simplenum [[buffer(1)]],
+    device const float* dof_M0 [[buffer(2)]],
+    device const int* dof_ids [[buffer(3)]],
+    device const int* awake_counts [[buffer(4)]],
+    constant int* awake_dims [[buffer(5)]],
+    device const int* tree_layout [[buffer(6)]],
+    constant uint* dims [[buffer(7)]],
+    constant int* layout [[buffer(8)]],
+    uint world [[thread_position_in_grid]]) {
+  uint nv=dims[2], batch=dims[3];
+  if (world >= batch || layout[5+world] == 0) return;
+  uint base=world*uint(layout[0]);
+  bool sparse=layout[1] != 0;
+  int ncomponent=layout[2];
+  int owner_base=ncomponent+1+max(layout[3],1);
+  int local_base=owner_base+max(layout[3],1);
+  int offset_base=local_base+max(layout[3],1);
+  uint list_base=world*uint(max(awake_dims[1],1));
+  for (int k=0; k<awake_counts[world*3+2]; ++k) {
+    uint i=uint(dof_ids[list_base+uint(k)]);
+    if (dof_simplenum[i] == 0) continue;
+    uint width=nv, row=i, offset=0;
+    if (sparse) {
+      int component=tree_layout[owner_base+i];
+      if (component < 0) continue;
+      width=uint(tree_layout[component+1]-tree_layout[component]);
+      row=uint(tree_layout[local_base+i]);
+      offset=uint(tree_layout[offset_base+component]);
+    }
+    for (uint col=0; col<width; ++col) {
+      mass[base+offset+row*width+col]=0.0f;
+      mass[base+offset+col*width+row]=0.0f;
+    }
+    mass[base+offset+row*width+row]=dof_M0[i];
+  }
+}
+
 // One batch thread applies the compiled block-CSR inertia. MuJoCo kinematic
 // components store one dense block at its statically compiled offset. A
 // component merges kinematic trees coupled by nonzero tendon armature.

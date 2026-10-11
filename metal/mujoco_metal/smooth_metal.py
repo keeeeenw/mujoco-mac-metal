@@ -80,6 +80,8 @@ _DEVICE_ARRAYS = (
     "body_mass",
     "body_inertia",
     "dof_armature",
+    "dof_simplenum",
+    "dof_M0",
     "gravity",
     "tendon_armature",
 )
@@ -141,6 +143,8 @@ class MetalSmoothDynamics:
 
   def __init__(self, model: ModelDescriptor, batch_size: int = 1, *,
                mass_storage="dense", velocity_derivative_layout=None):
+    from mujoco_metal.model import snapshot_descriptor
+    model = snapshot_descriptor(model)
     from mujoco_metal.model import actuator_joint_inheritance, actuator_tendon_inheritance
     # R06-1: joint-targeted actuator armature folds into the dof armature
     # (pinned mj_actuatorArmature gear^2 scan); tendon-targeted handled by tendon stage.
@@ -189,6 +193,7 @@ class MetalSmoothDynamics:
     self._torch = torch
     self._library = torch.mps.compile_shader(_SHADER.read_text())
     self._kernel = self._library.dense_mass_matrix
+    self._simple_mass_kernel = self._library.compiled_simple_mass
     self._tendon_armature_kernel = self._library.add_tendon_armature
     self._pose_finite_kernel = self._library.pose_finite_status
     self._pose_finite_residual_kernel = self._library.pose_finite_residual_status
@@ -909,6 +914,11 @@ class MetalSmoothDynamics:
     if len(args) != 31:
       raise RuntimeError("native dense mass shader buffer ABI mismatch")
     self._kernel(*args, threads=(batch,), group_size=(1,))
+    self._simple_mass_kernel(
+        mass_output, arrays["dof_simplenum"], arrays["dof_M0"],
+        lists["dof_ids"], lists["counts"], lists["list_dims"],
+        self._tree_layout_device, w["mass_dims"], w["mass_layout_dims"],
+        threads=(batch,), group_size=(1,))
     if _position_only:
       # POS owns FK/COM, cdof/local inertia and CRBA only.  In particular it
       # must not run comVel/RNE with a dummy velocity: mj_fwdVelocity is a
@@ -1151,12 +1161,18 @@ class MetalSmoothDynamics:
     lists = self._all_awake_lists(batch)
     args.extend([lists["body_ids"], lists["parent_ids"], lists["dof_ids"],
                  lists["counts"], lists["body_mask"], lists["list_dims"]])
-    args.extend([self._tree_layout_device,
-                 torch.tensor([nv * nv, 0, self.ntree, nv],
-                              dtype=torch.int32, device=self._fk._device)])
+    layout_dims = torch.tensor(
+        [nv * nv, 0, self.ncomponent, nv, self.model.ntendon, *([1] * batch)],
+        dtype=torch.int32, device=self._fk._device)
+    args.extend([self._tree_layout_device, layout_dims])
     if len(args) != 31:
       raise RuntimeError("native dense mass shader buffer ABI mismatch")
     self._kernel(*args, threads=(batch,), group_size=(1,))
+    self._simple_mass_kernel(
+        output, arrays["dof_simplenum"], arrays["dof_M0"],
+        lists["dof_ids"], lists["counts"], lists["list_dims"],
+        self._tree_layout_device, args[21], layout_dims,
+        threads=(batch,), group_size=(1,))
     return {
         "mass_matrix": output[: batch * nv * nv].reshape(batch, nv, nv),
         "root_com": root_com,

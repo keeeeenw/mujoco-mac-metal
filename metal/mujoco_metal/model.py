@@ -17,6 +17,7 @@
 from dataclasses import dataclass
 from dataclasses import fields
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 
 import mujoco
@@ -26,6 +27,38 @@ import numpy as np
 def _frozen(array, dtype=None):
   value = np.asarray(array, dtype=dtype, order="C")
   return np.frombuffer(value.tobytes(), dtype=value.dtype).reshape(value.shape)
+
+
+_SIMPLE_MASS_INPUTS = (
+    "body_parentid", "body_rootid", "body_treeid", "body_dofadr",
+    "body_dofnum", "body_jntadr", "body_jntnum", "body_mocapid",
+    "body_pos", "body_quat", "body_ipos", "body_iquat", "body_mass",
+    "body_inertia", "dof_parentid", "dof_bodyid", "dof_jntid",
+    "dof_armature", "jnt_type", "jnt_qposadr", "jnt_dofadr",
+    "jnt_bodyid", "jnt_pos", "jnt_axis", "qpos0", "actuator_armature",
+    "actuator_trntype", "actuator_trnid", "actuator_gear",
+    "tendon_armature", "tendon_treeid", "tendon_treenum",
+    "tendon_j_rowadr", "tendon_j_rownnz", "tendon_j_colind",
+    "mass_rowadr", "mass_rownnz", "mass_colind",
+)
+
+
+def _simple_mass_signature(values):
+  """Identify the owned compiled inputs for the mj_setM0/mj_crb shortcut.
+
+  Direct descriptor edits do not rerun the source compiler or mj_setConst.
+  Invalidate that shortcut on such edits; lifecycle recompilation/recomputation
+  provides fresh source constants via load_model. The generic CRBA remains
+  available for edited descriptors, so no physics step calls a CPU oracle.
+  """
+  digest = hashlib.sha256()
+  for name in _SIMPLE_MASS_INPUTS:
+    value = np.ascontiguousarray(values[name])
+    digest.update(name.encode("ascii"))
+    digest.update(value.dtype.str.encode("ascii"))
+    digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
+    digest.update(value.tobytes())
+  return _frozen(np.frombuffer(digest.digest(), dtype=np.uint8))
 
 
 def actuator_joint_inheritance(model, tendon_ok=False):
@@ -263,6 +296,9 @@ class ModelDescriptor:
   body_mass: np.ndarray
   body_inertia: np.ndarray
   dof_armature: np.ndarray
+  dof_simplenum: np.ndarray
+  dof_M0: np.ndarray
+  simple_mass_signature: np.ndarray
   dof_damping: np.ndarray
   actuator_armature: np.ndarray
   actuator_trntype: np.ndarray
@@ -438,6 +474,12 @@ def snapshot_descriptor(model):
   # descriptor snapshot; carrying stale SAMEFRAME flags changes FK semantics.
   sameframes = _source_sameframe_codes(model)
   values.update(sameframes)
+  signature = _simple_mass_signature(values)
+  if not np.array_equal(signature, model.simple_mass_signature):
+    # Never retain compiled inertia constants across a direct descriptor edit.
+    # A new source-model lowering can restore the optimized source route.
+    values["dof_simplenum"] = np.zeros(model.nv, dtype=np.int32)
+  values["simple_mass_signature"] = signature
   _validate_lowered(counts, values)
   arrays = {
       field.name: _frozen(getattr(model, field.name))
@@ -446,6 +488,8 @@ def snapshot_descriptor(model):
   }
   arrays.update({name: _frozen(value, np.int32)
                  for name, value in sameframes.items()})
+  arrays["dof_simplenum"] = _frozen(values["dof_simplenum"], np.int32)
+  arrays["simple_mass_signature"] = signature
   return replace(model, **arrays)
 
 
@@ -482,6 +526,9 @@ def _validate_lowered(counts, values):
       "body_mass": (nb,),
       "body_inertia": (nb, 3),
       "dof_armature": (nv,),
+      "dof_simplenum": (nv,),
+      "dof_M0": (nv,),
+      "simple_mass_signature": (32,),
       "dof_damping": (nv,),
       "actuator_armature": (counts["nu"],),
       "actuator_trntype": (counts["nu"],),
@@ -530,6 +577,15 @@ def _validate_lowered(counts, values):
   for name in ("body_sameframe", "geom_sameframe", "site_sameframe"):
     if np.any(values[name] < 0) or np.any(values[name] > 4):
       raise ValueError(f"invalid same-frame code in {name}")
+  simple = np.asarray(values["dof_simplenum"])
+  if (simple.dtype.kind not in "iu" or np.any(simple < 0)
+      or np.any(simple > nv - np.arange(nv))):
+    raise ValueError("invalid dof_simplenum in lowered model")
+  if np.any(np.asarray(values["dof_M0"]) < 0):
+    raise ValueError("negative compiled dof_M0 in lowered model")
+  signature = np.asarray(values["simple_mass_signature"])
+  if signature.dtype != np.uint8:
+    raise ValueError("simple_mass_signature must contain compiled digest bytes")
   # body_sameframe describes the body's inertial frame relative to its body
   # frame. MuJoCo 3.10's compiler emits NONE, BODY, or BODYROT here; INERTIA
   # and INERTIAROT are meaningful only for attached geom/site frames.
@@ -782,6 +838,8 @@ def load_model(source):
       "body_mass",
       "body_inertia",
       "dof_armature",
+      "dof_simplenum",
+      "dof_M0",
       "dof_damping",
       "actuator_armature",
       "actuator_trntype",
@@ -822,6 +880,7 @@ def load_model(source):
   values["mass_rowadr"] = _frozen(m.M_rowadr, np.int32)
   values["mass_rownnz"] = _frozen(m.M_rownnz, np.int32)
   values["mass_colind"] = _frozen(mass_colind, np.int32)
+  values["simple_mass_signature"] = _simple_mass_signature(values)
   counts = dict(
       nq=m.nq,
       nv=m.nv,
