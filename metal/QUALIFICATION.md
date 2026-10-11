@@ -1,5 +1,37 @@
 # Development qualification — 2026-10-11
 
+## Observational assembly, DC admission and contact-bound APIs
+
+Revisions `a4ca52ab1`, `42eaa5be1` and `12cc24ffd` add owned observational
+assembly, correct zero-state DC dynamics admission and expose the model-only
+`mj_maxContact` utility. The affected native actuation/query/plugin selection
+passes **60 tests, 37 deselected in 54.57 seconds** with CPU fallback disabled.
+This includes every individual force in a 20-combination gain/bias fixture,
+real neighboring activation states, four integrators and exact precision replay.
+Positive state layouts and DC-gain layouts remain validated. The native shader
+already skips unallocated dynamics; the admission correction follows that same
+pinned source rule. Independent CPU forward and eight-step execution accepted
+all 220 compile-valid templates previously rejected by that admission check.
+
+Observational-query fixtures cover dense Euler and component implicitfast,
+malformed input, an injected post-assembly failure, actual borrowed producer
+storage, a pending split-step record, stored energy/sensors, held inputs and
+checkpoint/replay preservation. They were additionally strengthened with
+independent pinned current-state acceleration and constraint-force comparisons;
+all **four tests pass in 3.49 seconds**, with native CPU-physics calls forbidden.
+The earlier SDF error-norm-only noninterference check missed changes to retained
+multiplier bytes. Its stronger complete-state checks pass for both bowl and
+torus through the new observational query. The producer's documented mutable
+workspace behavior is retained.
+
+The actual public model-only contact-bound utility passes **441 host tests**;
+its combined binding/catalogue selection passes **457 tests in 1.88 seconds**.
+Both geometry orders, all nine geometry types, CCD flags, SDF seed counts,
+explicit margins, model override/pair/geom precedence and argument boundaries
+are compared with pinned MuJoCo 3.10.0. No simulation state or physics is
+dispatched. These results qualify the utility, not contact physics. Full native,
+distribution, demo and milestone closure remains pending.
+
 ## Current checkpoint and owned keyframe regression gates — 2026-10-11
 
 Revisions `fe644d658` and `70136b887` update native lifecycle fixtures to the

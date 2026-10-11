@@ -78,6 +78,22 @@ def test_observational_assembly_preserves_checkpoint_and_borrowed_results(
   _assert_snapshot_bytes(before, sim.snapshot())
   owners = {key: (value, value.clone()) for key, value in borrowed.items()
             if isinstance(value, torch.Tensor)}
+  # Independent pinned forward results at the actual represented current
+  # state, with the query's inputs (not the restored held inputs).
+  state = before["device"]
+  words = state.precision_words.astype(np.float64)
+  positions = state.qpos.astype(np.float64) + words[:, :1] + words[:, 1:2]
+  velocities = state.qvel.astype(np.float64) + words[:, 2:3] + words[:, 3:4]
+  references = []
+  for row in range(2):
+    data = mujoco.MjData(model)
+    data.qpos[:], data.qvel[:], data.act[:] = positions[row], velocities[row], state.act[row]
+    data.ctrl[:] = ctrl[row] * .5
+    data.qfrc_applied[:] = force[row] * 2
+    data.qacc_warmstart[:] = before["native_state"]["qacc_warmstart"][row]
+    mujoco.mj_forward(model, data)
+    assert data.ncon == 1 and np.linalg.norm(data.qfrc_constraint) > .01
+    references.append(data)
   cc = sim._coupled_constraints
   original = cc.run_device
   calls = []
@@ -103,6 +119,11 @@ def test_observational_assembly_preserves_checkpoint_and_borrowed_results(
       assert output["contact_mask"].sum().item() > 0
       assert torch.linalg.vector_norm(output["qfrc_constraint"]).item() > .01
   assert calls, "query did not execute native assembly"
+  if not failure:
+    for field in ("qacc", "qfrc_constraint"):
+      np.testing.assert_allclose(output[field].cpu().numpy(),
+                                 np.stack([getattr(data, field) for data in references]),
+                                 rtol=3e-5, atol=3e-5)
   _assert_snapshot_bytes(before, sim.snapshot())
   assert sim._step1_record is record
   sim.validate_forward_stage_record(record, "VEL")
