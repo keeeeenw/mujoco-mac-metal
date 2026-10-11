@@ -337,6 +337,13 @@ def test_keyframe_reset_atomic_on_invalid_ctrl_gpu():
   from mujoco_metal import MetalSimulation
   m = mujoco.MjModel.from_xml_string(XML_KEYCTRL)
   sim = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
+  # Constructor and inspection models are owned copies. Corrupting either
+  # must not alter the prepared keyframe that the reset operation consumes.
+  m.key_ctrl[0, 0] = float("nan")
+  inspection = sim.model
+  inspection.key_ctrl[0, 0] = float("nan")
+  np.testing.assert_allclose(sim.model.key_ctrl[0], [0.7], atol=1e-12)
+  sim.reset_to_keyframe(0)
   sim.reset(qpos=np.array([[0.2], [0.25]], dtype=np.float32),
             act=np.array([[0.0], [0.0]], dtype=np.float32))
   sim.step(2, ctrl=np.array([[3.0], [4.0]], dtype=np.float32))
@@ -347,8 +354,11 @@ def test_keyframe_reset_atomic_on_invalid_ctrl_gpu():
       "mpos": sim.state.mocap_pos.cpu().numpy().copy(),
       "ctrl": sim._control.cpu().numpy().copy(),
       "gen": sim.state.generation,
+      "precision": sim.state.snapshot().precision_words.copy(),
   }
-  m.key_ctrl[0, 0] = float("nan")
+  # Test-only corruption of the actual prepared payload reaches reset's
+  # validation; this does not advertise direct model mutation as a public API.
+  sim._mjmodel.key_ctrl[0, 0] = float("nan")
   with pytest.raises(ValueError, match="keyframe ctrl must be finite"):
     sim.reset_to_keyframe(0)
   np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), before["qpos"])
@@ -357,8 +367,9 @@ def test_keyframe_reset_atomic_on_invalid_ctrl_gpu():
   np.testing.assert_array_equal(sim.state.mocap_pos.cpu().numpy(), before["mpos"])
   np.testing.assert_array_equal(sim._control.cpu().numpy(), before["ctrl"])
   assert sim.state.generation == before["gen"]
+  np.testing.assert_array_equal(sim.state.snapshot().precision_words, before["precision"])
   # Valid recovery after failure applies the keyframe to all worlds.
-  m.key_ctrl[0, 0] = 0.7
+  sim._mjmodel.key_ctrl[0, 0] = 0.7
   sim.reset_to_keyframe(0)
   np.testing.assert_allclose(sim.state.qpos.cpu().numpy()[:, 0], [0.3, 0.3], atol=1e-6)
   np.testing.assert_allclose(sim.state.act.cpu().numpy()[:, 0], [0.2, 0.2], atol=1e-6)
@@ -381,12 +392,20 @@ def test_keyframe_reset_partial_env_and_time_overflow_gpu():
   t1_before = float(sim.state.time.cpu().numpy()[1])
   q1_before = sim.state.qpos.cpu().numpy()[1].copy()
   m.key_time[0] = 1e300
+  assert float(sim.model.key_time[0]) == 1.5
+  sim._mjmodel.key_time[0] = 1e300
+  before = sim.state.snapshot()
+  generation_before = sim.state.generation
   with pytest.raises(ValueError, match="float32-representable"):
     sim.reset_to_keyframe(0, env_ids=[0])
   assert float(sim.state.time.cpu().numpy()[0]) == 1.5
   assert float(sim.state.time.cpu().numpy()[1]) == t1_before
   np.testing.assert_array_equal(sim.state.qpos.cpu().numpy()[1], q1_before)
-  m.key_time[0] = 1.5
+  after = sim.state.snapshot()
+  for name in ("qpos", "qvel", "qacc", "time", "status", "act", "mpos", "mquat", "precision_words"):
+    np.testing.assert_array_equal(getattr(after, name), getattr(before, name))
+  assert sim.state.generation == generation_before
+  sim._mjmodel.key_time[0] = 1.5
   sim.reset_to_keyframe(0, env_ids=[0])  # valid recovery
   assert float(sim.state.time.cpu().numpy()[0]) == 1.5
 
