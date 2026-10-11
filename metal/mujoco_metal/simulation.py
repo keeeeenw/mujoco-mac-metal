@@ -2878,54 +2878,15 @@ class MetalSimulation:
     return tuple(entries)
 
   def sensor_values(self):
-    """Evaluate current sensors without replacing stored stage diagnostics."""
-    if getattr(self, "_energy", None) is None:
-      return self._sensor_values_preserving_sparse_scratch()
-    scratch = [self._energy, self._energy_stage, self._energy_computed, self._energy_position_dims,
-               self._state._reset_mask_i32]
-    scratch += [self._smooth._workspace.get(name) for name in
-                ("energy_velocity_dims", "mass_matvec_dims", "mass_sparse_product")]
-    unique = {id(value): value for value in scratch if value is not None}
-    saved = [(value, value.clone()) for value in unique.values()]
-    try:
-      # A current query evaluates new geometry/velocity, independent of the
-      # last stored forward-stage flags, then restores both columns and flags.
-      self._energy_computed.zero_()
-      return self._sensor_values_preserving_sparse_scratch()
-    finally:
-      for value, previous in saved:
-        value.copy_(previous)
-
-  def _sensor_values_preserving_sparse_scratch(self):
-    """Evaluate a query without changing persistent sparse-solve scratch."""
-    if not getattr(self, "_component_mass_enabled", False):
+    """Evaluate current sensors while preserving prepared stage ownership."""
+    from mujoco_metal.native_api import _inverse_query_workspaces
+    with _inverse_query_workspaces(self):
+      computed = getattr(self, "_energy_computed", None)
+      if computed is not None:
+        # Stored flags describe the earlier forward state. Current queries
+        # evaluate fresh geometry and restore flags/samples at the boundary.
+        computed.zero_()
       return self._sensor_values_impl()
-    owned_names = ("_component_solve_rhs", "_component_solution_vector",
-                   "_component_solution_low_vector",
-                   "_component_world_status",
-                   "_component_tendon_J", "_component_damping_deriv")
-    owned = {name: (getattr(self, name).clone()
-                    if getattr(self, name, None) is not None else None)
-             for name in owned_names}
-    component_workspace = _clone_system_dict(
-        self._component_solver._workspace)
-    component_controls = {
-        name: getattr(self._component_solver, name).clone()
-        for name in ("_euler_dt", "_allow_indefinite")
-        if isinstance(getattr(self._component_solver, name, None),
-                      self._state._torch.Tensor)
-    }
-    try:
-      return self._sensor_values_impl()
-    finally:
-      for name, value in owned.items():
-        current = getattr(self, name, None)
-        if current is not None and value is not None:
-          current.copy_(value)
-      _restore_system_buffers(self._component_solver._workspace,
-                              component_workspace)
-      for name, value in component_controls.items():
-        getattr(self._component_solver, name).copy_(value)
 
   def _sensor_values_impl(self):
     """Evaluate supported stateless sensors at CURRENT state on MPS.
@@ -2956,6 +2917,13 @@ class MetalSimulation:
         mquat if sparse_poses is None else None, poses=sparse_poses,
         awake_lists=awake_lists, tendon_J=tendon_J,
         _trusted_internal_poses=self._component_mass_enabled)
+    if self._flex is not None:
+      # Potential energy includes one-dimensional flex edge springs. Current
+      # queries must use current vertex geometry, then restore the earlier
+      # stepping geometry/context through the enclosing query transaction.
+      self._flex.update_kinematics(
+          dict(dynamics["poses"], root_com=dynamics["root_com"]),
+          dynamics.get("cvel"))
     sensor_dynamics = dynamics
     if (not self._component_mass_enabled
         and np.any(np.asarray(self._sensors.descriptor.sensor_type)

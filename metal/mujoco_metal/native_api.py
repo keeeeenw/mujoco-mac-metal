@@ -227,7 +227,8 @@ def _inverse_query_workspaces(sim):
   cached forward contexts. Restoring only constraint rows leaves their smooth
   mass/pose buffers describing the temporary query. Snapshot device storage
   in place (including nested stage programs) without numerical readback.
-  This allocation cost belongs to the explicit inverse query, not stepping.
+  This shared transaction also protects current sensor queries. Its allocation
+  cost belongs to explicit inspection, not ordinary stepping.
   """
   roots = ("_smooth", "_passive", "_fluid", "_tendons", "_spatial_tendons",
            "_flex", "_coupled_constraints", "_component_solver", "_forward_stages",
@@ -287,7 +288,8 @@ def _inverse_query_workspaces(sim):
                    "_component_tendon_J", "_component_damping_deriv", "_rhs", "_rhs_low",
                    "_act_dot", "_integration_qacc_low", "_actuator_velocity_derivative", "_sensordata",
                    "_act_vel", "_sen_act_force", "_sen_qfrc_act",
-                   "_raw_sensordata", "_energy", "_energy_computed", "_sensor_plugin_status",
+           "_raw_sensordata", "_energy", "_energy_stage", "_energy_position_dims",
+           "_energy_computed", "_sensor_plugin_status",
                    "_legacy_canonical_rows", "_legacy_constraint_rhs", "_control",
                    "_applied_force", "_body_wrench",
                    "_native_actuator_force", "_native_actuator_qfrc")
