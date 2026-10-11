@@ -46,6 +46,7 @@ structure and it REPORTS divergence magnitudes.
 import json
 import math
 import os
+from dataclasses import fields
 
 import mujoco
 import numpy as np
@@ -65,6 +66,18 @@ def _clone(tensor):
   return np.asarray(tensor.detach().cpu().numpy()).copy()
 
 
+def _represented_state(sim):
+  """Independently reconstruct the physical input, not just its high view."""
+  snapshot = sim.state.snapshot()
+  nq, nv = snapshot.nq, snapshot.nv
+  words = snapshot.precision_words.astype(np.float64)
+  qpos = (snapshot.qpos.astype(np.float64) + words[:, :nq]
+          + words[:, nq:2 * nq])
+  qvel = (snapshot.qvel.astype(np.float64) + words[:, 2 * nq:2 * nq + nv]
+          + words[:, 2 * nq + nv:])
+  return qpos, qvel
+
+
 def _native_step_stage(sim, qfrc):
   """Advance one native step; clone step-stage quantities immediately.
 
@@ -74,12 +87,15 @@ def _native_step_stage(sim, qfrc):
   """
   status = sim.step(1, qfrc_applied=qfrc)
   accepted = sim._accepted_step["system"]
+  qpos, qvel = _represented_state(sim)
   stage = {
       "stage": "native-step",
       "status": _clone(status).reshape(-1),
       "time": _clone(sim.state._time).reshape(-1),
-      "qpos": _clone(sim.state._qpos),
-      "qvel": _clone(sim.state._qvel),
+      "qpos": qpos,
+      "qvel": qvel,
+      "qpos_projection": _clone(sim.state._qpos),
+      "qvel_projection": _clone(sim.state._qvel),
       "qacc": _clone(sim.state._qacc),
   }
   for key in ("J", "lambda", "qacc", "qfrc_constraint", "status",
@@ -122,7 +138,7 @@ def _cpu_forward_at_state(model, qpos32, qvel32, qfrc):
 
 def _native_assembly(sim, qfrc):
   """Native forward assembly at the current device state; clones first."""
-  system = sim.assembled_system(recompute=True, qfrc_applied=qfrc)
+  system = sim.query_assembled_system(qfrc_applied=qfrc)
   assert int(_clone(system["status"])[0]) == 0
   return {
       "stage": "native-assembly",
@@ -296,8 +312,7 @@ def _diagnose(name, steps=8):
   packet = {"fixture": name, "dt": dt, "label": "same-start-one-step",
             "steps": []}
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
-  qpos0 = _clone(sim.state._qpos)[0].astype(np.float64)
-  qvel0 = _clone(sim.state._qvel)[0].astype(np.float64)
+  qpos0, qvel0 = (value[0] for value in _represented_state(sim))
   cpu_data, _, contacts0 = _cpu_contacts(model, qpos0, qvel0)
   assert len(contacts0) == 8 and all(c["dist"] < 0 for c in contacts0)
   # Determinism: repeated assembly at the same state is bitwise identical.
@@ -308,8 +323,7 @@ def _diagnose(name, steps=8):
     assert np.array_equal(first_assembly[key], second_assembly[key]), key
   cpu_rollout = mujoco.MjData(model)
   for step in range(steps):
-    pre_qpos = _clone(sim.state._qpos)[0].astype(np.float64)
-    pre_qvel = _clone(sim.state._qvel)[0].astype(np.float64)
+    pre_qpos, pre_qvel = (value[0] for value in _represented_state(sim))
     pre_time_native = float(_clone(sim.state._time).reshape(-1)[0])
     native = _native_step_stage(sim, qfrc)
     cpu_rollout.qpos[:] = pre_qpos
@@ -431,11 +445,12 @@ def _rollout(name, steps=8, with_assembly=False):
   qfrc = np.zeros((1, model.nv), dtype=np.float32)
   qfrc[0, 0] = 0.01
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
-  qpos0 = _clone(sim.state._qpos)[0].astype(np.float64)
+  qpos0, qvel0 = (value[0] for value in _represented_state(sim))
   cpu_data = mujoco.MjData(model)
   cpu_data.qpos[:] = qpos0
-  cpu_data.qvel[:] = 0.0
+  cpu_data.qvel[:] = qvel0
   trace = {"fixture": name, "label": "uninterrupted-rollout", "steps": []}
+  owned_states = []
   for step in range(steps):
     status = sim.step(1, qfrc_applied=qfrc)
     assert status.cpu().numpy().tolist() == [0]
@@ -443,6 +458,13 @@ def _rollout(name, steps=8, with_assembly=False):
     mujoco.mj_step(model, cpu_data)
     if with_assembly:
       _native_assembly(sim, qfrc)
+    # Error norms can remain equal while individual components, residual
+    # words or warm-start multipliers change. Retain every owned state array
+    # and compare its bytes, including signed zero, after each real step.
+    snapshot = sim.state.snapshot()
+    owned_states.append({field.name: getattr(snapshot, field.name).copy()
+                         for field in fields(snapshot)
+                         if isinstance(getattr(snapshot, field.name), np.ndarray)})
     trace["steps"].append({
         "step": step,
         "native_time": float(_clone(sim.state._time).reshape(-1)[0]),
@@ -458,6 +480,7 @@ def _rollout(name, steps=8, with_assembly=False):
         "device": {"ncon_cpu": int(cpu_data.ncon)},
     })
   print(f"UNINTERRUPTED_ROLLOUT[{name}] " + json.dumps(trace, default=float))
+  trace["owned_states"] = owned_states
   return trace
 
 
@@ -483,6 +506,13 @@ def test_uninterrupted_rollout_and_noninterference_gpu(name):
   pristine = _rollout(name)
   probed = _rollout(name, with_assembly=True)
   assert len(pristine["steps"]) == len(probed["steps"]) == 8
+  for step, (original, observed) in enumerate(zip(
+      pristine["owned_states"], probed["owned_states"])):
+    assert original.keys() == observed.keys()
+    for name, array in original.items():
+      other = observed[name]
+      assert array.dtype == other.dtype and array.shape == other.shape
+      assert array.tobytes() == other.tobytes(), (name, step)
   for p_step, d_step in zip(pristine["steps"], probed["steps"]):
     for key in ("qpos_err", "qvel_err", "qacc_err"):
       assert p_step["host_float64"][key] == d_step["host_float64"][key], (
@@ -503,8 +533,7 @@ def test_bowl_qp_reference_and_cross_swap_gpu():
   """
   model = _plugin_sphere_model("bowl")
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
-  qpos = _clone(sim.state._qpos)[0].astype(np.float64)
-  qvel = _clone(sim.state._qvel)[0].astype(np.float64)
+  qpos, qvel = (value[0] for value in _represented_state(sim))
   cpu_data, _, _ = _cpu_contacts(model, qpos, qvel)
   system = sim.assembled_system(recompute=True)
   desc = sim._coupled_constraints.descriptor
@@ -591,46 +620,42 @@ def test_same_state_operator_swap_shows_causal_sensitivity_gpu(name):
   steps = 4 if name == "torus" else 0
   for _ in range(steps):
     sim.step(1, qfrc_applied=qfrc)
-  qpos = _clone(sim.state._qpos)[0].astype(np.float64)
-  qvel = _clone(sim.state._qvel)[0].astype(np.float64)
+  qpos, qvel = (value[0] for value in _represented_state(sim))
   # Fresh assembly at the identical represented state (no warmstart on
   # either side); owned snapshots cloned before any recompute.
   sim2 = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
-  sim2.reset(qpos=qpos.astype(np.float32)[None],
-             qvel=qvel.astype(np.float32)[None])
+  sim2.reset(qpos=qpos[None], qvel=qvel[None])
   # Read-only capture of the actual native smooth rhs (solver qfrc input);
   # cloning never mutates device state (noninterference holds by
   # construction, as with the staged-workspace capture).
   smooth_seen = {}
   cc = sim2._coupled_constraints
-  orig = cc._solve_kernel
-  def wrapped(*args, **kwargs):
-    import torch
-    # qfrc_smooth is the second positional solver input (mass, smooth,
-    # qpos, qvel, ...); record a clone without mutating the call.
-    try:
-      if len(args) >= 2 and isinstance(args[1], torch.Tensor):
-        smooth_seen["qfrc"] = args[1].cpu().numpy().copy()
-    except Exception:
-      pass
-    return orig(*args, **kwargs)
-  cc._solve_kernel = wrapped
+  orig = cc.run_device
+  def wrapped(poses, mass, qfrc_smooth, *args, **kwargs):
+    # Capture the real force producer boundary, before the solver can pack
+    # high/low force or pre-solved acceleration into its second GPU argument.
+    high = _clone(qfrc_smooth).astype(np.float64)
+    low = kwargs.get("qfrc_smooth_low")
+    smooth_seen["qfrc"] = high if low is None else high + _clone(low).astype(np.float64)
+    smooth_seen["calls"] = smooth_seen.get("calls", 0) + 1
+    return orig(poses, mass, qfrc_smooth, *args, **kwargs)
+  cc.run_device = wrapped
   try:
     system = sim2.assembled_system(recompute=True, qfrc_applied=qfrc)
   finally:
-    cc._solve_kernel = orig
-  assert "qfrc" in smooth_seen, "smooth rhs was not captured"
+    cc.run_device = orig
+  assert smooth_seen.get("calls", 0) > 0, "smooth rhs was not captured"
   native_smooth = np.asarray(smooth_seen["qfrc"]).reshape(-1).astype(np.float64)
   cpu_data, _, _ = _cpu_contacts(model, qpos, qvel)
   cpu_data.qfrc_applied[:] = qfrc[0].astype(np.float64)
   import mujoco as _mj
   _mj.mj_forward(model, cpu_data)
   cpu_smooth = np.asarray(cpu_data.qfrc_smooth, dtype=np.float64)
-  cpu_applied = np.asarray(cpu_data.qfrc_applied, dtype=np.float64)
   # Real-rhs oracle gap (never the implied residual as certificate).
-  # Native solver smooth input carries applied forces; compare against
-  # CPU smooth+applied for identical staging.
-  smooth_gap = float(np.max(np.abs(native_smooth - (cpu_smooth + cpu_applied))))
+  # Pinned engine_forward.c already includes applied force in qfrc_smooth.
+  # Adding it again would double count the same input.
+  smooth_gap = float(np.max(np.abs(native_smooth - cpu_smooth)))
+  np.testing.assert_allclose(native_smooth, cpu_smooth, rtol=1e-6, atol=1e-6)
   # Owned snapshots for operators/multipliers/forces.
   desc = sim2._coupled_constraints.descriptor
   mask = _clone(system["contact_mask"])[0]

@@ -6,6 +6,34 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_query_restores_held_force_and_wrench_owners_including_absent_inputs(present, fail):
+  torch = pytest.importorskip("torch")
+  from mujoco_metal.native_api import _inverse_query_workspaces
+  force = torch.tensor([[.125]]) if present else None
+  wrench = torch.full((1, 1, 6), .25) if present else None
+  sim = SimpleNamespace(_applied_force=force, _body_wrench=wrench)
+  def query():
+    with _inverse_query_workspaces(sim):
+      if present:
+        force.fill_(4.)
+        wrench.fill_(5.)
+      sim._applied_force = torch.tensor([[6.]])
+      sim._body_wrench = torch.full((1, 1, 6), 7.)
+      if fail:
+        raise RuntimeError("held input query failed")
+  if fail:
+    with pytest.raises(RuntimeError, match="held input"):
+      query()
+  else:
+    query()
+  assert sim._applied_force is force and sim._body_wrench is wrench
+  if present:
+    assert torch.equal(force, torch.tensor([[.125]]))
+    assert torch.equal(wrench, torch.full((1, 1, 6), .25))
+
+
 @pytest.mark.parametrize('fail', [False, True])
 @pytest.mark.parametrize('stale', [False, True])
 def test_query_restores_paired_acceleration_values_aliases_and_coherence(fail, stale):

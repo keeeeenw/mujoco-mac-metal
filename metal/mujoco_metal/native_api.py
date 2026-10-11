@@ -222,6 +222,7 @@ def _inverse_query_workspaces(sim):
                    "_act_vel", "_sen_act_force", "_sen_qfrc_act",
                    "_raw_sensordata", "_energy", "_sensor_plugin_status",
                    "_legacy_canonical_rows", "_legacy_constraint_rhs", "_control",
+                   "_applied_force", "_body_wrench",
                    "_native_actuator_force", "_native_actuator_qfrc")
   scratch_names += tuple(name for name in vars(sim)
                          if name.startswith(("_forward_stage_", "_sleep_")) and

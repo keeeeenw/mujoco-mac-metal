@@ -3248,6 +3248,22 @@ class MetalSimulation:
     self._assembled_system_valid = True
     return coupled
 
+  def query_assembled_system(self, *, ctrl=None, qfrc_applied=None):
+    """Return an owned current-state system without changing trajectory state.
+
+    Unlike the borrowed producer ``assembled_system(recompute=True)``, this
+    explicit observation preserves checkpoint fields, held inputs, solver
+    seeds, pending forward records and all borrowed stage storage. The query
+    evaluates native physics at the supplied controls/forces, clones outputs
+    on device, then restores storage on success or exception. Its temporary
+    allocations belong to this diagnostic boundary, not the stepping path.
+    """
+    from mujoco_metal.native_api import _inverse_query_workspaces
+    with _inverse_query_workspaces(self):
+      result = self.assembled_system(
+          ctrl=ctrl, qfrc_applied=qfrc_applied, recompute=True)
+      return _clone_system_dict(result)
+
   @property
   def accepted_step(self):
     """Owned per-world snapshot of the latest successful trajectory rows.

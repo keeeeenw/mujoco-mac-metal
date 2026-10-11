@@ -301,6 +301,18 @@ it consumes that acceleration without another unconstrained solve. The selected
 native chain test verifies this sequence; it does not qualify every model or
 integrator combination.
 
+`sim.assembled_system(recompute=True)` is a producer: it rebuilds borrowed
+forward/solver workspaces and updates the retained multiplier buffer. Supplied
+controls and applied forces become held inputs. For an observation that leaves
+trajectory state intact, use
+`sim.query_assembled_system(ctrl=controls, qfrc_applied=forces)`. This returns
+owned device tensors for the current-state system and restores checkpoints,
+held inputs, solver seeds, pending records and borrowed storage on success or
+exception. It uses native physics and temporary device copies at this explicit
+query boundary. These copies are not added to ordinary stepping. Returned
+systems describe a new current-state forward evaluation, not the previous
+accepted integration step; use `sim.accepted_step` for that stored result.
+
 Development split stepping is available as `api.mj_step1(sim)` followed by
 `api.mj_step2(sim, ctrl=controls)`. Step1 evaluates POS/VEL, their sensors and
 enabled energy diagnostics; step2 evaluates ACT/ACC/constraints and advances
