@@ -364,6 +364,9 @@ static __attribute__((noinline)) int common_libccd_penetration(
   FlexDD3 origin=flex_dd3(float3(0));
   if (mpr_eq3(portal[0].minkowski,origin))
     portal[0].minkowski.x=flex_dd_source_add(portal[0].minkowski.x,flex_dd(0x1.4p-49f));
+  // Pinned libccd MPR discovery seeds the portal from the Minkowski center
+  // difference, not from the first_dir callback (first_dir is consumed only
+  // by GJK intersect, never by ccdMPRPenetration/discoverPortal).
   FlexDD3 direction=mpr_normalize(flex_dd3_neg(portal[0].minkowski));
   if (mpr_support_pair(a,b,direction,vertices,graph,portal[1])) return -20;
   FlexDD dot=mpr_dot(portal[1].minkowski,direction);

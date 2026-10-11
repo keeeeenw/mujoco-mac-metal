@@ -134,15 +134,42 @@ static inline CommonCCDSupportResult common_ccd_support(
     // radius*dir + pos without a local-frame rotation.
     world=flex_dd3_source_madd(direction,object.size[0],pos);
   } else if (object.kind==COMMON_CCD_LINE) {
+#if COMMON_CCD_USE_LIBCCD
+    // mjccd_support capsule adapter: mju_sign axial (zero stays zero).
+    int lsign=flex_dd_compare_exact(local_direction.z,flex_dd(0.0f));
+    FlexDD laxial=lsign>0 ? object.size[1] :
+        (lsign<0 ? flex_dd_neg(object.size[1]) : flex_dd(0.0f));
+    local=FlexDD3{flex_dd(0.0f),flex_dd(0.0f),laxial};
+#else
     FlexDD sign=flex_dd_compare_exact(local_direction.z,flex_dd(0.0f))>=0
                     ? object.size[1] : flex_dd_neg(object.size[1]);
     local=FlexDD3{flex_dd(0.0f),flex_dd(0.0f),sign};
+#endif
   } else if (object.kind==COMMON_CCD_CAPSULE) {
     local=flex_dd3_scale(local_direction,object.size[0]);
+#if COMMON_CCD_USE_LIBCCD
+    // mjccd_support capsule adapter: mju_sign axial (zero stays zero).
+    int csign=flex_dd_compare_exact(local_direction.z,flex_dd(0.0f));
+    FlexDD caxial=csign>0 ? object.size[1] :
+        (csign<0 ? flex_dd_neg(object.size[1]) : flex_dd(0.0f));
+    local.z=flex_dd_source_add(local.z,caxial);
+#else
     FlexDD axial=flex_dd_compare_exact(local_direction.z,flex_dd(0.0f))>=0
                     ? object.size[1] : flex_dd_neg(object.size[1]);
     local.z=flex_dd_source_add(local.z,axial);
+#endif
   } else if (object.kind==COMMON_CCD_BOX) {
+#if COMMON_CCD_USE_LIBCCD
+    // mjccd_support box adapter: mju_sign per axis (zero stays zero).
+    int sx=flex_dd_compare_exact(local_direction.x,flex_dd(0.0f));
+    int sy=flex_dd_compare_exact(local_direction.y,flex_dd(0.0f));
+    int sz=flex_dd_compare_exact(local_direction.z,flex_dd(0.0f));
+    local=FlexDD3{
+        sx>0 ? object.size[0] : (sx<0 ? flex_dd_neg(object.size[0]) : flex_dd(0.0f)),
+        sy>0 ? object.size[1] : (sy<0 ? flex_dd_neg(object.size[1]) : flex_dd(0.0f)),
+        sz>0 ? object.size[2] : (sz<0 ? flex_dd_neg(object.size[2]) : flex_dd(0.0f))};
+    out.selected_vertex=(sx>0 ? 1 : 0) | (sy>0 ? 2 : 0) | (sz>0 ? 4 : 0);
+#else
     local=FlexDD3{
         flex_dd_compare_exact(local_direction.x,flex_dd(0.0f))>=0
             ? object.size[0] : flex_dd_neg(object.size[0]),
@@ -156,6 +183,7 @@ static inline CommonCCDSupportResult common_ccd_support(
                             flex_dd(0.0f))>=0 ? 1 : 0)
         | (flex_dd_compare_exact(local_direction.y,flex_dd(0.0f))>=0 ? 2 : 0)
         | (flex_dd_compare_exact(local_direction.z,flex_dd(0.0f))>=0 ? 4 : 0);
+#endif
   } else if (object.kind==COMMON_CCD_ELLIPSOID) {
     FlexDD3 scaled=FlexDD3{
         flex_dd_mul(local_direction.x,object.size[0]),
@@ -176,6 +204,28 @@ static inline CommonCCDSupportResult common_ccd_support(
           flex_dd_mul(scaled.z,flex_dd_mul(norm_inv,object.size[2]))};
     }
   } else if (object.kind==COMMON_CCD_CYLINDER) {
+#if COMMON_CCD_USE_LIBCCD
+    // mjccd_support cylinder adapter order: separate squares, sqrt, strict
+    // mjMINVAL test on the root, (local/tmp)*size order, mju_sign axial.
+    FlexDD cyl_n2=flex_dd_source_add(
+        flex_dd_source_mul(local_direction.x,local_direction.x),
+        flex_dd_source_mul(local_direction.y,local_direction.y));
+    FlexDD cyl_tmp=flex_dd_source_sqrt(cyl_n2);
+    FlexDD cyl_minval=FlexDD{1.0000000036274937e-15f,-3.627493647833322e-24f,0.0f};
+    FlexDD cyl_rx, cyl_ry;
+    if (flex_dd_compare_exact(cyl_tmp,cyl_minval)>0) {
+      cyl_rx=flex_dd_source_mul(
+          flex_dd_source_div(local_direction.x,cyl_tmp),object.size[0]);
+      cyl_ry=flex_dd_source_mul(
+          flex_dd_source_div(local_direction.y,cyl_tmp),object.size[0]);
+    } else {
+      cyl_rx=flex_dd(0.0f); cyl_ry=flex_dd(0.0f);
+    }
+    int cyl_sign=flex_dd_compare_exact(local_direction.z,flex_dd(0.0f));
+    FlexDD cyl_axial=cyl_sign>0 ? object.size[1] :
+        (cyl_sign<0 ? flex_dd_neg(object.size[1]) : flex_dd(0.0f));
+    local=FlexDD3{cyl_rx,cyl_ry,cyl_axial};
+#else
     // The installed cylinder callback fuses x*x into the rounded y*y.
     // Separately rounding both squares changes EPA's smooth support ties.
     FlexDD norm2=flex_dd_source_fma(local_direction.x,local_direction.x,
@@ -188,6 +238,7 @@ static inline CommonCCDSupportResult common_ccd_support(
         ? object.size[1] : flex_dd_neg(object.size[1]);
     local=FlexDD3{flex_dd_mul(scl,local_direction.x),
                   flex_dd_mul(scl,local_direction.y),axial};
+#endif
   } else if (object.kind==COMMON_CCD_FLEX_ELEMENT) {
     // mjc_flexSupport selects the first element vertex attaining the strict
     // maximum projection, then adds flex_radius + margin/2 along the original
