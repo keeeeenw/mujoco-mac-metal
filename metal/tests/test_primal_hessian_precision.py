@@ -392,7 +392,7 @@ def test_primal_hessian_shader_uses_compensated_products_and_keeps_true_toleranc
   assert "scale, nv, nullptr, 0);" in rescale
   assert "an exactly zero represented residual" in solver
   assert "device float* product_scale" in shader
-  assert "absolute_scale += abs(mij)" in shader
+  assert "absolute_scale += (abs(mij) + abs(mij_low))" in shader
   assert "absolute_scale += abs(row_hessian[row])" in shader
   assert "absolute_scale += abs(ccj_get(J, start + a, dof, nv)) * hv_scale;" in shader
   assert "PrimalFloatPair contribution = primal_pair_product(coefficient, jd);" in shader
@@ -860,7 +860,10 @@ def test_native_paired_hessian_operator_matches_basis_reconstruction():
       [.9, .1, -.8, .3, .7, -.2],
   ], dtype=np.float64)
   row_r = np.array([.7, .2, .4, .6, .8], dtype=np.float32)
-  row_hessian = np.array([.65, 0, 0, 0, 0], dtype=np.float32)
+  # A positive scalar row contributes the source 1/R weight. Its stored
+  # high word enables the row; an arbitrary positive synthetic weight would
+  # contradict the canonical physics operator this witness executes.
+  row_hessian = np.array([1.0 / float(row_r[0]), 0, 0, 0, 0], dtype=np.float32)
   residual = np.array([0, -.1, .4, -.2, .3], dtype=np.float32)
   residual_low = np.array([0, 2e-8, -3e-8, 1e-8, -2e-8], dtype=np.float32)
   friction = np.array([.8, .6, .04, .1, .2], dtype=np.float32)
@@ -896,7 +899,7 @@ def test_native_paired_hessian_operator_matches_basis_reconstruction():
   _, cone_hessian = _middle_elliptic_force_hessian(
       residual[1:].astype(np.float64) + residual_low[1:].astype(np.float64),
       row_r[1:].astype(np.float64), friction.astype(np.float64))
-  expected = mass + row_hessian[0] * np.outer(jacobian[0], jacobian[0])
+  expected = mass + (1.0 / float(row_r[0])) * np.outer(jacobian[0], jacobian[0])
   expected += jacobian[1:].T @ cone_hessian @ jacobian[1:]
   direction = vector.astype(np.float64) + vector_low.astype(np.float64)
   np.testing.assert_allclose(basis, expected, rtol=3e-5, atol=3e-5)

@@ -70,10 +70,12 @@ def test_actual_contact_jacobian_reference_and_inverse_mass_rows(profile,solver)
     z=debug[zbase:zbase+nr*nv].reshape(nr,nv)+debug[zlowbase:zlowbase+nr*nv].reshape(nr,nv)
     if result['mass_matrix'] is not None:
       mass=result['mass_matrix'][0].cpu().numpy().astype(float)
+      mass+=result['mass_matrix_low'][0].cpu().numpy()
     else:
       # This fixture owns a single six-DOF component, stored row-major.
       assert result['mass_blocks'][0].numel()==nv*nv
       mass=result['mass_blocks'][0].cpu().numpy().astype(float).reshape(nv,nv)
+      mass+=result['mass_blocks_low'][0].cpu().numpy().reshape(nv,nv)
     np.testing.assert_allclose(z[rows],np.linalg.solve(mass,effective[rows].T).T,
                                rtol=2e-11,atol=2e-11)
     np.testing.assert_array_equal(sim.step().cpu().numpy(),0)

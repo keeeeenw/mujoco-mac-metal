@@ -168,7 +168,10 @@ def solver_debug_layout(nv, nr, solver_type, ntree=0, nbody=0,
   # The final nv plane retains the immutable smooth-acceleration low word while
   # primal islands update their own accepted acceleration pairs.
   high_low_workspace_length = 8 * max(v, 1) + 9 * max(r, 1) + nv * nr
-  final_stride = high_low_debug_offset + high_low_workspace_length
+  mass_residual_offset = high_low_debug_offset + high_low_workspace_length
+  mass_residual_words = (v * v if mass_storage == "dense"
+                         else 2 * values["component_nnz"])
+  final_stride = mass_residual_offset + mass_residual_words
   if min(qacc_offset, equality_scratch_offset) < prefix:
     raise ValueError("solver scratch layout overlaps the debug prefix")
   if final_stride > SIGNED_I32_ELEMENT_LIMIT:
@@ -189,6 +192,8 @@ def solver_debug_layout(nv, nr, solver_type, ntree=0, nbody=0,
       "high_low_debug_offset": high_low_debug_offset,
       "high_low_workspace_offset": high_low_workspace_offset,
       "high_low_workspace_length": high_low_workspace_length,
+      "mass_residual_offset": mass_residual_offset,
+      "mass_residual_words": mass_residual_words,
   }
 
 
@@ -1418,13 +1423,16 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
                   if mass_storage == "block_sparse" and component_configured
                   else 0)
                + 8 * max(int(nv), 1) + 9 * max(int(nr), 1)
-               + int(nv) * int(nr))))),
+               + int(nv) * int(nr)
+               + (int(nv) ** 2 if mass_storage == "dense"
+                  else 2 * int(component_nnz)))))),
       # One constructor-owned signed-int32 tensor contains the 22 scalar
       # dimensions, six island offsets, dof-tree map (guarded at nv=0), ten
-      # canonical row words per row, and 20 appended solver/component
-      # offsets. Count the complete backing rather than only its tail.
+      # canonical row words per row, and 22 appended solver/component
+      # offsets plus the per-world selection mask. Count the complete backing
+      # rather than only its tail.
       ("solver_dims", _bytes_i32(
-          22 + 6 + max(nv, 1) + 10 * int(nr) + 20)),
+          22 + 6 + max(nv, 1) + 10 * int(nr) + 22 + b)),
       ("contact.body_dims", _bytes_i32(6 + b)),
       ("out_force", _bytes(guarded(b * v))),
       # Keep an independently addressable low word for qacc beside the

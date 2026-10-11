@@ -3178,6 +3178,10 @@ class MetalSimulation:
         tendon_J_spatial=_ten_J, tendon_length_spatial=_ten_L,
         flex=self._flex, qacc_warmstart=state._qacc_warmstart,
         qfrc_smooth_low=rhs_low,
+        mass_low=(None if self._component_mass_enabled
+                  else dynamics.get("mass_matrix_low")),
+        mass_blocks_low=(dynamics.get("mass_blocks_low")
+                         if self._component_mass_enabled else None),
         awake_tree=getattr(getattr(self, "_sleep_schedule", None), "tree_awake", None),
         component_solver=(self._component_solver
                           if self._component_mass_enabled else None),
@@ -3193,8 +3197,10 @@ class MetalSimulation:
                       else None),
     )
     coupled["mass_matrix"] = dynamics.get("mass_matrix")
+    coupled["mass_matrix_low"] = dynamics.get("mass_matrix_low")
     if self._component_mass_enabled:
       coupled["mass_blocks"] = dynamics["mass_blocks"]
+      coupled["mass_blocks_low"] = dynamics.get("mass_blocks_low")
       coupled["mass_block_layout"] = self._smooth.mass_block_layout
       coupled["tendon_armature_blocks"] = dynamics.get(
           "tendon_armature_blocks")
@@ -5063,6 +5069,10 @@ class MetalSimulation:
           cdof_dot=velocity["dynamics"]["cdof_dot"],
           qacc_smooth=acceleration["qacc_smooth"],
           qacc_smooth_low=acceleration.get("qacc_low"),
+          mass_low=(None if self._component_mass_enabled
+                    else velocity["dynamics"].get("mass_matrix_low")),
+          mass_blocks_low=(velocity["dynamics"].get("mass_blocks_low")
+                           if self._component_mass_enabled else None),
           world_mask=world_mask_i32,
           exact_impedance=self._constraint_impedance,
           exact_dense_solver=self._exact_impedance_dense_solver)
@@ -6359,11 +6369,17 @@ class MetalSimulation:
           exact_impedance=self._constraint_impedance,
           exact_dense_solver=self._exact_impedance_dense_solver,
           qfrc_smooth_low=self._rhs_low,
+          mass_low=(None if self._component_mass_enabled
+                    else dynamics.get("mass_matrix_low")),
+          mass_blocks_low=(dynamics.get("mass_blocks_low")
+                           if self._component_mass_enabled else None),
           world_mask=world_mask_i32,
       )
       coupled["mass_matrix"] = dynamics.get("mass_matrix")
+      coupled["mass_matrix_low"] = dynamics.get("mass_matrix_low")
       if self._component_mass_enabled:
         coupled["mass_blocks"] = dynamics["mass_blocks"]
+        coupled["mass_blocks_low"] = dynamics.get("mass_blocks_low")
         coupled["mass_block_layout"] = self._smooth.mass_block_layout
         coupled["tendon_armature_blocks"] = dynamics.get(
             "tendon_armature_blocks")

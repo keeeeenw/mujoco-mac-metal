@@ -55,7 +55,7 @@ def test_workspace_mirror_is_byte_exact_cpu():
   # The independent high/low tail adds 8*nv + 9*nr words (35 here),
   # including the retained aref residual row. Keep this expected
   # arithmetic independent of the estimator helper.
-  assert by_name["workspace_debug"] == 2 * (9 + 21 + 107 + 35 + 3) * 4
+  assert by_name["workspace_debug"] == 2 * (9 + 21 + 107 + 35 + 3 + 1) * 4
   assert by_name["out_force"] == 2 * 1 * 4
   assert by_name["out_acc"] == 2 * 2 * 1 * 4
   assert by_name["out_status"] == 2 * 4
@@ -331,7 +331,7 @@ def test_paired_correction_accounts_independent_inverse_row_low_cpu():
   d1 = dict(parts2)["workspace_debug"] - by_name["workspace_debug"]
   # Independent arithmetic: dense factor +15, high/low inverse rows
   # +16 each, equality scratch +12, qacc pair +2 and DOF tail +8 words.
-  assert d1 == (15 + 16 + 16 + 12 + 2 + 8) * 4
+  assert d1 == (15 + 16 + 16 + 12 + 2 + 8 + 13) * 4
 
 
 

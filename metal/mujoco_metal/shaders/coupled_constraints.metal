@@ -198,8 +198,19 @@ inline bool solver_factor_component_mass(device const float* mass,
   // reused for rounded factors. Residuals and all primal mass products must
   // target M itself, never a reconstruction L*L^T of the float factor.
   device float* original_mass = debug + layout_offset + 2*ncomponent + 1 + 3*nv;
-  for (int index=0; index<nnz; index++)
-    original_mass[index] = mass[mass_base+index] + factor[index];
+  bool residual_enabled = (dims[7] & 512) != 0;
+  device float* original_low = residual_enabled ? debug + dims[header+21] : debug;
+  for (int index=0; index<nnz; index++) {
+    float a=mass[mass_base+index], b=factor[index];
+    float hi=a+b, virt=hi-a;
+    float lo=(a-(hi-virt))+(b-virt);
+    if (residual_enabled) {
+      lo += original_low[index] + original_low[nnz+index];
+      float sum=hi+lo, v=sum-hi;
+      original_low[index]=(hi-(sum-v))+(lo-v);
+      original_mass[index]=sum;
+    } else original_mass[index]=hi;
+  }
   for (int component = 0; component < ncomponent; ++component) {
     int begin = layout[component];
     int end = layout[component + 1];
@@ -218,7 +229,8 @@ inline bool solver_factor_component_mass(device const float* mass,
           factor[index] = 0.0f;
           continue;
         }
-        float value = mass[mass_base + index] + factor[index];
+        if (residual_enabled && !isfinite(original_low[index])) return false;
+        float value = original_mass[index];
         for (int k = 0; k < j; ++k)
           value -= factor[block + i * width + k]
               * factor[block + j * width + k];
@@ -282,6 +294,25 @@ inline float solver_component_mass_entry(device const float* debug,
   int block_offset = layout[ncomponent + 1 + nv + ci];
   device const float* original_mass = debug + layout_offset + 2*ncomponent + 1 + 3*nv;
   return original_mass[block_offset + li*width + lj];
+}
+
+// Original mass residual, distinct from rounded factor/preconditioner scratch.
+// The marker guards legacy standalone witnesses that have no extended metadata.
+inline float solver_operator_mass_low(device const float* debug,
+    constant int* dims, int nv, int i, int j, bool sparse_mass) {
+  if ((dims[7] & 512) == 0) return 0.0f;
+  int header=dims[24]+dims[9]*10;
+  device const float* low=debug+dims[header+21];
+  if (!sparse_mass) return low[i*nv+j];
+  int nc=dims[header], layout_offset=dims[header+3];
+  device const int* layout=reinterpret_cast<device const int*>(debug)+layout_offset;
+  int ci=layout[2*nc+1+nv+i], cj=layout[2*nc+1+nv+j];
+  if (ci!=cj || ci<0 || ci>=nc) return 0;
+  int li=layout[2*nc+1+2*nv+i], lj=layout[2*nc+1+2*nv+j];
+  int width=layout[ci+1]-layout[ci];
+  if (li<0 || lj<0 || li>=width || lj>=width) return 0;
+  int offset=layout[nc+1+nv+ci];
+  return low[offset+li*width+lj];
 }
 
 inline void solver_component_mass_apply_difference(device const float* debug,
@@ -2109,6 +2140,13 @@ inline float primal_compensated_dot(device const float* a,
 // float32 PCG and line-search stages.  The low word is part of the solver
 // state, not a relaxed residual allowance: convergence checks evaluate the
 // original operator on hi+lo before the public float32 result is emitted.
+inline void primal_compensated_mass_product3_add(float a, float m_hi,
+    float m_low, float c, thread float& sum, thread float& correction) {
+  primal_compensated_product3_add(a, m_hi, c, sum, correction);
+  if (m_low != 0.0f)
+    primal_compensated_product3_add(a, m_low, c, sum, correction);
+}
+
 struct PrimalFloatPair {
   float hi;
   float lo;
@@ -3349,10 +3387,11 @@ inline void primal_refresh_pair_state(device const float* mass,
       float entry = sparse_mass
           ? solver_component_mass_entry(debug, dims, nv, dof, other)
           : mass[dof * nv + other];
-      primal_compensated_product_add(entry, acc[other], value, correction);
-      primal_compensated_product_add(entry, acc_low[other], value, correction);
-      primal_compensated_product_add(-entry, q0[other], value, correction);
-      primal_compensated_product_add(-entry, q0_low[other], value, correction);
+      float entry_low = solver_operator_mass_low(debug, dims, nv, dof, other, sparse_mass);
+      primal_compensated_product_add_eff(entry, entry_low, acc[other], value, correction);
+      primal_compensated_product_add_eff(entry, entry_low, acc_low[other], value, correction);
+      primal_compensated_product_add_eff(-entry, -entry_low, q0[other], value, correction);
+      primal_compensated_product_add_eff(-entry, -entry_low, q0_low[other], value, correction);
     }
     PrimalFloatPair g = primal_pair_renormalize(value, correction);
     gradient[dof] = g.hi;
@@ -3462,10 +3501,11 @@ inline void primal_mass_difference_pair(device const float* mass,
       float entry = sparse_mass
           ? solver_component_mass_entry(debug, dims, nv, dof, other)
           : mass[dof * nv + other];
-      primal_compensated_product_add(entry, acc[other], sum, correction);
-      primal_compensated_product_add(entry, acc_low[other], sum, correction);
-      primal_compensated_product_add(-entry, q0[other], sum, correction);
-      primal_compensated_product_add(-entry, q0_low[other], sum, correction);
+      float entry_low = solver_operator_mass_low(debug, dims, nv, dof, other, sparse_mass);
+      primal_compensated_product_add_eff(entry, entry_low, acc[other], sum, correction);
+      primal_compensated_product_add_eff(entry, entry_low, acc_low[other], sum, correction);
+      primal_compensated_product_add_eff(-entry, -entry_low, q0[other], sum, correction);
+      primal_compensated_product_add_eff(-entry, -entry_low, q0_low[other], sum, correction);
     }
     PrimalFloatPair value = primal_pair_renormalize(sum, correction);
     difference[dof] = value.hi;
@@ -3483,7 +3523,8 @@ inline void primal_mass_product(device const float* mass, bool sparse_mass,
       float entry = sparse_mass
           ? solver_component_mass_entry(debug, dims, nv, i, j)
           : mass[i * nv + j];
-      primal_compensated_product_add(entry, vector[j], value, correction);
+      float entry_low = solver_operator_mass_low(debug, dims, nv, i, j, sparse_mass);
+      primal_compensated_product_add_eff(entry, entry_low, vector[j], value, correction);
     }
     product[i] = value + correction;
   }
@@ -3499,8 +3540,9 @@ inline void primal_mass_product_pair(device const float* mass,
       float entry = sparse_mass
           ? solver_component_mass_entry(debug, dims, nv, i, j)
           : mass[i * nv + j];
-      primal_compensated_product_add(entry, vector[j], sum, correction);
-      primal_compensated_product_add(entry, vector_low[j], sum, correction);
+      float entry_low = solver_operator_mass_low(debug, dims, nv, i, j, sparse_mass);
+      primal_compensated_product_add_eff(entry, entry_low, vector[j], sum, correction);
+      primal_compensated_product_add_eff(entry, entry_low, vector_low[j], sum, correction);
     }
     PrimalFloatPair result = primal_pair_renormalize(sum, correction);
     product[i] = result.hi;
@@ -3558,10 +3600,11 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
       float mij = sparse_mass
           ? solver_component_mass_entry(debug, dims, nv, dof, other)
           : mass[dof * nv + other];
-      primal_compensated_product_add(mij, vector[other], value, correction);
-      primal_compensated_product_add(mij, vector_low[other], value, correction);
+      float mij_low = solver_operator_mass_low(debug, dims, nv, dof, other, sparse_mass);
+      primal_compensated_product_add_eff(mij, mij_low, vector[other], value, correction);
+      primal_compensated_product_add_eff(mij, mij_low, vector_low[other], value, correction);
       if (product_scale)
-        absolute_scale += abs(mij)
+        absolute_scale += (abs(mij) + abs(mij_low))
             * (abs(vector[other]) + abs(vector_low[other]));
     }
     for (int row = 0; row < n; ++row) {
@@ -5252,13 +5295,14 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
       float mij = sparse_mass
           ? solver_component_mass_entry(debug, dims, nv, i, j)
           : mass[i * nv + j];
-      primal_compensated_product3_add(direction[i], mij, direction[j],
+      float mij_low = solver_operator_mass_low(debug, dims, nv, i, j, sparse_mass);
+      primal_compensated_mass_product3_add(direction[i], mij, mij_low, direction[j],
           gauss_quadratic, gauss_quadratic_correction);
-      primal_compensated_product3_add(direction[i], mij, direction_low[j],
+      primal_compensated_mass_product3_add(direction[i], mij, mij_low, direction_low[j],
           gauss_quadratic, gauss_quadratic_correction);
-      primal_compensated_product3_add(direction_low[i], mij, direction[j],
+      primal_compensated_mass_product3_add(direction_low[i], mij, mij_low, direction[j],
           gauss_quadratic, gauss_quadratic_correction);
-      primal_compensated_product3_add(direction_low[i], mij,
+      primal_compensated_mass_product3_add(direction_low[i], mij, mij_low,
           direction_low[j], gauss_quadratic, gauss_quadratic_correction);
     }
   }
@@ -5465,7 +5509,8 @@ inline bool primal_mass_solve_island(device const float* mass,
         float mij = sparse_mass
             ? solver_component_mass_entry(debug, dims, nv, i, j)
             : mass[i * nv + j];
-        primal_compensated_product_add(mij, direction[j], value, correction);
+        float mij_low = solver_operator_mass_low(debug, dims, nv, i, j, sparse_mass);
+        primal_compensated_product_add_eff(mij, mij_low, direction[j], value, correction);
       }
       product[i] = value + correction;
     }
@@ -5500,7 +5545,8 @@ inline bool primal_mass_solve_island(device const float* mass,
           float mij = sparse_mass
               ? solver_component_mass_entry(debug, dims, nv, i, j)
               : mass[i * nv + j];
-          primal_compensated_product_add(mij, solution[j], value, correction);
+          float mij_low = solver_operator_mass_low(debug, dims, nv, i, j, sparse_mass);
+          primal_compensated_product_add_eff(mij, mij_low, solution[j], value, correction);
         }
         product[i] = value + correction;
       }
@@ -5645,8 +5691,9 @@ __attribute__((noinline)) bool primal_hessian_mass_precondition_pair_elliptic(
       float mij = sparse_mass
           ? solver_component_mass_entry(debug, dims, nv, dof, other)
           : mass[dof * nv + other];
-      primal_compensated_product_add(mij, solution_hi[other], sum, correction);
-      primal_compensated_product_add(mij, solution_low[other], sum, correction);
+      float mij_low = solver_operator_mass_low(debug, dims, nv, dof, other, sparse_mass);
+      primal_compensated_product_add_eff(mij, mij_low, solution_hi[other], sum, correction);
+      primal_compensated_product_add_eff(mij, mij_low, solution_low[other], sum, correction);
     }
     PrimalFloatPair product = primal_pair_renormalize(sum, correction);
     PrimalFloatPair residual = primal_pair_add(
@@ -5733,7 +5780,8 @@ __attribute__((noinline)) bool primal_cg_mass_precondition_pair_elliptic(
       float mij = sparse_mass
           ? solver_component_mass_entry(debug, dims, nv, dof, other)
           : mass[dof * nv + other];
-      primal_compensated_product_add(mij, solution_hi[other], sum, correction);
+      float mij_low = solver_operator_mass_low(debug, dims, nv, dof, other, sparse_mass);
+      primal_compensated_product_add_eff(mij, mij_low, solution_hi[other], sum, correction);
     }
     PrimalFloatPair product = primal_pair_renormalize(sum, correction);
     PrimalFloatPair residual = primal_pair_add(
@@ -5780,8 +5828,9 @@ __attribute__((noinline)) bool primal_cg_mass_precondition_pair_elliptic(
       float mij = sparse_mass
           ? solver_component_mass_entry(debug, dims, nv, dof, other)
           : mass[dof * nv + other];
-      primal_compensated_product_add(mij, solution_hi[other], sum, correction);
-      primal_compensated_product_add(mij, low_stash[other], sum, correction);
+      float mij_low = solver_operator_mass_low(debug, dims, nv, dof, other, sparse_mass);
+      primal_compensated_product_add_eff(mij, mij_low, solution_hi[other], sum, correction);
+      primal_compensated_product_add_eff(mij, mij_low, low_stash[other], sum, correction);
     }
     PrimalFloatPair product = primal_pair_renormalize(sum, correction);
     PrimalFloatPair residual = primal_pair_add(
@@ -7358,8 +7407,10 @@ inline void refine_minv_pair(device const float* L,
       if (!solver_dof_awake(dims, awake_tree, j)) continue;
       float mij = solver_mass_entry(mass_world, dbg_pre, dims,
           awake_tree, world, nv, i, j);
+      float mij_low = solver_operator_mass_low(dbg_pre, dims, nv, i, j,
+                                               dims[20] == -3);
       racc = primal_pair_add(racc, primal_pair_product(
-          {mij, 0.0f}, {-u[j], 0.0f}));
+          {mij, mij_low}, {-u[j], 0.0f}));
     }
     t_hi[i] = racc.hi; t_lo[i] = racc.lo;
   }
@@ -7620,7 +7671,7 @@ inline bool solver_component_force_pair(device const float* debug,
     device const float* rhs_low, device float* result, device float* result_low,
     device float* scratch) {
   int nv=dims[1];
-  bool has_low=false;
+  bool has_low=(dims[7] & 512) != 0;
   for(int dof=0;dof<nv;dof++) {
     result_low[dof]=0;
     has_low=has_low || rhs_low[dof]!=0;
@@ -7637,7 +7688,7 @@ inline bool solver_component_row_pair(device const float* mass,
     device const float* debug, constant int* dims, device const int* awake,
     device const float* J, int row, int nv, device float* result,
     device float* result_low, device float* scratch) {
-  bool has_low = false;
+  bool has_low = (dims[7] & 512) != 0;
   for (int dof=0; dof<nv; dof++) {
     scratch[dof] = ccj_get(J, row, dof, nv);
     scratch[nv+dof] = ccj_get_lo(J, row, dof, nv);
@@ -8328,7 +8379,14 @@ kernel void solve_coupled_constraints(
   } else {
     // 3. Dense Cholesky factorization of the awake principal mass matrix.
     device const float* mass_world = dims[20] == -3 ? mass : mass + mb;
-    for (int i = 0; i < nv; ++i) for (int j = 0; j < nv; ++j) L[i * nv + j] = 0.0f;
+    for (int i = 0; i < nv; ++i) for (int j = 0; j < nv; ++j) {
+      if (solver_dof_awake(dims, solver_awake_tree, i)
+          && solver_dof_awake(dims, solver_awake_tree, j)
+          && !isfinite(solver_operator_mass_low(dbg_pre, dims, nv, i, j, false))) {
+        out_status[world] = 2; return;
+      }
+      L[i * nv + j] = 0.0f;
+    }
     for (int i = 0; i < nv; ++i) for (int j = 0; j <= i; ++j) {
       if (!solver_dof_awake(dims, solver_awake_tree, i)) {
         L[i * nv + j] = (i == j) ? 1.0f : 0.0f;
@@ -8359,10 +8417,22 @@ kernel void solve_coupled_constraints(
       }
     } else if (paired_qfrc_input) {
       device float* pair_tail = solver_scratch + dims[metadata_header + 15];
-      primal_cholesky_solve_pair(L, nv, solver_awake_tree, dims,
-          qfrc + qb, qfrc + batch * nv + qb,
-          out_acc + qb, out_acc + batch * nv + qb,
-          y, pair_tail + 5 * max(nv, 1));
+      if (dims[7] & 512) {
+        int v = max(nv, 1);
+        if (!primal_cg_mass_precondition_pair_elliptic(mass_world, L, false,
+            dbg_pre, dims, solver_awake_tree, qfrc + qb,
+            qfrc + batch * nv + qb, out_acc + qb,
+            out_acc + batch * nv + qb, pair_tail, pair_tail + v,
+            pair_tail + 2*v, pair_tail + 3*v, pair_tail + 4*v,
+            pair_tail + 5*v, nullptr, 0, false, nv)) {
+          out_status[world] = 2; return;
+        }
+      } else {
+        primal_cholesky_solve_pair(L, nv, solver_awake_tree, dims,
+            qfrc + qb, qfrc + batch * nv + qb,
+            out_acc + qb, out_acc + batch * nv + qb,
+            y, pair_tail + 5 * max(nv, 1));
+      }
     } else {
       for (int i = 0; i < nv; ++i) {
         float v = solver_dof_awake(dims, solver_awake_tree, i) ? qfrc[qb + i] : 0.0f;
@@ -8397,7 +8467,7 @@ kernel void solve_coupled_constraints(
           row_has_lo = true; break;
         }
       }
-      if (!row_has_lo) {
+      if (!row_has_lo && !(dims[7] & 512)) {
         for (int i = 0; i < nv; ++i) {
           float v = solver_dof_awake(dims, solver_awake_tree, i)
               ? ccj_get(J_world, row, i, nv) : 0.0f;
@@ -9625,10 +9695,12 @@ kernel void solve_coupled_constraints(
       PrimalFloatPair rhs = {0.0f, 0.0f};
       if (provided_qacc_smooth) {
         for (int k = 0; k < nv; ++k)
-          rhs = primal_pair_fma(solver_mass_entry(mass_world, dbg_pre,
-              dims, solver_awake_tree, world, nv, i, k),
+          rhs = primal_pair_add(rhs, primal_pair_product(
+              {solver_mass_entry(mass_world, dbg_pre,
+                  dims, solver_awake_tree, world, nv, i, k),
+               solver_operator_mass_low(dbg_pre, dims, nv, i, k, false)},
               {qfrc[qb + k], paired_qfrc_input
-                  ? qfrc[batch * nv + qb + k] : 0.0f}, rhs);
+                  ? qfrc[batch * nv + qb + k] : 0.0f}));
       } else {
         rhs = {qfrc[qb + i], paired_qfrc_input
             ? qfrc[batch * nv + qb + i] : 0.0f};
@@ -9637,9 +9709,11 @@ kernel void solve_coupled_constraints(
           {out_force[qb + i], constraint_force_low[i]});
       PrimalFloatPair mass_product = {0.0f, 0.0f};
       for (int k = 0; k < nv; ++k)
-        mass_product = primal_pair_fma(solver_mass_entry(mass_world,
-            dbg_pre, dims, solver_awake_tree, world, nv, i, k),
-            {out_acc[qb + k], out_acc[batch * nv + qb + k]}, mass_product);
+        mass_product = primal_pair_add(mass_product, primal_pair_product(
+            {solver_mass_entry(mass_world, dbg_pre, dims,
+                 solver_awake_tree, world, nv, i, k),
+             solver_operator_mass_low(dbg_pre, dims, nv, i, k, false)},
+            {out_acc[qb + k], out_acc[batch * nv + qb + k]}));
       PrimalFloatPair residual = primal_pair_add(rhs,
           primal_pair_multiply(mass_product, -1.0f));
       residual_hi[i] = residual.hi;
@@ -10617,7 +10691,14 @@ kernel void solve_coupled_constraints_block(
     }
   } else {
   device const float* mass_world = mass + mb;
-  for (int i = 0; i < nv; ++i) for (int j = 0; j < nv; ++j) L[i * nv + j] = 0.0f;
+  for (int i = 0; i < nv; ++i) for (int j = 0; j < nv; ++j) {
+    if (solver_dof_awake(dims, solver_awake_tree, i)
+        && solver_dof_awake(dims, solver_awake_tree, j)
+        && !isfinite(solver_operator_mass_low(dbg, dims, nv, i, j, false))) {
+      out_status[world] = 2; return;
+    }
+    L[i * nv + j] = 0.0f;
+  }
   for (int i = 0; i < nv; ++i) for (int j = 0; j <= i; ++j) {
     if (!solver_dof_awake(dims, solver_awake_tree, i)) {
       L[i * nv + j] = (i == j) ? 1.0f : 0.0f;

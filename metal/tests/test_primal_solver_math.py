@@ -321,7 +321,7 @@ def test_pair_mass_preconditioner_clears_low_word_before_matrix_product():
       "for (int dof = 0; dof < nv; ++dof) {", clear + len(
           "for (int dof = 0; dof < nv; ++dof) solution_low[dof] = 0.0f;"))
   assert clear < residual_rows
-  residual_product = helper.index("primal_compensated_product_add(mij, solution_low[other]")
+  residual_product = helper.index("primal_compensated_product_add_eff(mij, mij_low, solution_low[other]")
   assert residual_rows < residual_product
   assert "!solver_dof_awake(dims, awake_tree, other)" in helper
   assert "bool direct = !partitioned && (sparse_mass || !has_inactive_dof);" in helper

@@ -26,7 +26,8 @@ def test_component_tail_does_not_move_per_world_scratch_offsets():
         sparse["high_low_debug_offset"] - sparse["debug_prefix"])
     assert sparse["high_low_workspace_length"] == 8 * 7 + 9 * 23 + 7 * 23
     assert sparse["final_stride"] == (
-        sparse["high_low_debug_offset"]
+        sparse["mass_residual_offset"] + sparse["mass_residual_words"])
+    assert sparse["mass_residual_offset"] == (sparse["high_low_debug_offset"]
         + sparse["high_low_workspace_length"])
     # For batch 2+, the shader's world stride lands the second world at the
     # true next debug record, rather than in world zero's sparse tail.
@@ -45,7 +46,8 @@ def test_qacc_tail_and_dynamic_equality_scratch_are_disjoint():
   assert layout["base_stride"] <= layout["component_armature_offset"]
   assert layout["component_original_mass_offset"] + 211 == layout["high_low_debug_offset"]
   assert layout["component_layout_offset"] + 317 == layout["component_original_mass_offset"]
-  assert layout["high_low_debug_offset"] + layout["high_low_workspace_length"] == layout["final_stride"]
+  assert layout["high_low_debug_offset"] + layout["high_low_workspace_length"] == layout["mass_residual_offset"]
+  assert layout["mass_residual_offset"] + layout["mass_residual_words"] == layout["final_stride"]
 
 
 def test_cached_smooth_acceleration_stage_flag_composes_and_restores():
@@ -138,7 +140,9 @@ def test_high_low_tail_is_world_local_and_after_all_existing_regions():
       assert tail_start == layout["component_original_mass_offset"] + nnz
       assert layout["component_original_mass_offset"] == layout["component_layout_offset"] + layout_words
       assert tail_words == 8 * max(nv, 1) + 9 * max(nr, 1) + nv * nr
-      assert tail_start + tail_words == layout["final_stride"]
+      assert tail_start + tail_words == layout["mass_residual_offset"]
+      assert layout["mass_residual_words"] == 2 * nnz
+      assert layout["mass_residual_offset"] + 2 * nnz == layout["final_stride"]
       assert layout["high_low_workspace_offset"] == (
           tail_start - layout["debug_prefix"])
       # Each world owns a disjoint full record, including its scratch tail.

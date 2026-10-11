@@ -237,6 +237,10 @@ class MetalConstraintImpedance:
       int32 = np.iinfo(np.int32)
       for raw_start, raw_condim, raw_kind in raw_groups:
         start, condim, kind = int(raw_start), int(raw_condim), int(raw_kind)
+        # The cone lowering emits one physical inert slot when no logical
+        # cones exist. It has no row span and the shader skips its kind.
+        if (start, condim, kind) == (0, 0, 0):
+          continue
         nrows = condim if kind == 1 else 2 * (condim - 1)
         if (not int32.min <= start <= int32.max
             or not int32.min <= condim <= int32.max
@@ -312,8 +316,8 @@ class MetalConstraintImpedance:
   def solve_mass_rows_device(self, jacobian, active_rows, *,
                              mass_storage, solver, mass,
                              mass_blocks=None, dof_ids=None, counts=None,
-                             tendon_armature_blocks=None,
-                             packed_jacobian=False):
+                             tendon_armature_blocks=None, mass_blocks_low=None,
+                             tendon_armature_blocks_low=None, packed_jacobian=False):
     """Apply the prepared mass factor to each active canonical row RHS.
 
     The returned layout matches the native diagonal contraction: dense solves
@@ -355,11 +359,13 @@ class MetalConstraintImpedance:
           jacobian.reshape(-1), self._workspace["active_rows"].reshape(-1),
           rhs.reshape(-1),
           self._pack_dims,
-          threads=(self.batch_size, self.row_capacity, self.dof_capacity),
+          threads=(self.batch_size, self.row_capacity + 1, self.dof_capacity),
           group_size=(1, 1, 1))
       return solver.run_device(
           mass_blocks, rhs, dof_ids=dof_ids, counts=counts,
-          tendon_armature_blocks=tendon_armature_blocks)
+          tendon_armature_blocks=tendon_armature_blocks,
+          mass_blocks_low=mass_blocks_low,
+          tendon_armature_blocks_low=tendon_armature_blocks_low)
     if mass_storage == "dense":
       if solver is None or mass is None or not hasattr(solver, "run_device"):
         raise ValueError("dense row solve requires its factor and mass matrix")

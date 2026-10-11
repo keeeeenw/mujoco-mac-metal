@@ -61,6 +61,23 @@ def test_static_contact_cone_lowering_returns_one_inert_empty_sentinel():
   np.testing.assert_array_equal(friction, np.zeros((1, 5), dtype=np.float32))
 
 
+def test_real_empty_contact_descriptor_has_no_logical_cone_slot():
+  import mujoco
+  from mujoco_metal.coupled_constraints import lower_coupled_constraints
+  model = mujoco.MjModel.from_xml_string('''<mujoco>
+    <worldbody><body><joint type="free" frictionloss=".125"/>
+      <inertial pos="0 0 0" mass="1.3" diaginertia=".02 .03 .04"/>
+    </body></worldbody></mujoco>''')
+  descriptor = lower_coupled_constraints(model)
+  assert descriptor.npairs == descriptor.ncontacts_max == 0
+  assert descriptor.contact_condim_packed.shape == (0,)
+  assert descriptor.contact_friction.shape == (0, 5)
+  assert descriptor.contact_solreffriction.shape == (0, 2)
+  groups, friction = compile_contact_cone_groups(descriptor)
+  np.testing.assert_array_equal(groups, np.zeros((1, 3), dtype=np.int32))
+  np.testing.assert_array_equal(friction, np.zeros((1, 5), dtype=np.float32))
+
+
 def test_static_cone_lowering_matches_compiled_rigid_contact_descriptor():
   import mujoco
   from mujoco_metal.coupled_constraints import lower_coupled_constraints

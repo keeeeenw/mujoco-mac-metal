@@ -66,10 +66,18 @@ The development `MetalSmoothDynamics` stage also exposes `mass_matrix_low` or
 source `dof_M0` constants; generic CRBA rows currently have zero residuals.
 `mass_matrix_pair(qpos_batch)` returns owned dense high/low matrices at an
 explicit query boundary. Retained position contexts own both planes. Component
-smooth-force solves and discrete inverse mass operations consume these words;
-coupled constraint solves and effective implicit operators still need that
+smooth-force solves, discrete inverse mass operations and fresh/cached coupled
+PGS, CG and Newton operators consume these words. The coupled device APIs accept
+optional contiguous float32 MPS `mass_low` of shape `[batch,nv,nv]` on the dense
+route, or `mass_blocks_low` and `tendon_armature_blocks_low` of shape
+`[batch,component_nnz]` on the component route. Metadata is validated before
+residual staging; selected operator words are copied into owned, admitted debug
+storage without adding a shader buffer binding. Component exact-impedance row
+solves also accept these residual inputs. Dense exact-impedance row solves,
+effective implicit operators and general articulated CRBA still need precision
 integration. A residual-bearing output is not a claim of complete binary64
-physics parity. See [producing revisions and qualification](QUALIFICATION.md).
+physics parity or full solver/contact composition. See
+[producing revisions and qualification](QUALIFICATION.md).
 
 
 ## Applied forces, damping and basic motors

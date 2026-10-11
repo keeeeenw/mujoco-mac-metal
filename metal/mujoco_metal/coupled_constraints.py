@@ -166,6 +166,20 @@ def _paired_smooth_input_stage(solver_dims):
 
 
 @contextmanager
+def _mass_residual_input_stage(solver_dims, enabled):
+  """Mark the owned original-operator residual without another MSL binding."""
+  if not enabled:
+    yield
+    return
+  original = int(solver_dims[7])
+  solver_dims[7] = original | 512
+  try:
+    yield
+  finally:
+    solver_dims[7] = original
+
+
+@contextmanager
 def _preassembled_rows_stage(solver_dims):
   """Reuse canonical rows prepared by the immediately preceding dispatch."""
   original = int(solver_dims[7])
@@ -1874,7 +1888,9 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     c_condim = np.empty(0, dtype=np.int32)
     c_friction = np.empty((0, 5), dtype=np.float32)
     c_solreffriction = np.empty((0, 2), dtype=np.float32)
-    c_condim_packed = np.zeros(3, dtype=np.int32)
+    # Descriptors contain logical slots, not the kernel's empty sentinel.
+    # Upload preparation supplies the three-word physical backing separately.
+    c_condim_packed = np.empty(0, dtype=np.int32)
 
 
   geometry = lower_collision_geometry(model, pairs, limits=limits)
@@ -2760,9 +2776,10 @@ class MetalCoupledConstraints:
     # solver-dimensions binding.  This keeps the 31-buffer CC ABI unchanged
     # while allowing every per-world kernel to return before touching a
     # failed or unselected world's workspace.
-    world_mask_offset = int(packed.size) + 1
+    world_mask_offset = int(packed.size) + 2
     self._world_mask_offset = world_mask_offset
-    packed = np.concatenate((packed, np.asarray((world_mask_offset,),
+    packed = np.concatenate((packed, np.asarray((world_mask_offset,
+                                                debug_layout["mass_residual_offset"]),
                                                 dtype=np.int32)))
     packed = np.concatenate((packed, np.ones(self.batch_size, dtype=np.int32)))
     packed[metadata_header + 20] = world_mask_offset
@@ -3034,6 +3051,7 @@ class MetalCoupledConstraints:
     self._regularizer_low_debug_offset = (self._aref_low_debug_offset
                                          + max(nr,1) + nv*nr)
     self._debug_stride = debug_layout["final_stride"]
+    self._mass_residual_offset = debug_layout["mass_residual_offset"]
     if self._component_operator_layout_device is not None:
       self._component_operator_armature_offset = (
           debug_layout["component_armature_offset"])
@@ -4349,7 +4367,8 @@ class MetalCoupledConstraints:
                           awake_counts=None, cdof=None, cdof_dot=None,
                           exact_impedance=None, exact_dense_solver=None,
                           qacc_smooth_low=None, qfrc_smooth_low=None,
-                          world_mask=None):
+                          world_mask=None, mass_low=None, mass_blocks_low=None,
+                          tendon_armature_blocks_low=None):
     """Refresh and solve a captured position context without row assembly.
 
     Candidate generation, FK, equality/tendon/flex row construction and J
@@ -4390,6 +4409,8 @@ class MetalCoupledConstraints:
     if qfrc_smooth_low is not None:
       _validate_cached_tensor(torch, self._device, "qfrc_smooth_low",
                               qfrc_smooth_low, expected_q, torch.float32)
+    self._validate_mass_residual_inputs(
+        component_solver, mass_low, mass_blocks_low, tendon_armature_blocks_low)
     _validate_cached_tensor(torch, self._device, "qpos", qpos, (b, int(d.nq)),
                             torch.float32)
     if poses is not None:
@@ -4496,6 +4517,9 @@ class MetalCoupledConstraints:
     # overwritten the borrowed views. This cache remains valid until another
     # capture or workspace replacement, matching the retained RK4 POS stage.
     w = self._workspace
+    self._stage_mass_residuals(
+        component_solver, mass_low, mass_blocks_low,
+        tendon_armature_blocks_low, world_mask)
     jacobian_stride = int(w["workspace_J"].numel()) // max(b, 1)
     self._copy_world_masked(
         w["workspace_J"], w["position_cache_J"], world_mask,
@@ -4642,8 +4666,10 @@ class MetalCoupledConstraints:
 
     solver_acceleration_input = (qfrc_smooth if qacc_smooth is None
                                  else qacc_smooth)
+    has_mass_residuals = any(value is not None for value in (
+        mass_low, mass_blocks_low, tendon_armature_blocks_low))
     paired_smooth_input = (qacc_smooth is not None or qfrc_smooth_low is not None
-                             ) and int(nv) > 0
+                          or has_mass_residuals) and int(nv) > 0
     if int(nv) > 0 and (d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS)
                         or paired_smooth_input):
       pair = w.get("component_smooth_acceleration_pair")
@@ -4683,23 +4709,24 @@ class MetalCoupledConstraints:
         dispatch_solver_bound(mass_input, smooth_input)
 
     def dispatch_solver_bound(mass_input, smooth_input=None):
-      solve_fn(
-          mass_input.reshape(-1),
-          (solver_acceleration_input if smooth_input is None
-           else smooth_input).reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
-          (self._eq_active_default if eq_active is None else eq_active).reshape(-1),
-          self._constants["joint_qposadr"], self._constants["qpos0"],
-          self._constants["joint_dofadr"], self._constants["joint_limited"],
-          self._constants["joint_limit_params"], self._constants["joint_sol_params"],
-          self._constants["dof_frictionloss"], self._constants["dof_invweight0"],
-          self._constants["dof_sol_params"], self._constants["eq_obj"],
-          self._constants["eq_data"], self._constants["eq_sol_params"],
-          w["contact_jacobian"], w["contact_row_data"],
-          self._constants["contact_friction"], self._constants["contact_condim"],
-          solver_dims, self._constants["solver_params"], w["out_force"], w["out_acc"],
-          w["out_status"], w["out_diagnostics"], w["out_contact_force"],
-          packed_slots, w["workspace_J"], w["workspace_debug"],
-          threads=(b,), group_size=(1,))
+      with _mass_residual_input_stage(solver_dims, has_mass_residuals):
+        solve_fn(
+            mass_input.reshape(-1),
+            (solver_acceleration_input if smooth_input is None
+             else smooth_input).reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
+            (self._eq_active_default if eq_active is None else eq_active).reshape(-1),
+            self._constants["joint_qposadr"], self._constants["qpos0"],
+            self._constants["joint_dofadr"], self._constants["joint_limited"],
+            self._constants["joint_limit_params"], self._constants["joint_sol_params"],
+            self._constants["dof_frictionloss"], self._constants["dof_invweight0"],
+            self._constants["dof_sol_params"], self._constants["eq_obj"],
+            self._constants["eq_data"], self._constants["eq_sol_params"],
+            w["contact_jacobian"], w["contact_row_data"],
+            self._constants["contact_friction"], self._constants["contact_condim"],
+            solver_dims, self._constants["solver_params"], w["out_force"], w["out_acc"],
+            w["out_status"], w["out_diagnostics"], w["out_contact_force"],
+            packed_slots, w["workspace_J"], w["workspace_debug"],
+            threads=(b,), group_size=(1,))
 
     exact_data = None
     if component_solver is None:
@@ -4708,7 +4735,9 @@ class MetalCoupledConstraints:
             exact_impedance, mass=mass,
             exact_dense_solver=exact_dense_solver,
             component_solver=None, mass_blocks=mass_blocks,
-            tendon_armature_blocks=tendon_armature_blocks)
+            tendon_armature_blocks=tendon_armature_blocks,
+            mass_blocks_low=mass_blocks_low,
+            tendon_armature_blocks_low=tendon_armature_blocks_low)
       with _cached_position_stage(
           solver_dims, d.refsafe,
           bool(getattr(self, "_iteration_trace_enabled", False)),
@@ -4722,7 +4751,7 @@ class MetalCoupledConstraints:
               if exact_data is not None else nullcontext()):
         dispatch_solver(mass)
     elif component_primal_route:
-      self._stage_component_operator(tendon_armature_blocks)
+      self._stage_component_operator(tendon_armature_blocks, world_mask)
       with _component_primal_stage(
           solver_dims, d.refsafe, -1, self._line_search_iterations,
           qacc_smooth is not None,
@@ -4736,7 +4765,9 @@ class MetalCoupledConstraints:
             exact_dense_solver=exact_dense_solver,
             component_solver=component_solver, mass_blocks=mass_blocks,
             dof_ids=awake_dof_ids, counts=awake_counts,
-            tendon_armature_blocks=tendon_armature_blocks)
+            tendon_armature_blocks=tendon_armature_blocks,
+            mass_blocks_low=mass_blocks_low,
+            tendon_armature_blocks_low=tendon_armature_blocks_low)
       with _component_primal_stage(
           solver_dims, d.refsafe, -3, self._line_search_iterations,
           qacc_smooth is not None,
@@ -4759,7 +4790,9 @@ class MetalCoupledConstraints:
               exact_dense_solver=exact_dense_solver,
               component_solver=component_solver, mass_blocks=mass_blocks,
               dof_ids=awake_dof_ids, counts=awake_counts,
-              tendon_armature_blocks=tendon_armature_blocks)
+              tendon_armature_blocks=tendon_armature_blocks,
+              mass_blocks_low=mass_blocks_low,
+              tendon_armature_blocks_low=tendon_armature_blocks_low)
         else:
           exact = None
         with (_provided_smooth_acceleration_stage(solver_dims)
@@ -4779,7 +4812,10 @@ class MetalCoupledConstraints:
                   component_rhs.reshape(b, rhs_capacity, nv),
                   dof_ids=awake_dof_ids, counts=awake_counts,
                   tendon_armature_blocks=tendon_armature_blocks,
-                  rhs_low=component_rhs_low.reshape(b, rhs_capacity, nv))))
+                  mass_blocks_low=mass_blocks_low,
+                  tendon_armature_blocks_low=tendon_armature_blocks_low,
+                  rhs_low=component_rhs_low.reshape(b, rhs_capacity, nv),
+                  world_mask=world_mask)))
       with _cached_position_stage(
           solver_dims, d.refsafe,
           bool(getattr(self, "_iteration_trace_enabled", False)),
@@ -4791,7 +4827,8 @@ class MetalCoupledConstraints:
                   _preassembled_rows_stage(solver_dims)
                   if exact_data is not None else nullcontext()):
         dispatch_solver(component_solver.paired_output)
-      component_solver.merge_world_status(component_status, w["out_status"])
+      component_solver.merge_world_status(component_status, w["out_status"],
+                                          world_mask=world_mask)
 
     if exact_data is not None:
       _merge_exact_world_status(torch, w["out_status"], exact_data)
@@ -4886,23 +4923,67 @@ class MetalCoupledConstraints:
       result["exact_impedance"] = exact_data
     return result
 
-  def _stage_component_operator(self, tendon_armature_blocks):
+  def _validate_mass_residual_inputs(self, component_solver, mass_low,
+                                     mass_blocks_low, tendon_armature_blocks_low):
+    """Validate residual metadata before tokens, caches or outputs mutate."""
+    b, nv = self.batch_size, int(self.descriptor.nv)
+    if component_solver is None:
+      if mass_blocks_low is not None or tendon_armature_blocks_low is not None:
+        raise ValueError("component mass residuals require component_solver")
+      if mass_low is not None:
+        _validate_cached_tensor(self._torch, self._device, "mass_low",
+                                mass_low, (b, nv, nv), self._torch.float32)
+    else:
+      if mass_low is not None:
+        raise ValueError("mass_low requires a dense mass route")
+      for name, value in (("mass_blocks_low", mass_blocks_low),
+                          ("tendon_armature_blocks_low", tendon_armature_blocks_low)):
+        if value is not None:
+          _validate_cached_tensor(self._torch, self._device, name, value,
+              (b, int(component_solver.nnz)), self._torch.float32)
+
+  def _stage_mass_residuals(self, component_solver, mass_low, mass_blocks_low,
+                            tendon_armature_blocks_low, world_mask):
+    """Own selected operator residuals in the admitted per-world debug tail."""
+    values = ((mass_low,) if component_solver is None
+              else (mass_blocks_low, tendon_armature_blocks_low))
+    # Inverse assembly is legal on a configured component workspace without
+    # mass inputs. Its mass tail is not a dense-matrix backing.
+    if all(value is None for value in values):
+      return
+    width = (int(self.descriptor.nv) ** 2 if component_solver is None
+             else int(component_solver.nnz))
+    debug = self._workspace["workspace_debug"]
+    for plane, value in enumerate(values):
+      offset = self._mass_residual_offset + plane * width
+      if value is None:
+        self._fill_world_masked(debug, world_mask, width=width,
+                                stride=self._debug_stride, offset=offset)
+      else:
+        self._copy_world_masked(debug, value.reshape(-1), world_mask,
+            width=width, source_stride=width, destination_stride=self._debug_stride,
+            destination_offset=offset)
+
+  def _stage_component_operator(self, tendon_armature_blocks, world_mask=None):
     """Copy the per-step armature into the prebound sparse-operator tail."""
     if self._component_operator_layout_device is None:
       raise ValueError("sparse primal solve requires a configured component layout")
     torch = self._torch
     b, nnz = int(self.batch_size), self._component_operator_nnz
-    debug = self._workspace["workspace_debug"].reshape(b, self._debug_stride)
+    backing = self._workspace["workspace_debug"]
+    debug = backing.reshape(b, self._debug_stride)
     if nnz:
-      armature = debug[:, self._component_operator_armature_offset:
-                       self._component_operator_armature_offset + nnz]
       if tendon_armature_blocks is None:
-        armature.zero_()
+        self._fill_world_masked(backing, world_mask, width=nnz,
+            stride=self._debug_stride, offset=self._component_operator_armature_offset)
       else:
         _validate_cached_tensor(
             torch, self._device, "tendon_armature_blocks",
             tendon_armature_blocks, (b, nnz), torch.float32)
-        armature.copy_(tendon_armature_blocks)
+        self._copy_world_masked(backing, tendon_armature_blocks.reshape(-1),
+            world_mask, width=nnz, source_stride=nnz,
+            destination_stride=self._debug_stride,
+            destination_offset=self._component_operator_armature_offset)
     debug_i32 = debug.view(torch.int32)
     start = self._component_operator_layout_offset
     end = start + int(self._component_operator_layout_device.numel())
@@ -4915,7 +4996,8 @@ class MetalCoupledConstraints:
                  awake_dof_ids=None, awake_counts=None, cdof=None, cdof_dot=None,
                  assemble_only=False, candidate_token=None,
                  exact_impedance=None, exact_dense_solver=None,
-                 qfrc_smooth_low=None, world_mask=None):
+                 qfrc_smooth_low=None, world_mask=None, mass_low=None,
+                 mass_blocks_low=None, tendon_armature_blocks_low=None):
     """Solve coupled contacts, limits, dry friction, and equalities on MPS.
 
     `poses` is the dict of FK outputs from `MetalKinematics`. For differential
@@ -4958,6 +5040,8 @@ class MetalCoupledConstraints:
     if qfrc_smooth_low is not None:
       _validate_cached_tensor(torch, self._device, "qfrc_smooth_low",
                               qfrc_smooth_low, (b, nv), torch.float32)
+    self._validate_mass_residual_inputs(
+        component_solver, mass_low, mass_blocks_low, tendon_armature_blocks_low)
     if candidate_token is not None:
       if candidate_token is not self._candidate_generation_token:
         raise ValueError("candidate-generation token is stale or foreign")
@@ -5110,6 +5194,9 @@ class MetalCoupledConstraints:
       eq_active_tensor = eq_active
 
     self._set_world_mask(world_mask)
+    self._stage_mass_residuals(
+        component_solver, mass_low, mass_blocks_low,
+        tendon_armature_blocks_low, world_mask)
     # Snapshot current assembly inputs only after all motion and equality
     # inputs pass host-side validation. These writes are isolated from an
     # already retained position_cache_* epoch.
@@ -5474,14 +5561,20 @@ class MetalCoupledConstraints:
       packed_slots = self._empty_compaction_map
     else:
       packed_slots = slot_maps.packed_to_logical.reshape(-1)
-    paired_smooth_input = qfrc_smooth_low is not None and int(nv) > 0
+    has_mass_residuals = any(value is not None for value in (
+        mass_low, mass_blocks_low, tendon_armature_blocks_low))
+    paired_smooth_input = (qfrc_smooth_low is not None
+                          or has_mass_residuals) and int(nv) > 0
     smooth_solver_input = qfrc_smooth
     if paired_smooth_input:
       pair = w.get("component_smooth_acceleration_pair")
       if pair is None:
         raise RuntimeError("paired smooth-force workspace was not prepared")
       pair[:b * nv].copy_(qfrc_smooth.reshape(-1))
-      pair[b * nv:2 * b * nv].copy_(qfrc_smooth_low.reshape(-1))
+      if qfrc_smooth_low is None:
+        pair[b * nv:2 * b * nv].zero_()
+      else:
+        pair[b * nv:2 * b * nv].copy_(qfrc_smooth_low.reshape(-1))
       smooth_solver_input = pair
 
     def dispatch_solver(mass_input, smooth_input=None):
@@ -5490,27 +5583,27 @@ class MetalCoupledConstraints:
         dispatch_solver_bound(mass_input, smooth_input)
 
     def dispatch_solver_bound(mass_input, smooth_input=None):
-      solve_fn(
-          mass_input.reshape(-1),
-          (smooth_solver_input if smooth_input is None
-           else smooth_input).reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
-          eq_active_tensor.reshape(-1),
-          self._constants["joint_qposadr"], self._constants["qpos0"],
-          self._constants["joint_dofadr"], self._constants["joint_limited"],
-          self._constants["joint_limit_params"],
-          self._constants["joint_sol_params"],
-          self._constants["dof_frictionloss"], self._constants["dof_invweight0"],
-          self._constants["dof_sol_params"],
-          self._constants["eq_obj"], self._constants["eq_data"],
-          self._constants["eq_sol_params"],
-          w["contact_jacobian"], w["contact_row_data"],
-          self._constants["contact_friction"], self._constants["contact_condim"],
-          self._constants["solver_dims"], self._constants["solver_params"],
-          w["out_force"], w["out_acc"], w["out_status"], w["out_diagnostics"],
-          w["out_contact_force"], packed_slots, w["workspace_J"],
-          w["workspace_debug"],
-          threads=(b,), group_size=(1,),
-      )
+      with _mass_residual_input_stage(solver_dims, has_mass_residuals):
+        solve_fn(
+            mass_input.reshape(-1),
+            (smooth_solver_input if smooth_input is None
+             else smooth_input).reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
+            eq_active_tensor.reshape(-1),
+            self._constants["joint_qposadr"], self._constants["qpos0"],
+            self._constants["joint_dofadr"], self._constants["joint_limited"],
+            self._constants["joint_limit_params"],
+            self._constants["joint_sol_params"],
+            self._constants["dof_frictionloss"], self._constants["dof_invweight0"],
+            self._constants["dof_sol_params"],
+            self._constants["eq_obj"], self._constants["eq_data"],
+            self._constants["eq_sol_params"],
+            w["contact_jacobian"], w["contact_row_data"],
+            self._constants["contact_friction"], self._constants["contact_condim"],
+            self._constants["solver_dims"], self._constants["solver_params"],
+            w["out_force"], w["out_acc"], w["out_status"], w["out_diagnostics"],
+            w["out_contact_force"], packed_slots, w["workspace_J"],
+            w["workspace_debug"],
+            threads=(b,), group_size=(1,))
 
     def recompute_exact_impedance():
       if exact_impedance is None:
@@ -5520,7 +5613,9 @@ class MetalCoupledConstraints:
           exact_dense_solver=exact_dense_solver,
           component_solver=component_solver, mass_blocks=mass_blocks,
           dof_ids=awake_dof_ids, counts=awake_counts,
-          tendon_armature_blocks=tendon_armature_blocks)
+          tendon_armature_blocks=tendon_armature_blocks,
+          mass_blocks_low=mass_blocks_low,
+          tendon_armature_blocks_low=tendon_armature_blocks_low)
 
     solver_dims = self._constants["solver_dims"]
     if assemble_only:
@@ -5542,7 +5637,7 @@ class MetalCoupledConstraints:
 
     if component_primal_route:
       solver_dims = self._constants["solver_dims"]
-      self._stage_component_operator(tendon_armature_blocks)
+      self._stage_component_operator(tendon_armature_blocks, world_mask)
       with _solver_dimension_stage(
           solver_dims, -1, self._line_search_iterations):
         dispatch_solver(mass_blocks)
@@ -5592,6 +5687,8 @@ class MetalCoupledConstraints:
                   component_rhs.reshape(b, rhs_capacity, nv),
                   dof_ids=awake_dof_ids, counts=awake_counts,
                   tendon_armature_blocks=tendon_armature_blocks,
+                  mass_blocks_low=mass_blocks_low,
+                  tendon_armature_blocks_low=tendon_armature_blocks_low,
                   rhs_low=component_rhs_low.reshape(b, rhs_capacity, nv),
                   world_mask=world_mask)))
       with _solver_dimension_stage(
@@ -5750,7 +5847,8 @@ class MetalCoupledConstraints:
   def recompute_exact_impedance_device(
       self, exact_impedance, *, mass=None, exact_dense_solver=None,
       component_solver=None, mass_blocks=None, dof_ids=None, counts=None,
-      tendon_armature_blocks=None):
+      tendon_armature_blocks=None, mass_blocks_low=None,
+      tendon_armature_blocks_low=None):
     """Update canonical R from the current assembled rows and exact mass.
 
     This runs only after the assembly-only ``dims[20] = -1`` pass. Its mass
@@ -5786,6 +5884,8 @@ class MetalCoupledConstraints:
           solver=component_solver, mass=None, mass_blocks=mass_blocks,
           dof_ids=dof_ids, counts=counts,
           tendon_armature_blocks=tendon_armature_blocks,
+          mass_blocks_low=mass_blocks_low,
+          tendon_armature_blocks_low=tendon_armature_blocks_low,
           packed_jacobian=packed_jacobian)
     else:
       inverse, mass_status = exact_impedance.solve_mass_rows_device(
