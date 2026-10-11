@@ -30,7 +30,7 @@ MuJoCo 3.10.0 binary. Their sampled bitwise matches do not qualify every
 direction or other MuJoCo/compiler builds. Poisoned-allocation tests cover
 first masked solves and retention of an inactive world's prior failure status.
 
-A separate native spot check finished with **1 passed and 2 failed in
+A separate native spot check at that revision finished with **1 passed and 2 failed in
 131.79 seconds**. Transformed/scaled heightfield frames passed. The original
 PGS/Euler strict contact-J gate still fails (maximum violating error
 `9.39097133e-11`, with `rtol=atol=2e-12`). The original zero-margin alternate
@@ -43,7 +43,7 @@ These results use Python 3.12.13, MuJoCo 3.10.0 and Torch 2.9.1 on Apple
 Silicon, with MPS fallback and fast math disabled. All imports and shaders
 resolve to this source checkout. They establish the covered regressions,
 not full simulation parity, milestone completion, wheel qualification,
-demo requalification or a performance improvement. The strict solver and
+demo requalification or a performance improvement. At that revision the strict solver and
 terrain gates, broader SDF/deformable/integrator/API combinations and final
 distribution/demo gates remain open.
 
@@ -74,6 +74,49 @@ PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
 python -m pytest -q -p no:cacheprovider \
   'metal/tests/test_contact_operator_precision.py::test_actual_contact_jacobian_reference_and_inverse_mass_rows[solver0-integrated_euler_v1]' \
   'metal/tests/test_primitive_hfield_full_manifold.py::test_full_primitive_terrain_contacts_forces_trajectory_and_restore[0.0-False-True-cylinder-.25 .15]'
+```
+
+## Near-axis libccd correction — 2026-10-11
+
+Revision `7db8b94ac` preserves source precision when a cylinder support direction
+is almost parallel to its axis. Its tiny radial components are scaled by an exact
+power of two before their squared length is formed, then the scale is undone on
+the root. Both libccd adapters use this path and retain the original source
+`mjMINVAL` comparison. No collision epsilon, solver budget or test tolerance was
+relaxed. The native-CCD cylinder branch is unchanged.
+
+Independent same-state diagnostics found that FK and the local support direction
+matched CPU exactly; the first loss was the tiny radial length, before the square
+root's existing refinement. At the original failing state, all 36 terrain contact
+positions now match the CPU oracle exactly, with normals matching within
+roundoff. This fixes a collision defect rather than attributing the same-state
+Jacobian discrepancy to divergence between two rollouts.
+
+The native correction group passed **9 tests, 1 deselected in 139.30 seconds**.
+It includes tiny/large radial arithmetic, both actual libccd adapters against the
+installed MuJoCo callback near the axis and threshold, the complete frozen
+terrain witness set with a separated peer, existing sqrt/callback regressions,
+and the original PGS/Euler strict-J rollout gate at its unchanged tolerance.
+The complete host selection passed **2,419 tests, 99 skipped, 2,204 deselected
+in 102.06 seconds**. Runtime and flags are the same as above.
+
+The original zero-margin alternate cylinder-heightfield trajectory **still
+failed** in a separate 11.13-second run, with maximum violating acceleration
+difference `1.85741866` at the unchanged `rtol=atol=2e-3`. Its initial contacts
+and forces passed. The other original solver/profile and terrain trajectory
+combinations are not qualified by the repaired strict-J node. No full milestone,
+wheel, demo or performance claim follows from these bounded results.
+
+Reproduce the correction group with the pinned callback source root supplied:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -m gpu -p no:cacheprovider \
+  metal/tests/test_libccd_radial_precision.py \
+  metal/tests/test_common_ccd_sqrt_source.py \
+  metal/tests/test_common_ccd_support_source.py \
+  'metal/tests/test_contact_operator_precision.py::test_actual_contact_jacobian_reference_and_inverse_mass_rows[solver0-integrated_euler_v1]'
 ```
 
 ## Publication scope
