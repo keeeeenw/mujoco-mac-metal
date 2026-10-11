@@ -1,9 +1,80 @@
-# Development qualification — 2026-10-05
+# Development qualification — 2026-10-11
 
 Current `main` publishes the experimental development backend. See
 [milestone status](STATUS.md): **0/16 milestones 005–020 have full-composition
 sign-off**. Earlier bounded capabilities and individual regression groups retain
 their recorded evidence. This is source publication, not a new PyPI release.
+
+## Local source regression review — 2026-10-11
+
+Revision `fc4cced35657f9bc24bf579fb0c39fd840cd95d9` on
+`implementation/mac-milestone-completion` adds owned compensated force scratch,
+pre-allocation memory admission, cached Jacobian/row ownership repairs,
+selected-world recovery coverage and route-specific collision support fixes.
+The prepared API host fixture now uses the real accumulator and preserves its
+residual. Dense solver outputs start with defined values so a first masked
+solve cannot expose allocator contents from an inactive world.
+
+The final host run at that revision passed **2,419 tests, 99 skipped,
+2,201 deselected, in 99.92 seconds**. It explicitly disabled MPS availability
+for collection and excluded tests marked `gpu`; it is host regression
+evidence, not native physics evidence. The host command below can be used
+with pytest arguments `-m 'not gpu'` to reproduce this selection.
+
+The independently executed native regression group passed **134 tests,
+10 deselected, in 137.78 seconds**. It covers dense/awake solves, compensated
+forces, retained Jacobians, masked recovery, cached constraint families, mesh
+contacts/forces and cylinder support callbacks. The callback checks compare
+both native CCD and libccd routes, with two rotations, against the installed
+MuJoCo 3.10.0 binary. Their sampled bitwise matches do not qualify every
+direction or other MuJoCo/compiler builds. Poisoned-allocation tests cover
+first masked solves and retention of an inactive world's prior failure status.
+
+A separate native spot check finished with **1 passed and 2 failed in
+131.79 seconds**. Transformed/scaled heightfield frames passed. The original
+PGS/Euler strict contact-J gate still fails (maximum violating error
+`9.39097133e-11`, with `rtol=atol=2e-12`). The original zero-margin alternate
+cylinder-heightfield trajectory also still fails its acceleration comparison
+(maximum violating error `1.85741866`, with `rtol=atol=2e-3`). No tolerances
+were relaxed. The remaining recorded zero-margin terrain cases were not
+repeated in this spot check.
+
+These results use Python 3.12.13, MuJoCo 3.10.0 and Torch 2.9.1 on Apple
+Silicon, with MPS fallback and fast math disabled. All imports and shaders
+resolve to this source checkout. They establish the covered regressions,
+not full simulation parity, milestone completion, wheel qualification,
+demo requalification or a performance improvement. The strict solver and
+terrain gates, broader SDF/deformable/integrator/API combinations and final
+distribution/demo gates remain open.
+
+Reproduce the native regression group using the pinned source runtime.
+`MUJOCO_METAL_TRACE_ROOT` must point to a directory containing
+`.upstream/mujoco-3.10.0` for the callback ABI test; a skip is not a pass:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -m gpu -p no:cacheprovider \
+  metal/tests/test_solve.py metal/tests/test_awake_smooth_017.py \
+  metal/tests/test_component_smooth_force_pair.py \
+  metal/tests/test_cached_jacobian_capture.py \
+  metal/tests/test_rhs_accumulate_owned.py \
+  metal/tests/test_masked_recovery_production.py \
+  metal/tests/test_cached_row_family_closure.py \
+  metal/tests/test_mesh_contact_011.py metal/tests/test_mesh_force_011.py \
+  metal/tests/test_common_ccd_support_source.py
+```
+
+Reproduce the two remaining numerical spot failures without changing their
+original acceptance thresholds:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -p no:cacheprovider \
+  'metal/tests/test_contact_operator_precision.py::test_actual_contact_jacobian_reference_and_inverse_mass_rows[solver0-integrated_euler_v1]' \
+  'metal/tests/test_primitive_hfield_full_manifold.py::test_full_primitive_terrain_contacts_forces_trajectory_and_restore[0.0-False-True-cylinder-.25 .15]'
+```
 
 ## Publication scope
 
