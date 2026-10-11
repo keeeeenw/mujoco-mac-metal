@@ -278,7 +278,9 @@ def test_native_site_feedback_masked_force_preserves_unselected_output_row():
                         profile="integrated_euler_v1")
   position = mj_fwdPosition(sim, return_record=True)
   stage = mj_fwdVelocity(sim, record=position)
-  plugin = SiteFeedbackPlugin()
+  plugin = SiteFeedbackPlugin(
+      kp=1.8, kd=.65, center=(1., 0., .9), amplitude=(.06, 0., .055),
+      frequency=(.9, 0., 1.3), phase=(0., 0., 1.1))
   plugin.init(model, batch_size=2, device=sim.state._device)
   refs = [mujoco.MjData(model) for _ in range(2)]
   for world, data in enumerate(refs):
@@ -286,7 +288,7 @@ def test_native_site_feedback_masked_force_preserves_unselected_output_row():
     mujoco.mj_forward(model, data)
   plugin._queries._plugin_force[1].fill_(-432.25)
   actual = plugin.run_device(
-      sim.state, dynamics=stage["dynamics"],
+      sim.state, dynamics=stage,
       compute_mask=torch.tensor([True, False], dtype=torch.bool, device="mps"))
   site_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "pen_tip"))
   np.testing.assert_allclose(
