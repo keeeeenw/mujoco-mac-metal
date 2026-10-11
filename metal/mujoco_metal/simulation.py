@@ -749,6 +749,7 @@ class MetalSimulation:
             "ctrl": batch_size * model.nu,
             "energy_output": (batch_size * 2 if energy_storage_enabled(model) else 0),
             "energy_stage": (batch_size * 2 if energy_storage_enabled(model) else 0),
+            "energy_computed": (batch_size * 2 if energy_storage_enabled(model) else 0),
             "energy_body_mass_const": (max(int(model.nbody) - 1, 1)
                                         if energy_storage_enabled(model) else 0),
             "energy_gravity_const": (3 if energy_storage_enabled(model) else 0),
@@ -1126,6 +1127,7 @@ class MetalSimulation:
         (batch_size, 2), dtype=torch.float32, device=self._state._device)
     self._energy = None
     self._energy_stage = None
+    self._energy_computed = None
     self._energy_body_mass = None
     self._energy_gravity = None
     self._energy_qpos_spring = None
@@ -1624,6 +1626,22 @@ class MetalSimulation:
                & int(mujoco.mjtEnableBit.mjENBL_ENERGY)) or getattr(self, "_energy_manual", False)
     return None if self._energy is None or not visible else self._energy.clone()
 
+  @property
+  def flg_energypos(self):
+    """Owned int32[batch] flags for computed potential-energy samples."""
+    if getattr(self, "_energy_computed", None) is None:
+      return self._state._torch.zeros(self.batch_size, dtype=self._state._torch.int32,
+                                      device=self._state._device)
+    return self._energy_computed[:, 0].clone()
+
+  @property
+  def flg_energyvel(self):
+    """Owned int32[batch] flags for computed kinetic-energy samples."""
+    if getattr(self, "_energy_computed", None) is None:
+      return self._state._torch.zeros(self.batch_size, dtype=self._state._torch.int32,
+                                      device=self._state._device)
+    return self._energy_computed[:, 1].clone()
+
   def _invalidate_after_state_write(self, fields):
     """Advance state identity and invalidate records derived from a state transaction."""
     state = self._state
@@ -1824,6 +1842,9 @@ class MetalSimulation:
     energy = getattr(self, "_energy", None)
     if energy is not None:
       energy[dst_i] = energy[src_i].clone()
+      computed = getattr(self, "_energy_computed", None)
+      if computed is not None:
+        computed[dst_i] = computed[src_i].clone()
     seen_low = set()
     for program in (getattr(self, "_sensors", None),
                     getattr(self, "_raw_sensor_program", None)):
@@ -1920,6 +1941,9 @@ class MetalSimulation:
     snap["energy"] = (energy.detach().cpu().numpy().copy()
                       if energy is not None and energy_visible else None)
     snap["energy_manual"] = bool(getattr(self, "_energy_manual", False))
+    computed = getattr(self, "_energy_computed", None)
+    snap["energy_computed"] = (computed.detach().cpu().numpy().copy()
+        if computed is not None else _np.zeros((self.batch_size, 2), _np.int32))
     snap["sensordata_low"] = self._sensor_output_low_snapshot(
         getattr(self, "_sensors", None))
     raw_program = getattr(self, "_raw_sensor_program", None)
@@ -2013,6 +2037,17 @@ class MetalSimulation:
       if not _np.all(_np.isfinite(energy_checked)):
         raise ValueError("snapshot energy values overflow float32")
       energy_checked = energy_checked.copy()
+    flags = _np.asarray(snapshot.get("energy_computed",
+                        _np.zeros((self.batch_size, 2), _np.int32)))
+    if (flags.shape != (self.batch_size, 2) or flags.dtype.kind not in "biu"
+        or _np.any((flags != 0) & (flags != 1))):
+      raise ValueError("snapshot energy_computed must contain boolean flags [batch, 2]")
+    flags_checked = flags.astype(_np.int32, copy=True)
+    # Legacy checkpoints omitted evaluated energy entirely.
+    if "energy" not in snapshot:
+      flags_checked.fill(0)
+    elif snapshot.get("energy") is None and _np.any(flags_checked):
+      raise ValueError("snapshot computed energy values are missing")
     # Validate all device state before any extension restore callback.
     self._state.validate_snapshot(snapshot.get("device"), env_ids=ids)
     plugins = snapshot.get("plugins")
@@ -2118,6 +2153,8 @@ class MetalSimulation:
     restored_energy = (self._state._torch.as_tensor(
         energy_checked, dtype=self._state._torch.float32, device=self._state._device)
         if energy_checked is not None else None)
+    restored_flags = self._state._torch.as_tensor(
+        flags_checked, dtype=self._state._torch.int32, device=self._state._device)
     # Apply actual callbacks before the native commit: implementations may
     # reject only on a later call after the preflight probe succeeded.
     _apply_plugin_restores(plugin_map, plugins, env_ids=ids)
@@ -2133,6 +2170,12 @@ class MetalSimulation:
         energy.copy_(restored_energy)
       else:
         energy[ids] = restored_energy[ids]
+    computed = getattr(self, "_energy_computed", None)
+    if computed is not None:
+      if ids is None:
+        computed.copy_(restored_flags)
+      else:
+        computed[ids.tolist()] = restored_flags[ids.tolist()]
     for name, attr in (("history", "_history"),
                        ("qacc_warmstart", "_qacc_warmstart"),
                        ("userdata", "_userdata"),
@@ -2259,6 +2302,12 @@ class MetalSimulation:
         ids = self._state._env_ids(env_ids)
         if ids.size:
           self._energy[ids.tolist()] = 0.0
+      computed = getattr(self, "_energy_computed", None)
+      if computed is not None:
+        if env_ids is None:
+          computed.zero_()
+        elif ids.size:
+          computed[ids.tolist()] = 0
     self._clear_held_inputs(env_ids)
     if getattr(self, "_coupled_constraints", None) is not None:
       self._coupled_constraints.clear_warmstart(env_ids=env_ids)
@@ -2317,7 +2366,7 @@ class MetalSimulation:
         return
       self._state.clear_masked_rows(value, reset_mask)
 
-    for name in ("_control", "_body_wrench", "_applied_force", "_energy",
+    for name in ("_control", "_body_wrench", "_applied_force", "_energy", "_energy_computed",
                  "_sensordata", "_raw_sensordata", "_next_act", "_act_dot",
                  "_act_vel", "_sen_act_force", "_sen_qfrc_act",
                  "_sensor_plugin_status", "_combined_status"):
@@ -2505,6 +2554,12 @@ class MetalSimulation:
         ids = self._state._env_ids(env_ids)
         if ids.size:
           self._energy[ids.tolist()] = 0.0
+      computed = getattr(self, "_energy_computed", None)
+      if computed is not None:
+        if env_ids is None:
+          computed.zero_()
+        elif ids.size:
+          computed[ids.tolist()] = 0
     # mj_resetDataKeyframe sets time after _resetData; mirror per selected world.
     if env_ids is None:
       self._state._time.zero_().add_(key_time)
@@ -2826,13 +2881,16 @@ class MetalSimulation:
     """Evaluate current sensors without replacing stored stage diagnostics."""
     if getattr(self, "_energy", None) is None:
       return self._sensor_values_preserving_sparse_scratch()
-    scratch = [self._energy, self._energy_stage, self._energy_position_dims,
+    scratch = [self._energy, self._energy_stage, self._energy_computed, self._energy_position_dims,
                self._state._reset_mask_i32]
     scratch += [self._smooth._workspace.get(name) for name in
                 ("energy_velocity_dims", "mass_matvec_dims", "mass_sparse_product")]
     unique = {id(value): value for value in scratch if value is not None}
     saved = [(value, value.clone()) for value in unique.values()]
     try:
+      # A current query evaluates new geometry/velocity, independent of the
+      # last stored forward-stage flags, then restores both columns and flags.
+      self._energy_computed.zero_()
       return self._sensor_values_preserving_sparse_scratch()
     finally:
       for value, previous in saved:
@@ -3942,6 +4000,9 @@ class MetalSimulation:
     remains on MPS. This mirrors engine_sensor.c: gravity, joint springs,
     tendon springs, and one-dimensional flex edge springs.
     """
+    from mujoco_metal.energy import clear_energy_computed, mark_energy_computed
+    if not manual:
+      clear_energy_computed(self, 0, world_mask)
     if self._energy is None:
       return None
     torch, model = self._state._torch, self._mjmodel
@@ -4008,6 +4069,7 @@ class MetalSimulation:
           threads=(self.batch_size,), group_size=(1,))
       self._state.copy_masked_rows(
           self._energy, self._energy_stage, world_mask)
+      mark_energy_computed(self, 0, world_mask)
       return self._energy[:, 0]
     out.zero_()
     disabled = int(model.opt.disableflags)
@@ -4144,10 +4206,14 @@ class MetalSimulation:
       self._state.update_masked_rows(
           self._energy, self._energy_stage, world_mask, add=False)
       return self._energy[:, 0]
+    mark_energy_computed(self, 0, world_mask)
     return out
 
   def _update_energy_velocity(self, velocity, *, world_mask=None, manual=False):
     """Refresh pinned ``mj_energyVel`` using the complete prepared mass."""
+    from mujoco_metal.energy import clear_energy_computed, mark_energy_computed
+    if not manual:
+      clear_energy_computed(self, 1, world_mask)
     if (self._energy is None or (not manual and not
         int(self._mjmodel.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY))):
       return None
@@ -4192,6 +4258,7 @@ class MetalSimulation:
         threads=(batch,), group_size=(1,))
     if world_mask is not None:
       self._state.copy_masked_rows(self._energy, self._energy_stage, world_mask)
+    mark_energy_computed(self, 1, world_mask)
     return self._energy[:, 1]
 
   def prepare_forward_position(self, qpos=None, *, mocap_pos=None,
@@ -7063,8 +7130,8 @@ class MetalSimulation:
                 success, qpos=qpos, qvel=qvel, qacc=acceleration,
                 act=(self._next_act if self._actuators is not None
                      and na_here > 0 else None), time=time)
-            from mujoco_metal.energy import advance_rk_energy_history
-            advance_rk_energy_history(self, final_energy_dynamics,
+            from mujoco_metal.energy import advance_energy_history
+            advance_energy_history(self, final_energy_dynamics,
                                       state._qpos, rk4_initial_qvel, success)
             state._qpos = torch.where(success[:, None], qpos, state._qpos)
             state._qvel = torch.where(success[:, None], qvel, state._qvel)
@@ -7174,8 +7241,8 @@ class MetalSimulation:
               success, qpos=qpos, qvel=qvel, qacc=acceleration,
               act=(self._next_act if self._actuators is not None
                    and na_here > 0 else None), time=time)
-          from mujoco_metal.energy import advance_rk_energy_history
-          advance_rk_energy_history(self, final_energy_dynamics,
+          from mujoco_metal.energy import advance_energy_history
+          advance_energy_history(self, final_energy_dynamics,
                                     state._qpos, step_qvel, success)
           state._qpos = torch.where(success.unsqueeze(1), qpos, state._qpos)
           state._qvel = torch.where(success.unsqueeze(1), qvel, state._qvel)
@@ -7539,6 +7606,10 @@ class MetalSimulation:
             act=(self._next_act if self._actuators is not None
                  and getattr(state, "_na", 0) > 0 else None),
             time=self._next_time)
+
+        from mujoco_metal.energy import advance_energy_history
+        advance_energy_history(self, dynamics, state._qpos,
+                               step_qvel, self._success)
 
         # Ping-pong owned tensors keep live state disjoint from borrowed stage
         # outputs and make each new current-state reference safe for the next

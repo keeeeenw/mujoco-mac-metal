@@ -27,7 +27,7 @@ def energy_storage_bytes(model, batch_size):
                      for edge in range(begin, begin + int(model.flex_edgenum[fid])))
     # Two output/staging columns; masses, gravity, spring reference;
     # joint/tendon metadata, flex rows, and 12 + batch dispatch dimensions.
-    return (16 * batch_size + 4 * max(int(model.nbody) - 1, 1) + 12
+    return (24 * batch_size + 4 * max(int(model.nbody) - 1, 1) + 12
             + 4 * max(int(model.nq), 1) + 24 * max(int(model.njnt), 1)
             + 36 * max(int(model.ntendon), 1) + 12 * max(edges, 1)
             + 4 * (12 + batch_size))
@@ -45,6 +45,8 @@ def _build_energy_storage(sim):
     stage._energy = torch.zeros((batch_size, 2), dtype=torch.float32,
                                 device=sim.state._device)
     stage._energy_stage = torch.empty_like(stage._energy)
+    stage._energy_computed = torch.zeros((batch_size, 2), dtype=torch.int32,
+                                        device=sim.state._device)
     stage._energy_body_mass = None
     stage._energy_gravity = None
     stage._energy_qpos_spring = None
@@ -151,6 +153,30 @@ def build_energy_storage(sim):
         return _build_energy_storage(sim)
 
 
+def clear_energy_computed(sim, component=None, world_mask=None):
+    """Invalidate the source lazy-evaluation flags for refreshed stages."""
+    flags = getattr(sim, '_energy_computed', None)
+    if flags is None:
+        return
+    mask = sim.state._status == 0
+    if world_mask is not None:
+        mask = mask & world_mask
+    if component is None:
+        flags[mask] = 0
+    else:
+        flags[:, component].masked_fill_(mask, 0)
+
+
+def mark_energy_computed(sim, component, world_mask=None):
+    flags = getattr(sim, '_energy_computed', None)
+    if flags is None:
+        return
+    mask = sim.state._status == 0
+    if world_mask is not None:
+        mask = mask & world_mask
+    flags[:, component].masked_fill_(mask, 1)
+
+
 def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
                          context, stages, world_mask, *, history_advance=False):
     """Sample canonical native energies before sensor cutoff/history.
@@ -162,8 +188,6 @@ def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
     if int(mujoco.mjtStage.mjSTAGE_POS) not in tuple(int(s) for s in stages):
         return
     torch, model = sim.state._torch, sim._mjmodel
-    potential = torch.zeros(sim.batch_size, dtype=torch.bool,
-                            device=sim.state._qpos.device)
     active = sim.state._status == 0
     if world_mask is not None:
         active = active & world_mask
@@ -183,16 +207,13 @@ def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
         if awake is not None:
             mask = mask & (awake[:, index] != 0)
         component = int(typ == int(mujoco.mjtSensor.mjSENS_E_KINETIC))
-        already_computed = (history_advance and int(model.opt.enableflags)
-                            & int(mujoco.mjtEnableBit.mjENBL_ENERGY))
+        missing = mask & (sim._energy_computed[:, component] == 0)
         if component == 0:
-            potential |= mask
-            if not already_computed:
-                sim._update_energy_position(qpos, dynamics, context,
-                                            world_mask=mask.contiguous(), manual=True)
-        elif not already_computed:
+            sim._update_energy_position(qpos, dynamics, context,
+                                        world_mask=missing.contiguous(), manual=True)
+        else:
             sim._update_energy_velocity({'dynamics': dynamics, 'qvel': qvel},
-                                        world_mask=mask.contiguous(), manual=True)
+                                        world_mask=missing.contiguous(), manual=True)
         value = sim._energy[:, component]
         cutoff = float(program.descriptor.sensor_cutoff[index])
         if cutoff > 0:
@@ -202,11 +223,22 @@ def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
         & int(mujoco.mjtEnableBit.mjENBL_ENERGY)):
         # engine_forward clears both values after sensorPos when no potential
         # energy sensor actually computed this sweep (including kinetic-only).
-        sim._energy[active & ~potential] = 0.0
+        sim._energy[active & (sim._energy_computed[:, 0] == 0)] = 0.0
+    if (not history_advance and int(mujoco.mjtStage.mjSTAGE_VEL)
+        in tuple(int(s) for s in stages)
+        and not int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY)):
+        # Source fwdVelocity invalidates kinetic energy after POS sensors.
+        # The combined sensor dispatcher must preserve that stage ordering.
+        clear_energy_computed(sim, 1, world_mask)
 
 
-def advance_rk_energy_history(sim, dynamics, qpos, qvel, world_mask):
-    """Pinned mj_advance energy sampling with X3 geometry and restored X0."""
+def advance_energy_history(sim, dynamics, qpos, qvel, world_mask):
+    """Pinned mj_advance lazy energy sampling before integration publication.
+
+    Ordinary methods retain X0 geometry. RK retains X3 geometry with restored
+    X0 inputs. Both methods may compute a delayed sensor after VEL has cleared
+    its lazy flag, even when the earlier POS sensor already evaluated energy.
+    """
     if sim._energy is None or sim._raw_sensordata is None:
         return
     sample_sensor_energy(sim, sim._raw_sensor_program, sim._raw_sensordata,
@@ -262,7 +294,7 @@ def update_energy(sim, component, record=None, *, env_ids=None):
     # Account for rollback clones, staged/returned energy, selection mask/IDs
     # and the source body/tree awake lists used by potential energy publication.
     extra = sum(value.numel() * value.element_size() for value in scratch)
-    extra += 4 * batch * 5 + 8 * batch + 8 * batch
+    extra += 4 * batch * 7 + 8 * batch + 8 * batch
     if old_energy is None:
         extra += energy_storage_bytes(model, batch)
     limits = getattr(sim, 'limits', None) or CapacityLimits()
@@ -273,6 +305,8 @@ def update_energy(sim, component, record=None, *, env_ids=None):
     with torch.inference_mode(False), torch.no_grad():
         old_values = target.clone()
         working = target.clone()
+        computed = (new_fields['_energy_computed'] if new_fields is not None
+                    else sim._energy_computed).clone()
         saved = [(value, value.clone()) for value in scratch]
     old_version = target._version
     mask = torch.zeros((batch,), dtype=torch.bool, device=sim.state._qpos.device)
@@ -292,6 +326,7 @@ def update_energy(sim, component, record=None, *, env_ids=None):
         if new_fields is not None:
             vars(sim).update(new_fields)
         sim._energy = working
+        sim._energy_computed = computed
         if component == 0:
             sim._update_energy_position(record.qpos, position['dynamics'],
                                         position.get('context'), world_mask=mask, manual=True)

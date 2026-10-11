@@ -48,6 +48,53 @@ def _host(x):
   return x.detach().cpu().numpy().copy()
 
 
+def _computed(sim):
+  return np.column_stack((_host(sim.flg_energypos), _host(sim.flg_energyvel)))
+
+
+def test_prepared_energy_computed_flags_follow_selected_publication_and_restore(monkeypatch):
+  _, sim, _ = _fixture()
+  np.testing.assert_array_equal(_computed(sim), 0)
+  record = _prepare(sim, monkeypatch)
+  np.testing.assert_array_equal(_computed(sim), 0)
+  _native_only(monkeypatch, lambda: mj_energyPos(sim, record, env_ids=[2, 0]))
+  _native_only(monkeypatch, lambda: mj_energyVel(sim, record, env_ids=[1]))
+  expected = np.array([[1, 0], [0, 1], [1, 0]], np.int32)
+  np.testing.assert_array_equal(_computed(sim), expected)
+  owned = sim.flg_energypos
+  owned.zero_()
+  np.testing.assert_array_equal(_computed(sim), expected)
+  snap = sim.snapshot()
+  _native_only(monkeypatch, lambda: sim.reset(env_ids=[1]))
+  expected[1] = 0
+  np.testing.assert_array_equal(_computed(sim), expected)
+  _native_only(monkeypatch, lambda: sim.restore(snap, env_ids=[1]))
+  np.testing.assert_array_equal(_computed(sim), snap['energy_computed'])
+  _native_only(monkeypatch, lambda: sim.copy_environment(1, 2))
+  np.testing.assert_array_equal(_computed(sim)[2], snap['energy_computed'][1])
+  _native_only(monkeypatch, lambda: sim.restore(snap))
+  np.testing.assert_array_equal(_computed(sim), snap['energy_computed'])
+
+
+@pytest.mark.parametrize('bad', [None, [[1, 0]], [[1, 0, 0]]*3,
+                               [[-1, 0]]*3, [[2, 0]]*3, [[.5, 0]]*3,
+                               [[np.nan, 0]]*3, [['yes', 'no']]*3])
+def test_invalid_computed_flags_restore_is_atomic(bad, monkeypatch):
+  _, sim, _ = _fixture()
+  record = _prepare(sim, monkeypatch)
+  _native_only(monkeypatch, lambda: mj_energyPos(sim, record))
+  before = sim.snapshot()
+  identity = (sim.state.generation, sim._forward_stages.epoch)
+  with pytest.raises(ValueError, match='energy_computed'):
+    _native_only(monkeypatch, lambda: sim.restore(dict(before, energy_computed=bad),
+                                                  env_ids=[1]))
+  np.testing.assert_array_equal(_host(sim.energy), before['energy'])
+  np.testing.assert_array_equal(_computed(sim), before['energy_computed'])
+  np.testing.assert_array_equal(_host(sim.state._qpos), before['device'].qpos)
+  assert sim.validate_forward_stage_record(record, 'VEL') is record
+  assert (sim.state.generation, sim._forward_stages.epoch) == identity
+
+
 def _prepare(sim, monkeypatch):
   record = _native_only(monkeypatch, lambda: mj_fwdPosition(
       sim, skipsensor=True, return_record=True))
@@ -145,6 +192,7 @@ def test_native_post_publication_failure_is_atomic(existing, monkeypatch):
     _native_only(monkeypatch, lambda: mj_energyPos(sim, record))
   old = sim._energy
   before = None if old is None else _host(old)
+  flags_before = _computed(sim)
   scratch = {k: _host(v) for k, v in sim._smooth._workspace.items()
              if k in ('mass_sparse_product', 'mass_matvec_dims', 'energy_velocity_dims')}
   publish = implementation._publish_energy
@@ -157,6 +205,7 @@ def test_native_post_publication_failure_is_atomic(existing, monkeypatch):
   with pytest.raises(RuntimeError, match='publication fault'):
     _native_only(monkeypatch, lambda: mj_energyVel(sim, record))
   assert calls == [True] and sim._energy is old
+  np.testing.assert_array_equal(_computed(sim), flags_before)
   if old is not None:
     np.testing.assert_array_equal(_host(old), before)
   for k, value in scratch.items():
@@ -187,6 +236,7 @@ def test_lifecycle_rebuild_preserves_samples_and_uses_new_constants(enabled, mon
     refs.append(d)
   _native_only(monkeypatch, lambda: sim.apply_lifecycle(replacement))
   np.testing.assert_array_equal(_host(sim.energy), before)
+  np.testing.assert_array_equal(_computed(sim), 0)
   np.testing.assert_array_equal(_host(sim.state._qpos), q)
   np.testing.assert_array_equal(_host(sim.state._qvel), v)
   with pytest.raises(ValueError):
@@ -196,6 +246,8 @@ def test_lifecycle_rebuild_preserves_samples_and_uses_new_constants(enabled, mon
   _native_only(monkeypatch, lambda: mj_energyVel(sim, updated))
   np.testing.assert_allclose(_host(sim.energy), [d.energy for d in refs],
                              rtol=2e-5, atol=2e-6)
+  np.testing.assert_array_equal(_computed(sim),
+      [[d.flg_energypos, d.flg_energyvel] for d in refs])
   assert np.max(np.abs(_host(sim.energy)[:, 0] - before[:, 0])) > 1.
 
 
@@ -291,6 +343,8 @@ def test_energy_sensors_share_source_storage_and_current_velocity(
   assert sim.energy is not None
   np.testing.assert_allclose(_host(sim.energy), [d.energy for d in refs],
                              rtol=2e-5, atol=2e-6)
+  np.testing.assert_array_equal(_computed(sim),
+      [[d.flg_energypos, d.flg_energyvel] for d in refs])
 
 
 @pytest.mark.parametrize('integrator,profile', _METHODS)
@@ -328,6 +382,8 @@ def test_timed_energy_sensors_samples_storage_and_checkpoint_replay(
                                rtol=2e-5, atol=2e-6)
     np.testing.assert_allclose(_host(sim.energy), [d.energy for d in refs],
                                rtol=2e-5, atol=2e-6)
+    np.testing.assert_array_equal(_computed(sim),
+        [[d.flg_energypos, d.flg_energyvel] for d in refs])
     if step == 3:
       mid = sim.snapshot()
   final = sim.snapshot()
@@ -336,6 +392,7 @@ def test_timed_energy_sensors_samples_storage_and_checkpoint_replay(
     _native_only(monkeypatch, sim.step)
   replay = sim.snapshot()
   np.testing.assert_array_equal(replay['energy'], final['energy'])
+  np.testing.assert_array_equal(replay['energy_computed'], final['energy_computed'])
   for name in ('qpos', 'qvel', 'qacc', 'time', 'precision_words'):
     np.testing.assert_array_equal(getattr(replay['device'], name),
                                    getattr(final['device'], name))
