@@ -1,5 +1,103 @@
 # Development qualification — 2026-10-11
 
+## Original-mass residuals in coupled solvers — 2026-10-11
+
+Local producing revision `cb2901278b0c59eb51c83cc820a306333fb73303`
+connects the compiled inertia residual producer to fresh and retained-position
+PGS, CG and Newton matrix operators. Original high/low mass is retained before
+rounded factor scratch is reused. Component tendon-armature high/low inputs
+are included in the original operator. Refinement consumes mass residuals even
+when the force or Jacobian low word is zero. Dense primal initial acceleration,
+paired gradient/Hessian products and paired line polynomials use these words.
+The debug tail and complete solver dimensions, including the world mask, are
+included in admission; the coupled shader retains its 31-buffer ABI.
+
+Empty contact descriptors now have zero logical slots while device upload
+retains physical sentinels. Exact-impedance cone validation accepts its inert
+sentinel. Component exact row packing now dispatches its final zero RHS row;
+previously that allocated row could retain uninitialized values. Native tests
+poison the backing before initial and repeated recomputation. Cached component
+PGS solves, status merging and component armature staging preserve selected
+world ownership.
+
+At the producing revision, the complete host selection passed **2,426 tests,
+99 skipped, 2,270 deselected in 100.78 seconds**, exit 0. The affected native
+selection passed **124 tests, 129 deselected in 36.53 seconds**, exit 0. This
+includes 45 new native cases across fresh/cached dense/component PGS/CG/Newton:
+actual nonbinary MuJoCo inertia, friction constraints, armature residuals,
+invalid metadata, masked nonfinite isolation, failure/recovery, actual backing
+admission and component exact inverse rows. The equations use independent
+`mj_fullM` oracles, with CPU forward/mass calls forbidden during the selected
+native coupled execution. These checks retain their original tight bounds.
+
+The original dense-PGS terrain contact-Jacobian/reference/inverse-mass gate
+passed separately in a fresh process: **1 passed in 118.15 seconds**, exit 0.
+It retains source Jacobian and regularizer bounds of `2e-12`, reference bounds
+of `rtol=2e-11, atol=2e-10`, and inverse-row bounds of `2e-11`. Its mass oracle
+uses both published original-operator words. A preceding combined invocation
+reported a Metal command-buffer error and missing contacts; that failure is
+not erased by the isolated pass. Reliability across long mixed native test
+batches remains unproven. The existing Hessian witness was also corrected to
+use its canonical scalar-row `1/R` weight; the previous inconsistent fixture
+failed identically against the preceding shader revision.
+
+The unchanged zero-margin alternate cylinder-heightfield **trajectory still
+fails** at its original `rtol=atol=2e-3`, with maximum violating acceleration
+error `0.05186221`. Initial contact/frame/generalized-force checks passed.
+Its latest combined terrain/strict run failed both cases in 35.50 seconds;
+the missing mass-result field that stopped that strict run was subsequently
+fixed, and its fresh-process result is recorded above. No terrain fixture,
+tolerance or solver budget was relaxed.
+
+General articulated CRBA residuals, dense exact-impedance row precision,
+effective implicit precision, scalar cold/warm objective predicates and full
+solver/contact/integrator compositions remain open. Component exact inverse
+rows passing does not establish complete binary64 regularizer precision.
+This is **scoped operator qualification**, not full milestone closure, terrain
+parity, a wheel qualification or a speedup claim. Earlier sections below record
+historical producing revisions rather than the current residual wiring.
+
+Python 3.12.13, MuJoCo 3.10.0 and Torch 2.9.1 were used. All native tests ran
+with fallback disabled and serialized GPU work; runtime source remained
+unchanged during the final checks. Reproduce the affected native selection:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -m gpu -p no:cacheprovider \
+  metal/tests/test_coupled_mass_residual.py \
+  metal/tests/test_compiled_mass_residual_producer.py \
+  metal/tests/test_compiled_simple_mass.py \
+  metal/tests/test_component_matrix_residual.py \
+  metal/tests/test_awake_smooth_017.py \
+  metal/tests/test_smooth_sparse_mass.py \
+  metal/tests/test_dense_pair_mass_solve_019.py \
+  metal/tests/test_cached_position_015.py \
+  metal/tests/test_position_context_geom_residual_018.py \
+  metal/tests/test_forward_stages_019.py \
+  metal/tests/test_native_inverse_split_019.py \
+  metal/tests/test_inverse_skip_019.py \
+  metal/tests/test_mass_queries_019.py \
+  metal/tests/test_component_smooth_force_pair.py \
+  metal/tests/test_cached_position_solver_015.py \
+  metal/tests/test_primal_hessian_precision.py \
+  metal/tests/test_constraint_impedance_020.py
+```
+
+Run the original gates separately, quoting each complete node ID:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -p no:cacheprovider \
+  'metal/tests/test_contact_operator_precision.py::test_actual_contact_jacobian_reference_and_inverse_mass_rows[solver0-integrated_euler_v1]'
+
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -p no:cacheprovider \
+  'metal/tests/test_primitive_hfield_full_manifold.py::test_full_primitive_terrain_contacts_forces_trajectory_and_restore[0.0-False-True-cylinder-.25 .15]'
+```
+
 ## Compiled inertia residual producer — 2026-10-11
 
 Local revision `d3636c169a5dcd1fc430f56a210f6b539573b2fc` lowers the
