@@ -58,3 +58,52 @@ def test_source_mapping_cannot_escape_package_root(tmp_path):
       'bad': {'counterpart': '../outside.py:step'}}}
   assert counterpart_source_drift(surface, source_root=tmp_path) == (
       'Missing counterpart source: bad',)
+
+
+def test_all_requirement_backend_anchors_resolve():
+  from mujoco_metal.binding_inventory import requirement_source_drift
+  assert requirement_source_drift() == ()
+
+
+def test_requirement_anchor_drift_cannot_hide_behind_existing_module():
+  from dataclasses import replace
+  from mujoco_metal.binding_inventory import requirement_source_drift
+  from mujoco_metal.registry import REQUIREMENTS
+  row = next(row for row in REQUIREMENTS if row.id == 'REQ-FLEX-001')
+  stale = replace(row, source_ref='mujoco_metal/flex.py:FlexProgram')
+  assert requirement_source_drift([stale]) == (
+      'Missing counterpart callable: REQ-FLEX-001',)
+  missing = replace(row, source_ref='mujoco_metal/shaders/missing_material.metal')
+  assert requirement_source_drift([missing]) == (
+      'Missing counterpart source: REQ-FLEX-001',)
+
+
+def test_all_backend_fragments_checked_but_upstream_refs_not_reinterpreted():
+  from dataclasses import replace
+  from mujoco_metal.binding_inventory import requirement_source_drift
+  from mujoco_metal.registry import REQUIREMENTS
+  row = next(row for row in REQUIREMENTS if row.id == 'REQ-FLEX-001')
+  combined = replace(row, source_ref='mujoco_metal/flex.py:MetalFlex; '
+      'engine/engine_passive.c:mj_flexPassive; '
+      'mujoco_metal/flex.py:FlexProgram')
+  assert requirement_source_drift([combined]) == (
+      'Missing counterpart callable: REQ-FLEX-001[1]',)
+
+
+def test_active_material_requirement_retains_all_physics_witnesses():
+  from mujoco_metal.registry import REQUIREMENTS, Qualification
+  row = next(row for row in REQUIREMENTS if row.id == 'REQ-FLEX-001')
+  assert row.source_ref == 'mujoco_metal/flex.py:MetalFlex'
+  assert row.qualification == Qualification.UNQUALIFIED
+  assert set(row.tests) >= {
+      'test_flex_material_parity.py', 'test_flex_integrator_lifecycle.py',
+      'test_active_material_invariants_018.py', 'test_active_material_energy_018.py'}
+
+
+def test_every_requirement_test_reference_is_retained():
+  from pathlib import Path
+  from mujoco_metal.registry import REQUIREMENTS
+  root = Path(__file__).parent
+  missing = [(row.id, name) for row in REQUIREMENTS for name in row.tests
+             if not (root / name).is_file()]
+  assert missing == []

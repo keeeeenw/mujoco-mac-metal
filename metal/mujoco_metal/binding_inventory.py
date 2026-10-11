@@ -202,6 +202,28 @@ def counterpart_source_drift(surface=None, *, source_root=None):
   return tuple(errors)
 
 
+def requirement_source_drift(requirements=None, *, source_root=None):
+  """Check backend anchors in support requirements, without GPU imports.
+
+  A requirement can cite multiple backend and upstream references. Only
+  backend fragments are checked here; upstream references retain their pinned
+  semantic audit rather than being checked against this newer source tree.
+  Existence of an anchor is structural evidence, not physics qualification.
+  """
+  if requirements is None:
+    from .registry import REQUIREMENTS
+    requirements = REQUIREMENTS
+  rows = {}
+  for requirement in requirements:
+    fragments = [part.strip() for part in requirement.source_ref.split(';')
+                 if part.strip().startswith('mujoco_metal/')]
+    for index, fragment in enumerate(fragments):
+      name = requirement.id if len(fragments) == 1 else f'{requirement.id}[{index}]'
+      rows[name] = {'counterpart': fragment}
+  return counterpart_source_drift({'python_function_map': rows},
+                                  source_root=source_root)
+
+
 def pinned_binding_surface():
   """Return owned specification metadata and drift, without execution claims."""
   result = deepcopy(_surface_catalogue())
