@@ -51,6 +51,13 @@ ownership crosswalk; complete feature-to-execution mapping and native
 qualification remain open (`feature_mapping_complete=False`,
 `function_mapping_complete=False`).
 
+Shared options have multiple subsystem owners: CCD budgets/tolerances affect
+applicable rigid and deformable convex paths; line-search settings affect CG
+and Newton; no-slip is a separate post-solve stage rather than a PGS-only
+option. Flex material and collision paths have separate, explicitly unqualified
+requirement rows. CPU lowering tests check the actual uploaded CCD words and
+solver descriptors; those checks do not qualify native physics.
+
 <!-- COVERAGE_TABLE_BEGIN -->
 | ID | Capability | Execution | Status | Owner | Limitation | Admission | Tests |
 |---|---|---|---|---|---|---|---|
@@ -79,6 +86,9 @@ qualification remain open (`feature_mapping_complete=False`,
 | REQ-SOL-001 | native projected Gauss-Seidel solver | device | native_gpu/gpu_qualified | baseline | recorded PGS subset qualified; complete cone, budget and cross-feature composition gates remain open | PGS selects the projected solver | test_coupled_constraints.py |
 | REQ-SOL-002 | native primal conjugate-gradient solver | device | native_gpu/unqualified | 014 | native primal CG with configured search budgets; selected mixed-island force and acceleration comparisons pass, but exact iteration counts and full composition remain unqualified | CG selects native primal CG | test_solver_completion_014.py, test_solver_islands_014.py |
 | REQ-SOL-003 | native primal Newton solver | device | native_gpu/unqualified | 014 | native Newton/PCG Hessian path; selected warm elliptic and mixed mass/contact-island gates pass; complete composition qualification remains open | Newton selects native primal Newton | test_solver_completion_014.py, test_solver_islands_014.py |
+| REQ-SOL-004 | native no-slip post-solve stage | device | native_gpu/unqualified | 014 | separate friction post-stage after PGS, CG or Newton; zero iterations skip it; complete cone, dimension and option compositions remain under qualification | validated noslip_iterations and noslip_tolerance in coupled lowering | test_solver_completion_014.py |
+| REQ-FLEX-001 | compiled flex kinematics and material forces | device | native_gpu/unqualified | 018 | compiled material, damping and interpolation paths implemented; complete topology, attachment, stiffness and integrator compositions remain under qualification | compiled topology, material and workspace validation | test_flex_018.py, test_flex_material_equality_composition_018.py, test_flex_implicit_simulation.py |
+| REQ-FLEX-002 | flex rigid, self and cross-flex collision | device | native_gpu/unqualified | 018 | compiled candidates and native CCD/contact rows implemented; complete primitive, interpolation, self-contact and integrator compositions remain under qualification | compiled candidate filtering, CCD budgets and contact-row capacity checks | test_flex_contact_lowering.py, test_coupled_flex_contact_rows.py, test_flex_interpolated_pair_018.py, test_flex_tetra_self_pair_018.py |
 | REQ-EQ-001 | joint/connect/weld equalities with per-env activity | device | native_gpu/gpu_qualified | 004 | 1/3/6 rows, body/world/site forms incl. mocap anchors, torquescale, schema-2/3 activity state | accept joint/connect/weld body/site/world/mocap, reject others even if inactive | test_connect_weld.py, test_equality_activity.py, test_equality_qualification.py, test_mocap_state.py |
 | REQ-EQ-002 | tendon equality | device | native_gpu/gpu_qualified | 008 | cubic tendon-length coupling as coupled rows (single or paired tendons) | tendon_constraint_rows equality branch | test_spatial_tendons_008.py |
 | REQ-EQ-003 | flex distance equality | device | native_gpu/gpu_qualified | 018 | flex edge distance equalities on GPU | mjEQ_FLEX distance constraints coupled with block-row solver | test_flex_018.py |

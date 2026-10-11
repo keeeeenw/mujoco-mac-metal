@@ -237,3 +237,61 @@ def test_source_wrapper_inventory_agrees_with_explicit_runtime_module():
   assert package_entrypoint_drift() == package_entrypoint_drift(native_api) == ()
   with pytest.raises(ValueError, match="api_module or source_path"):
     package_entrypoint_drift(native_api, source_path="unused.py")
+
+
+def test_shared_options_classify_every_owning_pipeline():
+  from mujoco_metal.registry import REQUIREMENTS, Qualification
+  surface = pinned_binding_surface()
+  rows = {row.id: row for row in REQUIREMENTS}
+  convex_owners = ["REQ-GEO-001", "REQ-GEO-002", "REQ-GEO-003",
+                   "REQ-GEO-004", "REQ-GEO-005", "REQ-FLEX-002"]
+  for name in ("ccd_iterations", "ccd_tolerance"):
+    assert surface["option_fields"][name]["requirements"] == convex_owners
+  for name in ("ls_iterations", "ls_tolerance"):
+    assert surface["option_fields"][name]["requirements"] == [
+        "REQ-SOL-002", "REQ-SOL-003"]
+  for name in ("noslip_iterations", "noslip_tolerance"):
+    assert surface["option_fields"][name]["requirements"] == ["REQ-SOL-004"]
+  for name in ("REQ-SOL-004", "REQ-FLEX-001", "REQ-FLEX-002"):
+    row = rows[name]
+    assert row.qualification == Qualification.UNQUALIFIED
+    assert row.tests and row.admission and row.entry_point
+    assert all((Path(__file__).parent / test).is_file() for test in row.tests)
+
+
+@pytest.mark.parametrize("solver", [mujoco.mjtSolver.mjSOL_PGS,
+                                    mujoco.mjtSolver.mjSOL_CG,
+                                    mujoco.mjtSolver.mjSOL_NEWTON])
+def test_shared_solver_options_reach_the_actual_compiled_descriptor(solver):
+  from mujoco_metal.coupled_constraints import lower_coupled_constraints
+  model = mujoco.MjModel.from_xml_string('''<mujoco>
+    <option ls_iterations="7" ls_tolerance=".012"
+            noslip_iterations="3" noslip_tolerance=".004"/>
+    <worldbody><geom type="plane" size="1 1 .1"/>
+      <body pos="0 0 .1"><freejoint/><geom type="sphere" size=".12"/>
+      </body></worldbody></mujoco>''')
+  model.opt.solver = solver
+  desc = lower_coupled_constraints(model)
+  assert desc.solver_type == int(solver)
+  assert desc.line_search_iterations == 7
+  assert desc.line_search_tolerance == model.opt.ls_tolerance == .012
+  assert desc.noslip_iterations == 3
+  assert desc.noslip_tolerance == model.opt.noslip_tolerance == .004
+
+
+def test_shared_ccd_options_reach_convex_geometry_without_sdf():
+  import numpy as np
+  from mujoco_metal.common_ccd_bridge import build_common_ccd_model_upload
+  model = mujoco.MjModel.from_xml_string('''<mujoco>
+    <option ccd_iterations="37" ccd_tolerance=".000123456789"/>
+    <worldbody><geom type="ellipsoid" size=".2 .3 .4"/>
+      <body pos=".1 0 0"><freejoint/><geom type="box" size=".2 .2 .2"/>
+      </body></worldbody></mujoco>''')
+  vertices, info, layout = build_common_ccd_model_upload(
+      model, np.zeros(3, np.float32), np.zeros(9 * model.ngeom, np.int32))
+  header = layout["header_base"]
+  assert int(info[header + 9]) == 37
+  tolerance_at = int(info[header + 10])
+  represented = vertices[tolerance_at:tolerance_at + 3].astype(np.float64).sum()
+  assert represented == model.opt.ccd_tolerance
+  assert not np.any(model.geom_type == int(mujoco.mjtGeom.mjGEOM_SDF))

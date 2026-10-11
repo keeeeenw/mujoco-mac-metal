@@ -10785,13 +10785,23 @@
   "option_fields": {
     "ccd_iterations": {
       "requirements": [
-        "REQ-GEO-005"
+        "REQ-GEO-001",
+        "REQ-GEO-002",
+        "REQ-GEO-003",
+        "REQ-GEO-004",
+        "REQ-GEO-005",
+        "REQ-FLEX-002"
       ],
       "classification": "explicit_option_crosswalk"
     },
     "ccd_tolerance": {
       "requirements": [
-        "REQ-GEO-005"
+        "REQ-GEO-001",
+        "REQ-GEO-002",
+        "REQ-GEO-003",
+        "REQ-GEO-004",
+        "REQ-GEO-005",
+        "REQ-FLEX-002"
       ],
       "classification": "explicit_option_crosswalk"
     },
@@ -10869,12 +10879,14 @@
     },
     "ls_iterations": {
       "requirements": [
+        "REQ-SOL-002",
         "REQ-SOL-003"
       ],
       "classification": "explicit_option_crosswalk"
     },
     "ls_tolerance": {
       "requirements": [
+        "REQ-SOL-002",
         "REQ-SOL-003"
       ],
       "classification": "explicit_option_crosswalk"
@@ -10887,13 +10899,13 @@
     },
     "noslip_iterations": {
       "requirements": [
-        "REQ-SOL-001"
+        "REQ-SOL-004"
       ],
       "classification": "explicit_option_crosswalk"
     },
     "noslip_tolerance": {
       "requirements": [
-        "REQ-SOL-001"
+        "REQ-SOL-004"
       ],
       "classification": "explicit_option_crosswalk"
     },

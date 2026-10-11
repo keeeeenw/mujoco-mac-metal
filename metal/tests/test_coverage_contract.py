@@ -33,7 +33,8 @@ def test_requirement_ids_unique_and_milestones_valid():
 def test_every_pinned_enum_member_classified():
   missing = unclassified_enum_members()
   assert missing == (), f"unclassified pinned enum members: {missing}"
-  # The contract must actually cover the full pinned surface, not a subset.
+  # This selectable-feature projection covers these 15 groups. The separate
+  # binding catalogue checks all 70 pinned public enum groups and 529 members.
   total = sum(
       len(getattr(mujoco, name).__members__)
       for name in _ENUMS
