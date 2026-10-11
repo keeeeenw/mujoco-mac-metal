@@ -33,7 +33,8 @@ also passes its 25-case affected group after including solved constraint force.
 See [exact scope and producing revisions](QUALIFICATION.md). These close
 specific contracts; the full milestone count remains unchanged.
 
-The latest local development host selection at `ab7c360a2` passed **2,460 tests, 99 skipped**;
+The latest complete local development host selection at `50d3bdad0` passed
+**2,976 tests, 87 skipped, 2,470 deselected**;
 it does not qualify the skipped native cases. The historical host publication
 check passed **2,163 tests, 1,615 skipped** at its separately recorded revision;
 see [producing revisions and scope](QUALIFICATION.md).

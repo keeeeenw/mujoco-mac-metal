@@ -8,6 +8,11 @@ in 2.37 seconds**. The complete native copy, transaction, device-state, energy
 and split-step selection passes **94 tests, 19 deselected in 78.44 seconds**,
 with no failures or skips and CPU fallback disabled.
 
+The full host suite at `50d3bdad0` passes **2,976 tests, 87 skipped,
+2,470 deselected in 111.99 seconds**, with MPS availability disabled only in
+that host-test process. Skipped/deselected tests do not establish native physics
+qualification.
+
 The copy file includes all individual bits and composite masks, actual contact
 and connect-equality forces, activation and compiled history, retained position/
 velocity, changed/replaced source tensors with unavailable mutation counters,
