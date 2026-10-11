@@ -319,6 +319,7 @@ def test_limits_groups_actearly_native_parity_gpu():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_act_lifecycle_native_gpu():
+  from dataclasses import replace
   from mujoco_metal import MetalSimulation
   m = mujoco.MjModel.from_xml_string(
       '<mujoco><option timestep="0.002"/><worldbody>' + HINGE_BODY + '</worldbody>'
@@ -327,11 +328,28 @@ def test_act_lifecycle_native_gpu():
   sim = MetalSimulation(m, batch_size=2, profile="integrated_euler_v1")
   assert sim.state.na == 1
   snap = sim.state.snapshot()
-  assert snap.schema_version == 6 and snap.nact == 1
+  assert snap.schema_version == 7 and snap.nact == 1
+  assert snap.precision_words.shape == (2, 2 * (m.nq + m.nv))
+  assert not snap.precision_words.flags.writeable
   sim.step(5, ctrl=np.ones((2, 1), dtype=np.float32))
   assert float(sim.state.act.cpu().numpy()[0, 0]) > 0.05
+  advanced = sim.state.snapshot()
   sim.state.restore(snap)
+  for name in ("qpos", "qvel", "qacc", "time", "status", "act", "precision_words"):
+    np.testing.assert_array_equal(getattr(sim.state.snapshot(), name), getattr(snap, name))
   np.testing.assert_allclose(sim.state.act.cpu().numpy(), np.zeros((2, 1)), atol=1e-7)
+  # Schema 6 retains activation but has no persistent precision planes.
+  # Its supported migration must restore physical state and clear old residuals.
+  legacy = replace(advanced, schema_version=6)
+  assert legacy.precision_words is None
+  sim.state.restore(legacy)
+  restored = sim.state.snapshot()
+  for name in ("qpos", "qvel", "qacc", "time", "status", "act"):
+    np.testing.assert_array_equal(getattr(restored, name), getattr(advanced, name))
+  np.testing.assert_array_equal(restored.precision_words, 0)
+  sim.state.restore(advanced)
+  np.testing.assert_array_equal(sim.state.snapshot().precision_words, advanced.precision_words)
+  sim.state.restore(snap)
   sim.reset_to_keyframe(0, env_ids=[0])
   np.testing.assert_allclose(sim.state.act.cpu().numpy()[0], [0.25], atol=1e-6)
   np.testing.assert_allclose(sim.state.act.cpu().numpy()[1], [0.0], atol=1e-7)

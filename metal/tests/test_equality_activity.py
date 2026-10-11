@@ -137,14 +137,19 @@ def test_state_lifecycle_snapshot_restore_replay_with_masks():
     sim.set_equality_active(np.array([[1], [0]], dtype=np.int32))
     sim.step(3)
     snap = sim.state.snapshot()
-    assert snap.schema_version == 2
+    assert snap.schema_version == 7
+    assert not snap.precision_words.flags.writeable
     sim.step(3)
     q_after = sim.state.qpos.clone()
+    v_after = sim.state.qvel.clone()
+    precision_after = sim.state.snapshot().precision_words.copy()
     sim.state.restore(snap)
     # Masks survive restore and replay reproduces attach/release trajectory.
     np.testing.assert_array_equal(sim.state.eq_active.cpu().numpy(), [[1], [0]])
     sim.step(3)
     assert (sim.state.qpos == q_after).all()
+    assert (sim.state.qvel == v_after).all()
+    np.testing.assert_array_equal(sim.state.snapshot().precision_words, precision_after)
     # Selected reset restores defaults for selected worlds only.
     sim.state.reset(env_ids=[0])
     np.testing.assert_array_equal(sim.state.eq_active.cpu().numpy(), [[1], [0]])
