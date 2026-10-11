@@ -26,6 +26,7 @@ def _copy(value):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in native test")
+@pytest.mark.filterwarnings("error:The given NumPy array is not writable:UserWarning")
 def test_observe_flex_inverse_operands_dense():
   import torch
   from mujoco_metal import MetalSimulation

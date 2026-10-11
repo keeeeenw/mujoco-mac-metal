@@ -5443,12 +5443,16 @@ class MetalCoupledConstraints:
               equality_id=eid)
           raw = flex.equality_position_context
           ids = np.asarray(d.eq_row_ids[eid], dtype=np.int32)
+          # Descriptor arrays are immutable. Passing them directly as Torch
+          # indices creates a tensor over read-only NumPy storage; use owned
+          # host index values without changing the descriptor's row contract.
+          index_ids = ids.tolist()
           rows = {
               "row_ids": ids,
-              "J": f_J[:, ids, :], "R": f_R[:, ids],
-              "aref": f_aref[:, ids], "pos": raw["pos"][:, ids],
-              "impedance": raw["impedance"][:, ids],
-              "b0": raw["b0"][:, ids], "k0": raw["k0"][:, ids],
+              "J": f_J[:, index_ids, :], "R": f_R[:, index_ids],
+              "aref": f_aref[:, index_ids], "pos": raw["pos"][:, index_ids],
+              "impedance": raw["impedance"][:, index_ids],
+              "b0": raw["b0"][:, index_ids], "k0": raw["k0"][:, index_ids],
           }
         elif et == _EQ_FLEXVERT:
           rows = flex.run_flexvert_equality_rows(eid, qvel)
