@@ -53,7 +53,7 @@ def _rne_allocation_bytes(model, batch_size):
       "result_spatial": b * max(nb, 1) * (6 + 6 + 6 + 3),
       "result_qacc": b * nv,
       "result_status": b,
-      "dispatch_metadata": 32,
+      "dispatch_metadata": 32 + 2 * b,
   }
   total = 0
   for name, count in elements.items():
@@ -75,7 +75,10 @@ def _rne_allocation_bytes(model, batch_size):
 
 def _rne_result_bytes(model, batch_size):
   b, nb, nv = int(batch_size), int(model.nbody), int(model.nv)
-  counts = (b * max(nb, 1) * 21, b * nv, b, 8)
+  # Both shared kernels consume a per-world compute selector after their
+  # metadata prefix, including when every world is selected. Reserve their
+  # complete query-local metadata and empty-input sentinels on reuse too.
+  counts = (b * max(nb, 1) * 21, b * nv, b, 32 + 2 * b)
   if any(value < 0 or value > _I32_MAX for value in counts):
     raise ValueError("RNE post-constraint result exceeds int32 indexing")
   peak_bool = b * max(max(nb, 1) * 6, nv) + 6 * b
@@ -247,7 +250,7 @@ def _run_rne_post(program, sim, qvel, qacc, dynamics, qacc_low,
   eqr = (eq_rowadr if eq_rowadr is not None else
          torch.zeros(1, dtype=torch.int32, device=dev))
   adims = torch.tensor([b, nb, int(eqr.numel()) if eq_rowadr is not None else 0,
-                        nc, npairs, has_x, lam_nr, lam_stride],
+                        nc, npairs, has_x, lam_nr, lam_stride] + [1] * b,
                        dtype=torch.int32, device=dev)
   bjn = program._rne_body_jnt[:, 1].contiguous().reshape(-1)
   program._rne_assemble(
@@ -265,7 +268,7 @@ def _run_rne_post(program, sim, qvel, qacc, dynamics, qacc_low,
 
   gravity_disabled = bool(int(model.opt.disableflags)
       & int(mujoco.mjtDisableBit.mjDSBL_GRAVITY))
-  rdims = torch.tensor([b, nb, nv, int(model.njnt), int(gravity_disabled)],
+  rdims = torch.tensor([b, nb, nv, int(model.njnt), int(gravity_disabled)] + [1] * b,
                        dtype=torch.int32, device=dev)
   program._rne_post(
       qvel.reshape(-1) if nv else dummy,
