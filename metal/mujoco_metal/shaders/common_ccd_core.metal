@@ -645,6 +645,24 @@ static inline FlexDD flex_dd_source_sqrt(FlexDD value) {
                ldexp(root.tail,root_exponent)};
 }
 
+// Match sqrt(fma(x,x,y*y)) without losing the residual words of tiny
+// squares. For near-axis cylinder directions, x/y can be around mjMINVAL:
+// their squares fit in float32 but their source-precision residuals do not.
+// Scale the operands before either product, preserving each binary64 rounding
+// boundary on a normal grid, then undo that exact power of two on the root.
+static inline FlexDD flex_dd_source_radial_norm(FlexDD x, FlexDD y) {
+  if (((as_type<uint>(x.hi)|as_type<uint>(x.lo)|as_type<uint>(x.tail)|
+        as_type<uint>(y.hi)|as_type<uint>(y.lo)|as_type<uint>(y.tail))
+        &0x7fffffffu)==0u) return flex_dd(0.0f);
+  int exponent=max(flex_float_exponent(x.hi),flex_float_exponent(y.hi));
+  // The exponent of an exact zero must not dominate a nonzero tiny operand.
+  if ((as_type<uint>(x.hi)&0x7fffffffu)==0u) exponent=flex_float_exponent(y.hi);
+  if ((as_type<uint>(y.hi)&0x7fffffffu)==0u) exponent=flex_float_exponent(x.hi);
+  x=flex_dd_scalbn(x,-exponent); y=flex_dd_scalbn(y,-exponent);
+  FlexDD square=flex_dd_source_fma(x,x,flex_dd_source_mul(y,y));
+  return flex_dd_scalbn(flex_dd_source_sqrt(square),exponent);
+}
+
 static inline FlexDD3 flex_dd3_cross(FlexDD3 a, FlexDD3 b) {
   return FlexDD3{
       flex_dd_source_mulsub(a.y,b.z,a.z,b.y),

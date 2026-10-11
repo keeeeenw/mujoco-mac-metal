@@ -78,9 +78,9 @@ static __attribute__((noinline)) CommonCCDSupportResult mpr_object_support(
         flex_dd_source_mul(local.y,object.size[1]),
         flex_dd_source_mul(local.z,object.size[2])};
   } else if (object.kind==COMMON_CCD_CYLINDER) {
-    FlexDD norm=flex_dd_source_sqrt(flex_dd_source_fma(local_dir.x,local_dir.x,
-        flex_dd_source_mul(local_dir.y,local_dir.y)));
-    if (flex_dd_compare_exact(norm,flex_dd(1e-15f))>0) {
+    FlexDD norm=flex_dd_source_radial_norm(local_dir.x,local_dir.y);
+    FlexDD minimum=FlexDD{1.0000000036274937e-15f,-3.627493647833322e-24f,0.0f};
+    if (flex_dd_compare_exact(norm,minimum)>0) {
       local.x=flex_dd_source_mul(flex_dd_source_div(local_dir.x,norm),object.size[0]);
       local.y=flex_dd_source_mul(flex_dd_source_div(local_dir.y,norm),object.size[0]);
     }
