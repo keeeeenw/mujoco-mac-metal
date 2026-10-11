@@ -567,8 +567,21 @@ class ActuatorModel:
           raise ValueError(f"actuator {i}: USER dynamics actnum must be nonnegative")
       else:  # dcmotor
         slots = dcmotor_slots(dynprm[i], gainprm[i])
-        if slots["num_slots"] != int(actnum[i]):
+        # Pinned mj_fwdActuation skips actadr < 0 before its dynamics
+        # switch. A general DC dynamics tag with no allocated states can
+        # therefore drive another gain family directly from ctrl, even when
+        # dynprm describes optional states that are never evaluated.
+        if int(actadr[i]) >= 0 and slots["num_slots"] != int(actnum[i]):
           raise ValueError(f"actuator {i}: DC-motor slots do not match actnum")
+      if not plugin_mask[i] and int(gaintype[i]) == gain_dcmotor:
+        # The independent DC gain switch always checks the state layout,
+        # including stateless rows and rows with a different dynamics tag.
+        if dcmotor_slots(dynprm[i], gainprm[i])["num_slots"] != int(actnum[i]):
+          raise ValueError(f"actuator {i}: DC-motor gain slots do not match actnum")
+      if not plugin_mask[i] and int(biastype[i]) == bias_dcmotor and dynprm[i, 5] > 0:
+        bristle = dcmotor_slots(dynprm[i], gainprm[i])["bristle"]
+        if int(actadr[i]) < 0 or not 0 <= bristle < int(actnum[i]):
+          raise ValueError(f"actuator {i}: DC-motor mechanical bristle state is unallocated")
       if int(actadr[i]) != cursor and int(actnum[i]) != 0:
         raise ValueError(f"actuator {i}: non-dense activation addressing")
       if int(actnum[i]) == 0 and int(actadr[i]) not in (-1, cursor):
