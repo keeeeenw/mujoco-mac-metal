@@ -4894,6 +4894,79 @@ inline PrimalFloatPair primal_huber_cost_delta_pair(
           primal_huber_cost_pair(start, friction, bound, inverse_R), -1.0f));
 }
 
+// Initial cold/warm selection uses the same represented original operator
+// and row constants as the subsequent paired gradient and line search. A
+// rounded factor norm or scalar cost can reverse this decision at a boundary.
+inline PrimalFloatPair primal_initial_objective_pair(
+    device const float* mass, bool sparse_mass, device const float* debug,
+    constant int* dims, device const float* J, device const float* R,
+    device const float* aref, device const float* lo, device const float* hi,
+    device const float* q0, device const float* q0_low,
+    device const float* acc, device const float* acc_low,
+    device const int* enabled, device const int* elliptic_member,
+    device const int* elliptic_start, device const int* elliptic_dim,
+    device const float* elliptic_friction, int elliptic_count,
+    int nv, int nr, int n, int n_eq_rows) {
+  PrimalFloatPair cost = {0, 0};
+  for (int i = 0; i < nv; ++i) {
+    PrimalFloatPair di = primal_pair_add({acc[i], acc_low[i]},
+        primal_pair_neg({q0[i], q0_low[i]}));
+    for (int j = 0; j < nv; ++j) {
+      PrimalFloatPair dj = primal_pair_add({acc[j], acc_low[j]},
+          primal_pair_neg({q0[j], q0_low[j]}));
+      float entry = sparse_mass
+          ? solver_component_mass_entry(debug, dims, nv, i, j)
+          : mass[i * nv + j];
+      PrimalFloatPair mij = {entry,
+          solver_operator_mass_low(debug, dims, nv, i, j, sparse_mass)};
+      cost = primal_pair_add(cost, primal_pair_multiply(
+          primal_pair_product(di, primal_pair_product(mij, dj)), 0.5f));
+    }
+  }
+  device const float* R_low = primal_regularizer_low_view(debug, dims, nv, nr);
+  device const float* aref_low = primal_aref_low_view(debug, dims, nv, nr);
+  for (int row = 0; row < n; ++row) {
+    if (!enabled[row] || elliptic_member[row]) continue;
+    PrimalFloatPair r = primal_pair_add(
+        primal_ccj_compensated_dot_pair(J, row, acc, nv),
+        primal_ccj_compensated_dot_pair(J, row, acc_low, nv));
+    r = primal_pair_add(r, primal_pair_neg({aref[row], aref_low[row]}));
+    PrimalFloatPair reg = primal_positive_entry_pair(R, R_low, row, 1e-15f);
+    PrimalFloatPair inverse = primal_pair_divide({1, 0}, reg);
+    bool friction = lo[row] < 0 && hi[row] > 0 && isfinite(lo[row])
+        && isfinite(hi[row])
+        && abs(lo[row] + hi[row]) <= 1e-5f * max(1.0f, abs(hi[row]));
+    if (row < n_eq_rows || (!friction && primal_pair_negative(r))) {
+      cost = primal_pair_add(cost, primal_pair_multiply(
+          primal_pair_product(primal_pair_product(r, r), inverse), 0.5f));
+    } else if (friction) {
+      cost = primal_pair_add(cost, primal_huber_cost_pair(r, hi[row],
+          primal_pair_multiply(reg, hi[row]), inverse));
+    }
+  }
+  device const float* friction_low = primal_friction_low_view(debug, dims, nv, nr);
+  for (int block = 0; block < elliptic_count; ++block) {
+    int start = elliptic_start[block], dim = elliptic_dim[block];
+    if (start < 0 || dim < 2 || dim > 6 || start + dim > n || !enabled[start]) continue;
+    float rhi[6], rlo[6], fhi[6], flo[6];
+    for (int k = 0; k < dim; ++k) {
+      PrimalFloatPair r = primal_pair_add(
+          primal_ccj_compensated_dot_pair(J, start + k, acc, nv),
+          primal_ccj_compensated_dot_pair(J, start + k, acc_low, nv));
+      r = primal_pair_add(r, primal_pair_neg({aref[start + k], aref_low[start + k]}));
+      rhi[k] = r.hi; rlo[k] = r.lo;
+    }
+    primal_elliptic_force_pair(rhi, rlo, R + start, elliptic_friction + 5 * block,
+        dim, fhi, flo, R_low + start, friction_low + 5 * block);
+    // Cone cost is homogeneous of degree two: -r dot force / 2.
+    // Huber costs above retain their nonhomogeneous saturation constant.
+    for (int k = 0; k < dim; ++k)
+      cost = primal_pair_add(cost, primal_pair_multiply(
+          primal_pair_product({rhi[k], rlo[k]}, {fhi[k], flo[k]}), -0.5f));
+  }
+  return cost;
+}
+
 inline PrimalFloatPair primal_unilateral_cost_delta_pair(
     PrimalFloatPair start, PrimalFloatPair end, float inverse_R) {
   bool old_active = primal_pair_less_float(start, 0.0f);
@@ -6213,26 +6286,39 @@ inline int solve_primal_accel_scalar(device const float* mass,
       residual, generalized_force, nv, nr, n, n_eq_rows,
       nullptr, nullptr, row_residual_low, false);
   float cold_start_cost = cold_cost;
+  PrimalFloatPair cold_objective = primal_initial_objective_pair(
+      mass, sparse_mass, debug, dims, J, R, aref, lo, hi, q0, q0_low,
+      acc, acc_low, enabled, elliptic_member, elliptic_start, elliptic_dim,
+      elliptic_friction, elliptic_count, nv, nr, n, n_eq_rows);
   for (int i = 0; i < nv; ++i)
     if (partitioned && dof_island[i] != island) gradient[i] = 0.0f;
   // Compare the full acceleration-space constraint + Gauss cost against the
   // cold qacc_smooth point.
   if (warmstart_enabled) {
-    for (int i = 0; i < nv; ++i)
-      candidate[i] = solver_dof_awake(dims, awake_tree, i)
-          && (!partitioned || dof_island[i] == island)
-          ? qacc_warmstart[i] : q0[i];
+    for (int i = 0; i < nv; ++i) {
+      bool selected = solver_dof_awake(dims, awake_tree, i)
+          && (!partitioned || dof_island[i] == island);
+      candidate[i] = selected ? qacc_warmstart[i] : q0[i];
+      mass_delta_low[i] = selected ? 0.0f : q0_low[i];
+    }
     float warm_cost = primal_accel_eval_elliptic(mass, L, sparse_mass,
         debug, dims, J, R, aref, lo, hi,
         q0, candidate, enabled, elliptic_member, elliptic_start, elliptic_dim,
         elliptic_friction, elliptic_count, candidate_force, old_gradient,
         candidate_hessian, residual, generalized_force, nv, nr, n, n_eq_rows,
         nullptr, nullptr, row_residual_low, false);
-    if (isfinite(warm_cost)) warm_cost_delta = warm_cost - cold_start_cost;
-    if (isfinite(warm_cost) && warm_cost <= cold_cost) {
+    PrimalFloatPair warm_objective = primal_initial_objective_pair(
+        mass, sparse_mass, debug, dims, J, R, aref, lo, hi, q0, q0_low,
+        candidate, mass_delta_low, enabled, elliptic_member,
+        elliptic_start, elliptic_dim, elliptic_friction, elliptic_count,
+        nv, nr, n, n_eq_rows);
+    if (primal_pair_is_finite(warm_objective)) warm_cost_delta = primal_pair_value(
+        primal_pair_add(warm_objective, primal_pair_neg(cold_objective)));
+    if (primal_pair_is_finite(warm_objective)
+        && primal_pair_less_equal(warm_objective, cold_objective)) {
       for (int i = 0; i < nv; ++i) {
         acc[i] = candidate[i];
-        acc_low[i] = 0.0f;
+        acc_low[i] = mass_delta_low[i];
       }
       cold_cost = warm_cost;
     }
