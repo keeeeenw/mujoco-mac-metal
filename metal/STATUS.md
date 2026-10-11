@@ -26,6 +26,14 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
+Prepared potential/kinetic energy APIs and coherent energy-sensor storage pass
+141 native and 51 host affected checks. These include disabled automatic energy,
+five integrators, timed samples, RK4 stage ordering, query rollback and checkpoint
+replay. The complete host selection passes 2,983 checks with 99 skips; the skipped
+native cases remain unqualified. See [producing revisions and exact remaining
+scope](QUALIFICATION.md#prepared-energy-apis-and-sensor-storage). This does not
+change the full milestone count.
+
 The public selected-state copy contract passes 73 host/crosswalk checks and
 94 affected native copy/lifecycle checks, including retained words, overlap,
 failure atomicity, ordered worlds and exact replay. Split implicit integration

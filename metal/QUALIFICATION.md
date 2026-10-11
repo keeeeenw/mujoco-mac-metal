@@ -1,5 +1,39 @@
 # Development qualification — 2026-10-11
 
+## Prepared energy APIs and sensor storage
+
+Runtime revision `2f0c6ded4`, with tests through `7145fe3d9`, passes the complete
+eight-file affected selection: **192 checks in 113.76 seconds, comprising
+141 native checks and 51 host checks**, with no failures or skips and MPS CPU
+fallback disabled. The complete host selection at the same runtime passes
+**2,983 tests, 99 skipped, 2,544 deselected in 113.64 seconds**. Skips and
+deselections do not qualify native physics.
+
+Actual public `mj_energyPos`/`mj_energyVel` calls match independent pinned
+MuJoCo with automatic energy enabled or disabled. Tests cover dense/component
+mass, five integrators, real scalar/free/ball joints, nonlinear joint springs,
+fixed/spatial tendon springs, active one-dimensional flex and zero-DOF models.
+Prepared calls forbid geometry/mass redispatch and CPU physics. Selected rows,
+other-column preservation, owned outputs, injected publication failures,
+copy/reset/checkpoint replay and compatible model rebuilds are checked.
+
+New correction gates exposed typed flex-context access, malformed enabled
+checkpoint acceptance, disabled-forward clearing, POS kinetic sensors reading
+zero velocity, and current queries replacing stored samples. Corrected query
+rollback is exercised after actual native computation as well as on success.
+Sensor-driven buffers are charged in host allocation admission.
+
+Timed sensors cover automatic energy on/off across all five integrators, cutoff,
+interval/delay storage and exact checkpoint replay. A failing-before RK4 case
+showed potential-energy error up to `0.00731576`: delayed samples require the
+last RK substage geometry with restored starting inputs. The correction keeps
+the original `rtol=2e-5`, `atol=2e-6` energy bounds and exact replay assertions.
+
+This is scoped qualification. Complete sleeping/failed-peer, gravity/spring
+disable, pulley/armature, retained-precision and lifecycle boundary combinations,
+the full native suite, clean-wheel execution and final demos remain open.
+Milestones 005–020 remain unaccepted.
+
 ## Rigid convex oracle input precision
 
 The complete public rigid-convex regression file passes **20 checks in 49.24

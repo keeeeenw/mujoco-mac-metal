@@ -345,8 +345,32 @@ or selected rows preserves their stored samples without recomputing physics.
 Malformed energy is rejected before state writes or extension callbacks. Older
 simulation schema-1 checkpoints without the optional `energy` key clear the
 selected stored energy rows; the next forward evaluation computes fresh values.
-Disabled diagnostics carry `energy=None`. Full simulation restore rejects an
-empty environment selection before mutation.
+Without automatic energy, energy sensors or explicit energy evaluation,
+diagnostics carry `energy=None`. Full simulation restore rejects an empty
+environment selection before mutation.
+
+`api.mj_energyPos(sim, record=None, *, env_ids=None)` and
+`api.mj_energyVel(sim, record=None, *, env_ids=None)` evaluate potential and
+kinetic energy from a coherent prepared POS or VEL record. Omitting `record`
+uses the current published record. Both work with automatic ENERGY disabled,
+update only their selected column/worlds, and return an owned `[batch]` MPS
+tensor. They reuse prepared geometry/mass without rerunning forward physics.
+Invalid/stale records, selections and memory admission reject before writes;
+producer/publication failures restore diagnostics and scratch.
+
+Explicit samples and energy-sensor storage are carried by full/selected
+checkpoints and simulation copies. Compatible model rebuilds preserve samples
+while rebuilding energy constants. A disabled full forward with no computed
+potential-energy sensor clears both samples, matching pinned MuJoCo; an
+explicit energy call does not enable automatic sampling. Current-state sensor
+queries preserve stored step diagnostics, including on exceptions.
+
+Energy sensors use the prepared mass and current velocity at the POS stage,
+apply cutoff before sensor history, and preserve pinned RK4 delayed sampling
+with last-substage geometry and restored starting inputs. The development
+energy/forward/sensor/capacity selection passes 141 native checks and 51 host
+checks. Complete sleep, armature/pulley, retained-precision and lifecycle
+boundary compositions remain unqualified; this does not close a milestone.
 
 Explicit inverse queries also preserve pending split-step records, sleep
 scheduling, stored sensor status and plugin device state. Registered plugins
