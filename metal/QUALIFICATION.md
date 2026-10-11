@@ -1,5 +1,23 @@
 # Development qualification — 2026-10-11
 
+## Current checkpoint and owned keyframe regression gates — 2026-10-11
+
+Revisions `fe644d658` and `70136b887` update native lifecycle fixtures to the
+current schema-7 checkpoint and the prepared model ownership contract. Schema-6
+activation migration remains tested; current checkpoints additionally preserve
+owned precision planes. Invalid keyframe tests corrupt the actual prepared
+payload, while constructor and public inspection copies are independently shown
+to leave that payload unchanged.
+
+The complete actuator, device-state, mocap and equality native selection passes
+**19 tests, 32 deselected in 28.27 seconds**, with no failures or skips. Original
+activation, selected reset, invalid-input and attach/release trajectory bounds
+remain, with stronger exact velocity/precision replay and rejection atomicity
+checks. These commits change tests only, not production physics. The preceding
+full native discovery stopped after 115 passes on the stale schema assertion;
+that discovery is not a full-suite pass. Full composition, wheel and demo
+qualification remains open.
+
 ## Stored energy copy and checkpoint ownership — 2026-10-11
 
 Revision `ab7c360a2` includes enabled stored energy in full simulation copies

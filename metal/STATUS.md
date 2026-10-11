@@ -99,6 +99,13 @@ selected worlds, malformed rejection, legacy compatibility and exact replay.
 These are source-specific results; full heightfield/deformable composition,
 final wheel/demo checks and milestones 005–020 remain open.
 
+Current checkpoint and owned-keyframe regression fixtures at `fe644d658` /
+`70136b887` pass the complete 19-case native actuator/device/mocap/equality
+selection. They retain legacy activation migration and strengthen current
+velocity/precision replay and corrupt-payload rejection. The preceding full
+native discovery stopped after 115 passes on a stale checkpoint-version test;
+it is not a completed backend suite.
+
 The original rigid-SDF deadline and mesh/bowl/torus failures are historical
 evidence. The seven original bundled rigid-SDF fixtures now pass in the
 117-test group, including strict five-provider force/trajectory/replay,
