@@ -252,11 +252,26 @@ def test_cfrc_composition_connect_weld_xfrc_gpu():
   xfrc[2, 3, 2] = 1.0
   for _ in range(80):
     sim.step(1, xfrc_applied=xfrc)
-  gq = sim.state.qpos.cpu().numpy().astype(float)
-  gv = sim.state.qvel.cpu().numpy().astype(float)
-  got_sens = sim.sensor_values().cpu().numpy()
-  got_ext = sim._sensors._rne_ext.cpu().numpy().reshape(3, nb, 6)
-  got_int = sim._sensors._rne_cfrc.cpu().numpy().reshape(3, nb, 6)
+  # Match the actual retained state, not only its public float32 projection.
+  snapshot = sim.state.snapshot()
+  words = snapshot.precision_words.astype(float)
+  nq, nv = model.nq, model.nv
+  gq = snapshot.qpos.astype(float) + words[:, :nq] + words[:, nq:2*nq]
+  gv = snapshot.qvel.astype(float) + words[:, 2*nq:2*nq+nv] + words[:, 2*nq+nv:]
+  retained_ext = sim._sensors._rne_ext.clone()
+  retained_int = sim._sensors._rne_cfrc.clone()
+  from test_energy_lifecycle_006 import _native_only
+  with pytest.MonkeyPatch.context() as guard:
+    got_sens = _native_only(guard, sim.sensor_values).cpu().numpy()
+  # Current queries preserve the borrowed previous-step RNE buffers. Inspect
+  # current forces through the public owned query rather than those buffers.
+  from mujoco_metal.native_api import mj_rnePostConstraint
+  with pytest.MonkeyPatch.context() as guard:
+    current = _native_only(guard, lambda: mj_rnePostConstraint(sim))
+  got_ext = current['cfrc_ext'].cpu().numpy().reshape(3, nb, 6)
+  got_int = current['cfrc_int'].cpu().numpy().reshape(3, nb, 6)
+  torch.testing.assert_close(sim._sensors._rne_ext, retained_ext, rtol=0, atol=0)
+  torch.testing.assert_close(sim._sensors._rne_cfrc, retained_int, rtol=0, atol=0)
   xh = xfrc.cpu().numpy().reshape(3, nb, 6)
   for w in range(3):
     dd = _cpu_frame(model, gq[w], gv[w], time=float(sim.state.time.cpu().numpy()[w]),
