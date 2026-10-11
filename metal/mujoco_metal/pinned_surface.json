@@ -11422,6 +11422,12 @@
       "requirement": "REQ-GEO-001",
       "execution": "host_model_metadata",
       "semantics": "Pinned MuJoCo 3.10.0 per-geom-pair bound; no runtime collision, state access or GPU dispatch."
+    },
+    "mj_copyState": {
+      "path": "mujoco_metal/native_api.py:mj_copyState",
+      "requirement": "REQ-STATE-001",
+      "execution": "device_or_host_validation",
+      "semantics": "Transactional selected batched device state copy, ordered paired worlds and retained precision; no forward or CPU physics."
     }
   },
   "python_function_map": {
@@ -11666,12 +11672,12 @@
       "counterpart_kind": null
     },
     "mj_copyState": {
-      "classification": "state_reset_and_copy",
+      "classification": "package_counterpart",
       "owner": "REQ-STATE-001",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_copyState.",
-      "counterpart_kind": null
+      "execution": "device state copy with host metadata admission; no physics evaluation",
+      "counterpart": "mujoco_metal/native_api.py:mj_copyState",
+      "gap": null,
+      "counterpart_kind": "public_wrapper"
     },
     "mj_crb": {
       "classification": "internal_pipeline_counterpart",

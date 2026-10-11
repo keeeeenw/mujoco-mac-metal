@@ -1,5 +1,30 @@
 # Development qualification — 2026-10-11
 
+## Public selected state copy
+
+The batched `mj_copyState` entrypoint copies selected pinned state components
+without evaluating physics. Its complete host/crosswalk group passes **73 tests
+in 2.37 seconds**. The complete native copy, transaction, device-state, energy
+and split-step selection passes **94 tests, 19 deselected in 78.44 seconds**,
+with no failures or skips and CPU fallback disabled.
+
+The copy file includes all individual bits and composite masks, actual contact
+and connect-equality forces, activation and compiled history, retained position/
+velocity, changed/replaced source tensors with unavailable mutation counters,
+ordered selection, different batch sizes, overlapping rows, prepared-context
+invalidation and exact replay. An injected failure after real writes restores
+storage and coherent records. Literal nonfinite/signed-zero values and invalid
+mocap normalization are copied without setter admission; they do not constitute
+valid stepping inputs. Immutable inference destination storage is rejected
+before any writes, following a failing-before rollback regression. Empty
+compiled plugin state is covered; arbitrary plugin contracts are not implied.
+
+Initial native admission also caught the distinction between unindexed `mps`
+metadata and actual `mps:0` tensor devices. Admission now uses the actual indexed
+device. These checks retain original physics bounds and independent pinned CPU
+oracles; they qualify this selected-copy contract, not `mj_copyData`, whole
+milestones 006/019 or final distribution qualification.
+
 ## Split-step integration with solved constraints
 
 Split-step integration now includes the solved constraint force in its total

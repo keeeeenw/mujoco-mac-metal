@@ -1746,6 +1746,19 @@ class StateSpec:
   ALL = INTEGRATION
 
 
+def mj_copyState(src, dst, spec=StateSpec.ALL, *, src_env_ids=None, dst_env_ids=None):
+  """Copy selected device state between identical compiled model owners.
+
+  This batched backend signature pairs source/destination selections in order.
+  Component values are copied without normalization or physics evaluation;
+  position and velocity include retained precision. See API.md for ownership,
+  cache invalidation, compatibility and transactional failure semantics.
+  """
+  from mujoco_metal.state_copy import copy_state
+  return copy_state(src, dst, spec, src_env_ids=src_env_ids,
+                    dst_env_ids=dst_env_ids)
+
+
 def mj_stateSize(model, sig):
   """Pinned vector width from host model metadata and an upstream mjtState mask.
 

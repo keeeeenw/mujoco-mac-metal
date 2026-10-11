@@ -755,6 +755,34 @@ transition or inverse finite-difference analysis support.
 
 ### Equality activation, reset, snapshots and failure
 
+`mj_copyState(src, dst, spec=StateSpec.ALL, *, src_env_ids=None,
+dst_env_ids=None)` copies selected state components between simulations with
+identical compiled models on the same device. This is a batched backend
+signature, rather than upstream's model/data argument list. Selections pair in
+supplied order, may use different batch sizes, and must contain unique valid
+world IDs with equal lengths. Omitted selections mean all worlds. Overlapping
+same-simulation copies stage every source row before writing any destination.
+
+All pinned state bits and composite masks are supported. Position and velocity
+also copy their retained precision words; a source component changed directly
+or replaced is privately reconciled without modifying its owner or shadow.
+Values are copied literally, including signed zero, nonfinite values and
+unnormalized mocap quaternions. This operation does not validate values for a
+subsequent physics step. Zero masks and zero-width components leave state and
+prepared records unchanged. Invalid masks, layouts, selections and memory
+budgets fail before writes. Immutable inference tensors are rejected as
+destination backings before any writes; inference source tensors remain valid.
+
+Unselected components/worlds, acceleration, stored sensors/energy, solver
+workspace views and plugin callbacks are untouched. Successful nonempty copies
+invalidate destination prepared records and lower-level position contexts;
+these are rebuilt on demand. A post-write exception restores destination data,
+precision, epochs and previously coherent records. No FK, collision, solve,
+history callback, CPU physics or numerical device readback is evaluated by the
+copy operation. It returns `None`. Full simulation checkpoints and copies carry
+additional derived storage and extension state; selected state copying is not
+an alias for `mj_copyData`.
+
 `mj_stateSize(model, sig)` computes the flat vector width from compiled model
 metadata. `mj_extractState(model, source, srcsig, dstsig)` extracts an owned
 batched tensor with pinned upstream field ordering, including history, equality

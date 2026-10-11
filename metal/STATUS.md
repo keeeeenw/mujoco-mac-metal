@@ -26,6 +26,13 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
+The public selected-state copy contract passes 73 host/crosswalk checks and
+94 affected native copy/lifecycle checks, including retained words, overlap,
+failure atomicity, ordered worlds and exact replay. Split implicit integration
+also passes its 25-case affected group after including solved constraint force.
+See [exact scope and producing revisions](QUALIFICATION.md). These close
+specific contracts; the full milestone count remains unchanged.
+
 The latest local development host selection at `ab7c360a2` passed **2,460 tests, 99 skipped**;
 it does not qualify the skipped native cases. The historical host publication
 check passed **2,163 tests, 1,615 skipped** at its separately recorded revision;
