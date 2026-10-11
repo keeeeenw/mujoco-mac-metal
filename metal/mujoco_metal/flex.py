@@ -825,6 +825,13 @@ class MetalFlex:
         np.asarray(d.edge, dtype=np.int32).copy(), dtype=torch.int32,
         device=self._device)
     self._edge_length0 = torch.tensor(d.edge_length0, dtype=torch.float32, device=self._device)
+    rest_source = np.asarray(model.flexedge_length0, dtype=np.float64)
+    rest_low = rest_source - np.asarray(d.edge_length0).astype(np.float64)
+    rest_tail = rest_low - rest_low.astype(np.float32).astype(np.float64)
+    self._edge_length0_low = torch.as_tensor(
+        np.array(rest_low, dtype=np.float32, copy=True), device=self._device)
+    self._edge_length0_tail = torch.as_tensor(
+        np.array(rest_tail, dtype=np.float32, copy=True), device=self._device)
     self._edge_invweight0 = torch.tensor(d.edge_invweight0, dtype=torch.float32, device=self._device)
     self._edgestiffness = torch.tensor(d.edgestiffness, dtype=torch.float32, device=self._device)
     self._edgedamping = torch.tensor(d.edgedamping, dtype=torch.float32, device=self._device)
@@ -3955,6 +3962,11 @@ class MetalFlex:
         dims[6:].copy_(world_mask)
       elem_force = torch.zeros(
           (b, self._stretch_count, nv), dtype=torch.float32, device=self._device)
+      # One element owner publishes its precise elongation and edge gradients
+      # for the matching analytic tangent. This scratch is call-owned, so a
+      # masked recovery cannot overwrite a borrowed ordinary material record.
+      elem_geometry = torch.zeros(
+          (b, self._stretch_count, 6, 4), dtype=torch.float32, device=self._device)
       self._material_shader.flex_stretch_force(
           self._flexvert_xpos.reshape(-1), self._flexedge_length.reshape(-1),
           self._flexedge_velocity.reshape(-1), self._edge_length0,
@@ -3963,7 +3975,9 @@ class MetalFlex:
           self._stretch_damping, self._stretch_edge_count,
           self._stretch_vertex_count, dims,
           torch.as_tensor([d.timestep], dtype=torch.float32, device=self._device),
-          elem_force.reshape(-1),
+          elem_force.reshape(-1), self._flexvert_xpos_low.reshape(-1),
+          self._flexvert_xpos_tail.reshape(-1), self._edge_length0_low,
+          self._edge_length0_tail, elem_geometry.reshape(-1),
           threads=(b * self._stretch_count * nv,), group_size=(128,))
       self._qfrc_passive.add_(elem_force.sum(dim=1))
     else:
@@ -4014,7 +4028,8 @@ class MetalFlex:
       x = self._flexvert_xpos[:, verts, :]
       vel = self._flexvert_xvel[:, verts, :]
       jv = self._flexvert_J[:, verts, :, :]
-      diffs = torch.stack([x[:, a] - x[:, c] for a, c in pairs], dim=1)
+      diffs = (elem_geometry[:, e, :ne, 1:4] if self._device.type == "mps"
+               else torch.stack([x[:, a] - x[:, c] for a, c in pairs], dim=1))
       vdiffs = torch.stack([vel[:, a] - vel[:, c] for a, c in pairs], dim=1)
       jrel = torch.stack([jv[:, a] - jv[:, c] for a, c in pairs], dim=1)
       lengths = self._flexedge_length[:, edge_ids]
@@ -4034,8 +4049,11 @@ class MetalFlex:
       jrate += torch.einsum("bei,bein->ben", unit, rel_vq)
       kd = self._stretch_damping_host[e] / d.timestep if d.timestep > 0 else 0.0
       previous = lengths - rates * d.timestep
-      elong = lengths.square() - self._edge_length0[edge_ids].square().unsqueeze(0)
-      elong = elong + (lengths.square() - previous.square()) * kd
+      if self._device.type == "mps":
+        elong = elem_geometry[:, e, :ne, 0]
+      else:
+        elong = lengths.square() - self._edge_length0[edge_ids].square().unsqueeze(0)
+        elong = elong + (lengths.square() - previous.square()) * kd
       coeff = elong @ metric
 
       # Derivative of each projected edge gradient, Jrel' * Jrel.

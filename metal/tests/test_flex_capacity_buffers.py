@@ -71,3 +71,31 @@ def test_fw_and_midpoint_residual_planes_match_owned_host_allocation():
   assert program._contact_pos_low_tail.numel() == expected
   assert dict(__import__("mujoco_metal.capacity", fromlist=["_runtime_buffer_sizes"])
               ._runtime_buffer_sizes(model, batch))["flex_contact.contact_pos_low_tail"] == expected
+
+
+def test_material_rest_length_residuals_are_owned_and_charged():
+  import numpy as np
+  from mujoco_metal.capacity import _runtime_buffer_sizes
+  from mujoco_metal.flex import MetalFlex
+
+  model = mujoco.MjModel.from_xml_string('''<mujoco>
+    <worldbody><flexcomp name="sheet" type="grid" count="2 2 1"
+        spacing=".1 .1 .1" mass="1" dim="2">
+      <contact contype="0" conaffinity="0"/>
+      <edge stiffness="0" damping="0"/>
+      <elasticity young="1000" poisson=".2" thickness=".02"
+                  elastic2d="stretch"/>
+    </flexcomp></worldbody></mujoco>''')
+  batch = 3
+  program = MetalFlex(model, batch_size=batch, device='cpu')
+  words = [program._edge_length0, program._edge_length0_low,
+           program._edge_length0_tail]
+  assert all(tuple(word.shape) == (model.nflexedge,) for word in words)
+  represented = sum(word.numpy().astype(np.float64) for word in words)
+  np.testing.assert_array_equal(represented, model.flexedge_length0)
+  assert np.any(words[1].numpy() != 0.)
+  inventory = dict(_runtime_buffer_sizes(model, batch))
+  assert inventory['flex.rest_edge_low'] == words[1].numel()
+  assert inventory['flex.rest_edge_tail'] == words[2].numel()
+  assert inventory['flex.stretch_geometry_scratch'] >= (
+      batch * program._stretch_count * 6 * 4)

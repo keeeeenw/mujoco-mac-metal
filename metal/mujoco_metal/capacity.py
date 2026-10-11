@@ -640,6 +640,11 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
               + int(np.asarray(getattr(model, "flex_node", [])).shape[0])) * 3),
         ("flex.local_vertex_low", int(getattr(model, "nflexvert", 0)) * 3),
         ("flex.local_vertex_tail", int(getattr(model, "nflexvert", 0)) * 3),
+        ("flex.rest_edge_low", nflexedge),
+        ("flex.rest_edge_tail", nflexedge),
+        # Stretch owns at most one six-edge element per compiled element.
+        # Elongation plus XYZ gradient remain live through its tangent stage.
+        ("flex.stretch_geometry_scratch", b * int(model.nflexelem) * 24),
         ("flex.local_node_low",
          int(np.asarray(getattr(model, "flex_node", [])).shape[0]) * 3),
         ("flex.local_node_tail",

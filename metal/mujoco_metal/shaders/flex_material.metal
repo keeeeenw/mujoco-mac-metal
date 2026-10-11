@@ -405,6 +405,11 @@ kernel void flex_stretch_force(
     constant int* dims [[buffer(11)]],
     constant float* timestep [[buffer(12)]],
     device float* element_force [[buffer(13)]],
+    device const float* vertex_xpos_low [[buffer(14)]],
+    device const float* vertex_xpos_tail [[buffer(15)]],
+    device const float* edge_length0_low [[buffer(16)]],
+    device const float* edge_length0_tail [[buffer(17)]],
+    device float* element_geometry [[buffer(18)]],
     uint tid [[thread_position_in_grid]]) {
   int batch = dims[0];
   int nv = dims[1];
@@ -444,19 +449,32 @@ kernel void flex_stretch_force(
       const int edge_b[6] = {1, 2, 0, 3, 3, 3};
       a = edge_a[e]; b = edge_b[e];
     }
+    FPDD squared = fpdd(0.0f);
     for (int d = 0; d < 3; ++d) {
-      float xa = vertex_xpos[(env * dims[5] + v[a]) * 3 + d];
-      float xb = vertex_xpos[(env * dims[5] + v[b]) * 3 + d];
-      grad[e][0][d] = xa - xb;
-      grad[e][1][d] = xb - xa;
+      int ia = (env * dims[5] + v[a]) * 3 + d;
+      int ib = (env * dims[5] + v[b]) * 3 + d;
+      FPDD delta = fpsub(
+          FPDD{vertex_xpos[ia], vertex_xpos_low[ia], vertex_xpos_tail[ia]},
+          FPDD{vertex_xpos[ib], vertex_xpos_low[ib], vertex_xpos_tail[ib]});
+      squared = fpadd(squared, fpmul(delta, delta));
+      grad[e][0][d] = (delta.hi + delta.lo) + delta.tail;
+      grad[e][1][d] = -grad[e][0][d];
     }
     float len = edge_length[eadr[e]];
     float rate = edge_velocity[eadr[e]];
     float prev = len - rate * h;
-    float rest = edge_length0[ge];
+    FPDD rest = FPDD{edge_length0[ge], edge_length0_low[ge],
+                      edge_length0_tail[ge]};
+    FPDD elastic = fpsub(squared, fpmul(rest, rest));
     float kd = h > 0.0f ? damping[elem] / h : 0.0f;
-    elong[e] = len * len - rest * rest +
+    elong[e] = ((elastic.hi + elastic.lo) + elastic.tail) +
                (len * len - prev * prev) * kd;
+    if (dof == 0) {
+      int out = ((env * nelem + elem) * 6 + e) * 4;
+      element_geometry[out] = elong[e];
+      for (int d = 0; d < 3; ++d)
+        element_geometry[out + 1 + d] = grad[e][0][d];
+    }
   }
 
   float local[4][3] = {{0}};
