@@ -1,5 +1,29 @@
 # Development qualification — 2026-10-11
 
+## Stored energy copy and checkpoint ownership — 2026-10-11
+
+Revision `ab7c360a2` includes enabled stored energy in full simulation copies
+and checkpoints. Full and selected restoration preserves the saved stage
+samples without running extra physics. Energy payloads are validated before
+state writes or extension callbacks. Legacy schema-1 checkpoints without the
+optional field clear selected stored energy; disabled diagnostics carry None.
+
+The new complete native lifecycle file passes **19 tests in 4.33 seconds**,
+covering all five dense/scalable Euler/RK4/implicit profiles, nonzero independent
+CPU energy comparisons, copy and result ownership, full/selected/legacy restore,
+malformed atomic rejection, disabled energy, empty-selection rejection and exact
+replay. All CPU physics stage calls are forbidden during native evaluation.
+The complete affected transaction, split-stage, actuator-delay, energy and
+recovery group passes **71 native tests, 69 deselected in 49.59 seconds**,
+with no failures, skips or warnings. Revision `88f297e75` repairs its stale
+force-failure injection to the executed paired solver, verifies injection calls,
+and preserves every original failed/healthy state, sensor and warm-start bound.
+
+The full CPU suite at `ab7c360a2` passes **2,460 tests, 99 skipped,
+2,398 deselected in 99.48 seconds**. This does not qualify skipped native cases.
+The scoped lifecycle results do not establish full milestones 006/019/020,
+standalone energy-stage API coverage, final installed-wheel physics or demos.
+
 ## Articulated COM and nonzero elastic damping — 2026-10-11
 
 Revision `abf0bde7c` publishes each articulated root's center of mass into its

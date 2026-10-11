@@ -26,7 +26,7 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
-The latest local development host selection at `ed74d3fa0` passed **2,460 tests, 99 skipped**;
+The latest local development host selection at `ab7c360a2` passed **2,460 tests, 99 skipped**;
 it does not qualify the skipped native cases. The historical host publication
 check passed **2,163 tests, 1,615 skipped** at its separately recorded revision;
 see [producing revisions and scope](QUALIFICATION.md).
@@ -92,6 +92,10 @@ COM/spatial/recovery/invariant regressions. The original 90-case material/
 integrator/equality matrix plus 32 independent native energy cases also pass
 at `4d5497758` (122 passed, no failures or skips). Original force, derivative,
 trajectory and replay bounds remain unchanged.
+Stored energy copy/checkpoint ownership at `ab7c360a2` also passes the
+complete 19-case native lifecycle file and 71 affected native transaction,
+split-stage, delay and recovery cases. These preserve nonzero source energy,
+selected worlds, malformed rejection, legacy compatibility and exact replay.
 These are source-specific results; full heightfield/deformable composition,
 final wheel/demo checks and milestones 005–020 remain open.
 
