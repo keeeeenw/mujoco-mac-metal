@@ -1,5 +1,44 @@
 # Development qualification — 2026-10-11
 
+## Consistent primal line coefficients — 2026-10-11
+
+Local producing revision `8f105983b9e52c6a2afbfd119256355c81e736be`
+retains regularizer and anisotropic friction words through scalar and elliptic
+line evaluation, matching the represented operands used by gradient/Hessian
+updates. It also corrects the missing polynomial constant when an initially
+satisfied unilateral row enters its active quadratic zone. Test-only shader
+wrappers exercise the production functions against pinned `mj_constraintUpdate`
+costs and independent derivatives; no CPU physics is used in the native solve.
+
+The complete host selection passed **2,429 tests, 99 skipped, 2,297 deselected
+in 101.87 seconds**, exit 0. The focused native line group passed **43 tests,
+34 deselected in 7.07 seconds**, exit 0. It covers scalar equality, unilateral
+and Huber transitions plus elliptic dimensions 3/4/6 and cone-zone transitions,
+with cost/derivative/curvature bounds of `2e-12`.
+
+The original zero-margin alternate cylinder-heightfield trajectory and restore
+case now **passes in 57.77 seconds**, with its model, `rtol=atol=2e-3`, solver
+budget, independent four-step rollout and bitwise replay unchanged. The expanded
+terrain matrix has additional failures, so this result does **not** qualify all
+terrain shapes, CCD modes, margins or geom orders. Initial cold/warm objectives
+and Huber force-zone predicates also retain precision gaps; complete solver
+qualification remains open. The earlier failures below belong to their recorded
+producing revisions, rather than proving the corrected case still fails.
+
+This is source-only scoped qualification, not milestone closure, a current-wheel
+qualification or a performance claim. Python 3.12.13, MuJoCo 3.10.0 and Torch
+2.9.1 were used, with fallback/fast math disabled and serialized native checks.
+Reproduce the focused line group:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -m gpu -p no:cacheprovider \
+  metal/tests/test_primal_line_coefficient_residuals.py \
+  metal/tests/test_primal_elliptic_line_pair_014.py \
+  metal/tests/test_primal_line_alpha_014.py
+```
+
 ## Original-mass residuals in coupled solvers — 2026-10-11
 
 Local producing revision `cb2901278b0c59eb51c83cc820a306333fb73303`

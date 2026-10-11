@@ -26,9 +26,15 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
-The current host publication check passed **2,163 tests, 1,615 skipped**.
-The skipped native cases remain unqualified by this run; see
-[the recorded scope](QUALIFICATION.md).
+The latest local development host selection passed **2,429 tests, 99 skipped**;
+it does not qualify the skipped native cases. The historical host publication
+check passed **2,163 tests, 1,615 skipped** at its separately recorded revision;
+see [producing revisions and scope](QUALIFICATION.md).
+
+A local line-search correction passed 43 focused native checks and the original
+alternate-cylinder heightfield trajectory/restore case without altered bounds
+or solver budgets. The broader terrain matrix has additional failures. Neither
+heightfields nor the full solver milestone is accepted from this scoped result.
 
 Selected source compositions passed 94 Newton regression checks (including the
 original 300-step slope fixture), 69 contact-override checks and 11 retained

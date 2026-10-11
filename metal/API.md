@@ -79,6 +79,12 @@ integration. A residual-bearing output is not a claim of complete binary64
 physics parity or full solver/contact composition. See
 [producing revisions and qualification](QUALIFICATION.md).
 
+Development primal line evaluation retains regularizer and anisotropic friction
+coefficient pairs through scalar and elliptic costs, slopes and curvature. The
+unilateral entering-zone polynomial includes its constant term. Initial
+cold/warm objective comparisons and Huber force-zone predicates still need
+consistent retained precision; the complete solver/terrain matrix is unqualified.
+
 
 ## Applied forces, damping and basic motors
 
