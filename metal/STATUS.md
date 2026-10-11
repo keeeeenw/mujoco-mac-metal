@@ -88,7 +88,9 @@ Separately, a
 stiffnesses, two timesteps and all four integrators with deformed free carriers.
 Articulated COM publication and stable nonzero material damping corrections at
 `abf0bde7c`/`ed74d3fa0` pass 16 native damping cases and 27 native
-COM/spatial/recovery/invariant regressions. Original force, derivative,
+COM/spatial/recovery/invariant regressions. The original 90-case material/
+integrator/equality matrix plus 32 independent native energy cases also pass
+at `4d5497758` (122 passed, no failures or skips). Original force, derivative,
 trajectory and replay bounds remain unchanged.
 These are source-specific results; full heightfield/deformable composition,
 final wheel/demo checks and milestones 005–020 remain open.

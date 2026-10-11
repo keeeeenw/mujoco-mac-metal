@@ -20,8 +20,11 @@ passed **27 native tests in 16.68 seconds**. No bounds were relaxed.
 The complete CPU selection at `ed74d3fa0` passed **2,460 tests, 99 skipped,
 2,379 deselected in 99.93 seconds**, with MPS availability hidden. This does not
 qualify skipped GPU cases. The earlier 90-case material/integrator/equality
-matrix belongs to `88aed2063`; its current-source rerun, broader compositions,
-long-horizon behavior, demos and final wheel remain required. These results
+matrix was repeated at `4d5497758` together with the 32 native independent
+energy cases: **122 passed, 109 deselected in 2,670.23 seconds**, with no
+failures, skips or warnings. The original force, derivative, trajectory, replay
+bounds and budgets were unchanged. Broader compositions, long-horizon behavior,
+demos and final wheel remain required. These results
 are scoped correctness evidence, not full milestone closure or a speed claim.
 
 ## Retained velocity in inertial bias — 2026-10-11

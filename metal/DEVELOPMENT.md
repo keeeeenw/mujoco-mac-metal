@@ -83,6 +83,8 @@ material/contact composition or general source-rounded dynamics precision.
 Articulated root COM publication and stable squared-length damping at
 `abf0bde7c`/`ed74d3fa0` pass 16 nonzero damping cases across 2D/3D and all
 four integrators, plus 27 COM/spatial/recovery/invariant native regressions.
+The original material/integrator/equality and independent energy native groups
+were repeated at `4d5497758`: 122 passed with no failures, skips or warnings.
 The complete CPU selection at `ed74d3fa0` passes 2,460 tests with 99 skips;
 skips do not qualify native execution.
 
