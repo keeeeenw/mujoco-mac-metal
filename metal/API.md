@@ -60,6 +60,18 @@ inputs. These development contracts are not present in the released 0.4.0 wheel.
 
 Run the opt-in GPU correctness tests only on an available Apple GPU with the pinned Torch extra installed: `MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 python -m pytest -m gpu`. CPU reference tests may require Torch on the host; disabling the opt-in flag alone is not a universal GPU exclusion for every historical test. Use an explicitly CPU-only test environment or availability guard for CPU-only qualification. `preflight` remains CPU-only: shader hashes and stage labels are inventory, not a device probe. The overall GPU-qualified field stays false because full-library physics coverage remains incomplete. The standalone source tree carries the Apache 2.0 license and notices.
 
+
+The development `MetalSmoothDynamics` stage also exposes `mass_matrix_low` or
+`mass_blocks_low`. Compiled simple rows retain a float32 residual of their
+source `dof_M0` constants; generic CRBA rows currently have zero residuals.
+`mass_matrix_pair(qpos_batch)` returns owned dense high/low matrices at an
+explicit query boundary. Retained position contexts own both planes. Component
+smooth-force solves and discrete inverse mass operations consume these words;
+coupled constraint solves and effective implicit operators still need that
+integration. A residual-bearing output is not a claim of complete binary64
+physics parity. See [producing revisions and qualification](QUALIFICATION.md).
+
+
 ## Applied forces, damping and basic motors
 
 Select a profile explicitly; the original `contact_free_euler_v1` remains the

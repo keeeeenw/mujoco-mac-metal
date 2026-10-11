@@ -1,5 +1,67 @@
 # Development qualification — 2026-10-11
 
+## Compiled inertia residual producer — 2026-10-11
+
+Local revision `d3636c169a5dcd1fc430f56a210f6b539573b2fc` lowers the
+residual of each binary64 compiled `dof_M0` constant into a separate float32
+word. The native simple-row postpass publishes that word alongside dense or
+component mass storage. Selected worlds and awake rows are updated; sleeping
+rows and unselected worlds retain their previous backing. Generic CRBA rows
+currently publish zero residuals. This preserves the represented constant pair;
+it does not establish binary64 fidelity for general articulated inertia.
+
+Retained POS stages own both mass planes and validate their metadata before
+velocity-stage writes. The standalone `MetalSmoothDynamics.mass_matrix_pair`
+query returns owned high/low dense matrices. Native component smooth-force
+solves and dense/component discrete inverse mass products and solves consume
+the producer's residuals. Lowering uses host compilation constants; stepping
+and these native operators do not call CPU forward dynamics or a CPU mass
+query. Device admission includes the constant residual, mass residual backing
+and retained POS residual, including physical empty-model sentinels.
+
+At the exact revision above, the complete host selection passed **2,424 tests,
+99 skipped, 2,225 deselected in 99.45 seconds**, exit 0. The affected native
+regression group passed **58 tests, 83 deselected in 9.56 seconds**, exit 0.
+This group covers the new producer, compiled simple mass, paired component
+matrix, awake/sparse mass, dense pair solve, position/cache validation, split
+forward/inverse stages, inverse skipping and mass query fixtures. New native
+checks compare actual source constant residuals and inverse operations, reject
+corrupted cached metadata before output writes, refresh recomputed constants,
+invalidate stale shortcuts, preserve masked/sleeping backing and verify actual
+empty-model allocations against admission. Native producer/inverse tests also
+forbid CPU `mj_forward` and `mj_fullM` calls during execution.
+
+The unchanged original zero-margin alternate cylinder-heightfield trajectory
+was rerun separately and **failed in 10.91 seconds**, exit 1. Initial contacts
+and constraint forces passed; the rollout acceleration discrepancy remains
+`1.85741866` at the original `rtol=atol=2e-3`. The coupled constraint APIs do
+not yet consume the mass residual planes. Remaining work includes that
+integration, generic source-order CRBA, factor/refinement conditioning,
+effective implicit operators, remaining compositions and demo/wheel gates.
+**No full milestone closure, terrain parity or speedup is claimed.**
+
+These checks used Python 3.12.13, MuJoCo 3.10.0 and Torch 2.9.1 with the
+same MPS and host guards recorded below. Tracked source stayed unchanged.
+Reproduce the affected native selection with the pinned runtime:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -m gpu -p no:cacheprovider \
+  metal/tests/test_compiled_mass_residual_producer.py \
+  metal/tests/test_compiled_simple_mass.py \
+  metal/tests/test_component_matrix_residual.py \
+  metal/tests/test_awake_smooth_017.py \
+  metal/tests/test_smooth_sparse_mass.py \
+  metal/tests/test_dense_pair_mass_solve_019.py \
+  metal/tests/test_cached_position_015.py \
+  metal/tests/test_position_context_geom_residual_018.py \
+  metal/tests/test_forward_stages_019.py \
+  metal/tests/test_native_inverse_split_019.py \
+  metal/tests/test_inverse_skip_019.py \
+  metal/tests/test_mass_queries_019.py
+```
+
 ## Component matrix residuals and cached diagonal ownership — 2026-10-11
 
 Local revision `dccfbe5c59396f50679e018e40c55f6751361814` adds optional
