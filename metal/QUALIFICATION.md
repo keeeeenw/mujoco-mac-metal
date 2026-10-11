@@ -63,6 +63,39 @@ The complete host selection passes **2,988 tests, 99 skipped, 2,588 deselected
 in 104.79 seconds**. These overlapping selections are separate evidence and
 must not be added together.
 
+Prepared sensor publication is implemented in `b943aa49e`, following cached
+mass admission correction `0af0fc76e`. Its complete affected selection passes
+**574 checks in 322.01 seconds**, without failures or skips. The complete host
+selection passes **2,996 tests, 99 skipped, 2,863 deselected in 102.39 seconds**.
+The stage tests compare actual calls against pinned MuJoCo, with CPU physics
+forbidden in native execution. They cover mixed address sentinels, dense/component
+profiles, populated delayed/interval histories, energy metadata, real sleeping
+trees, selected healthy/failed worlds, input mutation/replacement, reset/restore,
+owned outputs, admitted storage and actual evaluation/publication/plugin faults.
+
+A further contact/equality composition gate exposed missing component
+implicitfast midpoint initialization: orientation differed by `0.00020559`
+after two updates while velocity matched the source. A diagnostic reproduced
+the same defect without sensor publication. The correction is `e6c0acdce`.
+Expanded island-disabled cases then exposed monolithic Newton/CG stopping
+scaled by an empty island inertia; `73e2cf55a` restores the pinned global scale.
+
+The expanded native source comparison passes all **120** force-composition cases:
+three standalone sensor stages, five integrated configurations, two solver
+families, dense/sparse Jacobians and islands enabled/disabled. It checks nonzero
+contact/equality reactions and force/torque readings, subsequent CPU trajectories,
+actual midpoint eligibility, unchanged history and exact checkpoint replay.
+The same selection also passes the complete 13-case midpoint file before a new
+CPU protocol fixture failed for missing batch metadata; correcting that fixture
+requires no production change. The subsequent complete admission/allocation
+selection passes **24 checks in 10.31 seconds**, including actual dense/component
+program tensors and reusable mask execution. Earlier midpoint/force selection:
+**28 passed in 19.18 seconds**. These overlapping results must not be summed.
+
+No tolerances or iteration limits were relaxed. The broader backend regression,
+remaining public stage contracts, final clean-wheel and creative demo gates
+remain open. These results do not establish performance or complete milestones.
+
 Current flex-energy queries are corrected at `ba8c2097c`. Real tensor mutation
 previously left flex geometry stale, producing a potential-energy error of
 `0.704` in a retained fixture. Eight new native cases cover dense/component

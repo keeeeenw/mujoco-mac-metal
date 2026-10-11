@@ -80,6 +80,13 @@ environment. These are separate source/environment results, not a full GPU or
 installed-wheel qualification. The development source has not been released
 to PyPI.
 
+Recent development corrections add independent publication of prepared sensor
+stages and restore eligible free-body midpoint advancement on the component
+implicitfast route. Newton/CG stopping now also follows MuJoCo when constraint
+islands are disabled. Focused CPU-oracle, trajectory, rollback and replay checks
+pass; these changes do not close the full milestones. See the
+[API contracts](metal/API.md) and [qualification evidence](metal/QUALIFICATION.md).
+
 ## Measured performance on M1 Max
 
 For the contact-free four-DOF pendulum on an **M1 Max with 32 GB unified memory**,

@@ -26,6 +26,13 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
+Standalone POS/VEL/ACC publication now has actual source-stage, ownership,
+history and rollback regressions. Additional nonzero contact/equality cases
+qualified the component implicitfast midpoint correction and both monolithic
+Newton/CG solver layouts, across dense/sparse Jacobians and island modes.
+These are scoped corrections; the full milestone acceptance count remains
+unchanged. See [API](API.md) and [qualification](QUALIFICATION.md).
+
 Prepared potential/kinetic energy APIs, computed-stage metadata and current flex
 queries have separate passing native correction gates. A 100-case source-order
 matrix checks five integrators, automatic energy and sensors enabled/disabled,

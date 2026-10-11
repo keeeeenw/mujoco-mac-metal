@@ -1003,3 +1003,56 @@ on Metal, and initialization copies device storage without invoking CPU physics.
 Temporary allocation admission includes current owned backings and a conservative
 named per-call workspace peak before device allocation. These backend signatures
 and owned outputs differ from upstream pointer-returning APIs.
+
+### Publish prepared sensor stages
+
+Development `mj_sensorPos(sim, record=None, *, env_ids=None)`, `mj_sensorVel`
+and `mj_sensorAcc` publish only the selected stage's sensor addresses and return
+an owned float32 MPS `[B, nsensordata]` tensor. Other addresses, unselected worlds,
+failed worlds and sleeping sensor samples retain their previous values. These
+are batched backend counterparts, not upstream `MjData` signatures.
+
+```python
+from mujoco_metal import native_api as api
+
+record = api.mj_forward(sim, skipsensor=True)["record"]
+samples = api.mj_sensorAcc(sim, record, env_ids=[0])
+```
+
+POS requires a current POS record; VEL requires VEL; ACC requires the accepted
+CONSTRAINT result, including solved forces and acceleration. POS also validates
+an existing VEL bundle when it consumes that bundle's motion fields. The APIs
+reject foreign/stale records, replaced or mutated inputs and invalid selections
+before evaluation. Reset and checkpoint restoration invalidate records: prepare
+a fresh prefix afterward. Validation still applies when sensors are disabled.
+
+These calls do not redispatch forward physics, integrate, advance time or insert
+history samples. Delayed/interval sensors read the existing canonical history.
+Energy sensors retain pinned lazy computation semantics; standalone publication
+does not perform the automatic energy finalization of a full forward call.
+Registered device sensor adapters participate only in their declared stage, with
+selected state changes and rollback. Arbitrary upstream host callbacks are not
+converted into native device adapters.
+
+Explicit publication preserves borrowed prepared buffers and previous diagnostic
+views, admits its conservative transaction storage before allocation, and rolls
+back real evaluation/publication/plugin failures. Its snapshot cost belongs to
+this explicit API boundary, not the ordinary step loop. Input validation can
+synchronize; numerical evaluation and history reads execute on Metal. Complete
+sensor/extension/model composition and installed-wheel qualification remain open.
+
+### Component implicitfast midpoint and monolithic solver scaling
+
+Eligible standalone free bodies use MuJoCo's midpoint position velocity after
+either dense or component implicitfast velocity solves. Eligibility follows
+current native island labels or the pinned structural masks when islands are
+disabled, including packed Jacobian layouts. Constrained bodies retain ordinary
+implicitfast advancement; fluid and inverse-discrete options disable the source
+midpoint correction. Constants, outputs and reusable selection storage are
+included in capacity admission before allocation.
+
+Newton and CG use reciprocal island inertia for partitioned stopping tests.
+With islands disabled they use `1 / (meaninertia * max(nv, 1))`, matching pinned
+MuJoCo's monolithic solve. This changes neither the configured iteration limit
+nor the requested physics acceptance bounds. Full solver/integrator/deformable
+composition qualification remains open.
