@@ -3371,9 +3371,7 @@ class MetalCoupledConstraints:
               "float32 on the geometry pose device")
     paired_contact_rows = bool(d.npairs > 0 and nc > 0 and (
         getattr(self, "_has_analytic_sdf_pairs", False)
-        or (getattr(self, "_common_ccd_hfield_mesh_requested", False)
-            and int(getattr(d, "disableflags", 0))
-                & int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD))))
+        or getattr(self, "_common_ccd_hfield_mesh_requested", False)))
     retained = None
     if paired_contact_rows:
       for pose_name in ("body_pos_low", "body_pos_tail",

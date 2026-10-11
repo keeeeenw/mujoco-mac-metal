@@ -8,13 +8,15 @@ import numpy as np
 import pytest
 
 from test_primitive_hfield_full_manifold import _LIMITS, _model
+from test_contact_operator_precision import _effective_rows
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='native opt-in')
 @pytest.mark.parametrize('shape,size', [('cylinder', '.25 .15'), ('box', '.3 .22 .2')])
 @pytest.mark.parametrize('reversed_order', [False, True])
-def test_native_prism_contact_retains_source_witness_words(shape, size, reversed_order, monkeypatch):
+@pytest.mark.parametrize('profile', ['integrated_euler_v1', 'integrated_scalable_v1'])
+def test_native_prism_contact_retains_source_witness_words(shape, size, reversed_order, profile, monkeypatch):
   from mujoco_metal.simulation import MetalSimulation
 
   model = _model(shape, size, False, reversed_order)
@@ -27,8 +29,11 @@ def test_native_prism_contact_retains_source_witness_words(shape, size, reversed
   source_points = np.asarray([c.pos.copy() for c in data.contact[:data.ncon]])
   source_normals = np.asarray([c.frame[:3].copy() for c in data.contact[:data.ncon]])
   source_distances = np.asarray([c.dist for c in data.contact[:data.ncon]])
+  source_jacobian = np.asarray(data.efc_J).reshape(data.nefc, model.nv).copy()
+  source_aref = np.asarray(data.efc_aref).copy()
+  source_regularizer = np.asarray(data.efc_R).copy()
   sim = MetalSimulation(model, 2, qpos=qpos, qvel=qvel,
-                        profile='integrated_scalable_v1', limits=_LIMITS)
+                        profile=profile, limits=_LIMITS)
 
   def forbidden(*args, **kwargs):
     raise AssertionError('CPU forward/mass physics during native prism publication')
@@ -53,3 +58,25 @@ def test_native_prism_contact_retains_source_witness_words(shape, size, reversed
   np.testing.assert_allclose(points, source_points, rtol=0, atol=2e-12)
   np.testing.assert_allclose(normals, source_normals, rtol=0, atol=2e-12)
   np.testing.assert_allclose(distances, source_distances, rtol=0, atol=2e-12)
+  # Accurate collision words must reach the actual solve, including the
+  # native CCD route and an adjacent contact-free world. A producer-only
+  # witness check would miss the host's former alternate-CCD-only gate.
+  offsets = np.asarray(cc.descriptor.contact_condim_packed).reshape(-1, 3)
+  rows, source_rows = [], []
+  for slot, contact in zip(np.flatnonzero(mask[0]), data.contact[:data.ncon]):
+    base = int(cc.descriptor.nr_joint) + int(offsets[slot, 1])
+    rows.extend(range(base, base + 3))
+    source_rows.extend(range(contact.efc_address, contact.efc_address + 3))
+  np.testing.assert_allclose(_effective_rows(cc)[rows], source_jacobian[source_rows],
+                             rtol=2e-12, atol=2e-12)
+  np.testing.assert_array_equal(_effective_rows(cc, 1), 0)
+  aref = host(system['ar'])[0] + host(system['ar_low'])[0]
+  np.testing.assert_allclose(aref[rows], source_aref[source_rows],
+                             rtol=2e-11, atol=2e-10)
+  nr = cc.descriptor.nr
+  debug = host(cc._workspace['workspace_debug']).reshape(2, -1)
+  low = debug[:, cc._regularizer_low_debug_offset:cc._regularizer_low_debug_offset + nr]
+  regularizer = host(system['R'])[0] + low[0]
+  np.testing.assert_allclose(regularizer[rows], source_regularizer[source_rows],
+                             rtol=2e-12, atol=2e-12)
+  np.testing.assert_array_equal(low[1], 0)
