@@ -3140,11 +3140,13 @@ class MetalCoupledConstraints:
             if d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS) else None),
         # Cached component-PGS solves consume a high/low smooth-acceleration
         # pair through the existing qfrc binding. Keep that input contiguous
-        # and independent from the row-RHS/factor output buffers.
+        # and independent from the row-RHS/factor output buffers. The pair is
+        # owned for every solver route whenever nv > 0 (fresh, cached,
+        # dense and component CG/Newton/PGS all stage through it); the
+        # consumers below fail closed when it is absent.
         "component_smooth_acceleration_pair": (
             empty(2 * b * nv)
-            if (nv > 0 and (d.dense_path
-                or d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS))) else None),
+            if nv > 0 else None),
         "out_force": empty(b * nv),
         # Preserve the original contiguous high-word prefix and keep a
         # world-major low-word result for precision-sensitive consumers.
@@ -4609,7 +4611,8 @@ class MetalCoupledConstraints:
 
     solver_acceleration_input = (qfrc_smooth if qacc_smooth is None
                                  else qacc_smooth)
-    paired_smooth_input = (qacc_smooth is not None or qfrc_smooth_low is not None)
+    paired_smooth_input = (qacc_smooth is not None or qfrc_smooth_low is not None
+                             ) and int(nv) > 0
     if (d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS)
         or paired_smooth_input):
       pair = w.get("component_smooth_acceleration_pair")
@@ -5440,7 +5443,7 @@ class MetalCoupledConstraints:
       packed_slots = self._empty_compaction_map
     else:
       packed_slots = slot_maps.packed_to_logical.reshape(-1)
-    paired_smooth_input = qfrc_smooth_low is not None
+    paired_smooth_input = qfrc_smooth_low is not None and int(nv) > 0
     smooth_solver_input = qfrc_smooth
     if paired_smooth_input:
       pair = w.get("component_smooth_acceleration_pair")

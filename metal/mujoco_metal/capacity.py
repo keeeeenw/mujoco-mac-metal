@@ -1385,11 +1385,16 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
       ("component_mass_rhs_low", _bytes(
           guarded(b * (int(nr) + 1) * int(nv))
           if int(solver_type) == int(mujoco.mjtSolver.mjSOL_PGS) else 0)),
+      # Paired smooth-force inputs belong to every mass/solver route. Fresh,
+      # cached, dense and component CG/Newton/PGS all stage high/low smooth
+      # forces through this owned pair whenever residuals are provided, so
+      # preparation cannot gate on dense_path or PGS. Size is independent of
+      # row counts, solver selection and mass storage; zero-DOF stays empty.
+      # It is disjoint from row RHS, factors and output workspaces by
+      # construction (separate workspace key, never aliased).
       ("component_smooth_acceleration_pair", _bytes(
           guarded(2 * b * int(nv))
-          if (int(nv) > 0 and (
-              (int(nr) <= DENSE_ROW_THRESHOLD and int(nv) <= 32)
-              or int(solver_type) == int(mujoco.mjtSolver.mjSOL_PGS)))
+          if int(nv) > 0
           else 0)),
       # Reusable acceleration-space primal-solver scratch shares the debug
       # binding to preserve Metal's 31-buffer ABI.

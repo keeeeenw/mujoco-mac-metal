@@ -197,14 +197,15 @@ def test_estimate_is_deterministic_and_counts_memory():
   assert sparse_runtime["smooth.mass"] == 0
   assert sparse_runtime["smooth.mass_blocks"] == 2 * layout["nnz"] * 4
   assert sparse_runtime["smooth.mass_armature"] == 2 * layout["nnz"] * 4
-  # The smooth-force pair follows actual allocation: dense-path models
-  # (nr<=96 and nv<=32) allocate it for any solver; otherwise only PGS.
-  # This CG fixture is small (dense path), so both mass modes allocate it.
+  # The smooth-force pair follows actual allocation: it is owned whenever
+  # nv > 0 on every solver/mass route (fresh, cached, dense and component
+  # CG/Newton/PGS), independent of row counts. This CG fixture allocates it
+  # in both mass modes, and the big-nr estimate below does too.
   assert sparse_runtime["component_smooth_acceleration_pair"] == 2 * 2 * 4 * 4
   big = estimate_capacity(
       model, 1, npairs=0, nslots=0, nr=200, mass_storage="block_sparse")
   assert dict(big.memory_breakdown)[
-      "component_smooth_acceleration_pair"] == 0
+      "component_smooth_acceleration_pair"] == 2 * 1 * int(model.nv) * 4
   solver_breakdown = dict(sparse_estimate.memory_breakdown)
   sparse_solver = dict(estimate_workspace_expected(
       model, 2, 3, 5, 20, mass_storage="block_sparse"))
