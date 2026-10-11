@@ -4613,8 +4613,8 @@ class MetalCoupledConstraints:
                                  else qacc_smooth)
     paired_smooth_input = (qacc_smooth is not None or qfrc_smooth_low is not None
                              ) and int(nv) > 0
-    if (d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS)
-        or paired_smooth_input):
+    if int(nv) > 0 and (d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS)
+                        or paired_smooth_input):
       pair = w.get("component_smooth_acceleration_pair")
       if pair is None:
         raise RuntimeError("paired smooth-acceleration workspace was not prepared")

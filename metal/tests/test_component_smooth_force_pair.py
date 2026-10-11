@@ -51,3 +51,32 @@ def test_component_smooth_force_pairs_match_pinned_mass_and_preserve_inputs(solv
   np.testing.assert_array_equal(force.cpu().numpy(), hi)
   np.testing.assert_array_equal(residual.cpu().numpy(), low)
   assert int(cc._constants["solver_dims"][7].cpu()) == int(cc.descriptor.refsafe)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native large-row qualification")
+@pytest.mark.parametrize("solver", ["PGS", "CG", "Newton"])
+def test_large_row_block_route_is_exercised_and_restores(solver):
+  """>96-row / nv>32 fixture reaches the block solve (dense_path False)."""
+  from mujoco_metal.capacity import DENSE_ROW_THRESHOLD
+  from mujoco_metal.simulation import MetalSimulation
+  bodies = "".join(
+      f'<body pos="{.3 * k} 0 .09"><freejoint/><geom type="sphere" size=".1"/></body>'
+      for k in range(6))
+  model = mujoco.MjModel.from_xml_string(
+      f'<mujoco><option solver="{solver}"/><worldbody>'
+      f'<geom type="plane" size="5 5 .1"/>{bodies}</worldbody></mujoco>')
+  sim = MetalSimulation(model, 2, profile="integrated_scalable_v1")
+  desc = sim._coupled_constraints.descriptor
+  assert desc.nr > DENSE_ROW_THRESHOLD and not desc.dense_path
+  snap = sim.snapshot()
+  sim.step(5)
+  first = sim.state.qpos.cpu().numpy().copy()
+  source = mujoco.MjData(model)
+  for _ in range(5):
+    mujoco.mj_step(model, source)
+  np.testing.assert_allclose(first[0], source.qpos, atol=1e-6)
+  assert np.any(first != 0)
+  sim.restore(snap)
+  sim.step(5)
+  np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), first)
