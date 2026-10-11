@@ -15,7 +15,7 @@ native fixtures have passed independent checks.
 | 010 | Analytic collision families | Primitive and additional convex-shape paths implemented; complete dispatcher/trajectory gate open |
 | 011 | Mesh collisions | Native hull and contact paths implemented; full irregular/degenerate/composition gate open |
 | 012 | Heightfields | Source-precision and pose/cache checks pass on selected fixtures; full terrain/integrator gate open |
-| 013 | SDF collisions | Native providers and search paths implemented; original mesh/bowl/torus correctness gates open |
+| 013 | SDF collisions | Seven original bundled rigid-SDF oracle fixtures pass; complete pair, search and feature-composition gates open |
 | 014 | Solvers | Selected Newton, warm-start and coupled regressions pass; full solver-option matrix open |
 | 015 | Integrators and forces | Euler/RK4/implicit paths and derivatives implemented; full force/contact/material matrix open |
 | 016 | Sensors and queries | Expanded native stages and queries implemented; complete timing/history/frame matrix open |
@@ -56,11 +56,19 @@ SDF arithmetic/source-trace checks. These are distinct regression groups, not a
 complete backend suite. Earlier terrain/cache, flex and API results retain their
 producing-composition limits; see [development coverage](DEVELOPMENT.md).
 
-The original rigid-SDF group remained incomplete after a 300-second deadline,
-with failures in mesh witness multiplicity and bowl/torus force or trajectory
-comparisons. More recent mesh arithmetic changes are still under qualification
-and are not included in this publication. The newer 180-second combined check
-also did not finish; a timeout is not a passing result.
+The remaining 26-file native API group at `baf24b80c` passed **117 tests,
+280 deselected**, with no failures or skips. The earlier 16 failures were
+corrected in RNE dispatch selectors, retained-state projection, masked force
+publication and a stale site-feedback fixture. A separate earlier 35-file
+native API group passed **304 tests** at its recorded producing revision.
+The later force/recovery fixes passed 39 and 58 affected checks; these combine
+host contracts with real native physics and lifecycle execution.
+
+The original rigid-SDF deadline and mesh/bowl/torus failures are historical
+evidence. The seven original bundled rigid-SDF fixtures now pass in the
+117-test group, including strict five-provider force/trajectory/replay,
+mesh rows and query reuse. This closes those fixtures, not the complete SDF
+search, pair, lifecycle or extension composition scope.
 
 [Qualification](QUALIFICATION.md) separates publication checks from historical
 native evidence. [Coverage](COVERAGE.md) describes admitted paths and restrictions.

@@ -1,5 +1,50 @@
 # Development qualification — 2026-10-11
 
+## Public API corrections and retained state — 2026-10-11
+
+The complete remaining 26-file native API selection at producing revision
+`baf24b80c7f1ae88f2fb3228ffab2ef3549c5cf5` passed **117 tests, 280 deselected
+in 440.95 seconds**, with no failures or skips. The same selection previously
+passed 101 and failed 16 at `783ce0d6d`. Its original force, trajectory,
+checkpoint, recovery and ownership bounds were retained. This includes the
+seven original bundled rigid-SDF oracle fixtures: query reuse, five provider
+force/trajectory/replay cases and mesh contact rows. Those fixtures pass;
+the complete SDF pair, search and feature-composition scope remains open.
+
+Three production corrections and one stale fixture correction cleared the
+observed failures:
+
+- `c3aad7ef6` supplies the per-world selector suffix required by both native
+  post-constraint RNE dispatches and admits its storage. The complete RNE file
+  passed **34 checks in 5.22 seconds**.
+- `5ced2d594` publishes the float32 projection of the complete retained scalar,
+  including a tail that decides a halfway tie, and canonicalizes residuals with
+  scaled arithmetic that preserves subnormal storage. The strict checkpoint
+  validator is unchanged. The writer and original 120-step site-feedback
+  trajectory/reset/replay passed **3 checks in 9.72 seconds**; the affected
+  integration/quaternion/lifecycle/capacity group passed **42 checks in
+  230.02 seconds**.
+- `c371443a7` aligns the site-feedback fixture with the existing public velocity
+  return contract and its independent oracle's target parameters. It preserves
+  the nonzero selected force comparison and unselected-world sentinel.
+- `baf24b80c` publishes masked compensated force words through predicated native
+  stores, preserving borrowed high/low RHS versions during healthy checks.
+  The force/site-feedback/owner group passed **39 checks in 13.60 seconds**;
+  complete state-check, production recovery and admission groups passed
+  **58 checks in 6.17 seconds**. These include host contracts and actual native
+  execution; they are not all GPU tests.
+
+The separate 35-file forward/inverse/query/derivative/plugin native selection
+passed **304 tests, 384 deselected in 156.09 seconds** at `fd79f3e90`. Its one
+immutable-index ownership warning was corrected in `783ce0d6d`; the affected
+actual flex inverse/lifecycle group then passed **10 tests, 8 deselected in
+25.18 seconds**, treating that warning as an error. This earlier 304-test result
+is not a claim that every case has been rerun at the later revision.
+
+Full API and milestone acceptance still require the execution inventory,
+remaining feature combinations, final wheel and demo gates. The two terrain
+trajectory failures below remain open. No new performance result is claimed.
+
 ## Complete primitive-terrain matrix — 2026-10-11
 
 The unchanged 40-case native terrain matrix at producing revision
