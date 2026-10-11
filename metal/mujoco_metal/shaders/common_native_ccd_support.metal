@@ -115,9 +115,13 @@ static inline CommonCCDSupportResult common_ccd_support(
   out.point=FlexDD3{flex_dd(0.0f),flex_dd(0.0f),flex_dd(0.0f)};
   out.selected_vertex=-1;
   out.status=0;
+  bool already_world=(object.kind==COMMON_CCD_POINT ||
+                      object.kind==COMMON_CCD_SPHERE ||
+                      object.kind==COMMON_CCD_FLEX_ELEMENT ||
+                      object.kind==COMMON_CCD_HFIELD_PRISM);
   FlexDD3 pos=FlexDD3{object.pos[0],object.pos[1],object.pos[2]};
-  FlexDD3 local_direction=common_ccd_matrix_transpose_vector(object.mat,
-                                                              direction);
+  FlexDD3 local_direction=already_world ? direction :
+      common_ccd_matrix_transpose_vector(object.mat, direction);
   FlexDD3 local=FlexDD3{flex_dd(0.0f),flex_dd(0.0f),flex_dd(0.0f)};
   FlexDD3 world;
 
@@ -244,6 +248,7 @@ static inline CommonCCDSupportResult common_ccd_support(
                object.hfield_residual[best].y.lo},
         FlexDD{mesh_vertices[address+2],object.hfield_residual[best].z.hi,
                object.hfield_residual[best].z.lo}};
+    world=local;
     out.selected_vertex=best;
   } else if (object.kind==COMMON_CCD_HULL) {
     if (object.vertex_offset<0 || object.vertex_count<=0 ||
@@ -274,9 +279,6 @@ static inline CommonCCDSupportResult common_ccd_support(
     return out;
   }
 
-  bool already_world=(object.kind==COMMON_CCD_POINT ||
-                      object.kind==COMMON_CCD_SPHERE ||
-                      object.kind==COMMON_CCD_FLEX_ELEMENT);
   if (!already_world)
     world=common_ccd_local_to_world(object.mat,object.pos,local);
   // `support` adds half of each geom margin along its normalized world input
