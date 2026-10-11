@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.gpu, pytest.mark.skipif(
     os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='native opt-in')]
 
 
-def _model(dim, young):
+def _model(dim, young, *, damping=0.):
   count = '3 3 1' if dim == 2 else '2 2 2'
   membrane = ' thickness=".02" elastic2d="stretch"' if dim == 2 else ''
   return mujoco.MjModel.from_xml_string(f'''<mujoco>
@@ -28,7 +28,7 @@ def _model(dim, young):
         <pin id="0"/>
         <contact contype="0" conaffinity="0" selfcollide="none"/>
         <edge stiffness="0" damping="0"/>
-        <elasticity young="{young}" poisson=".23" damping="0"{membrane}/>
+        <elasticity young="{young}" poisson=".23" damping="{damping}"{membrane}/>
       </flexcomp>
     </body></worldbody>
   </mujoco>''')

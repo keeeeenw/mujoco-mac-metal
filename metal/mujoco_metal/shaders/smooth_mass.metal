@@ -227,6 +227,18 @@ kernel void dense_mass_matrix(
     root_com[com_base+root*3+2] = center.z;
   }
 
+  // Publish the articulated-root COM at every awake body slot. Mass/CDOF
+  // consumers can still index by rootid, while point-velocity consumers use
+  // the body's slot. Leaving descendant slots untouched gives their spatial
+  // velocity the wrong origin even when comVel itself is correct.
+  for (uint bi=0; bi<nbody_awake; ++bi) {
+    uint b = uint(body_ids[body_base+bi]);
+    uint root = uint(rootid[b]);
+    if (b == root) continue;
+    for (uint axis=0; axis<3; ++axis)
+      root_com[com_base+b*3+axis] = root_com[com_base+root*3+axis];
+  }
+
   // Initialize body spatial inertias about their articulated-root COM.
   for (uint bi=0; bi<nbody_awake; ++bi) {
     uint b = uint(body_ids[body_base+bi]);
