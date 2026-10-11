@@ -105,45 +105,44 @@ def _configs(tag):
   return out
 
 
-def _check_single(tag, cfg, cpu, nat):
-  # R05-1 bounded manifolds: 1-4 native witnesses (face-clip expansion on
-  # planes, multiCCD on box/cylinder/capsule/mesh; sphere/ellipsoid stay
-  # single by the pinned rule). Every witness checks depth against the CPU
-  # minimum and frame against the nearest CPU witness; the old
-  # centroid-tier fallback now applies per witness.
+def _one_to_one(cpu, nat):
+  """Return the permutation ``perm`` pairing nat[i] with cpu[perm[i]].
+
+  Witnesses are paired by minimum total position distance, one native
+  witness per source witness, so a duplicated native witness cannot hide a
+  lost source witness. Manifolds hold at most the pinned pair maximum (5)
+  entries, so exhaustive search is exact and cheap.
+  """
+  import itertools
+  assert len(cpu) == len(nat), ("witness count", len(nat), len(cpu))
+  best, best_cost = None, np.inf
+  for perm in itertools.permutations(range(len(cpu))):
+    cost = sum(float(np.linalg.norm(nat[i][2] - cpu[j][2]))
+               for i, j in enumerate(perm))
+    if cost < best_cost:
+      best, best_cost = perm, cost
+  return best
+
+
+def _check_single(tag, cfg, cpu, nat, max_contacts=None):
+  # Manifold contract: the native count may not exceed the pinned
+  # per-pair producer maximum (``pair_max_contacts``; mesh-cylinder emits five
+  # valid witnesses) and, since every fixture has a unique source manifold,
+  # must equal the CPU cardinality. Witnesses are matched one-to-one and each
+  # matched witness is compared on depth, normal and position.
   assert cpu and nat, (tag, cfg, len(nat), len(cpu))
-  assert 1 <= len(nat) <= 4, (tag, cfg, len(nat))
-  depths = np.array([c[0] for c in cpu])
-  # Rotated deep mesh-mesh admits genuinely multi-basin penetration (both
-  # engines valid, depths differ): loose depth gate there, exact elsewhere.
-  dtol = 0.1 if (tag == "mesh-mesh" and cfg == "rotated") else 2e-4
+  if max_contacts is not None:
+    assert len(nat) <= max_contacts, (tag, cfg, len(nat), max_contacts)
+    assert len(cpu) <= max_contacts, (tag, cfg, len(cpu), max_contacts)
+  dtol = 2e-4
   ntol = 5e-2 if tag == "mesh-ellipsoid" else 5e-3
-  if tag == "mesh-mesh" and cfg == "rotated":
-    ntol = 1.0
-  for nd, nn, np_ in nat:
-    assert abs(nd - depths.min()) < dtol + 2e-3, (tag, cfg, nd, depths.min())
-    best = min(cpu, key=lambda c: float(np.linalg.norm(c[2] - np_)))
-    np.testing.assert_allclose(nn, best[1], atol=ntol,
-                               err_msg=f"{tag}/{cfg} nrm")
-  if tag == "mesh-mesh" and cfg == "rotated":
-    # Multi-basin deep-rotated overlap: witnesses sit on legitimately
-    # different features; depth/normal loose gates above carry the
-    # qualification, force parity excludes this regime.
-    return
-  # Position gate on the closest witness pair (face tier: any same-plane
-  # witness admitted, bounded by hull face scale).
-  nd0, nn0, np0 = nat[0]
-  best = min(cpu, key=lambda c: float(np.linalg.norm(c[2] - np0)))
-  try:
-    np.testing.assert_allclose(np0, best[2], atol=2e-3,
-                               err_msg=f"{tag}/{cfg} pos")
-  except AssertionError:
-    gaps = [float(np.dot(np0 - c[2], best[1])) for c in cpu]
-    assert max(abs(g) for g in gaps) < 1e-3, (tag, cfg, gaps)
-    assert max(abs(c[0] - nd0) for c in cpu) < 1e-6 + 1e-4 + 2e-3, (tag, cfg)
-    tang = float(np.linalg.norm((np0 - best[2])
-                                - np.dot(np0 - best[2], best[1]) * best[1]))
-    assert tang < 0.75, (tag, cfg, tang)
+  perm = _one_to_one(cpu, nat)
+  for i, j in enumerate(perm):
+    nd, nn, np_ = nat[i]
+    cd, cn, cp = cpu[j]
+    assert abs(nd - cd) < dtol, (tag, cfg, "depth", i, nd, cd)
+    np.testing.assert_allclose(nn, cn, atol=ntol, err_msg=f"{tag}/{cfg} nrm")
+    np.testing.assert_allclose(np_, cp, atol=2e-3, err_msg=f"{tag}/{cfg} pos")
 
 
 @pytest.mark.gpu
@@ -158,6 +157,8 @@ def test_pair_matrix_mesh_gpu():
     name_b = "floor" if tag == "mesh-plane" else "mb"
     gb = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, name_b)
     sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
+    pair_max = int(lower_coupled_constraints(m).pair_max_contacts[0])
+    assert int(sim._coupled_constraints.descriptor.ncontacts_max) == pair_max
     for cfg, qpos in _configs(tag):
       try:
         qp = np.array(qpos, dtype=np.float32)
@@ -186,7 +187,7 @@ def test_pair_matrix_mesh_gpu():
         # Non-separated placements must truly overlap (or the config is a
         # mis-designed skip, not coverage).
         assert cpu, (tag, cfg, "placement misses; fix config")
-        _check_single(tag, cfg, cpu, nat)
+        _check_single(tag, cfg, cpu, nat, max_contacts=pair_max)
       except AssertionError as exc:
         failures.append(f"{tag}/{cfg}: {exc}")
   assert not failures, "\n".join(failures)
@@ -269,3 +270,53 @@ def test_mesh_assets_admit_cpu():
     validate_stepping_profile(m, profile="integrated_euler_v1")
     desc = lower_coupled_constraints(m)
     assert desc.npairs == 1 and desc.ncontacts_max == 1
+
+
+def _cpu_witnesses(tag, cfg):
+  m = _model(tag)
+  ga = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "ma")
+  gb = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM,
+                         "floor" if tag == "mesh-plane" else "mb")
+  qpos = dict(_configs(tag))[cfg]
+  d = mujoco.MjData(m)
+  d.qpos[:] = np.array(qpos, dtype=np.float64)
+  mujoco.mj_forward(m, d)
+  out = [(float(d.contact[c].dist), np.asarray(d.contact[c].frame[:3]).copy(),
+          np.asarray(d.contact[c].pos).copy())
+         for c in range(d.ncon)
+         if {int(d.contact[c].geom[0]), int(d.contact[c].geom[1])} == {ga, gb}]
+  return out, int(lower_coupled_constraints(m).pair_max_contacts[0])
+
+
+_SELF_ORACLE = [("mesh-plane", "flipped", 3), ("mesh-cylinder", "shallow", 5),
+                ("mesh-cylinder", "deep", 5)]
+
+
+@pytest.mark.parametrize("tag,cfg,count", _SELF_ORACLE)
+def test_cpu_self_oracle_manifold_contract(tag, cfg, count):
+  cpu, pair_max = _cpu_witnesses(tag, cfg)
+  assert len(cpu) == count <= pair_max
+  # Reordering the same witnesses must still match one-to-one.
+  _check_single(tag, cfg, cpu, list(reversed(cpu)), max_contacts=pair_max)
+
+
+@pytest.mark.parametrize("tag,cfg,count", _SELF_ORACLE)
+def test_manifold_contract_negative_controls(tag, cfg, count):
+  cpu, pair_max = _cpu_witnesses(tag, cfg)
+
+  def bad(nat, **kw):
+    with pytest.raises(AssertionError):
+      _check_single(tag, cfg, cpu, nat, max_contacts=kw.get("cap", pair_max))
+
+  base = [(d, n.copy(), p.copy()) for d, n, p in cpu]
+  bad(base[:-1])                                   # missing witness
+  bad(base + [base[0]])                            # extra/duplicate witness
+  bad(base[:-1] + [base[0]])                       # duplicate hides lost one
+  bad(base, cap=count - 1)                         # overflow of producer cap
+  wrong = list(base)
+  wrong[0] = (wrong[0][0] + 1e-3, wrong[0][1], wrong[0][2])
+  bad(wrong)                                       # wrong depth
+  wrong[0] = (base[0][0], np.array([1.0, 0.0, 0.0]), base[0][2])
+  bad(wrong)                                       # wrong normal
+  wrong[0] = (base[0][0], base[0][1], base[0][2] + np.array([0.01, 0, 0]))
+  bad(wrong)                                       # wrong position
