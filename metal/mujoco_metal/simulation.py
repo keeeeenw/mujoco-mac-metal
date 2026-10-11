@@ -3083,24 +3083,24 @@ class MetalSimulation:
     rhs = torch.neg(dynamics["qfrc_bias"])
     rhs_low = torch.neg(dynamics["qfrc_bias_low"])
     if self._applied_force is not None:
-      rhs.add_(self._applied_force)
+      self._rhs_accumulate(rhs, rhs_low, self._applied_force)
     if self._passive is not None:
       passive, _ = self._passive.run_device(
           qpos, qvel, xfrc_applied=self._body_wrench, return_damping=True,
           mocap_pos=mpos, mocap_quat=mquat, awake_lists=awake_lists,
       )
-      rhs.add_(passive)
+      self._rhs_accumulate(rhs, rhs_low, passive)
     if self._flex is not None:
       flex_qfrc, _, _ = self._flex.run_device(
           qpos, qvel, dict(dynamics["poses"], root_com=dynamics["root_com"]),
           dynamics.get("cvel", None)
       )
-      rhs.add_(flex_qfrc)
+      self._rhs_accumulate(rhs, rhs_low, flex_qfrc)
     if self._fluid is not None:
-      rhs.add_(self._fluid.run_device(qpos, qvel, dynamics))
+      self._rhs_accumulate(rhs, rhs_low, self._fluid.run_device(qpos, qvel, dynamics))
     if self._tendons is not None:
       tendon_force, _, tendon_armature = self._tendons.run_device(qpos, qvel)
-      rhs.add_(tendon_force)
+      self._rhs_accumulate(rhs, rhs_low, tendon_force)
       if not self._component_mass_enabled:
         dynamics["mass_matrix"].add_(tendon_armature)
     if self._spatial_tendons is not None:
@@ -3108,26 +3108,26 @@ class MetalSimulation:
       skin = self._spatial_kin
       sforce, _, sarm = self._spatial_tendons.run_forces(
           skin, include_armature=not self._component_mass_enabled)
-      rhs.add_(sforce.reshape(rhs.shape))
+      self._rhs_accumulate(rhs, rhs_low, sforce.reshape(rhs.shape))
       sbias, _ = self._spatial_tendons.run_armature_bias(
           skin, qvel, dynamics["poses"], dynamics.get("cvel", None),
           dynamics.get("root_com", None), dynamics.get("cdof", None),
           dynamics.get("cdof_dot", None))
       # Armature bias is a bias force (pinned mj_tendonBias accumulates into
       # qfrc_bias), so it subtracts from rhs like Coriolis/gravity.
-      rhs.sub_(sbias.reshape(rhs.shape))
+      self._rhs_accumulate(rhs, rhs_low, sbias, sign=-1)
       if not self._component_mass_enabled:
         dynamics["mass_matrix"].add_(sarm.reshape(dynamics["mass_matrix"].shape))
     if self._transmissions is not None:
-      rhs.add_(self._transmissions.run_device(
+      self._rhs_accumulate(rhs, rhs_low, self._transmissions.run_device(
           qpos, qvel, self._delayed_control(state._time),
           awake_lists=awake_lists,
           gravcomp=self._transmission_gravcomp(
               qpos, dynamics["poses"], awake_lists=awake_lists)))
     if self._actuators is not None:
-      rhs.add_(self._actuation_force(qpos, qvel, dynamics["poses"]))
+      self._rhs_accumulate(rhs, rhs_low, self._actuation_force(qpos, qvel, dynamics["poses"]))
     if self._motor is not None:
-      rhs.add_(self._motor.run_device(self._delayed_control(state._time)))
+      self._rhs_accumulate(rhs, rhs_low, self._motor.run_device(self._delayed_control(state._time)))
     eq_active = getattr(state, "_eq_active", None)
     _ten_J, _ten_L = self._spatial_for_coupled(qvel, dynamics["poses"])
     self._coupled_solve_dispatches += 1
@@ -4761,6 +4761,30 @@ class MetalSimulation:
     self._forward_stages.publish(record, ForwardStage.ACT, result)
     return result
 
+  def _rhs_accumulate(self, hi, lo, value, *, sign=1, mask=None):
+    """Error-free ``hi + sign*value`` with the rounding error kept in ``lo``.
+
+    Knuth TwoSum on separately dispatched float32 operations (no fused or
+    fast-math reassociation), so ``hi + lo`` represents the exact sum of the
+    float32 operands up to the precision of ``lo``'s own accumulation. This
+    compensates accumulation only; each force producer keeps its own
+    precision contract. ``mask`` is a per-world nonzero selector.
+    """
+    torch = self._state._torch
+    v = value.reshape(hi.shape)
+    if sign < 0:
+      v = torch.neg(v)
+    s = torch.add(hi, v)
+    bb = torch.sub(s, hi)
+    err = torch.add(torch.sub(hi, torch.sub(s, bb)), torch.sub(v, bb))
+    if mask is None:
+      hi.copy_(s)
+      lo.add_(err)
+    else:
+      m = (mask != 0).reshape(-1, 1)
+      hi.copy_(torch.where(m, s, hi))
+      lo.add_(torch.where(m, err, torch.zeros_like(err)))
+
   def prepare_forward_acceleration(self, record, *, qfrc_applied=None):
     """Solve unconstrained acceleration from already published force stages."""
     from mujoco_metal.forward_stages import ForwardStage
@@ -4784,28 +4808,27 @@ class MetalSimulation:
       state.update_masked_rows(
           rhs_low, velocity["dynamics"]["qfrc_bias_low"], row_valid,
           add=False, sign=-1)
-      state.update_masked_rows(rhs, velocity["qfrc_passive"], row_valid)
+      self._rhs_accumulate(rhs, rhs_low, velocity["qfrc_passive"],
+                           mask=world_mask_i32)
       if (self._passive is None and self.profile.passive_damping_enabled
           and rhs.numel()):
-        state.add_masked_scaled_rows(
-            rhs, velocity["qvel"], self._damping, row_valid, sign=-1)
+        self._rhs_accumulate(
+            rhs, rhs_low, velocity["qvel"] * self._damping.unsqueeze(0),
+            sign=-1, mask=world_mask_i32)
     else:
       torch.neg(velocity["qfrc_bias"], out=rhs)
       torch.neg(velocity["dynamics"]["qfrc_bias_low"], out=rhs_low)
-      rhs.add_(velocity["qfrc_passive"])
+      self._rhs_accumulate(rhs, rhs_low, velocity["qfrc_passive"])
       if (self._passive is None and self.profile.passive_damping_enabled
           and rhs.numel()):
-        rhs.addcmul_(velocity["qvel"], self._damping.unsqueeze(0), value=-1.0)
+        self._rhs_accumulate(
+            rhs, rhs_low, velocity["qvel"] * self._damping.unsqueeze(0),
+            sign=-1)
     force = self._applied_force if qfrc_applied is None else qfrc_applied
     if force is not None:
-      if world_mask_i32 is None:
-        rhs.add_(force)
-      else:
-        state.update_masked_rows(rhs, force, row_valid)
-    if world_mask_i32 is None:
-      rhs.add_(actuation["qfrc_actuator"])
-    else:
-      state.update_masked_rows(rhs, actuation["qfrc_actuator"], row_valid)
+      self._rhs_accumulate(rhs, rhs_low, force, mask=world_mask_i32)
+    self._rhs_accumulate(rhs, rhs_low, actuation["qfrc_actuator"],
+                         mask=world_mask_i32)
     awake_lists = record.values[ForwardStage.POS]["awake_lists"]
     if self._component_mass_enabled:
       qacc, status = self._solve_component_rhs(
@@ -5879,7 +5902,11 @@ class MetalSimulation:
             self._forward_stage_passive_force, forward_mask)
         self._state.clear_masked_rows(
             self._forward_stage_actuator_force, forward_mask)
-    def add_rhs(value, sign=1):
+    def add_rhs(value, sign=1, compensated=True):
+      if compensated and self._rhs_low.shape == self._rhs.shape:
+        self._rhs_accumulate(self._rhs, self._rhs_low, value, sign=sign,
+                             mask=forward_mask if world_mask_i32 is not None else None)
+        return
       if world_mask_i32 is None:
         if sign < 0:
           self._rhs.sub_(value)
@@ -6185,7 +6212,7 @@ class MetalSimulation:
             add=False, sign=1)
       if capture_fwdinv:
         constraint_force_for_compare = coupled["qfrc_constraint"]
-      add_rhs(coupled["qfrc_constraint"])
+      add_rhs(coupled["qfrc_constraint"], compensated=False)
     legacy_contact_rows = None
     legacy_joint_rows = None
     if self._contact is not None:
@@ -6203,7 +6230,7 @@ class MetalSimulation:
             add=False, sign=1)
       if capture_fwdinv:
         constraint_force_for_compare = contact["qfrc_contact"]
-      add_rhs(contact["qfrc_contact"])
+      add_rhs(contact["qfrc_contact"], compensated=False)
       legacy_contact_rows = contact["canonical_rows"]
     if self._joint_constraints is not None:
       constrained = self._joint_constraints.run_device(
@@ -6222,7 +6249,7 @@ class MetalSimulation:
             add=False, sign=1)
       if capture_fwdinv:
         constraint_force_for_compare = constrained["qfrc_constraint"]
-      add_rhs(constrained["qfrc_constraint"])
+      add_rhs(constrained["qfrc_constraint"], compensated=False)
       legacy_joint_rows = constrained["canonical_rows_view"]
     scheduler = getattr(self, "_sleep_schedule", None)
     if scheduler is not None and int(self._mjmodel.nv) > 0:

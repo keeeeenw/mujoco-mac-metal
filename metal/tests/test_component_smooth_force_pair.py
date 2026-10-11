@@ -80,3 +80,34 @@ def test_large_row_block_route_is_exercised_and_restores(solver):
   sim.restore(snap)
   sim.step(5)
   np.testing.assert_array_equal(sim.state.qpos.cpu().numpy(), first)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native force aggregation")
+@pytest.mark.parametrize("solver", ["PGS", "CG", "Newton"])
+def test_cancelling_force_terms_keep_residual(solver):
+  """passive(1) + applied(2**24) + actuator(-2**24) must not collapse to 0.
+
+  In float32 source order 1 + 2**24 rounds back to 2**24, so a high-only sum
+  loses the unit force; the compensated pair carries it to the solve.
+  """
+  import torch
+  from mujoco_metal.simulation import MetalSimulation
+  model = mujoco.MjModel.from_xml_string(f"""<mujoco>
+    <option gravity="0 0 0" solver="{solver}" timestep="0.001"><flag contact="disable"/></option>
+    <worldbody><body><joint name="j" type="slide" axis="1 0 0" stiffness="1" ref="0"/>
+      <geom type="sphere" size=".1" mass="1"/></body></worldbody>
+    <actuator><motor joint="j" ctrllimited="false" forcelimited="false"/></actuator>
+  </mujoco>""")
+  source = mujoco.MjData(model)
+  source.qpos[0] = -1.0
+  source.qfrc_applied[0] = 2.0**24
+  source.ctrl[0] = -2.0**24
+  mujoco.mj_step(model, source)
+  assert source.qvel[0] == pytest.approx(model.opt.timestep * 1.0, rel=1e-9)
+  sim = MetalSimulation(model, 1, profile="integrated_scalable_v1")
+  sim.reset(qpos=np.array([[-1.0]], dtype=np.float32))
+  sim.step(1, qfrc_applied=torch.tensor([[2.0**24]], device="mps"),
+           ctrl=torch.tensor([[-2.0**24]], device="mps"))
+  qvel = float(sim.state.qvel.cpu().numpy()[0, 0])
+  assert qvel == pytest.approx(source.qvel[0], rel=1e-5)
