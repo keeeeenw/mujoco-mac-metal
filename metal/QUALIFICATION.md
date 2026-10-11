@@ -1,5 +1,57 @@
 # Development qualification — 2026-10-11
 
+## Component matrix residuals and cached diagonal ownership — 2026-10-11
+
+Local revision `dccfbe5c59396f50679e018e40c55f6751361814` adds optional
+`mass_blocks_low` and `tendon_armature_blocks_low` inputs to the native component
+mass solver. Fresh and cached solves retain the original operator's residuals;
+both matrix-vector routes consume them. Cached factorization owns both matrix
+planes and its diagonal addition, so caller mutation and subsequent scratch
+reuse cannot silently change the equation used by refinement. Device admission
+includes the retained residual and diagonal buffers, including empty-model
+sentinels. Invalid residual metadata is rejected before retained state changes.
+
+The complete host selection passed **2,423 tests, 99 skipped, 2,215 deselected
+in 100.46 seconds**, exit 0. The focused component group passed **41 tests in
+1.19 seconds**. The expanded native regression group passed **151 tests,
+34 deselected in 149.23 seconds**, exit 0. These runs used the identical source
+subsequently committed at the revision above, Python 3.12.13, MuJoCo 3.10.0 and
+Torch 2.9.1, with MPS fallback and fast math disabled. No test ran concurrently
+with an edit to its runtime source.
+
+Native execution covers positive-definite and indefinite component equations,
+noncontiguous component DOF layouts, multiple worlds and right-hand sides,
+caller mutation after factorization, invalid input metadata, selected-world
+failure isolation and recovery, diagonal ownership, and both matrix-vector
+routes. An actual MuJoCo inertia matrix supplies a test-only oracle residual:
+the previous quantized solve differs by more than `1e-8`; the retained-matrix
+solve matches the full reference at `rtol=atol=3e-13`. CPU oracle matrices are
+used only by tests, not by production stepping.
+
+**This is a solver-interface correction, not full simulation precision.** The
+production mass producer and coupled constraint routes do not yet supply these
+matrix residuals. Factor storage remains float32 and is used as the refinement
+preconditioner; the tests do not establish convergence for every ill-conditioned
+operator or an operator whose rounded factor is singular. The original failing
+terrain trajectory was not rerun for this interface-only change and remains
+unqualified. No additional full milestone, demo, wheel or speedup is claimed.
+
+Reproduce the focused component gate with the pinned source runtime:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -p no:cacheprovider \
+  metal/tests/test_component_matrix_residual.py \
+  metal/tests/test_component_mass_solver.py \
+  metal/tests/test_component_paired_rhs.py \
+  metal/tests/test_component_solve_017.py
+```
+
+The expanded native selection adds these four files to the ten-file local
+source regression command recorded below, and uses `-m gpu`. Supply the pinned
+callback source root as described there; skips are not native passes.
+
 ## Compiled simple-inertia correction — 2026-10-11
 
 Local revision `3d38fd35f` on `implementation/mac-milestone-completion`
