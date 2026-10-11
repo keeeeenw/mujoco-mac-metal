@@ -11428,6 +11428,18 @@
       "requirement": "REQ-STATE-001",
       "execution": "device_or_host_validation",
       "semantics": "Transactional selected batched device state copy, ordered paired worlds and retained precision; no forward or CPU physics."
+    },
+    "mj_energyPos": {
+      "path": "mujoco_metal/native_api.py:mj_energyPos",
+      "requirement": "REQ-SENS-002",
+      "execution": "device_or_host_validation",
+      "semantics": "Selected transactional energy publication from coherent prepared POS/VEL; independent of automatic ENERGY; no CPU physics or geometry/mass recomputation."
+    },
+    "mj_energyVel": {
+      "path": "mujoco_metal/native_api.py:mj_energyVel",
+      "requirement": "REQ-SENS-002",
+      "execution": "device_or_host_validation",
+      "semantics": "Selected transactional energy publication from coherent prepared POS/VEL; independent of automatic ENERGY; no CPU physics or geometry/mass recomputation."
     }
   },
   "python_function_map": {
@@ -11728,20 +11740,20 @@
       "gap": null
     },
     "mj_energyPos": {
-      "classification": "sensor_or_energy_stage",
+      "classification": "package_counterpart",
       "owner": "REQ-SENS-002",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_energyPos.",
-      "counterpart_kind": null
+      "execution": "native energy from prepared device stage with host admission",
+      "counterpart": "mujoco_metal/native_api.py:mj_energyPos",
+      "counterpart_kind": "public_wrapper",
+      "gap": "Complete sleep, timed sensor, lifecycle failure and broad composition qualification remains open."
     },
     "mj_energyVel": {
-      "classification": "sensor_or_energy_stage",
+      "classification": "package_counterpart",
       "owner": "REQ-SENS-002",
-      "execution": "upstream host binding; no same-named package entrypoint",
-      "counterpart": null,
-      "gap": "Exact package execution/host-boundary decision remains open for mj_energyVel.",
-      "counterpart_kind": null
+      "execution": "native energy from prepared device stage with host admission",
+      "counterpart": "mujoco_metal/native_api.py:mj_energyVel",
+      "counterpart_kind": "public_wrapper",
+      "gap": "Complete sleep, timed sensor, lifecycle failure and broad composition qualification remains open."
     },
     "mj_extractState": {
       "classification": "package_counterpart",

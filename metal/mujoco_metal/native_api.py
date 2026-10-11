@@ -1746,6 +1746,18 @@ class StateSpec:
   ALL = INTEGRATION
 
 
+def mj_energyPos(sim, record=None, *, env_ids=None):
+  """Publish owned potential energy from an already prepared position record."""
+  from mujoco_metal.energy import update_energy
+  return update_energy(sim, 0, record, env_ids=env_ids)
+
+
+def mj_energyVel(sim, record=None, *, env_ids=None):
+  """Publish owned kinetic energy from an already prepared velocity record."""
+  from mujoco_metal.energy import update_energy
+  return update_energy(sim, 1, record, env_ids=env_ids)
+
+
 def mj_copyState(src, dst, spec=StateSpec.ALL, *, src_env_ids=None, dst_env_ids=None):
   """Copy selected device state between identical compiled model owners.
 

@@ -834,8 +834,8 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
   # Smooth mass/RNE workspaces. `crb` and `local_inertia` are 6x6 spatial
   # matrices per body; omitting these made fixed-heavy models evade bounds.
   derivative_stride = 6 * (3 * nb + nv)
-  energy_enabled = bool(int(model.opt.enableflags)
-                        & int(mujoco.mjtEnableBit.mjENBL_ENERGY))
+  from mujoco_metal.energy import energy_storage_enabled
+  energy_enabled = energy_storage_enabled(model)
   for name, count in (
       ("mass", b * nv * nv if mass_storage == "dense" else 0),
       ("mass_low", max(b * (nv * nv if mass_storage == "dense" else component_nnz), 1)),
@@ -915,28 +915,19 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       ("next_act", b * na), ("sensordata", b * nsensordata),
       ("sensor_act_force", b * max(nu, 1)),
       ("sensor_qfrc_act", b * max(nv, 1)),
-      ("energy_stage", b * 2 if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-      ("energy_body_mass_const", max(nb - 1, 1) if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-      ("energy_gravity_const", 3 if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-      ("energy_qpos_spring_const", max(nq, 1) if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-      ("energy_position_dims", 12 + b if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-      ("energy_joint_int", 3 * max(nj, 1) if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-      ("energy_joint_float", 3 * max(nj, 1) if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-      ("energy_tendon_int", 4 * max(ntendon, 1) if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-      ("energy_tendon_float", 5 * max(ntendon, 1) if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-      ("energy_flex_int", max(nflexedge, 1) if int(model.opt.enableflags)
-       & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
+      ("energy_output", b * 2 if energy_enabled else 0),
+      ("energy_stage", b * 2 if energy_enabled else 0),
+      ("energy_body_mass_const", max(nb - 1, 1) if energy_enabled else 0),
+      ("energy_gravity_const", 3 if energy_enabled else 0),
+      ("energy_qpos_spring_const", max(nq, 1) if energy_enabled else 0),
+      ("energy_position_dims", 12 + b if energy_enabled else 0),
+      ("energy_joint_int", 3 * max(nj, 1) if energy_enabled else 0),
+      ("energy_joint_float", 3 * max(nj, 1) if energy_enabled else 0),
+      ("energy_tendon_int", 4 * max(ntendon, 1) if energy_enabled else 0),
+      ("energy_tendon_float", 5 * max(ntendon, 1) if energy_enabled else 0),
+      ("energy_flex_int", max(nflexedge, 1) if energy_enabled else 0),
       ("energy_flex_float", 2 * max(nflexedge, 1)
-       if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY)
+       if energy_enabled
        else 0),
       # Fixed-tendon RK4 forwardSkip(POS) cache. The current stage's lengths
       # are copied into a persistent buffer; separate kernel dimensions select

@@ -22,6 +22,7 @@ import numpy as np
 from dataclasses import replace, fields, is_dataclass
 
 import mujoco
+from mujoco_metal.energy import energy_storage_enabled
 
 from mujoco_metal.device_state import DeviceState, _device_matches
 from mujoco_metal.actuation import MetalScalarMotorForce
@@ -746,16 +747,13 @@ class MetalSimulation:
             "cacc": batch_size * model.nbody * 6,
             "body_force": batch_size * model.nbody * 6,
             "ctrl": batch_size * model.nu,
-            "energy_stage": (batch_size * 2 if int(model.opt.enableflags)
-                             & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
+            "energy_output": (batch_size * 2 if energy_storage_enabled(model) else 0),
+            "energy_stage": (batch_size * 2 if energy_storage_enabled(model) else 0),
             "energy_body_mass_const": (max(int(model.nbody) - 1, 1)
-                                        if int(model.opt.enableflags)
-                                        & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
-            "energy_gravity_const": (3 if int(model.opt.enableflags)
-                                     & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
+                                        if energy_storage_enabled(model) else 0),
+            "energy_gravity_const": (3 if energy_storage_enabled(model) else 0),
             "energy_qpos_spring_const": (max(int(model.nq), 1)
-                                         if int(model.opt.enableflags)
-                                         & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else 0),
+                                         if energy_storage_enabled(model) else 0),
             "legacy_constraint_rhs": (batch_size * int(model.nv)
                                       if legacy_joint_rows else 0),
             "legacy_joint_lambda": (batch_size * max(legacy_joint_rows, 1)
@@ -1126,109 +1124,19 @@ class MetalSimulation:
         if self._legacy_row_count else None)
     self._solver_fwdinv = torch.zeros(
         (batch_size, 2), dtype=torch.float32, device=self._state._device)
-    self._energy = (
-        torch.zeros((batch_size, 2), dtype=torch.float32,
-                    device=self._state._device)
-        if int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY)
-        else None)
-    self._energy_stage = (torch.empty_like(self._energy)
-                          if self._energy is not None else None)
+    self._energy = None
+    self._energy_stage = None
     self._energy_body_mass = None
     self._energy_gravity = None
     self._energy_qpos_spring = None
-    if self._energy is not None:
-      self._energy_body_mass = torch.zeros(
-          (max(int(model.nbody) - 1, 1),), dtype=torch.float32,
-          device=self._state._device)
-      if model.nbody > 1:
-        self._energy_body_mass[:model.nbody - 1].copy_(torch.as_tensor(
-            np.asarray(model.body_mass[1:], dtype=np.float32).copy(),
-            dtype=torch.float32, device=self._state._device))
-      self._energy_gravity = torch.as_tensor(
-          np.asarray(model.opt.gravity, dtype=np.float32).copy(),
-          dtype=torch.float32, device=self._state._device)
-      self._energy_qpos_spring = torch.zeros(
-          (max(int(model.nq), 1),), dtype=torch.float32,
-          device=self._state._device)
-      if model.nq:
-        self._energy_qpos_spring[:model.nq].copy_(torch.as_tensor(
-            np.asarray(model.qpos_spring, dtype=np.float32).copy(),
-            dtype=torch.float32, device=self._state._device))
-      energy_jint = np.zeros((max(int(model.njnt), 1), 3), dtype=np.int32)
-      energy_jfloat = np.zeros((max(int(model.njnt), 1), 3), dtype=np.float32)
-      for jid in range(int(model.njnt)):
-        energy_jint[jid] = (int(model.jnt_type[jid]),
-                            int(model.jnt_qposadr[jid]),
-                            int(model.jnt_bodyid[jid]))
-        energy_jfloat[jid] = (
-            float(model.jnt_stiffness[jid]),
-            float(np.asarray(model.jnt_stiffnesspoly).reshape(-1, 2)[jid, 0]),
-            float(np.asarray(model.jnt_stiffnesspoly).reshape(-1, 2)[jid, 1]))
-      energy_tint = np.zeros((max(int(model.ntendon), 1), 4), dtype=np.int32)
-      energy_tfloat = np.zeros((max(int(model.ntendon), 1), 5), dtype=np.float32)
-      tendon_poly = np.asarray(model.tendon_stiffnesspoly).reshape(
-          int(model.ntendon), 2) if int(model.ntendon) else np.zeros((0, 2))
-      tendon_range = np.asarray(model.tendon_lengthspring).reshape(
-          int(model.ntendon), 2) if int(model.ntendon) else np.zeros((0, 2))
-      paths = (self._spatial_tendons._meta.paths
-               if self._spatial_tendons is not None else [None] * int(model.ntendon))
-      for tid in range(int(model.ntendon)):
-        tree_num = int(np.asarray(model.tendon_treenum)[tid])
-        treeids = np.asarray(model.tendon_treeid).reshape(
-            int(model.ntendon), 2)[tid]
-        energy_tint[tid] = (tree_num, int(treeids[0]), int(treeids[1]),
-                            int(paths[tid] is not None))
-        energy_tfloat[tid] = (
-            float(model.tendon_stiffness[tid]),
-            float(tendon_poly[tid, 0]), float(tendon_poly[tid, 1]),
-            float(tendon_range[tid, 0]), float(tendon_range[tid, 1]))
-      edge_pairs = []
-      flex_dim = np.asarray(model.flex_dim)
-      flex_rigid = np.asarray(model.flex_rigid)
-      edge_adr = np.asarray(model.flex_edgeadr)
-      edge_num = np.asarray(model.flex_edgenum)
-      edge_rigid = np.asarray(model.flexedge_rigid)
-      rest = np.asarray(model.flexedge_length0, dtype=np.float32)
-      edge_stiffness = np.asarray(model.flex_edgestiffness, dtype=np.float32)
-      for fid in range(int(model.nflex)):
-        if bool(flex_rigid[fid]) or int(flex_dim[fid]) > 1:
-          continue
-        for edge in range(int(edge_adr[fid]),
-                          int(edge_adr[fid]) + int(edge_num[fid])):
-          if not bool(edge_rigid[edge]) and float(edge_stiffness[fid]) != 0.0:
-            edge_pairs.append((edge, float(rest[edge]),
-                               float(edge_stiffness[fid])))
-      self._energy_joint_int = torch.as_tensor(
-          energy_jint.reshape(-1), dtype=torch.int32, device=self._state._device)
-      self._energy_joint_float = torch.as_tensor(
-          energy_jfloat.reshape(-1), dtype=torch.float32, device=self._state._device)
-      self._energy_tendon_int = torch.as_tensor(
-          energy_tint.reshape(-1), dtype=torch.int32, device=self._state._device)
-      self._energy_tendon_float = torch.as_tensor(
-          energy_tfloat.reshape(-1), dtype=torch.float32, device=self._state._device)
-      flex_int = np.zeros((max(len(edge_pairs), 1),), dtype=np.int32)
-      flex_float = np.zeros((max(len(edge_pairs), 1), 2), dtype=np.float32)
-      self._energy_flex_row_count = len(edge_pairs)
-      if edge_pairs:
-        flex_int[:len(edge_pairs)] = [row[0] for row in edge_pairs]
-        flex_float[:len(edge_pairs)] = [row[1:] for row in edge_pairs]
-      self._energy_flex_int = torch.as_tensor(
-          flex_int, dtype=torch.int32, device=self._state._device)
-      self._energy_flex_float = torch.as_tensor(
-          flex_float.reshape(-1), dtype=torch.float32,
-          device=self._state._device)
-      self._energy_position_dims = torch.tensor(
-          [int(model.nq), int(model.nv), int(model.nbody), int(model.njnt),
-           int(model.ntendon), int(model.nflexedge), len(edge_pairs),
-           max(int(model.ntree), 1),
-           int(bool(int(model.opt.disableflags)
-                    & int(mujoco.mjtDisableBit.mjDSBL_SPRING))),
-           int(bool(int(model.opt.disableflags)
-                    & int(mujoco.mjtDisableBit.mjDSBL_GRAVITY))),
-           int(bool(int(model.opt.enableflags)
-                    & int(mujoco.mjtEnableBit.mjENBL_SLEEP))),
-           int(batch_size)] + [1] * int(batch_size),
-          dtype=torch.int32, device=self._state._device)
+    has_energy_sensors = bool(np.any(np.isin(np.asarray(model.sensor_type),
+        [int(mujoco.mjtSensor.mjSENS_E_POTENTIAL),
+         int(mujoco.mjtSensor.mjSENS_E_KINETIC)])))
+    self._energy_manual = has_energy_sensors
+    if (int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY)
+        or has_energy_sensors):
+      from mujoco_metal.energy import build_energy_storage
+      vars(self).update(build_energy_storage(self))
     self._component_damping_deriv = (
         torch.empty_like(self._rhs) if self._component_mass_enabled else None)
     self._forward_position_epoch = 0
@@ -1712,7 +1620,9 @@ class MetalSimulation:
   @property
   def energy(self):
     """Pinned ``[potential, kinetic]`` energy from the latest evaluated stages."""
-    return None if self._energy is None else self._energy.clone()
+    visible = (int(self._mjmodel.opt.enableflags)
+               & int(mujoco.mjtEnableBit.mjENBL_ENERGY)) or getattr(self, "_energy_manual", False)
+    return None if self._energy is None or not visible else self._energy.clone()
 
   def _invalidate_after_state_write(self, fields):
     """Advance state identity and invalidate records derived from a state transaction."""
@@ -2005,8 +1915,11 @@ class MetalSimulation:
     snap["sensordata"] = (self._sensordata.detach().cpu().numpy().copy()
                           if getattr(self, "_sensordata", None) is not None else None)
     energy = getattr(self, "_energy", None)
+    energy_visible = (int(self._mjmodel.opt.enableflags)
+                      & int(mujoco.mjtEnableBit.mjENBL_ENERGY)) or getattr(self, "_energy_manual", False)
     snap["energy"] = (energy.detach().cpu().numpy().copy()
-                      if energy is not None else None)
+                      if energy is not None and energy_visible else None)
+    snap["energy_manual"] = bool(getattr(self, "_energy_manual", False))
     snap["sensordata_low"] = self._sensor_output_low_snapshot(
         getattr(self, "_sensors", None))
     raw_program = getattr(self, "_raw_sensor_program", None)
@@ -2074,13 +1987,21 @@ class MetalSimulation:
     # Stored energy is an evaluated-stage output, not a value to recompute
     # during restore. Validate it before any extension callback or state write.
     energy = getattr(self, "_energy", None)
+    manual_energy = snapshot.get("energy_manual", False)
+    if not isinstance(manual_energy, (bool, _np.bool_)):
+      raise ValueError("snapshot energy_manual must be boolean")
+    manual_energy = bool(manual_energy)
     energy_checked = None
-    if energy is None:
+    if energy is None and not manual_energy:
       if snapshot.get("energy") is not None:
         raise ValueError("snapshot energy does not match disabled diagnostics")
-    elif "energy" not in snapshot:
-      # Older schema-1 snapshots did not carry this optional field. Clear
-      # selected rows instead of retaining output from an unrelated trajectory.
+    elif snapshot.get("energy") is None:
+      if manual_energy:
+        raise ValueError("snapshot manual energy values are missing")
+      if ("energy" in snapshot and int(self._mjmodel.opt.enableflags)
+          & int(mujoco.mjtEnableBit.mjENBL_ENERGY)):
+        raise ValueError("snapshot enabled energy values are missing")
+      # Legacy checkpoints and inactive manual diagnostics clear selected rows.
       energy_checked = _np.zeros((self.batch_size, 2), dtype=_np.float32)
     else:
       arr = _np.asarray(snapshot["energy"], dtype=_np.float64)
@@ -2187,15 +2108,27 @@ class MetalSimulation:
         raise ValueError("snapshot delay state is missing")
       delay_checked = self._delay.checked_snapshot(delay_snap)
 
+    # Lazy direct-call diagnostics restore without enabling automatic sampling.
+    # Allocate locally before any plugin callback or physical state commit.
+    energy_fields = None
+    if energy_checked is not None and energy is None:
+      from mujoco_metal.energy import build_energy_storage
+      energy_fields = build_energy_storage(self)
+      energy = energy_fields["_energy"]
+    restored_energy = (self._state._torch.as_tensor(
+        energy_checked, dtype=self._state._torch.float32, device=self._state._device)
+        if energy_checked is not None else None)
     # Apply actual callbacks before the native commit: implementations may
     # reject only on a later call after the preflight probe succeeded.
     _apply_plugin_restores(plugin_map, plugins, env_ids=ids)
     # Commit boundary: DeviceState validates its fields atomically before mutating.
     self._state.restore(snapshot["device"], env_ids=ids)
     torch = self._state._torch
+    if energy_fields is not None:
+      vars(self).update(energy_fields)
+    self._energy_manual = (manual_energy if ids is None else
+                           getattr(self, "_energy_manual", False) or manual_energy)
     if energy_checked is not None:
-      restored_energy = torch.as_tensor(
-          energy_checked, dtype=torch.float32, device=self._state._device)
       if ids is None:
         energy.copy_(restored_energy)
       else:
@@ -2652,6 +2585,16 @@ class MetalSimulation:
     # Full validation + stage construction happens here, before any mutation
     # of this simulation (atomicity).
     fresh = type(self)(new_model, self.batch_size, profile=self.profile.name)
+    # Energy samples are data-owned evaluated outputs, like held inputs.
+    # Rebuild their model constants before adopting the new descriptor, but
+    # retain the last sample until a subsequent evaluation replaces it.
+    old_energy = getattr(self, "_energy", None)
+    if old_energy is not None:
+      if fresh._energy is None:
+        from mujoco_metal.energy import build_energy_storage
+        vars(fresh).update(build_energy_storage(fresh))
+      fresh._energy.copy_(old_energy)
+      fresh._energy_manual = getattr(self, "_energy_manual", False)
     keep = {"_state", "batch_size", "_success", "_combined_status",
             "_next_qpos", "_next_qvel", "_next_qacc", "_next_time",
             "_next_status", "_next_act", "_control", "_applied_force",
@@ -2880,6 +2823,22 @@ class MetalSimulation:
     return tuple(entries)
 
   def sensor_values(self):
+    """Evaluate current sensors without replacing stored stage diagnostics."""
+    if getattr(self, "_energy", None) is None:
+      return self._sensor_values_preserving_sparse_scratch()
+    scratch = [self._energy, self._energy_stage, self._energy_position_dims,
+               self._state._reset_mask_i32]
+    scratch += [self._smooth._workspace.get(name) for name in
+                ("energy_velocity_dims", "mass_matvec_dims", "mass_sparse_product")]
+    unique = {id(value): value for value in scratch if value is not None}
+    saved = [(value, value.clone()) for value in unique.values()]
+    try:
+      return self._sensor_values_preserving_sparse_scratch()
+    finally:
+      for value, previous in saved:
+        value.copy_(previous)
+
+  def _sensor_values_preserving_sparse_scratch(self):
     """Evaluate a query without changing persistent sparse-solve scratch."""
     if not getattr(self, "_component_mass_enabled", False):
       return self._sensor_values_impl()
@@ -3091,11 +3050,16 @@ class MetalSimulation:
       mass_qvel = self._smooth.mass_blocks_matvec_device(
           mass_blocks, qvel, tendon_armature_blocks=armature_blocks,
           world_mask=producer_mask)
-    return program.run_state_device(
+    result = program.run_state_device(
         qpos, qvel, poses, mass_matrix=mm, mass_qvel=mass_qvel,
         ten_spa_len=ten_l, ten_spa_vel=ten_v,
         act_dyn_len=act_l, act_dyn_vel=act_v, act_kind=kind, out=out,
         stages=stages, world_mask=world_mask)
+    if self._energy is not None:
+      from mujoco_metal.energy import sample_sensor_energy
+      sample_sensor_energy(self, program, result, qpos, qvel, dynamics,
+                           position_context, stages, world_mask)
+    return result
 
   def assembled_system(self, *, ctrl=None, qfrc_applied=None, recompute=False):
     """Return the coupled constraint system tensors on MPS.
@@ -3970,7 +3934,8 @@ class MetalSimulation:
                    _generation=self._state.generation)
     return context
 
-  def _update_energy_position(self, qpos, dynamics, context, *, world_mask=None):
+  def _update_energy_position(self, qpos, dynamics, context, *, world_mask=None,
+                              manual=False, skipsensor=False):
     """Refresh pinned ``mj_energyPos`` into the owned two-value stage buffer.
 
     Static model metadata is read on the host; all state-dependent arithmetic
@@ -3980,6 +3945,21 @@ class MetalSimulation:
     if self._energy is None:
       return None
     torch, model = self._state._torch, self._mjmodel
+    if (not manual and not int(model.opt.enableflags)
+        & int(mujoco.mjtEnableBit.mjENBL_ENERGY)):
+      # Pinned full forward clears both samples unless sensorPos computed
+      # potential energy. Explicit calls still evaluate independently of
+      # this flag. Sensor-driven publication is handled by sensor sampling.
+      potential_sensor = (not skipsensor and not int(model.opt.disableflags)
+                          & int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
+                          and np.any(np.asarray(model.sensor_type)
+                              == int(mujoco.mjtSensor.mjSENS_E_POTENTIAL)))
+      if not potential_sensor:
+        mask = self._state._status == 0
+        if world_mask is not None:
+          mask = mask & world_mask
+        self._energy[mask] = 0.0
+      return None
     if world_mask is None:
       out = self._energy[:, 0]
     else:
@@ -4011,7 +3991,7 @@ class MetalSimulation:
           self._spatial_kin["length"] if self._spatial_tendons is not None else
           fixed_length)
       flex_length = (
-          context["flex"]["buffers"]["_flexedge_length"]
+          context["flex"].buffers["_flexedge_length"]
           if context is not None and "flex" in context else
           self._flex._flexedge_length if self._flex is not None else
           self._energy_flex_float)
@@ -4147,7 +4127,7 @@ class MetalSimulation:
         edge_rigid = np.asarray(model.flexedge_rigid)
         rest = np.asarray(model.flexedge_length0, dtype=np.float32)
         edge_k = np.asarray(model.flex_edgestiffness, dtype=np.float32)
-        lengths = (context["flex"]["buffers"]["_flexedge_length"]
+        lengths = (context["flex"].buffers["_flexedge_length"]
                    if context is not None and "flex" in context
                    else self._flex._flexedge_length)
         for fid in range(int(model.nflex)):
@@ -4166,9 +4146,10 @@ class MetalSimulation:
       return self._energy[:, 0]
     return out
 
-  def _update_energy_velocity(self, velocity, *, world_mask=None):
+  def _update_energy_velocity(self, velocity, *, world_mask=None, manual=False):
     """Refresh pinned ``mj_energyVel`` using the complete prepared mass."""
-    if self._energy is None:
+    if (self._energy is None or (not manual and not
+        int(self._mjmodel.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY))):
       return None
     dynamics = velocity["dynamics"]
     qvel = velocity["qvel"]
@@ -4386,7 +4367,7 @@ class MetalSimulation:
     energy_pos = self._update_energy_position(qpos, dynamics, context)
     if not skipsensor and self._sensors is not None:
       self._store_step_sensors(
-          qpos, zero_qvel, dynamics, stages=(mujoco.mjtStage.mjSTAGE_POS,),
+          qpos, state._qvel, dynamics, stages=(mujoco.mjtStage.mjSTAGE_POS,),
           position_context=context, include_spatial=False)
     record = self._forward_stages.begin(
         generation=state.generation, qpos=qpos, mocap_pos=mocap_pos,
@@ -7013,11 +6994,15 @@ class MetalSimulation:
                        else None)
             callback_index = 0
             final_callback_index = 2 if initial_stage is not None else 3
+            final_energy_dynamics = None
 
             def _rk4_sleep_accel(q, v, a, t=None):
-              nonlocal callback_index
+              nonlocal callback_index, final_energy_dynamics
               acc, solve_status, dyn = self._acceleration(
                   q, v, act_override=a, time_override=t)
+              self._update_energy_position(q, dyn, None, skipsensor=True)
+              self._update_energy_velocity({"dynamics": dyn, "qvel": v})
+              final_energy_dynamics = dyn
               adot = self._act_dot.clone() if na_here > 0 else None
               result = (acc, adot, solve_status)
               if callback_index == final_callback_index:
@@ -7078,6 +7063,9 @@ class MetalSimulation:
                 success, qpos=qpos, qvel=qvel, qacc=acceleration,
                 act=(self._next_act if self._actuators is not None
                      and na_here > 0 else None), time=time)
+            from mujoco_metal.energy import advance_rk_energy_history
+            advance_rk_energy_history(self, final_energy_dynamics,
+                                      state._qpos, rk4_initial_qvel, success)
             state._qpos = torch.where(success[:, None], qpos, state._qpos)
             state._qvel = torch.where(success[:, None], qvel, state._qvel)
             state._precision.commit(state._qpos,state._qvel,self._integrator._output_words,success)
@@ -7148,9 +7136,14 @@ class MetalSimulation:
                 compute_worlds=(~check_reset).contiguous())
           rk4_act = (state._act if (self._actuators is not None and na_here > 0)
                      else None)
+          final_energy_dynamics = None
           def _rk4_accel(q, v, a, t=None):
-            acc, solve_status, _ = self._acceleration(
+            nonlocal final_energy_dynamics
+            acc, solve_status, dyn = self._acceleration(
                 q, v, act_override=a, time_override=t)
+            self._update_energy_position(q, dyn, None, skipsensor=True)
+            self._update_energy_velocity({"dynamics": dyn, "qvel": v})
+            final_energy_dynamics = dyn
             adot = self._act_dot.clone() if na_here > 0 else None
             return acc, adot, solve_status
           qpos, qvel, acceleration, weighted_dot, time, status = self._rk4.run_device(
@@ -7181,6 +7174,9 @@ class MetalSimulation:
               success, qpos=qpos, qvel=qvel, qacc=acceleration,
               act=(self._next_act if self._actuators is not None
                    and na_here > 0 else None), time=time)
+          from mujoco_metal.energy import advance_rk_energy_history
+          advance_rk_energy_history(self, final_energy_dynamics,
+                                    state._qpos, step_qvel, success)
           state._qpos = torch.where(success.unsqueeze(1), qpos, state._qpos)
           state._qvel = torch.where(success.unsqueeze(1), qvel, state._qvel)
           state._precision.commit(state._qpos,state._qvel,self._rk4._position._output_words,success)
