@@ -4938,6 +4938,15 @@ class MetalSimulation:
       return
     sel = self._twosum_mask[:rows].reshape(-1, 1)
     torch.ne(mask.reshape(-1, 1), 0, out=sel)
+    if device.type == "mps" and rows == self.batch_size:
+      # A Torch copy_ changes the mutation counter even when every selector
+      # is false. Prepared stages borrow these owners, so publish through
+      # predicated native stores and leave healthy rows and versions intact.
+      row_mask = sel.reshape(-1)
+      self._state.copy_masked_rows(hi, s_buf, row_mask)
+      torch.add(lo, err_buf, out=tmp_buf)
+      self._state.copy_masked_rows(lo, tmp_buf, row_mask)
+      return
     torch.where(sel, s_buf, hi, out=tmp_buf)
     hi.copy_(tmp_buf)
     torch.add(lo, err_buf, out=tmp_buf)

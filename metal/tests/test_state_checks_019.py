@@ -424,6 +424,7 @@ def test_native_all_healthy_check_preserves_cached_owners_and_samples():
   owners = {
       "qacc": sim.state._qacc,
       "rhs": sim._rhs,
+      "rhs_low": sim._rhs_low,
       "stored_sensor": sim._sensordata,
       "raw_sensor": sim._raw_sensordata,
       "energy": sim._energy,
@@ -444,6 +445,7 @@ def test_native_all_healthy_check_preserves_cached_owners_and_samples():
   live = {
       "qacc": sim.state._qacc,
       "rhs": sim._rhs,
+      "rhs_low": sim._rhs_low,
       "stored_sensor": sim._sensordata,
       "raw_sensor": sim._raw_sensordata,
       "energy": sim._energy,
@@ -454,7 +456,7 @@ def test_native_all_healthy_check_preserves_cached_owners_and_samples():
     if value is None:
       continue
     assert live[name] is value
-    assert value._version == versions[name]
+    assert value._version == versions[name], name
     assert torch.equal(value, contents[name])
 
   # An all-healthy check must leave the subsequent real step bitwise equal
