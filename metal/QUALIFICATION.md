@@ -53,10 +53,50 @@ CPU counterfactual (`0.51` potential energy); the unchanged native bounds are
 `rtol=2e-5`, `atol=2e-6`. Sleep cases use the admitted scalable Euler and RK4
 profiles; historical small dense Euler rejects sleep by design.
 
-These later scoped gates do not establish complete computed-stage metadata,
-all retained-precision/lifecycle compositions, a full native suite or milestone
-completion. The earlier 192-case eight-file selection and this later 192-case
-four-file selection are distinct evidence and must not be counted twice.
+Computed-energy metadata is implemented at `7c6ac50d3`. Its final affected gate
+passes **135 checks in 22.06 seconds: 117 native cases and 18 host checks**.
+Owned per-world flags participate in selected reset/copy/restore, compatible
+model rebuilds and publication rollback. Malformed checkpoint flags reject
+before mutation; legacy checkpoints initialize them to zero. The earlier
+eight-file history/composition gate passes **241 checks in 117.16 seconds**.
+The complete host selection passes **2,988 tests, 99 skipped, 2,588 deselected
+in 104.79 seconds**. These overlapping selections are separate evidence and
+must not be added together.
+
+Current flex-energy queries are corrected at `ba8c2097c`. Real tensor mutation
+previously left flex geometry stale, producing a potential-energy error of
+`0.704` in a retained fixture. Eight new native cases cover dense/component
+mass, changed/unchanged inputs and success/injected failure after real native
+evaluation. They verify stored energy/flags/history, borrowed mass/geometry and
+record validity survive inspection, then compare three subsequent CPU/native
+steps and exact checkpoint replay. The full nine-file affected selection passes
+**249 checks in 119.26 seconds**, with no failures or skips; its complete host
+selection passes **2,988 tests, 99 skipped, 2,596 deselected in 103.91 seconds**.
+
+These scoped gates do not establish all retained-precision/lifecycle
+compositions, a full native suite or milestone completion. The earlier
+192-case selections and the later metadata/query selections are distinct,
+overlapping evidence and must not be counted twice.
+
+Lazy POS/VEL energy ordering is corrected in `ef814cfa1`. A new 100-case
+matrix compares full forward and five consecutive updates against pinned
+MuJoCo across five integrators, automatic energy enabled/disabled, sensors
+enabled/disabled and direct/history/interval/delay modes. It checks diagnostic
+values and flags, stored samples, complete raw history buffers and exact cursor
+and checkpoint replay. An earlier ten-file candidate selection passed **350
+checks in 180.12 seconds**. The subsequent optional-owner recovery correction
+passes the complete stage-order and state-check selection: **140 checks in
+65.27 seconds**, with no failures or skips.
+
+The wider gate also exposed an undersized optional sensor payload: later worlds
+could read beyond its backing, occasionally returning NaN tendon samples.
+`51513bd7d` sizes it from admitted batched tendon/actuator counts. A deterministic
+binding check, the original 50-step physical/reset/replay test, exact owned
+memory admission and zero-width/tendon-only/actuator-only boundaries pass
+**35 checks in 5.30 seconds**. The complete host suite at this final source
+passes **2,996 tests, 99 skipped, 2,705 deselected in 102.38 seconds**. The
+350-, 140- and 35-case selections overlap and are not cumulative counts. These
+results still do not qualify the full native suite or close milestones 005–020.
 
 ## Rigid convex oracle input precision
 

@@ -359,18 +359,29 @@ Invalid/stale records, selections and memory admission reject before writes;
 producer/publication failures restore diagnostics and scratch.
 
 Explicit samples and energy-sensor storage are carried by full/selected
-checkpoints and simulation copies. Compatible model rebuilds preserve samples
-while rebuilding energy constants. A disabled full forward with no computed
+checkpoints and simulation copies. Owned `sim.flg_energypos` and
+`sim.flg_energyvel` tensors expose each world's lazy computation flags.
+Checkpoints carry these as the optional `[batch,2]` `energy_computed` field;
+older checkpoints without it restore flags as zero. Reset clears the selected
+flags, and compatible model rebuilds preserve samples while invalidating the
+flags and rebuilding energy constants. A disabled full forward with no computed
 potential-energy sensor clears both samples, matching pinned MuJoCo; an
 explicit energy call does not enable automatic sampling. Current-state sensor
-queries preserve stored step diagnostics, including on exceptions.
+queries refresh flex geometry from current inputs and preserve stored step
+diagnostics, prepared mass/geometry buffers and record validity, including on
+exceptions. These explicit queries allocate rollback storage; they are not an
+allocation-free stepping path.
 
-Energy sensors use the prepared mass and current velocity at the POS stage,
+Energy sensors use prepared mass and the pinned lazy-energy stage ordering,
 apply cutoff before sensor history, and preserve pinned RK4 delayed sampling
 with last-substage geometry and restored starting inputs. The development
-energy/forward/sensor/capacity selection passes 141 native checks and 51 host
-checks. Complete sleep, armature/pulley, retained-precision and lifecycle
-boundary compositions remain unqualified; this does not close a milestone.
+energy/forward/sensor/capacity selections and later metadata/current-flex-query
+correction gates pass at separately recorded revisions. See
+[qualification evidence](QUALIFICATION.md#prepared-energy-apis-and-sensor-storage)
+for exact counts and scope. Selected sleep and pulley/armature cases are tested;
+complete retained-precision/lifecycle compositions, the full native suite,
+clean-wheel execution and final demos remain open. These checks do not close a
+milestone.
 
 Explicit inverse queries also preserve pending split-step records, sleep
 scheduling, stored sensor status and plugin device state. Registered plugins

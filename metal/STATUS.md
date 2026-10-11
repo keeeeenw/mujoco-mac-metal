@@ -26,10 +26,13 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
-Prepared potential/kinetic energy APIs and coherent energy-sensor storage pass
-141 native and 51 host affected checks. These include disabled automatic energy,
-five integrators, timed samples, RK4 stage ordering, query rollback and checkpoint
-replay. The complete host selection passes 2,983 checks with 99 skips; the skipped
+Prepared potential/kinetic energy APIs, computed-stage metadata and current flex
+queries have separate passing native correction gates. A 100-case source-order
+matrix checks five integrators, automatic energy and sensors enabled/disabled,
+interval/delay modes, raw history buffers and exact checkpoint replay. Batched
+optional sensor payloads now cover every tendon/actuator index; their real
+allocation and physical regression selection passes 35 checks. The complete host
+selection at `51513bd7d` passes 2,996 checks with 99 skips; the skipped
 native cases remain unqualified. See [producing revisions and exact remaining
 scope](QUALIFICATION.md#prepared-energy-apis-and-sensor-storage). This does not
 change the full milestone count.
@@ -41,8 +44,8 @@ also passes its 25-case affected group after including solved constraint force.
 See [exact scope and producing revisions](QUALIFICATION.md). These close
 specific contracts; the full milestone count remains unchanged.
 
-The latest complete local development host selection at `50d3bdad0` passed
-**2,976 tests, 87 skipped, 2,470 deselected**;
+The latest complete local development host selection at `51513bd7d` passed
+**2,996 tests, 99 skipped, 2,705 deselected in 102.38 seconds**;
 it does not qualify the skipped native cases. The historical host publication
 check passed **2,163 tests, 1,615 skipped** at its separately recorded revision;
 see [producing revisions and scope](QUALIFICATION.md).
