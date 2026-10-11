@@ -94,7 +94,8 @@ def component_solver_workspace_sizes(*, batch, nv, ncomponent, nnz,
       "component_mass_output_pair": 2 * batch * rhs_capacity * maxnv,
       "component_mass_single_output_pair": 2 * batch * maxnv,
       "component_mass_matvec_output": batch * maxnv,
-      "component_mass_retained_matrix": max(batch * nnz, 1),
+      "component_mass_retained_matrix": batch * max(nnz, 1),
+      "component_mass_retained_matrix_low": batch * max(nnz, 1),
       "component_mass_status": batch * max(ncomponent, 1),
       "component_mass_factor_status": batch * max(ncomponent, 1),
       "component_mass_zero_blocks": max(batch * nnz, 1),
@@ -102,6 +103,7 @@ def component_solver_workspace_sizes(*, batch, nv, ncomponent, nnz,
       "component_mass_default_dof_ids": batch * maxnv,
       "component_mass_default_counts": batch * 3,
       "component_mass_diagonal_add": batch * maxnv,
+      "component_mass_retained_diagonal_add": batch * maxnv,
       "component_mass_damping_mask": maxnv,
       "component_mass_euler_dt": 1,
       "component_mass_allow_indefinite": 1,
@@ -571,11 +573,33 @@ class MetalComponentMassSolver:
     self._factorized = False
     self._workspace["diagonal_add"] = torch.zeros(
         (batch_size, maxnv), dtype=torch.float32, device=self._device)
+    self._workspace["retained_diagonal_add"] = torch.zeros(
+        (batch_size, maxnv), dtype=torch.float32, device=self._device)
     self._workspace["factor_dof_mask"] = torch.zeros(
         (batch_size, maxnv), dtype=torch.int32, device=self._device)
+    self._workspace["retained_matrix_low"] = torch.zeros(
+        (batch_size, max(self.nnz, 1)), dtype=torch.float32,
+        device=self._device)
     self._workspace["retained_matrix"] = torch.zeros(
         (batch_size, max(self.nnz, 1)), dtype=torch.float32,
         device=self._device)
+
+  def _validate_mass_lows(self, mass_blocks_low, tendon_armature_blocks_low):
+    """Validate borrowed matrix residuals before mutating retained solver state."""
+    torch = self._torch
+    shape = (self.batch_size, self.nnz)
+    zero = self._workspace["zero_blocks"][:self.batch_size * self.nnz].reshape(shape)
+    checked = []
+    for name, value in (("mass_blocks_low", mass_blocks_low),
+                        ("tendon_armature_blocks_low", tendon_armature_blocks_low)):
+      if value is None:
+        value = zero
+      elif (not isinstance(value, torch.Tensor) or tuple(value.shape) != shape
+            or value.dtype != torch.float32 or value.device.type != "mps"
+            or not value.is_contiguous()):
+        raise ValueError(f"{name} must be contiguous float32 MPS [batch,nnz]")
+      checked.append(value)
+    return tuple(checked)
 
   def _validate_rhs_low(self, rhs_low):
     """Accept either the legacy last-row residual or every canonical row.
@@ -599,12 +623,15 @@ class MetalComponentMassSolver:
 
   def run_device(self, mass_blocks, rhs, *, dof_ids=None, counts=None,
                  tendon_armature_blocks=None, diagonal_add=None,
-                 allow_indefinite=False, rhs_low=None, world_mask=None):
+                 allow_indefinite=False, rhs_low=None, world_mask=None,
+                 mass_blocks_low=None, tendon_armature_blocks_low=None):
     """Return borrowed ``(solution, per-component status)`` MPS tensors.
 
     ``rhs_low`` is optional. Its legacy ``[batch,nv]`` layout applies to the
     final RHS row only; ``[batch,rhs_capacity,nv]`` retains a residual for
-    every row. The solution pair represents the sum of both input planes.
+    every row. Optional matrix/armature low words enter the original operator
+    used for residual refinement; the factor remains a rounded preconditioner.
+    The solution pair represents the sum of both input planes.
     """
     torch = self._torch
     if (not isinstance(mass_blocks, torch.Tensor)
@@ -638,6 +665,8 @@ class MetalComponentMassSolver:
           or tendon_armature_blocks.device.type != "mps"
           or not tendon_armature_blocks.is_contiguous()):
       raise ValueError("tendon_armature_blocks must be contiguous float32 MPS [batch,nnz]")
+    mass_blocks_low, tendon_armature_blocks_low = self._validate_mass_lows(
+        mass_blocks_low, tendon_armature_blocks_low)
     diagonal_add = self._validate_diagonal_add(diagonal_add)
     rhs_low, full_rhs_low = self._validate_rhs_low(rhs_low)
     if not isinstance(allow_indefinite, (bool, np.bool_)):
@@ -677,6 +706,7 @@ class MetalComponentMassSolver:
           output_low.reshape(-1),
           rhs_low.reshape(-1),
           world_mask.reshape(-1),
+          mass_blocks_low.reshape(-1), tendon_armature_blocks_low.reshape(-1),
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     return (output[:, :, :self.nv],
             status[:, :self.ncomponent])
@@ -698,13 +728,15 @@ class MetalComponentMassSolver:
 
   def factorize_device(self, mass_blocks, *, dof_ids=None, counts=None,
                        tendon_armature_blocks=None, diagonal_add=None,
-                       allow_indefinite=False):
+                       allow_indefinite=False, mass_blocks_low=None,
+                       tendon_armature_blocks_low=None):
     """Factor the active component mass blocks once for repeated RHS solves.
 
     The returned status is borrowed device memory. The retained factors are
     valid until this solver performs another factorization or fused
-    ``run_device`` call. The caller must keep the mass, armature, diagonal,
-    and active-DOF set unchanged while using ``solve_factored_device``.
+    ``run_device`` call. The original mass/armature high and low words,
+    diagonal addition and active-DOF set are retained in owned buffers; later
+    caller mutation does not change the equation used for refinement.
     """
     torch = self._torch
     if (not isinstance(mass_blocks, torch.Tensor)
@@ -734,6 +766,8 @@ class MetalComponentMassSolver:
           or not tendon_armature_blocks.is_contiguous()):
       raise ValueError(
           "tendon_armature_blocks must be contiguous float32 MPS [batch,nnz]")
+    mass_blocks_low, tendon_armature_blocks_low = self._validate_mass_lows(
+        mass_blocks_low, tendon_armature_blocks_low)
     diagonal_add = self._validate_diagonal_add(diagonal_add)
     if not isinstance(allow_indefinite, (bool, np.bool_)):
       raise ValueError("allow_indefinite must be a boolean")
@@ -750,12 +784,19 @@ class MetalComponentMassSolver:
           workspace["all_world_mask"],
           threads=(self.batch_size,), group_size=(1,))
     workspace["factor_dof_mask"].copy_(workspace["dof_mask"])
+    workspace["retained_diagonal_add"][:, :self.nv].copy_(
+        diagonal_add[:, :self.nv])
     if self.nnz:
-      workspace["retained_matrix"][:, :self.nnz].copy_(
-          mass_blocks + tendon_armature_blocks)
+      self._library.retain_component_matrix(
+          mass_blocks.reshape(-1), tendon_armature_blocks.reshape(-1),
+          mass_blocks_low.reshape(-1), tendon_armature_blocks_low.reshape(-1),
+          workspace["retained_matrix"].reshape(-1),
+          workspace["retained_matrix_low"].reshape(-1), self._dims,
+          threads=(self.batch_size * self.nnz,), group_size=(64,))
     if self.ncomponent:
       self._library.factor_apply_components(
-          mass_blocks.reshape(-1), tendon_armature_blocks.reshape(-1),
+          workspace["retained_matrix"].reshape(-1),
+          workspace["zero_blocks"].reshape(-1),
           workspace["output"].reshape(-1),
           workspace["factor_dof_mask"].reshape(-1), self._component_layout,
           workspace["factor"], workspace["output"].reshape(-1),
@@ -765,6 +806,8 @@ class MetalComponentMassSolver:
           workspace["output_low"].reshape(-1),
           workspace["zero_rhs_low"].reshape(-1),
           workspace["all_world_mask"],
+          workspace["retained_matrix_low"].reshape(-1),
+          workspace["zero_blocks"].reshape(-1),
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     self._factorized = True
     return workspace["factor_status"][:, :self.ncomponent]
@@ -794,12 +837,14 @@ class MetalComponentMassSolver:
           self._workspace["zero_blocks"].reshape(-1), rhs.reshape(-1),
           workspace["factor_dof_mask"].reshape(-1), self._component_layout,
           workspace["factor"], output.reshape(-1), status.reshape(-1),
-          self._dims, self._workspace["diagonal_add"].reshape(-1),
+          self._dims, self._workspace["retained_diagonal_add"].reshape(-1),
           self._allow_indefinite, self._phase,
           workspace["factor_status"].reshape(-1),
           output_low.reshape(-1),
           rhs_low.reshape(-1),
           workspace["all_world_mask"],
+          self._workspace["retained_matrix_low"].reshape(-1),
+          self._workspace["zero_blocks"].reshape(-1),
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     return output[:, :, :self.nv], status[:, :self.ncomponent]
 
@@ -838,12 +883,14 @@ class MetalComponentMassSolver:
           self._workspace["factor_dof_mask"].reshape(-1),
           self._component_layout, self._workspace["factor"],
           output.reshape(-1), status.reshape(-1), self._single_dims,
-          self._workspace["diagonal_add"].reshape(-1),
+          self._workspace["retained_diagonal_add"].reshape(-1),
           self._allow_indefinite, self._phase,
           self._workspace["factor_status"].reshape(-1),
           output_low.reshape(-1),
           rhs_low.reshape(-1),
           self._workspace["all_world_mask"],
+          self._workspace["retained_matrix_low"].reshape(-1),
+          self._workspace["zero_blocks"].reshape(-1),
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     return output[:, :self.nv], status[:, :self.ncomponent]
 
@@ -958,7 +1005,8 @@ class MetalComponentMassSolver:
 
   def run_mass_matvec_device(self, mass_blocks, vector, *, dof_ids=None,
                              counts=None, tendon_armature_blocks=None,
-                             diagonal_add=None):
+                             diagonal_add=None, mass_blocks_low=None,
+                             tendon_armature_blocks_low=None):
     """Apply the exact compiled sparse mass operator to one vector per world.
 
     This operator is a reusable primitive for future acceleration-space CG/
@@ -998,6 +1046,8 @@ class MetalComponentMassSolver:
           or not tendon_armature_blocks.is_contiguous()):
       raise ValueError(
           "tendon_armature_blocks must be contiguous float32 MPS [batch,nnz]")
+    mass_blocks_low, tendon_armature_blocks_low = self._validate_mass_lows(
+        mass_blocks_low, tendon_armature_blocks_low)
     diagonal_add = self._validate_diagonal_add(diagonal_add)
     output = self._workspace["matvec_output"]
     output.zero_()
@@ -1014,13 +1064,15 @@ class MetalComponentMassSolver:
           self._component_layout, output.reshape(-1), self._dims,
           diagonal_add.reshape(-1),
           self._workspace["all_world_mask"],
+          mass_blocks_low.reshape(-1), tendon_armature_blocks_low.reshape(-1),
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     return output[:, :self.nv]
 
   def run_mass_matvec_pair_device(self, mass_blocks, vector_hi, vector_low, *,
                                   dof_ids=None, counts=None,
                                   tendon_armature_blocks=None,
-                                  diagonal_add=None, world_mask=None):
+                                  diagonal_add=None, world_mask=None,
+                                  mass_blocks_low=None, tendon_armature_blocks_low=None):
     """Apply the compiled mass map to a two-word vector without collapsing.
 
     The returned buffers are the component solver's single-RHS pair scratch;
@@ -1067,6 +1119,8 @@ class MetalComponentMassSolver:
           or world_mask.dtype != torch.int32 or world_mask.device.type != "mps"
           or not world_mask.is_contiguous()):
       raise ValueError("world_mask must be contiguous MPS int32 [batch]")
+    mass_blocks_low, tendon_armature_blocks_low = self._validate_mass_lows(
+        mass_blocks_low, tendon_armature_blocks_low)
     diagonal_add = self._validate_diagonal_add(diagonal_add)
     if self.nv:
       self._library.build_dof_awake_mask(
@@ -1083,5 +1137,6 @@ class MetalComponentMassSolver:
           self._workspace["dof_mask"].reshape(-1),
           self._component_layout, high.reshape(-1), low.reshape(-1),
           self._dims, diagonal_add.reshape(-1), world_mask,
+          mass_blocks_low.reshape(-1), tendon_armature_blocks_low.reshape(-1),
           threads=(self.batch_size * self.ncomponent,), group_size=(1,))
     return high[:, :self.nv], low[:, :self.nv]

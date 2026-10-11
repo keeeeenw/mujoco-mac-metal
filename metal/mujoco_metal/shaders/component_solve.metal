@@ -99,6 +99,28 @@ inline ComponentFloatPair component_pair_scale(ComponentFloatPair a,
   return component_pair_add(high,low);
 }
 
+// Preserve all matrix operands independently of rounded factor storage.
+inline ComponentFloatPair component_matrix_pair(
+    device const float* mass, device const float* armature,
+    device const float* mass_low, device const float* armature_low, int idx) {
+  return component_pair_add({mass[idx],mass_low[idx]},
+                            {armature[idx],armature_low[idx]});
+}
+
+kernel void retain_component_matrix(
+    device const float* mass [[buffer(0)]],
+    device const float* armature [[buffer(1)]],
+    device const float* mass_low [[buffer(2)]],
+    device const float* armature_low [[buffer(3)]],
+    device float* retained [[buffer(4)]],
+    device float* retained_low [[buffer(5)]],
+    constant int* dims [[buffer(6)]], uint tid [[thread_position_in_grid]]) {
+  if (int(tid) >= dims[2]*dims[3]) return;
+  ComponentFloatPair value=component_matrix_pair(mass,armature,mass_low,armature_low,int(tid));
+  retained[tid]=value.hi;
+  retained_low[tid]=value.lo;
+}
+
 inline void clear_component_outputs(
     device float* output, device float* output_low, int output_base,
     int nv, int rhs_capacity,
@@ -129,6 +151,8 @@ kernel void factor_apply_components(
     device float* output_low [[buffer(13)]],
     device const float* rhs_low [[buffer(14)]],
     device const int* world_mask [[buffer(15)]],
+    device const float* mass_blocks_low [[buffer(16)]],
+    device const float* tendon_armature_blocks_low [[buffer(17)]],
     uint tid [[thread_position_in_grid]]) {
   int nv=dims[0], ncomponent=dims[1], batch=dims[2];
   int nnz=dims[3], rhs_capacity=dims[4], nrhs=rhs_capacity;
@@ -188,13 +212,17 @@ kernel void factor_apply_components(
       if (active_i && active_j) {
         float mass=mass_blocks[idx];
         float armature=tendon_armature_blocks[idx];
-        if (!component_finite(mass) || !component_finite(armature)) {
+        if (!component_finite(mass) || !component_finite(armature)
+            || !component_finite(mass_blocks_low[idx])
+            || !component_finite(tendon_armature_blocks_low[idx])) {
           status[world*ncomponent+component]=1;
           clear_component_outputs(output,output_low,output_base,nv,rhs_capacity,
                                  component_layout,dof_base,begin,end);
           return;
         }
-        value=mass+armature;
+        ComponentFloatPair coefficient=component_matrix_pair(mass_blocks,
+            tendon_armature_blocks,mass_blocks_low,tendon_armature_blocks_low,idx);
+        value=coefficient.hi+coefficient.lo;
         if (!component_finite(value)) {
           status[world*ncomponent+component]=1;
           clear_component_outputs(output,output_low,output_base,nv,rhs_capacity,
@@ -490,10 +518,10 @@ kernel void factor_apply_components(
         if (dof_mask[dof_mask_base+dof_j] == 0) continue;
         int ij=mass_base+i*width+j;
         int ji=mass_base+j*width+i;
-        ComponentFloatPair a={mass_blocks[ij],0.0f};
-        a=component_pair_add(a,{tendon_armature_blocks[ij],0.0f});
-        a=component_pair_add(a,{mass_blocks[ji],0.0f});
-        a=component_pair_add(a,{tendon_armature_blocks[ji],0.0f});
+        ComponentFloatPair a=component_matrix_pair(mass_blocks,
+            tendon_armature_blocks,mass_blocks_low,tendon_armature_blocks_low,ij);
+        a=component_pair_add(a,component_matrix_pair(mass_blocks,
+            tendon_armature_blocks,mass_blocks_low,tendon_armature_blocks_low,ji));
         a=component_pair_scale(a,0.5f);
         if (i == j)
           a=component_pair_add(a,
@@ -618,6 +646,8 @@ kernel void apply_component_mass(
     constant int* dims [[buffer(6)]],
     device const float* diagonal_add [[buffer(7)]],
     device const int* world_mask [[buffer(8)]],
+    device const float* mass_blocks_low [[buffer(9)]],
+    device const float* tendon_armature_blocks_low [[buffer(10)]],
     uint tid [[thread_position_in_grid]]) {
   int nv=dims[0], ncomponent=dims[1], batch=dims[2], nnz=dims[3];
   if (int(tid) >= batch*ncomponent) return;
@@ -641,16 +671,18 @@ kernel void apply_component_mass(
       output[output_base+dof_i]=0.0f;
       continue;
     }
-    float sum=0.0f;
+    ComponentFloatPair sum={0.0f,0.0f};
     for (int j=0; j<width; ++j) {
       int dof_j=component_layout[dof_base+begin+j];
       if (dof_mask[mask_base+dof_j] == 0) continue;
       int idx=mass_base+i*width+j;
-      sum+=(mass_blocks[idx]+tendon_armature_blocks[idx])
-          * vector[vector_base+dof_j];
+      ComponentFloatPair coefficient=component_matrix_pair(mass_blocks,
+          tendon_armature_blocks,mass_blocks_low,tendon_armature_blocks_low,idx);
+      sum=component_pair_add(sum,component_pair_scale(coefficient,vector[vector_base+dof_j]));
     }
-    sum+=diagonal_add[world*dof_stride+dof_i]*vector[vector_base+dof_i];
-    output[output_base+dof_i]=sum;
+    sum=component_pair_add(sum,component_pair_product(
+        diagonal_add[world*dof_stride+dof_i],vector[vector_base+dof_i]));
+    output[output_base+dof_i]=sum.hi+sum.lo;
   }
 }
 
@@ -696,6 +728,8 @@ kernel void apply_component_mass_pair(
     constant int* dims [[buffer(8)]],
     device const float* diagonal_add [[buffer(9)]],
     device const int* world_mask [[buffer(10)]],
+    device const float* mass_blocks_low [[buffer(11)]],
+    device const float* tendon_armature_blocks_low [[buffer(12)]],
     uint tid [[thread_position_in_grid]]) {
   int nv=dims[0], ncomponent=dims[1], batch=dims[2], nnz=dims[3];
   if (int(tid) >= batch*ncomponent) return;
@@ -722,9 +756,8 @@ kernel void apply_component_mass_pair(
       int dof_j=component_layout[dof_base+begin+j];
       if (dof_mask[base+dof_j] == 0) continue;
       int idx=mass_base+i*width+j;
-      ComponentFloatPair coefficient=component_pair_add(
-          {mass_blocks[idx],0.0f},
-          {tendon_armature_blocks[idx],0.0f});
+      ComponentFloatPair coefficient=component_matrix_pair(mass_blocks,
+          tendon_armature_blocks,mass_blocks_low,tendon_armature_blocks_low,idx);
       ComponentFloatPair term=component_pair_scale(
           coefficient,vector_hi[base+dof_j]);
       sum=component_pair_add(sum,term);
