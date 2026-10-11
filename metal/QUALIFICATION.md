@@ -34,6 +34,30 @@ disable, pulley/armature, retained-precision and lifecycle boundary combinations
 the full native suite, clean-wheel execution and final demos remain open.
 Milestones 005–020 remain unaccepted.
 
+The later prepared-record owner binding correction at `4552436df`, with tests
+through `aafda0e3f`, passes a separate **192-case** energy/stage/state-copy gate
+in **96.13 seconds**: **152 native checks and 40 host checks**, no failures or
+skips. State-bound tensors cannot be replaced while an old record is reused;
+explicitly prepared external inputs remain valid. Real tensor protocol controls
+cover position, velocity and both mocap fields. The complete host selection
+passes **2,988 tests, 99 skipped, 2,565 deselected in 111.77 seconds**.
+
+Additional native energy cases at this runtime pass the complete direct-energy
+file: **108 passed in 19.82 seconds**, without failures or skips. They cover
+gravity/spring disables, nonlinear scalar and fixed-tendon springs, fixed and
+spatial pulley armature, true sleeping trees/static gravity, failed/stale peers,
+lazy selected checkpoint restoration under inference mode, all five integrators
+with zero-DOF energy sensors, and rejection of MPS inputs lacking mutation
+counters. Sleeping fixed/spatial/static tendon springs have a separate nonzero
+CPU counterfactual (`0.51` potential energy); the unchanged native bounds are
+`rtol=2e-5`, `atol=2e-6`. Sleep cases use the admitted scalable Euler and RK4
+profiles; historical small dense Euler rejects sleep by design.
+
+These later scoped gates do not establish complete computed-stage metadata,
+all retained-precision/lifecycle compositions, a full native suite or milestone
+completion. The earlier 192-case eight-file selection and this later 192-case
+four-file selection are distinct evidence and must not be counted twice.
+
 ## Rigid convex oracle input precision
 
 The complete public rigid-convex regression file passes **20 checks in 49.24
