@@ -186,6 +186,8 @@ def _capture_query_storage(value, memo):
     return memo[id(value)]
   if isinstance(value, torch.Tensor):
     node = ("tensor", value, value.detach().clone())
+  elif isinstance(value, np.ndarray) and value.flags.writeable:
+    node = ("array", value, value.copy())
   elif isinstance(value, dict):
     children = {}
     node = ("dict", value, children)
@@ -206,6 +208,8 @@ def _restore_query_storage(node):
   kind, original, saved = node
   if kind == "tensor":
     original.copy_(saved)
+  elif kind == "array":
+    np.copyto(original, saved)
   elif kind == "dict":
     original.clear()
     original.update({name: _restore_query_storage(value) for name, value in saved.items()})

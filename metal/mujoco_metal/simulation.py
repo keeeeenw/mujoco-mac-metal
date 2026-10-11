@@ -1842,6 +1842,8 @@ class MetalSimulation:
       w[dst_i, nr * nr + 3 * nr:nr * nr + 4 * nr] = w[src_i, nr * nr + 3 * nr:nr * nr + 4 * nr].clone()
     if getattr(self, "_sensordata", None) is not None:
       self._sensordata[dst_i] = self._sensordata[src_i].clone()
+    from mujoco_metal.sensor_lifecycle import copy_sensor_diagnostic_row
+    copy_sensor_diagnostic_row(self, src_i, dst_i)
     energy = getattr(self, "_energy", None)
     if energy is not None:
       energy[dst_i] = energy[src_i].clone()
@@ -1938,6 +1940,8 @@ class MetalSimulation:
     snap["held"] = held
     snap["sensordata"] = (self._sensordata.detach().cpu().numpy().copy()
                           if getattr(self, "_sensordata", None) is not None else None)
+    from mujoco_metal.sensor_lifecycle import snapshot_sensor_diagnostics
+    snap.update(snapshot_sensor_diagnostics(self))
     energy = getattr(self, "_energy", None)
     energy_visible = (int(self._mjmodel.opt.enableflags)
                       & int(mujoco.mjtEnableBit.mjENBL_ENERGY)) or getattr(self, "_energy_manual", False)
@@ -2011,6 +2015,8 @@ class MetalSimulation:
             or int(snapshot.get("nv", -1)) != int(self._mjmodel.nv)
             or int(snapshot.get("nbody", -1)) != int(self._mjmodel.nbody)):
       raise ValueError("snapshot model dimensions do not match")
+    from mujoco_metal.sensor_lifecycle import validate_sensor_diagnostics, stage_sensor_diagnostics
+    diagnostic_checked = validate_sensor_diagnostics(self, snapshot)
     # Stored energy is an evaluated-stage output, not a value to recompute
     # during restore. Validate it before any extension callback or state write.
     energy = getattr(self, "_energy", None)
@@ -2057,14 +2063,6 @@ class MetalSimulation:
     plugin_map = {_plugin_state_key(p): p for p in getattr(self, "_native_plugins", ())}
     if not isinstance(plugins, dict) or set(plugins) != set(plugin_map):
       raise ValueError("snapshot plugin roles/names do not match this simulation")
-    for key, plugin in plugin_map.items():
-      validator = getattr(plugin, "validate_snapshot", None)
-      if callable(validator):
-        validator(plugins[key], env_ids=ids)
-    # Some third-party restore implementations validate while writing. Probe
-    # their payloads and restore their prior state before committing any
-    # simulation-owned tensor, so a late rejecting plugin is transactional.
-    _preflight_plugin_restores(plugin_map, plugins, env_ids=ids)
     held = snapshot.get("held", {})
     held_checked = {}
     for name, tensor in (("control", self._control),
@@ -2158,125 +2156,138 @@ class MetalSimulation:
         if energy_checked is not None else None)
     restored_flags = self._state._torch.as_tensor(
         flags_checked, dtype=self._state._torch.int32, device=self._state._device)
-    # Apply actual callbacks before the native commit: implementations may
-    # reject only on a later call after the preflight probe succeeded.
-    _apply_plugin_restores(plugin_map, plugins, env_ids=ids)
-    # Commit boundary: DeviceState validates its fields atomically before mutating.
-    self._state.restore(snapshot["device"], env_ids=ids)
-    torch = self._state._torch
-    if energy_fields is not None:
-      vars(self).update(energy_fields)
-    self._energy_manual = (manual_energy if ids is None else
-                           getattr(self, "_energy_manual", False) or manual_energy)
-    if energy_checked is not None:
-      if ids is None:
-        energy.copy_(restored_energy)
-      else:
-        energy[ids] = restored_energy[ids]
-    computed = getattr(self, "_energy_computed", None)
-    if computed is not None:
-      if ids is None:
-        computed.copy_(restored_flags)
-      else:
-        computed[ids.tolist()] = restored_flags[ids.tolist()]
-    for name, attr in (("history", "_history"),
-                       ("qacc_warmstart", "_qacc_warmstart"),
-                       ("userdata", "_userdata"),
-                       ("plugin_state", "_plugin_state")):
-      tensor = getattr(self._state, attr)
-      val = torch.as_tensor(native_checked[name], dtype=torch.float32,
-                            device=self._state._device)
-      if ids is None:
-        tensor.copy_(val)
-      else:
-        tensor[ids] = val[ids]
-    if nr > 0 and warm32 is not None:
-      if ids is None:
-        cc.set_warmstart(warm32)
-      else:
-        cc.set_warmstart(warm32[ids], env_ids=ids)
-    for name, tensor in (("control", self._control),
-                         ("wrench", self._body_wrench),
-                         ("force", self._applied_force)):
-      if tensor is not None:
-        val_t = torch.as_tensor(held_checked[name], dtype=torch.float32, device=self._state._device)
+    restored_diagnostics = stage_sensor_diagnostics(self, diagnostic_checked, ids)
+    from mujoco_metal.sensor_lifecycle import lifecycle_transaction
+    with lifecycle_transaction(self):
+      # Validate/admit every simulation-owned field before extension callbacks.
+      # Some adapters validate while writing; their probe still restores their
+      # old state before any physical publication.
+      for key, plugin in plugin_map.items():
+        validator = getattr(plugin, "validate_snapshot", None)
+        if callable(validator):
+          validator(plugins[key], env_ids=ids)
+      _preflight_plugin_restores(plugin_map, plugins, env_ids=ids)
+      # Apply actual callbacks before the native commit: implementations may
+      # reject only on a later call after the preflight probe succeeded.
+      _apply_plugin_restores(plugin_map, plugins, env_ids=ids)
+      # Commit boundary: DeviceState validates its fields atomically before mutating.
+      self._state.restore(snapshot["device"], env_ids=ids)
+      torch = self._state._torch
+      if energy_fields is not None:
+        vars(self).update(energy_fields)
+      self._energy_manual = (manual_energy if ids is None else
+                             getattr(self, "_energy_manual", False) or manual_energy)
+      if energy_checked is not None:
         if ids is None:
-          tensor.copy_(val_t)
+          energy.copy_(restored_energy)
         else:
-          tensor[ids] = val_t[ids]
-    if sens_checked is not None:
-      if self._sensordata is None:
-        self._sensordata = torch.zeros(
-            (self.batch_size, int(self._mjmodel.nsensordata)),
-            dtype=torch.float32, device=self._state._device)
-      val_s = torch.as_tensor(sens_checked, dtype=torch.float32, device=self._state._device)
-      if ids is None:
-        self._sensordata.copy_(val_s)
+          energy[ids] = restored_energy[ids]
+      computed = getattr(self, "_energy_computed", None)
+      if computed is not None:
+        if ids is None:
+          computed.copy_(restored_flags)
+        else:
+          computed[ids.tolist()] = restored_flags[ids.tolist()]
+      for name, attr in (("history", "_history"),
+                         ("qacc_warmstart", "_qacc_warmstart"),
+                         ("userdata", "_userdata"),
+                         ("plugin_state", "_plugin_state")):
+        tensor = getattr(self._state, attr)
+        val = torch.as_tensor(native_checked[name], dtype=torch.float32,
+                              device=self._state._device)
+        if ids is None:
+          tensor.copy_(val)
+        else:
+          tensor[ids] = val[ids]
+      if nr > 0 and warm32 is not None:
+        if ids is None:
+          cc.set_warmstart(warm32)
+        else:
+          cc.set_warmstart(warm32[ids], env_ids=ids)
+      for name, tensor in (("control", self._control),
+                           ("wrench", self._body_wrench),
+                           ("force", self._applied_force)):
+        if tensor is not None:
+          val_t = torch.as_tensor(held_checked[name], dtype=torch.float32, device=self._state._device)
+          if ids is None:
+            tensor.copy_(val_t)
+          else:
+            tensor[ids] = val_t[ids]
+      if sens_checked is not None:
+        if self._sensordata is None:
+          self._sensordata = torch.zeros(
+              (self.batch_size, int(self._mjmodel.nsensordata)),
+              dtype=torch.float32, device=self._state._device)
+        val_s = torch.as_tensor(sens_checked, dtype=torch.float32, device=self._state._device)
+        if ids is None:
+          self._sensordata.copy_(val_s)
+        else:
+          self._sensordata[ids] = val_s[ids]
       else:
-        self._sensordata[ids] = val_s[ids]
-    else:
-      if ids is None:
-        self._sensordata = None
-      elif self._sensordata is not None:
-        self._sensordata[ids] = 0.0
-    self._restore_sensor_output_low(
-        getattr(self, "_sensors", None), sens_low_checked, ids)
-    raw_program = getattr(self, "_raw_sensor_program", None)
-    if raw_program is not getattr(self, "_sensors", None):
+        if ids is None:
+          self._sensordata = None
+        elif self._sensordata is not None:
+          self._sensordata[ids] = 0.0
+      from mujoco_metal.sensor_lifecycle import publish_sensor_diagnostics
+      publish_sensor_diagnostics(self, restored_diagnostics)
       self._restore_sensor_output_low(
-          raw_program, raw_sens_low_checked, ids)
-    if delay_checked is not None:
-      if ids is None:
-        self._delay.restore(delay_checked)
-      else:
-        cur = self._delay.snapshot()
-        nmax = self._delay.nmax
-        nu = self._delay.nu
-        for row in np.asarray(ids).tolist():
-          cur["cursor"].reshape(self.batch_size, nu)[row] = \
-              delay_checked["cursor"].reshape(self.batch_size, nu)[row].copy()
-          cur["times"].reshape(self.batch_size, nu, nmax)[row] = \
-              delay_checked["times"].reshape(self.batch_size, nu, nmax)[row].copy()
-          cur["values"].reshape(self.batch_size, nu, nmax)[row] = \
-              delay_checked["values"].reshape(self.batch_size, nu, nmax)[row].copy()
-        self._delay.restore(cur)
-      self._sync_delay_from_history(env_ids=ids)
-    if getattr(self, "_islands", None) is not None and "islands" in snapshot and snapshot["islands"] is not None:
-      if ids is None:
-        self._islands.tree_asleep[:] = snapshot["islands"]["tree_asleep"]
-        self._islands._stationary_steps[:] = snapshot["islands"]["_stationary_steps"]
-      else:
-        for row in np.asarray(ids).tolist():
-          self._islands.tree_asleep[row] = snapshot["islands"]["tree_asleep"][row]
-          self._islands._stationary_steps[row] = snapshot["islands"]["_stationary_steps"][row]
-    if getattr(self, "_sleep_schedule", None) is not None:
-      sleep_snapshot = snapshot.get("sleep_schedule")
-      if sleep_snapshot is None:
-        self._sleep_schedule.wake_all(env_ids=ids)
-      else:
-        self._sleep_schedule.restore(sleep_snapshot, env_ids=ids)
-      # Restored sleep cycles can contain asleep trees while the FK workspace
-      # cache belongs to a different trajectory. Rebuild every selected pose
-      # before the next masked prepass, then retain the restored sleep state.
-      refresh = self._sleep_fk_refresh
-      refresh.fill_(1)
-      self._smooth._fk.run_device(
-          self._state._qpos, getattr(self._state, "_mpos", None),
-          getattr(self._state, "_mquat", None), tree_awake=refresh)
-    if getattr(self, "_flex", None) is not None:
-      if "flex" in snapshot and snapshot["flex"] is not None:
-        self._flex.set_state(snapshot["flex"], env_ids=env_ids)
-      else:
-        dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
-        self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
-    if hasattr(self, "_last_coupled"):
-      self._last_coupled = None
-    if hasattr(self, "_last_coupled_generation"):
-      self._last_coupled_generation = None
-    self._assembled_system_valid = False
-    self._accepted_step = None
-    self._step1_record = None
-    return self._state.generation
+          getattr(self, "_sensors", None), sens_low_checked, ids)
+      raw_program = getattr(self, "_raw_sensor_program", None)
+      if raw_program is not getattr(self, "_sensors", None):
+        self._restore_sensor_output_low(
+            raw_program, raw_sens_low_checked, ids)
+      if delay_checked is not None:
+        if ids is None:
+          self._delay.restore(delay_checked)
+        else:
+          cur = self._delay.snapshot()
+          nmax = self._delay.nmax
+          nu = self._delay.nu
+          for row in np.asarray(ids).tolist():
+            cur["cursor"].reshape(self.batch_size, nu)[row] = \
+                delay_checked["cursor"].reshape(self.batch_size, nu)[row].copy()
+            cur["times"].reshape(self.batch_size, nu, nmax)[row] = \
+                delay_checked["times"].reshape(self.batch_size, nu, nmax)[row].copy()
+            cur["values"].reshape(self.batch_size, nu, nmax)[row] = \
+                delay_checked["values"].reshape(self.batch_size, nu, nmax)[row].copy()
+          self._delay.restore(cur)
+        self._sync_delay_from_history(env_ids=ids)
+      if getattr(self, "_islands", None) is not None and "islands" in snapshot and snapshot["islands"] is not None:
+        if ids is None:
+          self._islands.tree_asleep[:] = snapshot["islands"]["tree_asleep"]
+          self._islands._stationary_steps[:] = snapshot["islands"]["_stationary_steps"]
+        else:
+          for row in np.asarray(ids).tolist():
+            self._islands.tree_asleep[row] = snapshot["islands"]["tree_asleep"][row]
+            self._islands._stationary_steps[row] = snapshot["islands"]["_stationary_steps"][row]
+      if getattr(self, "_sleep_schedule", None) is not None:
+        sleep_snapshot = snapshot.get("sleep_schedule")
+        if sleep_snapshot is None:
+          self._sleep_schedule.wake_all(env_ids=ids)
+        else:
+          self._sleep_schedule.restore(sleep_snapshot, env_ids=ids)
+        # Restored sleep cycles can contain asleep trees while the FK workspace
+        # cache belongs to a different trajectory. Rebuild every selected pose
+        # before the next masked prepass, then retain the restored sleep state.
+        refresh = self._sleep_fk_refresh
+        refresh.fill_(1)
+        self._smooth._fk.run_device(
+            self._state._qpos, getattr(self._state, "_mpos", None),
+            getattr(self._state, "_mquat", None), tree_awake=refresh)
+      if getattr(self, "_flex", None) is not None:
+        if "flex" in snapshot and snapshot["flex"] is not None:
+          self._flex.set_state(snapshot["flex"], env_ids=env_ids)
+        else:
+          dyn = self._smooth.run_device(self._state.qpos, self._state.qvel)
+          self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
+      if hasattr(self, "_last_coupled"):
+        self._last_coupled = None
+      if hasattr(self, "_last_coupled_generation"):
+        self._last_coupled_generation = None
+      self._assembled_system_valid = False
+      self._accepted_step = None
+      self._step1_record = None
+      return self._state.generation
 
   def reset(self, env_ids=None, qpos=None, qvel=None, eq_active=None,
             mocap_pos=None, mocap_quat=None, act=None):
@@ -2327,6 +2338,8 @@ class MetalSimulation:
           self._sensordata[ids.tolist()] = 0.0
     self._clear_sensor_output_low(
         None if env_ids is None else self._state._env_ids(env_ids))
+    from mujoco_metal.sensor_lifecycle import clear_sensor_diagnostics
+    clear_sensor_diagnostics(self, env_ids)
     if getattr(self, "_islands", None) is not None:
       self._islands.wake_all(env_ids=env_ids)
     # DeviceState.reset invokes the registered `_handle_state_reset` callback,
@@ -2590,6 +2603,8 @@ class MetalSimulation:
           self._sensordata[ids.tolist()] = 0.0
     self._clear_sensor_output_low(
         None if env_ids is None else self._state._env_ids(env_ids))
+    from mujoco_metal.sensor_lifecycle import clear_sensor_diagnostics
+    clear_sensor_diagnostics(self, env_ids)
     if getattr(self, "_islands", None) is not None:
       self._islands.wake_all(env_ids=env_ids)
     if getattr(self, "_sleep_schedule", None) is not None:
