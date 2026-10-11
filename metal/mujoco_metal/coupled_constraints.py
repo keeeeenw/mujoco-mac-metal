@@ -24,6 +24,7 @@ projected solve.
 from dataclasses import dataclass, replace
 from contextlib import contextmanager, nullcontext
 import math
+import operator
 from pathlib import Path
 
 import mujoco
@@ -2866,11 +2867,24 @@ class MetalCoupledConstraints:
     the strided workspace-debug view.
     """
     torch, b = self._torch, int(self.batch_size)
-    width = int(width)
-    source_stride, destination_stride = (int(source_stride),
-                                         int(destination_stride))
-    if width <= 0:
-      return
+
+    def _dimension(name, value):
+      # Dimensions must be genuine integers: fractional floats/strings must
+      # raise rather than truncate into accidentally valid dimensions.
+      try:
+        number = operator.index(value)
+      except TypeError:
+        raise ValueError(
+            f"masked world copy dimension {name} must be an integer") from None
+      return int(number)
+
+    width = _dimension("width", width)
+    source_stride = _dimension("source_stride", source_stride)
+    destination_stride = _dimension("destination_stride", destination_stride)
+    source_offset = _dimension("source_offset", source_offset)
+    destination_offset = _dimension("destination_offset", destination_offset)
+    if width < 0:
+      raise ValueError("masked world copy dimensions must be nonnegative")
     if min(source_stride, destination_stride,
            source_offset, destination_offset) < 0:
       raise ValueError("masked world copy dimensions must be nonnegative")
@@ -2881,6 +2895,8 @@ class MetalCoupledConstraints:
         or not source.is_contiguous() or not destination.is_contiguous()):
       raise ValueError("masked world copy exceeds a per-world record")
     if width == 0:
+      # Validated empty no-op: every dimension, offset and layout check above
+      # still applies, so malformed empty calls fail instead of passing.
       return
     if world_mask is None:
       src = source.view(b, source_stride)
@@ -2917,6 +2933,12 @@ class MetalCoupledConstraints:
                          offset=0, value=0):
     """Fill an owned per-world slice without touching masked records."""
     torch, b = self._torch, int(self.batch_size)
+    try:
+      width, stride, offset = (operator.index(width), operator.index(stride),
+                               operator.index(offset))
+    except TypeError:
+      raise ValueError(
+          "masked world fill dimensions must be integers") from None
     width, stride, offset = int(width), int(stride), int(offset)
     if width < 0 or stride < 0 or offset < 0 or offset + width > stride:
       raise ValueError("masked world fill exceeds a per-world record")
@@ -4262,6 +4284,14 @@ class MetalCoupledConstraints:
       stored_extra.copy_(extra_aref)
     debug = w["workspace_debug"].reshape(b, self._debug_stride)
     row_base = nr * nr
+    # Owned capture of the actual Jacobian backing for every supported
+    # context (contact-only, scalar-only equality, implicit and explicit).
+    # Both backings share prepare-time shapes (position_cache_J is a clone
+    # of the live backing), so this full-tensor copy is valid for dense and
+    # packed/CSR layouts and for zero-size dummy backings alike; it performs
+    # no reshape. Cached solver paths copy it back verbatim, so omitting it
+    # would leave them reading zero/stale rows.
+    w["position_cache_J"].copy_(w["workspace_J"])
     if nv > 0:
       w["position_cache_qvel"].view(b, nv).copy_(
           w["position_qvel"][:b * nv].view(b, nv))

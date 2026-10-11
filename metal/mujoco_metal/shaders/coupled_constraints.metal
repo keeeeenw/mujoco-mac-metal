@@ -7851,7 +7851,16 @@ kernel void solve_coupled_constraints(
       ar[i] = cached[nr * nr + nr + i];
       lo[i] = cached[nr * nr + 4 * nr + i];
       hi[i] = cached[nr * nr + 5 * nr + i];
+      // Retained plane 6 carries producer tendon-ownership flags, never
+      // contact activity (contact producers leave it zero), so reading it
+      // as activity enables only tendon rows. Derive cached activity exactly
+      // as fresh assembly would: tendon-owned rows from the retained flag,
+      // all other rows from retained R/aref (fresh equality rule
+      // R>0||ar!=0, and contact/joint rows carry R>=1e-15 when active).
+      // Contact rows are additionally enabled per active slot below.
       enabled[i] = cached[nr * nr + 6 * nr + i] > 0.5f;
+      if (R[i] > 0.0f || ar[i] != 0.0f)
+        enabled[i] = true;
     } else {
       enabled[i] = false;
     }
@@ -8023,6 +8032,21 @@ kernel void solve_coupled_constraints(
       int row_start = base_contact + row_offset;
       int crbase = (world * ncontacts_max + s) * 60;
       if (contact_row_data[crbase] <= 0.5f) continue;
+      // Cached contact activity: enable exactly the row span fresh assembly
+      // would (single row for condim-1, cdim rows for elliptic blocks, edge
+      // rows for pyramidal blocks), driven by the retained active flag and
+      // slot maps. The debug active plane cannot serve here: contact
+      // producers never publish into it.
+      if (cone_type == 1 && cdim > 1) {
+        for (int k = 0; k < cdim; ++k)
+          if (row_start + k < nr) enabled[row_start + k] = true;
+      } else if (cdim == 1) {
+        if (row_start < nr) enabled[row_start] = true;
+      } else {
+        int block_rows = cone_type == 0 ? 2 * (cdim - 1) : cdim;
+        for (int k = 0; k < block_rows; ++k)
+          if (row_start + k < nr) enabled[row_start + k] = true;
+      }
       if (cone_type == 1 && cdim > 1) {
         if (elliptic_count < nr) {
           elliptic_start[elliptic_count] = row_start;
@@ -10162,6 +10186,12 @@ kernel void solve_coupled_constraints_block(
 
   for (int i = 0; i < nr; ++i) {
     enabled[i] = reuse_rows_stage ? (meta[i] > 0.5f) : false;
+    // Cached activity mirrors fresh assembly for every row family (tendon
+    // flags plus retained R/aref rule); contact rows are additionally
+    // enabled per active slot below. The debug active plane carries only
+    // producer tendon flags otherwise.
+    if (reuse_rows_stage && (R[i] > 0.0f || ar[i] != 0.0f))
+      enabled[i] = true;
     elliptic_member[i] = 0;
   }
 
@@ -10317,6 +10347,21 @@ kernel void solve_coupled_constraints_block(
       int row_start = base_contact + row_offset;
       int crbase = (world * ncontacts_max + s) * 60;
       if (contact_row_data[crbase] <= 0.5f) continue;
+      // Cached contact activity: enable exactly the row span fresh assembly
+      // would (single row for condim-1, cdim rows for elliptic blocks, edge
+      // rows for pyramidal blocks), driven by the retained active flag and
+      // slot maps. The debug active plane cannot serve here: contact
+      // producers never publish into it.
+      if (cone_type == 1 && cdim > 1) {
+        for (int k = 0; k < cdim; ++k)
+          if (row_start + k < nr) enabled[row_start + k] = true;
+      } else if (cdim == 1) {
+        if (row_start < nr) enabled[row_start] = true;
+      } else {
+        int block_rows = cone_type == 0 ? 2 * (cdim - 1) : cdim;
+        for (int k = 0; k < block_rows; ++k)
+          if (row_start + k < nr) enabled[row_start + k] = true;
+      }
       if (cone_type == 1 && cdim > 1) {
         if (elliptic_count < nr) {
           elliptic_start[elliptic_count] = row_start;
@@ -11627,7 +11672,15 @@ kernel void refresh_cached_constraint_aref(
   int debug_base = world * stride;
   int active_offset = nr * nr + 6 * nr + row;
   int aref_offset = nr * nr + nr + row;
-  if (workspace_debug[debug_base + active_offset] <= 0.5f) {
+  // Activity gate must match the solver's cached rule: plane 6 holds only
+  // tendon-ownership flags, never contact activity. Active contact/joint
+  // rows carry R>=1e-15; active equality rows carry R>0 or ar!=0. Gating on
+  // the flag alone zeroes every active contact reference.
+  float retained_R = workspace_debug[debug_base + nr * nr + row];
+  float retained_ar = workspace_debug[debug_base + aref_offset];
+  bool row_active = (workspace_debug[debug_base + active_offset] > 0.5f)
+      || (retained_R > 0.0f) || (retained_ar != 0.0f);
+  if (!row_active) {
     workspace_debug[debug_base + aref_offset] = 0.0f;
     return;
   }
@@ -11702,7 +11755,14 @@ kernel void refresh_cached_constraint_aref_low(
   device float* solver_scratch = workspace_debug + debug_base + nr * nr + 7 * nr;
   device float* pair_tail = solver_scratch + dims[solver_metadata + 15];
   device float* aref_low = pair_tail + 8 * max(nv, 1) + 2 * max(nr, 1);
-  if (workspace_debug[debug_base + active_offset] <= 0.5f) {
+  // Same cached-activity rule as the high-word refresh: flag or retained
+  // R / refreshed high-word ar. The high kernel runs first, so new ar is
+  // already correct for active rows here.
+  float retained_R_low = workspace_debug[debug_base + nr * nr + row];
+  float refreshed_ar = workspace_debug[debug_base + aref_offset];
+  bool row_active_low = (workspace_debug[debug_base + active_offset] > 0.5f)
+      || (retained_R_low > 0.0f) || (refreshed_ar != 0.0f);
+  if (!row_active_low) {
     aref_low[row] = 0.0f;
     return;
   }
