@@ -170,6 +170,7 @@ def _forward_args(sim, cc, qpos, qvel):
       torch.as_tensor(np.asarray(qvel, dtype=np.float32), device="mps"))
   args = dict(
       poses={k: v.detach().clone() for k, v in dyn["poses"].items()},
+      qfrc_smooth_low=(-dyn["qfrc_bias_low"]).detach().clone(),
       qpos=torch.as_tensor(np.asarray(qpos, dtype=np.float32),
                            device="mps"),
       qvel=torch.as_tensor(np.asarray(qvel, dtype=np.float32),
@@ -181,11 +182,13 @@ def _forward_args(sim, cc, qpos, qvel):
         qfrc_smooth=(-dyn["qfrc_bias"]).detach().clone(),
         component_solver=sim._component_solver,
         mass_blocks=dyn["mass_blocks"].detach().clone(),
+        mass_blocks_low=dyn["mass_blocks_low"].detach().clone(),
         awake_dof_ids=lists["dof_ids"].detach().clone(),
         awake_counts=lists["counts"].detach().clone())
   else:
     args.update(
         mass=dyn["mass_matrix"].detach().clone(),
+        mass_low=dyn["mass_matrix_low"].detach().clone(),
         qfrc_smooth=(-dyn["qfrc_bias"]).detach().clone())
   return args, dyn
 

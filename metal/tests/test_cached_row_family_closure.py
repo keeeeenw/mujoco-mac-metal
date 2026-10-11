@@ -13,6 +13,7 @@ pinned oracle, with restore/replay on the block route.
 """
 
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -27,7 +28,7 @@ def _forward_args(sim, cc, qpos, qvel):
   """Production-shaped inputs; merges root_com for multi-body poses."""
   args, dyn = _base_forward_args(sim, cc, qpos, qvel)
   if "root_com" in dyn and "root_com" not in args["poses"]:
-    args["poses"] = dict(args["poses"], root_com=dyn["root_com"])
+    args["poses"] = dict(args["poses"], root_com=dyn["root_com"].detach().clone())
   # Connect/weld assembly consumes current motion data; clone it as the
   # production `_acceleration` call does.
   for key in ("cvel", "cdof", "cdof_dot"):
@@ -251,6 +252,45 @@ def test_cached_packed_layout_solve(profile):
   qp = np.array([[0, 0, 0.05, 1, 0, 0, 0]], dtype=np.float32)
   qv = np.array([[0.1, -0.1, -0.2, 0.0, 0.0, 0.3]], dtype=np.float32)
   _check_family(sim, model, qp, qv)
+
+
+@_GPU
+@_NEEDS_GPU
+@pytest.mark.parametrize("profile", ["integrated_euler_v1",
+                                     "integrated_scalable_v1"])
+def test_cached_packed_solve_requires_complete_smooth_input_words(profile, monkeypatch):
+  """Dropped source residuals are different inputs, not cached-solver drift.
+
+  Exercise both actual routes with the original cached/fresh bound. The
+  negative control removes only the explicitly supplied residual arguments;
+  no shader, cached row, solver budget or tolerance is changed.
+  """
+  from mujoco_metal.simulation import MetalSimulation
+  model = mujoco.MjModel.from_xml_string("""<mujoco>
+    <option gravity="0 0 0" solver="Newton" jacobian="sparse"/>
+    <worldbody><geom type="plane" size="5 5 .1"/>
+      <body pos="0 0 .05"><freejoint/>
+        <geom type="sphere" size=".1" mass="1"/></body>
+    </worldbody></mujoco>""")
+  sim = MetalSimulation(model, 1, profile=profile)
+  qp = np.array([[0, 0, .05, 1, 0, 0, 0]], dtype=np.float32)
+  qv = np.array([[.1, -.1, -.2, 0, 0, .3]], dtype=np.float32)
+  cached, fresh, _ = _cached_vs_fresh(sim, model, qp, qv)
+  np.testing.assert_allclose(cached, fresh, rtol=1e-5, atol=1e-7)
+  complete = _base_forward_args
+  observed = []
+  def drop_residuals(*args, **kwargs):
+    inputs, dynamics = complete(*args, **kwargs)
+    assert "qfrc_smooth_low" in inputs
+    assert "mass_blocks_low" in inputs or "mass_low" in inputs
+    observed.append(float(np.linalg.norm(inputs["qfrc_smooth_low"].cpu().numpy())))
+    for name in ("qfrc_smooth_low", "mass_blocks_low", "mass_low"):
+      inputs.pop(name, None)
+    return inputs, dynamics
+  monkeypatch.setattr(sys.modules[__name__], "_base_forward_args", drop_residuals)
+  truncated, fresh, _ = _cached_vs_fresh(sim, model, qp, qv)
+  assert observed and max(observed) > 0
+  assert not np.allclose(truncated, fresh, rtol=1e-5, atol=1e-7)
 
 
 @_GPU

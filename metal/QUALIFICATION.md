@@ -1,5 +1,25 @@
 # Development qualification — 2026-10-11
 
+## Cached solver input completeness
+
+The two complete cached Jacobian-capture and row-family native files pass
+**59 tests in 50.12 seconds**, with fallback disabled and their original
+cached/fresh and CPU-oracle bounds retained. Their input helper now preserves
+the force and mass residual words that production passes to the solver, plus
+an owned root-COM copy. Contact dimensions, both friction cones, equality and
+limit rows, dense/component and packed layouts, disturbed workspaces and the
+large-row route remain covered.
+
+A new negative control deliberately drops the residual arguments and detects
+the resulting acceleration difference on both profiles. The preceding complete
+native discovery stopped after **243 passes and one failure in 1,100.48 seconds**
+on this incomplete-input fixture. Including both produced words reproduces the
+fresh rotational acceleration exactly in the isolated diagnostic; no solver or
+physics code, tolerance or iteration budget was changed. This is a corrected
+regression gate, not a full-suite pass. The last complete CPU gate passed
+**2,907 tests, 99 skipped and 2,406 deselected in 101.03 seconds** at `58989de9e`.
+Skipped GPU tests are not qualification evidence.
+
 ## Observational assembly, DC admission and contact-bound APIs
 
 Revisions `a4ca52ab1`, `42eaa5be1` and `12cc24ffd` add owned observational
