@@ -2018,9 +2018,41 @@ class SensorProgram:
         raise ValueError("poses['geom_quat'] must be contiguous float32 MPS")
 
   def run_contact_device(self, poses, contact, out=None, *, world_mask=None):
-    """Evaluate CONTACT sensors into ``out`` (borrowed, merged)."""
-    self._ensure_spatial_constants()
+    """Evaluate CONTACT sensors from contiguous canonical contact records.
+
+    Record layout follows contact_precision.RECORD_WORDS; old packed layouts
+    are rejected before any output write or spatial scratch allocation.
+    """
     torch, d, b = self._torch, self.descriptor, self.batch_size
+    if contact is not None:
+      from mujoco_metal.contact_precision import RECORD_WORDS
+      if not isinstance(contact, dict):
+        raise ValueError("contact must be a mapping of canonical device views")
+      frame = contact.get("frame")
+      if (not isinstance(frame, torch.Tensor) or frame.ndim != 3
+          or frame.shape[0] != b or frame.shape[2] != 12):
+        raise ValueError("contact frame must have shape [batch,slots,12]")
+      nc = int(frame.shape[1])
+      for name, shape in (("frame", (b, nc, 12)),
+                          ("force", (b, nc, 11)),
+                          ("records", (b, nc, RECORD_WORDS))):
+        value = contact.get(name)
+        if (not isinstance(value, torch.Tensor) or value.device.type != "mps"
+            or value.dtype != torch.float32 or tuple(value.shape) != shape
+            or not value.is_contiguous()):
+          raise ValueError(f"contact {name} must be contiguous float32 MPS {shape}")
+      live = contact.get("pair_live")
+      if not isinstance(live, torch.Tensor) or live.ndim != 1:
+        raise ValueError("contact pair_live must be a device vector")
+      npairs = int(live.numel())
+      for name, count, dtype in (("packed", nc*3, torch.int32),
+          ("mu", nc*5, torch.float32), ("slot_pair", nc, torch.int32),
+          ("pair_live", npairs, torch.int32), ("pair_geoms", npairs*2, torch.int32)):
+        value = contact.get(name)
+        if (not isinstance(value, torch.Tensor) or value.device.type != "mps"
+            or value.dtype != dtype or value.numel() != count or not value.is_contiguous()):
+          raise ValueError(f"contact {name} must be contiguous MPS {dtype} with {count} values")
+    self._ensure_spatial_constants()
     self._sp_validate_poses(poses, need_geom_quat=bool(getattr(self, "_tactile_sensors", None)))
     nc = 0 if contact is None else int(contact["frame"].shape[1])
     dummy = self._s_dummy

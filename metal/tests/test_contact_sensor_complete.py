@@ -71,13 +71,14 @@ def test_actual_native_contact_query_all_matches_slots_fields_and_reductions(con
     pytest.skip("explicit native qualification required")
   import torch
   from mujoco_metal.sensors import SensorProgram
+  from mujoco_metal.contact_precision import RECORD_WORDS
   model = _fixture(cone, condim, inactive)
   model.sensor_cutoff[:] = cutoff
   qp, qv, times = _states(model)
   poses, extra, expected = _feed(model, qp, qv, times)
   count = int(extra["ncon"][0])
   assert count == 30 and np.all(extra["ncon"] == count)
-  records = np.zeros((2, count, 42))
+  records = np.zeros((2, count, RECORD_WORDS))
   frames = np.zeros((2, count, 12))
   force = np.zeros((2, count, 11))
   for world in range(2):
@@ -122,3 +123,34 @@ def test_actual_native_contact_query_all_matches_slots_fields_and_reductions(con
   assert float(retained[0, 0]) == 30
   if cutoff and not inactive:
     assert float(retained[0, -1]) == np.float32(cutoff)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
+@pytest.mark.parametrize('bad', ['records_legacy_width', 'force_width', 'record_dtype', 'packed_count'])
+def test_invalid_canonical_views_reject_before_spatial_allocation_or_output_mutation(bad, monkeypatch):
+  import torch
+  from mujoco_metal.sensors import SensorProgram
+  from mujoco_metal.contact_precision import RECORD_WORDS
+  model = _fixture('pyramidal', 1, False)
+  program = SensorProgram(model, batch_size=2)
+  contact = dict(frame=torch.zeros((2, 30, 12), device='mps'),
+      force=torch.zeros((2, 30, 11), device='mps'),
+      records=torch.zeros((2, 30, RECORD_WORDS), device='mps'),
+      packed=torch.zeros((30, 3), dtype=torch.int32, device='mps'),
+      mu=torch.ones((30, 5), device='mps'),
+      slot_pair=torch.arange(30, dtype=torch.int32, device='mps'),
+      pair_live=torch.ones(30, dtype=torch.int32, device='mps'),
+      pair_geoms=torch.zeros((30, 2), dtype=torch.int32, device='mps'))
+  if bad == 'records_legacy_width': contact['records'] = torch.zeros((2, 30, 42), device='mps')
+  elif bad == 'force_width': contact['force'] = torch.zeros((2, 30, 6), device='mps')
+  elif bad == 'record_dtype': contact['records'] = contact['records'].to(torch.int32)
+  else: contact['packed'] = torch.zeros(3, dtype=torch.int32, device='mps')
+  program._s_state_out.fill_(17.0)
+  before = program._s_state_out.clone()
+  def forbidden(*args, **kwargs):
+    raise AssertionError('malformed records reached spatial setup')
+  monkeypatch.setattr(program, '_ensure_spatial_constants', forbidden)
+  with pytest.raises(ValueError, match='contact'):
+    program.run_contact_device({}, contact)
+  torch.testing.assert_close(program._s_state_out, before, rtol=0, atol=0)
