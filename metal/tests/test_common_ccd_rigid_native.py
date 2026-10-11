@@ -127,16 +127,30 @@ def test_pinned_source_no_multiccd_uses_only_the_primary_witness():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_common_mjc_convex_mesh_box_multicontact_public_native_gate():
+@pytest.mark.parametrize("projected_input", (False, True))
+def test_common_mjc_convex_mesh_box_multicontact_public_native_gate(projected_input, monkeypatch):
   for xml, expected_count in ((_XML, 4), (_XML_REVERSED, 4)):
     model = mujoco.MjModel.from_xml_string(xml)
-    sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+    # The constructor preserves residual words from float64 input. Exercise
+    # both that original pose and the explicitly projected float32 pose;
+    # pinned CPU itself chooses different EPA faces at these nearby inputs.
+    initial = np.asarray(model.qpos0, dtype=np.float32 if projected_input else np.float64)
+    sim = MetalSimulation(model, batch_size=1, qpos=initial[None],
+                          profile="integrated_euler_v1")
+    snapshot = sim.snapshot()["device"]
+    words = snapshot.precision_words.astype(np.float64)
+    represented = (snapshot.qpos.astype(np.float64)
+                   + words[:, :model.nq] + words[:, model.nq:2*model.nq])
+    np.testing.assert_array_equal(represented[0], initial.astype(np.float64))
     cpu = mujoco.MjData(model)
-    # Compare the exact pose represented by the native float32 state. The
-    # symmetric fixture selects a different CPU EPA face after rounding.
-    cpu.qpos[:] = np.asarray(model.qpos0, dtype=np.float32)
+    cpu.qpos[:] = initial
     mujoco.mj_forward(model, cpu)
-    native = sim.assembled_system(recompute=True)
+    with monkeypatch.context() as guard:
+      def forbid(*args, **kwargs):
+        raise AssertionError("native contact assembly may not delegate to CPU physics")
+      for name in ("mj_forward", "mj_step", "mj_collision", "mj_fwdPosition"):
+        guard.setattr(mujoco, name, forbid)
+      native = sim.assembled_system(recompute=True)
 
     mask = native["contact_mask"][0].detach().cpu().numpy() > 0.5
     count = int(mask.sum())
@@ -199,7 +213,9 @@ def test_common_mjc_convex_pair_matrix_matches_contact_rows_and_solver():
     cpu.qpos[:] = np.asarray(model.qpos0, dtype=np.float32)
     mujoco.mj_forward(model, cpu)
     assert cpu.ncon > 0, pair
-    sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
+    sim = MetalSimulation(model, batch_size=1,
+                          qpos=np.asarray(model.qpos0, dtype=np.float32)[None],
+                          profile="integrated_euler_v1")
     native = sim.assembled_system(recompute=True)
     mask = native["contact_mask"][0].detach().cpu().numpy() > 0.5
     native_pos = native["contact_position"][0, mask].detach().cpu().numpy()
@@ -254,6 +270,7 @@ def test_common_mjc_convex_primary_witness_without_multiccd_is_native():
 def test_common_mjc_convex_trajectory_checkpoint_replay_and_reset():
   model = mujoco.MjModel.from_xml_string(_pair_xml(6, 7))
   cpu = mujoco.MjData(model)
+  cpu.qpos[:] = np.asarray(model.qpos0, dtype=np.float32)
   mujoco.mj_forward(model, cpu)
   sim = MetalSimulation(model, batch_size=1, profile="integrated_euler_v1")
   sim.reset(qpos=np.asarray(cpu.qpos, dtype=np.float32)[None],
@@ -363,6 +380,7 @@ def test_common_mjc_convex_rotated_friction_pair_lifecycle_gpu(pair, cone):
   sim.reset(qpos=np.asarray(model.qpos0, dtype=np.float32)[None],
             qvel=np.zeros((1, model.nv), dtype=np.float32))
   cpu = mujoco.MjData(model)
+  cpu.qpos[:] = np.asarray(model.qpos0, dtype=np.float32)
   mujoco.mj_forward(model, cpu)
   checkpoint = sim.snapshot()
   expected = []
@@ -473,3 +491,17 @@ def test_common_mjc_convex_b2_contact_failure_and_nocontact_isolation_gpu():
                                cpu.qpos, rtol=2e-5, atol=3e-5)
     np.testing.assert_allclose(sim.state._qvel[world].detach().cpu().numpy(),
                                cpu.qvel, rtol=2e-4, atol=5e-4)
+
+
+def test_pinned_symmetric_mesh_face_selection_is_sensitive_to_projected_pose():
+  for xml in (_XML, _XML_REVERSED):
+    model = mujoco.MjModel.from_xml_string(xml)
+    normals = []
+    for initial in (model.qpos0, np.asarray(model.qpos0, dtype=np.float32)):
+      data = mujoco.MjData(model)
+      data.qpos[:] = initial
+      mujoco.mj_forward(model, data)
+      assert data.ncon == 4
+      normals.append(data.contact[0].frame[:3].copy())
+    np.testing.assert_allclose(normals[0], [1., 0., 0.], rtol=0., atol=2e-4)
+    np.testing.assert_allclose(normals[1], [0., 0., 1.], rtol=0., atol=2e-4)

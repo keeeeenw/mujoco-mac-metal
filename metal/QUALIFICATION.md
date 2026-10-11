@@ -1,5 +1,24 @@
 # Development qualification — 2026-10-11
 
+## Rigid convex oracle input precision
+
+The complete public rigid-convex regression file passes **20 checks in 49.24
+seconds: 14 native cases and six host checks**, with fallback disabled and no
+failures or skips. A symmetric mesh–box test had compared a float32 CPU pose
+with a native constructor pose that now retains float64 residual words. Pinned
+CPU itself chooses an X-normal manifold at the original pose and a Z-normal
+manifold after projection. The test now verifies represented initialization
+exactly and exercises both inputs in both geometry orders, with CPU physics
+forbidden during native contact assembly.
+
+The pair-matrix and reset/trajectory protocols also use matching declared
+inputs on both systems. Original contact count, position (`2e-4`), distance
+(`2e-5`), normal/Jacobian, reference/regularization, friction, force and replay
+bounds remain unchanged. No production physics or solver budget was changed.
+The preceding full native discovery stopped at **289 passes, one failure and
+3,063 deselected in 1,198.32 seconds**; it is not a complete native suite or a
+milestone acceptance result.
+
 ## Public selected state copy
 
 The batched `mj_copyState` entrypoint copies selected pinned state components
