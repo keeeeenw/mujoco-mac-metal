@@ -177,6 +177,47 @@ def mark_energy_computed(sim, component, world_mask=None):
     flags[:, component].masked_fill_(mask, 1)
 
 
+def finish_energy_position(sim, qpos, dynamics, context=None, world_mask=None):
+    """Pinned post-sensor POS sampling or disabled diagnostic clearing."""
+    if getattr(sim, '_energy', None) is None:
+        return
+    missing = (sim.state._status == 0) & (sim._energy_computed[:, 0] == 0)
+    if world_mask is not None:
+        missing &= world_mask
+    if int(sim._mjmodel.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY):
+        sim._update_energy_position(qpos, dynamics, context,
+                                    world_mask=missing.contiguous(), manual=True)
+    else:
+        sim._energy[missing] = 0.0
+
+
+def finish_energy_velocity(sim, qvel, dynamics, world_mask=None):
+    """Source VEL invalidation followed by enabled automatic sampling."""
+    if getattr(sim, '_energy', None) is None:
+        return
+    clear_energy_computed(sim, 1, world_mask)
+    if int(sim._mjmodel.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY):
+        mask = sim.state._status == 0
+        if world_mask is not None:
+            mask &= world_mask
+        sim._update_energy_velocity({'dynamics': dynamics, 'qvel': qvel},
+                                    world_mask=mask.contiguous(), manual=True)
+
+
+def prepare_forward_energy(sim, qpos, qvel, dynamics, context=None, *,
+                           world_mask=None, skipsensor=False):
+    """Begin a forward sweep without moving VEL energy ahead of POS sensors.
+
+    Combined physics producers prepare all operands first. The sensor sweep
+    completes POS and VEL lazy-energy publication in source order. A sweep
+    with skipped/absent sensors finishes immediately, including RK substages.
+    """
+    clear_energy_computed(sim, 0, world_mask)
+    if skipsensor or getattr(sim, '_sensors', None) is None:
+        finish_energy_position(sim, qpos, dynamics, context, world_mask)
+        finish_energy_velocity(sim, qvel, dynamics, world_mask)
+
+
 def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
                          context, stages, world_mask, *, history_advance=False):
     """Sample canonical native energies before sensor cutoff/history.
@@ -185,7 +226,10 @@ def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
     the live velocity and the already prepared mass, even before VEL refresh.
     Sensor tick masks govern data.energy as well as the returned samples.
     """
-    if int(mujoco.mjtStage.mjSTAGE_POS) not in tuple(int(s) for s in stages):
+    selected_stages = tuple(int(s) for s in stages)
+    if int(mujoco.mjtStage.mjSTAGE_POS) not in selected_stages:
+        if not history_advance and int(mujoco.mjtStage.mjSTAGE_VEL) in selected_stages:
+            finish_energy_velocity(sim, qvel, dynamics, world_mask)
         return
     torch, model = sim.state._torch, sim._mjmodel
     active = sim.state._status == 0
@@ -203,6 +247,13 @@ def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
         if history_advance and not (int(model.sensor_history[index, 0]) > 0
                                     and float(model.sensor_delay[index]) > 0):
             continue
+        if not history_advance and (
+            int(model.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_SENSOR)
+            or (int(model.sensor_history[index, 0]) > 0
+                and float(model.sensor_delay[index]) > 0)):
+            # Forward reads delayed sensors from history; only mj_advance
+            # computes their raw samples, including with sensors disabled.
+            continue
         mask = active & compute[:, adr]
         if awake is not None:
             mask = mask & (awake[:, index] != 0)
@@ -219,17 +270,10 @@ def sample_sensor_energy(sim, program, output, qpos, qvel, dynamics,
         if cutoff > 0:
             value = value.clamp(-cutoff, cutoff)
         output[:, adr] = torch.where(mask, value, output[:, adr])
-    if (not history_advance and not int(model.opt.enableflags)
-        & int(mujoco.mjtEnableBit.mjENBL_ENERGY)):
-        # engine_forward clears both values after sensorPos when no potential
-        # energy sensor actually computed this sweep (including kinetic-only).
-        sim._energy[active & (sim._energy_computed[:, 0] == 0)] = 0.0
-    if (not history_advance and int(mujoco.mjtStage.mjSTAGE_VEL)
-        in tuple(int(s) for s in stages)
-        and not int(model.opt.enableflags) & int(mujoco.mjtEnableBit.mjENBL_ENERGY)):
-        # Source fwdVelocity invalidates kinetic energy after POS sensors.
-        # The combined sensor dispatcher must preserve that stage ordering.
-        clear_energy_computed(sim, 1, world_mask)
+    if not history_advance:
+        finish_energy_position(sim, qpos, dynamics, context, world_mask)
+        if int(mujoco.mjtStage.mjSTAGE_VEL) in selected_stages:
+            finish_energy_velocity(sim, qvel, dynamics, world_mask)
 
 
 def advance_energy_history(sim, dynamics, qpos, qvel, world_mask):

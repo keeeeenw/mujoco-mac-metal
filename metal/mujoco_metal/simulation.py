@@ -2425,11 +2425,9 @@ class MetalSimulation:
       if warm_before is not None:
         self._state.copy_masked_strided_rows(
             workspace, warm_before, ~reset_mask, offset=offset)
-      self._update_energy_position(self._state._qpos, dynamics, None,
-                                   world_mask=reset_mask)
-      self._update_energy_velocity({"dynamics": dynamics,
-                                    "qvel": self._state._qvel},
-                                   world_mask=reset_mask)
+      from mujoco_metal.energy import prepare_forward_energy
+      prepare_forward_energy(self, self._state._qpos, self._state._qvel,
+                             dynamics, world_mask=reset_mask)
       self._state.copy_masked_rows(
           self._state._qacc, acceleration, reset_mask)
       self._state.copy_masked_rows(
@@ -4399,11 +4397,17 @@ class MetalSimulation:
         raise NotImplementedError(
             "native plug-in position-stage callbacks are not admitted")
     context = self._capture_forward_position(qpos, dynamics)
-    energy_pos = self._update_energy_position(qpos, dynamics, context)
+    from mujoco_metal.energy import clear_energy_computed, finish_energy_position
+    clear_energy_computed(self, 0)
     if not skipsensor and self._sensors is not None:
       self._store_step_sensors(
           qpos, state._qvel, dynamics, stages=(mujoco.mjtStage.mjSTAGE_POS,),
           position_context=context, include_spatial=False)
+    else:
+      finish_energy_position(self, qpos, dynamics, context)
+    energy_pos = (self._energy[:, 0] if self._energy is not None
+                  and int(self._mjmodel.opt.enableflags)
+                  & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else None)
     record = self._forward_stages.begin(
         generation=state.generation, qpos=qpos, mocap_pos=mocap_pos,
         mocap_quat=mocap_quat,
@@ -4733,8 +4737,12 @@ class MetalSimulation:
         "position_context": context,
         "status": row_status,
     }
-    result["energy_vel"] = self._update_energy_velocity(
-        result, world_mask=forward_mask)
+    if skipsensor or self._sensors is None:
+      from mujoco_metal.energy import finish_energy_velocity
+      finish_energy_velocity(self, qvel, dynamics, forward_mask)
+    result["energy_vel"] = (self._energy[:, 1] if self._energy is not None
+                            and int(self._mjmodel.opt.enableflags)
+                            & int(mujoco.mjtEnableBit.mjENBL_ENERGY) else None)
     self._forward_stages.publish(record, ForwardStage.VEL, result)
     return result
 
@@ -7010,9 +7018,8 @@ class MetalSimulation:
             na_here = int(getattr(state, "_na", 0))
             fwd_acc, fwd_status, fwd_dyn = self._acceleration(
                 state._qpos, step_qvel, capture_fwdinv=fwdinv_enabled)
-            self._update_energy_position(state._qpos, fwd_dyn, None)
-            self._update_energy_velocity({"dynamics": fwd_dyn,
-                                          "qvel": step_qvel})
+            from mujoco_metal.energy import prepare_forward_energy
+            prepare_forward_energy(self, state._qpos, step_qvel, fwd_dyn)
             fwd_acc, step_qvel, fwd_status, check_reset = (
                 self._check_step_acceleration(fwd_acc, step_qvel, fwd_status))
             initial_low=self._qacc_low_for_sensor(fwd_acc)
@@ -7035,8 +7042,7 @@ class MetalSimulation:
               nonlocal callback_index, final_energy_dynamics
               acc, solve_status, dyn = self._acceleration(
                   q, v, act_override=a, time_override=t)
-              self._update_energy_position(q, dyn, None, skipsensor=True)
-              self._update_energy_velocity({"dynamics": dyn, "qvel": v})
+              prepare_forward_energy(self, q, v, dyn, skipsensor=True)
               final_energy_dynamics = dyn
               adot = self._act_dot.clone() if na_here > 0 else None
               result = (acc, adot, solve_status)
@@ -7154,9 +7160,8 @@ class MetalSimulation:
           # RK4; feed that exact X0 stage into the four-stage integrator.
           fwd_acc, fwd_status, fwd_dyn = self._acceleration(
               state._qpos, step_qvel, capture_fwdinv=fwdinv_enabled)
-          self._update_energy_position(state._qpos, fwd_dyn, None)
-          self._update_energy_velocity({"dynamics": fwd_dyn,
-                                        "qvel": step_qvel})
+          from mujoco_metal.energy import prepare_forward_energy
+          prepare_forward_energy(self, state._qpos, step_qvel, fwd_dyn)
           fwd_acc, step_qvel, fwd_status, check_reset = (
               self._check_step_acceleration(fwd_acc, step_qvel, fwd_status))
           initial_low=self._qacc_low_for_sensor(fwd_acc)
@@ -7176,8 +7181,7 @@ class MetalSimulation:
             nonlocal final_energy_dynamics
             acc, solve_status, dyn = self._acceleration(
                 q, v, act_override=a, time_override=t)
-            self._update_energy_position(q, dyn, None, skipsensor=True)
-            self._update_energy_velocity({"dynamics": dyn, "qvel": v})
+            prepare_forward_energy(self, q, v, dyn, skipsensor=True)
             final_energy_dynamics = dyn
             adot = self._act_dot.clone() if na_here > 0 else None
             return acc, adot, solve_status
@@ -7253,9 +7257,8 @@ class MetalSimulation:
           acceleration, solve_status, dynamics = self._acceleration(
               state._qpos, step_qvel, capture_fwdinv=fwdinv_enabled
           )
-          self._update_energy_position(state._qpos, dynamics, None)
-          self._update_energy_velocity({"dynamics": dynamics,
-                                        "qvel": step_qvel})
+          from mujoco_metal.energy import prepare_forward_energy
+          prepare_forward_energy(self, state._qpos, step_qvel, dynamics)
         else:
           from mujoco_metal.forward_stages import ForwardStage
           record = self.validate_forward_stage_record(
