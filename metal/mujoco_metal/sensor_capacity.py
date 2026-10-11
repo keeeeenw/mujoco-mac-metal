@@ -29,7 +29,7 @@ def sensor_owned_workspace_sizes(model, batch_size, limits=None):
       site_geom=max(ns,1)*4,econst=11+nq+3*nj+34*int(model.ncam),
       ten_fix_lmap=max(nt,1)*max(nq,1),ten_fix_mmap=max(nt,1)*max(nv,1),
       act_stat_lmap=max(nu,1)*max(nq,1),act_stat_mmap=max(nu,1)*max(nv,1),
-      subtree_runtime=4+b*nb*32+b*max(nsen,1),dummy=1,
+      subtree_runtime=4+b*nb*32+b*max(nsen,1),dummy=max(b*nt,b*nu,1),
       state_output_pair=2*max(b*ndata,1),rne_body_jnt=max(nb,1)*4,
       rne_dof_jntid=max(nv,1),rne_jnt_type=max(nj,1),rne_jnt_dofadr=max(nj,1),
       rne_mass=max(nb,1),rne_body_tree=max(nb,1)*2,rne_inertia=max(nb,1)*3,

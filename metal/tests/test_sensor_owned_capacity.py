@@ -23,6 +23,43 @@ def _model(kind):
   return mujoco.MjModel.from_xml_string(f'<mujoco>{asset}<option sdf_initpoints="3"/><worldbody><geom name="a" type="sphere" size=".1"/><body><joint name="j"/><site name="s"/>{shape}</body></worldbody><sensor>{sensors}</sensor></mujoco>')
 
 
+def _payload_model(tendons, actuators):
+  tendon = ''.join(f'<fixed name="t{i}"><joint joint="j" coef="1"/></fixed>'
+                   for i in range(tendons))
+  motor = ''.join(f'<motor joint="j"/>' for _ in range(actuators))
+  return mujoco.MjModel.from_xml_string(f'''<mujoco><worldbody><body>
+    <joint name="j"/><geom type="sphere" size=".1"/></body></worldbody>
+    <tendon>{tendon}</tendon><actuator>{motor}</actuator>
+    <sensor><jointpos joint="j"/></sensor></mujoco>''')
+
+
+@pytest.mark.parametrize('batch', [1, 3])
+@pytest.mark.parametrize('tendons,actuators', [(0, 0), (2, 0), (0, 3), (2, 3)])
+def test_optional_channel_admission_covers_every_batched_index(batch, tendons, actuators):
+  model = _payload_model(tendons, actuators)
+  sizes = sensor_owned_workspace_sizes(model, batch)
+  count = sizes['dummy']
+  for width in (model.ntendon, model.nu):
+    for world in range(batch):
+      for index in range(width):
+        assert world*width+index < count
+  assert count == max(batch*tendons, batch*actuators, 1)
+
+
+@pytest.mark.parametrize('batch', [1, 3])
+@pytest.mark.parametrize('tendons,actuators', [(0, 0), (2, 0), (0, 3), (2, 3)])
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='owned MPS allocation qualification')
+def test_real_optional_channel_payload_uses_admitted_shape(batch, tendons, actuators):
+  from mujoco_metal.sensors import SensorProgram
+  model = _payload_model(tendons, actuators)
+  sizes = sensor_owned_workspace_sizes(model, batch)
+  program = SensorProgram(model, batch, limits=replace(
+      CapacityLimits(), memory_budget_bytes=4*sum(sizes.values())))
+  assert program._s_dummy.numel() == sizes['dummy']
+  np.testing.assert_array_equal(program._s_dummy.detach().cpu().numpy(), 0)
+
+
 @pytest.mark.parametrize('kind',['empty','state','query','sdf','ray'])
 def test_sensor_inventory_is_part_of_aggregate_preflight(kind):
   model=(_model(kind) if kind!='empty' else

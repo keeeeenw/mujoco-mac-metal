@@ -1540,7 +1540,11 @@ class SensorProgram:
         self._workspace_sizes["subtree_runtime"], dtype=torch.float32, device=self._device)
     self._sensor_awake_offset = 4 + self.batch_size * d.nbody * 32
     self._sensor_awake_mask = None
-    self._s_dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
+    # Optional tendon/actuator channels are indexed as world*count+id in
+    # state kernels. A one-word placeholder permits out-of-bounds reads in
+    # every later world even when the spatial contribution should be zero.
+    self._s_dummy = torch.zeros(self._owned_workspace_sizes["dummy"], dtype=torch.float32,
+                                device=self._device)
     state_output_size = self.batch_size * int(d.nsensordata)
     self._s_state_out_pair = torch.zeros(
         (2 * max(state_output_size, 1),), dtype=torch.float32,

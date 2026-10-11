@@ -187,6 +187,7 @@ def test_stored_step_sample_matches_mj_step_gpu():
   # Query differs from stored: it re-evaluates at the post-step state.
   query = sim.sensor_values().cpu().numpy()
   assert np.any(np.abs(query - stored) > 1e-6)
+
   # Reset zeroes the stored sample; restore leaves it until the next step.
   sim.reset()
   np.testing.assert_array_equal(sim.step_sensordata(),
@@ -208,4 +209,34 @@ def test_stored_step_sample_matches_mj_step_gpu():
   d.time = snap_time
   mujoco.mj_step(model, d)
   np.testing.assert_allclose(sim.step_sensordata()[0], np.asarray(d.sensordata),
+                             rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='opt-in GPU')
+def test_missing_spatial_payload_has_valid_zero_storage_for_every_world(monkeypatch):
+  from mujoco_metal import MetalSimulation
+  from test_energy_lifecycle_006 import _native_only
+  model = mujoco.MjModel.from_xml_string(_XML)
+  descriptor = load_model(model)
+  q, v, _ = _batch(model, descriptor, batch=3)
+  q, v = q.astype(np.float32), v.astype(np.float32)
+  refs = []
+  for pos, vel in zip(q, v):
+    data = mujoco.MjData(model)
+    data.qpos[:], data.qvel[:] = pos, vel
+    mujoco.mj_step(model, data)
+    refs.append(data)
+  sim = MetalSimulation(model, 3, qpos=q, qvel=v, profile='integrated_euler_v1')
+  kernel, calls = sim._raw_sensor_program._s_state_kernel, []
+  def checked_native_kernel(*args, **kwargs):
+    for index in (13, 14):
+      assert args[index].numel() >= sim.batch_size*model.ntendon, 'batched spatial zero payload is too small'
+      np.testing.assert_array_equal(args[index].detach().cpu().numpy(), 0)
+    calls.append(True)
+    return kernel(*args, **kwargs)
+  monkeypatch.setattr(sim._raw_sensor_program, '_s_state_kernel', checked_native_kernel)
+  _native_only(monkeypatch, sim.step)
+  assert calls
+  np.testing.assert_allclose(sim.step_sensordata(), [d.sensordata for d in refs],
                              rtol=2e-4, atol=2e-4)
