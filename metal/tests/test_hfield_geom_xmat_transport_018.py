@@ -85,10 +85,14 @@ def test_hfield_consumer_requires_and_passes_all_retained_fk_pose_words():
   assert "object.mat[i]=rotation[i]" in _SHADER
   assert "common_ccd_matrix_transpose_vector(\n      Rh,flex_dd3_source_sub(pm,ph))" in _SHADER
   assert "common_ccd_matrix_transpose_product(Rh,Rm,local_mat)" in _SHADER
-  # Alternate CCD and the source sphere/capsule shrink branch retain their
-  # witnesses through the world transform; deep prism EPA keeps its producer ABI.
-  assert "Rh,(libccd || shrunk_primitive)?retained_position:flex_dd3(contact.pos)" in _SHADER
-  assert "Rh,(libccd || shrunk_primitive)?retained_normal:flex_dd3(contact.normal)" in _SHADER
+  # All CCD branches retain their witnesses through the world transform;
+  # native prism EPA publishes its source precision sidecar too.
+  assert "common_ccd_matrix_vector(Rh,retained_position)" in _SHADER
+  assert "common_ccd_matrix_vector(Rh,retained_normal)" in _SHADER
+  assert "*retained_position=epa.position" in _SHADER
+  assert "*retained_normal=epa.normal" in _SHADER
+  assert "*retained_distance=flex_dd_neg(epa.distance)" in _SHADER
+  assert "retain_prism_precision=libccd || !shrunk_primitive" in _SHADER
   assert "quat_to_mat(qa)" not in _SHADER
   assert "quat_to_mat(qb)" not in _SHADER
 

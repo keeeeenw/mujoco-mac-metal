@@ -229,7 +229,10 @@ static inline int common_ccd_production_one_prism(
     int vertex_capacity, int face_capacity, int horizon_capacity,
     int stack_capacity, thread ContactGeom& contact,
     thread int2* out_face_ids, device float* diagnostic,
-    int diagnostic_row, int diagnostic_col, int diagnostic_triangle) {
+    int diagnostic_row, int diagnostic_col, int diagnostic_triangle,
+    thread FlexDD3* retained_position=nullptr,
+    thread FlexDD3* retained_normal=nullptr,
+    thread FlexDD* retained_distance=nullptr) {
   CommonCCDVertex simplex[4];
   for (int i=0;i<4;i++) {
     simplex[i].point_a=FlexDD3{flex_dd(0),flex_dd(0),flex_dd(0)};
@@ -332,6 +335,11 @@ static inline int common_ccd_production_one_prism(
     out_face_ids[0]=vertex_ids[fv.x];
     out_face_ids[1]=vertex_ids[fv.y];
     out_face_ids[2]=vertex_ids[fv.z];
+  }
+  if (epa.status==0) {
+    if (retained_position!=nullptr) *retained_position=epa.position;
+    if (retained_normal!=nullptr) *retained_normal=epa.normal;
+    if (retained_distance!=nullptr) *retained_distance=flex_dd_neg(epa.distance);
   }
   return epa.status==0 ? 1 : -10-epa.status;
 }
@@ -781,7 +789,8 @@ kernel void common_ccd_hfield_mesh_candidates(
               iterations,tolerance,mesh_hull,mesh_hull_info,
               epa_vertices,vertex_id_base_ptr,epa_faces,epa_face_map,epa_horizon,epa_stack,
               vertex_capacity,face_capacity,horizon_capacity,stack_capacity,contact,face_ids,
-              prism_diagnostic,r,c,tri);
+              prism_diagnostic,r,c,tri,
+              &retained_position,&retained_normal,&retained_distance);
         }
         if (result<0) {
           status=-result;
@@ -791,18 +800,20 @@ kernel void common_ccd_hfield_mesh_candidates(
         if (result>0) {
           // Contact is expressed in the hfield frame. Preserve the common
           // source witness, then map to world once at the production boundary.
-          FlexDD3 world_pos=common_ccd_matrix_vector(
-              Rh,(libccd || shrunk_primitive)?retained_position:flex_dd3(contact.pos));
+          FlexDD3 world_pos=common_ccd_matrix_vector(Rh,retained_position);
           world_pos=mpr_add(world_pos,ph);
           contact.pos=flex_dd3_high(world_pos);
-          FlexDD3 world_normal=common_ccd_matrix_vector(
-              Rh,(libccd || shrunk_primitive)?retained_normal:flex_dd3(contact.normal));
+          FlexDD3 world_normal=common_ccd_matrix_vector(Rh,retained_normal);
           if (libccd) world_normal=common_libccd_fix_normal(
               prism,original,world_pos,world_normal);
           // Source mj_addContact normalizes the corrected world normal
           // before constructing the remaining axes. Preserve that source
           // normalization rather than normalizing its float32 projection.
-          if(libccd) world_normal=mpr_normalize(world_normal);
+          // Native prism EPA has the same retained witness contract as MPR.
+          // Do not round either witness before world-frame normalization.
+          bool retain_prism_precision=libccd || !shrunk_primitive;
+          if(retain_prism_precision) world_normal=mpr_normalize(world_normal);
+          if(!libccd && !shrunk_primitive) contact.dist=retained_distance.hi;
           contact.normal=flex_dd3_high(world_normal);
           // mjc_ConvexHField publishes only the world normal after
           // mjc_fixNormal. mj_addContact then builds a fresh world frame.
@@ -810,7 +821,7 @@ kernel void common_ccd_hfield_mesh_candidates(
           // with the corrected normal, changing the friction Jacobian.
           contact.t1=float3(0.0f);
           make_frame(contact.normal,contact.t1,contact.t2);
-          if(libccd) {
+          if(retain_prism_precision) {
             FlexDD3 seed=flex_dd3(float3(0,1,0));
             if(flex_dd_compare_exact(world_normal.y,flex_dd(.5f))>=0 ||
                flex_dd_compare_exact(world_normal.y,flex_dd(-.5f))<=0)
@@ -820,7 +831,7 @@ kernel void common_ccd_hfield_mesh_candidates(
             contact.t2=flex_dd3_high(mpr_cross(world_normal,tangent));
           }
           common_ccd_production_store_contact(mesh_hull,out,ncontact,contact);
-          if(libccd) {
+          if(retain_prism_precision) {
             int precision=out+COMMON_CCD_CONTACT_PRECISION_BASE+14*ncontact;
             mesh_hull[precision]=retained_distance.lo;
             mesh_hull[precision+1]=retained_distance.tail;
