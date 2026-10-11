@@ -3151,8 +3151,10 @@ class MetalSimulation:
           tree_awake=(scheduler.tree_awake if scheduler is not None else None))
       sparse_tendon_J = self._component_tendon_jacobian(qvel, sparse_poses)
     dynamics = self._smooth.run_device(
-        qpos, qvel, mpos, mquat, poses=sparse_poses,
-        awake_lists=awake_lists, tendon_J=sparse_tendon_J)
+        qpos, qvel, mpos if sparse_poses is None else None,
+        mquat if sparse_poses is None else None, poses=sparse_poses,
+        awake_lists=awake_lists, tendon_J=sparse_tendon_J,
+        _trusted_internal_poses=self._component_mass_enabled)
     torch = state._torch
     rhs = torch.neg(dynamics["qfrc_bias"])
     rhs_low = torch.neg(dynamics["qfrc_bias_low"])

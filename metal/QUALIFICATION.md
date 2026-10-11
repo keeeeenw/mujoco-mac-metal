@@ -1,5 +1,19 @@
 # Development qualification — 2026-10-11
 
+## Component assembly with mocap
+
+Component assembly now passes prepared poses to smooth dynamics without
+also passing the mocap inputs already represented by those poses. The complete
+component-mocap, observational-query and cached-solver selection passes
+**65 native tests in 52.39 seconds**, with fallback disabled. New scalable
+Euler and component implicitfast cases exercise active plane contact, a real
+connect equality, changed mocap poses, retained positions/velocities and a
+pending split-step record. Current acceleration and constraint forces match
+pinned MuJoCo within the unchanged `rtol=4e-5`, `atol=6e-6` bounds; querying
+preserves complete checkpoint bytes. No CPU physics is called by native
+assembly. This closes the supplied-pose/mocap composition defect, not an entire
+milestone or full-suite qualification.
+
 ## Cached solver input completeness
 
 The two complete cached Jacobian-capture and row-family native files pass
