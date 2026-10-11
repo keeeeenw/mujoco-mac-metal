@@ -15,7 +15,8 @@ pytestmark = [pytest.mark.gpu, pytest.mark.skipif(
     os.getenv('MUJOCO_METAL_RUN_GPU') != '1', reason='native opt-in')]
 
 
-def _fixture(integrator='Euler', profile='integrated_scalable_v1', enabled=False):
+def _fixture(integrator='Euler', profile='integrated_scalable_v1', enabled=False,
+             disableflags=0):
   from mujoco_metal import MetalSimulation
   model = mujoco.MjModel.from_xml_string(f'''<mujoco>
     <option timestep=".001" integrator="{integrator}">
@@ -25,6 +26,9 @@ def _fixture(integrator='Euler', profile='integrated_scalable_v1', enabled=False
       <geom type="sphere" size=".05" mass="1"/></body></worldbody>
     <tendon><fixed stiffness="3" springlength=".1 .2">
       <joint joint="slider" coef="2"/></fixed></tendon></mujoco>''')
+  model.opt.disableflags |= int(disableflags)
+  model.tendon_armature[:] = .4
+  model.tendon_stiffnesspoly[:] = [-.25, .4]
   qpos = np.array([[.05], [.125], [.375]], np.float32)
   qvel = np.array([[.25], [-.5], [.75]], np.float32)
   refs = []
@@ -195,7 +199,7 @@ def test_lifecycle_rebuild_preserves_samples_and_uses_new_constants(enabled, mon
   assert np.max(np.abs(_host(sim.energy)[:, 0] - before[:, 0])) > 1.
 
 
-@pytest.mark.parametrize('case', ['free', 'ball', 'spatial', 'flex', 'static'])
+@pytest.mark.parametrize('case', ['free', 'ball', 'hinge', 'spatial', 'flex', 'static'])
 @pytest.mark.parametrize('profile', ['integrated_euler_v1', 'integrated_scalable_v1'])
 @pytest.mark.parametrize('enabled', [False, True])
 def test_direct_energy_real_model_families(case, profile, enabled, monkeypatch):
@@ -203,6 +207,7 @@ def test_direct_energy_real_model_families(case, profile, enabled, monkeypatch):
   bodies = {
     'free': '<body pos="0 0 1"><freejoint/><geom type="box" size=".1 .2 .3" mass="2"/></body>',
     'ball': '<body pos="0 0 1"><joint type="ball" stiffness="3" armature=".4"/><geom type="box" size=".1 .2 .3" mass="2"/></body>',
+    'hinge': '<body pos="0 0 1"><joint type="hinge" axis="0 1 0" stiffness="3" armature=".4"/><geom type="box" pos=".1 0 .05" size=".1 .2 .3" mass="2"/></body>',
     'spatial': '<site name="anchor" pos="0 0 2"/><body pos="0 0 1"><joint type="slide" axis="0 0 1"/><geom type="sphere" size=".1" mass="2"/><site name="load"/></body>',
     'flex': '<flexcomp name="rope" type="grid" count="3 1 1" spacing=".2 .2 .2" dim="1" pos="0 0 1" radius=".01" mass="1"><edge stiffness="20" damping="0"/><contact contype="0" conaffinity="0"/></flexcomp>',
     'static': '<geom type="sphere" size=".1" pos="0 0 1" mass="2"/>',
@@ -216,7 +221,7 @@ def test_direct_energy_real_model_families(case, profile, enabled, monkeypatch):
   if case == 'free':
     model.jnt_stiffness[:] = 3.
     model.jnt_stiffnesspoly[:] = [1., .5]
-  elif case == 'ball':
+  elif case in ('ball', 'hinge'):
     model.jnt_stiffnesspoly[:] = [1., .5]
   q = np.tile(model.qpos0, (3, 1))
   v = np.tile(np.linspace(.15, .45, model.nv), (3, 1))
@@ -226,6 +231,8 @@ def test_direct_energy_real_model_families(case, profile, enabled, monkeypatch):
       q[row, 3:7] = [np.cos(.1*(row+1)), np.sin(.1*(row+1)), 0, 0]
     elif case == 'ball':
       q[row] = [np.cos(.1*(row+1)), np.sin(.1*(row+1)), 0, 0]
+    elif case == 'hinge':
+      q[row, 0] = [-.3, .1, .4][row]
     elif case == 'spatial':
       q[row, 0] = [.1, .3, .45][row]
     elif case == 'flex':
@@ -374,3 +381,155 @@ def test_current_energy_sensor_query_preserves_stored_step_samples(profile, fail
   np.testing.assert_array_equal(after['energy'], before['energy'])
   np.testing.assert_array_equal(after['sensordata'], before['sensordata'])
   np.testing.assert_array_equal(after['native_state']['history'], before['native_state']['history'])
+
+
+@pytest.mark.parametrize('profile', ['integrated_euler_v1', 'integrated_scalable_v1'])
+@pytest.mark.parametrize('flags', [int(mujoco.mjtDisableBit.mjDSBL_GRAVITY),
+    int(mujoco.mjtDisableBit.mjDSBL_SPRING),
+    int(mujoco.mjtDisableBit.mjDSBL_GRAVITY) | int(mujoco.mjtDisableBit.mjDSBL_SPRING)])
+def test_explicit_energy_obeys_gravity_and_spring_disable(flags, profile, monkeypatch):
+  _, sim, refs = _fixture(profile=profile, disableflags=flags)
+  record = _prepare(sim, monkeypatch)
+  _native_only(monkeypatch, lambda: mj_energyPos(sim, record))
+  _native_only(monkeypatch, lambda: mj_energyVel(sim, record))
+  np.testing.assert_allclose(_host(sim.energy), [d.energy for d in refs],
+                             rtol=2e-5, atol=2e-6)
+  if flags & int(mujoco.mjtDisableBit.mjDSBL_GRAVITY) and flags & int(mujoco.mjtDisableBit.mjDSBL_SPRING):
+    np.testing.assert_array_equal(_host(sim.energy)[:, 0], 0)
+
+
+@pytest.mark.parametrize('profile', ['integrated_euler_v1', 'integrated_scalable_v1'])
+def test_spatial_pulley_armature_is_in_complete_prepared_energy(profile, monkeypatch):
+  from mujoco_metal import MetalSimulation
+  model = mujoco.MjModel.from_xml_string('''<mujoco>
+    <worldbody><site name="anchor" pos="0 0 2"/><body pos="0 0 1">
+      <joint type="slide" axis="0 0 1" armature=".25"/>
+      <geom type="sphere" size=".1" mass="2"/><site name="load"/>
+    </body></worldbody><tendon><spatial armature=".4" stiffness="4"
+      springlength=".6 .8"><site site="anchor"/><site site="load"/>
+      <pulley divisor="2"/><site site="load"/><site site="anchor"/>
+    </spatial></tendon></mujoco>''')
+  q = np.array([[.1], [.3], [.45]])
+  v = np.array([[.25], [-.5], [.75]])
+  refs = []
+  for pos, vel in zip(q, v):
+    d = mujoco.MjData(model)
+    d.qpos[:], d.qvel[:] = pos, vel
+    mujoco.mj_forward(model, d)
+    mujoco.mj_energyPos(model, d)
+    mujoco.mj_energyVel(model, d)
+    refs.append(d)
+    assert abs(d.ten_velocity[0]) > .3
+    assert d.energy[1] > .5*(2+.25)*float(vel[0])**2 + .02
+  sim = MetalSimulation(model, 3, qpos=q, qvel=v, profile=profile)
+  record = _prepare(sim, monkeypatch)
+  with monkeypatch.context() as guard:
+    _forbid_producers(sim, guard)
+    _native_only(guard, lambda: mj_energyPos(sim, record))
+    _native_only(guard, lambda: mj_energyVel(sim, record))
+  np.testing.assert_allclose(_host(sim.energy), [d.energy for d in refs],
+                             rtol=2e-5, atol=2e-6)
+
+
+def test_explicit_energy_filters_real_failed_and_stale_peer_rows(monkeypatch):
+  _, sim, refs = _fixture()
+  record = _prepare(sim, monkeypatch)
+  sim.state._status[1] = 1
+  record.row_valid[2] = False
+  _native_only(monkeypatch, lambda: mj_energyPos(sim, record))
+  _native_only(monkeypatch, lambda: mj_energyVel(sim, record))
+  np.testing.assert_allclose(_host(sim.energy)[0], refs[0].energy, rtol=2e-5, atol=2e-6)
+  np.testing.assert_array_equal(_host(sim.energy)[1:], 0)
+
+
+@pytest.mark.parametrize('mutation', ['qpos', 'qvel', 'replacement', 'reset', 'restore'])
+def test_stale_energy_record_rejected_before_lazy_publication(mutation, monkeypatch):
+  import torch
+  _, sim, _ = _fixture()
+  snapshot = sim.snapshot()
+  record = _prepare(sim, monkeypatch)
+  if mutation == 'qpos':
+    sim.state._qpos.add_(.01)
+  elif mutation == 'qvel':
+    sim.state._qvel.add_(.01)
+  elif mutation == 'replacement':
+    sim.state._qpos = sim.state._qpos.clone()
+  elif mutation == 'reset':
+    _native_only(monkeypatch, sim.reset)
+  else:
+    _native_only(monkeypatch, lambda: sim.restore(snapshot))
+  with pytest.raises(ValueError):
+    _native_only(monkeypatch, lambda: mj_energyVel(sim, record))
+  assert sim._energy is None
+
+
+def test_manual_energy_restore_into_unallocated_simulation_is_owned(monkeypatch):
+  import torch
+  _, src, refs = _fixture()
+  _, dst, _ = _fixture()
+  record = _prepare(src, monkeypatch)
+  _native_only(monkeypatch, lambda: mj_energyPos(src, record))
+  _native_only(monkeypatch, lambda: mj_energyVel(src, record))
+  snap = src.snapshot()
+  assert dst.energy is None and dst._energy is None
+  with torch.inference_mode():
+    _native_only(monkeypatch, lambda: dst.restore(snap, env_ids=[2, 0]))
+  expected = snap['energy'].copy()
+  expected[1] = 0
+  np.testing.assert_array_equal(_host(dst.energy), expected)
+  assert not torch.is_inference(dst._energy)
+  snap['energy'][:] = -9
+  np.testing.assert_array_equal(_host(dst.energy), expected)
+  _native_only(monkeypatch, lambda: dst.reset(env_ids=[1]))
+  updated = _prepare(dst, monkeypatch)
+  _native_only(monkeypatch, lambda: mj_energyVel(dst, updated))
+  np.testing.assert_allclose(_host(dst.energy)[:, 1], [refs[0].energy[1], 0, refs[2].energy[1]],
+                             rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize('integrator,profile', [
+    ('Euler', 'integrated_scalable_v1'), ('RK4', 'integrated_rk4_v1')])
+def test_explicit_energy_retains_static_gravity_and_filters_real_sleeping_springs(
+    integrator, profile, monkeypatch):
+  import copy
+  from mujoco_metal import MetalSimulation
+  model = mujoco.MjModel.from_xml_string(f'''<mujoco>
+    <option integrator="{integrator}"><flag sleep="enable" contact="disable"/></option>
+    <worldbody><body name="sleeping" pos="-1 0 1" sleep="init">
+      <joint type="slide" axis="0 0 1" stiffness="8" springref=".2"/>
+      <geom type="sphere" size=".1" mass="2"/></body>
+      <body name="awake" pos="1 0 .5" sleep="allowed">
+        <joint type="slide" axis="0 0 1" stiffness="3" armature=".25"/>
+        <geom type="sphere" size=".1" mass="1"/></body>
+      <body pos="0 0 2"><geom type="box" size=".1 .1 .1" mass="3"/></body>
+    </worldbody></mujoco>''')
+  q = np.array([[0., .1], [0., .2], [0., .3]])
+  v = np.array([[0., .2], [0., .3], [0., .4]])
+  refs = []
+  counterfactual = copy.copy(model)
+  counterfactual.opt.enableflags &= ~int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+  for pos, vel in zip(q, v):
+    d = mujoco.MjData(model)
+    d.qpos[:], d.qvel[:] = pos, vel
+    mujoco.mj_forward(model, d)
+    mujoco.mj_energyPos(model, d)
+    mujoco.mj_energyVel(model, d)
+    assert d.tree_asleep[0] >= 0 and d.tree_asleep[1] < 0
+    assert d.nbody_awake < model.nbody
+    assert d.energy[0] > 70  # sleeping and static masses retain gravity energy
+    full = mujoco.MjData(counterfactual)
+    full.qpos[:], full.qvel[:] = pos, vel
+    mujoco.mj_forward(counterfactual, full)
+    mujoco.mj_energyPos(counterfactual, full)
+    np.testing.assert_allclose(full.energy[0]-d.energy[0], .16, rtol=0, atol=1e-12)
+    refs.append(d)
+  sim = MetalSimulation(model, 3, qpos=q, qvel=v, profile=profile)
+  record = _prepare(sim, monkeypatch)
+  np.testing.assert_array_equal(_host(sim._sleep_schedule.tree_state),
+                                 [d.tree_asleep for d in refs])
+  with monkeypatch.context() as guard:
+    _forbid_producers(sim, guard)
+    _native_only(guard, lambda: mj_energyPos(sim, record))
+    _native_only(guard, lambda: mj_energyVel(sim, record))
+  np.testing.assert_allclose(_host(sim.energy), [d.energy for d in refs],
+                             rtol=2e-5, atol=2e-6)
