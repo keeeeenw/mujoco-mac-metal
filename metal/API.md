@@ -82,8 +82,10 @@ physics parity or full solver/contact composition. See
 Development primal line evaluation retains regularizer and anisotropic friction
 coefficient pairs through scalar and elliptic costs, slopes and curvature. The
 unilateral entering-zone polynomial includes its constant term. Initial
-cold/warm objective comparisons and Huber force-zone predicates still need
-consistent retained precision; the complete solver/terrain matrix is unqualified.
+cold/warm selection compares represented original-operator paired objectives;
+joint/connect/weld regularizers retain compiled inverse-weight residuals in
+existing constant bindings. Huber force-zone predicates and complete
+solver/terrain compositions remain unqualified.
 
 Native heightfield prism EPA preserves computed witness words through world
 transformation and contact publication. Scoped gates compare retained cylinder/

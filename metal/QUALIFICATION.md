@@ -1,5 +1,51 @@
 # Development qualification — 2026-10-11
 
+## Original-operator warm selection — 2026-10-11
+
+Local producing revision `c77851c9072295d014f1c015c8c9efa36a0da476`
+compares cold and warm acceleration objectives using retained original mass,
+Jacobian, reference and regularizer words. It evaluates quadratic, unilateral,
+Huber and elliptic cone costs with paired arithmetic, preserving the cold
+acceleration residual for DOFs outside the current island. The preceding
+regularizer commit `eb173e5a393837261108e9c989876260fdb79b8c` retains compiled
+DOF/body inverse-weight residuals in existing constant bindings, accounts the
+additional storage, and publishes joint/connect/weld regularizer low words.
+
+The failing-first regression has a warm seed which the pinned source rejects
+but rounded operator/cost arithmetic accepts. Its adjacent float32 seed must
+be accepted. All **8 native boundary cases** now pass across CG/Newton and
+dense/component routes, with CPU physics forbidden; the complete boundary
+group passed **12 tests in 33.31 seconds**. The original rejected-seed run failed
+all four native cases. No epsilon, blanket seed rejection or tolerance change
+was used to fix the decision.
+
+Further qualification passed:
+
+- **85 native tests, 119 deselected in 13.09 seconds**: actual equality
+  regularizers, existing primal solver, islands and line-coefficient cases.
+- **10 native tests, 67 deselected in 50.09 seconds**: original solver-selection,
+  finite-budget, warm-start and 300-step slope compositions.
+- **9 tests in 1.94 seconds**: compiled residuals/capacity accounting and actual
+  native joint/connect/weld regularizers, packed constant sizes and repeated
+  inactive-world transitions. Regularizers match pinned rows at `2e-12`.
+- **2,436 host tests, 99 skipped, 2,319 deselected in 99.46 seconds**. Skips do
+  not qualify native physics. All producing source/tests are now committed.
+
+Complete terrain, solver-option and other feature compositions remain open,
+including Huber force-zone predicates and generic articulated mass precision.
+This is no claim of whole-milestone, current-wheel or performance qualification.
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+PYTORCH_MPS_FAST_MATH=0 PYTHONPATH=metal:metal/tests \
+python -m pytest -q -p no:cacheprovider \
+  metal/tests/test_primal_objective_pairs.py \
+  metal/tests/test_equality_regularizer_pairs.py \
+  metal/tests/test_primal_solver_math.py \
+  metal/tests/test_solver_islands_014.py \
+  metal/tests/test_primal_line_coefficient_residuals.py
+```
+
 ## Retained native terrain constraint rows — 2026-10-11
 
 Local producing revision `fdcff2d80f9ee0159f3df29ceb76b6e5f6c259d7`

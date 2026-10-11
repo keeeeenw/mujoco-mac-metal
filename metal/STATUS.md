@@ -26,7 +26,7 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
-The latest local development host selection passed **2,429 tests, 99 skipped**;
+The latest local development host selection passed **2,436 tests, 99 skipped**;
 it does not qualify the skipped native cases. The historical host publication
 check passed **2,163 tests, 1,615 skipped** at its separately recorded revision;
 see [producing revisions and scope](QUALIFICATION.md).
@@ -41,8 +41,11 @@ A subsequent native-prism publication correction passed seven affected native
 checks and the original native-CCD cylinder trajectory/restore case. A separate
 constraint-row consumer correction then passed 14 dense/component and alternate
 CCD operator checks and the original native-CCD box trajectory. The complete
-terrain matrix has not been rerun at the latest revision. Four rejected-seed warm-selection cases also fail against the
-pinned zero-iteration source oracle. See the qualification record for the
+terrain matrix has not been rerun at the latest revision. The four rejected-seed
+warm-selection failures were subsequently corrected by retaining equality
+regularizers and comparing original-operator paired objectives. All eight native
+accepted/rejected boundary cases now pass; further groups passed 85 native
+solver/island/line cases and 10 original solver/warm/slope compositions. See the qualification record for the
 separate source revisions and their limits.
 
 Selected source compositions passed 94 Newton regression checks (including the
