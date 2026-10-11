@@ -4858,30 +4858,30 @@ inline float primal_friction_cost_delta(float start, float end,
 }
 
 inline PrimalFloatPair primal_huber_cost_pair(PrimalFloatPair residual,
-    float friction, float bound, float inverse_R) {
-  if (primal_pair_less_float(residual, -bound))
-    return primal_pair_renormalize(
-        friction * (-0.5f * bound - residual.hi), -friction * residual.lo);
-  if (primal_pair_less_equal_float(residual, bound))
-    return primal_pair_multiply(primal_pair_product(residual, residual),
-        0.5f * inverse_R);
-  return primal_pair_renormalize(
-      friction * (-0.5f * bound + residual.hi), friction * residual.lo);
+    float friction, PrimalFloatPair bound, PrimalFloatPair inverse_R) {
+  if (primal_pair_negative(primal_pair_add(residual, bound)))
+    return primal_pair_multiply(primal_pair_add(
+        primal_pair_multiply(bound, -0.5f), primal_pair_neg(residual)), friction);
+  if (!primal_pair_negative(primal_pair_add(bound, primal_pair_neg(residual))))
+    return primal_pair_multiply(primal_pair_product(
+        primal_pair_product(residual, residual), inverse_R), 0.5f);
+  return primal_pair_multiply(primal_pair_add(
+      primal_pair_multiply(bound, -0.5f), residual), friction);
 }
 
 inline PrimalFloatPair primal_huber_cost_delta_pair(
     PrimalFloatPair start, PrimalFloatPair end, PrimalFloatPair alpha,
-    PrimalFloatPair row_direction, float friction, float bound,
-    float inverse_R) {
-  bool start_left = primal_pair_less_equal_float(start, -bound);
-  bool start_right = primal_pair_less_float({bound - start.hi, -start.lo}, 0.0f);
-  bool end_left = primal_pair_less_equal_float(end, -bound);
-  bool end_right = primal_pair_less_float({bound - end.hi, -end.lo}, 0.0f);
+    PrimalFloatPair row_direction, float friction, PrimalFloatPair bound,
+    PrimalFloatPair inverse_R) {
+  bool start_left = primal_pair_less_equal_float(primal_pair_add(start, bound), 0.0f);
+  bool start_right = primal_pair_negative(primal_pair_add(bound, primal_pair_neg(start)));
+  bool end_left = primal_pair_less_equal_float(primal_pair_add(end, bound), 0.0f);
+  bool end_right = primal_pair_negative(primal_pair_add(bound, primal_pair_neg(end)));
   if (!start_left && !start_right && !end_left && !end_right) {
     PrimalFloatPair delta = primal_pair_product(row_direction, alpha);
     PrimalFloatPair midpoint_sum = primal_pair_add(start, end);
-    return primal_pair_multiply(
-        primal_pair_product(delta, midpoint_sum), 0.5f * inverse_R);
+    return primal_pair_multiply(primal_pair_product(
+        primal_pair_product(delta, midpoint_sum), inverse_R), 0.5f);
   }
   if (start_left && end_left)
     return primal_pair_multiply(primal_pair_product(row_direction, alpha),
@@ -5112,16 +5112,21 @@ inline PrimalFloatPair primal_elliptic_line_eval_pair(
     thread const PrimalFloatPair* direction,
     device const float* R, device const float* friction, int dim,
     thread PrimalFloatPair& derivative,
-    thread PrimalFloatPair& second_derivative) {
+    thread PrimalFloatPair& second_derivative,
+    device const float* R_low = nullptr,
+    device const float* friction_low = nullptr) {
   derivative = {0.0f, 0.0f};
   second_derivative = {0.0f, 0.0f};
   if (dim < 2 || dim > 6) return {0.0f, 0.0f};
 
-  PrimalFloatPair mu = primal_pair_multiply(
-      primal_pair_sqrt(primal_pair_divide({max(R[1], 0.0f), 0.0f},
-          {max(R[0], 1e-15f), 0.0f})), friction[0]);
+  PrimalFloatPair mu = primal_pair_product(
+      primal_pair_sqrt(primal_pair_divide(
+          primal_positive_entry_pair(R, R_low, 1, 0.0f),
+          primal_positive_entry_pair(R, R_low, 0, 1e-15f))),
+      primal_positive_entry_pair(friction, friction_low, 0, 0.0f));
   PrimalFloatPair Dm = primal_pair_divide(
-      primal_pair_divide({1.0f, 0.0f}, {max(R[0], 1e-15f), 0.0f}),
+      primal_pair_divide({1.0f, 0.0f},
+          primal_positive_entry_pair(R, R_low, 0, 1e-15f)),
       primal_pair_product(primal_pair_product(mu, mu),
           primal_pair_add({1.0f, 0.0f},
               primal_pair_product(mu, mu))));
@@ -5135,7 +5140,7 @@ inline PrimalFloatPair primal_elliptic_line_eval_pair(
   PrimalFloatPair bottom_quadratic = {0.0f, 0.0f};
   for (int k = 0; k < dim; ++k) {
     PrimalFloatPair inverse_R = primal_pair_divide({1.0f, 0.0f},
-        {max(R[k], 1e-15f), 0.0f});
+        primal_positive_entry_pair(R, R_low, k, 1e-15f));
     bottom_constant = primal_pair_add(bottom_constant,
         primal_pair_multiply(primal_pair_product(
             primal_pair_product(residual[k], residual[k]), inverse_R), 0.5f));
@@ -5146,7 +5151,8 @@ inline PrimalFloatPair primal_elliptic_line_eval_pair(
         primal_pair_multiply(primal_pair_product(
             primal_pair_product(direction[k], direction[k]), inverse_R), 0.5f));
     if (k == 0) continue;
-    PrimalFloatPair fk = {max(friction[k - 1], 0.0f), 0.0f};
+    PrimalFloatPair fk = primal_positive_entry_pair(
+        friction, friction_low, k - 1, 0.0f);
     PrimalFloatPair u = primal_pair_product(fk, residual[k]);
     PrimalFloatPair v = primal_pair_product(fk, direction[k]);
     tangent_sq0 = primal_pair_add(tangent_sq0, primal_pair_product(u, u));
@@ -5263,7 +5269,9 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
     thread PrimalFloatPair& second_derivative,
     device const float* mass_delta, device const float* mass_delta_low,
     device const float* base_row_residual,
-    device const float* base_row_residual_low) {
+    device const float* base_row_residual_low,
+    device const float* regularizer_low = nullptr,
+    device const float* friction_low = nullptr) {
   if (mass_delta == nullptr) {
     if (sparse_mass) {
     solver_component_mass_apply_difference(debug, dims, nv, acc, q0,
@@ -5340,15 +5348,17 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
         primal_pair_renormalize(direction_sum, direction_correction);
     PrimalFloatPair end = primal_pair_add(start,
         primal_pair_product(row_direction, alpha));
-    float inverse_R = 1.0f / max(R[row], 1e-15f);
+    PrimalFloatPair reg = primal_positive_entry_pair(
+        R, regularizer_low, row, 1e-15f);
+    PrimalFloatPair inverse_R = primal_pair_divide({1.0f, 0.0f}, reg);
     if (row < n_eq_rows) {
       shifted_linear = primal_pair_add(shifted_linear,
-          primal_pair_multiply(
+          primal_pair_product(
               primal_pair_product(start, row_direction), inverse_R));
       shifted_quadratic = primal_pair_add(shifted_quadratic,
-          primal_pair_multiply(
+          primal_pair_product(
               primal_pair_product(row_direction, row_direction),
-              0.5f * inverse_R));
+              primal_pair_multiply(inverse_R, 0.5f)));
     } else {
       bool friction_row = lo[row] < 0.0f && hi[row] > 0.0f
           && isfinite(lo[row]) && isfinite(hi[row])
@@ -5356,21 +5366,21 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
               <= 1e-5f * max(1.0f, abs(hi[row]));
       if (friction_row) {
         float loss = hi[row];
-        float bound = R[row] * loss;
+        PrimalFloatPair bound = primal_pair_multiply(reg, loss);
         delta_cost = primal_pair_add(delta_cost,
             primal_huber_cost_delta_pair(start, end, alpha,
                 row_direction, loss, bound, inverse_R));
-        if (!primal_pair_less_equal_float(end, -bound)
-            && primal_pair_less_float(end, bound)) {
+        if (!primal_pair_less_equal_float(primal_pair_add(end, bound), 0.0f)
+            && primal_pair_negative(primal_pair_add(end, primal_pair_neg(bound)))) {
           explicit_derivative = primal_pair_add(explicit_derivative,
-              primal_pair_multiply(
+              primal_pair_product(
                   primal_pair_product(end, row_direction), inverse_R));
           explicit_second_derivative = primal_pair_add(
               explicit_second_derivative,
-              primal_pair_multiply(
+              primal_pair_product(
                   primal_pair_product(row_direction, row_direction),
                   inverse_R));
-        } else if (primal_pair_less_equal_float(end, -bound)) {
+        } else if (primal_pair_less_equal_float(primal_pair_add(end, bound), 0.0f)) {
           explicit_derivative = primal_pair_add(explicit_derivative,
               primal_pair_multiply(row_direction, -loss));
         } else {
@@ -5379,17 +5389,24 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
         }
       } else {
         PrimalFloatPair old_cost = primal_pair_less_float(start, 0.0f)
-            ? primal_pair_multiply(primal_pair_product(start, start),
-                  0.5f * inverse_R)
+            ? primal_pair_product(primal_pair_product(start, start),
+                  primal_pair_multiply(inverse_R, 0.5f))
             : PrimalFloatPair{0.0f, 0.0f};
         if (primal_pair_less_float(end, 0.0f)) {
+          // An initially satisfied row contributes no starting cost. When
+          // the line enters its quadratic zone, restore the polynomial's
+          // constant as well as its linear/quadratic terms.
+          if (!primal_pair_less_float(start, 0.0f))
+            shifted_constant = primal_pair_add(shifted_constant,
+                primal_pair_product(primal_pair_product(start, start),
+                    primal_pair_multiply(inverse_R, 0.5f)));
           shifted_linear = primal_pair_add(shifted_linear,
-              primal_pair_multiply(
+              primal_pair_product(
                   primal_pair_product(start, row_direction), inverse_R));
           shifted_quadratic = primal_pair_add(shifted_quadratic,
-              primal_pair_multiply(
+              primal_pair_product(
                   primal_pair_product(row_direction, row_direction),
-                  0.5f * inverse_R));
+                  primal_pair_multiply(inverse_R, 0.5f)));
         } else {
           delta_cost = primal_pair_add(delta_cost,
               primal_pair_multiply(old_cost, -1.0f));
@@ -5435,7 +5452,9 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
     PrimalFloatPair local_delta = primal_elliptic_line_eval_pair(alpha,
         row_residual, row_direction, R + start_row,
         elliptic_friction + block * 5, dim,
-        local_derivative, local_second);
+        local_derivative, local_second,
+        regularizer_low ? regularizer_low + start_row : nullptr,
+        friction_low ? friction_low + block * 5 : nullptr);
     delta_cost = primal_pair_add(delta_cost, local_delta);
     explicit_derivative = primal_pair_add(explicit_derivative,
         local_derivative);
@@ -5881,7 +5900,9 @@ inline PrimalLinePoint primal_line_eval_elliptic(PrimalFloatPair alpha,
       enabled, elliptic_member, elliptic_start, elliptic_dim,
       elliptic_friction, elliptic_count, gradient, generalized_force,
       nv, nr, n, n_eq_rows, slope, curvature,
-      mass_delta, mass_delta_low, row_residual, row_residual_low);
+      mass_delta, mass_delta_low, row_residual, row_residual_low,
+      primal_regularizer_low_view(debug, dims, nv, nr),
+      primal_friction_low_view(debug, dims, nv, nr));
   for (int i = 0; i < nv; ++i) {
     PrimalFloatPair next = primal_pair_add(
         primal_pair_product(alpha, {direction[i], direction_low[i]}),
