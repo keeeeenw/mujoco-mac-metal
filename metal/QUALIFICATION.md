@@ -24,8 +24,12 @@ with MPS availability hidden. Skips do not establish native qualification.
 Both original zero-margin alternate-CCD box terrain orders then passed at that
 revision: **2 passed, 48 deselected in 50.04 seconds**, preserving their original
 force, four-step trajectory, checkpoint bounds and solver budgets. Their earlier
-failures below are historical. The full 40-case terrain matrix is being repeated
-against this source; complete heightfield and milestone acceptance remain open.
+failures below are historical. The complete unchanged matrix then passed
+**40 tests, 10 deselected in 1,893.40 seconds** at the same production revision.
+This covers five primitive families, both CCD algorithms, both geom orders,
+zero/positive margin, a contact-free peer, forces, four-step trajectories and
+checkpoint replay. Complete heightfield composition and milestone acceptance
+remain open; no terrain bounds or solver budgets changed.
 
 ## Public API corrections and retained state — 2026-10-11
 
@@ -85,9 +89,9 @@ The full CPU selection at `f59d1224f` passed **2,442 tests, 99 skipped,
 qualify the skipped native cases.
 
 Full API and milestone acceptance still require the execution inventory,
-remaining feature combinations, final wheel and demo gates. The complete terrain
-matrix remains under requalification. No new performance result
-is claimed.
+remaining feature combinations, final wheel and demo gates. The later complete
+40-case primitive-terrain result is recorded above; broader heightfield
+composition remains open. No new performance result is claimed.
 
 ## Derivative residuals and active elastic materials — 2026-10-11
 
@@ -139,7 +143,7 @@ The two unchanged alternate-CCD box terrain cases were repeated at `15787fa29`:
 acceleration violation of `2.81290692`. The later retained-velocity correction
 above clears both original cases; this failed result belongs to its source.
 
-## Complete primitive-terrain matrix — 2026-10-11
+## Earlier incomplete primitive-terrain matrix — 2026-10-11
 
 The unchanged 40-case native terrain matrix at producing revision
 `10d9bf13676b766ddb936b19876ffeab8b9827af` finished with **38 passed,

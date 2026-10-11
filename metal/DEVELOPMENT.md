@@ -76,7 +76,8 @@ deformed free-carrier trajectories and replay. A later retained-velocity bias
 correction at `ff659a24e` passes 71 affected host/native checks and the full CPU
 selection (2,455 passed, 99 skipped). Both original alternate-CCD box terrain
 cases pass their unchanged trajectory bounds after that correction; the complete
-terrain matrix is under requalification. These gates do not establish complete
+terrain matrix now passes all 40 cases at that production source, with original
+bounds and budgets. These gates do not establish complete
 material/contact composition or general source-rounded dynamics precision.
 
 These results cover preserved source compositions, not the entire current

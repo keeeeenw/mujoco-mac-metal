@@ -80,7 +80,10 @@ at that source with their original trajectory bounds.
 The retained-velocity bias correction at `ff659a24e` passes 71 affected
 host/native checks and the complete CPU selection (2,455 passed, 99 skipped).
 Both original alternate-CCD box trajectories now pass their unchanged gates;
-the full 40-case terrain matrix is under requalification. Separately, a
+the complete original 40-case terrain matrix now passes at that source,
+including both CCD algorithms, both margins and geom orders, a separated peer,
+forces, four-step trajectories and exact replay. No bounds or budgets changed.
+Separately, a
 34-case active simplex work/energy/stability gate at `15787fa29` covers two
 stiffnesses, two timesteps and all four integrators with deformed free carriers.
 These are source-specific results; full heightfield/deformable composition,
