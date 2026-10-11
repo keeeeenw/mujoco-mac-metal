@@ -8869,6 +8869,12 @@ kernel void solve_coupled_constraints(
             ? solver_component_mass_entry(dbg_pre, dims, nv, i, i)
             : mass[mb + i * nv + i];
       }
+      // With islands disabled all DOF labels remain -1. Pinned MuJoCo uses
+      // compiled mean inertia times the global DOF count for this solve,
+      // rather than the (empty) per-island diagonal sum.
+      float residual_scale = partitioned
+          ? 1.0f / max(island_inertia, 1e-15f)
+          : 1.0f / (params[4] * float(max(nv, 1)));
       int island_used = solve_primal_accel_scalar(
           dims[20] == -3 ? mass : mass + mb, dbg_pre, J_world, primal_R,
           primal_aref, primal_lo, primal_hi, L, qacc_baseline,
@@ -8877,7 +8883,7 @@ kernel void solve_coupled_constraints(
           elliptic_member, elliptic_start, elliptic_dim, elliptic_friction,
           elliptic_count, primal_lambda, nv, nr, total_nr, n_eq_rows, solver_type, maxiter,
           dims[metadata_header + 14], params[5], tol,
-          1.0f / max(island_inertia, 1e-15f),
+          residual_scale,
           (flags & 512) == 0, primal_scratch, high_low_scratch,
           out_diagnostics + world * 10,
           dof_island, island, partitioned);
@@ -11109,6 +11115,9 @@ kernel void solve_coupled_constraints_block(
             ? solver_component_mass_entry(dbg, dims, nv, i, i)
             : mass[i * nv + i];
       }
+      float residual_scale = partitioned
+          ? 1.0f / max(island_inertia, 1e-15f)
+          : 1.0f / (params[4] * float(max(nv, 1)));
       int island_used = solve_primal_accel_scalar(
           dims[20] == -3 ? mass : mass + mb, dbg, J_world, R, ar, lo, hi,
           L, qacc_baseline, qacc_smooth_low, dims, solver_awake_tree, enabled,
@@ -11116,7 +11125,7 @@ kernel void solve_coupled_constraints_block(
           elliptic_friction, elliptic_count, primal_lambda, nv, nr, nr,
           n_eq_rows, solver_type, maxiter, dims[metadata_header + 14],
           params[5], tol,
-          1.0f / max(island_inertia, 1e-15f),
+          residual_scale,
           (flags & 512) == 0, primal_scratch, high_low_scratch,
           out_diagnostics + world * 10, dof_island, island, partitioned);
       if (island_used < 0) {
