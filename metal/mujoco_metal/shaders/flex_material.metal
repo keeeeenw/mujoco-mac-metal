@@ -462,13 +462,14 @@ kernel void flex_stretch_force(
     }
     float len = edge_length[eadr[e]];
     float rate = edge_velocity[eadr[e]];
-    float prev = len - rate * h;
     FPDD rest = FPDD{edge_length0[ge], edge_length0_low[ge],
                       edge_length0_tail[ge]};
     FPDD elastic = fpsub(squared, fpmul(rest, rest));
-    float kd = h > 0.0f ? damping[elem] / h : 0.0f;
-    elong[e] = ((elastic.hi + elastic.lo) + elastic.tail) +
-               (len * len - prev * prev) * kd;
+    // Factor L^2 - (L - h*rate)^2 before float32 evaluation. The
+    // subtract-and-divide form loses damping at small h and can emit force
+    // even at rate==0 when the compiler contracts only one squared product.
+    float damp = h > 0.0f ? damping[elem] * rate * (2.0f * len - h * rate) : 0.0f;
+    elong[e] = ((elastic.hi + elastic.lo) + elastic.tail) + damp;
     if (dof == 0) {
       int out = ((env * nelem + elem) * 6 + e) * 4;
       element_geometry[out] = elong[e];

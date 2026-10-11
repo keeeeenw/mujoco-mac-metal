@@ -3996,9 +3996,9 @@ class MetalFlex:
         lengths = self._flexedge_length[:, edge_ids]
         rates = self._flexedge_velocity[:, edge_ids]
         rest = self._edge_length0[edge_ids].unsqueeze(0)
-        previous = lengths - rates * d.timestep
-        kd = float(self._stretch_damping[e]) / d.timestep if d.timestep > 0 else 0.0
-        elong = lengths.square() - rest.square() + (lengths.square() - previous.square()) * kd
+        damping = self._stretch_damping_host[e] if d.timestep > 0 else 0.0
+        elong = (lengths.square() - rest.square() +
+                 damping * rates * (2.0 * lengths - rates * d.timestep))
         coeff = elong @ metric
         local = torch.zeros((b, nve, 3), dtype=torch.float32, device=self._device)
         for j, (a, c) in enumerate(self._stretch_edge_pairs[e]):
@@ -4053,7 +4053,8 @@ class MetalFlex:
         elong = elem_geometry[:, e, :ne, 0]
       else:
         elong = lengths.square() - self._edge_length0[edge_ids].square().unsqueeze(0)
-        elong = elong + (lengths.square() - previous.square()) * kd
+        damping = self._stretch_damping_host[e] if d.timestep > 0 else 0.0
+        elong = elong + damping * rates * (2.0 * lengths - rates * d.timestep)
       coeff = elong @ metric
 
       # Derivative of each projected edge gradient, Jrel' * Jrel.
