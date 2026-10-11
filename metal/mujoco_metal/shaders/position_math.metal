@@ -359,8 +359,62 @@ inline KinDD kin_state_load(device const float* high,device const float* words,
                              uint at,uint word_offset,uint tail_offset) {
   return KinDD{high[at],words[word_offset],words[tail_offset]};
 }
+// Sequential binary32 additions can round an exact halfway low word before
+// the tail decides the tie. Publish the nearest binary32 value of the complete
+// represented scalar instead. Scale the comparison into the normal range so
+// Metal's arithmetic flush of subnormal storage words cannot decide it.
+inline float kin_state_projection(KinDD value) {
+  uint leading=max(as_type<uint>(value.hi)&0x7fffffffu,
+                   max(as_type<uint>(value.lo)&0x7fffffffu,
+                       as_type<uint>(value.tail)&0x7fffffffu));
+  if (leading==0u) return value.hi;
+  if (leading>=0x7f800000u) return kin_value(value);
+  int shift=1-flex_float_exponent(as_type<float>(leading));
+  FlexDD scaled=flex_dd_scalbn(kin_source(value),shift);
+  float high=flex_float_scalbn((scaled.hi+scaled.lo)+scaled.tail,-shift);
+  if (!isfinite(high)) return high;
+  float scaled_high=flex_float_scalbn(high,shift);
+  int direction=flex_dd_compare_exact(scaled,flex_dd(scaled_high));
+  if (direction==0) return high;
+  uint bits=as_type<uint>(high), magnitude=bits&0x7fffffffu;
+  uint adjacent;
+  if (magnitude==0u) {
+    adjacent=direction<0 ? 0x80000001u : 1u;
+  } else {
+    bool away=(bits&0x80000000u) ? direction<0 : direction>0;
+    adjacent=away ? bits+1u : bits-1u;
+  }
+  float neighbor=as_type<float>(adjacent);
+  float gap;
+  if ((adjacent&0x7fffffffu)==0x7f800000u) {
+    // The overflow boundary is half an ulp beyond the largest finite value.
+    float inward=flex_float_scalbn(as_type<float>(bits-1u),shift);
+    gap=scaled_high-inward;
+  } else {
+    gap=flex_float_scalbn(neighbor,shift)-scaled_high;
+  }
+  FlexDD midpoint={scaled_high,0.5f*gap,0.0f};
+  int side=flex_dd_compare_exact(scaled,midpoint);
+  bool beyond=direction>0 ? side>0 : side<0;
+  return beyond || (side==0 && (bits&1u)) ? neighbor : high;
+}
+inline KinDD kin_state_remainder(KinDD value,float high) {
+  uint leading=max(as_type<uint>(value.hi)&0x7fffffffu,
+                   max(as_type<uint>(value.lo)&0x7fffffffu,
+                       as_type<uint>(value.tail)&0x7fffffffu));
+  if (leading==0u) return kin_dd(0.0f);
+  if (leading>=0x7f800000u || !isfinite(high))
+    return kin_sub(value,kin_dd(high));
+  int shift=1-flex_float_exponent(as_type<float>(leading));
+  FlexDD rest=flex_dd_source_sub(flex_dd_scalbn(kin_source(value),shift),
+                               flex_dd(flex_float_scalbn(high,shift)));
+  return kin_retained(flex_dd_scalbn(rest,-shift));
+}
 inline void kin_state_store(device float* high,device float* words,uint at,
                              uint word_offset,uint tail_offset,KinDD value) {
-  float h=kin_value(value);KinDD rest=kin_sub(value,kin_dd(h));
-  high[at]=h;words[word_offset]=rest.hi;words[tail_offset]=rest.lo+rest.tail;
+  float h=kin_state_projection(value);
+  KinDD rest=kin_state_remainder(value,h);
+  float low=kin_state_projection(rest);
+  high[at]=h;words[word_offset]=low;
+  words[tail_offset]=kin_state_projection(kin_state_remainder(rest,low));
 }
