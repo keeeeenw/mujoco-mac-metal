@@ -111,3 +111,33 @@ def test_cancelling_force_terms_keep_residual(solver):
            ctrl=torch.tensor([[-2.0**24]], device="mps"))
   qvel = float(sim.state.qvel.cpu().numpy()[0, 0])
   assert qvel == pytest.approx(source.qvel[0], rel=1e-5)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="zero-dof direct qualification")
+@pytest.mark.parametrize("solver", ["PGS", "CG", "Newton"])
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_zero_dof_direct_dispatch_and_cache(solver, with_residual):
+  """Direct MetalCoupledConstraints dispatch and position caching on nv==0 models."""
+  import torch
+  from mujoco_metal.coupled_constraints import MetalCoupledConstraints
+  from mujoco_metal.simulation import MetalSimulation
+  model = mujoco.MjModel.from_xml_string(f"""<mujoco>
+    <option solver="{solver}"/>
+    <worldbody><geom type="sphere" size=".1"/></worldbody>
+  </mujoco>""")
+  b = 2
+  sim = MetalSimulation(model, b, profile="integrated_scalable_v1")
+  cc = MetalCoupledConstraints(model, b)
+  qpos = torch.zeros((b, 0), device="mps")
+  qvel = torch.zeros((b, 0), device="mps")
+  mass = torch.zeros((b, 0, 0), device="mps")
+  force = torch.zeros((b, 0), device="mps")
+  residual = torch.zeros((b, 0), device="mps") if with_residual else None
+  poses = sim._smooth._fk.run_device(qpos)
+  res_fresh = cc.run_device(poses, mass, force, qpos, qvel, qfrc_smooth_low=residual)
+  np.testing.assert_array_equal(res_fresh["status"].cpu().numpy(), 0)
+  ctx = cc.capture_position_context()
+  res_cached = cc.run_velocity_device(ctx, poses, mass, force, qpos, qvel, qfrc_smooth_low=residual)
+  np.testing.assert_array_equal(res_cached["status"].cpu().numpy(), 0)
+

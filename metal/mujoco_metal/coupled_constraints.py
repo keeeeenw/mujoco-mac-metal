@@ -2869,10 +2869,10 @@ class MetalCoupledConstraints:
     width = int(width)
     source_stride, destination_stride = (int(source_stride),
                                          int(destination_stride))
-    source_offset, destination_offset = (int(source_offset),
-                                         int(destination_offset))
-    if width < 0 or min(source_stride, destination_stride,
-                        source_offset, destination_offset) < 0:
+    if width <= 0:
+      return
+    if min(source_stride, destination_stride,
+           source_offset, destination_offset) < 0:
       raise ValueError("masked world copy dimensions must be nonnegative")
     if (source_offset + width > source_stride
         or destination_offset + width > destination_stride
@@ -4262,17 +4262,18 @@ class MetalCoupledConstraints:
       stored_extra.copy_(extra_aref)
     debug = w["workspace_debug"].reshape(b, self._debug_stride)
     row_base = nr * nr
-    w["position_cache_J"].copy_(w["workspace_J"])
-    w["position_cache_qvel"].view(b, nv).copy_(
-        w["position_qvel"][:b * nv].view(b, nv))
-    w["position_cache_rows"][:b * 7 * nr].view(b, 7 * nr).copy_(
-        debug[:, row_base:row_base + 7 * nr])
-    w["position_cache_impedance"].view(b, nr).copy_(
-        debug[:, row_base + 2 * nr:row_base + 3 * nr])
-    low_aref = debug[:, self._aref_low_debug_offset:
-                     self._aref_low_debug_offset + nr]
-    w["position_current_aref_low"].view(b, nr).copy_(low_aref)
-    w["position_cache_aref_low"].view(b, nr).copy_(low_aref)
+    if nv > 0:
+      w["position_cache_qvel"].view(b, nv).copy_(
+          w["position_qvel"][:b * nv].view(b, nv))
+    if nr > 0:
+      w["position_cache_rows"][:b * 7 * nr].view(b, 7 * nr).copy_(
+          debug[:, row_base:row_base + 7 * nr])
+      w["position_cache_impedance"].view(b, nr).copy_(
+          debug[:, row_base + 2 * nr:row_base + 3 * nr])
+      low_aref = debug[:, self._aref_low_debug_offset:
+                       self._aref_low_debug_offset + nr]
+      w["position_current_aref_low"].view(b, nr).copy_(low_aref)
+      w["position_cache_aref_low"].view(b, nr).copy_(low_aref)
     precision_offset = self._regularizer_low_debug_offset
     w["position_cache_contact_precision"].view(b,6*max(nr,1)).copy_(
         debug[:,precision_offset:precision_offset+6*max(nr,1)])
