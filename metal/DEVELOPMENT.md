@@ -51,9 +51,10 @@ impedance batch (101 tests), and inverse/split-stage batch (115 tests). The fina
 retained-output solver certificate is distinct from optimizer stopping history;
 configured iteration budgets and original physics comparison bounds are retained.
 
-The rich three-world derivative fixture passes its original transition-matrix
-comparisons after a paired RNE precision correction, but its later inverse-force
-finite differences still fail the original bounds. The original interpolated-flex detector matrix now
+The complete original native finite-difference gate at `f59d1224f` passes all
+14 cases. The rich three-world derivative fixture now passes both its original
+transition-matrix and inverse-force bounds, with exact query rollback. This
+supersedes its earlier inverse-force failure; broader combinations remain open. The original interpolated-flex detector matrix now
 passes all 16 cases, plus three trace/comparator checks, after correcting EPA
 ordering of represented expansion scalars. A separate full-size public Q1 volume
 sphere-contact fixture passes assembled contacts, nonzero passive forces,

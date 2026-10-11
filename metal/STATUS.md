@@ -26,7 +26,7 @@ native fixtures have passed independent checks.
 
 ## Evidence and limitations
 
-The latest local development host selection passed **2,436 tests, 99 skipped**;
+The latest local development host selection passed **2,442 tests, 99 skipped**;
 it does not qualify the skipped native cases. The historical host publication
 check passed **2,163 tests, 1,615 skipped** at its separately recorded revision;
 see [producing revisions and scope](QUALIFICATION.md).
@@ -59,8 +59,11 @@ producing-composition limits; see [development coverage](DEVELOPMENT.md).
 The remaining 26-file native API group at `baf24b80c` passed **117 tests,
 280 deselected**, with no failures or skips. The earlier 16 failures were
 corrected in RNE dispatch selectors, retained-state projection, masked force
-publication and a stale site-feedback fixture. A separate earlier 35-file
-native API group passed **304 tests** at its recorded producing revision.
+publication and a stale site-feedback fixture. The complementary 35-file
+native API group was repeated at `f59d1224f` and passed **304 tests** with no
+failures, skips or warnings. The complete original finite-difference gate at
+that revision separately passed **14 native tests**, including the rich
+three-world inverse-force fixture and exact query rollback.
 The later force/recovery fixes passed 39 and 58 affected checks; these combine
 host contracts with real native physics and lifecycle execution.
 

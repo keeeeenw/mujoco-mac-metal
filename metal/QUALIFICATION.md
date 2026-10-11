@@ -34,12 +34,28 @@ observed failures:
   **58 checks in 6.17 seconds**. These include host contracts and actual native
   execution; they are not all GPU tests.
 
-The separate 35-file forward/inverse/query/derivative/plugin native selection
-passed **304 tests, 384 deselected in 156.09 seconds** at `fd79f3e90`. Its one
-immutable-index ownership warning was corrected in `783ce0d6d`; the affected
-actual flex inverse/lifecycle group then passed **10 tests, 8 deselected in
-25.18 seconds**, treating that warning as an error. This earlier 304-test result
-is not a claim that every case has been rerun at the later revision.
+The complementary 35-file forward/inverse/query/derivative/plugin native
+selection was repeated at `f59d1224feb872fc084aa011772f6a66de1b58a0`:
+**304 tests passed, 384 deselected in 151.61 seconds**, with no failures,
+skips or warnings. Its earlier immutable-index ownership warning was corrected
+in `783ce0d6d`; the affected flex inverse/lifecycle group separately passed
+**10 tests, 8 deselected in 25.18 seconds**, treating that warning as an error.
+Together the two complementary selections exercise 417 native cases; their
+runtime sources are identical, with only inventory and documentation changes
+between their producing revisions.
+
+The complete original `test_finite_difference_native_020.py` at `f59d1224f`
+then passed **14 native tests in 55.55 seconds**. This separately covers the
+rich three-world contact/equality/mocap/activation and stored-sensor fixture,
+including its original inverse-force derivative bounds, public transition and
+inverse matrices, exact query rollback, checkpoint/reset behavior,
+integrators, sleeping worlds and nonfinite-world isolation. Earlier derivative
+failures remain historical evidence; this result does not cover every possible
+model or derivative combination.
+
+The full CPU selection at `f59d1224f` passed **2,442 tests, 99 skipped,
+2,320 deselected in 99.38 seconds**, with MPS availability hidden. It does not
+qualify the skipped native cases.
 
 Full API and milestone acceptance still require the execution inventory,
 remaining feature combinations, final wheel and demo gates. The two terrain
