@@ -182,18 +182,23 @@ def test_failed_world_rolls_back_sensors_warmstarts_and_state_gpu(fail_stage):
   assert bool(np.all(np.isfinite(w0_qpos)))
 
   # Inject failure into world 1 specifically at the selected pipeline stage
+  injected_calls = []
   if fail_stage == "force":
-    orig_solver = sim._solver.run_device
+    # The retained RHS path solves both words directly. Hook the entrypoint
+    # actually used by this profile, not the dormant single-word method.
+    orig_solver = sim._solver.run_pair_device
     def fail_solver(*args, **kwargs):
-      acc, st = orig_solver(*args, **kwargs)
+      acc, low, st = orig_solver(*args, **kwargs)
+      injected_calls.append("force")
       st = st.clone()
       st[1] = 3
-      return acc, st
-    sim._solver.run_device = fail_solver
+      return acc, low, st
+    sim._solver.run_pair_device = fail_solver
   elif fail_stage == "constraint":
     orig_cc = sim._coupled_constraints.run_device
     def fail_cc(*args, **kwargs):
       coupled = orig_cc(*args, **kwargs)
+      injected_calls.append("constraint")
       st = coupled["status"].clone()
       st[1] = 4
       coupled["status"] = st
@@ -203,12 +208,14 @@ def test_failed_world_rolls_back_sensors_warmstarts_and_state_gpu(fail_stage):
     orig_int = sim._integrator.run_device
     def fail_int(*args, **kwargs):
       qpos, qvel, time, st = orig_int(*args, **kwargs)
+      injected_calls.append("integration")
       st = st.clone()
       st[1] = 5
       return qpos, qvel, time, st
     sim._integrator.run_device = fail_int
 
   sim.step(1, ctrl=np.array([[1.0], [1.0]], dtype=np.float32))
+  assert injected_calls, "failure injection must execute in the active pipeline"
 
   # 1. World 1 status is non-zero
   status = sim.state.status.cpu().numpy()
@@ -231,7 +238,7 @@ def test_failed_world_rolls_back_sensors_warmstarts_and_state_gpu(fail_stage):
 
   # 4. Sticky failure status: removing injection still keeps world 1 frozen
   if fail_stage == "force":
-    sim._solver.run_device = orig_solver
+    sim._solver.run_pair_device = orig_solver
   elif fail_stage == "constraint":
     sim._coupled_constraints.run_device = orig_cc
   elif fail_stage == "integration":
