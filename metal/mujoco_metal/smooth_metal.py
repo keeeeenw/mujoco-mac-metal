@@ -46,9 +46,11 @@ def position_context_shapes(model, batch, *, mass_storage="dense", component_nnz
                 pose_status=(batch,), local_inertia=(batch, model.nbody, 36))
   if mass_storage == "dense":
     shapes["mass_matrix"] = (batch, model.nv, model.nv)
+    shapes["mass_matrix_low"] = (batch, model.nv, model.nv)
     shapes["tendon_armature_matrix"] = (batch, model.nv, model.nv)
   elif mass_storage == "block_sparse":
     shapes["mass_blocks"] = (batch, component_nnz)
+    shapes["mass_blocks_low"] = (batch, component_nnz)
     shapes["tendon_armature_blocks"] = (batch, component_nnz)
   else:
     raise ValueError("mass_storage must be 'dense' or 'block_sparse'")
@@ -82,6 +84,7 @@ _DEVICE_ARRAYS = (
     "dof_armature",
     "dof_simplenum",
     "dof_M0",
+    "dof_M0_low",
     "gravity",
     "tendon_armature",
 )
@@ -155,6 +158,12 @@ class MetalSmoothDynamics:
     if np.any(~np.isfinite(effective_tendon_armature)):
       raise ValueError("effective tendon armature must be finite")
     host = _prepare_host_arrays(model)
+    # Compilation constants are binary64 on the host. Preserve their residual
+    # at lowering; no CPU dynamics or mass query is used while stepping.
+    raw_m0 = np.asarray(model.dof_M0, dtype=np.float64).reshape(-1)
+    host["dof_M0_low"] = ((raw_m0 - host["dof_M0"][:raw_m0.size])
+                          .astype(np.float32) if raw_m0.size
+                          else np.zeros(1, dtype=np.float32))
     # ModelDescriptor intentionally does not mirror MjModel.ntree. Build this
     # immutable layout from its lowered body-tree and DOF-owner arrays.
     tree_layout = compile_tree_mass_layout(
@@ -292,6 +301,7 @@ class MetalSmoothDynamics:
         {
             "mass": batch_size * nv * nv if mass_storage == "dense" else 0,
             "mass_blocks": batch_size * self._tree_mass_nnz if mass_storage == "block_sparse" else 0,
+            "mass_low": batch_size * (nv * nv if mass_storage == "dense" else self._tree_mass_nnz),
             "mass_sparse_product": batch_size * nv,
             "mass_armature": batch_size * (nv * nv if mass_storage == "dense" else self._tree_mass_nnz),
             "tree_layout": self._tree_layout_device_size,
@@ -339,6 +349,8 @@ class MetalSmoothDynamics:
                  if mass_storage == "dense" else None),
         "mass_blocks": (buffer(batch_size * self._tree_mass_nnz)
                         if mass_storage == "block_sparse" else None),
+        "mass_low": buffer(batch_size * (nv * nv if mass_storage == "dense"
+                                        else self._tree_mass_nnz)),
         "mass_sparse_product": buffer(batch_size * nv),
         "pose_status": torch.zeros(batch_size, dtype=torch.int32,
                                     device=device),
@@ -441,6 +453,7 @@ class MetalSmoothDynamics:
     if self._workspace["mass_blocks"] is not None:
       self._workspace["mass_blocks"].zero_()
     self._workspace["mass_armature"].zero_()
+    self._workspace["mass_low"].zero_()
     self._workspace["root_com"].zero_()
     self._workspace["mass_zero_blocks"].zero_()
     self._workspace["cdof"].zero_()
@@ -633,7 +646,8 @@ class MetalSmoothDynamics:
     and no device storage is allocated by this method.
     """
     names = ("poses", "root_com", "cdof", "pose_status", "mass_matrix",
-             "mass_blocks", "mass_block_layout", "tendon_armature_matrix",
+             "mass_matrix_low", "mass_blocks", "mass_blocks_low",
+             "mass_block_layout", "tendon_armature_matrix",
              "tendon_armature_blocks")
     source = {}
     for name in names:
@@ -706,7 +720,7 @@ class MetalSmoothDynamics:
     return result
 
   def _validate_cached_pose_fields(self, context, batch):
-    """Reject replaced/corrupted borrowed FK pose views before VEL writes."""
+    """Reject corrupted retained position products before any VEL writes."""
     poses = context.get("poses") if isinstance(context, dict) else None
     pose_names = {name.split(".", 1)[1]
                   for name in self._position_shapes if name.startswith("poses.")}
@@ -723,6 +737,21 @@ class MetalSmoothDynamics:
               and value.device.index != self._fk._device.index)
           or not value.is_contiguous()):
         raise ValueError(f"position context poses.{name} has invalid tensor metadata")
+    for name, shape in self._position_shapes.items():
+      if name.startswith("poses."):
+        continue
+      key = "_local_inertia" if name == "local_inertia" else name
+      value = context.get(key)
+      if value is None and name.startswith("tendon_armature_"):
+        continue
+      dtype = self._torch.int32 if name == "pose_status" else self._torch.float32
+      if (not isinstance(value, self._torch.Tensor)
+          or tuple(value.shape) != shape or value.dtype != dtype
+          or value.device.type != self._fk._device.type
+          or (self._fk._device.index is not None
+              and value.device.index != self._fk._device.index)
+          or not value.is_contiguous()):
+        raise ValueError(f"position context {name} has invalid tensor metadata")
 
   def _validate_world_mask(self, world_mask, batch):
     """Validate an optional world mask before any smooth-stage dispatch."""
@@ -918,6 +947,7 @@ class MetalSmoothDynamics:
         mass_output, arrays["dof_simplenum"], arrays["dof_M0"],
         lists["dof_ids"], lists["counts"], lists["list_dims"],
         self._tree_layout_device, w["mass_dims"], w["mass_layout_dims"],
+        w["mass_low"], arrays["dof_M0_low"],
         threads=(batch,), group_size=(1,))
     if _position_only:
       # POS owns FK/COM, cdof/local inertia and CRBA only.  In particular it
@@ -990,11 +1020,14 @@ class MetalSmoothDynamics:
     }
     if selected_mass_storage == "dense":
       result["mass_matrix"] = w["mass"][: batch * nv * nv].reshape(batch, nv, nv)
+      result["mass_matrix_low"] = w["mass_low"][: batch * nv * nv].reshape(batch, nv, nv)
       if tendon_armature_output is not None:
         result["tendon_armature_matrix"] = tendon_armature_output[
             :batch * nv * nv].reshape(batch, nv, nv)
     else:
       result["mass_blocks"] = w["mass_blocks"][
+          :batch * self._tree_mass_nnz].reshape(batch, self._tree_mass_nnz)
+      result["mass_blocks_low"] = w["mass_low"][
           :batch * self._tree_mass_nnz].reshape(batch, self._tree_mass_nnz)
       result["mass_block_layout"] = {
           "tree_dofadr": self._tree_dofadr.copy(),
@@ -1109,13 +1142,15 @@ class MetalSmoothDynamics:
     batch = source.shape[0]
     nv, nb = self.model.nv, self.model.nbody
     _validate_workspace_index_capacity(
-        batch, {"dense_mass_query": batch * nv * nv},
+        batch, {"dense_mass_query": batch * nv * nv,
+                "dense_mass_query_low": batch * nv * nv},
         {"nv": nv, "dense_mass_stride": nv * nv, "batch": batch})
     poses = self._fk.run(source, mocap_pos, mocap_quat)
     torch = self._torch
     output = torch.empty(
         max(batch * nv * nv, 1), dtype=torch.float32, device=self._fk._device
     )
+    output_low = torch.zeros_like(output)
     root_com = torch.empty(
         max(batch * nb * 3, 1), dtype=torch.float32, device=self._fk._device
     )
@@ -1172,9 +1207,11 @@ class MetalSmoothDynamics:
         output, arrays["dof_simplenum"], arrays["dof_M0"],
         lists["dof_ids"], lists["counts"], lists["list_dims"],
         self._tree_layout_device, args[21], layout_dims,
+        output_low, arrays["dof_M0_low"],
         threads=(batch,), group_size=(1,))
     return {
         "mass_matrix": output[: batch * nv * nv].reshape(batch, nv, nv),
+        "mass_matrix_low": output_low[: batch * nv * nv].reshape(batch, nv, nv),
         "root_com": root_com,
         "cdof": cdof,
         "local_inertia": local_inertia,
@@ -1185,6 +1222,15 @@ class MetalSmoothDynamics:
   def mass_matrix(self, qpos_batch):
     """Compute dense generalized inertia for a batch, returning MPS output."""
     return self._compute_mass_matrix(qpos_batch)["mass_matrix"]
+
+  def mass_matrix_pair(self, qpos_batch):
+    """Return owned dense mass high/low words at the explicit query boundary.
+
+    Compiled simple rows retain their source constant residuals. Generic CRBA
+    rows currently publish zero residuals; this does not claim binary64 CRBA.
+    """
+    result = self._compute_mass_matrix(qpos_batch)
+    return result["mass_matrix"], result["mass_matrix_low"]
 
   def run(self, qpos_batch, qvel_batch, mocap_pos=None, mocap_quat=None):
     """Return batched mass matrices and inertial/gravity bias on MPS."""
@@ -1301,6 +1347,7 @@ class MetalSmoothDynamics:
     self._bias_kernel(*args, threads=(batch,), group_size=(1,))
     return {
         "mass_matrix": computed["mass_matrix"],
+        "mass_matrix_low": computed["mass_matrix_low"],
         "qfrc_bias": bias[: batch * nv].reshape(batch, nv),
     }
 

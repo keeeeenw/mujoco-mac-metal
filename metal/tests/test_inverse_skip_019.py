@@ -109,6 +109,7 @@ def test_inverse_discrete_mass_pair_product_uses_compiled_component_pair_map():
   sim._component_mass_enabled = True
   sim._component_solver = SimpleNamespace()
   blocks = torch.tensor([[2.0, 0.25, 0.25, 3.0, 4.0]], dtype=torch.float32)
+  block_low = torch.tensor([[2e-8, -3e-8, -3e-8, 4e-8, -5e-8]], dtype=torch.float32)
   armature = torch.tensor([[0.125, 0.0, 0.0, 0.0, 0.5]], dtype=torch.float32)
   vector = torch.tensor([[1.25, -2.0, 3.5]], dtype=torch.float32)
   vector_low = torch.tensor([[2.0**-24, -2.0**-22, 2.0**-23]],
@@ -121,15 +122,16 @@ def test_inverse_discrete_mass_pair_product_uses_compiled_component_pair_map():
   }
   seen = []
   def run_pair(actual_blocks, vector_hi, actual_low, *, dof_ids, counts,
-               tendon_armature_blocks, diagonal_add):
+               tendon_armature_blocks, diagonal_add, mass_blocks_low):
     seen.append((actual_blocks is blocks, vector_hi is vector,
                  actual_low is vector_low, dof_ids, counts,
-                 tendon_armature_blocks is armature))
+                 tendon_armature_blocks is armature, mass_blocks_low is block_low))
     map_layout = dict(layout, nv=3, ncomponent=2, nnz=5)
     active = np.ones((1, 3), dtype=bool)
     x = vector_hi.numpy().astype(np.float64) + actual_low.numpy().astype(np.float64)
     result = component_mass_matvec_cpu(
-        actual_blocks.numpy(), map_layout, x, active_dof=active,
+        actual_blocks.numpy().astype(np.float64) + mass_blocks_low.numpy(),
+        map_layout, x, active_dof=active,
         tendon_armature_blocks=tendon_armature_blocks.numpy())
     hi = torch.tensor(result.astype(np.float32), dtype=torch.float32)
     lo = torch.tensor((result - hi.numpy().astype(np.float64)).astype(np.float32),
@@ -138,12 +140,18 @@ def test_inverse_discrete_mass_pair_product_uses_compiled_component_pair_map():
   sim._component_solver.run_mass_matvec_pair_device = run_pair
   high, low = MetalSimulation._inverse_discrete_mass_pair_product(
       sim, {"mass_blocks": blocks, "mass_block_layout": layout,
+            "mass_blocks_low": block_low,
             "tendon_armature_blocks": armature}, vector, vector_low)
   assert len(seen) == 1 and seen[0][:3] == (True, True, True)
   assert seen[0][3:5] == (None, None) and seen[0][5]
+  assert seen[0][6]
   effective = np.array([[3.0, 0.0, 0.25],
                         [0.0, 4.5, 0.0],
                         [0.25, 0.0, 2.125]], dtype=np.float64)
+  residual = block_low.numpy()[0]
+  effective += np.array([[residual[3], 0, residual[2]],
+                        [0, residual[4], 0],
+                        [residual[1], 0, residual[0]]])
   oracle = effective @ (vector.numpy().astype(np.float64)[0]
                        + vector_low.numpy().astype(np.float64)[0])
   actual = high.numpy().astype(np.float64)[0] + low.numpy().astype(np.float64)[0]

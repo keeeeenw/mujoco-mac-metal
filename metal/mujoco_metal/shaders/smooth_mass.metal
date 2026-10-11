@@ -412,6 +412,8 @@ kernel void compiled_simple_mass(
     device const int* tree_layout [[buffer(6)]],
     constant uint* dims [[buffer(7)]],
     constant int* layout [[buffer(8)]],
+    device float* mass_low [[buffer(9)]],
+    device const float* dof_M0_low [[buffer(10)]],
     uint world [[thread_position_in_grid]]) {
   uint nv=dims[2], batch=dims[3];
   if (world >= batch || layout[5+world] == 0) return;
@@ -424,7 +426,6 @@ kernel void compiled_simple_mass(
   uint list_base=world*uint(max(awake_dims[1],1));
   for (int k=0; k<awake_counts[world*3+2]; ++k) {
     uint i=uint(dof_ids[list_base+uint(k)]);
-    if (dof_simplenum[i] == 0) continue;
     uint width=nv, row=i, offset=0;
     if (sparse) {
       int component=tree_layout[owner_base+i];
@@ -433,11 +434,18 @@ kernel void compiled_simple_mass(
       row=uint(tree_layout[local_base+i]);
       offset=uint(tree_layout[offset_base+component]);
     }
+    // Generic CRBA has no residual producer yet. Clear only this dispatch's
+    // awake rows, preserving every unselected world and retained sleeping row.
+    for (uint col=0; col<width; ++col)
+      mass_low[base+offset+row*width+col]=0.0f;
+    if (dof_simplenum[i] == 0) continue;
     for (uint col=0; col<width; ++col) {
       mass[base+offset+row*width+col]=0.0f;
       mass[base+offset+col*width+row]=0.0f;
+      mass_low[base+offset+col*width+row]=0.0f;
     }
     mass[base+offset+row*width+row]=dof_M0[i];
+    mass_low[base+offset+row*width+row]=dof_M0_low[i];
   }
 }
 

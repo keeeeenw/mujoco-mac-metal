@@ -3471,6 +3471,7 @@ class MetalSimulation:
         rhs, workspace, rhs_index=rhs_index, world_mask=world_mask)
     solution, component_status = self._component_solver.run_device(
         dynamics["mass_blocks"], workspace,
+        mass_blocks_low=dynamics.get("mass_blocks_low"),
         dof_ids=(awake_lists["dof_ids"] if awake_lists is not None else None),
         counts=(awake_lists["counts"] if awake_lists is not None else None),
         tendon_armature_blocks=dynamics.get("tendon_armature_blocks"),
@@ -5753,6 +5754,12 @@ class MetalSimulation:
       low_product_hi, low_product_low = _dense_jacobian_pair_matvec(mass, low)
       product_hi, product_low = _pair_add(
           product_hi, product_low, low_product_hi, low_product_low)
+      mass_low = dynamics.get("mass_matrix_low")
+      if mass_low is not None:
+        for word in (high, low):
+          p_hi, p_low = _dense_jacobian_pair_matvec(mass_low, word)
+          product_hi, product_low = _pair_add(
+              product_hi, product_low, p_hi, p_low)
       residual_hi, residual_low = _pair_add(
           rhs, rhs_low, -product_hi, -product_low)
       delta_hi, delta_low, current_status = solve_pair(
@@ -5775,7 +5782,13 @@ class MetalSimulation:
           dynamics["mass_matrix"], vector)
       low_hi, low_lo = _dense_jacobian_pair_matvec(
           dynamics["mass_matrix"], vector_low)
-      return _pair_add(high, low, low_hi, low_lo)
+      high, low = _pair_add(high, low, low_hi, low_lo)
+      mass_low = dynamics.get("mass_matrix_low")
+      if mass_low is not None:
+        for word in (vector, vector_low):
+          p_hi, p_low = _dense_jacobian_pair_matvec(mass_low, word)
+          high, low = _pair_add(high, low, p_hi, p_low)
+      return high, low
 
     if self._component_solver is None:
       raise RuntimeError("component mass pair requires a compiled solver")
@@ -5787,6 +5800,7 @@ class MetalSimulation:
     counts = awake_lists.get("counts") if awake_lists is not None else None
     return self._component_solver.run_mass_matvec_pair_device(
         blocks, vector, vector_low, dof_ids=dof_ids, counts=counts,
+        mass_blocks_low=dynamics.get("mass_blocks_low"),
         tendon_armature_blocks=armature,
         diagonal_add=dynamics.get("mass_diagonal_add"))
 

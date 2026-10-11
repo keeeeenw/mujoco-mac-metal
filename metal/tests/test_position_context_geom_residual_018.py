@@ -78,6 +78,7 @@ def _complete_dynamics(obj, poses):
       "cdof": torch.zeros((batch, model.nv, 6)),
       "pose_status": torch.zeros((batch,), dtype=torch.int32),
       "mass_matrix": torch.zeros((batch, model.nv, model.nv)),
+      "mass_matrix_low": torch.zeros((batch, model.nv, model.nv)),
   }
   return result
 
@@ -143,9 +144,9 @@ def test_velocity_dispatch_validates_cached_residual_and_mask_before_bias():
   stub, poses = _smooth_stub()
   calls = []
   stub._position_capture = 3
-  context = {"_owner": stub, "_epoch": 0, "_capture": 3,
-             "poses": dict(poses), "cdof": torch.zeros((2, 3, 6)),
-             "_local_inertia": torch.zeros((2, 3, 36))}
+  context = _complete_dynamics(stub, dict(poses))
+  context.update(_owner=stub, _epoch=0, _capture=3,
+                 _local_inertia=torch.zeros((2, 3, 36)))
   stub._run_velocity_bias = lambda *args, **kwargs: calls.append(1)
   stub._workspace["all_awake_lists"] = {}
   stub._validate_cached_pose_fields = MethodType(
