@@ -43,7 +43,8 @@ constraint-row consumer correction then passed 14 dense/component and alternate
 CCD operator checks and the original native-CCD box trajectory. The complete
 40-case terrain matrix at `10d9bf136` then finished with **38 passed, 2 failed**.
 All former native-CCD cylinder/box failures pass; zero-margin alternate-CCD box
-trajectories in both geom orders remain correction gates. The four rejected-seed
+trajectories in both geom orders were correction gates at that revision and
+subsequently pass after the retained-velocity correction described below. The four rejected-seed
 warm-selection failures were subsequently corrected by retaining equality
 regularizers and comparing original-operator paired objectives. All eight native
 accepted/rejected boundary cases now pass; further groups passed 85 native
@@ -73,8 +74,17 @@ passes 90 cases at that revision. Stronger active 2D/3D elastic invariants expos
 false forces after rigid transformation; `15787fa29` corrects their retained
 geometry, passing all four new physical cases and 90 affected host/native checks.
 These demonstrate nonzero carrier reaction, momentum balance and replay, not
-complete deformable coverage. Both alternate-CCD box terrain cases still fail
+complete deformable coverage. Both alternate-CCD box terrain cases failed
 at that source with their original trajectory bounds.
+
+The retained-velocity bias correction at `ff659a24e` passes 71 affected
+host/native checks and the complete CPU selection (2,455 passed, 99 skipped).
+Both original alternate-CCD box trajectories now pass their unchanged gates;
+the full 40-case terrain matrix is under requalification. Separately, a
+34-case active simplex work/energy/stability gate at `15787fa29` covers two
+stiffnesses, two timesteps and all four integrators with deformed free carriers.
+These are source-specific results; full heightfield/deformable composition,
+final wheel/demo checks and milestones 005–020 remain open.
 
 The original rigid-SDF deadline and mesh/bowl/torus failures are historical
 evidence. The seven original bundled rigid-SDF fixtures now pass in the

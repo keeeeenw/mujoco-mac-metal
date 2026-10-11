@@ -1,5 +1,32 @@
 # Development qualification — 2026-10-11
 
+## Retained velocity in inertial bias — 2026-10-11
+
+Revision `ff659a24e` feeds the simulator's represented high/low/tail velocity
+into compensated comVel/RNE calculations, including cached velocity stages and
+RK4 stage state. Standalone device tensors have zero residuals; the explicit
+host-input entry retains supplied velocity residuals. The native dispatch keeps
+its 31-buffer binding limit, and memory admission includes the packed payload.
+
+A two-world public simulator fixture with binary-exact pose and inertia
+reproduced a bias error of `4.19095164e-9`. Its corrected result agrees with the
+independent CPU oracle within `2e-13`, including actual tensor mutation,
+replacement, selected reset and checkpoint restoration. CPU forward/step calls
+are forbidden during native evaluation. This isolates velocity loss; it does
+not establish source-rounded precision for general articulated inertia/CDOF.
+
+The affected native/host group passed **71 tests in 66.47 seconds**, including
+the complete original derivative file, cached POS/VEL, retained-state lifecycle,
+invalid-metadata ownership and actual workspace accounting. The complete CPU
+selection passed **2,455 tests, 99 skipped, 2,359 deselected in 99.54 seconds**,
+with MPS availability hidden. Skips do not establish native qualification.
+
+Both original zero-margin alternate-CCD box terrain orders then passed at that
+revision: **2 passed, 48 deselected in 50.04 seconds**, preserving their original
+force, four-step trajectory, checkpoint bounds and solver budgets. Their earlier
+failures below are historical. The full 40-case terrain matrix is being repeated
+against this source; complete heightfield and milestone acceptance remain open.
+
 ## Public API corrections and retained state — 2026-10-11
 
 The complete remaining 26-file native API selection at producing revision
@@ -58,8 +85,9 @@ The full CPU selection at `f59d1224f` passed **2,442 tests, 99 skipped,
 qualify the skipped native cases.
 
 Full API and milestone acceptance still require the execution inventory,
-remaining feature combinations, final wheel and demo gates. The two terrain
-trajectory failures below remain open. No new performance result is claimed.
+remaining feature combinations, final wheel and demo gates. The complete terrain
+matrix remains under requalification. No new performance result
+is claimed.
 
 ## Derivative residuals and active elastic materials — 2026-10-11
 
@@ -108,7 +136,8 @@ No native simulation path receives oracle forces, states or energy values.
 
 The two unchanged alternate-CCD box terrain cases were repeated at `15787fa29`:
 **both failed, 48 tests deselected in 52.10 seconds**, with the same maximum
-acceleration violation of `2.81290692`. They remain correction gates.
+acceleration violation of `2.81290692`. The later retained-velocity correction
+above clears both original cases; this failed result belongs to its source.
 
 ## Complete primitive-terrain matrix — 2026-10-11
 
@@ -121,8 +150,9 @@ trajectory steps and checkpoint replay. The original `rtol=atol=2e-3`
 trajectory bounds and solver budgets were retained.
 
 All four previously failing native-CCD cylinder/box cases now pass. The
-remaining failures are the zero-margin **alternate-CCD box** cases in both
-geom orders; rotational acceleration differs by up to `2.81290692` on the
+remaining failures at that producing revision are the zero-margin
+**alternate-CCD box** cases in both geom orders; rotational acceleration differs
+by up to `2.81290692` on the
 original trajectory. This is not complete heightfield qualification or full
 milestone closure. The preceding 34-pass/6-failure result below belongs to
 its earlier producing revision.
@@ -132,7 +162,8 @@ identical represented state, native witnesses match the pinned CPU engine
 and native acceleration agrees to about `1.2e-11`; the independent CPU
 trajectory later selects a different alternate-CCD contact result after a
 tiny accumulated state difference. That evidence identifies a precision and
-trajectory gate still requiring correction. It does not justify removing the
+trajectory gate subsequently corrected by consuming retained velocity words.
+It does not justify removing the
 original gate or replacing trajectory qualification with same-state checks.
 
 ```sh

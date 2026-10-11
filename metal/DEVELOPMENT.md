@@ -68,8 +68,16 @@ equality native group passes 90 cases at that revision. Active elastic
 rigid-motion, stiffness-scaling, carrier-reaction and momentum-balance tests
 subsequently exposed retained-geometry errors; `15787fa29` fixes them and passes
 four new physical cases plus 90 affected host/native regressions. The full
-deformable contact, energy and stability qualification remains open, as do the
-two original alternate-CCD box terrain trajectories.
+deformable contact, energy and stability qualification remains open.
+
+A 34-case active simplex work/energy/stability gate at the same production
+source checks two stiffnesses and timesteps across all four integrators,
+deformed free-carrier trajectories and replay. A later retained-velocity bias
+correction at `ff659a24e` passes 71 affected host/native checks and the full CPU
+selection (2,455 passed, 99 skipped). Both original alternate-CCD box terrain
+cases pass their unchanged trajectory bounds after that correction; the complete
+terrain matrix is under requalification. These gates do not establish complete
+material/contact composition or general source-rounded dynamics precision.
 
 These results cover preserved source compositions, not the entire current
 checkout. See [publication qualification](QUALIFICATION.md) and [milestone status](STATUS.md). Native warning/autoreset semantics, final native
