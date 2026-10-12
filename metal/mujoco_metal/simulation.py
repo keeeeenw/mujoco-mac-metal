@@ -1816,72 +1816,74 @@ class MetalSimulation:
     for index in (src_i, dst_i):
       if not 0 <= index < self.batch_size:
         raise ValueError("environment index out of range")
-    plugin_map = {_plugin_state_key(p): p for p in getattr(self, "_native_plugins", ())}
-    plugin_targets = {}
-    for key, plugin in plugin_map.items():
-      payload = plugin.snapshot()
-      plugin_targets[key] = _copy_plugin_row(payload, src_i, dst_i, self.batch_size)
-    active_plugins = {key: plugin_map[key] for key, value in plugin_targets.items()
-                      if value is not None}
-    active_targets = {key: plugin_targets[key] for key in active_plugins}
-    _preflight_plugin_restores(active_plugins, active_targets, env_ids=[dst_i])
-    # A restore implementation can still fail on its later, real commit call.
-    # Apply it transactionally before touching any simulation-owned rows.
-    _apply_plugin_restores(active_plugins, active_targets, env_ids=[dst_i])
-    gen = self._state.copy_environment(src, dst)
-    fk = getattr(getattr(self, "_smooth", None), "_fk", None)
-    if fk is not None:
-      fk.invalidate_cache(env_ids=[dst_i])
-    # Full simulation state follows the device rows: retained warmstarts,
-    # stored sensor samples and held per-call inputs. Caches invalidate.
-    cc = getattr(self, "_coupled_constraints", None)
-    if cc is not None and int(cc.descriptor.nr) > 0:
-      w = cc._workspace["workspace_debug"].reshape(
-          self.batch_size, cc._debug_stride)
-      nr = cc.descriptor.nr
-      w[dst_i, nr * nr + 3 * nr:nr * nr + 4 * nr] = w[src_i, nr * nr + 3 * nr:nr * nr + 4 * nr].clone()
-    if getattr(self, "_sensordata", None) is not None:
-      self._sensordata[dst_i] = self._sensordata[src_i].clone()
-    from mujoco_metal.sensor_lifecycle import copy_sensor_diagnostic_row
-    copy_sensor_diagnostic_row(self, src_i, dst_i)
-    energy = getattr(self, "_energy", None)
-    if energy is not None:
-      energy[dst_i] = energy[src_i].clone()
-      computed = getattr(self, "_energy_computed", None)
-      if computed is not None:
-        computed[dst_i] = computed[src_i].clone()
-    seen_low = set()
-    for program in (getattr(self, "_sensors", None),
-                    getattr(self, "_raw_sensor_program", None)):
-      if program is None or id(program) in seen_low:
-        continue
-      seen_low.add(id(program))
-      low = getattr(program, "_s_state_out_low", None)
-      if low is not None:
-        low[dst_i] = low[src_i].clone()
-    for held in ("_control", "_body_wrench", "_applied_force"):
-      tensor = getattr(self, held, None)
-      if tensor is not None:
-        tensor[dst_i] = tensor[src_i].clone()
-    if getattr(self, "_delay", None) is not None:
-      self._delay.copy_row(src_i, dst_i)
-      self._sync_history_from_delay(env_ids=[dst_i])
-    if getattr(self, "_delay", None) is not None:
-      self._delay.copy_row(src_i, dst_i)
-    if getattr(self, "_islands", None) is not None:
-      self._islands.tree_asleep[dst_i] = self._islands.tree_asleep[src_i].copy()
-      self._islands._stationary_steps[dst_i] = self._islands._stationary_steps[src_i].copy()
-    if getattr(self, "_sleep_schedule", None) is not None:
-      self._sleep_schedule.tree_state[dst_i].copy_(
-          self._sleep_schedule.tree_state[src_i].clone())
-      self._sleep_schedule.tree_awake[dst_i].copy_(
-          self._sleep_schedule.tree_awake[src_i].clone())
-    self._assembled_system_valid = False
-    if hasattr(self, "_last_coupled"):
-      self._last_coupled = None
-    if hasattr(self, "_last_coupled_generation"):
-      self._last_coupled_generation = None
-    return gen
+    from mujoco_metal.sensor_lifecycle import lifecycle_transaction
+    with lifecycle_transaction(self):
+      plugin_map = {_plugin_state_key(p): p for p in getattr(self, "_native_plugins", ())}
+      plugin_targets = {}
+      for key, plugin in plugin_map.items():
+        payload = plugin.snapshot()
+        plugin_targets[key] = _copy_plugin_row(payload, src_i, dst_i, self.batch_size)
+      active_plugins = {key: plugin_map[key] for key, value in plugin_targets.items()
+                        if value is not None}
+      active_targets = {key: plugin_targets[key] for key in active_plugins}
+      _preflight_plugin_restores(active_plugins, active_targets, env_ids=[dst_i])
+      # A restore implementation can still fail on its later, real commit call.
+      # Apply it transactionally before touching any simulation-owned rows.
+      _apply_plugin_restores(active_plugins, active_targets, env_ids=[dst_i])
+      gen = self._state.copy_environment(src, dst)
+      fk = getattr(getattr(self, "_smooth", None), "_fk", None)
+      if fk is not None:
+        fk.invalidate_cache(env_ids=[dst_i])
+      # Full simulation state follows the device rows: retained warmstarts,
+      # stored sensor samples and held per-call inputs. Caches invalidate.
+      cc = getattr(self, "_coupled_constraints", None)
+      if cc is not None and int(cc.descriptor.nr) > 0:
+        w = cc._workspace["workspace_debug"].reshape(
+            self.batch_size, cc._debug_stride)
+        nr = cc.descriptor.nr
+        w[dst_i, nr * nr + 3 * nr:nr * nr + 4 * nr] = w[src_i, nr * nr + 3 * nr:nr * nr + 4 * nr].clone()
+      if getattr(self, "_sensordata", None) is not None:
+        self._sensordata[dst_i] = self._sensordata[src_i].clone()
+      from mujoco_metal.sensor_lifecycle import copy_sensor_diagnostic_row
+      copy_sensor_diagnostic_row(self, src_i, dst_i)
+      energy = getattr(self, "_energy", None)
+      if energy is not None:
+        energy[dst_i] = energy[src_i].clone()
+        computed = getattr(self, "_energy_computed", None)
+        if computed is not None:
+          computed[dst_i] = computed[src_i].clone()
+      seen_low = set()
+      for program in (getattr(self, "_sensors", None),
+                      getattr(self, "_raw_sensor_program", None)):
+        if program is None or id(program) in seen_low:
+          continue
+        seen_low.add(id(program))
+        low = getattr(program, "_s_state_out_low", None)
+        if low is not None:
+          low[dst_i] = low[src_i].clone()
+      for held in ("_control", "_body_wrench", "_applied_force"):
+        tensor = getattr(self, held, None)
+        if tensor is not None:
+          tensor[dst_i] = tensor[src_i].clone()
+      if getattr(self, "_delay", None) is not None:
+        self._delay.copy_row(src_i, dst_i)
+        self._sync_history_from_delay(env_ids=[dst_i])
+      if getattr(self, "_delay", None) is not None:
+        self._delay.copy_row(src_i, dst_i)
+      if getattr(self, "_islands", None) is not None:
+        self._islands.tree_asleep[dst_i] = self._islands.tree_asleep[src_i].copy()
+        self._islands._stationary_steps[dst_i] = self._islands._stationary_steps[src_i].copy()
+      if getattr(self, "_sleep_schedule", None) is not None:
+        self._sleep_schedule.tree_state[dst_i].copy_(
+            self._sleep_schedule.tree_state[src_i].clone())
+        self._sleep_schedule.tree_awake[dst_i].copy_(
+            self._sleep_schedule.tree_awake[src_i].clone())
+      self._assembled_system_valid = False
+      if hasattr(self, "_last_coupled"):
+        self._last_coupled = None
+      if hasattr(self, "_last_coupled_generation"):
+        self._last_coupled_generation = None
+      return gen
 
   def _assert_contact_override_binding(self):
     """Reject live option drift before touching state or cached workspaces."""
@@ -2302,63 +2304,65 @@ class MetalSimulation:
     )
     if not prepared[0].size:
       return self._state.generation
-    # Reset plugin-owned state before committing simulation-owned state. A
-    # plugin may mutate its state and then raise; its prior snapshot is restored
-    # transactionally while qpos, histories, warmstarts and held inputs remain
-    # untouched.
-    _reset_plugins_transactionally(getattr(self, "_native_plugins", ()),
-                                   env_ids=env_ids)
-    gen = self._state.reset(_prepared=prepared)
-    if self._energy is not None:
-      if env_ids is None:
-        self._energy.zero_()
-      else:
-        ids = self._state._env_ids(env_ids)
-        if ids.size:
-          self._energy[ids.tolist()] = 0.0
-      computed = getattr(self, "_energy_computed", None)
-      if computed is not None:
+    from mujoco_metal.sensor_lifecycle import lifecycle_transaction
+    with lifecycle_transaction(self):
+      # Reset plugin-owned state before committing simulation-owned state. A
+      # plugin may mutate its state and then raise; its prior snapshot is restored
+      # transactionally while qpos, histories, warmstarts and held inputs remain
+      # untouched.
+      _reset_plugins_transactionally(getattr(self, "_native_plugins", ()),
+                                     env_ids=env_ids)
+      gen = self._state.reset(_prepared=prepared)
+      if self._energy is not None:
         if env_ids is None:
-          computed.zero_()
-        elif ids.size:
-          computed[ids.tolist()] = 0
-    self._clear_held_inputs(env_ids)
-    if getattr(self, "_coupled_constraints", None) is not None:
-      self._coupled_constraints.clear_warmstart(env_ids=env_ids)
-    if getattr(self, "_delay", None) is not None:
-      self._delay.reset(env_ids=env_ids)
-      self._sync_delay_from_history(env_ids=env_ids)
-    if getattr(self, "_sensordata", None) is not None:
-      # Stored step samples are state: reset zeroes selected worlds.
-      if env_ids is None:
-        self._sensordata.zero_()
-      else:
-        ids = self._state._env_ids(env_ids)
-        if ids.size:
-          self._sensordata[ids.tolist()] = 0.0
-    self._clear_sensor_output_low(
-        None if env_ids is None else self._state._env_ids(env_ids))
-    from mujoco_metal.sensor_lifecycle import clear_sensor_diagnostics
-    clear_sensor_diagnostics(self, env_ids)
-    if getattr(self, "_islands", None) is not None:
-      self._islands.wake_all(env_ids=env_ids)
-    # DeviceState.reset invokes the registered `_handle_state_reset` callback,
-    # which resets the scheduler and seeds retained FK poses for these rows.
-    # Do not reset it a second time here: that would clear the just-established
-    # reset/cache epoch independently of the state transaction.
-    if getattr(self, "_flex", None) is not None:
-      dyn = self._smooth.run_device(
-          self._state._qpos, self._state._qvel,
-          self._state._mpos, self._state._mquat)
-      self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
-    self._assembled_system_valid = False
-    self._accepted_step = None
-    if hasattr(self, "_last_coupled"):
-      self._last_coupled = None
-    if hasattr(self, "_last_coupled_generation"):
-      self._last_coupled_generation = None
-    self._step1_record = None
-    return gen
+          self._energy.zero_()
+        else:
+          ids = self._state._env_ids(env_ids)
+          if ids.size:
+            self._energy[ids.tolist()] = 0.0
+        computed = getattr(self, "_energy_computed", None)
+        if computed is not None:
+          if env_ids is None:
+            computed.zero_()
+          elif ids.size:
+            computed[ids.tolist()] = 0
+      self._clear_held_inputs(env_ids)
+      if getattr(self, "_coupled_constraints", None) is not None:
+        self._coupled_constraints.clear_warmstart(env_ids=env_ids)
+      if getattr(self, "_delay", None) is not None:
+        self._delay.reset(env_ids=env_ids)
+        self._sync_delay_from_history(env_ids=env_ids)
+      if getattr(self, "_sensordata", None) is not None:
+        # Stored step samples are state: reset zeroes selected worlds.
+        if env_ids is None:
+          self._sensordata.zero_()
+        else:
+          ids = self._state._env_ids(env_ids)
+          if ids.size:
+            self._sensordata[ids.tolist()] = 0.0
+      self._clear_sensor_output_low(
+          None if env_ids is None else self._state._env_ids(env_ids))
+      from mujoco_metal.sensor_lifecycle import clear_sensor_diagnostics
+      clear_sensor_diagnostics(self, env_ids)
+      if getattr(self, "_islands", None) is not None:
+        self._islands.wake_all(env_ids=env_ids)
+      # DeviceState.reset invokes the registered `_handle_state_reset` callback,
+      # which resets the scheduler and seeds retained FK poses for these rows.
+      # Do not reset it a second time here: that would clear the just-established
+      # reset/cache epoch independently of the state transaction.
+      if getattr(self, "_flex", None) is not None:
+        dyn = self._smooth.run_device(
+            self._state._qpos, self._state._qvel,
+            self._state._mpos, self._state._mquat)
+        self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
+      self._assembled_system_valid = False
+      self._accepted_step = None
+      if hasattr(self, "_last_coupled"):
+        self._last_coupled = None
+      if hasattr(self, "_last_coupled_generation"):
+        self._last_coupled_generation = None
+      self._step1_record = None
+      return gen
 
   def _reset_from_check(self, reset_mask, *, forward_acc=False,
                         warning_commit=None):
@@ -2558,70 +2562,72 @@ class MetalSimulation:
     )
     if not prepared[0].size:
       return self._state.generation
-    _reset_plugins_transactionally(getattr(self, "_native_plugins", ()),
-                                   env_ids=env_ids)
-    gen = self._state.reset(_prepared=prepared)
-    if self._energy is not None:
-      if env_ids is None:
-        self._energy.zero_()
-      else:
-        ids = self._state._env_ids(env_ids)
-        if ids.size:
-          self._energy[ids.tolist()] = 0.0
-      computed = getattr(self, "_energy_computed", None)
-      if computed is not None:
+    from mujoco_metal.sensor_lifecycle import lifecycle_transaction
+    with lifecycle_transaction(self):
+      _reset_plugins_transactionally(getattr(self, "_native_plugins", ()),
+                                     env_ids=env_ids)
+      gen = self._state.reset(_prepared=prepared)
+      if self._energy is not None:
         if env_ids is None:
-          computed.zero_()
-        elif ids.size:
-          computed[ids.tolist()] = 0
-    # mj_resetDataKeyframe sets time after _resetData; mirror per selected world.
-    if env_ids is None:
-      self._state._time.zero_().add_(key_time)
-    else:
-      ids = self._state._env_ids(env_ids)
-      if ids.size:
-        index = self._state._torch.as_tensor(ids, dtype=self._state._torch.int64, device=self._state._device)
-        time_tensor = self._state._torch.full((ids.size,), key_time, dtype=self._state._torch.float32, device=self._state._device)
-        next_time = self._state._time.clone()
-        next_time.index_copy_(0, index, time_tensor)
-        self._state._time = next_time
-    self._state._generation += 1
-    # Held controls follow key_ctrl for selected worlds; other held inputs zeroed.
-    self._apply_key_ctrl(key_id, env_ids)
-    # Keyframe reset is cold like reset.
-    if getattr(self, "_coupled_constraints", None) is not None:
-      self._coupled_constraints.clear_warmstart(env_ids=env_ids)
-    if getattr(self, "_delay", None) is not None:
-      self._delay.reset(env_ids=env_ids)
-      self._sync_history_from_delay(env_ids=env_ids)
-    if getattr(self, "_sensordata", None) is not None:
+          self._energy.zero_()
+        else:
+          ids = self._state._env_ids(env_ids)
+          if ids.size:
+            self._energy[ids.tolist()] = 0.0
+        computed = getattr(self, "_energy_computed", None)
+        if computed is not None:
+          if env_ids is None:
+            computed.zero_()
+          elif ids.size:
+            computed[ids.tolist()] = 0
+      # mj_resetDataKeyframe sets time after _resetData; mirror per selected world.
       if env_ids is None:
-        self._sensordata.zero_()
+        self._state._time.zero_().add_(key_time)
       else:
         ids = self._state._env_ids(env_ids)
         if ids.size:
-          self._sensordata[ids.tolist()] = 0.0
-    self._clear_sensor_output_low(
-        None if env_ids is None else self._state._env_ids(env_ids))
-    from mujoco_metal.sensor_lifecycle import clear_sensor_diagnostics
-    clear_sensor_diagnostics(self, env_ids)
-    if getattr(self, "_islands", None) is not None:
-      self._islands.wake_all(env_ids=env_ids)
-    if getattr(self, "_sleep_schedule", None) is not None:
-      self._sleep_schedule.reset(
-          env_ids=(None if env_ids is None else self._state._env_ids(env_ids)))
-    if getattr(self, "_flex", None) is not None:
-      dyn = self._smooth.run_device(
-          self._state._qpos, self._state._qvel,
-          self._state._mpos, self._state._mquat)
-      self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
-    self._assembled_system_valid = False
-    self._accepted_step = None
-    if hasattr(self, "_last_coupled"):
-      self._last_coupled = None
-    if hasattr(self, "_last_coupled_generation"):
-      self._last_coupled_generation = None
-    return self._state._generation
+          index = self._state._torch.as_tensor(ids, dtype=self._state._torch.int64, device=self._state._device)
+          time_tensor = self._state._torch.full((ids.size,), key_time, dtype=self._state._torch.float32, device=self._state._device)
+          next_time = self._state._time.clone()
+          next_time.index_copy_(0, index, time_tensor)
+          self._state._time = next_time
+      self._state._generation += 1
+      # Held controls follow key_ctrl for selected worlds; other held inputs zeroed.
+      self._apply_key_ctrl(key_id, env_ids)
+      # Keyframe reset is cold like reset.
+      if getattr(self, "_coupled_constraints", None) is not None:
+        self._coupled_constraints.clear_warmstart(env_ids=env_ids)
+      if getattr(self, "_delay", None) is not None:
+        self._delay.reset(env_ids=env_ids)
+        self._sync_history_from_delay(env_ids=env_ids)
+      if getattr(self, "_sensordata", None) is not None:
+        if env_ids is None:
+          self._sensordata.zero_()
+        else:
+          ids = self._state._env_ids(env_ids)
+          if ids.size:
+            self._sensordata[ids.tolist()] = 0.0
+      self._clear_sensor_output_low(
+          None if env_ids is None else self._state._env_ids(env_ids))
+      from mujoco_metal.sensor_lifecycle import clear_sensor_diagnostics
+      clear_sensor_diagnostics(self, env_ids)
+      if getattr(self, "_islands", None) is not None:
+        self._islands.wake_all(env_ids=env_ids)
+      if getattr(self, "_sleep_schedule", None) is not None:
+        self._sleep_schedule.reset(
+            env_ids=(None if env_ids is None else self._state._env_ids(env_ids)))
+      if getattr(self, "_flex", None) is not None:
+        dyn = self._smooth.run_device(
+            self._state._qpos, self._state._qvel,
+            self._state._mpos, self._state._mquat)
+        self._flex.update_kinematics(dict(dyn["poses"], root_com=dyn["root_com"]), dyn.get("cvel"))
+      self._assembled_system_valid = False
+      self._accepted_step = None
+      if hasattr(self, "_last_coupled"):
+        self._last_coupled = None
+      if hasattr(self, "_last_coupled_generation"):
+        self._last_coupled_generation = None
+      return self._state._generation
 
   def apply_lifecycle(self, lifecycle):
     """Adopt a rebuilt model into this live simulation, atomically (R7).

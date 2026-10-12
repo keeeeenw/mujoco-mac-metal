@@ -236,10 +236,24 @@ def test_cpu_simulation_reset_restores_fresh_state_and_sleep_fk_ownership():
   assert not sim._assembled_system_valid
 
 
-def test_cpu_reset_orchestration_matches_pinned_cold_defaults_without_torch():
-  """Run Simulation.reset itself against a CPU state/reset oracle double."""
+def test_cpu_reset_orchestration_matches_pinned_cold_defaults_without_torch(monkeypatch):
+  """Run reset orchestration against host stage doubles and a pinned oracle.
+
+  Device transaction storage is a separate dependency, like the fake state
+  and FK below. Actual device rollback is exercised by native lifecycle tests.
+  """
+  from contextlib import contextmanager
+  from mujoco_metal import sensor_lifecycle
   from mujoco_metal.simulation import MetalSimulation
   from mujoco_metal.sleep_schedule import initial_sleep_state
+
+  transaction_events = []
+  @contextmanager
+  def host_transaction(owner):
+    transaction_events.append(("enter", owner.state.generation))
+    yield
+    transaction_events.append(("exit", owner.state.generation))
+  monkeypatch.setattr(sensor_lifecycle, "lifecycle_transaction", host_transaction)
 
   model = _rk4_sleep_model()
   batch = 2
@@ -357,6 +371,7 @@ def test_cpu_reset_orchestration_matches_pinned_cold_defaults_without_torch():
 
   generation = sim.reset()
   assert generation == 8
+  assert transaction_events == [("enter", 7), ("exit", 8)]
   reset_oracle = mujoco.MjData(model)
   mujoco.mj_resetData(model, reset_oracle)
   np.testing.assert_array_equal(sim._state._qpos,
