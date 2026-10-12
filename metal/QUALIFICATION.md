@@ -857,7 +857,7 @@ python -m pytest -q -p no:cacheprovider \
 
 ## Compiled inertia residual producer — 2026-10-11
 
-Local revision `d3636c170a5dcd1fc430f56a210f6b539573b2fc` lowers the
+Local revision `d3636c169a5dcd1fc430f56a210f6b539573b2fc` lowers the
 residual of each binary64 compiled `dof_M0` constant into a separate float32
 word. The native simple-row postpass publishes that word alongside dense or
 component mass storage. Selected worlds and awake rows are updated; sleeping
@@ -1347,7 +1347,8 @@ refreshed 45-frame GIF was inspected across carrying, release and landing.
 
 The added demo/CLI suite passes **9 tests in 112.15 seconds** with dtype- and
 literal-bit-exact replay, including signed-zero negative controls. The previous
-recording gate passed eight checks in 114.85 seconds; it is overlapping evidence. Mocap/flex passes **2 native checks in 2.50 seconds**, with independent
+recording gate passed eight checks in 114.85 seconds; it is overlapping evidence.
+Mocap/flex passes **2 native checks in 2.50 seconds**, with independent
 source vertices, selected reset/keyframe/restore and exact following steps.
 A main-thread GLFW/OpenGL viewer smoke run completes **66 actual native steps**
 and exits normally under `--viewer-seconds 3`. The existing standalone runtime’s
