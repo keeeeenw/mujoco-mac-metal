@@ -1415,16 +1415,21 @@ class MetalSimulation:
       fk = getattr(getattr(self, "_smooth", None), "_fk", None)
       if fk is not None:
         fk.invalidate_cache(env_ids=[dst])
-        body_pos = fk._workspace["outputs"]["body_pos"].view(
-            self.batch_size, self._mjmodel.nbody, 3)
-        body_quat = fk._workspace["outputs"]["body_quat"].view(
-            self.batch_size, self._mjmodel.nbody, 4)
-        body_pos[dst].copy_(body_pos[src].clone())
-        body_quat[dst].copy_(body_quat[src].clone())
+        outputs = fk._workspace["outputs"]
+        for kind, width in (("pos", 3), ("quat", 4)):
+          for suffix in ("", "_low", "_tail"):
+            key = f"body_{kind}{suffix}"
+            if key in outputs:
+              rows = outputs[key].view(self.batch_size, self._mjmodel.nbody, width)
+              rows[dst].copy_(rows[src].clone())
       scheduler = getattr(self, "_sleep_schedule", None)
       if scheduler is not None:
         scheduler.tree_state[dst].copy_(scheduler.tree_state[src].clone())
         scheduler.tree_awake[dst].copy_(scheduler.tree_awake[src].clone())
+        for name in ("body_awake_ids", "parent_awake_ids", "dof_awake_ids",
+                     "body_awake_mask", "awake_counts"):
+          rows = getattr(scheduler, name)
+          rows[dst].copy_(rows[src].clone())
         scheduler.status[dst] = 0
         scheduler.links_overflow[dst] = 0
       islands = getattr(self, "_islands", None)
