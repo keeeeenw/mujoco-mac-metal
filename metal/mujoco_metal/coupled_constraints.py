@@ -37,6 +37,7 @@ _SHADER = Path(__file__).parent / "shaders" / "coupled_constraints.metal"
 _BROADPHASE_SHADER = Path(__file__).parent / "shaders" / "broadphase.metal"
 _EQUALITY_SHADER = Path(__file__).parent / "shaders" / "equality_assembly.metal"
 _COLLISION_SHADER = Path(__file__).parent / "shaders" / "collision_primitives.metal"
+_CAPSULE_BOX_SOURCE_SHADER = Path(__file__).parent / "shaders" / "capsule_box_source.metal"
 _CONVEX_SHADER = Path(__file__).parent / "shaders" / "convex_narrowphase.metal"
 _SDF_SHADER = Path(__file__).parent / "shaders" / "sdf_narrowphase.metal"
 _COMMON_CCD_CORE_SHADER = Path(__file__).parent / "shaders" / "common_ccd_core.metal"
@@ -92,7 +93,17 @@ def _coupled_shader_source(*, expected_root=None, libccd=False):
       + "\n#define MUJOCO_METAL_EQUALITY_HELPERS_ONLY\n"
       + _EQUALITY_SHADER.read_text()
       + "\n#undef MUJOCO_METAL_EQUALITY_HELPERS_ONLY\n"
-      + _SHADER.read_text())
+      + _SHADER.read_text() + "\n"
+      + _CAPSULE_BOX_SOURCE_SHADER.read_text())
+
+
+def _source_float_words(values):
+  """Three planar float words preserving finite source-double constants."""
+  source = np.asarray(values, dtype=np.float64).reshape(-1)
+  high = source.astype(np.float32)
+  low = (source - high.astype(np.float64)).astype(np.float32)
+  tail = (source - high.astype(np.float64) - low.astype(np.float64)).astype(np.float32)
+  return np.concatenate((high, low, tail))
 
 
 def _pair_contact_cache_bytes(
@@ -863,6 +874,7 @@ class CoupledConstraintDescriptor:
   # Double-precision constant residuals for paired aref, per pair
   # [solref_lo(2), solimp_lo(5), margin_lo(2)]: lo = f64 TRUE - f32 hi.
   pair_const_lo: np.ndarray = None
+  pair_margin_source_words: np.ndarray = None
   dof_invweight0_low: np.ndarray = None
   body_invweight0_low: np.ndarray = None
 
@@ -2021,6 +2033,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
       solref=_frozen(sr, np.float32),
       solimp=_frozen(si, np.float32),
       pair_const_lo=_frozen(pair_const_lo, np.float32),
+      pair_margin_source_words=_frozen(_source_float_words([p[7] for p in pairs]), np.float32),
       condim=_frozen(cd, np.int32),
       friction=_frozen(fr, np.float32),
       solreffriction=_frozen(srfr, np.float32),
@@ -2377,6 +2390,12 @@ class MetalCoupledConstraints:
     self._contact_generic_producer = (
         self._library.contact_produce_generic
         if self._has_generic_contact_pairs else None)
+    self._has_capsule_box_pairs = any(
+        {int(d.geom_type[a]), int(d.geom_type[b])} == {_CAPSULE, _BOX}
+        for a, b in zip(d.geom1, d.geom2))
+    self._contact_capsule_box_producer = (
+        self._library.contact_produce_capsule_box_source
+        if self._has_capsule_box_pairs else None)
     self._contact_sdf_seed_init = (
         self._library.contact_sdf_seed_init
         if self._has_analytic_sdf_pairs else None)
@@ -2560,6 +2579,10 @@ class MetalCoupledConstraints:
         "row_velocity_scale_low": self._tensor(
             self._row_velocity_scales_low_cpu if d.nr else np.zeros(1, dtype=np.float32)),
         "geom_size": self._tensor(d.geom_size.reshape(-1) if d.ngeom else np.zeros(3, dtype=np.float32)),
+        "geom_size_source": self._tensor(_source_float_words(model.geom_size)
+            if self._has_capsule_box_pairs else np.zeros(3, dtype=np.float32)),
+        "pair_margin_source": self._tensor(d.pair_margin_source_words
+            if self._has_capsule_box_pairs else np.zeros(3, dtype=np.float32)),
         "geom_type": self._tensor(d.geom_type if d.ngeom else np.zeros(1, dtype=np.int32)),
         "geom_rbound": self._tensor(d.geom_rbound if d.ngeom else np.zeros(1, dtype=np.float32)),
         "mesh_hull": self._tensor(self._common_ccd_mesh_hull),
@@ -3355,7 +3378,7 @@ class MetalCoupledConstraints:
     w, d = self._workspace, self.descriptor
     b, nc = self.batch_size, d.ncontacts_max
     if (d.npairs > 0 and nc > 0
-        and self._common_ccd_requested):
+        and (self._common_ccd_requested or getattr(self, "_has_capsule_box_pairs", False))):
       # Validate borrowed source-precision poses before clearing persistent
       # masks, rows or status. A rejected input must not partially mutate the
       # preceding assembly or dispatch a kernel with a foreign-device buffer.
@@ -3384,7 +3407,8 @@ class MetalCoupledConstraints:
               "float32 on the geometry pose device")
     paired_contact_rows = bool(d.npairs > 0 and nc > 0 and (
         getattr(self, "_has_analytic_sdf_pairs", False)
-        or getattr(self, "_common_ccd_hfield_mesh_requested", False)))
+        or getattr(self, "_common_ccd_hfield_mesh_requested", False)
+        or getattr(self, "_has_capsule_box_pairs", False)))
     retained = None
     if paired_contact_rows:
       for pose_name in ("body_pos_low", "body_pos_tail",
@@ -3517,6 +3541,16 @@ class MetalCoupledConstraints:
             self._constants["pair_contact_offsets_dims"],
             pair_maps.logical_to_packed.reshape(-1),
             self._constants["mesh_hull"], self._constants["mesh_hull_info"],
+            w["contact_pair_count"], w["contact_pair_records"],
+            threads=(b * d.npairs,), group_size=(1,))
+      if getattr(self, "_contact_capsule_box_producer", None) is not None:
+        self._contact_capsule_box_producer(
+            poses["geom_pos"], poses["geom_pos_low"], poses["geom_pos_tail"],
+            poses["geom_xmat"], poses["geom_xmat_low"], poses["geom_xmat_tail"],
+            self._constants["geom_size_source"], self._constants["geom_type"],
+            self._constants["pair_geoms"], self._constants["pair_margin_source"],
+            self._constants["pair_contact_offsets_dims"],
+            pair_maps.logical_to_packed.reshape(-1),
             w["contact_pair_count"], w["contact_pair_records"],
             threads=(b * d.npairs,), group_size=(1,))
       if self._contact_sdf_seed_init is not None:

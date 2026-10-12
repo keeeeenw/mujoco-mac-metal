@@ -335,6 +335,10 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
   nq, nv = int(model.nq), int(model.nv)
   nb, nj = int(model.nbody), int(model.njnt)
   ng, ns = int(model.ngeom), int(model.nsite)
+  # A profile-independent upper bound: explicit filtering may exclude every
+  # capsule/box pair, but cannot require more than these planar source words.
+  source_capsule_box = bool(npairs and np.any(np.asarray(model.geom_type) == 3)
+                           and np.any(np.asarray(model.geom_type) == 6))
   nsensor, nsensordata = int(model.nsensor), int(model.nsensordata)
   ntree = int(np.max(np.asarray(model.body_treeid), initial=-1)) + 1
   nmocap = int(model.nmocap)
@@ -769,6 +773,8 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       ("model.coupled.dof_invweight0_low", max(nv, 1)),
       ("model.coupled.body_invweight0_low", 2 * max(nb, 1)),
       ("model.coupled.row_velocity_scale_low", max(coupled_rows, 1)),
+      ("model.coupled.geom_size_source", 9 * ng if source_capsule_box else 3),
+      ("model.coupled.pair_margin_source", 3 * npairs if source_capsule_box else 3),
       ("model.smooth.effective_tendon_armature", max(ntendon, 1)),
       ("model.sensor.type", max(nsensor, 1)),
       ("model.sensor.datatype", max(nsensor, 1)),
