@@ -920,6 +920,10 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       ("next_time", b), ("next_status", b),
       ("act_dot", b * na), ("act_vel", b * na),
       ("next_act", b * na), ("sensordata", b * nsensordata),
+      # Conservative transient peak for callback force/activation validation:
+      # finite masks, sanitized payloads and per-world result status. This
+      # explicit reserve applies independently of registry implementation.
+      ("actuator_plugin_validation_peak", 2 * b * (nu + na) + 4 * b),
       ("sensor_act_force", b * max(nu, 1)),
       ("sensor_qfrc_act", b * max(nv, 1)),
       ("energy_output", b * 2 if energy_enabled else 0),

@@ -4521,6 +4521,8 @@ class MetalSimulation:
     else:
       self._state.clear_masked_rows(total, compute_mask)
     outputs = {}
+    valid_worlds = torch.ones(self.batch_size, dtype=torch.bool,
+                               device=self._state._device)
     na = int(getattr(self._state, "_na", 0))
     for plugin in plugins:
       output = plugin.run_actuator_device(
@@ -4540,10 +4542,6 @@ class MetalSimulation:
           or not force.is_contiguous()):
         raise ValueError(
             f"native actuator plugin {plugin.name!r} force must be contiguous float32 {expected_force}")
-      if compute_mask is None:
-        total.add_(force)
-      else:
-        self._state.update_masked_rows(total, force, compute_mask)
       derivative = output.activation_derivative
       if derivative is not None:
         if not na or (not isinstance(derivative, torch.Tensor)
@@ -4553,11 +4551,24 @@ class MetalSimulation:
             or not derivative.is_contiguous()):
           raise ValueError(
               f"native actuator plugin {plugin.name!r} activation_derivative must be contiguous float32 {(self.batch_size, na)}")
+      valid = torch.isfinite(force).all(dim=1)
+      if derivative is not None:
+        valid &= torch.isfinite(derivative).all(dim=1)
+      valid_worlds &= valid if compute_mask is None else (valid | ~compute_mask)
+      # Reject nonfinite callback payloads before force projection or source
+      # acceleration checks. A rejected extension must not trigger a physical
+      # BADQACC autoreset and change its world's prior state.
+      safe_force = torch.where(valid[:, None], force, 0.0).contiguous()
+      if compute_mask is None:
+        total.add_(safe_force)
+      else:
+        self._state.update_masked_rows(total, safe_force, compute_mask)
+      if derivative is not None:
+        safe_derivative = torch.where(valid[:, None], derivative, 0.0).contiguous()
         if compute_mask is None:
-          self._act_dot.add_(derivative)
+          self._act_dot.add_(safe_derivative)
         else:
-          self._state.update_masked_rows(
-              self._act_dot, derivative, compute_mask)
+          self._state.update_masked_rows(self._act_dot, safe_derivative, compute_mask)
       outputs[plugin] = output
     qfrc = self._native_actuator_qfrc
     nv = int(self._mjmodel.nv)
@@ -4578,6 +4589,7 @@ class MetalSimulation:
       self._state.update_masked_rows(force_target, qfrc, compute_mask)
     self._last_native_actuator_outputs = outputs
     return {"force": total, "qfrc": qfrc,
+            "status": (~valid_worlds).to(dtype=torch.int32),
             "activation_derivative": self._act_dot if na else None}
 
   def _advance_native_actuator_plugins(self, accepted_mask, *, qpos=None,
@@ -5124,6 +5136,8 @@ class MetalSimulation:
           world_mask=world_mask_i32)
     if velocity["status"] is not None:
       status = torch.where(velocity["status"] == 0, status, velocity["status"])
+    if actuation.get("status") is not None:
+      status = torch.where(actuation["status"] == 0, status, actuation["status"])
     exact_status = record.values[ForwardStage.POS].get(
         "exact_impedance_status")
     if exact_status is not None:
@@ -6444,6 +6458,8 @@ class MetalSimulation:
     if "pose_status" in dynamics:
       status = torch.where(dynamics["pose_status"] == 0, status,
                            dynamics["pose_status"])
+    if typed_output is not None:
+      status = torch.where(typed_output["status"] == 0, status, typed_output["status"])
     coupled = None
     if not constrained:
       if forward_mask is None:
