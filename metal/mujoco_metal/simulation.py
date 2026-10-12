@@ -7787,6 +7787,16 @@ class MetalSimulation:
                 raise ValueError(f"sensor plugin {_plugin_state_key(plugin)!r} returned an invalid tensor")
               computed = (output if output is not None
                           else merged[:, adr:adr + dim])
+              # Pinned compute_user_sensors/compute_plugin_sensors apply
+              # cutoff after the callback, not before its device publication.
+              # Axis/quaternion outputs deliberately retain their values.
+              cutoff = float(self._sensors.descriptor.sensor_cutoff[i])
+              datatype = int(self._sensors.descriptor.sensor_datatype[i])
+              if cutoff > 0:
+                if datatype == int(_mj.mjtDataType.mjDATATYPE_REAL):
+                  computed = computed.clamp(-cutoff, cutoff)
+                elif datatype == int(_mj.mjtDataType.mjDATATYPE_POSITIVE):
+                  computed = computed.clamp(max=cutoff)
               valid_rows = torch.isfinite(computed).all(dim=1)
               invalid = tick_mask & ~valid_rows
               self._sensor_plugin_status.copy_(torch.where(
