@@ -724,7 +724,7 @@
     "mjtSDFType": {
       "source": "include/mujoco/mjtype.h:472",
       "domain": "signed_distance",
-      "owner": "011",
+      "owner": "013",
       "members": {
         "mjSDFTYPE_SINGLE": 0,
         "mjSDFTYPE_INTERSECTION": 1,

@@ -62,7 +62,8 @@ def test_preflight_reports_catalogue_without_claiming_native_completion():
   from mujoco_metal.__main__ import preflight
   result = preflight(include_inventory=True)
   assert result["pinned_enums"]["catalogue_matches_installed_bindings"] is True
-  assert result["inventory_complete"] is False
+  assert result["inventory_complete"] is True
+  assert result["support_inventory"]["gpu_qualified"] is False
   assert result["gpu_qualified"] is False
 
 
@@ -75,10 +76,12 @@ def test_pinned_runtime_fields_and_api_surface_match_without_support_claims():
   assert binding_surface_drift() == ()
   assert surface["binding_field_count"] == 809
   assert surface["binding_function_count"] == 317
-  assert len(surface["header_functions"]) == 527
+  assert len(surface["header_functions"]) == 530
   assert "set_mjcb_passive" in surface["binding_only_functions"]
   assert "from_zip" in surface["binding_only_functions"]
   assert len(surface["binding_only_functions"]) == 24
+  assert len(surface["header_only_functions"]) == 237
+  assert surface["header_drift"] == []
   assert surface["gpu_qualified"] is False
   assert surface["feature_mapping_complete"] is False
   assert surface["python_class_count"] == 69
@@ -136,7 +139,7 @@ def test_surface_queries_are_owned_and_preflight_keeps_coverage_incomplete():
   result = preflight(include_inventory=True)
   assert result["pinned_binding_surface"]["catalogue_matches_installed_bindings"] is True
   assert result["pinned_binding_surface"]["feature_mapping_complete"] is False
-  assert result["inventory_complete"] is False
+  assert result["inventory_complete"] is True
 
 
 def test_exported_class_members_and_package_counterparts_have_exact_crosswalks():

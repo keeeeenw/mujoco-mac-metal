@@ -408,7 +408,9 @@ def _inventory():
   return tuple(result)
 
 
-INVENTORY_COMPLETE = False
+# Pinned classification completeness, not physics or standalone API equivalence.
+# preflight --inventory also evaluates the executable crosswalk's drift checks.
+INVENTORY_COMPLETE = True
 
 
 SOURCE_TAG = "mujoco-3.10.0"
@@ -514,7 +516,7 @@ REQUIREMENTS = (
         Stage.COLLISION, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
         Execution.DEVICE, "all 9 valid unordered pairs; plane-plane yields nothing",
         "mujoco_metal/shaders/collision_primitives.metal",
-        "accept the four primitives, reject others",
+        "accept the four primitive families; additional geometry families have separate requirement rows",
         "MetalSimulation(profile='integrated_euler_v1')", "baseline",
         ("test_primitive_collision_qualification.py",),
         enums=("mjtGeom.mjGEOM_PLANE", "mjtGeom.mjGEOM_SPHERE",
@@ -725,7 +727,7 @@ REQUIREMENTS = (
         Stage.CONSTRAINTS, Implementation.NATIVE_GPU, Qualification.GPU_QUALIFIED,
         Execution.DEVICE, "1/3/6 rows, body/world/site forms incl. mocap anchors, torquescale, schema-2/3 activity state",
         "mujoco_metal/shaders/equality_assembly.metal",
-        "accept joint/connect/weld body/site/world/mocap, reject others even if inactive",
+        "accept listed baseline forms; tendon and flex equality admission is inventoried separately",
         "sim.set_equality_active", "004",
         ("test_connect_weld.py", "test_equality_activity.py",
          "test_equality_qualification.py", "test_mocap_state.py"),
@@ -1350,9 +1352,9 @@ FIELD_RULES = (
     ("nuser_", "019", "extension user-parameter dimensions"),
     ("ntext", "out-of-scope", "custom text counts"),
     ("ntex", "out-of-scope", "asset counts"),
-    ("nmesh", "out-of-scope", "asset counts"),
+    ("nmesh", "011", "compiled collision mesh asset counts"),
     ("nskin", "out-of-scope", "asset counts"),
-    ("nhfield", "out-of-scope", "asset counts"),
+    ("nhfield", "012", "compiled heightfield asset counts"),
     ("nlight", "out-of-scope", "visual counts"),
     ("ncam", "016", "camera-projection sensor dimensions"),
     ("nkey", "006", "compiled keyframe data used by native reset"),

@@ -50,6 +50,8 @@ def _jsonable(value):
 
 
 def preflight(model_path=None, include_inventory=False):
+  from mujoco_metal.support_inventory import support_inventory_drift
+  inventory_drift = support_inventory_drift()
   package = Path(__file__).resolve().parent
   shader = package / "shaders" / "kinematics.metal"
   # Inventory the installed package, including development kernels. A legacy
@@ -81,7 +83,8 @@ def preflight(model_path=None, include_inventory=False):
           }
           for name, path in shader_paths.items()
       },
-      "inventory_complete": INVENTORY_COMPLETE,
+      "inventory_complete": INVENTORY_COMPLETE and not inventory_drift,
+      "inventory_drift": list(inventory_drift),
       "diagnostic_execution": "host_inventory_only",
       "requirement_counts": requirement_counts,
       "requirement_counts_scope": (
@@ -161,6 +164,9 @@ def preflight(model_path=None, include_inventory=False):
     from mujoco_metal.binding_inventory import pinned_enum_inventory, pinned_binding_surface
     result["pinned_enums"] = pinned_enum_inventory()
     result["pinned_binding_surface"] = pinned_binding_surface()
+    from mujoco_metal.support_inventory import support_inventory
+    result["support_inventory"] = support_inventory()
+    result["inventory_complete"] = result["support_inventory"]["classification_complete"]
     result["features"] = [_jsonable(asdict(row)) for row in FEATURES]
     result["requirements"] = [_jsonable(asdict(row)) for row in REQUIREMENTS]
   return result
@@ -437,6 +443,8 @@ def main(argv=None):
       "coverage", help="Print the machine-readable support-contract table"
   )
   coverage_parser.add_argument("--json", action="store_true", dest="as_json")
+  coverage_parser.add_argument("--inventory", action="store_true",
+                               help="Show the complete pinned classification crosswalk")
   demo_parser = subparsers.add_parser(
       "demo", help="Run bundled demo scripts and their model assets")
   demo_parser.add_argument("--list", action="store_true", dest="list_demos")
@@ -458,6 +466,12 @@ def main(argv=None):
       demo_parser.error(str(error))
     return 0
   if args.command == "coverage":
+    if args.inventory:
+      from mujoco_metal.support_inventory import support_inventory, inventory_summary_table
+      inventory = support_inventory()
+      print(json.dumps(inventory, indent=2, sort_keys=True) if args.as_json
+            else inventory_summary_table(inventory), end="\n" if args.as_json else "")
+      return 0 if inventory["classification_complete"] else 1
     from mujoco_metal.registry import REQUIREMENTS, coverage_table
     from mujoco_metal.registry import _jsonable_requirement
     if args.as_json:

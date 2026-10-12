@@ -24,8 +24,8 @@ composition gate remains open. `gpu_qualified` describes the cited fixtures
 and stated restrictions, not every combination of model features, solvers,
 integrators and runtime flags. Test filenames identify evidence to inspect;
 their presence in this table is not a claim that every test in them passed.
-The pinned inventory is still being reconciled (`INVENTORY_COMPLETE=False`);
-this table is not a declaration of complete MuJoCo compatibility.
+The pinned classification is complete (`INVENTORY_COMPLETE=True`); this does
+not declare complete MuJoCo compatibility or qualify native physics.
 
 Development `preflight --inventory --json` also exposes `pinned_enums`, a separate
 catalogue of all 70 public `mjt` enum groups and 529 members from MuJoCo 3.10.0.
@@ -34,20 +34,20 @@ owners, and detects new or changed binding groups and values. This extends
 the earlier selected-feature inventory to sleep policies, flex self-contact,
 constraint states, extension capabilities and host compilation/UI/rendering
 enums. A matching catalogue establishes specification coverage only;
-`gpu_qualified` and overall `inventory_complete` remain false. The feature
+`gpu_qualified` remains false; `inventory_complete` describes classification only. The feature
 table below remains the implementation and fixture-qualification contract.
 
 `pinned_binding_surface` additionally records 809 public fields across `MjModel`,
 `MjData`, `MjOption`, `MjContact` and `MjStatistic`; 69 exported non-enum Python
 classes and their public member sets; all 317 public free-function bindings;
-all 29 option fields; and an exact map of the 72 package `native_api`
+all 29 option fields; and an exact map of the 79 package `native_api`
 counterparts. Each remaining upstream function has its own host boundary or
 subsystem-owner row; internal/prepared counterparts are distinguished from
-same-named wrappers. It retains 812 field declarations and 527 function
+same-named wrappers. It retains 812 field declarations and 530 function
 declarations from the pinned headers separately, so C-only storage and APIs are
 not silently counted as Python exposure. Added or removed fields, class members,
 functions, or wrapper names fail the drift checks. This is a specification and
-ownership crosswalk; complete feature-to-execution mapping and native
+ownership crosswalk; complete execution equivalence and native
 qualification remain open (`feature_mapping_complete=False`,
 `function_mapping_complete=False`).
 
@@ -67,7 +67,7 @@ solver descriptors; those checks do not qualify native physics.
 | REQ-JNT-001 | hinge/slide/ball/free kinematics | device | native_gpu/gpu_qualified | baseline | one immutable model per batch | accept all four joint types | test_model.py |
 | REQ-JNT-002 | scalar hinge/slide joint limits | device | native_gpu/gpu_qualified | baseline | scalar hinge/slide limit rows; ball and tendon rows are separately implemented by the integrated constraint stage | accept scalar limits; legacy scalar-only profiles still reject ball limits | test_coupled_constraints.py |
 | REQ-JNT-003 | ball joint limits | device | native_gpu/gpu_qualified | 009 | pinned axis-angle rows in reserved slots (integrated profile; legacy joint-constraints profile stays scalar-only) | ball branch in joint-limit loop | test_rigid_constraints_009.py |
-| REQ-GEO-001 | plane/sphere/capsule/box collision | device | native_gpu/gpu_qualified | baseline | all 9 valid unordered pairs; plane-plane yields nothing | accept the four primitives, reject others | test_primitive_collision_qualification.py |
+| REQ-GEO-001 | plane/sphere/capsule/box collision | device | native_gpu/gpu_qualified | baseline | all 9 valid unordered pairs; plane-plane yields nothing | accept the four primitive families; additional geometry families have separate requirement rows | test_primitive_collision_qualification.py |
 | REQ-GEO-002 | cylinder/ellipsoid collision | device | native_gpu/unqualified | 010 | 010 implements plane/sphere-cylinder analytic pairs + convex MPR pairs | admit cylinder/ellipsoid pairs with pinned slot counts | test_coupled_constraints.py |
 | REQ-GEO-003 | convex mesh collision | device | native_gpu/unqualified | 011 | compiled convex graphs with source GJK/EPA and alternate libccd MPR; full degenerate/manifold/trajectory composition remains under qualification | admit compiled hull graphs with complete source manifold and explicit memory/count budgets | test_mesh_contact_011.py |
 | REQ-GEO-004 | heightfield collision | device | native_gpu/unqualified | 012 | source per-prism terrain collision against five convex primitive families and compiled mesh hulls, both CCD routes; hfield-hfield absent from the pinned dispatcher, plane-hfield yields no contacts; complete force/trajectory/integrator qualification remains open | reserve fifty source witnesses per terrain pair and exact compiled grid storage subject to explicit capacity/memory budgets | test_hfield_contact_012.py |
@@ -89,7 +89,7 @@ solver descriptors; those checks do not qualify native physics.
 | REQ-SOL-004 | native no-slip post-solve stage | device | native_gpu/unqualified | 014 | separate friction post-stage after PGS, CG or Newton; zero iterations skip it; complete cone, dimension and option compositions remain under qualification | validated noslip_iterations and noslip_tolerance in coupled lowering | test_solver_completion_014.py |
 | REQ-FLEX-001 | compiled flex kinematics and material forces | device | native_gpu/unqualified | 018 | compiled material, damping and interpolation paths implemented; complete topology, attachment, stiffness and integrator compositions remain under qualification | compiled topology, material and workspace validation | test_flex_018.py, test_flex_material_equality_composition_018.py, test_flex_implicit_simulation.py, test_flex_material_parity.py, test_flex_integrator_lifecycle.py, test_active_material_invariants_018.py, test_active_material_energy_018.py, test_active_material_damping_018.py, test_flex_root_com_velocity_018.py |
 | REQ-FLEX-002 | flex rigid, self and cross-flex collision | device | native_gpu/unqualified | 018 | compiled candidates and native CCD/contact rows implemented; complete primitive, interpolation, self-contact and integrator compositions remain under qualification | compiled candidate filtering, CCD budgets and contact-row capacity checks | test_flex_contact_lowering.py, test_coupled_flex_contact_rows.py, test_flex_interpolated_pair_018.py, test_flex_tetra_self_pair_018.py |
-| REQ-EQ-001 | joint/connect/weld equalities with per-env activity | device | native_gpu/gpu_qualified | 004 | 1/3/6 rows, body/world/site forms incl. mocap anchors, torquescale, schema-2/3 activity state | accept joint/connect/weld body/site/world/mocap, reject others even if inactive | test_connect_weld.py, test_equality_activity.py, test_equality_qualification.py, test_mocap_state.py |
+| REQ-EQ-001 | joint/connect/weld equalities with per-env activity | device | native_gpu/gpu_qualified | 004 | 1/3/6 rows, body/world/site forms incl. mocap anchors, torquescale, schema-2/3 activity state | accept listed baseline forms; tendon and flex equality admission is inventoried separately | test_connect_weld.py, test_equality_activity.py, test_equality_qualification.py, test_mocap_state.py |
 | REQ-EQ-002 | tendon equality | device | native_gpu/gpu_qualified | 008 | cubic tendon-length coupling as coupled rows (single or paired tendons) | tendon_constraint_rows equality branch | test_spatial_tendons_008.py |
 | REQ-EQ-003 | flex distance equality | device | native_gpu/gpu_qualified | 018 | flex edge distance equalities on GPU | mjEQ_FLEX distance constraints coupled with block-row solver | test_flex_018.py |
 | REQ-EQ-005 | flex vertex and strain equalities | device | native_gpu/unqualified | 018 | compiled vertex/strain row producers and coupled assembly implemented; full flex/contact/integrator qualification remains open | validate compiled equality row spans and flex topology | test_coupled_flex_equality_rows.py |
@@ -148,3 +148,30 @@ solver descriptors; those checks do not qualify native physics.
 | REQ-PLUG-007 | mujoco.sdf.nut | device | native_gpu/unqualified | 019 | compiled native SDF provider and sampled default/custom query fixtures implemented; full collision/ray/lifecycle composition remains unqualified | validate compiled bundled configuration and profile-specific native composition; reject unknown plugins | test_bundled_plugin_inventory.py, test_bundled_plugins_019.py |
 | REQ-PLUG-008 | mujoco.sdf.torus | device | native_gpu/unqualified | 019 | compiled native SDF provider and sampled default/custom query fixtures implemented; full collision/ray/lifecycle composition remains unqualified | validate compiled bundled configuration and profile-specific native composition; reject unknown plugins | test_bundled_plugin_inventory.py, test_bundled_plugins_019.py |
 <!-- COVERAGE_TABLE_END -->
+
+## Complete classification explorer
+
+The host-only explorer includes binding and C-only fields/functions, every
+public enum member, and explicit geometry-pair, actuator and integration axes.
+Internal/prepared pipeline references remain distinct from public standalone
+API counterparts. All combination rows require compiled model/profile/capacity
+validation and their owning numerical gates; no Cartesian-product admission or
+physics guarantee is implied. Source references use pinned MuJoCo 3.10.0 revision
+`28009f9105cd92784b7b0b30c0605a5e29107a77`.
+
+```sh
+PYTHONPATH=metal python -m mujoco_metal coverage --inventory
+PYTHONPATH=metal python -m mujoco_metal coverage --inventory --json
+```
+
+<!-- INVENTORY_TABLE_BEGIN -->
+| Inventory dimension | Classified entries | Native qualification |
+|---|---:|---|
+| enums | 529 | Separate owning-milestone gates |
+| fields | 813 | Separate owning-milestone gates |
+| functions | 554 | Separate owning-milestone gates |
+| python_classes | 69 | Separate owning-milestone gates |
+| option_fields | 29 | Separate owning-milestone gates |
+| package_entrypoints | 79 | Separate owning-milestone gates |
+| combinations | 1167 | Separate owning-milestone gates |
+<!-- INVENTORY_TABLE_END -->

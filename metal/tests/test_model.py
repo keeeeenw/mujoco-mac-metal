@@ -236,7 +236,8 @@ def test_preflight_is_cpu_only_and_includes_stage_inventory(tmp_path):
       "integration",
   }
   assert all(row["sha256"] for row in result["shaders"].values())
-  assert result["inventory_complete"] is False
+  assert result["inventory_complete"] is True
+  assert result["support_inventory"]["standalone_api_qualified"] is False
   assert "narrowly GPU-qualified" in result["stages"]["dynamics"]
   assert result["stages"]["acceleration_solve"].startswith("native dense SPD")
   assert result["stages"]["integration"].startswith(

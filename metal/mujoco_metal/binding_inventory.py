@@ -7,6 +7,7 @@ import ast
 from functools import lru_cache
 import json
 import inspect
+import re
 from pathlib import Path
 
 import mujoco
@@ -241,4 +242,79 @@ def pinned_binding_surface():
   result["function_mapping_complete"] = False
   result["gpu_qualified"] = False
   result["feature_mapping_complete"] = False
+  result["header_drift"] = list(header_inventory_drift())
   return result
+
+
+def header_inventory_drift(header_root=None):
+  """Compare C-only declarations too, against the installed pinned headers.
+
+  Checking Python exposure alone misses C-only additions. Parse exported
+  function prototypes (not extern callback variables), and the five runtime
+  structures including each member's C type and array extent.
+  """
+  root = (Path(mujoco.__file__).parent / "include" / "mujoco"
+          if header_root is None else Path(header_root))
+  surface = _surface_catalogue()
+  errors = []
+  text = {}
+  for name in ("mujoco.h", "mjmodel.h", "mjdata.h"):
+    path = root / name
+    if not path.is_file():
+      errors.append(f"Missing pinned header: {name}")
+      continue
+    text[name] = re.sub(r"/\*.*?\*/|//[^\n]*", "", path.read_text(), flags=re.S)
+  if errors:
+    return tuple(errors)
+  enum_groups = {}
+  for path in root.glob("*.h"):
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", "", path.read_text(), flags=re.S)
+    for body, group in re.findall(
+        r"typedef\s+enum(?:\s+\w+)?\s*\{(.*?)\}\s*(mjt\w+)\s*;", source, flags=re.S):
+      enum_groups[group] = {
+          re.match(r"\s*(\w+)", part).group(1)
+          for part in body.split(",") if part.strip()}
+  expected_enums = _catalogue()["groups"]
+  for name in sorted(set(enum_groups) - set(expected_enums)):
+    errors.append(f"Unclassified C enum: {name}")
+  for name in sorted(set(expected_enums) - set(enum_groups)):
+    errors.append(f"Missing C enum: {name}")
+  for name in set(enum_groups) & set(expected_enums):
+    if enum_groups[name] != set(expected_enums[name]["members"]):
+      errors.append(f"Changed C enum members: {name}")
+  functions = set()
+  for statement in re.findall(r"\bMJAPI\s+[^;]+;", text["mujoco.h"]):
+    if re.match(r"MJAPI\s+extern\b", statement):
+      continue  # Callback variables are not function API declarations.
+    match = re.search(r"\b([A-Za-z_]\w*)\s*\(", statement)
+    if match:
+      functions.add(match.group(1))
+  for name in sorted(functions - set(surface["header_functions"])):
+    errors.append(f"Unclassified C function: {name}")
+  for name in sorted(set(surface["header_functions"]) - functions):
+    errors.append(f"Missing C function: {name}")
+  for cls, group in surface["classes"].items():
+    name = "mjdata.h" if cls in ("MjData", "MjContact") else "mjmodel.h"
+    match = re.search(r"struct\s+" + group["c_name"] + r"_\s*\{(.*?)\n\};",
+                      text[name], flags=re.S)
+    if match is None:
+      errors.append(f"Missing C structure: {cls}")
+      continue
+    fields = {}
+    for statement in match.group(1).split(";")[:-1]:
+      declaration = re.fullmatch(r"\s*(.*?)\b([A-Za-z_]\w*)\s*((?:\[[^]]*\]\s*)*)", statement, flags=re.S)
+      if declaration is None:
+        errors.append(f"Unparsed C declaration: {cls}")
+        continue
+      ctype, field, extent = declaration.groups()
+      fields[field] = ("".join(ctype.split()), "".join(extent.split()))
+    wanted = group["header_fields"]
+    for field in sorted(set(fields) - set(wanted)):
+      errors.append(f"Unclassified C field: {cls}.{field}")
+    for field in sorted(set(wanted) - set(fields)):
+      errors.append(f"Missing C field: {cls}.{field}")
+    for field in set(fields) & set(wanted):
+      target = ("".join(wanted[field]["c_type"].split()), wanted[field]["extent"])
+      if fields[field] != target:
+        errors.append(f"Changed C field type/extent: {cls}.{field}")
+  return tuple(errors)

@@ -8094,6 +8094,15 @@
     },
     "mjs_asPlugin": {
       "source": "include/mujoco/mujoco.h:2098"
+    },
+    "mjc_getSDF": {
+      "source": "include/mujoco/mujoco.h:1454"
+    },
+    "mjc_distance": {
+      "source": "include/mujoco/mujoco.h:1457"
+    },
+    "mjc_gradient": {
+      "source": "include/mujoco/mujoco.h:1460"
     }
   },
   "binding_only_functions": [
@@ -8159,6 +8168,9 @@
     "mj_stackAllocNum",
     "mj_unmountVFS",
     "mj_warning",
+    "mjc_distance",
+    "mjc_getSDF",
+    "mjc_gradient",
     "mjp_defaultDecoder",
     "mjp_defaultEncoder",
     "mjp_defaultPlugin",
