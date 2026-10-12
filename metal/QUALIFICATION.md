@@ -1268,3 +1268,51 @@ exit codes and raw output for any new qualification. Current `main` source
 features are not a new PyPI release; the published 0.4.0 package retains its
 previous scope. See [development coverage](DEVELOPMENT.md), the
 [support inventory](COVERAGE.md), and individual demo guides for numerical bounds.
+
+## Sequential qualification: Milestone 005 — 2026-10-12
+
+The complete targeted inventory/support-contract gate passes **1,292 tests in
+37.04 seconds**, with no failures or skips. This closes Milestone 005's
+infrastructure scope; it is not native physics or whole-backend qualification.
+The remaining milestones are qualified in order using their complete required
+checks, without requiring a full repository regression between milestones.
+
+The crosswalk classifies all 529 pinned public enum members, 813 distinct fields
+across the five runtime binding/header structures, 554 distinct binding/header
+functions, 69 Python classes, 29 option fields and 79 package wrappers. Direct
+MuJoCo 3.10.0 header checks independently validate C enum membership, function
+declarations and field types/extents. They exposed three previously omitted
+C-only SDF APIs; those retain explicit subsystem ownership and upstream/API
+boundaries. Internal/prepared stages never imply same-named standalone API
+equivalence. Missing or new rows, owners, test references and declaration drift
+are exercised by negative controls. Generated public tables are checked verbatim.
+
+The combination matrix contains 45 unordered geometry pairs, 1,050 actuator
+transmission/dynamics/gain/bias tuples and 72 integrator/solver/cone/Jacobian
+configurations. All are exercised through actual pinned compilation and applicable
+CPU lowering/profile admission. The actuator fixture admits 870 tuples; 180
+parameter configurations fail the pinned DC-motor activation-slot consistency
+check. This is an explicit expected rejection for those parameters, not a
+family-wide rejection or a skip. Heightfield/heightfield admission rejects the
+absent source dispatcher; other absent-dispatch primitive combinations retain
+empty contact capacity. None of these checks establishes native numerical
+parity or arbitrary Cartesian-product feature support. All combination rows
+retain their later numerical qualification owners.
+
+```sh
+PYTHONPATH=metal:metal/tests PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+python -m pytest -m 'not gpu' -q -x -p no:cacheprovider \
+  metal/tests/test_support_inventory_005.py \
+  metal/tests/test_combination_admission_005.py \
+  metal/tests/test_binding_inventory.py \
+  metal/tests/test_coverage_contract.py \
+  metal/tests/test_counterpart_source_contract_005.py \
+  metal/tests/test_admission_contract_consistency_005.py \
+  metal/tests/test_model.py metal/tests/test_stepping.py \
+  metal/tests/test_bundled_plugin_inventory.py metal/tests/test_doctor.py
+```
+
+The classification explorer is available through `coverage --inventory` and
+`coverage --inventory --json`. Milestone 006's state/model lifecycle and magnetic
+crane are next. The known full-timeline muscle-gripper failure remains open under
+its owning physics/demo gates; no original numerical bound was relaxed.

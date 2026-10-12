@@ -65,10 +65,11 @@ cache corrections, with regression tests preserving the original physics bounds.
 The pinned catalogue covers 70 enum groups, 809 runtime binding fields and 317
 free-function bindings; a matching inventory does not prove native execution.
 
-**Full-coverage milestones 005–020 remain open: 0 of 16 are signed off as
-complete.** Earlier bounded capabilities and selected development fixtures are
-usable and have passing native checks. This count uses the full feature-combination,
-lifecycle, demo and distribution requirements; it does not discard that evidence.
+**Milestone 005 is qualified: the pinned inventory and executable support
+contract pass 1,292 targeted checks. Milestones 006–020 remain open.**
+Inventory qualification does not establish native physics correctness. Earlier
+bounded capabilities and selected development fixtures remain usable and retain
+their passing checks. Further milestones are qualified individually, in order.
 See the [milestone status](metal/STATUS.md) and
 [qualification record](metal/QUALIFICATION.md) for the tested scope and known failures.
 The earlier host publication check passed **2,163 tests, with 1,615
