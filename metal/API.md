@@ -848,7 +848,7 @@ sim.restore(checkpoint)
 - `copy_environment` copies every state row (qpos/qvel/qacc/time/status/eq/mocap) src to dst and bumps generation.
 - `DeviceState.snapshot()` captures device-state rows and is not a full trajectory checkpoint. Use `MetalSimulation.snapshot()` and `restore()` for exact replay: they also carry acceleration and constraint warm starts, held inputs, stored energy, sensor/history storage, delay rings and extension state. Restoring only kinematic rows cannot reproduce the rounding of a later solve with different retained seeds.
 - Development device-state snapshots use schema version 7, including canonical residual words for position and velocity, warning statistics and reset epochs, plus equality/mocap/activation fields when present. Older schemas remain validated on restore: a version-1 snapshot cannot restore a model with equalities, versions below 3 cannot restore mocap bodies, and versions below 4 cannot restore activation storage. Schemas below 7 initialize zero position/velocity residual words; schema-7 words must preserve the float32 projection and canonical residual representation. Schemas below 5 restore zero warning history and schemas below 6 restore legacy reset epochs. Model/profile/dimension mismatches are rejected before writes. Simulation-level snapshots have their own schema and include the nested device-state snapshot.
-- Model changes are shared by the batch, not per environment: `ModelLifecycle.recompute_body_masses` (via `mj_setConst`) and `update_geom_contact` (friction/solref/solimp/margin/gap) are host preparation utilities with transactional validation; reference poses/shapes/types are recompile-required. `MetalSimulation.apply_lifecycle` adopts a rebuilt lifecycle/model into a live simulation atomically (structural-count compatibility required): device stages are rebuilt and swapped, live state and held inputs preserved, fingerprints/generation advance, caches invalidate. On any failure the simulation is untouched and keeps stepping. Development device state owns activation, history, userdata, warm-start acceleration, controls and applied forces. Registered extensions must provide the documented lifecycle and device rollback hooks; this does not imply support for arbitrary upstream plugins. Explicit state/query boundaries may synchronize for validation. Profile/model admission and source qualification remain separate from state storage.
+- Model changes are shared by the batch, not per environment: `ModelLifecycle.recompute_body_masses` (via `mj_setConst`) and `update_geom_contact` (friction/solref/solimp/margin/gap) are host preparation utilities with transactional validation; reference body/geom/site poses have a validated `update_reference_frames` route; geometry shapes/types and structural changes require a recompiled model. `recompute_body_inertias` updates diagonal inertia and inertial quaternions, rejecting changes that alter the compiled sparse inertia layout. `MetalSimulation.apply_lifecycle` adopts a rebuilt lifecycle/model into a live simulation atomically (structural-count compatibility required): device stages are rebuilt and swapped, live state and held inputs preserved, fingerprints/generation advance, caches invalidate. On any failure the simulation is untouched and keeps stepping. Development device state owns activation, history, userdata, warm-start acceleration, controls and applied forces. Registered extensions must provide the documented lifecycle and device rollback hooks; this does not imply support for arbitrary upstream plugins. Explicit state/query boundaries may synchronize for validation. Profile/model admission and source qualification remain separate from state storage.
 - A failed physics step rolls back physical state/time for that world and stays sticky until reset/restore; an accepted activity change is persistent input state, not a partially applied step.
 
 Try the [magnetic crane demo](examples/magnetic_crane.md), the [latch-and-release cargo bridge demo](examples/cargo_bridge.md), the [clockwork parcel sorter demo](examples/clockwork_parcel_sorter.md), the [robotic marble music machine demo](examples/marble_music_machine.md) or the [spacecraft force-control demo](examples/space_docking.md), or use the
@@ -1116,3 +1116,28 @@ With islands disabled they use `1 / (meaninertia * max(nv, 1))`, matching pinned
 MuJoCo's monolithic solve. This changes neither the configured iteration limit
 nor the requested physics acceptance bounds. Full solver/integrator/deformable
 composition qualification remains open.
+
+### Qualified state/model lifecycle boundary
+
+Milestone 006 qualifies state and cache ownership for the admitted models and
+profiles; it does not qualify every later actuator, collision, solver, flex or
+sensor numerical composition. Model constants are shared by the simulation
+batch. Per-environment mass utilities are host preparation tools and are not
+live per-environment model randomization in `MetalSimulation`.
+
+| Change | Validated route | Boundary |
+|---|---|---|
+| Body mass | `ModelLifecycle.recompute_body_masses` | Selected body IDs; then atomic shared-model rebuild |
+| Diagonal inertia / inertial quaternion | `recompute_body_inertias` | Reject incompatible sparse inertia layouts |
+| Body / geom / site reference pose | `update_reference_frames` | Refresh compiler flags/constants; world-body pose immutable |
+| Friction / solref / solimp / margin / gap | `update_geom_contact` | Finite validated compiled contact parameters |
+| Other immutable constants / geometry shape or type | Fresh compiled model + `apply_lifecycle`, when compatible | Rebuild device stages; reject incompatible structural/state dimensions atomically |
+| Structural or state-dimension changes | New simulation | No implicit remapping of existing state |
+
+Full simulation checkpoints retain physical state, held inputs, warning/reset
+bookkeeping, residual words, warm starts, enabled energy, raw/stored sensor data,
+history/delay, sleep and registered extension state. Selected restore, reset,
+keyframe and whole-environment copy preserve other worlds and roll back complete
+transactions on failure. A narrow `DeviceState` checkpoint remains distinct
+from a full simulation checkpoint. See [qualification](QUALIFICATION.md) for
+the targeted source, native and complete crane evidence.

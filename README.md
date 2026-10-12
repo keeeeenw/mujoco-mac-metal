@@ -66,7 +66,9 @@ The pinned catalogue covers 70 enum groups, 809 runtime binding fields and 317
 free-function bindings; a matching inventory does not prove native execution.
 
 **Milestone 005 is qualified: the pinned inventory and executable support
-contract pass 1,292 targeted checks. Milestones 006–020 remain open.**
+contract pass 1,292 targeted checks. Milestone 006 also qualifies state/model
+lifecycle with 170 host and 191 native checks, a full crane demo and exact
+checkpoint replay. Milestones 007–020 remain open.**
 Inventory qualification does not establish native physics correctness. Earlier
 bounded capabilities and selected development fixtures remain usable and retain
 their passing checks. Further milestones are qualified individually, in order.

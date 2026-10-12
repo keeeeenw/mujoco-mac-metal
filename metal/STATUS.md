@@ -1,14 +1,15 @@
 # Development milestone status
 
-The source backend is experimental. **1 of the 16 milestones 005–020 is accepted: Milestone 005, the pinned
-classification and executable support contract.** This infrastructure
-qualification does not qualify native physics. Milestones 006–020 remain open. Earlier bounded profiles and selected
+The source backend is experimental. **2 of the 16 milestones 005–020 are accepted: 005 (classification/support
+contract) and 006 (state/model lifecycle under its admitted-model contract).**
+Milestones 007–020 remain open; acceptance of state ownership does not qualify
+their remaining numerical feature compositions. Earlier bounded profiles and selected
 native fixtures have passed independent checks.
 
 | Milestone | Area | Current status |
 |---|---|---|
 | 005 | Pinned inventory and support contract | Qualified: complete classification, direct header/binding drift and compiled admission matrix; native physics qualification remains separate |
-| 006 | State, model and lifecycle | Transactional and cache regressions pass in selected compositions; final full lifecycle gate open |
+| 006 | State, model and lifecycle | Qualified: 170 host + 191 native checks, full crane/replay and bounded Mac viewer; shared-model and recompile boundaries documented |
 | 007 | Actuators and transmissions | Built-in and extension paths implemented; complete combination and demo qualification open |
 | 008 | Spatial tendons | Wrapping and admitted armature paths implemented; public assembly and final composition gate open |
 | 009 | Rigid constraints | Coupled constraint paths implemented; full mixed-feature qualification open |
@@ -45,7 +46,7 @@ selection (3,008 passed, 99 skipped); the exact managed source port passes
 sleeping pose words and awake lists, source callback cutoffs, invalid sensor
 row ownership and typed actuator payload rejection before physical recovery.
 Normal warning/AUTORESET controls remain tested. These overlapping scopes are
-not a completed full native, wheel or demo qualification. Milestones 006–020
+not a completed full native, wheel or demo qualification. Milestones 007–020
 remain open.
 
 Prepared potential/kinetic energy APIs, computed-stage metadata and current flex
@@ -138,7 +139,7 @@ complete 19-case native lifecycle file and 71 affected native transaction,
 split-stage, delay and recovery cases. These preserve nonzero source energy,
 selected worlds, malformed rejection, legacy compatibility and exact replay.
 These are source-specific results; full heightfield/deformable composition,
-final wheel/demo checks and milestones 006–020 remain open.
+final wheel/demo checks and milestones 007–020 remain open.
 
 Current checkpoint and owned-keyframe regression fixtures at `fe644d658` /
 `70136b887` pass the complete 19-case native actuator/device/mocap/equality
@@ -169,3 +170,10 @@ rows. Direct installed-header checks found and classified three previously omitt
 C-only SDF functions. No full repository regression was required for this
 infrastructure gate. Next is Milestone 006: complete state/model lifecycle and
 its magnetic-crane demonstration.
+
+Milestone 006 passes 170 distinct host and 191 native checks, including full
+crane release/attached counterfactual, exact checkpoint replay and mocap-driven
+flex lifecycle. The refreshed crane GIF shows actual native/CPU frames. Its
+main-thread GLFW viewer advances native physics and closes under a wall-time
+limit; no interpreter or global environment changes were needed. Milestone 007
+actuator qualification and its full gripper demo are next.

@@ -857,7 +857,7 @@ python -m pytest -q -p no:cacheprovider \
 
 ## Compiled inertia residual producer — 2026-10-11
 
-Local revision `d3636c169a5dcd1fc430f56a210f6b539573b2fc` lowers the
+Local revision `d3636c170a5dcd1fc430f56a210f6b539573b2fc` lowers the
 residual of each binary64 compiled `dof_M0` constant into a separate float32
 word. The native simple-row postpass publishes that word alongside dense or
 component mass storage. Selected worlds and awake rows are updated; sleeping
@@ -1316,3 +1316,45 @@ The classification explorer is available through `coverage --inventory` and
 `coverage --inventory --json`. Milestone 006's state/model lifecycle and magnetic
 crane are next. The known full-timeline muscle-gripper failure remains open under
 its owning physics/demo gates; no original numerical bound was relaxed.
+
+## Sequential qualification: Milestone 006 — 2026-10-12
+
+Milestone 006 closes its complete state/model ownership and admitted lifecycle
+contract: **170 distinct host tests and 191 native tests**, with no skips or
+failures. These include the 22-file core gate (**160 host in 5.21 seconds**,
+**188 native in 166.93 seconds**), eight additional crane host/CLI tests and
+one full native crane test, plus two host and two native mocap/flex lifecycle
+checks. Overlapping smoke repeats are not added to the distinct counts.
+
+The core gate covers model ownership, shared mass/inertia/contact/reference
+updates and atomic rebuild/adoption; actual constant recomputation and late
+failure/restore/randomization coherence; device state, equality/mocap, history,
+activation, controls/forces, warm starts, raw/stored sensor diagnostics, energy,
+sleep, retained precision and registered extension lifecycle. Full/selected
+reset, keyframe, environment copy and checkpoint operations have source oracles,
+healthy-peer preservation, real mutation/replacement, cache-owner checks,
+late-fault rollback and exact subsequent replay. Known field/API/storage ABI
+boundaries remain explicit; no arbitrary upstream callback or per-environment
+live model randomization claim is made.
+
+The full **900-step crane** and always-attached native counterfactual preserve
+the original model, solver settings and physical bounds. New evidence adds
+actual native bin-contact counts and exact complete-checkpoint replay from
+transport through release and landing. Native/CPU contact counts are **218/218**;
+attached counterfactual counts are **0/0**. Maximum full-run qpos/qvel errors are
+**1.13e-7 / 1.86e-6**. Native weld force changes from **3.930** to **0.0**. The
+refreshed 45-frame GIF was inspected across carrying, release and landing.
+
+The added demo/CLI suite passes **9 tests in 112.15 seconds** with dtype- and
+literal-bit-exact replay, including signed-zero negative controls. The previous
+recording gate passed eight checks in 114.85 seconds; it is overlapping evidence. Mocap/flex passes **2 native checks in 2.50 seconds**, with independent
+source vertices, selected reset/keyframe/restore and exact following steps.
+A main-thread GLFW/OpenGL viewer smoke run completes **66 actual native steps**
+and exits normally under `--viewer-seconds 3`. The existing standalone runtime’s
+upstream `mjpython` trampoline had library-lookup/crash failures; the demo uses
+main-thread GLFW without changing any installed runtime or global environment.
+
+These milestone checks do not qualify the full backend, packaging, broad Mac
+hardware or later numerical feature matrices. Milestone 007 is next; the known
+full-timeline gripper penetration failure remains its explicit open gate. No
+repository-wide regression or performance benchmark was run.
