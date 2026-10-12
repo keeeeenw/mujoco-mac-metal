@@ -851,13 +851,15 @@ def act_dot_reference(meta, ctrl, act, length, velocity, user_dynamics=None):
       if slots["temperature"] >= 0:
         c, ta, alpha, t0 = dp[3], dp[4], gp[2], gp[3]
         temp = act[adr]
-        rr = r * (1.0 + alpha * (temp + ta - t0))
-        current = act[last] if te > 0 else (v - k * vel) / rr
-        out[adr] = (rr * current * current - temp / dp[2]) / c
+        # The source updates R in-place before both thermal and current ODEs.
+        r *= 1.0 + alpha * (temp + ta - t0)
+        current = act[last] if te > 0 else (v - k * vel) / r
+        out[adr] = (r * current * current - temp / dp[2]) / c
         adr += 1
       if slots["bristle"] >= 0:
         z = act[adr]
-        g = lugre_stribeck(vel, meta_bias_f_c(meta, i), meta_bias_f_s(meta, i), meta_bias_v_s(meta, i))
+        fc, fs, vs = np.asarray(meta.biasprm[i], dtype=np.float64)[3:6]
+        g = lugre_stribeck(vel, fc, fs, vs)
         a = -dp[5] * abs(vel) / max(_MJMINVAL, g)
         out[adr] = a * z + vel
         adr += 1

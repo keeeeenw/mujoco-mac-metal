@@ -355,9 +355,11 @@ kernel void actuator_act_dot(
         float c=dynprm[10*i+3], ta=dynprm[10*i+4];
         float alpha=gainprm[10*i+2], t0=gainprm[10*i+3];
         float temp=act[abase+uint(adr)];
-        float rr=r*(1.0f+alpha*(temp+ta-t0));
-        float cur = te>0.0f ? act[abase+uint(last)] : (V-k*vel)/rr;
-        out_actdot[abase+uint(adr)]=(rr*cur*cur-temp/dynprm[10*i+2])/c;
+        // Pinned mj_fwdActuation mutates R here. The following current
+        // equation must use this same temperature-adjusted resistance.
+        r *= 1.0f+alpha*(temp+ta-t0);
+        float cur = te>0.0f ? act[abase+uint(last)] : (V-k*vel)/r;
+        out_actdot[abase+uint(adr)]=(r*cur*cur-temp/dynprm[10*i+2])/c;
         adr++;
       }
       if (has_br) {
