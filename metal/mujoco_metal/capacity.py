@@ -920,6 +920,7 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       ("next_time", b), ("next_status", b),
       ("act_dot", b * na), ("act_vel", b * na),
       ("next_act", b * na), ("sensordata", b * nsensordata),
+      ("forward_stage_raw_sensor_rollback", b * nsensordata),
       # Conservative transient peak for callback force/activation validation:
       # finite masks, sanitized payloads and per-world result status. This
       # explicit reserve applies independently of registry implementation.
@@ -965,7 +966,11 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       ("component_world_status", b if mass_storage == "block_sparse" else 0),
       ("dense_solver_world_mask", b if mass_storage == "dense" else 0),
   ):
-    if name.startswith("energy_") and not energy_enabled:
+    if name == "forward_stage_raw_sensor_rollback":
+      # This plane is never a shader's empty-buffer placeholder. A model
+      # with no sensor channels owns no numerical rollback storage.
+      parts.append((f"simulation.{name}", count))
+    elif name.startswith("energy_") and not energy_enabled:
       parts.append((f"simulation.{name}", 0))
     else:
       parts.append((f"simulation.{name}", max(count, 1)))

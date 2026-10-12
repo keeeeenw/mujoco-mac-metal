@@ -130,9 +130,15 @@ def publish_sensor_stage(sim, stage, record=None, env_ids=None):
         first, width = int(model.sensor_adr[index]), int(model.sensor_dim[index])
         addresses[first:first+width] = True
     channels = torch.as_tensor(addresses, device=selected.device)
-    writes = selected[:, None] & channels[None, :]
     with _inverse_query_workspaces(sim):
+      adapter_before = [(plugin, plugin.device_snapshot()) for plugin in sim._native_plugins]
       _evaluate_stage(sim, record, stage, selected)
+      accepted = selected & (sim._sensor_plugin_status == 0)
+      writes = accepted[:, None] & channels[None, :]
+      # One adapter's failure rejects this world's complete publication,
+      # including otherwise-valid state changes in another stage adapter.
+      for plugin, payload in adapter_before:
+        plugin.restore_masked(payload, accepted)
       values = {}
       for name in _FIELDS:
         value = getattr(sim, name)
@@ -140,6 +146,11 @@ def publish_sensor_stage(sim, stage, record=None, env_ids=None):
           if name in ('_sensordata', '_raw_sensordata'):
             retained = retained_values[name] if retained_values[name] is not None else previous
             value = torch.where(writes, value, retained)
+          elif name in ('_energy', '_energy_computed'):
+            retained = retained_values[name]
+            if retained is None:
+              retained = torch.zeros_like(value)
+            value = torch.where(accepted[:, None], value, retained)
           values[name] = value.clone()
       plugin_states = [(p, p.device_snapshot()) for p in sim._native_plugins]
     plugin_before = [(p, p.device_snapshot()) for p in sim._native_plugins]

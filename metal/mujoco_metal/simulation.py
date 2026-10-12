@@ -1465,6 +1465,12 @@ class MetalSimulation:
     from mujoco_metal.history import DeviceHistory
     self._history_program = DeviceHistory(model, batch_size, self._state._device)
     self._raw_sensordata = None
+    # Reusable, admitted rollback storage. Raw readings belong to the same
+    # accepted world as stored readings and adapter state, including failures.
+    # The forward-stage prefix also makes explicit queries preserve this buffer.
+    self._forward_stage_raw_sensor_rollback = (torch.zeros(
+        (batch_size, int(model.nsensordata)), dtype=torch.float32,
+        device=self._state._device) if self._sensors is not None else None)
     self._raw_sensor_program = self._sensors
     if (self._sensors is not None and not self._history_program.sensor_enabled
         and bool(np.any(np.asarray(model.sensor_delay) > 0))):
@@ -4920,6 +4926,7 @@ class MetalSimulation:
       raise
     _zero_invalid_rows(qfrc, getattr(record, "row_valid", None), self._state)
     result = {"qfrc_actuator": qfrc,
+              "status": (typed_output["status"] if typed_output is not None else None),
               "actuator_result": actuator_result,
               "native_actuator_output": typed_output,
               "act_dot": (self._act_dot if self._actuators is not None else None),
@@ -7030,8 +7037,17 @@ class MetalSimulation:
       plugin_step_snapshot = _snapshot_plugins_device(self._native_plugins)
       sleep_step_snapshot = self._snapshot_sleep_device()
       pre_warm = None
+      pre_sens_binding = self._sensordata
       pre_sens = (self._sensordata.clone() if self._sensordata is not None
                   else None)
+      pre_raw_binding = self._raw_sensordata
+      pre_raw = self._forward_stage_raw_sensor_rollback
+      if pre_raw is not None:
+        source = pre_raw_binding if pre_raw_binding is not None else pre_sens
+        if source is None:
+          pre_raw.zero_()
+        else:
+          pre_raw.copy_(source)
       pre_act_dot = (self._act_dot.clone()
                      if getattr(self, "_act_dot", None) is not None else None)
       try:
@@ -7187,6 +7203,7 @@ class MetalSimulation:
                                else torch.zeros_like(self._sensordata))
               self._sensordata.copy_(torch.where(
                   success.unsqueeze(1), self._sensordata, rollback_sens))
+            self._restore_failed_raw_sensor_rows(pre_raw, success)
             if pre_warm is not None and cc is not None:
               failed_mask = ~success
               nr = int(cc.descriptor.nr)
@@ -7287,6 +7304,7 @@ class MetalSimulation:
                              else torch.zeros_like(self._sensordata))
             self._sensordata.copy_(torch.where(
                 success.unsqueeze(1), self._sensordata, rollback_sens))
+          self._restore_failed_raw_sensor_rows(pre_raw, success)
           if pre_warm is not None and cc is not None:
             failed_mask = ~success
             nr = int(cc.descriptor.nr)
@@ -7663,6 +7681,7 @@ class MetalSimulation:
                            else torch.zeros_like(self._sensordata))
           self._sensordata.copy_(torch.where(
               self._success.unsqueeze(1), self._sensordata, rollback_sens))
+        self._restore_failed_raw_sensor_rows(pre_raw, self._success)
         if pre_warm is not None and cc is not None:
           failed_mask = ~self._success
           nr = int(cc.descriptor.nr)
@@ -7679,6 +7698,10 @@ class MetalSimulation:
         _restore_failed_plugin_rows(plugin_step_snapshot, self._success)
       except Exception:
         _restore_plugins_device(plugin_step_snapshot)
+        self._sensordata = pre_sens_binding
+        self._raw_sensordata = pre_raw_binding
+        if pre_raw_binding is not None and pre_raw is not None:
+          pre_raw_binding.copy_(pre_raw)
         if pre_sens is not None and self._sensordata is not None:
           self._sensordata.copy_(pre_sens)
         if pre_warm is not None and cc is not None:
@@ -7707,6 +7730,11 @@ class MetalSimulation:
     if self._sensors is None or self._sensordata is None:
       raise ValueError("step_sensordata requires a sensor stepping profile")
     return self._sensordata.detach().cpu().numpy().copy()
+
+  def _restore_failed_raw_sensor_rows(self, previous, accepted):
+    raw = self._raw_sensordata
+    if raw is not None and previous is not None:
+      self._state.copy_masked_rows(raw, previous, (~accepted).contiguous())
 
   def _store_step_sensors(self, qpos, qvel, dynamics, qacc=None, *,
                           qacc_low=_AUTO_SENSOR_QACC_LOW,
@@ -7823,12 +7851,13 @@ class MetalSimulation:
               self._sensor_plugin_status.copy_(torch.where(
                   invalid, torch.ones_like(self._sensor_plugin_status),
                   self._sensor_plugin_status))
+              accepted = tick_mask & valid_rows
               merged[:, adr:adr + dim] = torch.where(
-                  tick_mask.unsqueeze(1), computed, sensor_before)
+                  accepted.unsqueeze(1), computed, sensor_before)
               # Enforce the state contract even for callbacks that update
               # eagerly: worlds outside this sensor's compiled tick mask
               # retain their previous plugin state.
-              plugin.restore_masked(state_before, tick_mask)
+              plugin.restore_masked(state_before, accepted)
             except Exception:
               _restore_plugins_device(sensor_plugin_states)
               raise
