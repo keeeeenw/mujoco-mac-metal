@@ -39,6 +39,15 @@ publication restore faults have passing rollback checks, including prepared
 record and old-buffer ownership. The reviewed port passes a combined 209-check
 native/mixed gate. This does not close the full lifecycle or API milestones.
 
+Later coherent correction gates pass 1,100 affected checks and the full host
+selection (3,008 passed, 99 skipped); the exact managed source port passes
+495 checks. They cover complete late reset/keyframe/copy rollback, retained
+sleeping pose words and awake lists, source callback cutoffs, invalid sensor
+row ownership and typed actuator payload rejection before physical recovery.
+Normal warning/AUTORESET controls remain tested. These overlapping scopes are
+not a completed full native, wheel or demo qualification. Milestones 005–020
+remain open.
+
 Prepared potential/kinetic energy APIs, computed-stage metadata and current flex
 queries have separate passing native correction gates. A 100-case source-order
 matrix checks five integrators, automatic energy and sensors enabled/disabled,

@@ -1067,6 +1067,40 @@ shape and dtype. Invalid legacy record widths and payload shapes are rejected
 before spatial scratch allocation or output writes. These trusted native views
 are separate from the upstream host contact structure.
 
+Registered USER/PLUGIN sensor adapters remain awake when their referenced body
+sleeps, matching pinned MuJoCo's special sensor policy. Their declared stage,
+selected-world and compiled adapter-history masks still apply. REAL and POSITIVE
+cutoffs are applied after callback evaluation; axis/quaternion values are not
+clipped. Upstream XML rejects a positive cutoff for those normalized datatypes;
+the compiled-array runtime rule ignores it if that array is explicitly changed.
+The device adapter history contract does not automatically reproduce arbitrary
+upstream USER callback scheduling or convert host callback code.
+
+Nonfinite adapter samples report per-world failure and retain the prior sample
+and adapter state. Standalone publication rejects that world's complete stage
+publication, including other channels, adapter state and energy changes; it
+does not integrate or change the physical failure status. Ordinary stepping
+retains complete failed-world raw/stored samples and adapter state, with an
+admitted reusable raw rollback plane. Exceptions after actual sensor evaluation
+also restore previously lazy or populated sample bindings.
+
+Reset, keyframe reset and environment copying now enclose adapter and physical
+commits in the admitted lifecycle transaction. A later state/diagnostic failure
+rolls back the complete owned state and caches. Environment copies also carry
+retained body pose words and current derived awake lists immediately. These
+explicit API boundaries incur transaction snapshot cost and can serialize
+adapter state on the host; they are separate from native numerical stepping.
+
+Typed actuator callbacks validate both force and optional activation-derivative
+rows before projection. Invalid payload rows return a failure status through
+prepared ACT/ACC/constraint stages and ordinary/split stepping. Rejected callback
+values do not enter the physics acceleration check or trigger physical reset;
+failed worlds retain their prior state and adapter history. Finite forces that
+produce genuinely excessive acceleration still follow the configured MuJoCo
+warning/AUTORESET behavior. This is the explicit device extension contract,
+not a claim about arbitrary C/Python plugin failure semantics. Callback
+validation temporaries are included in conservative capacity admission.
+
 ### Component implicitfast midpoint and monolithic solver scaling
 
 Eligible standalone free bodies use MuJoCo's midpoint position velocity after

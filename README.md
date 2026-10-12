@@ -75,7 +75,7 @@ The earlier host publication check passed **2,163 tests, with 1,615
 native-dependent tests skipped**. More recent development corrections preserve
 retained precision in inertial bias, inverse derivatives and elastic forces,
 with independent trajectory, energy and lifecycle checks. The latest CPU
-selection passed **3,000 tests, with 99 skipped** in its prepared development
+selection passed **3,008 tests, with 99 skipped** in its prepared development
 environment. These are separate source/environment results, not a full GPU or
 installed-wheel qualification. The development source has not been released
 to PyPI.
@@ -86,6 +86,13 @@ implicitfast route. Newton/CG stopping now also follows MuJoCo when constraint
 islands are disabled. Focused CPU-oracle, trajectory, rollback and replay checks
 pass; these changes do not close the full milestones. See the
 [API contracts](metal/API.md) and [qualification evidence](metal/QUALIFICATION.md).
+
+Further corrections protect complete reset/keyframe/copy transactions, retain
+sleeping pose precision, apply source sensor cutoffs and isolate invalid sensor
+and typed-actuator extension outputs. A coherent affected selection passes
+**1,100 checks**, followed by **495 checks** after the exact source port. These
+overlapping checks cover native physics and host contracts; they are separate
+from complete repository, installed-wheel and final demo qualification.
 
 ## Measured performance on M1 Max
 

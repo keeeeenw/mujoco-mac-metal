@@ -1,5 +1,46 @@
 # Development qualification — 2026-10-11
 
+## Complete sensor and extension correction composition
+
+The coherent source at `203b59ca5` passes the complete **39-file affected
+selection: 1,100 checks in 888.90 seconds**, with no failures or skips and MPS
+CPU fallback disabled. The full host selection at that source passes
+**3,008 tests, 99 skipped, 3,294 deselected in 106.96 seconds** with MPS disabled.
+After porting the exact commits, verifying all 599 producing file hashes and
+checking actual managed module/shader imports, the combined **13-file managed
+selection passes 495 checks in 167.28 seconds**, including the original coupled
+constraint file. These overlapping counts must not be added together or called
+an unrestricted GPU test count.
+
+The reviewable corrections are `7d201f2ba` (complete reset/keyframe/copy
+rollback), `ad3dc31e4` (post-callback cutoff and source awake-policy checks),
+`3416b5fc8` (retained sleeping pose/list copies), `ece21dc59` (typed actuator
+payload rejection) and `203b59ca5` (complete failed-world sensor ownership).
+Actual baseline runs reproduced each affected ownership/failure path; fixture
+errors involving tuple checkpoint keys, source sleep behavior and compiler
+admission were corrected independently of production code. No original
+physics tolerance, iteration budget or source recovery behavior was relaxed.
+
+New cases compare source callback cutoffs, selected samples/state, subsequent
+CPU motion, actual post-write failures, initialized/lazy bindings, reusable
+storage, derivative-query ownership, prepared-record coherence and exact replay.
+Typed actuator checks cover NaN/Infinity in force and activation derivatives
+across five profiles and ordinary/split/prepared forward routes, with independent
+healthy-world CPU references. Separate finite-large-force controls retain
+configured BADQACC warning and AUTORESET behavior. Extension rejection remains
+an explicit backend contract, not arbitrary upstream callback conversion.
+
+The preceding complete backend discovery at `f65806d51` stopped after
+**1,121 passes and one failure in 2,075.11 seconds** on an obsolete empty-pair
+header assertion. `ec23523d0` distinguishes logical offsets from the world-mask
+pointer and entries, and checks actual empty-contact native acceleration and
+zero constraint force against CPU MuJoCo. Its focused gate passes **4 checks in
+1.70 seconds**. The failed discovery did not run the rest of the repository.
+
+Complete repository-native qualification, remaining API contracts, clean-wheel
+installation and full-timeline creative demo gates remain open. No performance
+claim or full milestone acceptance follows from these correction gates.
+
 ## Prepared energy APIs and sensor storage
 
 Runtime revision `2f0c6ded4`, with tests through `7145fe3d9`, passes the complete
