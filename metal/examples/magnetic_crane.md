@@ -35,11 +35,15 @@ Record the side-by-side native Metal and CPU MuJoCo renders (labels show
 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/magnetic_crane.py --record metal/examples/assets/magnetic_crane.gif --steps 900
 ```
 
-Launch the interactive viewer on a Mac:
+Launch the interactive viewer on a Mac (left-drag to orbit, right-drag to pan,
+scroll to zoom, Escape to close). GLFW runs on Python’s main thread, avoiding
+the passive viewer’s `mjpython` interpreter trampoline:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples mjpython metal/examples/magnetic_crane.py --steps 900
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/magnetic_crane.py --viewer
 ```
+
+For an automatically closing viewer smoke test, add `--viewer-seconds 3`.
 
 ![Magnetic crane](assets/magnetic_crane.gif)
 
@@ -48,15 +52,22 @@ weld force carries the cargo while attached and is removed after release, hook
 body tracks the prescribed mocap target exactly, pre-release native/CPU pose
 parity holds over the stable hold horizon, cargo contacts the bin, the released
 cargo lands inside the right-bin footprint while the always-attached
-counterfactual stays suspended, with zero bin contact when latched.
+native counterfactual stays suspended, with zero native bin contacts when
+latched. A checkpoint taken during transport restores and reproduces the
+complete final simulation checkpoint exactly, including retained precision
+and solver seeds. Every native step must retain successful status.
 
-Measured native results on the qualified run (MuJoCo 3.10.0, MPS float32):
+Measured results from the full 900-step native check (MuJoCo 3.10.0):
 
-- Pre-release parity (100 stable hold steps): qpos `2.97e-07`, qvel `9.72e-06`.
-- Full-run maxima (900 steps incl. carry + release): qpos `6.16e-07`, qvel `2.16e-05`.
-- Native weld force before release: `3.93`; after release: `0.0`.
-- Hook mocap tracking error: `0.0` (exact prescribed poses).
-- Cargo contact steps: `218`; cargo-bin contact steps released/latched: `218` / `0`.
-- Released cargo `(x, z)`: (`0.700`, `0.200`) inside right-bin footprint; latched cargo `(x, z)`: (`0.700`, `0.850`) suspended.
+- Stable-hold parity: qpos `3.54e-08`, qvel `3.86e-07`.
+- Full-timeline maxima: qpos `1.13e-07`, qvel `1.86e-06`.
+- Native weld force before/after release: `3.930` / `0.0`.
+- Hook mocap tracking error: `0.0`.
+- Native and CPU released bin contacts: `218` steps each; native and CPU
+  always-attached counterfactual contacts: `0`.
+- Released cargo `(x, z)`: `(0.70045, 0.19989)`; attached cargo:
+  `(0.70000, 0.84963)`.
+- Complete checkpoint replay: exact. The bounded Mac viewer smoke test
+  advanced 66 native steps and exited normally.
 
 Lighting and the dark checkerboard match the robotic marble music machine.
