@@ -1355,7 +1355,7 @@ def test_pair_header_routes_after_four_slot_first_pair(pruning):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_pair_header_empty_pair_universe():
+def test_pair_header_empty_pair_universe(monkeypatch):
   """An empty pair-offset tail remains valid when the model has one geom."""
   import torch
 
@@ -1371,8 +1371,26 @@ def test_pair_header_empty_pair_universe():
   assert coupled.descriptor.pair_contact_offset.tolist() == [0]
   packed = coupled._constants["pair_contact_offsets_dims"].cpu().numpy()
   assert packed[1] == 0
-  np.testing.assert_array_equal(packed[10:], [0])
-  coupled.generate_candidates(dynamics["poses"], qvel)
+  # Ten dimensions, npairs+1 logical offsets, candidate row starts, then
+  # the world-mask pointer and its batch entries. Empty pairs still own
+  # their terminating offset and the complete per-world enable mask.
+  np.testing.assert_array_equal(packed[10:11], [0])
+  assert packed.shape == (15,) and packed[11] == 12
+  np.testing.assert_array_equal(packed[12:], np.ones(3, dtype=np.int32))
+  np.testing.assert_array_equal(
+      coupled._constants["pair_contact_offset"].cpu().numpy(), [0])
+  from test_energy_lifecycle_006 import _native_only
+  _native_only(monkeypatch, lambda: coupled.generate_candidates(dynamics["poses"], qvel))
+  result = _native_only(monkeypatch, lambda: coupled.run_device(
+      dynamics["poses"], dynamics["mass_matrix"], -dynamics["qfrc_bias"], qpos, qvel))
+  refs = [mujoco.MjData(model) for _ in range(3)]
+  for data in refs:
+    mujoco.mj_forward(model, data)
+    assert data.ncon == 0 and data.nefc == 0
+  np.testing.assert_array_equal(result["status"].cpu().numpy(), 0)
+  np.testing.assert_array_equal(result["qfrc_constraint"].cpu().numpy(), 0)
+  np.testing.assert_allclose(result["qacc"].cpu().numpy(), [data.qacc for data in refs],
+                             atol=2e-6, rtol=2e-6)
 
 
 @pytest.mark.gpu
