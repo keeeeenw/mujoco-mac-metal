@@ -68,7 +68,9 @@ free-function bindings; a matching inventory does not prove native execution.
 **Milestone 005 is qualified: the pinned inventory and executable support
 contract pass 1,292 targeted checks. Milestone 006 also qualifies state/model
 lifecycle with 170 host and 191 native checks, a full crane demo and exact
-checkpoint replay. Milestones 007–020 remain open.**
+checkpoint replay. Milestone 007 qualifies built-in actuation and rigid
+transmissions with 181 host and 198 native checks, the complete muscle gripper
+and exact replay. Milestones 008–020 remain open.**
 Inventory qualification does not establish native physics correctness. Earlier
 bounded capabilities and selected development fixtures remain usable and retain
 their passing checks. Further milestones are qualified individually, in order.
@@ -153,7 +155,7 @@ the clip shows a separate 5,000-step native rollout with OpenGL rendering.
 
 ### [Muscle-powered gripper](metal/examples/muscle_gripper.md)
 
-A muscle-driven parallel-jaw gripper delivers a ball into a bin and places a second ball on a
+A muscle-driven parallel-jaw gripper delivers a ball into a bin and places a capsule on a
 pedestal, exercising stateful actuation and contact-rich manipulation. The guide
 reports both successful behavior and numerical comparison boundaries.
 

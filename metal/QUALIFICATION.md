@@ -1359,3 +1359,84 @@ These milestone checks do not qualify the full backend, packaging, broad Mac
 hardware or later numerical feature matrices. Milestone 007 is next; the known
 full-timeline gripper penetration failure remains its explicit open gate. No
 repository-wide regression or performance benchmark was run.
+
+## Sequential qualification: Milestone 007 — 2026-10-13 UTC
+
+The final scoped acceptance set passes **181 host tests in 1.00 seconds** and
+**198 native tests in 693.53 seconds**, with no failures or skips. Source bytes
+remained unchanged. The nine original gate files are augmented by optional DC
+states, aggregate limits/gravity/contact composition, nonzero rigid transmissions,
+retained analytic contacts, and affected crane and contact-precision checks.
+This closes admitted built-in actuation/rigid transmissions under integrated
+Euler. Extensions remain owned by 019 and other integration stages by 015;
+these results do not establish arbitrary Cartesian-product model support.
+
+Corrections preserve temperature-dependent DC current resistance, the world
+slider axis and its derivative, and the pinned rotational reference-site
+quaternion convention. Tests compare nonzero state/velocity, changing commands,
+parent-frame gears, common ancestry, infeasible crank branches, antagonist
+forces, activation derivatives and complete checkpoint replay with independent
+MuJoCo 3.10.0 stages/trajectories. Native stage checks forbid CPU physics.
+All 32 optional DC-state allocations run under three controller modes.
+Existing muscle transition, activation/force-limit and lifecycle checks remain.
+
+The original gripper and always-open episodes each pass all 22,000 native steps
+with unchanged XML, controls, solver configuration and bounds. Actual peak
+contact penetration is **0.880637 mm native versus 0.880697 mm CPU**, below 1 mm.
+Native support contacts occur on 14,299 steps and red-bin contacts on 12,436;
+the always-open counterfactual has zero bin hits. Both objects lift above 0.309 m
+and reach their receivers. A full checkpoint during the second carry replays
+exactly, including dtype/literal bits, precision and solver/actuator history.
+
+The earlier 28.01 mm capsule penetration failure is resolved by source-rounded
+capsule/box manifolds from retained poses. A new retained lateral adhesion case
+also exposed box/plane depth/impedance rounding under tiny rotation: its angular
+acceleration error 9.023e-5 exceeded the unchanged 5e-5 absolute bound. Both
+lateral and normal-motion cases now pass after source-rounded corner/depth
+production and paired assembly. Direct depth, corner-order, tiny-rotation and
+empty-world checks accompany the fix. No failed case was removed or bound
+relaxed. Complete collision/solver-option qualification remains separate.
+
+The reviewed GIF contains 88 actual native/CPU frame pairs at 2 fps across the
+44-second grasp at 1x playback. Both deliveries, lighting, framing and clipping
+were reviewed. Main-thread GLFW runs ordinary Python on macOS: 20 native steps
+in three wall seconds, with CPU stepping forbidden. CPU forward evaluation only
+mirrors native state for OpenGL. The rollout functions and XML are unchanged
+from full-demo source 61bdb3611; later physics corrections affect transmission
+and box/plane branches absent from that four-slide-muscle model.
+
+Long delivery does not imply identical rotational trajectories: maximum
+translation difference 0.986 mm, geodesic rotation 0.115 rad, and angular velocity
+2.35 rad/s during the second pickup. Pre-contact position/velocity errors are
+5.37e-8 and 1.83e-6; activation error stays below 3.22e-7.
+See the [gripper guide](examples/muscle_gripper.md).
+
+Reproduce the scoped selection in the pinned development environment:
+
+```sh
+PYTHONPATH=metal:metal/tests:metal/examples MUJOCO_METAL_RUN_GPU=1 \
+PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTORCH_MPS_FAST_MATH=0 \
+python -m pytest -q -x -p no:cacheprovider \
+  metal/tests/test_actuation.py \
+  metal/tests/test_actuators_007.py \
+  metal/tests/test_transmissions.py \
+  metal/tests/test_transmission_simulation.py \
+  metal/tests/test_actuator_inheritance_repair.py \
+  metal/tests/test_dcmotor_unallocated_activations.py \
+  metal/tests/test_actuator_velocity_derivatives.py \
+  metal/tests/test_actuator_workspace_scaling.py \
+  metal/tests/test_actuator_delay_repair.py \
+  metal/tests/test_actuator_complete_007.py \
+  metal/tests/test_actuator_limits_composition_007.py \
+  metal/tests/test_rigid_transmission_complete_007.py \
+  metal/tests/test_capsule_box_contact_source_007.py \
+  metal/tests/test_magnetic_crane_006.py \
+  metal/tests/test_contact_precision.py \
+  metal/tests/test_contact_operator_precision.py
+```
+
+Run separately with -m 'not gpu' and -m gpu for the two phases. The prepared host
+gate also disables MPS availability. The full original gripper is a separate
+acceptance run, not part of the 198 count. No repository-wide regression,
+benchmark, publication or release was performed. Milestone 008 is next.

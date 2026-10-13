@@ -1,8 +1,9 @@
 # Development milestone status
 
-The source backend is experimental. **2 of the 16 milestones 005–020 are accepted: 005 (classification/support
-contract) and 006 (state/model lifecycle under its admitted-model contract).**
-Milestones 007–020 remain open; acceptance of state ownership does not qualify
+The source backend is experimental. **3 of the 16 milestones 005–020 are accepted: 005 (classification/support
+contract), 006 (state/model lifecycle) and 007 (built-in actuation and rigid
+transmissions under the admitted-model and integrated Euler contracts).**
+Milestones 008–020 remain open; acceptance of state ownership does not qualify
 their remaining numerical feature compositions. Earlier bounded profiles and selected
 native fixtures have passed independent checks.
 
@@ -10,7 +11,7 @@ native fixtures have passed independent checks.
 |---|---|---|
 | 005 | Pinned inventory and support contract | Qualified: complete classification, direct header/binding drift and compiled admission matrix; native physics qualification remains separate |
 | 006 | State, model and lifecycle | Qualified: 170 host + 191 native checks, full crane/replay and bounded Mac viewer; shared-model and recompile boundaries documented |
-| 007 | Actuators and transmissions | Built-in and extension paths implemented; complete combination and demo qualification open |
+| 007 | Actuators and transmissions | Qualified: 181 host + 198 native checks, full gripper/counterfactual, exact replay and working Mac viewer; extensions and remaining integrators retain later owners |
 | 008 | Spatial tendons | Wrapping and admitted armature paths implemented; public assembly and final composition gate open |
 | 009 | Rigid constraints | Coupled constraint paths implemented; full mixed-feature qualification open |
 | 010 | Analytic collision families | Primitive and additional convex-shape paths implemented; complete dispatcher/trajectory gate open |
@@ -46,7 +47,7 @@ selection (3,008 passed, 99 skipped); the exact managed source port passes
 sleeping pose words and awake lists, source callback cutoffs, invalid sensor
 row ownership and typed actuator payload rejection before physical recovery.
 Normal warning/AUTORESET controls remain tested. These overlapping scopes are
-not a completed full native, wheel or demo qualification. Milestones 007–020
+not a completed full native, wheel or demo qualification. Milestones 008–020
 remain open.
 
 Prepared potential/kinetic energy APIs, computed-stage metadata and current flex
@@ -139,7 +140,7 @@ complete 19-case native lifecycle file and 71 affected native transaction,
 split-stage, delay and recovery cases. These preserve nonzero source energy,
 selected worlds, malformed rejection, legacy compatibility and exact replay.
 These are source-specific results; full heightfield/deformable composition,
-final wheel/demo checks and milestones 007–020 remain open.
+final wheel/demo checks and milestones 008–020 remain open.
 
 Current checkpoint and owned-keyframe regression fixtures at `fe644d658` /
 `70136b887` pass the complete 19-case native actuator/device/mocap/equality
@@ -177,3 +178,22 @@ flex lifecycle. The refreshed crane GIF shows actual native/CPU frames. Its
 main-thread GLFW viewer advances native physics and closes under a wall-time
 limit; no interpreter or global environment changes were needed. Milestone 007
 actuator qualification and its full gripper demo are next.
+
+## Sequential actuation qualification — 2026-10-13 UTC
+
+Milestone 007 passes 181 host and 198 native checks without failures or skips:
+nonzero rigid transmission frames, moving slider-cranks, optional DC states,
+aggregate limits/gravity routing, and changing adhesion forces under contact.
+The source corrections preserve DC resistance, axis derivatives, rotated
+reference-site conventions and retained geometry. The crane replay still passes.
+
+The original gripper and always-open episodes each complete 22,000 native steps.
+Maximum native penetration is 0.880637 mm against the unchanged 1 mm bound,
+both payloads reach their receivers, and full checkpoint replay is exact. The
+new comparison GIF and GLFW viewer were visually reviewed. The demo guide
+records remaining long-horizon rotational differences.
+
+Milestone 008 is next: complete spatial tendon mechanics and branch transitions,
+coupled forces/constraints and the full drawbridge. These results do not close
+all collision/solver options, other integrators, extensions, distribution,
+broad hardware or performance qualification.

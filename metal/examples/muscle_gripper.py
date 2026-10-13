@@ -439,56 +439,84 @@ def run(steps=DEFAULT_STEPS, mode="metal", check=False, record=None):
 
 
 def run_viewer(steps=DEFAULT_STEPS, seconds=0):
-  """Interactive native viewer (requires a display; headless uses --headless).
-
-  Steps the native simulation with the deterministic gantry/finger schedule
-  and shows native state live, tracking the CPU oracle for the report.
-  With seconds > 0 the viewer auto-closes after that wall time (used for
-  explicit visual checks); 0 runs the full finite rollout (steps), then closes.
-  """
+  """Display actual native physics; MuJoCo only mirrors it for OpenGL rendering."""
   import time
-  from mujoco import viewer as mj_viewer
+  import glfw
   from mujoco_metal import MetalSimulation
   model = _load_model()
-  qpos0 = model.qpos0.copy().astype(np.float32)
-  qvel0 = np.zeros(model.nv, dtype=np.float32)
-  native = MetalSimulation(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :],
-                           profile=PROFILE, limits=DEMO_LIMITS)
-  native.reset_to_keyframe(0)
-  cpu = mujoco.MjData(model)
-  mujoco.mj_resetDataKeyframe(model, cpu, 0)
-  mujoco.mj_forward(model, cpu)
-  actual = mujoco.MjData(model)
-  mujoco.mj_resetDataKeyframe(model, actual, 0)
-  mujoco.mj_forward(model, actual)
-  max_err = 0.0
-  with mj_viewer.launch_passive(model, actual) as viewer:
-    viewer.cam.lookat[:] = [0.1, 0.15, 0.30]
-    viewer.cam.distance = 2.1
-    viewer.cam.azimuth = 110
-    viewer.cam.elevation = -30
-    deadline = time.monotonic() + seconds
+  sim = MetalSimulation(model, batch_size=1, profile=PROFILE, limits=DEMO_LIMITS)
+  sim.reset_to_keyframe(0)
+  display = mujoco.MjData(model)
+  completed = 0
+  if not glfw.init():
+    raise RuntimeError("GLFW could not initialize the Mac viewer")
+  window = None
+  context = None
+  try:
+    window = glfw.create_window(1000, 700, "Muscle gripper — native Metal", None, None)
+    if window is None:
+      raise RuntimeError("GLFW could not create an OpenGL viewer window")
+    glfw.make_context_current(window)
+    glfw.swap_interval(1)
+    camera = mujoco.MjvCamera()
+    camera.lookat[:] = [.1, .15, .30]
+    camera.distance, camera.azimuth, camera.elevation = 2.1, 110, -30
+    scene = mujoco.MjvScene(model, maxgeom=1000)
+    context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
+    options = mujoco.MjvOption()
+    previous = list(glfw.get_cursor_pos(window))
+    def keyboard(win, key, scancode, action, mods):
+      if key == glfw.KEY_ESCAPE and action == glfw.PRESS:
+        glfw.set_window_should_close(win, True)
+    def cursor(win, x, y):
+      dx, dy = x-previous[0], y-previous[1]
+      previous[:] = [x, y]
+      left = glfw.get_mouse_button(win, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+      right = glfw.get_mouse_button(win, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+      middle = glfw.get_mouse_button(win, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
+      if not (left or right or middle):
+        return
+      action = (mujoco.mjtMouse.mjMOUSE_MOVE_V if right else
+                mujoco.mjtMouse.mjMOUSE_ROTATE_V if left else mujoco.mjtMouse.mjMOUSE_ZOOM)
+      height = max(1, glfw.get_window_size(win)[1])
+      mujoco.mjv_moveCamera(model, action, dx/height, dy/height, scene, camera)
+    def scroll(win, x, y):
+      mujoco.mjv_moveCamera(model, mujoco.mjtMouse.mjMOUSE_ZOOM, 0, -.05*y, scene, camera)
+    glfw.set_key_callback(window, keyboard)
+    glfw.set_cursor_pos_callback(window, cursor)
+    glfw.set_scroll_callback(window, scroll)
+    started = time.monotonic()
     for step in range(steps):
-      if not viewer.is_running():
+      if glfw.window_should_close(window) or (seconds > 0 and time.monotonic()-started >= seconds):
         break
-      if seconds > 0 and time.monotonic() >= deadline:
-        break
+      before = time.monotonic()
       target, ctrl = _sched(step)
-      native.set_mocap(target.astype(np.float32).reshape(1, 3),
-                       np.array([[1, 0, 0, 0]], dtype=np.float32))
-      native.step(1, ctrl=np.asarray(ctrl, dtype=np.float32).reshape(1, 4))
-      cpu.mocap_pos[0] = target
-      cpu.ctrl[:] = ctrl
-      mujoco.mj_step(model, cpu)
-      gq = native.state.qpos[0].cpu().numpy()
-      max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
-      with viewer.lock():
-        actual.qpos[:] = gq
-        actual.qvel[:] = native.state.qvel[0].cpu().numpy()
-        actual.mocap_pos[0] = target
-        actual.time = float(native.state.time[0].cpu().numpy())
-      viewer.sync()
-  return {"max_qpos_err": max_err, "steps": steps}
+      target = target.astype(np.float32)
+      sim.set_mocap(target.reshape(1, 3), np.asarray([[1, 0, 0, 0]], np.float32))
+      sim.step(1, ctrl=np.asarray(ctrl, np.float32).reshape(1, 4))
+      np.testing.assert_array_equal(sim.state._status.detach().cpu().numpy(), [0])
+      display.qpos[:] = sim.state.qpos[0].cpu().numpy()
+      display.qvel[:] = sim.state.qvel[0].cpu().numpy()
+      display.mocap_pos[0] = target
+      display.act[:] = sim.state.act[0].cpu().numpy()
+      display.ctrl[:] = ctrl
+      display.time = float(sim.state.time[0].cpu())
+      mujoco.mj_forward(model, display)
+      mujoco.mjv_updateScene(model, display, options, None, camera,
+                            mujoco.mjtCatBit.mjCAT_ALL, scene)
+      width, height = glfw.get_framebuffer_size(window)
+      mujoco.mjr_render(mujoco.MjrRect(0, 0, width, height), scene, context)
+      glfw.swap_buffers(window)
+      glfw.poll_events()
+      completed += 1
+      time.sleep(max(0, float(model.opt.timestep) - (time.monotonic()-before)))
+  finally:
+    if context is not None:
+      context.free()
+    if window is not None:
+      glfw.destroy_window(window)
+    glfw.terminate()
+  return {"viewer_steps": completed, "steps": completed, "backend": "native Metal physics; upstream OpenGL visualization"}
 
 
 def main():
@@ -502,6 +530,8 @@ def main():
   parser.add_argument("--viewer-seconds", type=float, default=0,
                       help="interactive native viewer; auto-close after this wall time (0 runs the finite rollout, requires a display)")
   args = parser.parse_args()
+  if not np.isfinite(args.viewer_seconds) or args.viewer_seconds < 0:
+    raise SystemExit("--viewer-seconds must be finite and nonnegative")
   if args.steps <= 0 or (args.check and not args.headless):
     raise SystemExit("use --headless --check for verification")
   if not args.headless and args.record is None and args.mode == "metal":
