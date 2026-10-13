@@ -164,7 +164,9 @@ def test_capacity_mixed_spans_near_96_and_overflow():
     assert d_ok.nr_joint == 36
     # Final valid row execution on GPU (row 95 active, finite, status 0).
     from mujoco_metal.simulation import MetalSimulation
-    sim = MetalSimulation(m_ok, batch_size=1, profile="integrated_euler_v1")
+    from mujoco_metal.capacity import CapacityLimits
+    limits = CapacityLimits(max_rows=96)
+    sim = MetalSimulation(m_ok, batch_size=1, profile="integrated_euler_v1", limits=limits)
     asm = sim.assembled_system(recompute=True)
     J96 = asm["J"][0].cpu().numpy()
     W96 = asm["W"][0].cpu().numpy()
@@ -176,12 +178,12 @@ def test_capacity_mixed_spans_near_96_and_overflow():
     # Overflow rejection before dispatch (add one more weld, 6 rows => 102>96).
     with pytest.raises(ValueError, match="total candidate constraint rows"):
         xml_bad = xml_ok.replace("</equality></mujoco>", '<weld body1="b4" body2="b5"/></equality></mujoco>')
-        lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_bad))
+        lower_coupled_constraints(mujoco.MjModel.from_xml_string(xml_bad), limits=limits)
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
-def test_failure_isolation_with_equality_contact_empty_worlds():
+def test_failure_isolation_with_equality_contact_empty_worlds(monkeypatch):
     from mujoco_metal.simulation import MetalSimulation
 
     xml = """<mujoco><option timestep="0.002" integrator="Euler" iterations="1" tolerance="1e-6" cone="pyramidal"/>
@@ -190,16 +192,43 @@ def test_failure_isolation_with_equality_contact_empty_worlds():
     <body name="b1" pos="0.5 0 0.05"><joint name="j2" type="slide" axis="0 0 1"/><geom type="sphere" size="0.1" condim="6" friction="0.8 0.6 0.07"/></body>
     </worldbody><equality><connect body1="a1" body2="b1" anchor="0 0 0"/></equality></mujoco>"""
     m = mujoco.MjModel.from_xml_string(xml)
-    # World 0: colliding active (fails with 1 iteration), world 1: far active
-    # (succeeds, no contact, satisfied equality), world 2: far inactive (empty-like).
+    # World 0 has active collision/equality; worlds 1/2 are contact-free,
+    # with equality active/inactive. One Newton iteration converges on this
+    # original quadratic fixture; exhausting a finite budget is not a failure.
     q0 = np.array([[0.0, 0.0], [5.0, 5.0], [5.0, 5.0]], dtype=np.float32)
     v0 = np.array([[2.0, -2.0], [0.0, 0.0], [0.0, 0.0]], dtype=np.float32)
     sim = MetalSimulation(m, batch_size=3, qpos=q0, qvel=v0, profile="integrated_euler_v1")
     # Make world 2 inactive via public API (empty/inactive world).
     sim.set_equality_active(np.array([[1], [1], [0]], dtype=np.int32))
     sim.step(1)
+    np.testing.assert_array_equal(sim.state.status.cpu().numpy(), [0, 0, 0])
+    cpu0 = mujoco.MjData(m)
+    cpu0.qpos[:] = q0[0]
+    cpu0.qvel[:] = v0[0]
+    mujoco.mj_step(m, cpu0)
+    assert cpu0.solver_niter[0] == 1
+    assert sim._last_coupled["solver_diagnostics"][0, 1].item() == 1
+    assert sim._last_coupled["solver_diagnostics"][0, 0].item() < 1e-6
+    np.testing.assert_allclose(sim.state.qacc[0].cpu().numpy(), cpu0.qacc,
+                               rtol=1e-5, atol=1e-4)
+    np.testing.assert_allclose(sim.state.qpos[0].cpu().numpy(), cpu0.qpos,
+                               atol=1e-5)
+    sim.reset(qpos=q0, qvel=v0)
+    sim.set_equality_active(np.array([[1], [1], [0]], dtype=np.int32))
+    # Inject corruption after public validation, at the actual MPS stage
+    # boundary. The native kernel must fail only the affected world; this
+    # tests fault handling, not valid-model physics or CPU-oracle accuracy.
+    original = sim._coupled_constraints.run_device
+    def corrupt_force(*args, **kwargs):
+        args = list(args)
+        force = args[2].clone()
+        force[0].fill_(float("nan"))
+        args[2] = force
+        return original(*args, **kwargs)
+    monkeypatch.setattr(sim._coupled_constraints, "run_device", corrupt_force)
+    sim.step(1)
     status = sim.state.status.cpu().numpy()
-    assert status[0] == 3, status
+    assert status[0] == 2, status
     assert status[1] == 0, status
     assert status[2] == 0, status
     qpos_after = sim.state.qpos.cpu().numpy()
@@ -212,7 +241,7 @@ def test_failure_isolation_with_equality_contact_empty_worlds():
     np.testing.assert_allclose(qpos_after[1], cpu1.qpos, atol=1e-5)
     # Sticky failure persists.
     sim.step(1)
-    assert sim.state.status.cpu().numpy()[0] == 3
+    assert sim.state.status.cpu().numpy()[0] == 2
     # Explicit recovery via selective reset restores defaults (active) and clears status.
     sim.state.reset(env_ids=[0])
     assert sim.state.status.cpu().numpy()[0] == 0

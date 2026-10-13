@@ -47,8 +47,17 @@ def test_joint_constraint_trajectory_and_replay(disable):
   for row, d in enumerate(refs):
     np.testing.assert_allclose(snap.qpos[row], d.qpos, atol=2e-4, rtol=2e-4)
     np.testing.assert_allclose(snap.qvel[row], d.qvel, atol=1e-3, rtol=1e-3)
+  # DeviceState snapshots intentionally omit solver seeds/held inputs.
+  # Exact trajectory replay uses the complete simulation checkpoint.
+  checkpoint = sim.snapshot()
   sim.step(10)
-  expected = sim.state.snapshot()
-  sim.state.restore(snap)
+  expected = sim.snapshot()
+  sim.restore(checkpoint)
   sim.step(10)
-  np.testing.assert_array_equal(sim.state.snapshot().qpos, expected.qpos)
+  np.testing.assert_array_equal(sim.state.snapshot().qpos, expected["device"].qpos)
+  from pathlib import Path
+  from importlib.util import spec_from_file_location, module_from_spec
+  spec = spec_from_file_location("crane_checkpoint", Path(__file__).parents[1]/"examples"/"magnetic_crane.py")
+  crane = module_from_spec(spec)
+  spec.loader.exec_module(crane)
+  crane._same_checkpoint(expected, sim.snapshot())

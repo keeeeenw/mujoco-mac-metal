@@ -63,7 +63,7 @@ def test_native_connect_assembly_exceeds_old_dof_and_row_limits():
   data.qvel[:] = qvel
   mujoco.mj_forward(model, data)
   simulation = MetalSimulation(model, qpos=qpos[None], qvel=qvel[None],
-                               profile="integrated_euler_v1",
+                               profile="integrated_scalable_v1",
                                limits=_DYNAMIC_LIMITS)
   _, status, _ = simulation._acceleration(
       torch.tensor(qpos[None], dtype=torch.float32, device="mps"),
@@ -75,6 +75,6 @@ def test_native_connect_assembly_exceeds_old_dof_and_row_limits():
       (np.asarray(data.efc_type) == int(mujoco.mjtConstraint.mjCNSTR_EQUALITY))
       & (np.asarray(data.efc_id) < 33))
   expected = np.asarray(data.efc_J).reshape(data.nefc, model.nv)[rows]
-  actual = (simulation._coupled_constraints._workspace["workspace_J"]
-            .reshape(1, descriptor.nr, model.nv)[0, :99].cpu().numpy())
+  actual = (simulation._coupled_constraints.materialize_jacobian()
+            [0, :99].cpu().numpy())
   np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=2e-5)
