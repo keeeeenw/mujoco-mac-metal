@@ -2393,9 +2393,12 @@ class MetalCoupledConstraints:
     self._has_capsule_box_pairs = any(
         {int(d.geom_type[a]), int(d.geom_type[b])} == {_CAPSULE, _BOX}
         for a, b in zip(d.geom1, d.geom2))
+    self._has_source_analytic_pairs = self._has_capsule_box_pairs or any(
+        {int(d.geom_type[a]), int(d.geom_type[b])} == {_PLANE, _BOX}
+        for a, b in zip(d.geom1, d.geom2))
     self._contact_capsule_box_producer = (
         self._library.contact_produce_capsule_box_source
-        if self._has_capsule_box_pairs else None)
+        if self._has_source_analytic_pairs else None)
     self._contact_sdf_seed_init = (
         self._library.contact_sdf_seed_init
         if self._has_analytic_sdf_pairs else None)
@@ -2580,9 +2583,9 @@ class MetalCoupledConstraints:
             self._row_velocity_scales_low_cpu if d.nr else np.zeros(1, dtype=np.float32)),
         "geom_size": self._tensor(d.geom_size.reshape(-1) if d.ngeom else np.zeros(3, dtype=np.float32)),
         "geom_size_source": self._tensor(_source_float_words(model.geom_size)
-            if self._has_capsule_box_pairs else np.zeros(3, dtype=np.float32)),
+            if self._has_source_analytic_pairs else np.zeros(3, dtype=np.float32)),
         "pair_margin_source": self._tensor(d.pair_margin_source_words
-            if self._has_capsule_box_pairs else np.zeros(3, dtype=np.float32)),
+            if self._has_source_analytic_pairs else np.zeros(3, dtype=np.float32)),
         "geom_type": self._tensor(d.geom_type if d.ngeom else np.zeros(1, dtype=np.int32)),
         "geom_rbound": self._tensor(d.geom_rbound if d.ngeom else np.zeros(1, dtype=np.float32)),
         "mesh_hull": self._tensor(self._common_ccd_mesh_hull),
@@ -3378,7 +3381,7 @@ class MetalCoupledConstraints:
     w, d = self._workspace, self.descriptor
     b, nc = self.batch_size, d.ncontacts_max
     if (d.npairs > 0 and nc > 0
-        and (self._common_ccd_requested or getattr(self, "_has_capsule_box_pairs", False))):
+        and (self._common_ccd_requested or getattr(self, "_has_source_analytic_pairs", False))):
       # Validate borrowed source-precision poses before clearing persistent
       # masks, rows or status. A rejected input must not partially mutate the
       # preceding assembly or dispatch a kernel with a foreign-device buffer.
@@ -3408,7 +3411,7 @@ class MetalCoupledConstraints:
     paired_contact_rows = bool(d.npairs > 0 and nc > 0 and (
         getattr(self, "_has_analytic_sdf_pairs", False)
         or getattr(self, "_common_ccd_hfield_mesh_requested", False)
-        or getattr(self, "_has_capsule_box_pairs", False)))
+        or getattr(self, "_has_source_analytic_pairs", False)))
     retained = None
     if paired_contact_rows:
       for pose_name in ("body_pos_low", "body_pos_tail",

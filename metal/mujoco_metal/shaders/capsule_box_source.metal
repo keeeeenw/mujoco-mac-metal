@@ -1,8 +1,10 @@
 // Copyright 2016 Svetoslav Kolev
+// Copyright 2021 DeepMind Technologies Limited
 // Copyright 2026 The MuJoCo Metal contributors
 // Licensed under the Apache License, Version 2.0.
 //
-// Source-rounded mjraw_{Sphere,Capsule}Box from pinned engine_collision_box.c.
+// Source-rounded mjraw_{Sphere,Capsule}Box and mjc_PlaneBox from pinned
+// engine_collision_box.c and engine_collision_primitive.c.
 // Capsule endpoint/edge ties must see the retained FK matrices, not matrices
 // reconstructed from rounded float quaternions. Losing a tiny capsule tilt
 // changes the manifold cardinality and the coupled trajectory.
@@ -469,6 +471,33 @@ int cb_raw_capsule_box(thread CBPreContact* con, CBNum margin,
   return n;
 }
 
+// Pinned mjc_PlaneBox (engine_collision_primitive.c): corner order and
+// source-rounded depth are significant for impedance and tiny rotations.
+int cb_plane_box(thread CBPreContact* con, CBNum margin,
+                 thread const CBNum* plane_pos, thread const CBNum* plane_mat,
+                 thread const CBNum* box_pos, thread const CBNum* box_mat,
+                 thread const CBNum* box_size) {
+  thread CBNum norm[3]={plane_mat[2],plane_mat[5],plane_mat[8]};
+  thread CBNum dif[3];cb_sub3(dif,box_pos,plane_pos);
+  CBNum dist=cb_dot3(dif,norm);
+  int count=0;
+  for(int corner_id=0;corner_id<8;corner_id++) {
+    thread CBNum vec[3],corner[3],offset[3];
+    for(int i=0;i<3;i++)vec[i]=(corner_id&(1<<i))?box_size[i]:-box_size[i];
+    cb_mulMatVec3(corner,box_mat,vec);
+    CBNum local_dist=cb_dot3(norm,corner);
+    if(dist+local_dist>margin || local_dist>0)continue;
+    con[count].dist=dist+local_dist;
+    cb_copy3(con[count].normal,norm);
+    cb_addTo3(corner,box_pos);
+    cb_scl3(offset,norm,-con[count].dist/2);
+    cb_add3(con[count].pos,corner,offset);
+    cb_zero3(con[count].tangent);
+    if(++count>=4)return 4;
+  }
+  return count;
+}
+
 // Declared here; the canonical record helper is defined by the coupled unit.
 inline void contact_cache_store(device float* records,int record,
                                thread const ContactGeom& contact);
@@ -494,7 +523,9 @@ kernel void contact_produce_capsule_box_source(
   if(npairs<=0 || world>=batch || pair>=npairs || !pair_contact_world_enabled(dims,world))return;
   int a=pair_geoms[2*pair],b=pair_geoms[2*pair+1];
   int ta=geom_type[a],tb=geom_type[b];
-  if(!((ta==3 && tb==6)||(ta==6 && tb==3)))return;
+  bool capsule_box=(ta==3 && tb==6)||(ta==6 && tb==3);
+  bool plane_box=(ta==0 && tb==6)||(ta==6 && tb==0);
+  if(!(capsule_box || plane_box))return;
   contact_count[world*npairs+pair]=0;
   if((dims[9]&1)!=0 && logical_to_packed[world*npairs+pair]<0)return;
   bool swapped=ta==6;if(swapped){int old=a;a=b;b=old;}
@@ -511,8 +542,9 @@ kernel void contact_produce_capsule_box_source(
     mb[i]=CBNum(FlexDD{geom_xmat[(go+b)*9+i],geom_xmat_low[(go+b)*9+i],geom_xmat_tail[(go+b)*9+i]});
   }
   CBNum margin(FlexDD{margin_words[pair],margin_words[npairs+pair],margin_words[2*npairs+pair]});
-  thread CBPreContact con[2];
-  int count=cb_raw_capsule_box(con,margin,pa,ma,sa,pb,mb,sb);
+  thread CBPreContact con[4];
+  int count=plane_box?cb_plane_box(con,margin,pa,ma,pb,mb,sb)
+                    :cb_raw_capsule_box(con,margin,pa,ma,sa,pb,mb,sb);
   int offset=dims[10+pair],capacity=dims[11+pair]-offset;
   count=min(count,capacity);contact_count[world*npairs+pair]=count;
   for(int k=0;k<count;k++) {

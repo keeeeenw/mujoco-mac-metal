@@ -193,3 +193,47 @@ def test_native_source_capsule_face_edge_inside_and_empty_worlds(reverse):
   for name in ("qpos", "qvel", "qacc", "precision_words", "time"):
     assert getattr(repeated["device"], name).tobytes() == getattr(expected["device"], name).tobytes()
   assert repeated["warmstart"].tobytes() == expected["warmstart"].tobytes()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native box/plane source poses")
+@pytest.mark.parametrize("reverse", [False, True])
+def test_box_plane_source_depth_corner_order_retained_rotation_and_empty_worlds(reverse):
+  from mujoco_metal import MetalSimulation
+  plane = '<body><geom name="plane" type="plane" size="2 2 .1"/></body>'
+  box = '<body pos="0 0 .0499"><freejoint/><geom name="box" type="box" size=".05 .05 .05" mass=".5"/></body>'
+  model = mujoco.MjModel.from_xml_string(f'''<mujoco><option gravity="0 0 0"/>
+    <worldbody>{box+plane if reverse else plane+box}</worldbody>
+    <contact><pair geom1="box" geom2="plane" margin=".000100000012345"/></contact></mujoco>''')
+  angles = np.asarray([0, 1e-8, -1e-8, .13, -.27, 0])
+  q = np.tile(model.qpos0, (len(angles), 1))
+  q[:, 3], q[:, 5] = np.cos(angles/2), np.sin(angles/2)
+  q[-1, 2] = .3
+  v = np.tile([.001, 0, -.001, 0, .003, 0], (len(angles), 1))
+  refs = [mujoco.MjData(model) for _ in angles]
+  for world, data in enumerate(refs):
+    data.qpos[:], data.qvel[:] = q[world], v[world]
+    mujoco.mj_forward(model, data)
+  sim = MetalSimulation(model, len(angles), profile="integrated_euler_v1")
+  qh, vh = q.astype(np.float32), v.astype(np.float32)
+  ql, vl = (q-qh).astype(np.float32), (v-vh).astype(np.float32)
+  qt, vt = (q-qh.astype(float)-ql).astype(np.float32), (v-vh.astype(float)-vl).astype(np.float32)
+  sim.reset(qpos=qh, qvel=vh)
+  before = sim.snapshot()
+  before["device"] = replace(before["device"], precision_words=np.concatenate((ql, qt, vl, vt), axis=1))
+  sim.restore(before)
+  _, status, _ = sim._acceleration(sim.state._qpos, sim.state._qvel)
+  np.testing.assert_array_equal(status.cpu().numpy(), 0)
+  result = sim._last_coupled
+  count = sim._coupled_constraints._workspace["contact_pair_count"].cpu().numpy().reshape(len(angles), -1)
+  records = sim._coupled_constraints._workspace["contact_pair_records"].cpu().numpy().reshape(len(angles), -1, 37)
+  for world, data in enumerate(refs):
+    assert count[world, 0] == data.ncon
+    for slot, contact in enumerate(data.contact):
+      # Inspect retained distances as well as published float32 contact fields.
+      stored = records[world, slot]
+      np.testing.assert_allclose(float(stored[12])+float(stored[9])+float(stored[10]),
+                                 contact.dist, rtol=0, atol=2e-14)
+      np.testing.assert_allclose(result["contact_position"].cpu().numpy()[world, slot],
+                                 contact.pos, rtol=2e-6, atol=3e-8)
+  assert count[-1, 0] == 0
