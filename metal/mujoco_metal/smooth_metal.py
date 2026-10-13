@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from mujoco_metal.mass_layout import compile_tree_mass_layout
+from mujoco_metal.source_rigid import SourceRigidDynamics, source_rigid_position_words
 
 from mujoco_metal.metal_kinematics import _prepare_host_arrays
 from mujoco_metal.metal_kinematics import MetalKinematics
@@ -45,6 +46,7 @@ def position_context_shapes(model, batch, *, mass_storage="dense", component_nnz
     shapes[f"poses.{name}"] = (batch, model.njnt, 3)
   shapes.update(root_com=(batch, model.nbody, 3), cdof=(batch, model.nv, 6),
                 pose_status=(batch,), local_inertia=(batch, model.nbody, 36))
+  shapes["source_rigid"] = (batch, source_rigid_position_words(model))
   if mass_storage == "dense":
     shapes["mass_matrix"] = (batch, model.nv, model.nv)
     shapes["mass_matrix_low"] = (batch, model.nv, model.nv)
@@ -214,6 +216,9 @@ class MetalSmoothDynamics:
     self._bias_library = torch.mps.compile_shader(_BIAS_SHADER.read_text())
     self._bias_kernel = self._bias_library.smooth_bias
     self._bias_deriv_kernel = self._bias_library.smooth_bias_derivative
+    self._source_rigid = SourceRigidDynamics(
+        self.model, torch, self._fk._device,
+        np.asarray(model.dof_armature, dtype=np.float64) + arm_fold)
     self._bias_derivative_layout = velocity_derivative_layout
     if velocity_derivative_layout is None:
       self._bias_column_offsets = self._bias_empty_index = torch.zeros(
@@ -342,6 +347,7 @@ class MetalSmoothDynamics:
          "ntree": self.ntree, "tree_mass_nnz": self._tree_mass_nnz},
     )
     self._fk.prepare_workspace(batch_size)
+    self._source_rigid.prepare(batch_size)
     self._position_context_epoch = getattr(self, "_position_context_epoch", 0) + 1
     torch, device = self._torch, self._fk._device
 
@@ -468,6 +474,8 @@ class MetalSmoothDynamics:
     self._workspace["local_inertia"].zero_()
     self._workspace["cvel"].zero_()
     self._workspace["cdof_dot"].zero_()
+    self._workspace["cacc"].zero_()
+    self._workspace["body_force"].zero_()
     self._workspace["bias"].zero_()
     self._workspace["bias_low"].zero_()
     self._workspace["cvel_low"].zero_()
@@ -622,7 +630,7 @@ class MetalSmoothDynamics:
     return output
 
   def _run_velocity_bias(self, qvel, lists, *, cdof, local_inertia,
-                         world_mask=None):
+                         world_mask=None, source_context=None):
     """Refresh only comVel/RNE; position-dependent CRBA inputs stay cached."""
     w, arrays = self._workspace, self._arrays
     batch = int(w["batch_size"])
@@ -661,6 +669,8 @@ class MetalSmoothDynamics:
     if len(bias_args) != 31:
       raise RuntimeError("native smooth bias shader buffer ABI mismatch")
     self._bias_kernel(*bias_args, threads=(batch,), group_size=(1,))
+    self._source_rigid.velocity(qvel_flat, w, lists, world_mask,
+                                position_packet=source_context)
     nv, nb = self.model.nv, self.model.nbody
     return {
         "qfrc_bias": w["bias"][:batch * nv].reshape(batch, nv),
@@ -678,7 +688,7 @@ class MetalSmoothDynamics:
     a new capture invalidates an older context. Runtime values stay on MPS
     and no device storage is allocated by this method.
     """
-    names = ("poses", "root_com", "cdof", "pose_status", "mass_matrix",
+    names = ("poses", "root_com", "cdof", "pose_status", "source_rigid", "mass_matrix",
              "mass_matrix_low", "mass_blocks", "mass_blocks_low",
              "mass_block_layout", "tendon_armature_matrix",
              "tendon_armature_blocks")
@@ -749,7 +759,8 @@ class MetalSmoothDynamics:
               if not name.startswith("_")}
     result.update(self._run_velocity_bias(
         qvel, lists, cdof=context["cdof"],
-        local_inertia=context["_local_inertia"], world_mask=world_mask))
+        local_inertia=context["_local_inertia"], world_mask=world_mask,
+        source_context=context["source_rigid"]))
     return result
 
   def _validate_cached_pose_fields(self, context, batch):
@@ -982,6 +993,7 @@ class MetalSmoothDynamics:
         self._tree_layout_device, w["mass_dims"], w["mass_layout_dims"],
         w["mass_low"], arrays["dof_M0_low"],
         threads=(batch,), group_size=(1,))
+    self._source_rigid.position(poses, w, lists, self._tree_layout_device)
     if _position_only:
       # POS owns FK/COM, cdof/local inertia and CRBA only.  In particular it
       # must not run comVel/RNE with a dummy velocity: mj_fwdVelocity is a
@@ -1038,6 +1050,7 @@ class MetalSmoothDynamics:
       tendon_armature_output = w["mass_armature"]
     nv = self.model.nv
     result = {
+        "source_rigid": self._source_rigid.position_packet,
         "qfrc_bias": w["bias"][: batch * nv].reshape(batch, nv),
         "qfrc_bias_low": w["bias_low"][: batch * nv].reshape(batch, nv),
         "pose_status": w["pose_status"],
@@ -1242,7 +1255,14 @@ class MetalSmoothDynamics:
         self._tree_layout_device, args[21], layout_dims,
         output_low, arrays["dof_M0_low"],
         threads=(batch,), group_size=(1,))
+    source_program = self._source_rigid.fork_workspace(batch)
+    source_program.position(poses, {
+        "batch_size": batch, "mass_storage": "dense", "mass": output,
+        "mass_low": output_low, "root_com": root_com, "cdof": cdof,
+        "local_inertia": local_inertia, "mass_layout_dims": layout_dims,
+    }, lists, self._tree_layout_device)
     return {
+        "_source_program": source_program,
         "mass_matrix": output[: batch * nv * nv].reshape(batch, nv, nv),
         "mass_matrix_low": output_low[: batch * nv * nv].reshape(batch, nv, nv),
         "root_com": root_com,
@@ -1259,8 +1279,8 @@ class MetalSmoothDynamics:
   def mass_matrix_pair(self, qpos_batch):
     """Return owned dense mass high/low words at the explicit query boundary.
 
-    Compiled simple rows retain their source constant residuals. Generic CRBA
-    rows currently publish zero residuals; this does not claim binary64 CRBA.
+    Source-rounded CRBA and compiled simple rows retain supplementary words.
+    The public pair remains float32 storage, not an arbitrary-precision API.
     """
     result = self._compute_mass_matrix(qpos_batch)
     return result["mass_matrix"], result["mass_matrix_low"]
@@ -1297,7 +1317,7 @@ class MetalSmoothDynamics:
     if not np.all(np.isfinite(qvel32)):
       raise ValueError("qvel cannot be represented as finite float32")
 
-    computed = self._compute_mass_matrix(qpos)
+    computed = self._compute_mass_matrix(qpos, mocap_pos, mocap_quat)
     batch, nb, nv = computed["batch"], self.model.nbody, self.model.nv
     torch = self._torch
     # The explicit host entry retains supplied source velocity. Device entry
@@ -1382,6 +1402,12 @@ class MetalSmoothDynamics:
     if len(args) != 31:
       raise RuntimeError("native smooth bias shader buffer ABI mismatch")
     self._bias_kernel(*args, threads=(batch,), group_size=(1,))
+    computed["_source_program"].velocity(qvel_tensor, {
+        "batch_size": batch, "bias": bias, "bias_low": bias_low,
+        "cvel": cvel, "cvel_low": cvel_low, "cdof_dot": cdof_dot,
+        "cdof_dot_low": cdof_dot_low, "cacc": cacc, "cacc_low": cacc_low,
+        "body_force": body_force, "body_force_low": body_force_low,
+    }, lists, self._fk._workspace["outputs"]["all_world_mask"])
     return {
         "mass_matrix": computed["mass_matrix"],
         "mass_matrix_low": computed["mass_matrix_low"],

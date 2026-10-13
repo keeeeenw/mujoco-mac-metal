@@ -652,7 +652,13 @@ class MetalKinematics:
           pos_in = np.broadcast_to(pos_in, (batch, nmocap, 3)).copy()
         if quat_in.shape == (nmocap, 4):
           quat_in = np.broadcast_to(quat_in, (batch, nmocap, 4)).copy()
-        checked_pos, checked_quat = self.model._checked_mocap(pos_in, quat_in)
+        if pos_in.shape != (batch, nmocap, 3) or quat_in.shape != (batch, nmocap, 4):
+          raise ValueError("mocap inputs must have shared or per-world pose shapes")
+        checked_pos = np.empty_like(pos_in)
+        checked_quat = np.empty_like(quat_in)
+        for world in range(batch):
+          checked_pos[world], checked_quat[world] = self.model._checked_mocap(
+              pos_in[world], quat_in[world])
       mocap_flat_host = np.concatenate(
           [np.asarray(checked_pos, dtype=np.float32).reshape(-1),
            np.asarray(checked_quat, dtype=np.float32).reshape(-1)]
