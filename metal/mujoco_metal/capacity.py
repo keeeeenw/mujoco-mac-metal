@@ -827,7 +827,7 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       (ng, 9), (ng, 9), (ng, 9),
       (ns, 3), (ns, 3), (ns, 3), (ns, 4), (ns, 4), (ns, 4),
       (nb, 3), (nb, 3), (nb, 3), (nb, 4), (nb, 4), (nb, 4),
-      (nj, 3), (nj, 3),
+      (nj, 3), (nj, 3), (nj, 3), (nj, 3), (nj, 3), (nj, 3),
   )
   fk_pose_output_words = sum(
       max(b * count * width, 1) for count, width in fk_outputs)
@@ -840,8 +840,8 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
       ("fk.qpos", max(b * nq, 1)),
       ("fk.position_words",max(2*b*nq,1)),
       # Header (12), packed-int offsets (9), packed-float offsets (11), and
-      # output-arena offsets (29). Every shader-read offset is signed int32.
-      ("fk.dims", 61),
+      # output-arena offsets (33). Every shader-read offset is signed int32.
+      ("fk.dims", 65),
   ))
 
   # Smooth mass/RNE workspaces. `crb` and `local_inertia` are 6x6 spatial
@@ -1137,6 +1137,12 @@ def _runtime_buffer_sizes(model, batch, *, npairs=None, rhs_capacity=None,
     parts.extend((
         ("spatial_tendon.actuator_state_rows", 3 * max(nu, 1)),
         ("spatial_tendon.actuator_state_dims", 5 + b),
+        # Conservatively reserve compensated site geometry, source constants
+        # and its largest transient low/tail vector even for wrapped paths.
+        ("spatial_tendon.source_site_poses", 2 * b * (3 * ns + 7 * nb + 6 * nj)),
+        ("spatial_tendon.source_site_pose_temporary",
+         b * max(3 * ns, 4 * nb, 3 * nj)),
+        ("spatial_tendon.source_site_constants", 2 * int(model.nwrap)),
     ))
   # Registered MuJoCo USER callbacks share the owned ACT-stage gain/bias
   # planes. Allocate both when any USER role exists: an ACT callback may be

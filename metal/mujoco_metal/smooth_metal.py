@@ -40,7 +40,8 @@ def position_context_shapes(model, batch, *, mass_storage="dense", component_nnz
   # Preserve all five residual-bearing geom rotation words through POS->VEL.
   for name in ("geom_xmat", "geom_xmat_low", "geom_xmat_tail"):
     shapes[f"poses.{name}"] = (batch, model.ngeom, 9)
-  for name in ("joint_anchor", "joint_axis"):
+  for name in ("joint_anchor", "joint_axis", "joint_anchor_low",
+               "joint_anchor_tail", "joint_axis_low", "joint_axis_tail"):
     shapes[f"poses.{name}"] = (batch, model.njnt, 3)
   shapes.update(root_com=(batch, model.nbody, 3), cdof=(batch, model.nv, 6),
                 pose_status=(batch,), local_inertia=(batch, model.nbody, 36))
@@ -110,6 +111,10 @@ def validate_pose_dict(model, poses, batch, device, torch, *, check_finite=True)
   shapes = {
       "joint_anchor": (batch, model.njnt, 3),
       "joint_axis": (batch, model.njnt, 3),
+      "joint_anchor_low": (batch, model.njnt, 3),
+      "joint_anchor_tail": (batch, model.njnt, 3),
+      "joint_axis_low": (batch, model.njnt, 3),
+      "joint_axis_tail": (batch, model.njnt, 3),
   }
   for kind, count in (("body", model.nbody), ("inertial", model.nbody),
                       ("geom", model.ngeom), ("site", model.nsite)):

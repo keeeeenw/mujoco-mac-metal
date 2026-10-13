@@ -474,6 +474,8 @@ class MetalSpatialTendonDynamics:
     self._offset = tensor(np.asarray(meta.flat_offset if nt else [0], dtype=np.int32), torch.int32)
     self._count = tensor(np.asarray(meta.flat_count if nt else [0], dtype=np.int32), torch.int32)
     nbody, njnt = int(model.nbody), int(model.njnt)
+    self._nbody = nbody
+    self._njnt = njnt
     self._geom_type = tensor(model.geom_type if ngeom0(model) else np.zeros(1, dtype=np.int32), torch.int32)
     self._geom_bodyid = tensor(model.geom_bodyid if ngeom0(model) else np.zeros(1, dtype=np.int32), torch.int32)
     self._geom_size = tensor(np.asarray(model.geom_size).reshape(-1)
@@ -561,6 +563,24 @@ class MetalSpatialTendonDynamics:
                      else torch.zeros(1, dtype=torch.float32,
                                       device=self._device)),
     }
+    # Site-only path cancellation consumes the retained native FK poses.
+    # Wrapped/fixed paths stay with their own kernels and are not overwritten.
+    self._site_source_kernel = None
+    self._source_pose = None
+    self._source_path = None
+    if any(path is not None and all(kind in (2, 3) for kind in path["types"])
+           for path in meta.paths):
+      source_lib = torch.mps.compile_shader(
+          (_Path(__file__).parent / "shaders" /
+           "spatial_tendon_sites.metal").read_text())
+      self._site_source_kernel = source_lib.spatial_tendon_site_source
+      width = 3 * meta.nsite + 7 * nbody + 6 * njnt
+      self._source_pose = torch.zeros((b, 2, width), dtype=torch.float32,
+                                      device=self._device)
+      constants = np.asarray(meta.flat_prms, dtype=np.float64)
+      high = constants.astype(np.float32)
+      low = (constants - high.astype(np.float64)).astype(np.float32)
+      self._source_path = tensor(np.concatenate((high, low)))
     self._dummy = torch.zeros(1, dtype=torch.float32, device=self._device)
 
   def actuator_moment_overlay(self, actuator_meta, spatial_jac):
@@ -679,6 +699,19 @@ class MetalSpatialTendonDynamics:
       qvel_flat = qvel.reshape(-1)
     else:
       qvel_flat = self._dummy
+    source_fields = (("site_pos", meta.nsite, 3),
+                     ("body_pos", self._nbody, 3),
+                     ("body_quat", self._nbody, 4),
+                     ("joint_anchor", self._njnt, 3),
+                     ("joint_axis", self._njnt, 3))
+    source_available = (self._site_source_kernel is not None and
+        all(name + "_low" in poses and name + "_tail" in poses
+            for name, _, _ in source_fields))
+    if source_available:
+      # Validate all borrowed planes before either kernel touches outputs.
+      for name, count, width in source_fields:
+        for suffix in ("", "_low", "_tail"):
+          self._check(poses[name + suffix], name + suffix, (b, count, width))
     w = self._ws
     site_pos = poses["site_pos"].reshape(-1) if meta.nsite else self._dummy
     self._kin_kernel(
@@ -696,6 +729,24 @@ class MetalSpatialTendonDynamics:
         w["length"], w["velocity"], w["jacobian"],
         threads=(b,), group_size=(1,),
     )
+    if source_available:
+      # Legacy low-level callers without retained poses keep their declared
+      # high-word inputs. The public simulation provides all retained planes.
+      cursor = 0
+      for name, count, width in source_fields:
+        size = count * width
+        self._source_pose[:, 0, cursor:cursor+size].copy_(
+            poses[name].reshape(b, size))
+        self._source_pose[:, 1, cursor:cursor+size].copy_(
+            (poses[name + "_low"] + poses[name + "_tail"]).reshape(b, size))
+        cursor += size
+      self._site_source_kernel(
+          self._source_pose.reshape(-1), self._source_path,
+          qvel_flat, self._types, self._objids, self._offset, self._count,
+          self._site_bodyid, self._body_parentid, self._body_jntadr,
+          self._body_jntnum, self._jnt_type, self._jnt_dofadr, self._dims,
+          w["length"], w["velocity"], w["jacobian"],
+          threads=(b * max(nt, 1),), group_size=(1,))
     return {"length": w["length"].reshape(b, max(nt, 1)),
             "velocity": w["velocity"].reshape(b, max(nt, 1)),
             "jacobian": w["jacobian"].reshape(b, max(nt, 1), max(nv, 1))}

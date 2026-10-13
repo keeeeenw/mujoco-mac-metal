@@ -67,6 +67,8 @@ _FK_OUTPUTS = (
     ("inertial_quat_low", "nbody", 4),
     ("inertial_quat_tail", "nbody", 4),
     ("joint_anchor", "njnt", 3), ("joint_axis", "njnt", 3),
+    ("joint_anchor_low", "njnt", 3), ("joint_anchor_tail", "njnt", 3),
+    ("joint_axis_low", "njnt", 3), ("joint_axis_tail", "njnt", 3),
 )
 
 
@@ -354,6 +356,10 @@ class MetalKinematics:
             "inertial_quat_tail": batch_size * m.nbody * 4,
             "joint_anchor": batch_size * m.njnt * 3,
             "joint_axis": batch_size * m.njnt * 3,
+            "joint_anchor_low": batch_size * m.njnt * 3,
+            "joint_anchor_tail": batch_size * m.njnt * 3,
+            "joint_axis_low": batch_size * m.njnt * 3,
+            "joint_axis_tail": batch_size * m.njnt * 3,
             "tree_awake": batch_size * max(
                 int(np.max(np.asarray(m.body_treeid), initial=-1)) + 1, 1),
             "tree_awake_cast": batch_size * max(
@@ -594,7 +600,8 @@ class MetalKinematics:
           out[f"{kind}_pos_tail"], batch, count, 3)
     for name in ("geom_xmat", "geom_xmat_low", "geom_xmat_tail"):
       result[name] = _shape_output(out[name], batch, self.model.ngeom, 9)
-    for name in ("joint_anchor", "joint_axis"):
+    for name in ("joint_anchor", "joint_axis", "joint_anchor_low",
+                 "joint_anchor_tail", "joint_axis_low", "joint_axis_tail"):
       result[name] = _shape_output(out[name], batch, self.model.njnt, 3)
     result["body_pos_low"] = _shape_output(
         out["body_pos_low"], batch, self.model.nbody, 3)

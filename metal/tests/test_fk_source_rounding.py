@@ -88,7 +88,8 @@ def test_actual_composed_frames_equal_pinned_binary64_values():
   poses = fk.run_device(torch.as_tensor(qpos, device="mps"))
   for name, field in (("body_quat", "xquat"), ("body_pos", "xpos"),
                       ("geom_pos", "geom_xpos"), ("site_pos", "site_xpos"),
-                      ("inertial_pos", "xipos"), ("geom_xmat", "geom_xmat")):
+                      ("inertial_pos", "xipos"), ("geom_xmat", "geom_xmat"),
+                      ("joint_anchor", "xanchor"), ("joint_axis", "xaxis")):
     expected = np.asarray([getattr(d, field) for d in references])
     planes = [poses[name + suffix].detach().cpu().numpy().reshape(-1)
               for suffix in ("", "_low", "_tail")]

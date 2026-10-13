@@ -44,8 +44,9 @@ def _pose_tensors(batch=2, device="cpu"):
     poses[f"{kind}_quat_tail"] = torch.zeros((batch, count, 4), device=device)
   for name in ("geom_xmat", "geom_xmat_low", "geom_xmat_tail"):
     poses[name] = torch.zeros((batch, model.ngeom, 9), device=device)
-  poses["joint_anchor"] = torch.zeros((batch, model.njnt, 3), device=device)
-  poses["joint_axis"] = torch.zeros((batch, model.njnt, 3), device=device)
+  for name in ("joint_anchor", "joint_axis"):
+    for suffix in ("", "_low", "_tail"):
+      poses[name+suffix] = torch.zeros((batch, model.njnt, 3), device=device)
   return model, poses
 
 
@@ -85,6 +86,9 @@ def _complete_dynamics(obj, poses):
 
 def test_position_context_shapes_retain_all_fk_geom_rotation_words():
   shapes = _SMOOTH.position_context_shapes(_Model(), 2)
+  for name in ("joint_anchor", "joint_axis"):
+    for suffix in ("", "_low", "_tail"):
+      assert shapes["poses."+name+suffix] == (2, 2, 3)
   assert shapes["poses.geom_xmat"] == (2, 2, 9)
   assert shapes["poses.geom_xmat_low"] == (2, 2, 9)
   assert shapes["poses.geom_xmat_tail"] == (2, 2, 9)

@@ -102,12 +102,12 @@ def test_static_heavy_model_checks_real_spatial_matrix_buffer_before_allocation(
   with pytest.raises(CapacityOverflow, match="smooth.crb.*signed 32-bit"):
     _check_i32_elements("smooth.crb", above["smooth.crb"])
   # Body/inertial (2 * 3 * (3+4)) and geom (3 * (3+4+9))
-  # outputs share one arena; absent site/joint fields keep eight sentinel words.
+  # outputs share one arena; absent site/joint fields keep twelve sentinel words.
   arena_stride = model.nbody * 42 + model.ngeom * 48
-  arena_batch = (SIGNED_I32_ELEMENT_LIMIT - 8) // arena_stride
+  arena_batch = (SIGNED_I32_ELEMENT_LIMIT - 12) // arena_stride
   complete = estimate_capacity(model, arena_batch, 0, 0, 0)
   assert dict(complete.memory_breakdown)["fk.pose_output_arena"] == (
-      arena_batch * arena_stride + 8) * 4
+      arena_batch * arena_stride + 12) * 4
   with pytest.raises(CapacityOverflow, match="fk.pose_output_arena.*signed 32-bit"):
     estimate_capacity(model, arena_batch + 1, 0, 0, 0)
   _check_i32_elements("exact-boundary", SIGNED_I32_ELEMENT_LIMIT)

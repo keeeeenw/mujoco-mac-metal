@@ -88,7 +88,7 @@ def test_estimate_is_deterministic_and_counts_memory():
       model.M_colind.size, 1) * 4
   # FK constants and high/low/tail outputs share physical arenas. The
   # admission envelope must count their backing allocations, not old views.
-  assert runtime["fk.dims"] == 61 * 4
+  assert runtime["fk.dims"] == 65 * 4
   int_words = (2 * max(model.nbody, 1) + 3 * max(model.njnt, 1)
                + 2 * max(model.ngeom, 1) + 2 * max(model.nsite, 1))
   float_words = 3 * sum(max(count * width, 1) for count, width in (
@@ -103,7 +103,7 @@ def test_estimate_is_deterministic_and_counts_memory():
                          + max(2 * model.ngeom * 9, 1))
                   + 3 * (max(2 * model.nsite * 3, 1)
                          + max(2 * model.nsite * 4, 1))
-                  + 2 * max(2 * model.njnt * 3, 1))
+                  + 6 * max(2 * model.njnt * 3, 1))
   assert runtime["model.fk.static_int"] == int_words * 4
   assert runtime["model.fk.static_float"] == float_words * 4
   assert runtime["fk.pose_output_arena"] == output_words * 4

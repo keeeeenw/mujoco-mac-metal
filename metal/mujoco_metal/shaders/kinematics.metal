@@ -92,6 +92,10 @@ kernel void forward_kinematics(
   device float* inertial_xquat_tail=output+dims[58];
   device float* joint_anchor=output+dims[59];
   device float* joint_axis=output+dims[60];
+  device float* joint_anchor_low=output+dims[61];
+  device float* joint_anchor_tail=output+dims[62];
+  device float* joint_axis_low=output+dims[63];
+  device float* joint_axis_tail=output+dims[64];
   uint nq = dims[0], nbody = dims[1], njnt = dims[2];
   uint ngeom = dims[3], nsite = dims[4], batch = dims[5];
   uint nmocap = dims[6];
@@ -181,6 +185,8 @@ kernel void forward_kinematics(
              load4(precision,pb+nq+jnt_qposadr[j]+3)));
         store3(joint_anchor, (world*njnt+j)*3, pos);
         store3(joint_axis, (world*njnt+j)*3, load3(jnt_axis, j*3));
+        anchor_pair=pos_pair;
+        axis_pair=axis_local;
       } else if (typ == 1) {
         quat=kinq_mul(quat,kinq_norm(kinq(load4(qpos,qa),load4(precision,pb+jnt_qposadr[j]),
              load4(precision,pb+nq+jnt_qposadr[j]))));
@@ -210,6 +216,13 @@ kernel void forward_kinematics(
         pos_pair=kin3_sub(anchor_pair,kinq_rotate(quat,joint_local));
         pos=kin3_value(pos_pair);
       }
+      // Keep the ordered joint frame, before subsequent joints on this
+      // body rotate or translate it. The public high planes stay unchanged.
+      uint joint_offset=(world*njnt+j)*3;
+      store3(joint_anchor_low,joint_offset,kin_residual_low(anchor_pair,load3(joint_anchor,joint_offset)));
+      store3(joint_anchor_tail,joint_offset,kin_residual_tail(anchor_pair,load3(joint_anchor,joint_offset)));
+      store3(joint_axis_low,joint_offset,kin_residual_low(axis_pair,load3(joint_axis,joint_offset)));
+      store3(joint_axis_tail,joint_offset,kin_residual_tail(axis_pair,load3(joint_axis,joint_offset)));
     }
     // Pinned mj_kinematics1 computes a candidate pose even for a sleeping
     // articulated body, compares it exactly with the retained pose, and marks
