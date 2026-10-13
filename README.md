@@ -74,7 +74,10 @@ and exact replay. Milestone 008 qualifies spatial tendon mechanics with
 113 host and 66 native checks, wrap transitions, complete drawbridge and exact
 replay. Milestone 009 qualifies rigid constraint composition with 54 host and
 76 native checks, the complete suspension platform and exact replay.
-Milestones 010–020 remain open.**
+Milestone 010 qualifies the pinned analytic collision pair matrix, including
+cylinder/ellipsoid geometry, contact forces, frictional impacts and exact replay.
+The complete roller comparison and native Mac viewer pass.
+Milestones 011–020 remain open.**
 Inventory qualification does not establish native physics correctness. Earlier
 bounded capabilities and selected development fixtures remain usable and retain
 their passing checks. Further milestones are qualified individually, in order.
@@ -202,6 +205,16 @@ A cable-supported platform and payload exercise tendon constraints and
 ball-joint limits. See the guide for the bounded configuration and comparison.
 
 ![Suspension platform: native Metal beside CPU MuJoCo](metal/examples/assets/suspension_platform.gif)
+
+### [Eccentric roller workshop](metal/examples/eccentric_roller.md)
+
+A cylinder rolls and two ellipsoids slide down a tilted table into separate
+catch bins. The complete 900-step native/CPU comparison meets the original
+sorting and pose bounds, with exact checkpoint replay during loaded motion.
+The clip runs at 1× simulated time; the guide documents compliant contact
+compression and the prescribed lanes and friction settings.
+
+![Eccentric roller workshop: native Metal beside CPU MuJoCo](metal/examples/assets/eccentric_roller.gif)
 
 ### [Clockwork parcel sorter](metal/examples/clockwork_parcel_sorter.md)
 

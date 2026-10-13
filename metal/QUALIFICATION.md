@@ -1638,3 +1638,117 @@ The overlapping affected selection comprises `test_source_rigid_dynamics.py`,
 `test_smooth_retained_velocity_020.py`, `test_smooth_bias_low_020.py` and
 `test_cached_equality_jdot_parity.py`. Full demo qualification remains a separate
 command and does not contribute to the test counts above.
+
+## Sequential qualification: Milestone 010 — 2026-10-13 UTC
+
+Milestone 010 closes analytic rigid collision qualification under the admitted
+integrated-Euler profile against MuJoCo **3.10.0**, source revision
+`28009f9105cd92784b7b0b30c0605a5e29107a77`. The source dispatcher has **20 valid
+unordered analytic pairs** among plane, sphere, capsule, box, cylinder and
+ellipsoid. Plane–plane has no callback. Nine primitive pairs retain their
+baseline coverage; eleven cylinder/ellipsoid additions pass the full scoped
+geometry and physics gates. Mesh, terrain and SDF retain later milestones.
+
+Producing commits:
+
+- `f3e46a29652a61fb459b67a75fd1f7b941a4f777`: shared CCD source exits, valid empty
+  EPA seeds, source callback margin+gap operands and their query/allocation ABI.
+- `c0e6d39d5cadd951f39c5ca661510832783ff0f8`: full mass-weighted acceleration,
+  world force/torque and loaded endcap trajectory/checkpoint checks.
+- `1df9844d81b1446328d8020db8d274016e27de43`: analytic material/options,
+  impacts, failure/reset/full replay and genuine near-degenerate/scale checks.
+- `9827992658224b799dc494c3fe9427e92a7598e7`: complete original roller demo,
+  actual native viewer, independent geometry/contact measurements and reviewed GIF.
+
+The serialized scoped gate and subsequent extreme-geometry gate passed with
+frozen runtime/test/example hashes verified. No original physical model,
+control schedule, numerical bound or acceptance scenario was removed or weakened.
+One subsequent comment-only edit clarifies which old shallow fixtures are
+supplemented by exact-touch/impact tests; its executable AST is unchanged.
+
+| Scope | Passing checks |
+|---|---:|
+| Callback margin words and actual multi-pair physical backing | 5 host + 1 native |
+| Actual GJK/EPA exits against the installed C library | 1 native |
+| Exact binary boundaries, all new pairs/orders/aspects | 66 host + 66 native |
+| Affected source math and feature arenas | 14 mixed |
+| Capacity, public queries and source capsule host contracts | 71 host |
+| Actual libCCD mesh/ellipsoid queries, physical backing and replay | 2 native |
+| Analytic materials/options/friction/impacts/full replay/failure/reset | 224 native |
+| Affected rigid/terrain/flex CCD callers and fault isolation | 19 native |
+| Nine baseline primitive pair and manifold/filter/transform targets | 15 native |
+| Existing analytic/contact and full-mass force selection | 42 host/native |
+| Pitched endcap press/slide/spin, surfaces/wrenches/trajectory/replay | 12 native |
+| Thin/near-parallel/near-coincident/scaled controls | 110 host + 220 native |
+
+These are distinct selections with some overlapping scenario coverage, not a
+unique full-repository test total. No full repository regression was run.
+Native checks disable Torch MPS fallback and forbid CPU physics in the measured
+native operations. Independent CPU references and OpenGL rendering remain host
+work.
+
+The new-family gates cover both orderings and contact cones, true touching,
+separation, shallow/deep/grazing and rotated contacts, nonuniform dimensions,
+positive feature aspect **1/65,536**, nearly parallel features, nearly coincident
+centers and **0.125×/4×** uniform scales. Contact counts, depth/points/normals,
+physical resultant force/torque, full `M @ qacc`, emitted multipliers and retained
+solver certificates are checked. Indeterminate endcap sampling is supplemented
+by strict surface and wrench gates; coarse legacy geometry checks alone were
+not accepted as physics evidence.
+
+Material coverage includes priority/solmix/direct-solref, anisotropic explicit
+friction, overrides, exclusions/masks, detection margin+gap versus solver
+inclusion margin, and complete contact frames. Default CCD, disabled MULTICCD
+and disabled NATIVECCD settings execute actual native paths. Each new pair has
+frictional trajectory and genuine entering-impact controls, held-force full
+checkpoint replay, failed/healthy/empty worlds and selected reset/history checks.
+
+The installed-C probe establishes literal source stopping values for seven
+normal-range boundary cases. Its eighth subnormal difference is bounded only at
+the float32 representation floor. This does **not** promise unrestricted binary64
+precision. Source-rounded callback margin+gap storage preserves low words needed
+by support mapping, depths and rotated restarts; solver inclusion remains separate.
+Geometric empty EPA seeds now follow the source no-contact contract, while invalid
+support, descriptor and capacity faults remain errors. A standalone triangle
+oracle compares the actual uploaded F32 vertices; full public simulation oracles
+and bounds are unchanged.
+
+The original roller completes **900 steps**, both **20-step full checkpoint
+replays at 300/700**, and its original sorting/lane/5 mm position/0.05 quaternion
+bounds. Maximum positional difference is **0.708 mm**, quaternion-component
+error **0.00613**, with **886 native contact steps**. Native-pose divider
+clearance is **84.9998 mm**, conservatively **84.4998 mm**. Contact compression is
+**6.8201 mm native versus 6.7573 mm CPU**, separate from hardware clearance; this
+is not a 1 mm all-contact qualification. A separate 900-step level-table control
+retains all pieces' initial downhill positions. See the [roller guide](examples/eccentric_roller.md).
+
+The complete comparison GIF has **45 frames, 1.8 seconds at 1× simulated time**.
+The full timeline and actual Mac viewer capture were inspected for marble-scene
+lighting, framing and divider interference. The bounded viewer renders **22
+actual native steps in three seconds**, with CPU stepping forbidden. Correctness
+run times include references, geometry queries, replay and rendering; they are
+not controlled performance measurements or a demonstrated speedup.
+
+Reproduce the added analytic selections from the active source environment:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTORCH_MPS_FAST_MATH=0 \
+PYTHONPATH=metal:metal/tests:metal/examples python -m pytest -q -p no:cacheprovider \
+  metal/tests/test_analytic_boundaries_010.py \
+  metal/tests/test_analytic_margin_source_010.py \
+  metal/tests/test_analytic_endcap_physics_010.py \
+  metal/tests/test_analytic_material_lifecycle_010.py \
+  metal/tests/test_analytic_degenerate_010.py \
+  metal/tests/test_analytic_collision_010.py \
+  metal/tests/test_convex_force_parity_010.py \
+  metal/tests/test_contact.py
+```
+
+Run the installed-C test separately with `MUJOCO_METAL_TRACE_ROOT` set to a local
+root containing the pinned checkout at `.upstream/mujoco-3.10.0`; it requires
+Clang and the installed MuJoCo 3.10.0 library. This is an internal source-ABI
+qualification probe, not a package runtime dependency. Its target is
+`metal/tests/test_analytic_ccd_source_exit_010.py`. The affected caller and baseline
+selections remain scoped; do not infer complete later mesh/terrain/flex milestones
+from them. **Milestone 011 is next.** Wheel installation, full solver/integrator
+combinations, Linux, broader hardware and performance qualification remain open.

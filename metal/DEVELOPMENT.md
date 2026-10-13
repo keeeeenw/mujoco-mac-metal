@@ -374,3 +374,23 @@ long-horizon rotational differences and soft-contact limits. Further collision,
 solver, integrator and distribution gates remain open; prior passing results
 retain their actual producing revisions. No new throughput benchmark follows
 from this correctness correction.
+
+## Analytic collision source semantics and qualification
+
+Milestone 010 now qualifies the pinned 20-pair analytic dispatcher crosswalk
+under the admitted rigid integrated-Euler profile. Shared native CCD preserves
+source GJK early exits and distinguishes EPA geometric no-contact from invalid
+support/capacity failures. Callback detection uses source-rounded margin+gap
+words; solver inclusion still uses margin alone. The physical query and capacity
+budgets include the added three-plane backing.
+
+Actual both-cone checks cover analytic boundaries, nonuniform/tiny features,
+material and CCD options, full mass-weighted acceleration, resultant force/torque,
+retained certificates, frictional motion, impacts and complete checkpoint replay.
+Affected rigid, terrain, flex and geometry-query callers pass scoped checks.
+The unchanged full roller demo, level-table control, reviewed GIF and native Mac
+viewer pass. See [qualification](QUALIFICATION.md) for producing scope and
+[the demo guide](examples/eccentric_roller.md) for compliant-contact limits.
+Mesh and later complete milestone gates remain open. These are correctness
+results, not a throughput comparison, unrestricted binary64 promise or new wheel
+release; use a source installation for this development backend.

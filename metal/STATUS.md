@@ -1,10 +1,11 @@
 # Development milestone status
 
-The source backend is experimental. **5 of the 16 milestones 005–020 are accepted: 005 (classification/support
+The source backend is experimental. **6 of the 16 milestones 005–020 are accepted: 005 (classification/support
 contract), 006 (state/model lifecycle), 007 (built-in actuation and rigid
-transmissions) and 008 (spatial tendon mechanics under the admitted-model and
-integrated Euler contracts), and 009 (rigid constraints and mixed composition).**
-Milestones 010–020 remain open; acceptance of state ownership does not qualify
+transmissions), 008 (spatial tendon mechanics under the admitted-model and
+integrated Euler contracts), 009 (rigid constraints and mixed composition),
+and 010 (analytic collision families).**
+Milestones 011–020 remain open; acceptance of state ownership does not qualify
 their remaining numerical feature compositions. Earlier bounded profiles and selected
 native fixtures have passed independent checks.
 
@@ -15,7 +16,7 @@ native fixtures have passed independent checks.
 | 007 | Actuators and transmissions | Qualified: 181 host + 198 native checks, full gripper/counterfactual, exact replay and working Mac viewer; extensions and remaining integrators retain later owners |
 | 008 | Spatial tendons | Qualified: 113 host + 66 native checks; wrapping/transition/FD/armature/composition, full drawbridge/counterfactual, exact replay and working Mac viewer |
 | 009 | Rigid constraints | Qualified: 54 host + 76 native checks; genuine both-cone shared coupling, retained global residuals/forces, full suspension/level hold, exact replay and reviewed Mac viewer |
-| 010 | Analytic collision families | Primitive and additional convex-shape paths implemented; complete dispatcher/trajectory gate open |
+| 010 | Analytic collision families | Qualified: pinned 20-pair crosswalk, 11 added analytic families, source boundary/material/options/force/lifecycle gates and full roller/replay/GIF/Mac viewer |
 | 011 | Mesh collisions | Native hull and contact paths implemented; full irregular/degenerate/composition gate open |
 | 012 | Heightfields | Source-precision and pose/cache checks pass on selected fixtures; full terrain/integrator gate open |
 | 013 | SDF collisions | Seven original bundled rigid-SDF oracle fixtures pass; complete pair, search and feature-composition gates open |
@@ -48,8 +49,8 @@ selection (3,008 passed, 99 skipped); the exact managed source port passes
 sleeping pose words and awake lists, source callback cutoffs, invalid sensor
 row ownership and typed actuator payload rejection before physical recovery.
 Normal warning/AUTORESET controls remain tested. These overlapping scopes are
-not a completed full native, wheel or demo qualification. Milestones 009–020
-remain open.
+not a completed full native, wheel or demo qualification. At those producing
+revisions, milestones 009–020 remained open.
 
 Prepared potential/kinetic energy APIs, computed-stage metadata and current flex
 queries have separate passing native correction gates. A 100-case source-order
@@ -141,7 +142,7 @@ complete 19-case native lifecycle file and 71 affected native transaction,
 split-stage, delay and recovery cases. These preserve nonzero source energy,
 selected worlds, malformed rejection, legacy compatibility and exact replay.
 These are source-specific results; full heightfield/deformable composition,
-final wheel/demo checks and milestones 009–020 remain open.
+final wheel/demo checks remained open, as did milestones 009–020 at those revisions.
 
 Current checkpoint and owned-keyframe regression fixtures at `fe644d658` /
 `70136b887` pass the complete 19-case native actuator/device/mocap/equality
@@ -247,3 +248,31 @@ retained position/velocity ownership, masks and explicit queries. Counts overlap
 and are not additive. No performance or unrestricted binary64 claim follows.
 Prior qualification stays attached to its producing revision. Milestone 010 is
 next; complete collision, solver, integrator and installed-wheel scope remains open.
+
+## Sequential analytic collision qualification — 2026-10-13 UTC
+
+Milestone 010 is qualified for the admitted rigid integrated-Euler scope.
+The pinned dispatcher has 20 valid unordered analytic pairs: nine baseline
+primitive pairs and eleven cylinder/ellipsoid additions. Both orderings,
+source-aligned touching/separation/penetration, rotations, nonuniform sizes,
+thin features, near-parallel and near-coincident controls pass. Actual solved
+forces, world torques, full mass-weighted accelerations and retained solver
+certificates pass under both contact cones.
+
+The complete material/options/lifecycle selection passes 224 native checks;
+strict boundary coverage passes 132 host/native checks, and the additional
+near-degenerate/scale selection passes 110 host and 220 native checks. Separate
+endcap, source-C, allocation/query and affected rigid/terrain/flex caller gates
+also pass. These overlapping scopes are not a unique repository total.
+
+Shared source corrections preserve GJK early-exit distance semantics, distinguish
+valid empty EPA seeds from real failures, and retain compiled callback margin+gap
+words without changing solver inclusion margins. The full original roller passes
+900 steps, both loaded 20-step checkpoint replays, a reviewed 1× comparison GIF
+and an actual native Mac viewer. Maximum positional difference is 0.708 mm against
+5 mm; compliant contact compression is 6.82 mm native versus 6.76 mm CPU, separately
+from divider clearance. No 1 mm all-contact or performance claim follows.
+
+See [qualification](QUALIFICATION.md) and the [roller guide](examples/eccentric_roller.md).
+Milestone 011 mesh qualification is next. Later solvers/integrators, wheel and
+broader hardware gates remain open; accepted results retain producing revisions.
