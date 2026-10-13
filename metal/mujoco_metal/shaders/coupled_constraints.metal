@@ -4031,6 +4031,15 @@ inline bool primal_hessian_solve_elliptic_legacy(device const float* mass,
       float true_residual_sq = primal_pair_dot(residual, residual_low,
           residual, residual_low, nv);
       if (!isfinite(true_residual_sq)) return false;
+      // The requested inner criterion bounds the vector's L2 norm. Requiring
+      // every component to fit limit/sqrt(n) is sufficient but not necessary:
+      // a sparse residual can satisfy the original norm and still fail that
+      // box. Use the scale-safe represented norm to certify that case without
+      // accepting a sum of squares that has merely flushed to zero.
+      float true_residual_norm = primal_pair_norm(residual, residual_low, nv);
+      float norm_limit = sqrt(max(residual_tolerance_sq, 0.0f));
+      if (isfinite(true_residual_norm) && true_residual_norm <= norm_limit)
+        return true;
       // A float32 sum of squares can underflow to zero even when the retained
       // two-word residual is nonzero. Check each active component against the
       // strict norm-derived allowance before accepting the squared norm.
@@ -4396,7 +4405,10 @@ inline bool primal_hessian_solve_elliptic_scaled(device const float* mass,
         if (!solver_dof_awake(dims, awake_tree, dof)
             || (partitioned && dof_island[dof] != island)) continue;
         float magnitude = abs(residual[dof]) + abs(residual_low[dof]);
-        if (!isfinite(magnitude) || magnitude > component_residual_limit) {
+        // With the scale-safe L2 check below, an individual component only
+        // needs to fit the full norm bound, not an inscribed limit/sqrt(n)
+        // box. The latter rejects valid sparse residuals at the work limit.
+        if (!isfinite(magnitude) || magnitude > outer_scaled_limit) {
           strict_component_residual = false;
           break;
         }

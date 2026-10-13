@@ -980,15 +980,20 @@ def test_scaled_scalar_pcg_cpu_oracle_covers_tiny_huge_and_overflow_scales():
   assert not accepted
 
 
-def test_componentwise_inner_certificate_rejects_one_bad_active_dof():
-  # The global norm is under the requested bound, while one DOF exceeds its
-  # equal-share component bound. The shader must retain both checks.
+def test_inner_l2_bound_is_not_an_equal_share_component_box():
+  # A sparse residual satisfies the requested L2 bound but lies outside its
+  # inscribed equal-share box. That sufficient box must not be mistaken for
+  # a necessary norm criterion. Actual native assembly/replay covers the
+  # solver regression in test_mesh_newton_l2_011.py.
   residual = np.asarray([7e-7, 0.0, 0.0, 0.0], dtype=np.float64)
   norm_limit = 1e-6
   component_limit = norm_limit / np.sqrt(residual.size)
   assert np.linalg.norm(residual) <= norm_limit
   assert np.any(np.abs(residual) > component_limit)
   assert not np.all(np.abs(residual) <= component_limit)
+  excessive = residual.copy()
+  excessive[0] = 1.01 * norm_limit
+  assert np.linalg.norm(excessive) > norm_limit
 
 
 def test_cancellation_pair_is_canonicalized_before_mass_preconditioning():
