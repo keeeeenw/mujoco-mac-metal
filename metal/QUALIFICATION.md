@@ -1524,3 +1524,117 @@ constraint composition is next in 009. Other solver options/integrators retain
 014/015; APIs/extensions retain 019 and distribution/broad hardware retain 020.
 No full repository regression, performance benchmark, publication or release
 was performed.
+
+## Sequential qualification: Milestone 009 — 2026-10-13 UTC
+
+The complete 15-file rigid-constraint selection passes **54 host checks in
+0.80 seconds** and **62 native checks in 148.56 seconds**, without failures or
+skips. A disjoint nine-target retained-global/batched selection adds **14 native
+checks in 35 seconds**. The total for these selections is **54 host / 76 native**.
+A separate seven-file affected smooth-stage selection passes **31 checks**,
+including host contracts and actual native physics. Its scope overlaps the
+other selections and must not be added to their totals.
+
+The runtime correction is `0c2c77f41`; rigid/operator qualification tests are
+`d5d3263fe`; the demo, fresh GIF and Mac viewer are `699064d52`. Checks used
+MuJoCo 3.10.0, actual MPS and the managed source modules/shaders, with MPS CPU
+fallback disabled. Producing source stayed frozen. Documentation and a CPU-only
+report field were reconciled after execution; native physics and original
+models, controls, timestep, schedules and all acceptance bounds are unchanged.
+No full repository regression or performance benchmark was run.
+
+The initial full suspension episode failed its original strut-axis bound:
+0.26795 rad versus <0.08 rad. Aligned-state checks exposed rounded generic mass
+and bias operands before the later stop-driven divergence. A general native
+source-rounded subtree COM, compact spatial inertia, CRBA and RNE path now
+preserves compiled constants and retained FK operands. It is not a special
+suspension model route, CPU physics injection, plane lock or post-step projection.
+Dense/component mass, cached POS/VEL, masks, retained sleeping-child forces,
+explicit mass/bias queries and real tensor mutation have independent checks.
+Public outputs remain float32 with supplementary residuals; no unrestricted
+binary64 API or speedup is claimed.
+
+A shared articulated fixture demonstrates all ten **nonzero** cross-blocks
+between rigid equalities, dry friction, ball/tendon limits and contacts under
+both pyramidal and elliptic cones. Every family has a nonzero multiplier.
+Quartic reference polynomials, offsets/margins, disabled rows, soft exact and
+near redundancy, permuted equality order and actual changing contact counts
+are compared with the pinned source. Independent mass/Jacobian/operator and
+force reconstruction checks use the actual retained global multiplier, without
+optimizing a replacement solution. The independent normalized certificate bound
+is 2e-6. Full replay, row/island ownership and healthy/failed/contact-free worlds
+are checked. A genuine injected native force fault qualifies rollback; a valid
+one-iteration source solve is not mislabeled as nonconvergence.
+
+Explicit 96-row capacity and actual packed-Jacobian materialization replace stale
+implicit-layout assumptions. The original 300-step trajectory bounds remain;
+exact replay now uses the documented complete simulation checkpoint, which also
+owns held inputs and solver history. The narrower device-state checkpoint does
+not promise full trajectory replay. Removed distance equalities remain rejected
+by the pinned compiler; deformable constraints retain Milestone 018.
+
+The original suspension platform passes **4,800 native tilt steps and 4,800 native
+level-hold steps** in 3,236 seconds including CPU references, diagnostic queries,
+recording and loaded checkpoint replay. This elapsed time is not a throughput
+benchmark. Literal 20-step full replay passes at tilt steps 1,200 and 3,600.
+All original pose, angular-stop, cable-travel and hardware-clearance bounds pass:
+maximum linear-coordinate discrepancy 0.215 mm, maximum strut-axis discrepancy
+0.04819 rad (<0.08), final axis discrepancy 0.02556 rad (<0.05), and zero nominal
+strut-tip/cable overruns against their unchanged ≤1 mm bounds. Actual native
+cargo contacts occur on 4,701 steps. Accepted-pose cable lengths are measured
+in independent native FK/tendon workspaces, with a separate CPU query diagnostic.
+
+The new comparison GIF has 60 native/CPU frames, 2.4 seconds total at 1× playback.
+The original geometry and marble-scene lighting are retained; the full-timeline
+views were inspected. A bounded main-thread Mac viewer advances **19 actual
+native steps in three seconds** with CPU stepping forbidden. Its OpenGL display
+mirrors native poses using CPU forward queries. See the
+[demo guide and original-bound measurements](examples/suspension_platform.md).
+
+Raw ball quaternion components still differ by up to 0.09660; ball-stop activation
+uses the full relative angle, so axial twist is not globally unconstrained.
+The source/native stop activation histories need not be identical. Cargo contact
+is compliant, reaching 5.17 mm penetration in tilt and 5.56 mm in level hold;
+that is separate from strut/bob hardware clearance and the nominal 1 mm travel
+bounds. This qualifies the stated rigid/integrated-Euler scope, not every solver,
+integrator, collision family, installed wheel or Mac. Earlier milestone results
+retain their actual producing revisions. **Milestone 010 is next.**
+
+The complete rigid selection is reproducible from the active source environment:
+
+```sh
+MUJOCO_METAL_RUN_GPU=1 PYTORCH_ENABLE_MPS_FALLBACK=0 PYTORCH_MPS_FAST_MATH=0 \
+PYTHONPATH=metal:metal/tests:metal/examples python -m pytest -q -p no:cacheprovider \
+  metal/tests/test_rigid_constraints_009.py \
+  metal/tests/test_joint_constraints.py \
+  metal/tests/test_equality_activity.py \
+  metal/tests/test_cached_equality_jdot_parity.py \
+  metal/tests/test_equality_qualification.py \
+  metal/tests/test_equality_regularizer_pairs.py \
+  metal/tests/test_equality_scaling_017.py \
+  metal/tests/test_equality_dynamic_workspace.py \
+  metal/tests/test_native_inverse_equality.py \
+  metal/tests/test_tendon_equality_metadata_ownership.py \
+  metal/tests/test_equality_aref_pair.py \
+  metal/tests/test_rigid_composition_complete_009.py \
+  metal/tests/test_joint_constraints_gpu.py \
+  metal/tests/test_joint_constraint_simulation.py \
+  metal/tests/test_masked_constraint_assembly.py
+```
+
+Select `-m 'not gpu'` and `-m gpu` separately for the host/native phases; the
+recorded host runner also disabled MPS availability. The nine additional native
+targets in `test_coupled_constraints.py` are
+`test_native_elliptic_multicontact_residual_uses_returned_global_lambda`,
+`test_metal_coupled_constraints_matches_cpu`, `test_metal_coupled_constraints_zero_contact`,
+`test_batched_second_pair_contact_routing`, `test_batched_debug_views_keep_full_scratch_stride`,
+`test_batched_stride_mixed_equality_and_tendon_rows`,
+`test_solver_residual_remains_diagnostic_for_finite_iterate_mixed_gpu`,
+`test_pair_header_empty_pair_universe` and `test_hot_loop_device_resident_invariants`.
+Parameterization produces the recorded 14 checks.
+
+The overlapping affected selection comprises `test_source_rigid_dynamics.py`,
+`test_smooth.py`, `test_awake_smooth_017.py`, `test_smooth_sparse_mass.py`,
+`test_smooth_retained_velocity_020.py`, `test_smooth_bias_low_020.py` and
+`test_cached_equality_jdot_parity.py`. Full demo qualification remains a separate
+command and does not contribute to the test counts above.

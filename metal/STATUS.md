@@ -1,10 +1,10 @@
 # Development milestone status
 
-The source backend is experimental. **4 of the 16 milestones 005–020 are accepted: 005 (classification/support
+The source backend is experimental. **5 of the 16 milestones 005–020 are accepted: 005 (classification/support
 contract), 006 (state/model lifecycle), 007 (built-in actuation and rigid
 transmissions) and 008 (spatial tendon mechanics under the admitted-model and
-integrated Euler contracts).**
-Milestones 009–020 remain open; acceptance of state ownership does not qualify
+integrated Euler contracts), and 009 (rigid constraints and mixed composition).**
+Milestones 010–020 remain open; acceptance of state ownership does not qualify
 their remaining numerical feature compositions. Earlier bounded profiles and selected
 native fixtures have passed independent checks.
 
@@ -14,7 +14,7 @@ native fixtures have passed independent checks.
 | 006 | State, model and lifecycle | Qualified: 170 host + 191 native checks, full crane/replay and bounded Mac viewer; shared-model and recompile boundaries documented |
 | 007 | Actuators and transmissions | Qualified: 181 host + 198 native checks, full gripper/counterfactual, exact replay and working Mac viewer; extensions and remaining integrators retain later owners |
 | 008 | Spatial tendons | Qualified: 113 host + 66 native checks; wrapping/transition/FD/armature/composition, full drawbridge/counterfactual, exact replay and working Mac viewer |
-| 009 | Rigid constraints | Coupled constraint paths implemented; full mixed-feature qualification open |
+| 009 | Rigid constraints | Qualified: 54 host + 76 native checks; genuine both-cone shared coupling, retained global residuals/forces, full suspension/level hold, exact replay and reviewed Mac viewer |
 | 010 | Analytic collision families | Primitive and additional convex-shape paths implemented; complete dispatcher/trajectory gate open |
 | 011 | Mesh collisions | Native hull and contact paths implemented; full irregular/degenerate/composition gate open |
 | 012 | Heightfields | Source-precision and pose/cache checks pass on selected fixtures; full terrain/integrator gate open |
@@ -223,3 +223,27 @@ Milestone 009 is next: complete rigid-constraint families and genuine mixed
 coupling under both contact cones, followed by the full suspension platform.
 Solver options, other integrators, extensions, distribution and broad hardware
 retain their later gates. No performance claim follows from these checks.
+
+## Sequential rigid constraint qualification — 2026-10-13 UTC
+
+Milestone 009 passes 54 host and 76 native checks without failures or skips.
+A shared articulated fixture demonstrates all ten nonzero cross-block couplings
+between equalities, dry friction, ball/tendon limits and contacts under both
+cones. Independent mass/Jacobian/force references, retained global residuals,
+soft redundancy, changing contacts, failed peers and full replay pass.
+
+The original 4,800-step tilt and 4,800-step level episodes pass unchanged bounds.
+Native/CPU maximum linear-coordinate difference is 0.215 mm; strut-axis error
+is 0.04819 rad against the original 0.08 rad limit. Full checkpoint replay is
+exact at two loaded-motion points. Both nominal stop overruns are zero, and the
+strut/bob stay clear of the platform and cargo. Cargo contacts remain compliant;
+this does not claim all contact penetration is below 1 mm. The fresh comparison
+GIF and bounded native Mac viewer were reviewed. See the [demo guide](examples/suspension_platform.md).
+
+A general source-rounded COM/CRBA/RNE correction resolves the preceding failed
+axis trajectory without changing the model or weakening its gates. Its separate
+31-check affected group covers native operator accuracy, dense/component storage,
+retained position/velocity ownership, masks and explicit queries. Counts overlap
+and are not additive. No performance or unrestricted binary64 claim follows.
+Prior qualification stays attached to its producing revision. Milestone 010 is
+next; complete collision, solver, integrator and installed-wheel scope remains open.

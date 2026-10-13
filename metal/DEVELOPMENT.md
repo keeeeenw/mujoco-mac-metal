@@ -357,3 +357,20 @@ compiler are not admitted by this port either.
 RL integration and broader Mac hardware validation are deferred. No new speedup
 claim follows from these feature checks. The published 0.4.0 wheel remains the
 earlier release; the development backend requires a source installation.
+
+## Source-rounded rigid operators and constraint qualification
+
+The development pipeline retains compiled constants and FK residuals through
+native subtree COM, compact spatial inertia, CRBA and RNE. Dense/component
+mass, retained POS/VEL ownership, masks and explicit mass/bias queries have
+independent pinned-oracle checks. This improves the effective operator without
+adding CPU runtime physics or claiming an unrestricted binary64 interface.
+The new workspaces are included in capacity admission.
+
+Milestone 009's shared-DOF both-cone composition and complete suspension/level
+hold meet their original acceptance bounds. See [qualification](QUALIFICATION.md)
+and the [suspension guide](examples/suspension_platform.md) for exact scope,
+long-horizon rotational differences and soft-contact limits. Further collision,
+solver, integrator and distribution gates remain open; prior passing results
+retain their actual producing revisions. No new throughput benchmark follows
+from this correctness correction.

@@ -72,10 +72,16 @@ checkpoint replay. Milestone 007 qualifies built-in actuation and rigid
 transmissions with 181 host and 198 native checks, the complete muscle gripper
 and exact replay. Milestone 008 qualifies spatial tendon mechanics with
 113 host and 66 native checks, wrap transitions, complete drawbridge and exact
-replay. Milestones 009–020 remain open.**
+replay. Milestone 009 qualifies rigid constraint composition with 54 host and
+76 native checks, the complete suspension platform and exact replay.
+Milestones 010–020 remain open.**
 Inventory qualification does not establish native physics correctness. Earlier
 bounded capabilities and selected development fixtures remain usable and retain
 their passing checks. Further milestones are qualified individually, in order.
+A general source-precision correction preserves native mass and bias operands
+through dense/component execution and retained stages. The suspension comparison
+now meets its original pose, stop-travel and geometry bounds. These results do
+not qualify every solver/integrator combination or imply a performance gain.
 See the [milestone status](metal/STATUS.md) and
 [qualification record](metal/QUALIFICATION.md) for the tested scope and known failures.
 The earlier host publication check passed **2,163 tests, with 1,615
@@ -106,7 +112,9 @@ from complete repository, installed-wheel and final demo qualification.
 For the contact-free four-DOF pendulum on an **M1 Max with 32 GB unified memory**,
 200 steps at 524,288 environments took **18.905 s on eight-thread CPU rollout
 versus 5.907 s on Metal: 3.20x faster**, reaching **17.75 million world-steps/s**.
-CPU wins at small batches; gains level off at large batches.
+CPU wins at small batches; gains level off at large batches. These measurements
+belong to the recorded earlier backend; the source-precision correction has
+not been rebenchmarked.
 
 This is a short physics API benchmark, not a walking or PPO training result.
 CPU rollout records float64 trajectories; Metal retains float32 device state.
