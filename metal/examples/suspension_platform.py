@@ -8,7 +8,7 @@ loose cargo crate riding aboard on contact. A ball-jointed pendulum strut
 swings into its angular-stop limit. Hinge-free composition: ball limits,
 tendon limits, tendon equality, dry contact (pyramidal cone) and mocap-driven
 motion all participate in the same coupled problem. A paired level-hold run
-shows the constraints never spuriously engage.
+isolates carrier-induced motion from the platform settling under its load.
 """
 
 import argparse
@@ -59,6 +59,8 @@ def _tendon_length_at(model, data, qpos, mocap_pos, mocap_quat, tendon_id):
 
 
 def run(steps=4800, mode="metal", check=False, record=None):
+  if check and steps < 4800:
+    raise ValueError("suspension --check requires the complete 4800-step schedule")
   if mode not in ("metal", "cpu"):
     raise ValueError(f"Unknown mode {mode!r}")
   model = _load_model()
@@ -67,10 +69,18 @@ def run(steps=4800, mode="metal", check=False, record=None):
   base_pos = np.asarray(model.key_mpos).reshape(-1, 3)[0].astype(np.float32)
 
   native = None
+  native_fk = None
+  native_tendon_query = None
   if mode == "metal":
     from mujoco_metal import MetalSimulation
     native = MetalSimulation(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :], profile=PROFILE)
     native.reset_to_keyframe(0)
+    # Independent query workspaces must not overwrite physics FK/row caches.
+    from mujoco_metal.metal_kinematics import MetalKinematics
+    from mujoco_metal.model import load_model
+    from mujoco_metal.spatial_tendons import MetalSpatialTendonDynamics
+    native_fk = MetalKinematics(load_model(model), batch_size=1)
+    native_tendon_query = MetalSpatialTendonDynamics(model, 1)
 
   cpu_swing = mujoco.MjData(model)
   cpu_level = mujoco.MjData(model)
@@ -100,17 +110,19 @@ def run(steps=4800, mode="metal", check=False, record=None):
   cargo_contacts = 0
   strut_hits = 0
   cable_hits = 0
-  # Ball-joint orientation is split: the strut/bob hardware is axisymmetric
-  # about the strut axis, so twist about that axis is physically invisible
-  # and unconstrained (it drifts to ~0.17 rad between float32/float64). The
-  # constrained quantity is the strut-axis tilt, gated below; raw ball-quat
-  # components stay reported but not gated.
+  # The visible strut/bob geometry is axisymmetric, so compare its axis
+  # separately from raw quaternion components. The angular stop still uses
+  # the FULL relative rotation angle: axial twist is not unconstrained while
+  # that stop is active. Both the axis trajectory and full-angle travel bound
+  # are gated below; raw quaternion differences remain separately reported.
   max_tilt_err = 0.0
   end_tilt_err = 0.0
   max_rigid_quat_err = 0.0
   end_rigid_quat_err = 0.0
   nat_strut_peak = 0.0
   nat_cable_peak = 0.0
+  cpu_query_cable_peak = 0.0
+  max_native_cable_query_err = 0.0
   nat_strut_hits = 0
   _AXIS = np.array([0.0, 0.0, -1.0])
   native_query = mujoco.MjData(model) if native is not None else None
@@ -119,7 +131,8 @@ def run(steps=4800, mode="metal", check=False, record=None):
     quat = _carrier_quat(step)
     if native is not None:
       native.set_mocap(base_pos.reshape(1, 3), quat.reshape(1, 4))
-      native.step(1)
+      status = native.step(1)
+      np.testing.assert_array_equal(status.cpu().numpy(), [0])
     cpu_swing.mocap_pos[0] = base_pos
     cpu_swing.mocap_quat[0] = quat
     mujoco.mj_step(model, cpu_swing)
@@ -166,13 +179,21 @@ def run(steps=4800, mode="metal", check=False, record=None):
       max_qpos_err = max(max_qpos_err, float(np.max(np.abs(gq - cpu_swing.qpos))))
       ns = _strut_angle(gq)
       nat_strut_peak = max(nat_strut_peak, ns)
-      # Measure the cable from the accepted native qpos. This is a kinematic
-      # query only; MuJoCo does not advance this scratch state. Keeping it
-      # separate from cpu_swing.ten_length prevents CPU trajectory values
-      # from standing in for the native limit response.
-      native_cable = _tendon_length_at(
+      # Measure accepted native qpos using separate Metal FK/tendon queries.
+      # The CPU query is a diagnostic at that same pose, not the physics
+      # trajectory or the native cable-limit measurement.
+      query_poses = native_fk.run_device(
+          native.state._qpos,
+          mocap_pos=native.state._mpos,
+          mocap_quat=native.state._mquat)
+      query = native_tendon_query.run_kinematics(native.state._qvel, query_poses)
+      native_cable = float(query["length"][0, 3].cpu())
+      cpu_query_cable = _tendon_length_at(
           model, native_query, gq, np.asarray([base_pos]),
           np.asarray([quat]), 3)
+      cpu_query_cable_peak = max(cpu_query_cable_peak, cpu_query_cable)
+      max_native_cable_query_err = max(max_native_cable_query_err,
+                                      abs(native_cable-cpu_query_cable))
       nat_cable_peak = max(nat_cable_peak, native_cable)
       if ns > STRUT_CONFIGURED_STOP - 1e-9:
         nat_strut_hits += 1
@@ -204,7 +225,8 @@ def run(steps=4800, mode="metal", check=False, record=None):
     lat_sim.reset_to_keyframe(0)
     for _ in range(steps):
       lat_sim.set_mocap(base_pos.reshape(1, 3), np.array([[1, 0, 0, 0]], dtype=np.float32))
-      lat_sim.step(1)
+      status = lat_sim.step(1)
+      np.testing.assert_array_equal(status.cpu().numpy(), [0])
     lat = lat_sim.state.qpos[0].cpu().numpy()
     level = (float(np.max(np.abs(lat[plat_idx:plat_idx + 1]))), float(lat[cargo_idx + 2]))
   else:
@@ -229,6 +251,10 @@ def run(steps=4800, mode="metal", check=False, record=None):
       "end_rigid_quat_err": end_rigid_quat_err,
       "nat_strut_peak": nat_strut_peak,
       "nat_cable_peak": nat_cable_peak if native is not None else None,
+      "native_cable_measurement": ("independent native Metal FK and tendon query"
+          if native is not None else None),
+      "cpu_query_cable_peak_on_native_state": cpu_query_cable_peak if native is not None else None,
+      "max_native_cable_query_error_m": max_native_cable_query_err if native is not None else None,
       "nat_strut_hits": nat_strut_hits,
       "strut_configured_stop": STRUT_CONFIGURED_STOP,
       "cable_configured_limit": CABLE_CONFIGURED_LIMIT,
@@ -257,17 +283,16 @@ def run(steps=4800, mode="metal", check=False, record=None):
     clearance.check()
   if check and mode == "metal":
     assert max_pos_err < 5e-3, max_pos_err
-    # Platform/cargo orientations are constrained and tight; the ball-joint
-    # raw quat includes invisible twist drift (reported in max_quat_err),
-    # so the ball joint is gated on strut-axis tilt instead (native peak
-    # tilt error 0.040 measured; twist reaches 0.17 with no observable
-    # effect on axisymmetric hardware).
+    # Gate platform/cargo orientations, the observable strut-axis trajectory
+    # and the full relative ball-angle travel bound. Report raw quaternion
+    # components separately rather than implying exact long-horizon parity.
     assert max_rigid_quat_err < 1.5e-2, max_rigid_quat_err
     assert max_tilt_err < 8e-2, max_tilt_err
     assert end_pos_err < 5e-3 and end_rigid_quat_err < 5e-3, (end_pos_err, end_rigid_quat_err)
     assert end_tilt_err < 5e-2, end_tilt_err
     assert nat_strut_peak > STRUT_CONFIGURED_STOP, nat_strut_peak
     assert nat_strut_hits > 100, nat_strut_hits
+    assert max_native_cable_query_err < 2e-6, max_native_cable_query_err
     assert nat_cable_peak > CABLE_CONFIGURED_LIMIT, nat_cable_peak
     assert strut_peak > STRUT_CONFIGURED_STOP, strut_peak
     assert cable_peak > CABLE_CONFIGURED_LIMIT, cable_peak
@@ -281,6 +306,20 @@ def run(steps=4800, mode="metal", check=False, record=None):
   return result
 
 
+def run_viewer(steps=4800, seconds=0):
+  from mujoco_metal import MetalSimulation
+  from demo_viewer import run_native_viewer
+  model=_load_model()
+  sim=MetalSimulation(model,1,profile=PROFILE)
+  sim.reset_to_keyframe(0)
+  base=np.asarray(model.key_mpos).reshape(-1,3)[0].astype(np.float32)
+  def before_step(sim,step):
+    sim.set_mocap(base.reshape(1,3),_carrier_quat(step).reshape(1,4))
+  return run_native_viewer(model,sim,steps=steps,seconds=seconds,
+      title="Suspension platform — native Metal",lookat=(0,-.1,1),
+      distance=2.8,azimuth=120,elevation=-20,before_step=before_step)
+
+
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--steps", type=int, default=4800)
@@ -289,10 +328,16 @@ def main():
   parser.add_argument("--check", action="store_true", help="check native/CPU rollout")
   parser.add_argument("--record", help="record native/CPU renders to a GIF")
   parser.add_argument("--json", help="write numerical report to JSON")
+  parser.add_argument("--viewer-seconds", type=float, default=0,
+                      help="auto-close the native Mac viewer after this wall time")
   args = parser.parse_args()
+  if not np.isfinite(args.viewer_seconds) or args.viewer_seconds<0:
+    raise SystemExit("--viewer-seconds must be finite and nonnegative")
   if args.steps <= 0 or (args.check and not args.headless):
     raise SystemExit("use --headless --check for verification")
-  out = run(steps=args.steps, mode=args.mode, check=args.check, record=args.record)
+  out = (run_viewer(steps=args.steps, seconds=args.viewer_seconds)
+         if not args.headless and args.record is None and args.mode=="metal"
+         else run(steps=args.steps, mode=args.mode, check=args.check, record=args.record))
   print(json.dumps(out, indent=2))
   if args.json:
     Path(args.json).write_text(json.dumps(out, indent=2))
