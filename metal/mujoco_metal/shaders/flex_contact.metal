@@ -1262,7 +1262,10 @@ static inline void flex_dd_s3d(thread FlexDD* lambda, FlexDD3 a,
     FlexDD3 p=flex_dd3_lincomb_source(values,face,3);
     FlexDD dv=flex_dd3_dot(p,p);
     if (flex_dd_compare(dv,dmin)<0) {
-      lambda[0]=face[0]; lambda[1]=face[1]; lambda[2]=face[2]; lambda[3]=flex_dd(0.0f);
+      // Pinned 3.10 S3D's final face updates only components 0..2.
+      // Preserve the preceding fourth component literally: clearing it
+      // changes GJK's retained simplex and deep-contact fallback.
+      lambda[0]=face[0]; lambda[1]=face[1]; lambda[2]=face[2];
     }
   }
 }

@@ -73,8 +73,14 @@ def test_gjk_tetra_matches_pinned_subdistance_and_closest_point(tmp_path):
   ], dtype=np.float64)
   thin = random.copy().reshape(-1, 4, 3)
   thin[:, :, 2] *= 1e-10
+  # Literal installed-GJK simplex from a capsule/mesh rotated query:
+  # duplicate non-axis supports exercise cofactor cancellation branches.
+  import itertools
+  restart = np.array([[-0.062312468781252524, 0.03125000000000005, 6.249998958318681e-05], [-0.06249996875000253, -0.03125000000000005, -0.1874374062604246], [-0.062312468781252524, -0.03125000000000005, 6.249998958318681e-05], [-0.06249996875000253, -0.03125000000000005, -0.1874374062604246]], dtype=np.float64)
+  restart_cases = np.array([restart[list(order)].reshape(-1)
+                           for order in itertools.permutations(range(4))])
   inputs = np.concatenate((random, random * 1e-8, random * 1e8,
-                           thin.reshape(-1, 12), degenerate))
+                           thin.reshape(-1, 12), degenerate, restart_cases))
   count = len(inputs)
   expected = np.zeros((count, 7), np.float64)
   for i in range(count):
@@ -88,7 +94,9 @@ def test_gjk_tetra_matches_pinned_subdistance_and_closest_point(tmp_path):
     FlexDD3 b=common_ccd_load_dd3(input,base+9);
     FlexDD3 c=common_ccd_load_dd3(input,base+18);
     FlexDD3 d=common_ccd_load_dd3(input,base+27);
-    FlexDD lambda[4]; flex_dd_s3d(lambda,a,b,c,d);
+    // Match the zeroed subdistance output supplied by pinned GJK.
+    FlexDD lambda[4]={flex_dd(0),flex_dd(0),flex_dd(0),flex_dd(0)};
+    flex_dd_s3d(lambda,a,b,c,d);
     FlexDD3 values[4]={a,b,c,d};
     common_ccd_store_dd3(output,out,FlexDD3{lambda[0],lambda[1],lambda[2]});
     output[out+9]=lambda[3].hi;

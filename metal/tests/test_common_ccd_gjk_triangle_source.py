@@ -67,7 +67,13 @@ def test_gjk_triangle_matches_pinned_subdistance_and_closest_point(tmp_path):
       [0,1,0, 0,1,0, 0,1,0],
       [1,1,0, -1,1,0, 0,1,0],
   ], dtype=np.float64)
-  inputs = np.concatenate((inputs, degenerate))
+  # Captured shrunk capsule/mesh restart supports: near-coplanar simplex
+  # reductions must preserve the same source branch under every ordering.
+  import itertools
+  restart_vertices = np.array([[-0.062312468781252524, 0.03125000000000005, 6.249998958318681e-05], [-0.06249996875000253, -0.03125000000000005, -0.1874374062604246], [-0.06249996875000253, -0.03125000000000005, 0.18756240623959125], [-0.062312468781252524, -0.03125000000000005, 6.249998958318681e-05], [-0.06249996875000253, -0.03125000000000005, -0.1874374062604246]], dtype=np.float64)
+  restart_triangles = np.array([restart_vertices[list(indices)].reshape(-1)
+                                for indices in itertools.permutations(range(5), 3)])
+  inputs = np.concatenate((inputs, degenerate, restart_triangles))
   count = len(inputs)
   expected = np.zeros((count, 6), np.float64)
   for i in range(count):
