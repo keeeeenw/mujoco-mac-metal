@@ -42,9 +42,8 @@ def test_pair_plane_cylinder_gpu():
       (np.array([0, 0, 0.2, 1, 0, 0, 0]), 0),      # upright, gap: none
       (np.array([0, 0, 0.0999, 1, 0, 0, 0]), 3),   # upright rim touch (1e-4 deep)
       (np.array([0.1, 0, 0.105, 0.9659, 0, 0.2588, 0]), 1),  # tilted touch
-      # Side-lying 1e-4 deep: exact-zero touching is float knife-edge on
-      # both CPU and GPU (strict <= against margin 0), so touching coverage
-      # uses slight penetration, never exact zeros.
+      # Retain this shallow-penetration control. Exact binary-representable
+      # touching and candidate-presence gates live in test_analytic_boundaries_010.
       (np.array([0, 0, 0.0499, 0.7071, 0.7071, 0, 0]), 1),    # side-lying
       (np.array([0, 0, 2.0, 1, 0, 0, 0]), 0),      # separated
   ]:
@@ -132,9 +131,9 @@ def test_cylinder_settle_trajectory_gpu():
   m = mujoco.MjModel.from_xml_string(xml)
   sim = MetalSimulation(m, batch_size=1, profile="integrated_euler_v1")
   cpu = mujoco.MjData(m)
-  # Gentle placement (1mm gap, rest): violent redundant-contact impacts can
-  # stall the coupled PGS (status 3, pre-existing solver scope, also seen on
-  # box drops); the manifold coupling itself is exact.
+  # Retain the original gentle-placement trajectory (1mm gap, rest).
+  # Actual entering impacts are separately gated for every new pair in
+  # test_analytic_material_lifecycle_010; this fixture alone is not impact coverage.
   sim.reset(qpos=np.array([[0, 0, 0.101, 1, 0, 0, 0]], dtype=np.float32))
   cpu.qpos[:] = [0, 0, 0.101, 1, 0, 0, 0]
   cpu.qvel[:] = 0
@@ -399,11 +398,10 @@ def test_pair_matrix_cylinder_ellipsoid_gpu():
 @pytest.mark.gpu
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
 def test_endcap_pitch_multibasin_gpu():
-  # Pitched-tube end-cap regime: penetration admits multiple valid witness
-  # basins at equal depth (CPU and native legitimately pick different patch
-  # points with different torques). Gates catch misses, flips and far
-  # witnesses; they do not demand a basin. Torque-sensitive force parity
-  # for this regime is not asserted (indeterminate).
+  # Retain the original coarse raw-high-word mutation regression. It does
+  # not qualify endcap physics: test_analytic_endcap_physics_010 compares
+  # the actual represented poses, surfaces, world forces/moments, full
+  # mass operator, trajectories and loaded full-checkpoint replay.
   qpitch = _axis_angle_quat([0, 1, 0], np.pi / 6.0)
   failures = []
   for swap in (False, True):

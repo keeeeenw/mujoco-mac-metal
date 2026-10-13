@@ -60,9 +60,9 @@ def _load(xml, qpos0, qvel0):
   return m, sim, cpu
 
 
-def _mass_diag(asm, nv):
+def _mass_matrix(asm, nv):
   mass = np.asarray(asm["mass_matrix"].cpu().numpy()[0]).reshape(nv, nv)
-  return np.abs(np.diag(mass))
+  return mass
 
 
 def _parity_step0(xml, qpos0, qvel0, tag,
@@ -77,7 +77,8 @@ def _parity_step0(xml, qpos0, qvel0, tag,
                              err_msg=f"{tag} qfrc_constraint")
   a_nat = np.asarray(asm["qacc"].cpu().numpy()[0])
   a_cpu = np.asarray(cpu.qacc)
-  mdiag = _mass_diag(asm, m.nv)
+  mass = _mass_matrix(asm, m.nv)
+  mdiag = np.abs(np.diag(mass))
   # Mass-weighted acceleration comparison: a torque residual at force scale
   # f_atol reads as f_atol/inertia in acceleration, false-alarming on
   # small-inertia DOFs. Comparing M*qacc (force scale) with the force
@@ -86,6 +87,16 @@ def _parity_step0(xml, qpos0, qvel0, tag,
   np.testing.assert_allclose(mdiag * a_nat, mdiag * a_cpu,
                              rtol=a_rtol, atol=f_atol,
                              err_msg=f"{tag} qacc")
+  # Preserve the existing diagonal gate, and also check the actual operator.
+  # A free body with an offset inertial center has translation/rotation
+  # cross terms; multiplying only its diagonal cannot qualify M*qacc.
+  cpu_mass = np.zeros((m.nv, m.nv))
+  mujoco.mj_fullM(m, cpu, cpu_mass)
+  np.testing.assert_allclose(mass, cpu_mass, rtol=3e-6, atol=1e-7,
+                             err_msg=f"{tag} full mass")
+  np.testing.assert_allclose(mass @ a_nat, cpu_mass @ a_cpu,
+                             rtol=a_rtol, atol=f_atol,
+                             err_msg=f"{tag} full M*qacc")
   assert int(sim.state.status.cpu().numpy()[0]) == 0, tag
   return m, sim, cpu
 
@@ -301,6 +312,55 @@ def test_force_rotated_press_gpu():
   _parity_1step(_CYLELL_XML, qp, qv, "rotated-press/cylell")
   qp, qv = _q(_free_qpos(0, 0, 0.5), _free_qpos(0.109, 0, 0.5, q30))
   _parity_1step(_ELLELL_XML, qp, qv, "rotated-press/ellell")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="opt-in GPU")
+@pytest.mark.parametrize("cone", ["pyramidal", "elliptic"])
+def test_all_convex_pairs_offset_inertia_full_mass_and_world_wrenches(cone):
+  """Contact torque is tested with genuinely coupled free-body mass blocks."""
+  from test_analytic_collision_010 import _PAIRS_010, _pair_xml
+  import xml.etree.ElementTree as ET
+  for tag, ta, sa, xa, tb, sb, xb in _PAIRS_010:
+    root = ET.fromstring(_pair_xml(ta, sa, tb, sb))
+    root.find("option").set("cone", cone)
+    for body in root.findall("worldbody/body"):
+      ET.SubElement(body, "inertial", pos=".02 -.01 .03", mass="1.4",
+                    fullinertia=".03 .05 .06 .001 .002 .003")
+    xml = ET.tostring(root, encoding="unicode")
+    qp, qv = _q(_free_qpos(0, 0, .5),
+                _free_qpos(xa + xb - .001, 0, .5),
+                [.02, -.04, .03, .1, -.07, .05],
+                [-.03, .12, -.02, -.07, .05, .11])
+    model, sim, cpu = _parity_step0(xml, qp, qv, f"{tag}/{cone}/offset")
+    asm = sim._last_coupled
+    mass = _mass_matrix(asm, model.nv)
+    assert np.linalg.norm(mass - np.diag(np.diag(mass))) > .03
+    force = asm["qfrc_constraint"][0].cpu().numpy()
+    assert np.linalg.norm(force) > .1
+    np.testing.assert_allclose(asm["J"][0].cpu().numpy().T @
+                               asm["lambda"][0].cpu().numpy(), force,
+                               rtol=3e-6, atol=2e-5)
+    # Independent contact-frame force oracle, summed about the world origin.
+    # Free-joint translational forces are world coordinates; angular forces
+    # are in the body's frame and are about its joint origin, not its COM.
+    wrenches = np.zeros((model.nbody, 6))
+    for i in range(cpu.ncon):
+      contact = cpu.contact[i]
+      local = np.zeros(6)
+      mujoco.mj_contactForce(model, cpu, i, local)
+      frame = np.asarray(contact.frame).reshape(3, 3)
+      linear, angular = frame.T @ local[:3], frame.T @ local[3:]
+      moment = angular + np.cross(contact.pos, linear)
+      for sign, geom in ((-1, contact.geom[0]), (1, contact.geom[1])):
+        wrenches[model.geom_bodyid[geom]] += sign * np.r_[linear, moment]
+    for body in (1, 2):
+      adr = model.jnt_dofadr[model.body_jntadr[body]]
+      linear = force[adr:adr + 3]
+      angular = np.asarray(cpu.xmat[body]).reshape(3, 3) @ force[adr + 3:adr + 6]
+      world = np.r_[linear, angular + np.cross(cpu.xpos[body], linear)]
+      np.testing.assert_allclose(world, wrenches[body], rtol=.03, atol=.02,
+                                 err_msg=f"{tag}/{cone}/body{body} world wrench")
 
 
 @pytest.mark.gpu
