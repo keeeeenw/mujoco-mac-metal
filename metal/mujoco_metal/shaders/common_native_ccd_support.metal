@@ -1,10 +1,6 @@
-// Private source-order CCD support adapter prototype.
-//
-// Private common-CCD candidate concatenated after flex_contact.metal to reuse
-// its three-word FlexDD and EPA topology primitives. It contains a generic
-// support adapter, source-order GJK/intersection, P2/P3/P4 EPA initialization,
-// an EPA loop, and a standalone diagnostic entry. It is not wired to a
-// production detector and remains unqualified.
+// Shared source-order CCD support, GJK/intersection and EPA stages.
+// Rigid, terrain and flex candidate producers use these same operators;
+// standalone diagnostic entries expose their retained state for qualification.
 
 static constant int COMMON_CCD_POINT = 0;
 static constant int COMMON_CCD_SPHERE = 1;
@@ -780,7 +776,12 @@ static inline CommonCCDGjkResult common_ccd_source_gjk(
     out.iterations=k;
     FlexDD norm2=common_ccd_dot3(x,x);
     if (flex_dd_compare_exact(norm2,min_norm2)<0) {
-      x_norm=flex_dd_sqrt(norm2);
+      // Pinned gjk assigns dot3(x_k,x_k) to x_norm in the stopping test
+      // and breaks BEFORE taking its square root. EPA's polytope3 uses
+      // this retained value to decide its missing-origin test. Taking a
+      // root here changes that branch at exact touching and can turn a
+      // valid source EPA seed into a native failure.
+      x_norm=norm2;
       exited=true;
       break;
     }
@@ -1265,7 +1266,10 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
       : tolerance;
   if (max_iterations<=0 || seed_count<2 || seed_count>4 ||
       vertex_capacity<6 || face_capacity<6 || horizon_capacity<3 ||
-      horizon_stack_capacity<1) return out;
+      horizon_stack_capacity<1) {
+    out.status=2;  // Invalid invocation is not a source no-contact result.
+    return out;
+  }
   CommonCCDVertex local_seed[4];
   for (int i=0;i<seed_count;i++) {
     local_seed[i]=seed[i];
@@ -1307,7 +1311,13 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
       int init=common_ccd_initialize_p3(p3seed,a,b,gjk_distance,
           mesh_vertices,mesh_graph,vertices,vertex_ids,center,face_vertices,
           adjacency,epa_support_trace,epa_support_count);
-      if (init) { out.status=2; return out; }
+      if (init) {
+        // Source polytope initialization rejects boundary/degenerate seeds
+        // without a contact. A support-read failure remains an error.
+        out.status=init==2 ? 2 : 1;
+        if (out.status==1) out.distance=flex_dd(0.0f);
+        return out;
+      }
       vertex_count=5; initial_faces=6; p3_initialized=true;
     }
     if (!p3_initialized &&
@@ -1315,13 +1325,17 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
                          local_seed[1].minkowski,
                          local_seed[2].minkowski,
                          local_seed[3].minkowski)) {
-      out.status=2; return out;
+      out.status=1; out.distance=flex_dd(0.0f); return out;
     }
   } else if (seed_count==3) {
     int init=common_ccd_initialize_p3(local_seed,a,b,gjk_distance,
         mesh_vertices,mesh_graph,vertices,vertex_ids,center,face_vertices,
         adjacency,epa_support_trace,epa_support_count);
-    if (init) { out.status=2; return out; }
+    if (init) {
+      out.status=init==2 ? 2 : 1;
+      if (out.status==1) out.distance=flex_dd(0.0f);
+      return out;
+    }
     vertex_count=5;
     initial_faces=6;
     p3_initialized=true;
@@ -1363,14 +1377,18 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
       int init=common_ccd_initialize_p3(p3seed,a,b,gjk_distance,
           mesh_vertices,mesh_graph,vertices,vertex_ids,center,face_vertices,
           adjacency,epa_support_trace,epa_support_count);
-      if (init) { out.status=2; return out; }
+      if (init) {
+        out.status=init==2 ? 2 : 1;
+        if (out.status==1) out.distance=flex_dd(0.0f);
+        return out;
+      }
       vertex_count=5; initial_faces=6; p3_initialized=true;
     }
     if (!p3_initialized && common_ccd_ray_triangle_source(
                           local_seed[0].minkowski,
                           local_seed[1].minkowski,
                           vertices[2].m,vertices[3].m,vertices[4].m)==0) {
-      out.status=2; return out;
+      out.status=1; out.distance=flex_dd(0.0f); return out;
     }
   }
   if (vertex_count>vertex_capacity || initial_faces>face_capacity) {
@@ -1381,7 +1399,7 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
           face_vertices[i].x,face_vertices[i].y,face_vertices[i].z,
           adjacency[i],face) ||
         flex_dd_compare_exact(face.dist2_dd,flex_dd(1.0e-30f))<0) {
-      out.status=2; return out;
+      out.status=1; out.distance=flex_dd(0.0f); return out;
     }
     face.index=i;
     faces[face_count]=face;

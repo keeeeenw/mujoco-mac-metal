@@ -874,6 +874,7 @@ class CoupledConstraintDescriptor:
   # Double-precision constant residuals for paired aref, per pair
   # [solref_lo(2), solimp_lo(5), margin_lo(2)]: lo = f64 TRUE - f32 hi.
   pair_const_lo: np.ndarray = None
+  # Three planar words of callback margin+gap; solver inclusion uses margin.
   pair_margin_source_words: np.ndarray = None
   dof_invweight0_low: np.ndarray = None
   body_invweight0_low: np.ndarray = None
@@ -2033,7 +2034,9 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
       solref=_frozen(sr, np.float32),
       solimp=_frozen(si, np.float32),
       pair_const_lo=_frozen(pair_const_lo, np.float32),
-      pair_margin_source_words=_frozen(_source_float_words([p[7] for p in pairs]), np.float32),
+      # Narrow-phase callbacks consume source-rounded margin+gap, while
+      # contact solver inclusion still consumes the separately stored margin.
+      pair_margin_source_words=_frozen(_source_float_words([p[7] + p[8] for p in pairs]), np.float32),
       condim=_frozen(cd, np.int32),
       friction=_frozen(fr, np.float32),
       solreffriction=_frozen(srfr, np.float32),
@@ -2585,7 +2588,7 @@ class MetalCoupledConstraints:
         "geom_size_source": self._tensor(_source_float_words(model.geom_size)
             if self._has_source_analytic_pairs else np.zeros(3, dtype=np.float32)),
         "pair_margin_source": self._tensor(d.pair_margin_source_words
-            if self._has_source_analytic_pairs else np.zeros(3, dtype=np.float32)),
+            if d.npairs else np.zeros(3, dtype=np.float32)),
         "geom_type": self._tensor(d.geom_type if d.ngeom else np.zeros(1, dtype=np.int32)),
         "geom_rbound": self._tensor(d.geom_rbound if d.ngeom else np.zeros(1, dtype=np.float32)),
         "mesh_hull": self._tensor(self._common_ccd_mesh_hull),
@@ -3514,7 +3517,7 @@ class MetalCoupledConstraints:
               self._constants["pair_contact_offsets_dims"],
               pair_maps.logical_to_packed.reshape(-1),
               self._constants["mesh_hull"], self._constants["mesh_hull_info"],
-              w["out_status"], restart_pass,
+              w["out_status"], restart_pass, self._constants["pair_margin_source"],
               threads=(b * d.npairs,), group_size=(1,))
       if self._contact_plane_convex_producer is not None:
         self._contact_plane_convex_producer(

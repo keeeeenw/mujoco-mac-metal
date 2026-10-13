@@ -341,6 +341,7 @@ static inline int common_ccd_production_one_prism(
     if (retained_normal!=nullptr) *retained_normal=epa.normal;
     if (retained_distance!=nullptr) *retained_distance=flex_dd_neg(epa.distance);
   }
+  if (epa.status==1) return 0;  // Source rejected a nonpenetrating seed.
   return epa.status==0 ? 1 : -10-epa.status;
 }
 
@@ -468,6 +469,7 @@ static inline int common_ccd_production_one_rigid_pair(
       epa_horizon,epa_stack,vertex_capacity,face_capacity,horizon_capacity,
       stack_capacity,contact,nullptr,nullptr,
       ignored_epa_support_count,ignored_epa_face_count);
+  if (epa.status==1) return 0;
   if (epa.status!=0) return -10-epa.status;
   if (source_position!=nullptr) *source_position=epa.position;
   if (source_normal!=nullptr) *source_normal=epa.normal;
@@ -1528,6 +1530,7 @@ kernel void common_ccd_rigid_convex_candidates(
     device int* mesh_hull_info [[buffer(14)]],
     device atomic_int* world_status [[buffer(15)]],
     constant long& restart_pass [[buffer(16)]],
+    device const float* pair_margin_source [[buffer(17)]],
     uint tid [[thread_position_in_grid]]) {
   int batch=pair_dims[3], npairs=pair_dims[1], ngeom=pair_dims[6];
   if (npairs<=0 || uint(tid)>=uint(batch*npairs)) return;
@@ -1592,10 +1595,13 @@ kernel void common_ccd_rigid_convex_candidates(
   int rec_a=geom_records+COMMON_CCD_GEOM_INFO_WORDS*a;
   int rec_b=geom_records+COMMON_CCD_GEOM_INFO_WORDS*b;
   float margin_value=pair_margin_gap[2*pair]+pair_margin_gap[2*pair+1];
+  FlexDD source_margin=FlexDD{pair_margin_source[pair],
+      pair_margin_source[npairs+pair],pair_margin_source[2*npairs+pair]};
   // mj_geomDistance passes distmax directly as the collision margin. A
   // negative finite bound is valid and must reach libccd's support mapping
   // and depth correction unchanged, rather than becoming an empty query.
-  if (!isfinite(margin_value)) {
+  if (!isfinite(margin_value) || !isfinite(source_margin.hi) ||
+      !isfinite(source_margin.lo) || !isfinite(source_margin.tail)) {
     mesh_hull[out+1]=4.0f;
     common_ccd_production_fail(world_status,world); return;
   }
@@ -1605,6 +1611,11 @@ kernel void common_ccd_rigid_convex_candidates(
   CommonCCDSupportObject object_b=common_ccd_production_geom(
       b,geom_type[b],rec_b,mesh_hull_info,mesh_hull,pb,mb,
       szb,margin_value);
+  // Preserve the compiled collision margin in the support mapping and
+  // depth correction. Its float32 projection can flip EPA face ties and
+  // rotated restart normals even when positions agree to nanometers.
+  object_a.margin=source_margin;
+  object_b.margin=source_margin;
   if (object_a.kind<0 || object_b.kind<0) {
     mesh_hull[out+1]=3.0f;
     common_ccd_production_fail(world_status,world); return;
@@ -1651,7 +1662,8 @@ kernel void common_ccd_rigid_convex_candidates(
   // Keeping both heavy algorithms live in one runtime branch needlessly
   // enlarges the compiled kernel; this selection changes no numerical inputs.
   const bool libccd=COMMON_CCD_USE_LIBCCD!=0;
-  bool source_multicontact=!libccd && margin_value==0.0f && pair_dims[8]==0 &&
+  bool source_multicontact=!libccd &&
+      flex_dd_compare_exact(source_margin,flex_dd(0.0f))==0 && pair_dims[8]==0 &&
       (geom_type[a]==6 || geom_type[a]==7) && (geom_type[b]==6 || geom_type[b]==7);
   if (phase>0) {
     if (source_multicontact || pair_dims[8]!=0 ||
@@ -1676,10 +1688,10 @@ kernel void common_ccd_rigid_convex_candidates(
   int3 face_slots=int3(-1);
   int found=libccd ? common_libccd_penetration(
       object_a,object_b,center_a,center_b,
-      FlexDD{margin_value,0.0f,0.0f},iterations,tolerance,mesh_hull,mesh_hull_info,
+      source_margin,iterations,tolerance,mesh_hull,mesh_hull_info,
       contact,contact_position,contact_normal) : common_ccd_production_one_rigid_pair(
       object_a,object_b,center_a,center_b,
-      FlexDD{margin_value,0.0f,0.0f},iterations,tolerance,
+      source_margin,iterations,tolerance,
       mesh_hull,mesh_hull_info,epa_vertices,epa_vertex_ids,epa_faces,epa_face_map,
       epa_horizon,epa_stack,vertex_capacity,face_capacity,horizon_capacity,
       stack_capacity,contact,face_ids,face_slots,&contact_position,&contact_normal);

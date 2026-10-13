@@ -199,6 +199,7 @@ kernel void flex_contact_detect_common_element_pair(
       vertices,nullptr,faces,face_map,horizon,stack,vertex_capacity,face_capacity,
       horizon_capacity,stack_capacity,contact,nullptr,nullptr,
       ignored_epa_support_count,ignored_epa_face_count);
+  if (epa.status==1) return;  // Pinned EPA produced no penetrating witness.
   if (epa.status!=0 || !isfinite(contact.dist)) {
     narrowphase_status[tid]=35;
     return;

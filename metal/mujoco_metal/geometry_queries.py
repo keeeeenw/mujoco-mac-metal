@@ -74,7 +74,7 @@ def lower_geometry_queries(model, batch_size=1, limits=None, *, query_pairs=None
       'results':batch_size*count*10,'zeros':batch_size*max(model.ngeom,1)*9}
   if callbacks:
     workspace_sizes.update(terrain_dims=12+51*count+batch_size,
-        terrain_geoms=2*count,terrain_margins=2*count,
+        terrain_geoms=2*count,terrain_margins=2*count,terrain_margin_source=3*count,
         terrain_sizes=3*model.ngeom,terrain_bounds=model.ngeom,
         terrain_map=batch_size*count,terrain_status=batch_size,
         terrain_matrices=27*batch_size*model.ngeom)
@@ -170,6 +170,8 @@ class GeometryQueryProgram:
           row[0],row[1]=row[1],row[0]
       self._terrain_geoms=tensor(canonical.reshape(-1))
       self._terrain_margins=tensor(np.stack([desc['cutoff'],np.zeros(count,np.float32)],1).reshape(-1))
+      from mujoco_metal.coupled_constraints import _source_float_words
+      self._terrain_margin_source=tensor(_source_float_words(desc['cutoff']))
       self._terrain_sizes=tensor(np.asarray(model.geom_size,np.float32).reshape(-1))
       self._terrain_bounds=tensor(np.asarray(model.geom_rbound,np.float32).reshape(-1))
       self._terrain_map=torch.zeros(batch_size*count,dtype=torch.int32,device='mps')
@@ -232,7 +234,7 @@ class GeometryQueryProgram:
       if self._libccd:
         for phase in range(5):
           library.common_ccd_rigid_convex_candidates(
-              *candidate_args[:9],*candidate_args[10:],phase,
+              *candidate_args[:9],*candidate_args[10:],phase,self._terrain_margin_source,
               threads=(b*self.count,),group_size=(1,))
       library.geometry_query_finish_terrain(self.types,self.pairs.reshape(-1),self.cutoff,
           self.hull,self.info,self.results.reshape(-1),stage_mask,self.dims,

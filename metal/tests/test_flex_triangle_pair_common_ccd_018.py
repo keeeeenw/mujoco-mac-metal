@@ -174,6 +174,21 @@ def test_cpu_tetra_detector_rounding_changes_the_pinned_contact_oracle():
   assert np.max(np.abs(original[(4, 0)] - rounded[(4, 0)])) > .5
 
 
+def test_cpu_self_triangle_detector_rounding_changes_source_normal_orientation():
+  model, data = _triangle_pair_fixture(which="self")
+  represented = _detector_input_reference(model, data)
+  assert data.ncon == represented.ncon == 5
+  np.testing.assert_array_equal(represented.flexvert_xpos,
+                                data.flexvert_xpos.astype(np.float32).astype(np.float64))
+  original = {tuple(map(int, c.elem)): c.frame[:3].copy() for c in data.contact}
+  rounded = {tuple(map(int, c.elem)): c.frame[:3].copy() for c in represented.contact}
+  assert original.keys() == rounded.keys()
+  # The standalone detector receives rounded vertex coordinates, rather
+  # than the public simulation's retained source pose. At this coplanar
+  # witness the rounding changes even the pinned CPU normal's orientation.
+  assert np.max(np.abs(original[(3, 4)] - rounded[(3, 4)])) > 1.9
+
+
 def _expected_pair_contacts(model, data, descriptor):
   expected = {}
   for contact in data.contact[:data.ncon]:
@@ -614,7 +629,10 @@ def test_native_triangle_pair_common_ccd_detector_matches_pinned_B2(which):
       current.qpos[:] = np.asarray(data.qpos, np.float64)
       current.qpos[18:24] = 0.0
     mujoco.mj_forward(model, current)
-    reference.append(current)
+    # Compare the standalone detector at the actual uploaded float32
+    # vertices. Public simulation force/trajectory gates below keep their
+    # full source-state oracle and all original bounds.
+    reference.append(_detector_input_reference(model, current))
   result = program.run_device(
       mps(np.stack([np.asarray(x.flexvert_xpos, np.float32)
                     for x in reference])),
