@@ -32,9 +32,12 @@ def _load_model():
   return model
 
 
-def run(steps=600, mode="metal", check=False, record=None):
+def run(steps=600, mode="metal", check=False, record=None, replay_check=False,
+        viewer_seconds=0, metrics_path=None):
   if mode not in ("metal", "cpu"):
     raise ValueError(f"Unknown mode {mode!r}")
+  if record and mode != "metal":
+    raise ValueError("Native/CPU comparison recording requires --mode metal")
   model = _load_model()
   qpos = model.qpos0.copy().astype(np.float32)
   qvel = np.zeros(model.nv, dtype=np.float32)
@@ -52,19 +55,39 @@ def run(steps=600, mode="metal", check=False, record=None):
     native = MetalSimulation(
         model, batch_size=1, qpos=qpos[None], qvel=qvel[None],
         profile=PROFILE)
+  if viewer_seconds:
+    if native is None:
+      raise ValueError("The Mac viewer requires --mode metal")
+    from demo_viewer import run_native_viewer
+    return run_native_viewer(
+        model, native, steps=steps, seconds=viewer_seconds,
+        title="Gravity Assembly Puzzle | Native Metal",
+        lookat=(0, 0, .1), distance=1.2, azimuth=135, elevation=-55)
 
   recorder = None
   if record:
     from demo_recording import ComparisonRecorder
     recorder = ComparisonRecorder(
         model, record, "Assembly Puzzle | Convex Mesh Settling",
-        [0.0, 0.0, 0.25], 1.1, azimuth=135, elevation=-25)
+        [0.0, 0.0, 0.1], 1.2, azimuth=135, elevation=-55)
 
   max_qpos_error = 0.0
   max_quat_error = 0.0
   pre_qpos_error = 0.0
   end_qpos_error = 0.0
   max_penetration = 0.0
+  native_max_penetration = 0.0
+  native_contact_steps = 0
+  replay_steps = []
+  minimum_hull_clearance = {"tetra/divider": float("inf"),
+                            "octa/floor": float("inf"),
+                            "octa/divider": float("inf"),
+                            "octa/right_wall": float("inf")}
+  from mujoco_metal.mesh_hull import collision_mesh_hull
+  mesh_vertices = {}
+  for name in ("tetra_geom", "brick_geom", "octa_geom"):
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+    mesh_vertices[name] = (gid, collision_mesh_hull(model, int(model.geom_dataid[gid]))[0])
   # Monitored omission bounds (see check below): tetra must never reach
   # the divider, and octa must never approach the tray floor.
   max_ax = -1.0
@@ -95,6 +118,44 @@ def run(steps=600, mode="metal", check=False, record=None):
       actual.qpos[:] = state.qpos[0]
       actual.qvel[:] = state.qvel[0]
       actual.time = float(state.time[0])
+      assembly = native._last_coupled
+      live = assembly["contact_mask"][0].cpu().numpy().astype(bool)
+      if live.any():
+        native_contact_steps += 1
+        native_max_penetration = max(native_max_penetration,
+            -float(assembly["contact_distance"][0].cpu().numpy()[live].min()))
+      if replay_check and step + 1 in (100, 400):
+        from magnetic_crane import _same_checkpoint
+        before = native.snapshot()
+        commands = [.0001 * np.cos(np.arange(model.nv) + i).astype(np.float32)[None]
+                    for i in range(20)]
+        for command in commands:
+          np.testing.assert_array_equal(native.step(qfrc_applied=command).cpu().numpy(), [0])
+        expected = native.snapshot()
+        native.restore(before)
+        for command in commands:
+          np.testing.assert_array_equal(native.step(qfrc_applied=command).cpu().numpy(), [0])
+        _same_checkpoint(native.snapshot(), expected)
+        native.restore(before)
+        _same_checkpoint(native.snapshot(), before)
+        replay_steps.append(step + 1)
+    # Host geometry measurements mirror the accepted native pose; these
+    # do not advance physics. Use compiled hull vertices, not center-radius
+    # guesses that miss a rotated tip or mix raw and compiled asset frames.
+    mujoco.mj_forward(model, actual)
+    world_vertices = {name: vertices @ actual.geom_xmat[gid].reshape(3, 3).T +
+                      actual.geom_xpos[gid] for name, (gid, vertices) in mesh_vertices.items()}
+    tetra, octa = world_vertices["tetra_geom"], world_vertices["octa_geom"]
+    furniture = {}
+    for name in ("divider", "trayfloor", "wallR"):
+      gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+      half = np.abs(actual.geom_xmat[gid].reshape(3, 3)) @ model.geom_size[gid]
+      furniture[name] = (actual.geom_xpos[gid] - half, actual.geom_xpos[gid] + half)
+    for key, value in (("tetra/divider", furniture["divider"][0][0] - tetra[:, 0].max()),
+                       ("octa/floor", octa[:, 2].min() - furniture["trayfloor"][1][2]),
+                       ("octa/divider", octa[:, 0].min() - furniture["divider"][1][0]),
+                       ("octa/right_wall", furniture["wallR"][0][0] - octa[:, 0].max())):
+      minimum_hull_clearance[key] = min(minimum_hull_clearance[key], float(value))
     max_qpos_error = max(
         max_qpos_error, float(np.max(np.abs(
             actual.qpos[pos_idx] - reference.qpos[pos_idx]))))
@@ -124,6 +185,11 @@ def run(steps=600, mode="metal", check=False, record=None):
       "pre_qpos_error": pre_qpos_error,
       "end_qpos_error": end_qpos_error,
       "max_penetration": max_penetration,
+      "cpu_max_penetration": max_penetration,
+      "native_max_penetration": native_max_penetration if native is not None else None,
+      "native_contact_steps": native_contact_steps,
+      "minimum_compiled_hull_clearance": minimum_hull_clearance,
+      "full_checkpoint_replay_steps": replay_steps,
       "max_ax": max_ax,
       "min_octa_clearance": min_octa_clearance,
       "pieceA_xyz": [float(q[0]), float(q[1]), float(q[2])],
@@ -132,6 +198,8 @@ def run(steps=600, mode="metal", check=False, record=None):
   }
   if recorder is not None:
     recorder.close()
+  if metrics_path:
+    Path(metrics_path).write_text(json.dumps(out, indent=2))
   if check:
     # Pieces rest in their tray lanes (divider at x=0.02 separates A on
     # the left from B/C on the right) below rim height. Octa (C) stacks on
@@ -172,6 +240,13 @@ def run(steps=600, mode="metal", check=False, record=None):
     # Compliant impact transient on light hulls (measured ~16 mm on the
     # first tray strike); the bound documents it, not zero penetration.
     assert max_penetration < 0.02, max_penetration
+    for pair, clearance in minimum_hull_clearance.items():
+      assert clearance > 0, (pair, clearance)
+    if native is not None:
+      assert native_contact_steps > steps // 2, native_contact_steps
+      assert native_max_penetration < 0.02, native_max_penetration
+      if replay_check:
+        assert replay_steps == [100, 400], replay_steps
   return out
 
 
@@ -183,11 +258,14 @@ def main():
   parser.add_argument("--check", action="store_true")
   parser.add_argument("--record", help="record native/CPU renders to a GIF")
   parser.add_argument("--json", help="write numerical report to JSON")
+  parser.add_argument("--replay-check", action="store_true")
+  parser.add_argument("--viewer-seconds", type=float, default=0)
   args = parser.parse_args()
   if args.steps <= 0 or (args.check and not args.headless):
     raise SystemExit("use --headless --check for verification")
   out = run(steps=args.steps, mode=args.mode, check=args.check,
-            record=args.record)
+            record=args.record, replay_check=args.replay_check,
+            viewer_seconds=args.viewer_seconds, metrics_path=args.json)
   print(json.dumps(out, indent=2))
   if args.json:
     Path(args.json).write_text(json.dumps(out, indent=2))

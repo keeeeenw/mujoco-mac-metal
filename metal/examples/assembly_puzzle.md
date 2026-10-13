@@ -1,55 +1,56 @@
 # Gravity assembly puzzle (convex mesh contact)
 
 Use the [shared source setup](../INSTALL.md#development-source), with its Python
-environment active, and run these commands from the repository root.
-This integrated demo requires current main source; it is not supported by the
-published 0.4.0 wheel alone.
+environment active, and run from the repository root. This demo requires current
+source; the published 0.4.0 wheel alone does not contain these expanded paths.
 
-Three procedural convex hulls (tetrahedron, brick, octahedron; authored
-vertex lists) drop into a two-lane walled tray under gravity with Coulomb
-friction: tetra settles in the left lane, brick in the right lane, octa
-stacks on top of the brick. Piece/tray, piece/wall, piece/divider and
-brick/octa contacts exercise the native bounded mesh manifolds (up to 4
-face witnesses with sorted slot identity) against boxes and other meshes.
-Six contact pairs x 4 slots fill the 24-slot/96-row budget exactly (see the
-pair-budget comment in `assembly_puzzle.xml`); the pyramidal cone needs 120
-rows on this scene and is rejected at admission, so the elliptic cone is a
-capacity requirement (CPU lands identically under both cones). Rest
-equilibria with friction are non-unique and tumbling orientations diverge
-chaotically, so the check gates lane containment (measured max orientation
-envelope 0.173 on the qualifying revision), impact-transient and settle
-envelopes plus pre-impact parity, not exact rest poses. Omitted pairs
-(octa/floor, tetra/divider and others the choreography never approaches)
-are guarded by monitored trajectory bounds (tetra/divider gap, octa floor
-clearance) that fail loudly instead of tunneling silently. Rendering uses
-MuJoCo OpenGL; playback speed is presentation only, not a physics
-throughput claim.
+Three project-authored procedural convex hulls drop into a divided tray under
+gravity and Coulomb friction. The tetrahedron settles in the left lane; the brick
+and octahedron stack in the right lane. Native Metal computes the compiled convex
+mesh contact manifolds. Asset preprocessing is host work, and visualization uses
+MuJoCo OpenGL. Arbitrary concave narrowphase is not advertised.
 
-Run a CPU reference smoke test:
+The unchanged 600-step comparison passes all original bounds: maximum position
+error **1.679 mm** (20 mm bound), final error **0.334 mm**, maximum quaternion
+component error **0.00377** (0.2 bound), and native/source compliant compression
+**8.950 mm** (20 mm bound). Native contacts are active for 551 steps. Minimum
+compiled-hull clearances are 74.53 mm for tetra/divider, 12.25 mm for octa/floor,
+45 mm for octa/divider and 60 mm for octa/right wall. The explicit six-pair plan
+is specific to this choreography: these omissions remain monitored, rather than
+safe for arbitrary controls. Workspace admission uses current compiled capacities;
+the old 24-slot/96-row description is obsolete.
+
+Full literal 20-step checkpoint replays at steps 100 and 400 pass. The actual
+Mac viewer advances native physics with CPU stepping forbidden. The 1x GIF and
+viewer use the marble music machine lighting and a raised camera so the settled
+pieces remain visible. Playback rate is not a throughput measurement.
+
+Run the original CPU reference:
 
 ```bash
-PYTHONPATH=metal python metal/examples/assembly_puzzle.py --mode cpu --headless --check --steps 600
+PYTHONPATH=metal:metal/examples python metal/examples/assembly_puzzle.py --mode cpu --headless --check --steps 600
 ```
 
-Run the native Metal comparison check on an Apple Silicon Mac:
+Run the full Metal check and loaded checkpoint replays:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/assembly_puzzle.py --headless --check --steps 600
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/assembly_puzzle.py --headless --check --steps 600 --replay-check
 ```
 
-Record the side-by-side native Metal and CPU MuJoCo renders (left panel native,
-right CPU):
+Open the native Mac viewer (close the window to finish):
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/assembly_puzzle.py --record metal/examples/assets/assembly_puzzle.gif --steps 600
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/assembly_puzzle.py --viewer-seconds 30
+```
+
+Record the original full check, with native left and CPU reference right:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/assembly_puzzle.py --headless --check --replay-check --steps 600 --record metal/examples/assets/assembly_puzzle.gif
 ```
 
 ![Assembly puzzle](assets/assembly_puzzle.gif)
 
-The `--headless --check` run asserts actual native behavior: all three pieces
-settle inside their tray lanes below rim height, pre-impact flight parity is
-exact, settled end positions agree to lane precision, and piece penetration
-stays within the compliant impact bound. Multi-basin deep-rotated mesh-mesh
-overlap is excluded from tight parity (matrix documents the regime).
-
-Lighting and the dark checkerboard match the robotic marble music machine.
+The procedural assets are project originals under Apache-2.0. Qualification
+covers the documented source-reference domains and integrated Euler contract;
+other feature compositions remain subject to their own milestone gates.
