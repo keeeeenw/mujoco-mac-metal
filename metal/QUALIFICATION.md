@@ -1,4 +1,8 @@
-# Development qualification — 2026-10-11
+# Development qualification — updated 2026-10-13 UTC
+
+Historical entries retain their producing revisions and original open gates.
+Use the latest sequential entries and [milestone status](STATUS.md) for current
+acceptance; overlapping counts are not additive.
 
 ## Complete sensor and extension correction composition
 
@@ -1440,3 +1444,83 @@ Run separately with -m 'not gpu' and -m gpu for the two phases. The prepared hos
 gate also disables MPS availability. The full original gripper is a separate
 acceptance run, not part of the 198 count. No repository-wide regression,
 benchmark, publication or release was performed. Milestone 008 is next.
+
+## Sequential qualification: Milestone 008 — 2026-10-13 UTC
+
+The complete 19-file scoped gate passes **113 host tests in 3.69 seconds** and
+**66 native tests in 65.99 seconds**, without failures or skips. Native tests
+use actual MPS, MuJoCo 3.10.0 and this source's modules/shaders with CPU fallback
+disabled. The source stayed frozen through the checks. Marker exclusions divide
+host/native phases; they are not skipped acceptance cases.
+
+The original pulley-armature acceleration test first failed its unchanged
+1e-4 absolute bound. Native site-only length/velocity/J now consume retained
+FK residuals in compensated arithmetic. Complete armature family checks then
+caught ordered same-body joints: final body orientation cannot reconstruct an
+earlier joint's frame. Native FK now retains that joint's actual source anchor
+and axis low/tail planes before later joints move. Source-word reconstruction,
+position-cache ABI, physical memory counts and exact overflow guards pass.
+The public outputs remain float32; this is not an unrestricted binary64 claim.
+Wrapped and fixed tendon kernels retain their existing paths.
+
+The selection includes the original spatial/fixed tendon mechanics, nonzero
+motor/filter/muscle forces, slack/rest damping, tendon limits/friction/equalities,
+contact composition and site armature dots/bias/mass/qacc. Independent finite
+differences cover multiple pulleys, hinge/ball/free chains and both sphere and
+cylinder wrap sides, inside routes and one-sided transition behavior. Actual
+wrap metadata and six-step boundary trajectories are checked. Real mutation,
+replacement, prevalidation, masked worlds, reset and complete snapshot replay
+pass. The 70-DOF CSR assembly test explicitly materializes its validation view;
+runtime stepping does not gain an implicit dense allocation.
+
+The full original drawbridge and constant-release counterfactual each pass
+**1,400 native steps**, with unchanged XML, controls and all original bounds.
+Full snapshots replay literally for 20 prescribed steps at release step 900
+and re-haul step 1,200, including retained precision/solver/actuator history.
+Maximum linear-coordinate, scalar-joint and normalized rotation differences are
+14.63 mm, 0.00707 rad and 0.10724 rad; activation differs by 4.05e-7.
+Default soft-contact impact compression is 18.31 mm native versus 18.57 mm CPU;
+this is not a 1 mm penetration qualification. The crate lifts to 0.535 m, slides
+off at release and the deck re-raises empty. The [demo guide](examples/cable_drawbridge.md)
+records these boundaries rather than claiming receiver delivery.
+
+The new GIF has 70 actual comparison pairs over 2.8 simulated seconds at 1x.
+A main-thread Mac GLFW viewer completes 45 native steps in three wall seconds
+with CPU stepping forbidden; source CPU forward queries only mirror native
+poses for upstream OpenGL visualization. Both visuals were reviewed.
+
+Reproduce the complete native selection in the pinned source environment:
+
+```sh
+PYTHONPATH=metal:metal/tests:metal/examples MUJOCO_METAL_RUN_GPU=1 \
+PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTORCH_MPS_FAST_MATH=0 \
+python -m pytest -q -x -p no:cacheprovider -m gpu \
+  metal/tests/test_spatial_tendons_008.py \
+  metal/tests/test_tendons.py \
+  metal/tests/test_tendon_equality_metadata_ownership.py \
+  metal/tests/test_contact_free_spatial_composition_015.py \
+  metal/tests/test_tendon_dynamic_nv_017.py \
+  metal/tests/test_spatial_shader_dependencies.py \
+  metal/tests/test_spatial_limit_firstsolve_019.py \
+  metal/tests/test_spatial_force_recovery_019.py \
+  metal/tests/test_spatial_site_precision_008.py \
+  metal/tests/test_spatial_wrap_transitions_008.py \
+  metal/tests/test_site_armature_families.py \
+  metal/tests/test_site_armature_closeout.py \
+  metal/tests/test_fk_source_rounding.py \
+  metal/tests/test_fk_position_words.py \
+  metal/tests/test_fk_source_identity_precision.py \
+  metal/tests/test_capacity_allocation_repair.py \
+  metal/tests/test_capacity_017.py \
+  metal/tests/test_position_context_geom_residual_018.py \
+  metal/tests/test_forward_stages_019.py
+```
+
+The host phase uses the same files with `-m "not gpu"`, disabling MPS
+availability before pytest collection. The full demo command is in its guide.
+These results close the admitted spatial-tendon milestone; complete rigid
+constraint composition is next in 009. Other solver options/integrators retain
+014/015; APIs/extensions retain 019 and distribution/broad hardware retain 020.
+No full repository regression, performance benchmark, publication or release
+was performed.

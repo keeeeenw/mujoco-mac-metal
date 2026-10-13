@@ -8,9 +8,9 @@ pulley divisor, a cylinder wrap with side-site selection, spring/damper
 passive forces with a rest range (genuine slack/taut transitions), and joint
 limits on the winch travel. A filter actuator drives the winch open-loop:
 haul (tension, raise deck), release (slack, lower deck), re-haul
-(re-tension, raise again). A paired always-slack run is not physically
-meaningful for force-driven schedules, so the counterfactual instead holds a
-constant light force that never raises the deck.
+(re-tension, raise again). The paired counterfactual applies constant release
+control throughout; its deck never rises without hauling. The payload slides
+off during release, so the final raised deck is empty.
 """
 
 import argparse
@@ -54,6 +54,8 @@ def _sched(step):
 
 
 def run(steps=1400, mode="metal", check=False, record=None):
+  if check and steps < 1400:
+    raise ValueError("drawbridge --check requires the complete 1400-step schedule")
   if mode not in ("metal", "cpu"):
     raise ValueError(f"Unknown mode {mode!r}")
   model = _load_model()
@@ -80,6 +82,10 @@ def run(steps=1400, mode="metal", check=False, record=None):
     recorder = ComparisonRecorder(model, record, "Cable Drawbridge | Wrap, Haul and Slack",
                                   [0.2, 0, 0.5], 3.0, azimuth=135, elevation=-15)
 
+  max_linear_position_err = 0.0
+  max_scalar_joint_err = 0.0
+  max_normalized_geodesic_err = 0.0
+  cpu_peak_contact_penetration = 0.0
   max_qpos_err = 0.0
   max_act_err = 0.0
   max_pos_err = 0.0
@@ -101,11 +107,14 @@ def run(steps=1400, mode="metal", check=False, record=None):
   for step in range(steps):
     ctrl = _sched(step)
     if native is not None:
-      native.step(1, ctrl=np.asarray(ctrl, dtype=np.float32).reshape(1, 1))
+      status = native.step(1, ctrl=np.asarray(ctrl, dtype=np.float32).reshape(1, 1))
+      np.testing.assert_array_equal(status.cpu().numpy(), [0])
     cpu_haul.ctrl[:] = ctrl
     mujoco.mj_step(model, cpu_haul)
     cpu_hold.ctrl[:] = SLACK
     mujoco.mj_step(model, cpu_hold)
+    cpu_peak_contact_penetration = max(cpu_peak_contact_penetration,
+        max((-float(c.dist) for c in cpu_haul.contact), default=0.0))
     length = float(np.asarray(cpu_haul.ten_length)[0])
     stretch = length - rest
     if stretch <= 0:
@@ -116,7 +125,9 @@ def run(steps=1400, mode="metal", check=False, record=None):
     # CPU oracle (review gap). CPU counters above remain the oracle baseline.
     if native is not None:
       nat_kin = native._spatial_kin
-      nat_len = float(nat_kin["length"].cpu().numpy()[0, 0]) if nat_kin is not None else length
+      if nat_kin is None:
+        raise RuntimeError("native spatial tendon state was not produced")
+      nat_len = float(nat_kin["length"].cpu().numpy()[0, 0])
       nat_stretch = nat_len - rest
       if nat_stretch <= 0:
         nat_slack_steps += 1
@@ -143,6 +154,15 @@ def run(steps=1400, mode="metal", check=False, record=None):
       # Geodesic orientation error: angle between unit quats, robust to sign.
       dot = float(np.clip(abs(np.dot(gq[[5, 6, 7, 8]], cpu_haul.qpos[[5, 6, 7, 8]])), -1.0, 1.0))
       geo = float(2.0 * np.arccos(dot))
+      max_linear_position_err = max(max_linear_position_err,
+          float(np.max(np.abs(gq[[0, 2, 3, 4]] - cpu_haul.qpos[[0, 2, 3, 4]]))))
+      max_scalar_joint_err = max(max_scalar_joint_err, abs(float(gq[1]-cpu_haul.qpos[1])))
+      nq = gq[5:9].astype(np.float64)
+      cq = cpu_haul.qpos[5:9].astype(np.float64)
+      normalized_dot = float(np.clip(abs(np.dot(nq, cq)) /
+          (np.linalg.norm(nq)*np.linalg.norm(cq)), 0, 1))
+      max_normalized_geodesic_err = max(max_normalized_geodesic_err,
+                                       float(2*np.arccos(normalized_dot)))
       max_pos_err = max(max_pos_err, epos)
       max_quat_err = max(max_quat_err, equat)
       max_geodesic_err = max(max_geodesic_err, geo)
@@ -168,7 +188,8 @@ def run(steps=1400, mode="metal", check=False, record=None):
     lat_sim = MS(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :], profile=PROFILE)
     lat_sim.reset_to_keyframe(0)
     for step in range(steps):
-      lat_sim.step(1, ctrl=np.asarray(SLACK, dtype=np.float32).reshape(1, 1))
+      status = lat_sim.step(1, ctrl=np.asarray(SLACK, dtype=np.float32).reshape(1, 1))
+      np.testing.assert_array_equal(status.cpu().numpy(), [0])
     lat = lat_sim.state.qpos[0].cpu().numpy()
     latched = (float(lat[deck_idx]), float(lat[crate_z]))
   else:
@@ -176,6 +197,10 @@ def run(steps=1400, mode="metal", check=False, record=None):
     latched = (float(cpu_hold.qpos[deck_idx]), float(cpu_hold.qpos[crate_z]))
 
   result = {
+      "max_linear_position_err_m": max_linear_position_err,
+      "max_scalar_joint_err_rad": max_scalar_joint_err,
+      "max_normalized_geodesic_err_rad": max_normalized_geodesic_err,
+      "cpu_peak_contact_penetration_m": cpu_peak_contact_penetration,
       "max_qpos_err": max_qpos_err,
       "max_act_err": max_act_err,
       "max_pos_err": max_pos_err,
@@ -214,57 +239,86 @@ def run(steps=1400, mode="metal", check=False, record=None):
     assert nat_crate_peak > 0.35, nat_crate_peak
     assert crate_peak > 0.35, crate_peak  # payload lifted with the deck
     assert released[0] < -0.3, released  # ends raised after re-haul
-    assert latched[0] > -0.05, latched  # hold-only run never raises
+    assert latched[0] > -0.05, latched  # constant-release run never raises
   return result
 
 
 def run_viewer(steps=1400, seconds=0):
-  """Interactive native viewer (requires a display; headless uses --headless).
-
-  Steps the native simulation with the open-loop haul schedule and shows
-  native state live, with the CPU oracle tracked alongside for the report.
-  With seconds > 0 the viewer auto-closes after that wall time (used for
-  explicit visual checks); 0 runs the full finite rollout (steps), then closes.
-  """
+  """Display actual native physics; MuJoCo only mirrors it for OpenGL rendering."""
   import time
-  from mujoco import viewer as mj_viewer
+  import glfw
   from mujoco_metal import MetalSimulation
   model = _load_model()
-  qpos0 = model.qpos0.copy().astype(np.float32)
-  qvel0 = np.zeros(model.nv, dtype=np.float32)
-  native = MetalSimulation(model, batch_size=1, qpos=qpos0[None, :], qvel=qvel0[None, :],
-                           profile=PROFILE)
-  native.reset_to_keyframe(0)
-  cpu = mujoco.MjData(model)
-  mujoco.mj_resetDataKeyframe(model, cpu, 0)
-  mujoco.mj_forward(model, cpu)
-  actual = mujoco.MjData(model)
-  mujoco.mj_resetDataKeyframe(model, actual, 0)
-  mujoco.mj_forward(model, actual)
-  max_err = 0.0
-  with mj_viewer.launch_passive(model, actual) as viewer:
-    viewer.cam.lookat[:] = [0.2, 0, 0.5]
-    viewer.cam.distance = 3.0
-    viewer.cam.azimuth = 135
-    viewer.cam.elevation = -15
-    deadline = time.monotonic() + seconds
+  sim = MetalSimulation(model, batch_size=1, profile=PROFILE)
+  sim.reset_to_keyframe(0)
+  display = mujoco.MjData(model)
+  completed = 0
+  if not glfw.init():
+    raise RuntimeError("GLFW could not initialize the Mac viewer")
+  window = None
+  context = None
+  try:
+    window = glfw.create_window(1000, 700, "Cable drawbridge — native Metal", None, None)
+    if window is None:
+      raise RuntimeError("GLFW could not create an OpenGL viewer window")
+    glfw.make_context_current(window)
+    glfw.swap_interval(1)
+    camera = mujoco.MjvCamera()
+    camera.lookat[:] = [.2, 0, .5]
+    camera.distance, camera.azimuth, camera.elevation = 3.0, 135, -15
+    scene = mujoco.MjvScene(model, maxgeom=1000)
+    context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
+    options = mujoco.MjvOption()
+    previous = list(glfw.get_cursor_pos(window))
+    def keyboard(win, key, scancode, action, mods):
+      if key == glfw.KEY_ESCAPE and action == glfw.PRESS:
+        glfw.set_window_should_close(win, True)
+    def cursor(win, x, y):
+      dx, dy = x-previous[0], y-previous[1]
+      previous[:] = [x, y]
+      left = glfw.get_mouse_button(win, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+      right = glfw.get_mouse_button(win, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
+      middle = glfw.get_mouse_button(win, glfw.MOUSE_BUTTON_MIDDLE) == glfw.PRESS
+      if not (left or right or middle):
+        return
+      action = (mujoco.mjtMouse.mjMOUSE_MOVE_V if right else
+                mujoco.mjtMouse.mjMOUSE_ROTATE_V if left else mujoco.mjtMouse.mjMOUSE_ZOOM)
+      height = max(1, glfw.get_window_size(win)[1])
+      mujoco.mjv_moveCamera(model, action, dx/height, dy/height, scene, camera)
+    def scroll(win, x, y):
+      mujoco.mjv_moveCamera(model, mujoco.mjtMouse.mjMOUSE_ZOOM, 0, -.05*y, scene, camera)
+    glfw.set_key_callback(window, keyboard)
+    glfw.set_cursor_pos_callback(window, cursor)
+    glfw.set_scroll_callback(window, scroll)
+    started = time.monotonic()
     for step in range(steps):
-      if not viewer.is_running():
+      if glfw.window_should_close(window) or (seconds > 0 and time.monotonic()-started >= seconds):
         break
-      if seconds > 0 and time.monotonic() >= deadline:
-        break
+      before = time.monotonic()
       ctrl = _sched(step)
-      native.step(1, ctrl=np.asarray(ctrl, dtype=np.float32).reshape(1, 1))
-      cpu.ctrl[:] = ctrl
-      mujoco.mj_step(model, cpu)
-      gq = native.state.qpos[0].cpu().numpy()
-      max_err = max(max_err, float(np.max(np.abs(gq - cpu.qpos))))
-      with viewer.lock():
-        actual.qpos[:] = gq
-        actual.qvel[:] = native.state.qvel[0].cpu().numpy()
-        actual.time = float(native.state.time[0].cpu().numpy())
-      viewer.sync()
-  return {"max_qpos_err": max_err, "steps": steps}
+      sim.step(1, ctrl=np.asarray(ctrl, np.float32).reshape(1, 1))
+      np.testing.assert_array_equal(sim.state._status.detach().cpu().numpy(), [0])
+      display.qpos[:] = sim.state.qpos[0].cpu().numpy()
+      display.qvel[:] = sim.state.qvel[0].cpu().numpy()
+      display.act[:] = sim.state.act[0].cpu().numpy()
+      display.ctrl[:] = ctrl
+      display.time = float(sim.state.time[0].cpu())
+      mujoco.mj_forward(model, display)
+      mujoco.mjv_updateScene(model, display, options, None, camera,
+                            mujoco.mjtCatBit.mjCAT_ALL, scene)
+      width, height = glfw.get_framebuffer_size(window)
+      mujoco.mjr_render(mujoco.MjrRect(0, 0, width, height), scene, context)
+      glfw.swap_buffers(window)
+      glfw.poll_events()
+      completed += 1
+      time.sleep(max(0, float(model.opt.timestep) - (time.monotonic()-before)))
+  finally:
+    if context is not None:
+      context.free()
+    if window is not None:
+      glfw.destroy_window(window)
+    glfw.terminate()
+  return {"viewer_steps": completed, "steps": completed, "backend": "native Metal physics; upstream OpenGL visualization"}
 
 
 def main():
@@ -278,6 +332,8 @@ def main():
   parser.add_argument("--viewer-seconds", type=float, default=0,
                       help="interactive native viewer; auto-close after this wall time (0 runs the finite rollout, requires a display)")
   args = parser.parse_args()
+  if not np.isfinite(args.viewer_seconds) or args.viewer_seconds < 0:
+    raise SystemExit("--viewer-seconds must be finite and nonnegative")
   if args.steps <= 0 or (args.check and not args.headless):
     raise SystemExit("use --headless --check for verification")
   if not args.headless and args.record is None and args.mode == "metal":

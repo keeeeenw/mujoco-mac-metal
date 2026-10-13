@@ -1,9 +1,10 @@
 # Development milestone status
 
-The source backend is experimental. **3 of the 16 milestones 005–020 are accepted: 005 (classification/support
-contract), 006 (state/model lifecycle) and 007 (built-in actuation and rigid
-transmissions under the admitted-model and integrated Euler contracts).**
-Milestones 008–020 remain open; acceptance of state ownership does not qualify
+The source backend is experimental. **4 of the 16 milestones 005–020 are accepted: 005 (classification/support
+contract), 006 (state/model lifecycle), 007 (built-in actuation and rigid
+transmissions) and 008 (spatial tendon mechanics under the admitted-model and
+integrated Euler contracts).**
+Milestones 009–020 remain open; acceptance of state ownership does not qualify
 their remaining numerical feature compositions. Earlier bounded profiles and selected
 native fixtures have passed independent checks.
 
@@ -12,7 +13,7 @@ native fixtures have passed independent checks.
 | 005 | Pinned inventory and support contract | Qualified: complete classification, direct header/binding drift and compiled admission matrix; native physics qualification remains separate |
 | 006 | State, model and lifecycle | Qualified: 170 host + 191 native checks, full crane/replay and bounded Mac viewer; shared-model and recompile boundaries documented |
 | 007 | Actuators and transmissions | Qualified: 181 host + 198 native checks, full gripper/counterfactual, exact replay and working Mac viewer; extensions and remaining integrators retain later owners |
-| 008 | Spatial tendons | Wrapping and admitted armature paths implemented; public assembly and final composition gate open |
+| 008 | Spatial tendons | Qualified: 113 host + 66 native checks; wrapping/transition/FD/armature/composition, full drawbridge/counterfactual, exact replay and working Mac viewer |
 | 009 | Rigid constraints | Coupled constraint paths implemented; full mixed-feature qualification open |
 | 010 | Analytic collision families | Primitive and additional convex-shape paths implemented; complete dispatcher/trajectory gate open |
 | 011 | Mesh collisions | Native hull and contact paths implemented; full irregular/degenerate/composition gate open |
@@ -47,7 +48,7 @@ selection (3,008 passed, 99 skipped); the exact managed source port passes
 sleeping pose words and awake lists, source callback cutoffs, invalid sensor
 row ownership and typed actuator payload rejection before physical recovery.
 Normal warning/AUTORESET controls remain tested. These overlapping scopes are
-not a completed full native, wheel or demo qualification. Milestones 008–020
+not a completed full native, wheel or demo qualification. Milestones 009–020
 remain open.
 
 Prepared potential/kinetic energy APIs, computed-stage metadata and current flex
@@ -140,7 +141,7 @@ complete 19-case native lifecycle file and 71 affected native transaction,
 split-stage, delay and recovery cases. These preserve nonzero source energy,
 selected worlds, malformed rejection, legacy compatibility and exact replay.
 These are source-specific results; full heightfield/deformable composition,
-final wheel/demo checks and milestones 008–020 remain open.
+final wheel/demo checks and milestones 009–020 remain open.
 
 Current checkpoint and owned-keyframe regression fixtures at `fe644d658` /
 `70136b887` pass the complete 19-case native actuator/device/mocap/equality
@@ -193,7 +194,32 @@ both payloads reach their receivers, and full checkpoint replay is exact. The
 new comparison GIF and GLFW viewer were visually reviewed. The demo guide
 records remaining long-horizon rotational differences.
 
-Milestone 008 is next: complete spatial tendon mechanics and branch transitions,
-coupled forces/constraints and the full drawbridge. These results do not close
+The following spatial-tendon qualification closes Milestone 008. These
+actuation results alone do not close
 all collision/solver options, other integrators, extensions, distribution,
 broad hardware or performance qualification.
+
+## Sequential spatial tendon qualification — 2026-10-13 UTC
+
+Milestone 008 passes 113 host and 66 native checks without failures or skips.
+Compensated native site geometry consumes retained FK words, including each
+joint's ordered anchor/axis. The complete armature family tests caught and
+corrected an earlier-joint frame error before acceptance. Position-cache ABI,
+physical storage and overflow guards include the new residual planes.
+
+Independent finite differences cover multiple pulleys, ball/free/hinge paths,
+sphere/cylinder inside and outside routes, both side selections and actual
+wrap transitions. Limits, friction, polynomial equalities, passive/actuated
+forces, 70-DOF assembly, masked worlds, reset and full replay pass.
+
+The unchanged drawbridge completes 1,400 primary and 1,400 constant-release
+native steps. Full checkpoint replay is exact during release and re-haul.
+The fresh comparison GIF and Mac GLFW viewer were reviewed. Default soft
+contacts briefly compress 18.31 mm native versus 18.57 mm CPU; the original
+checks pass, but this does not qualify a 1 mm impact bound. The payload slides
+off during release and the deck re-raises empty. See the [demo guide](examples/cable_drawbridge.md).
+
+Milestone 009 is next: complete rigid-constraint families and genuine mixed
+coupling under both contact cones, followed by the full suspension platform.
+Solver options, other integrators, extensions, distribution and broad hardware
+retain their later gates. No performance claim follows from these checks.

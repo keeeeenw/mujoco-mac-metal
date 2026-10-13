@@ -40,32 +40,42 @@ Launch the interactive viewer on a Mac (requires a display; headless
 verification uses `--headless --check` plus the GIF above):
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples mjpython metal/examples/cable_drawbridge.py --steps 1400
+PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examples/cable_drawbridge.py --steps 1400
 ```
 
-Add `--viewer-seconds 20` to auto-close after 20 s of wall time for explicit
-visual checks (without it, the viewer runs the finite `steps` rollout, then
-closes; interactive visual validation additionally requires a display and is
-otherwise unverified here).
+Add `--viewer-seconds 20` to auto-close after 20 s of wall time. Without
+it, the viewer runs the finite rollout and closes. Escape closes the window;
+left drag orbits, right drag pans, middle drag or scrolling zooms. Main-thread
+GLFW runs with ordinary Python on macOS. A three-second display smoke check
+completed 45 actual native steps with CPU stepping forbidden. CPU forward
+queries only mirror native state for OpenGL rendering.
 
 ![Cable drawbridge](assets/cable_drawbridge.gif)
 
-The `--headless --check` run asserts actual native behavior: native/CPU pose
-parity over the full haul/slack/re-haul rollout, deck raised past -0.3 rad,
-deck lowered past +0.05 rad during a genuinely slack interval (cable length
-below rest), hundreds of taut steps and dozens of slack steps, crate lifted
-past 0.35 m with the deck, final re-raised state and a hold-only
-counterfactual that never rises.
+The `--headless --check` run requires the complete 1,400-step schedule and
+checks original native/CPU trajectory bounds, raised/lowered/re-raised deck,
+genuine slack, re-tension and payload lift. A second full native run applies
+constant release control; its deck never rises without hauling. Full checkpoint
+replay is exact for 20 prescribed steps during release and re-haul.
 
-Measured CPU results on the qualified run (MuJoCo 3.10.0):
+Measured full-run results on MuJoCo 3.10.0, with the original XML, controls,
+solver settings and numerical bounds unchanged:
 
-- Deck minimum (raised): `-0.674` rad; deck maximum during slack window: `+0.157` rad.
-- Cable: `1025` taut steps, `375` slack steps (zero spring force).
-- Crate peak height: `0.535` m (rode the deck up from `0.28` m).
-- Final re-raised deck: `-0.651` rad; hold-only deck: `+0.131` rad.
-- Full-run native/CPU parity: translations `7.4e-03` (single crate-shift
-  transient at step 651, reconverges to `4.1e-03`), crate orientation `3.7e-02`
-  (same transient), actuator state `5e-4`. Position/orientation reported
-  separately per the roadmap; the transient is a contact event, not drift.
+- Native deck minimum: -0.675 rad; CPU minimum: -0.674 rad. CPU deck reaches
+  +0.157 rad during release.
+- Native cable: 1,022 taut and 378 slack steps; CPU: 1,025 taut and 375 slack.
+- Crate peak height: 0.535 m in both runs, lifted from 0.28 m.
+- Native final deck: -0.650 rad; constant-release deck: +0.131 rad.
+- Maximum native/CPU linear-coordinate difference: 14.63 mm; scalar-joint
+  difference: 0.00707 rad; normalized quaternion rotation difference: 0.10724 rad.
+  Activation difference: 4.05e-7. Position, joint angle and rotation are distinct
+  measurements; quaternion coefficients are not distances.
 
+The default soft contacts briefly compress **18.31 mm native versus 18.57 mm CPU**
+at impact. This model passes its original trajectory and behavior checks; it
+does not establish a 1 mm penetration bound or perfectly rigid contact.
+The crate slides off during release and the deck re-raises empty; this demo
+qualifies payload lift, not a second lift or receiver delivery.
+The new GIF contains 70 actual native/CPU frame pairs across 2.8 simulated
+seconds, displayed at 25 fps (1x). It is not a throughput measurement.
 Lighting and the dark checkerboard match the robotic marble music machine.

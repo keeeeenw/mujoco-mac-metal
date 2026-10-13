@@ -3128,8 +3128,10 @@ class MetalSimulation:
     If `recompute` is True, `ctrl` is given, `qfrc_applied` is given, or no step
     has been run yet, evaluates the forward smooth dynamics and coupled constraint
     assembly at the current device state with the provided control and applied forces.
-    Returns dict containing 'J', 'W', 'W_regularized', 'R', 'ar', 'rhs', 'lambda',
-    'qacc', 'qfrc_constraint', 'mass_matrix', 'status'.
+    Returns borrowed solver tensors including 'R', 'ar', 'rhs', 'lambda',
+    'qacc', 'qfrc_constraint', 'mass_matrix' and 'status'. Dense profiles also
+    expose 'J', 'W' and 'W_regularized'; scalable CSR profiles retain sparse
+    storage instead of implicitly allocating dense validation views.
     Component profiles return `mass_matrix=None`, rigid `mass_blocks`, immutable
     `mass_block_layout`, and optional `tendon_armature_blocks` with the same
     packed layout. The full mass operator is the sum of those two block arrays;

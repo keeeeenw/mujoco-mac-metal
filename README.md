@@ -70,7 +70,9 @@ contract pass 1,292 targeted checks. Milestone 006 also qualifies state/model
 lifecycle with 170 host and 191 native checks, a full crane demo and exact
 checkpoint replay. Milestone 007 qualifies built-in actuation and rigid
 transmissions with 181 host and 198 native checks, the complete muscle gripper
-and exact replay. Milestones 008–020 remain open.**
+and exact replay. Milestone 008 qualifies spatial tendon mechanics with
+113 host and 66 native checks, wrap transitions, complete drawbridge and exact
+replay. Milestones 009–020 remain open.**
 Inventory qualification does not establish native physics correctness. Earlier
 bounded capabilities and selected development fixtures remain usable and retain
 their passing checks. Further milestones are qualified individually, in order.
@@ -165,7 +167,10 @@ reports both successful behavior and numerical comparison boundaries.
 
 A winch hauls, releases and re-tensions a routed cable around a cylindrical
 bollard and pulley, lifting a deck and its payload. This demonstrates spatial
-tendon wrapping, spring/damping forces and a stateful actuator.
+tendon wrapping, spring/damping forces and a stateful actuator. The complete
+1,400-step native run and constant-release counterfactual pass, with exact
+checkpoint replay during slack and re-haul. Its default soft-contact impact
+compression is documented in the guide; this is a bounded source qualification.
 
 ![Cable drawbridge: native Metal beside CPU MuJoCo](metal/examples/assets/cable_drawbridge.gif)
 
