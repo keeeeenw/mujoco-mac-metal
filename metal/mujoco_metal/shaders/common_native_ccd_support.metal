@@ -324,8 +324,18 @@ static inline CommonCCDSupportResult common_ccd_support(
     return out;
   }
 
-  if (!already_world)
-    world=common_ccd_local_to_world(object.mat,object.pos,local);
+  if (!already_world) {
+#if !COMMON_CCD_USE_LIBCCD
+    if (object.kind==COMMON_CCD_LINE) {
+      // Pinned mjc_lineSupport forms each world component directly as
+      // axis*length + position. Rounding the product before translation
+      // changes GJK ties for rotated capsule endpoints.
+      FlexDD3 axis=FlexDD3{object.mat[2],object.mat[5],object.mat[8]};
+      world=flex_dd3_source_madd(axis,local.z,pos);
+    } else
+#endif
+      world=common_ccd_local_to_world(object.mat,object.pos,local);
+  }
   // `support` adds half of each geom margin along its normalized world input
   // direction after the shape callback. Callers implementing mjc_ccd's
   // sphere/capsule shrink branch pass geom=-1 and margin=0 here, then apply

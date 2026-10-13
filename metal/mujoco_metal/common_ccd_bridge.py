@@ -246,7 +246,7 @@ def production_upload_sizes(model, legacy_vertices, legacy_info,
                      for g in range(ngeom))
   # Four source-double HField dimensions each occupy three float words.
   static_hull_words = (padded_old_words + source_vertex_words
-                       + 12 * hfield_count + normal_words + 3 + 12 * ngeom)
+                       + 12 * hfield_count + 3 * normal_words + 3 + 12 * ngeom)
   static_info_words = (old_info_words + _COMMON_HEADER_WORDS + 9 * ngeom
                        + graph_words + table_words)
   work = production_ccd_layout(batch_size, pair_count,
@@ -375,9 +375,17 @@ def build_common_ccd_model_upload(model, legacy_vertices, legacy_info):
   info = feature_info
   info[header_base + 15] = int(graph_base + source_graph.size)
   info[header_base + 16:header_base + 22] = table_offsets
-  normals = np.asarray(model.mesh_polynormal, dtype=np.float32).reshape(-1)
+  source_normals = np.asarray(model.mesh_polynormal, dtype=np.float64).reshape(-1)
+  if not np.isfinite(source_normals).all():
+    raise ValueError("compiled mesh polygon normals are nonfinite")
+  normals = source_normals.astype(np.float32)
+  normal_remainder = source_normals - normals.astype(np.float64)
+  normal_middle = normal_remainder.astype(np.float32)
+  normal_tail = (normal_remainder - normal_middle.astype(np.float64)).astype(np.float32)
   normal_base = int(mesh_hull.size)
-  mesh_hull = np.concatenate((mesh_hull, normals))
+  # Keep the existing high-word plane and append two equally sized planes.
+  # Polygon normals are source-double compiler data, unlike mesh vertices.
+  mesh_hull = np.concatenate((mesh_hull, normals, normal_middle, normal_tail))
   info[header_base + 22] = normal_base
   info[header_base + 23] = int(normals.size // 3)
   tolerance = float(model.opt.ccd_tolerance)

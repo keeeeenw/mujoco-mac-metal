@@ -329,6 +329,12 @@ def test_common_upload_retains_compiled_mesh_feature_tables_for_multicontact():
   normals = np.asarray(model.mesh_polynormal, dtype=np.float32).reshape(-1)
   assert int(info[h + 23]) == normals.size // 3
   assert np.array_equal(hull[normal_offset:normal_offset + normals.size], normals)
+  # The high plane remains compatible with the old descriptor prefix;
+  # all three planes together must preserve the actual source-double data.
+  planes = hull[normal_offset:normal_offset + 3 * normals.size].reshape(3, -1)
+  np.testing.assert_array_equal(planes.astype(np.float64).sum(axis=0),
+                                np.asarray(model.mesh_polynormal).reshape(-1))
+  assert np.any(planes[1] != 0), "A high-only fixture would not test source precision"
 
 
 def test_mesh_feature_ids_resolve_source_ordered_faces_and_shared_edges():
