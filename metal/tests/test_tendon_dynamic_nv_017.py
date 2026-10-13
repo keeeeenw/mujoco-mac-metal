@@ -100,7 +100,10 @@ def test_high_dof_fixed_and_spatial_tendon_rows_match_pinned_jacobians():
                         limits=CapacityLimits(max_nv=70, max_rows=512,
                                               max_pairs=64, max_slots=64))
   assembled = sim.assembled_system(recompute=True)
-  rows = assembled["J"].detach().cpu().numpy()
+  np.testing.assert_array_equal(assembled["status"].cpu().numpy(), 0)
+  # Scalable assembly intentionally retains CSR storage; request a dense
+  # validation view explicitly instead of requiring implicit materialization.
+  rows = sim._coupled_constraints.materialize_jacobian().detach().cpu().numpy()
   desc = sim._coupled_constraints.descriptor
   assert rows.shape[2] == 70
   assert desc.ten_friction_rows == 2
