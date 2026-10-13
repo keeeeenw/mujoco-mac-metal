@@ -1752,3 +1752,49 @@ qualification probe, not a package runtime dependency. Its target is
 selections remain scoped; do not infer complete later mesh/terrain/flex milestones
 from them. **Milestone 011 is next.** Wheel installation, full solver/integrator
 combinations, Linux, broader hardware and performance qualification remain open.
+
+
+## Sequential convex mesh qualification (011)
+
+Milestone 011 is accepted for its complete pinned seven-family convex mesh and
+asset corpus under the integrated Euler contract. This is scoped qualification;
+no full repository regression, new wheel, benchmark or speedup is claimed.
+Actual source/test/shader ownership and frozen producing hashes were verified.
+
+The mesh selection passes its original 8 host/4 native baseline, 164 expanded
+host contracts, 168 imported-asset native cases, 112 native material/options/
+impact/failure/reset cases, 28 binary feature/history native cases and 10 actual
+compiled-hull graph/convex-representation native cases. The corpus covers both
+cones/orders, real OBJ/STL frames and inertias, asymmetric/face/thin/long/
+nearcoplanar shapes, actual physical resultants and full mass, strict candidate
+geometry, retained certificates, entering impacts, friction and literal loaded
+20-step checkpoint replay. Force comparisons retain documented bounded source
+numerical envelopes; they do not assert exact binary64 force equality.
+
+Corrections retain compiled polygon-normal words and source witness arithmetic,
+the normalization minimum, support hints through rotated/shrunk queries, direct
+capsule-line endpoints and the literal pinned S3D fourth-weight update semantics.
+Installed C/source-operator controls and actual contact physics both pass.
+An original assembly Newton failure exposed an unnecessarily restrictive
+component box for the inner L2 residual. The corrected scale-safe norm certificate
+preserves the requested bound and inner work/outer iteration budgets. A hermetic
+actual-state physical/replay regression and 286 affected Hessian/Newton/CG/
+rescale checks pass; original low-budget, retained-output and trace contracts
+also pass. Shared caller/query/full-mass/endcap and strict 132 boundary plus
+330 near-degenerate analytic checks were repeated. Counts overlap and must not
+be added to a unique repository total or transferred to later milestone scopes.
+
+The unchanged original 600-step assembly passes: maximum position error
+1.679459 mm, final error 0.333518 mm, quaternion error 0.00376745 and native/source
+compliant compression 8.950157 mm, all within original bounds. Actual native
+contacts occur for 551 steps; compiled-hull hardware clearances stay positive.
+Full literal 20-step replays at 100/400, a reviewed complete 30-frame/1.2-second
+1x GIF and an actual 24-native-step/3-second Mac viewer pass. A camera-only
+repetition yields identical physics metrics. Lighting matches the marble demo;
+the higher camera keeps settled pieces visible. Rendering uses OpenGL.
+
+The final comment/docstring-only reconciliation preserves parsed model XML and
+executable test ASTs. Producing runtime hashes are recorded separately from
+those documentation changes. These results qualify the corpus and original
+acceptance scope, not every possible model or later solver/integrator/terrain/
+SDF/flex/API composition. **Milestone 012 is next.**

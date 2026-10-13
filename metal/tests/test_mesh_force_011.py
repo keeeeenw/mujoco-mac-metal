@@ -1,14 +1,12 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
-"""Milestone 011: solved force/torque parity for mesh contact pairs.
+"""Milestone 011 original force and trajectory regression fixtures.
 
-Step-0 solved forces at identical states plus slide/settle trajectories.
-Mesh-sphere witnesses match the oracle exactly (tight gates). Mesh-box face
-press uses split gates: translation resultants are determinate and tight,
-rotation components carry the singles-representation torque split (native
-load-localized centroid witness vs oracle manifold corner), gated at force
-scale like 010's redundant-manifold treatment. Multi-basin rotated mesh-mesh
-is excluded from tight force parity (matrix documents the regime).
+The original assertions and models remain unchanged. Full mass, matched
+multi-contact geometry, physical world forces/moments, imported assets and
+mesh-mesh friction are additionally qualified by the mesh asset, material,
+boundary/history and compiled graph files. These baseline fixtures alone do
+not establish complete mesh coverage.
 """
 
 import os

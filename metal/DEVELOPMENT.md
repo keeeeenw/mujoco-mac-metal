@@ -391,6 +391,28 @@ Affected rigid, terrain, flex and geometry-query callers pass scoped checks.
 The unchanged full roller demo, level-table control, reviewed GIF and native Mac
 viewer pass. See [qualification](QUALIFICATION.md) for producing scope and
 [the demo guide](examples/eccentric_roller.md) for compliant-contact limits.
-Mesh and later complete milestone gates remain open. These are correctness
+Heightfield and later complete milestone gates remain open. These are correctness
 results, not a throughput comparison, unrestricted binary64 promise or new wheel
 release; use a source installation for this development backend.
+
+
+## Sequential convex mesh qualification (011)
+
+The pinned seven mesh pair families are qualified in the integrated Euler
+contract: plane, sphere, capsule, ellipsoid, cylinder, box and mesh partners.
+The corpus includes actual OBJ/STL imports, nontrivial scale/reference/body/geom
+and inertia frames, thin/long/asymmetric/nearcoplanar hulls, both orders and
+contact cones, compiled hill-climb graphs and convex collision representations
+of nonconvex visual assets. Host compilation/preprocessing remains permitted;
+per-step native physics does not call CPU stepping/forward/collision.
+
+Geometry, complete contact frames, full mass, physical force/moment resultants,
+retained certificates, materials/CCD settings, entering impacts, frictional
+motion, selected reset/failure isolation and literal checkpoint replay pass.
+These are bounded source-reference comparisons, not unrestricted binary64 or
+concave-mesh physics. The original assembly passes its complete 600-step
+schedule and all original bounds, with 1.679 mm maximum position error and
+8.950 mm native/source compliant compression. Full replay at steps 100/400,
+a reviewed 1x GIF and actual Mac viewer also pass. See
+[qualification](QUALIFICATION.md#sequential-convex-mesh-qualification-011).
+Heightfields and remaining milestones retain their separate qualification gates.

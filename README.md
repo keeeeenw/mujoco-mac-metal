@@ -77,7 +77,10 @@ replay. Milestone 009 qualifies rigid constraint composition with 54 host and
 Milestone 010 qualifies the pinned analytic collision pair matrix, including
 cylinder/ellipsoid geometry, contact forces, frictional impacts and exact replay.
 The complete roller comparison and native Mac viewer pass.
-Milestones 011–020 remain open.**
+Milestone 011 qualifies compiled convex mesh contact, imported OBJ/STL asset frames,
+materials, full-mass forces, frictional impacts and exact checkpoint replay.
+The complete assembly comparison and native Mac viewer pass.
+Milestones 012–020 remain open.**
 Inventory qualification does not establish native physics correctness. Earlier
 bounded capabilities and selected development fixtures remain usable and retain
 their passing checks. Further milestones are qualified individually, in order.
@@ -310,8 +313,10 @@ Three craft chase moving markers under host controls, applied forces and damping
 
 ### [Gravity assembly puzzle](metal/examples/assembly_puzzle.md)
 
-Procedural convex pieces tumble into a divided tray, exercising mesh contact.
-The guide records the fixture and its numerical limits.
+Procedural convex pieces settle and stack in a divided tray. The full native/CPU
+comparison passes its original bounds, with a 1.68 mm maximum position error,
+loaded checkpoint replay and a working Mac viewer. The guide records the scope
+and compliant contact limits.
 
 ![Gravity assembly puzzle: recorded simulation](metal/examples/assets/assembly_puzzle.gif)
 

@@ -1,11 +1,11 @@
 # Development milestone status
 
-The source backend is experimental. **6 of the 16 milestones 005–020 are accepted: 005 (classification/support
+The source backend is experimental. **7 of the 16 milestones 005–020 are accepted: 005 (classification/support
 contract), 006 (state/model lifecycle), 007 (built-in actuation and rigid
 transmissions), 008 (spatial tendon mechanics under the admitted-model and
 integrated Euler contracts), 009 (rigid constraints and mixed composition),
-and 010 (analytic collision families).**
-Milestones 011–020 remain open; acceptance of state ownership does not qualify
+010 (analytic collision families), and 011 (compiled convex mesh contact and asset semantics).**
+Milestones 012–020 remain open; acceptance of state ownership does not qualify
 their remaining numerical feature compositions. Earlier bounded profiles and selected
 native fixtures have passed independent checks.
 
@@ -17,7 +17,7 @@ native fixtures have passed independent checks.
 | 008 | Spatial tendons | Qualified: 113 host + 66 native checks; wrapping/transition/FD/armature/composition, full drawbridge/counterfactual, exact replay and working Mac viewer |
 | 009 | Rigid constraints | Qualified: 54 host + 76 native checks; genuine both-cone shared coupling, retained global residuals/forces, full suspension/level hold, exact replay and reviewed Mac viewer |
 | 010 | Analytic collision families | Qualified: pinned 20-pair crosswalk, 11 added analytic families, source boundary/material/options/force/lifecycle gates and full roller/replay/GIF/Mac viewer |
-| 011 | Mesh collisions | Native hull and contact paths implemented; full irregular/degenerate/composition gate open |
+| 011 | Mesh collisions | Qualified: seven pinned mesh families, actual OBJ/STL frames and hull graphs, both cones/orders, material/impact/history/failure/full replay and original assembly/GIF/Mac viewer |
 | 012 | Heightfields | Source-precision and pose/cache checks pass on selected fixtures; full terrain/integrator gate open |
 | 013 | SDF collisions | Seven original bundled rigid-SDF oracle fixtures pass; complete pair, search and feature-composition gates open |
 | 014 | Solvers | Selected Newton, warm-start and coupled regressions pass; full solver-option matrix open |

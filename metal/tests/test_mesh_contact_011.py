@@ -1,12 +1,11 @@
 # Copyright 2026 The MuJoCo Metal contributors
 # Licensed under the Apache License, Version 2.0.
-"""Milestone 011: convex mesh contact qualification (CPU + GPU).
+"""Milestone 011 baseline convex mesh contact checks.
 
-Native vertex-support GJK/MPR singles for convex mesh assets against the
-pinned pair matrix, with face-snap readout on shallow contacts. The CPU
-oracle may emit multi-point face manifolds; native yields one witness per
-mesh pair (documented singles restriction), compared against the nearest
-CPU witness. Rejection paths (concave, oversize) are CPU-only.
+Compiled convex hulls use pinned native GJK/EPA and alternate libCCD support.
+These original fixtures retain their strict source geometry assertions. Complete
+manifold, imported asset, degeneracy, full-mass and lifecycle coverage is in the
+additional mesh asset/material/boundary/graph qualification files.
 """
 
 import os
