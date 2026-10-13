@@ -325,7 +325,9 @@ kernel void general_actuator_kinematics(
       float3 sp=float3(site_pos[(so+slider)*3],site_pos[(so+slider)*3+1],site_pos[(so+slider)*3+2]);
       float4 sq=float4(site_quat[(so+slider)*4],site_quat[(so+slider)*4+1],site_quat[(so+slider)*4+2],site_quat[(so+slider)*4+3]);
       float3x3 sm=ak_quat2mat(sq);
-      float3 axis=float3(sm[0][2],sm[1][2],sm[2][2]);
+      // Metal matrices are column-major: source site_xmat[2,5,8]
+      // is the world-space local Z column, not the third row.
+      float3 axis=sm[2];
       float3 cp=float3(site_pos[(so+crank)*3],site_pos[(so+crank)*3+1],site_pos[(so+crank)*3+2]);
       float3 vec=cp-sp;
       float rod=cranklength[a];
@@ -345,8 +347,8 @@ kernel void general_actuator_kinematics(
       if (ok) {
         float k1=1.0f-av/sdet;
         dldv[0]=axis.x*k1+vec.x/sdet; dldv[1]=axis.y*k1+vec.y/sdet; dldv[2]=axis.z*k1+vec.z/sdet;
-        float k2=1.0f/sdet;
-        dlda[0]=vec.x*k2; dlda[1]=vec.y*k2; dlda[2]=vec.z*k2;
+        // Pinned mj_transmission: d(length)/d(axis) = vec*(1-av/sdet).
+        dlda[0]=vec.x*k1; dlda[1]=vec.y*k1; dlda[2]=vec.z*k1;
       } else {
         dlda[0]=vec.x; dlda[1]=vec.y; dlda[2]=vec.z;
         dldv[0]=axis.x; dldv[1]=axis.y; dldv[2]=axis.z;
@@ -429,7 +431,16 @@ kernel void general_actuator_kinematics(
           ak_point_jac(rp,rsb,body_pos,body_quat,joint_anchor,joint_axis,body_parentid,
             body_jntadr,body_jntnum,jnt_type,jnt_dofadr,nbody,njnt,nv,bo,jo,Jt0,Jr0);
           float4 q0=float4(site_quat[(so+id0)*4],site_quat[(so+id0)*4+1],site_quat[(so+id0)*4+2],site_quat[(so+id0)*4+3]);
-          float3 vec=ak_quat2vel(ak_qmul(ak_qconj(rq),q0));
+          // The pinned rotational length constructs local_site_quat *
+          // body_xquat, whereas FK exposes body_xquat * local_site_quat.
+          // Recover the local quaternion from FK without a host pose readback.
+          float4 bq0=float4(body_quat[(bo+sb)*4],body_quat[(bo+sb)*4+1],
+                           body_quat[(bo+sb)*4+2],body_quat[(bo+sb)*4+3]);
+          float4 bqr=float4(body_quat[(bo+rsb)*4],body_quat[(bo+rsb)*4+1],
+                           body_quat[(bo+rsb)*4+2],body_quat[(bo+rsb)*4+3]);
+          float4 source_q=ak_qmul(ak_qmul(ak_qconj(bq0),q0),bq0);
+          float4 source_ref=ak_qmul(ak_qmul(ak_qconj(bqr),rq),bqr);
+          float3 vec=ak_quat2vel(ak_qmul(ak_qconj(source_ref),source_q));
           len+=dot(vec,float3(gear[6*a+3],gear[6*a+4],gear[6*a+5]));
           for (int d=0;d<nv;++d) {
             Jr[0*32+d]-=Jr0[0*32+d]; Jr[1*32+d]-=Jr0[1*32+d]; Jr[2*32+d]-=Jr0[2*32+d];
