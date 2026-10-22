@@ -874,6 +874,8 @@ class CoupledConstraintDescriptor:
   # Double-precision constant residuals for paired aref, per pair
   # [solref_lo(2), solimp_lo(5), margin_lo(2)]: lo = f64 TRUE - f32 hi.
   pair_const_lo: np.ndarray = None
+  # Third source-double words, parallel to the 23-word residual record.
+  pair_const_tail: np.ndarray = None
   # Three planar words of callback margin+gap; solver inclusion uses margin.
   pair_margin_source_words: np.ndarray = None
   dof_invweight0_low: np.ndarray = None
@@ -1840,12 +1842,14 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
 
     if pairs:
       _clo_rows = []
+      _tail_rows = []
       for _k, _p in enumerate(pairs):
         _raw = (np.asarray(_p[2], dtype=np.float64).reshape(-1),
                 np.asarray(_p[3], dtype=np.float64).reshape(-1),
                 np.asarray([_p[7], _p[8]], dtype=np.float64),
                 np.asarray(_p[6], dtype=np.float64).reshape(-1))
         _clo = []
+        _tails = []
         for _vals, _kind, _key in (
             (_raw[0], "solref", "sr"), (_raw[1], "solimp", "si"),
             (_raw[2], "margin", "mg"),
@@ -1863,9 +1867,15 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
           else:
             _clo.append((_true - np.asarray(
                 [margin[_k], gap[_k]], dtype=np.float64)).astype(np.float32))
+          _high = (_true.astype(np.float32) if _key != "mg"
+                   else np.asarray([margin[_k], gap[_k]], dtype=np.float32))
+          _tails.append((_true - _high.astype(np.float64)
+                         - _clo[-1].astype(np.float64)).astype(np.float32))
         _fr64 = np.asarray(_p[5], dtype=np.float64)
         _frhi = _fr64.astype(np.float32)
         _frlo = (_fr64 - _frhi.astype(np.float64)).astype(np.float32)
+        _frtail = (_fr64 - _frhi.astype(np.float64)
+                   - _frlo.astype(np.float64)).astype(np.float32)
         _zero_tangent = float(_HFIELD in (geoms[int(_p[0])], geoms[int(_p[1])])
                               or 8 in (geoms[int(_p[0])], geoms[int(_p[1])]))
         _weights = np.asarray(model.body_invweight0, dtype=np.float64)[
@@ -1874,11 +1884,19 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
         _source_hi = _source.astype(np.float32)
         _source_lo = (_source - _source_hi.astype(np.float64)).astype(np.float32)
         _weight_words = np.column_stack((_source_hi, _source_lo)).reshape(-1)
+        _weight_tail = (_source - _source_hi.astype(np.float64)
+                        - _source_lo.astype(np.float64)).astype(np.float32)
+        _weight_tail_words = np.column_stack(
+            (_weight_tail, np.zeros(3, dtype=np.float32))).reshape(-1)
         _clo_rows.append(np.concatenate((*_clo, _frlo, [_zero_tangent],
                                          _weight_words)).astype(np.float32))
+        _tail_rows.append(np.concatenate((*_tails, _frtail, [0.0],
+                                          _weight_tail_words)).astype(np.float32))
       pair_const_lo = np.stack(_clo_rows).reshape(-1, 23)
+      pair_const_tail = np.stack(_tail_rows).reshape(-1, 23)
     else:
       pair_const_lo = np.empty((0, 23), dtype=np.float32)
+      pair_const_tail = np.empty((0, 23), dtype=np.float32)
     cd = np.array([p[4] for p in pairs], dtype=np.int32)
     fr = np.array([p[5] for p in pairs], dtype=np.float32).reshape(-1, 5)
     r1 = np.where(geoms[g1] == _PLANE, -1.0, model.geom_size[g1, 0]).astype(np.float32)
@@ -1894,6 +1912,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
     sr = np.empty((0, 2), dtype=np.float32)
     si = np.empty((0, 5), dtype=np.float32)
     pair_const_lo = np.empty((0, 23), dtype=np.float32)
+    pair_const_tail = np.empty((0, 23), dtype=np.float32)
     cd = np.empty(0, dtype=np.int32)
     fr = np.empty((0, 5), dtype=np.float32)
     srfr = np.empty((0, 2), dtype=np.float32)
@@ -2034,6 +2053,7 @@ def lower_coupled_constraints(model, limits=None, *, mass_storage="dense") -> Co
       solref=_frozen(sr, np.float32),
       solimp=_frozen(si, np.float32),
       pair_const_lo=_frozen(pair_const_lo, np.float32),
+      pair_const_tail=_frozen(pair_const_tail, np.float32),
       # Narrow-phase callbacks consume source-rounded margin+gap, while
       # contact solver inclusion still consumes the separately stored margin.
       pair_margin_source_words=_frozen(_source_float_words([p[7] + p[8] for p in pairs]), np.float32),
@@ -2625,9 +2645,10 @@ class MetalCoupledConstraints:
         "pair_solref": self._tensor(d.solref.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
         "pair_solimp": self._tensor(d.solimp.reshape(-1) if d.npairs else np.zeros(5, dtype=np.float32)),
         "pair_const_lo": self._tensor(
-            np.asarray(getattr(d, "pair_const_lo", None)).reshape(-1)
+            np.concatenate((d.pair_const_lo.reshape(-1),
+                            d.pair_const_tail.reshape(-1)))
             if (d.npairs and getattr(d, "pair_const_lo", None) is not None)
-            else np.zeros(23, dtype=np.float32)),
+            else np.zeros(46, dtype=np.float32)),
         "pair_condim": self._tensor(d.condim if d.npairs else np.zeros(1, dtype=np.int32)),
         "pair_friction": self._tensor(d.friction.reshape(-1) if d.npairs else np.zeros(5, dtype=np.float32)),
         "pair_solreffriction": self._tensor(d.solreffriction.reshape(-1) if d.npairs else np.zeros(2, dtype=np.float32)),
@@ -3501,7 +3522,8 @@ class MetalCoupledConstraints:
             self._constants["pair_margin_gap"], self._constants["pair_contact_offsets_dims"],
             pair_maps.logical_to_packed.reshape(-1),
             self._constants["mesh_hull"], self._constants["mesh_hull_info"],
-            w["out_status"], threads=(b * d.npairs,), group_size=(1,))
+            w["out_status"], self._constants["pair_margin_source"],
+            threads=(b * d.npairs,), group_size=(1,))
       if self._common_ccd_rigid_kernel is not None:
         # Source order: initial query, then two angles about each tangent.
         # Separate dispatches reuse the persistent per-pair arena and keep
@@ -4409,18 +4431,18 @@ class MetalCoupledConstraints:
     }
 
   def run_velocity_device(self, context, poses, mass, qfrc_smooth, qpos, qvel,
-                          eq_active=None, cvel=None, tendon_J_spatial=None,
-                          tendon_length_spatial=None, flex=None,
-                          qacc_warmstart=None, awake_tree=None,
-                          qacc_smooth=None,
-                          component_solver=None, mass_blocks=None,
-                          tendon_armature_blocks=None, awake_dof_ids=None,
-                          awake_counts=None, cdof=None, cdof_dot=None,
-                          exact_impedance=None, exact_dense_solver=None,
-                          qacc_smooth_low=None, qfrc_smooth_low=None,
-                          world_mask=None, mass_low=None, mass_blocks_low=None,
-                          tendon_armature_blocks_low=None):
-    """Refresh and solve a captured position context without row assembly.
+                            eq_active=None, cvel=None, tendon_J_spatial=None,
+                            tendon_length_spatial=None, flex=None,
+                            qacc_warmstart=None, awake_tree=None,
+                            qacc_smooth=None,
+                            component_solver=None, mass_blocks=None,
+                            tendon_armature_blocks=None, awake_dof_ids=None,
+                            awake_counts=None, cdof=None, cdof_dot=None,
+                            exact_impedance=None, exact_dense_solver=None,
+                            qacc_smooth_low=None, qfrc_smooth_low=None,
+                            world_mask=None, mass_low=None, mass_blocks_low=None,
+                            tendon_armature_blocks_low=None):
+      """Refresh and solve a captured position context without row assembly.
 
     Candidate generation, FK, equality/tendon/flex row construction and J
     updates are deliberately absent from this entry point. ``poses`` and the
@@ -4433,410 +4455,394 @@ class MetalCoupledConstraints:
     it is used directly as the unconstrained acceleration and the second mass
     solve is skipped; ``qfrc_smooth`` remains the fallback when omitted.
     """
-    if (not isinstance(context, dict) or context.get("_owner") is not self
-        or not self._position_context_valid
-        or context.get("_epoch") != self._position_context_epoch):
-      raise ValueError("position context is stale or belongs to another solver")
-    torch, d = self._torch, self.descriptor
-    b, nv, nr = int(self.batch_size), int(d.nv), int(d.nr)
-    if poses is not None:
-      _validate_geom_pose_residuals(torch, self._device, poses, b, int(d.ngeom))
-    # Row storage and mass storage are independent. The block-row solver also
-    # accepts a generalized dense mass; validate that input below rather than
-    # requiring a component solver merely because the row count is large.
-    if component_solver is None and mass is None:
-      raise ValueError("cached velocity stages require dense mass or a component solver")
-    expected_q = (b, nv)
-    _validate_cached_tensor(torch, self._device, "qvel", qvel, expected_q,
-                            torch.float32)
-    _validate_cached_tensor(torch, self._device, "qfrc_smooth", qfrc_smooth,
-                            expected_q, torch.float32)
-    if qacc_smooth is not None:
-      _validate_cached_tensor(torch, self._device, "qacc_smooth", qacc_smooth,
-                              expected_q, torch.float32)
-    if qacc_smooth_low is not None:
-      if qacc_smooth is None:
-        raise ValueError("qacc_smooth_low requires qacc_smooth high values")
-      _validate_cached_tensor(torch, self._device, "qacc_smooth_low",
-                              qacc_smooth_low, expected_q, torch.float32)
-    if qfrc_smooth_low is not None:
-      _validate_cached_tensor(torch, self._device, "qfrc_smooth_low",
-                              qfrc_smooth_low, expected_q, torch.float32)
-    self._validate_mass_residual_inputs(
-        component_solver, mass_low, mass_blocks_low, tendon_armature_blocks_low)
-    _validate_cached_tensor(torch, self._device, "qpos", qpos, (b, int(d.nq)),
-                            torch.float32)
-    if poses is not None:
-      if not isinstance(poses, dict):
-        raise ValueError("poses must be a mapping of captured pose tensors")
-      for name, shape in (("body_pos", (b, int(d.nbody), 3)),
-                          ("body_quat", (b, int(d.nbody), 4))):
-        if name in poses:
-          _validate_cached_tensor(torch, self._device, f"poses[{name!r}]",
-                                  poses[name], shape, torch.float32)
-    if cvel is not None:
-      _validate_cached_tensor(torch, self._device, "cvel", cvel,
-                              (b, int(d.nbody), 6), torch.float32)
-    has_differential_eq = d.neq and np.any(
-        np.isin(np.asarray(d.eq_type, dtype=np.int32), (0, 1)))
-    if cdof is not None:
-      _validate_cached_tensor(torch, self._device, "cdof", cdof,
-                              (b, nv, 6), torch.float32)
-    if cdof_dot is not None:
-      _validate_cached_tensor(torch, self._device, "cdof_dot", cdof_dot,
-                              (b, nv, 6), torch.float32)
-    if has_differential_eq and (cvel is None or cdof is None or cdof_dot is None):
-      raise ValueError("cached connect/weld refresh requires current cvel, cdof, and cdof_dot")
-    if has_differential_eq and not (
-        self._position_context_eq_jdot_inputs_valid
-        and context.get("_eq_jdot_inputs_valid") is True):
-      raise ValueError("captured position context lacks equality motion metadata")
-    if d.neq and cvel is None:
-      eq_types = np.asarray(d.eq_type, dtype=np.int32)
-      if np.any(np.isin(eq_types, (0, 1))):
-        raise ValueError("cached connect/weld refresh requires current cvel")
-    if eq_active is not None:
-      expected_eq = (b, int(d.neq)) if d.neq else (b, 1)
-      _validate_cached_tensor(torch, self._device, "eq_active", eq_active,
-                              expected_eq, torch.int32)
-    if qacc_warmstart is not None:
-      _validate_cached_tensor(torch, self._device, "qacc_warmstart",
-                              qacc_warmstart, expected_q, torch.float32)
-    component_primal_route = (component_solver is not None
-                              and d.solver_type != int(mujoco.mjtSolver.mjSOL_PGS))
-    if component_primal_route and self._component_operator_layout_device is None:
-      raise ValueError("cached sparse primal solve requires a configured component layout")
-    if component_solver is not None:
-      if mass_blocks is None or awake_dof_ids is None or awake_counts is None:
-        raise ValueError("cached component solve requires mass blocks and awake DOF lists")
-      if (component_solver.batch_size != b or component_solver.nv != nv
-          or component_solver.nnz != self._component_operator_nnz):
-        raise ValueError("cached component solver does not match the configured layout")
-      _validate_cached_tensor(torch, self._device, "mass_blocks", mass_blocks,
-                              (b, component_solver.nnz), torch.float32)
-      _validate_cached_tensor(torch, self._device, "awake_dof_ids", awake_dof_ids,
-                              (b, max(nv, 1)), torch.int32)
-      _validate_cached_tensor(torch, self._device, "awake_counts", awake_counts,
-                              (b, 3), torch.int32)
-      if tendon_armature_blocks is not None:
-        _validate_cached_tensor(
-            torch, self._device, "tendon_armature_blocks", tendon_armature_blocks,
-            (b, component_solver.nnz), torch.float32)
-    else:
-      _validate_cached_tensor(torch, self._device, "mass", mass, (b, nv, nv),
+      if (not isinstance(context, dict) or context.get("_owner") is not self
+          or not self._position_context_valid
+          or context.get("_epoch") != self._position_context_epoch):
+        raise ValueError("position context is stale or belongs to another solver")
+      torch, d = self._torch, self.descriptor
+      b, nv, nr = int(self.batch_size), int(d.nv), int(d.nr)
+      if poses is not None:
+        _validate_geom_pose_residuals(torch, self._device, poses, b, int(d.ngeom))
+      # Row storage and mass storage are independent. The block-row solver also
+      # accepts a generalized dense mass; validate that input below rather than
+      # requiring a component solver merely because the row count is large.
+      if component_solver is None and mass is None:
+        raise ValueError("cached velocity stages require dense mass or a component solver")
+      expected_q = (b, nv)
+      _validate_cached_tensor(torch, self._device, "qvel", qvel, expected_q,
                               torch.float32)
-    if exact_impedance is not None:
-      if (getattr(exact_impedance, "batch_size", None) != b
-          or getattr(exact_impedance, "row_capacity", None) != nr
-          or getattr(exact_impedance, "dof_capacity", None) != nv):
-        raise ValueError("exact impedance helper does not match this constraint workspace")
-      if component_solver is None:
-        if (exact_dense_solver is None
-            or getattr(exact_impedance, "mass_storage", None) != "dense"
-            or getattr(exact_dense_solver, "batch_size", None) != b
-            or getattr(exact_dense_solver, "nv", None) != nv
-            or getattr(exact_dense_solver, "nrhs", None) != nr):
-          raise ValueError("dense exact impedance solver does not match its prepared workspace")
-      elif (getattr(exact_impedance, "mass_storage", None) != "block_sparse"
-            or getattr(component_solver, "rhs_capacity", 0) < nr + 1):
-        raise ValueError("component exact impedance solver does not match its prepared workspace")
-
-    debug = self._workspace["workspace_debug"].reshape(b, self._debug_stride)
-    context_view = context["position_context"]
-    surface = context.get("surface_velocity")
-    extra = context.get("extra_aref")
-    try:
-      _validate_cached_tensor(torch, self._device, "context.position_context",
-                              context_view, (b, nr, 5), torch.float32)
-      _validate_cached_tensor(torch, self._device, "context.surface_velocity",
-                              surface, (b, nr), torch.float32)
-      _validate_cached_tensor(torch, self._device, "context.extra_aref",
-                              extra, (b, nr), torch.float32)
-    except ValueError:
-      raise ValueError("captured position context was modified or is malformed") from None
-    expected_awake = (b, max(self._solver_island_ntree, 1))
-    if awake_tree is not None and (
-        not isinstance(awake_tree, torch.Tensor)
-        or tuple(awake_tree.shape) != expected_awake
-        ):
-      raise ValueError(f"awake_tree must be contiguous int32 with shape {expected_awake}")
-    if awake_tree is not None:
-      _validate_cached_tensor(torch, self._device, "awake_tree", awake_tree,
-                              expected_awake, torch.int32)
-    self._set_world_mask(world_mask)
-    # Restore the captured position workspace after any ordinary forward has
-    # overwritten the borrowed views. This cache remains valid until another
-    # capture or workspace replacement, matching the retained RK4 POS stage.
-    w = self._workspace
-    self._stage_mass_residuals(
-        component_solver, mass_low, mass_blocks_low,
-        tendon_armature_blocks_low, world_mask)
-    jacobian_stride = int(w["workspace_J"].numel()) // max(b, 1)
-    self._copy_world_masked(
-        w["workspace_J"], w["position_cache_J"], world_mask,
-        width=jacobian_stride, source_stride=jacobian_stride,
-        destination_stride=jacobian_stride)
-    self._copy_world_masked(
-        w["position_qvel"], w["position_cache_qvel"], world_mask,
-        width=nv, source_stride=nv, destination_stride=nv)
-    row_base = nr * nr
-    self._copy_world_masked(
-        w["workspace_debug"], w["position_cache_rows"], world_mask,
-        width=7 * nr, source_stride=7 * nr,
-        destination_stride=self._debug_stride,
-        destination_offset=row_base)
-    self._copy_world_masked(
-        w["workspace_debug"], w["position_cache_impedance"], world_mask,
-        width=nr, source_stride=nr, destination_stride=self._debug_stride,
-        destination_offset=row_base + 2 * nr)
-    self._copy_world_masked(
-        w["workspace_debug"], w["position_cache_aref_low"], world_mask,
-        width=nr, source_stride=nr, destination_stride=self._debug_stride,
-        destination_offset=self._aref_low_debug_offset)
-    self._copy_world_masked(
-        w["workspace_debug"], w["position_cache_contact_precision"], world_mask,
-        width=6*max(nr,1), source_stride=6*max(nr,1),
-        destination_stride=self._debug_stride,
-        destination_offset=self._regularizer_low_debug_offset)
-    self._copy_world_masked(
-        w["position_current_aref_low"], w["workspace_debug"], world_mask,
-        width=nr, source_stride=self._debug_stride,
-        destination_stride=nr, source_offset=self._aref_low_debug_offset)
-    for destination_name, source_name in (
-        ("contact_row_data", "position_cache_contact_data"),
-        ("contact_frame", "position_cache_contact_frame")):
-      destination, source = w[destination_name], w[source_name]
-      width = destination.numel() // max(b, 1)
-      self._copy_world_masked(
-          destination, source, world_mask, width=width,
-          source_stride=width, destination_stride=width)
-    if self._jacobian_layout.mode == 0:
-      destination = w["contact_jacobian"]
-      source = w["position_cache_contact_jacobian"]
-      width = destination.numel() // max(b, 1)
-      self._copy_world_masked(
-          destination, source, world_mask, width=width,
-          source_stride=width, destination_stride=width)
-    for prefix, name in (("slot", "slot_maps"), ("pair", "pair_maps")):
-      maps = w.get(name)
-      if maps is not None:
-        for destination, source_name in (
-            (maps.packed_to_logical, f"position_cache_{prefix}_packed"),
-            (maps.logical_to_packed, f"position_cache_{prefix}_reverse"),
-            (maps.active_count, f"position_cache_{prefix}_count"),
-            (maps.overflow, f"position_cache_{prefix}_overflow"),
-        ):
-          width = destination.numel() // max(b, 1)
-          self._copy_world_masked(
-              destination, w[source_name], world_mask, width=width,
-              source_stride=width, destination_stride=width)
-    warm_offset = getattr(
-        self, "_qacc_warmstart_offset",
-        self._debug_prefix + self._primal_scratch_floats - max(nv, 1))
-    warm_tail = debug[:, warm_offset:warm_offset + nv]
-    if qacc_warmstart is None:
-      self._fill_world_masked(
-          w["workspace_debug"].view(torch.int32), world_mask,
-          width=nv, stride=self._debug_stride,
-          offset=warm_offset, value=0)
-    else:
-      self._copy_world_masked(
-          w["workspace_debug"], qacc_warmstart, world_mask,
-          width=nv, source_stride=nv, destination_stride=self._debug_stride,
-          destination_offset=warm_offset)
-    debug_i32 = debug.view(torch.int32)
-    awake_offset = self._debug_prefix + self._solver_island_awake_offset
-    awake_view = debug_i32[:, awake_offset:
-                           awake_offset + max(self._solver_island_ntree, 1)]
-    if awake_tree is None:
-      self._fill_world_masked(
-          debug_i32, world_mask,
-          width=max(self._solver_island_ntree, 1),
-          stride=self._debug_stride,
-          offset=awake_offset, value=1)
-    else:
-      self._copy_world_masked(
-          debug_i32, awake_tree, world_mask,
-          width=max(self._solver_island_ntree, 1),
-          source_stride=max(self._solver_island_ntree, 1),
-          destination_stride=self._debug_stride,
-          destination_offset=awake_offset)
-    refresh_extra = extra
-    eq_types = np.asarray(d.eq_type, dtype=np.int32)
-    has_differential_eq = d.neq and np.any(np.isin(eq_types, (0, 1)))
-    has_site_differential_eq = bool(
-        has_differential_eq
-        and np.any(np.isin(eq_types, (0, 1))
-                   & (np.asarray(d.eq_objtype, dtype=np.int32) == 6)))
-    old_extra = w["position_refresh_old_extra_aref"][:b * nr].view(b, nr)
-    self._copy_world_masked(
-        old_extra, w["position_extra_aref"][:b * nr].view(b, nr),
-        world_mask, width=nr, source_stride=nr, destination_stride=nr)
-    if has_differential_eq:
-      old_jdot = w["position_context_zero"][:b * nr].view(b, nr)
-      self._refresh_equality_jdot(
-          w["position_cache_qvel"].view(b, nv),
-          w["position_cache_cvel"].view(b, d.nbody, 6),
-          w["position_cache_cdof"].view(b, nv, 6),
-          w["position_cache_cdof_dot"].view(b, nv, 6), old_jdot,
-          eq_active=w["position_cache_eq_active"])
-      self._copy_world_masked(
-          old_extra, old_jdot, world_mask, width=nr,
-          source_stride=nr, destination_stride=nr, add=True)
-    if d.neq:
-      refresh_extra = w["position_refresh_extra_aref"][:b * nr].view(b, nr)
-      self._copy_world_masked(
-          refresh_extra, extra, world_mask, width=nr,
-          source_stride=nr, destination_stride=nr)
-      if has_differential_eq:
-        equality_aref = w["position_context_zero"][:b * nr].view(b, nr)
-        self._refresh_equality_jdot(
-            qvel, cvel, cdof, cdof_dot, equality_aref)
-        self._copy_world_masked(
-            refresh_extra, equality_aref, world_mask, width=nr,
-            source_stride=nr, destination_stride=nr, add=True)
-    self.refresh_position_references(
-        context_view, qvel, surface, refresh_extra, world_mask=world_mask)
-    self._refresh_cached_aref_low(
-        qvel, surface, refresh_extra, old_extra, world_mask=world_mask)
-
-    solver_dims = self._constants["solver_dims"]
-    solve_fn = self._solve_kernel if d.dense_path else self._solve_block_kernel
-    w = self._workspace
-    self._fill_world_masked(
-        w["out_status"], world_mask, width=1, stride=1, value=0)
-    if self._has_sdf_contact_pairs:
-      self._merge_sdf_narrowphase_status_kernel(
-          w["contact_pair_count"], w["out_status"],
-          self._pair_contact_world_mask,
-          self._constants["pair_contact_offsets_dims"],
-          threads=(b,), group_size=(1,))
-    slot_maps = w.get("slot_maps")
-    packed_slots = (self._empty_compaction_map if slot_maps is None
-                    else slot_maps.packed_to_logical.reshape(-1))
-
-    solver_acceleration_input = (qfrc_smooth if qacc_smooth is None
-                                 else qacc_smooth)
-    has_mass_residuals = any(value is not None for value in (
-        mass_low, mass_blocks_low, tendon_armature_blocks_low))
-    paired_smooth_input = (qacc_smooth is not None or qfrc_smooth_low is not None
-                          or has_mass_residuals) and int(nv) > 0
-    if int(nv) > 0 and (d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS)
-                        or paired_smooth_input):
-      pair = w.get("component_smooth_acceleration_pair")
-      if pair is None:
-        raise RuntimeError("paired smooth-acceleration workspace was not prepared")
+      _validate_cached_tensor(torch, self._device, "qfrc_smooth", qfrc_smooth,
+                              expected_q, torch.float32)
       if qacc_smooth is not None:
-        self._copy_world_masked(
-            pair[:b * nv], qacc_smooth, world_mask, width=nv,
-            source_stride=nv, destination_stride=nv)
-        if qacc_smooth_low is None:
-          self._fill_world_masked(
-              pair[b * nv:2 * b * nv], world_mask, width=nv,
-              stride=nv, value=0)
-        else:
-          self._copy_world_masked(
-              pair[b * nv:2 * b * nv], qacc_smooth_low, world_mask,
-              width=nv, source_stride=nv, destination_stride=nv)
+        _validate_cached_tensor(torch, self._device, "qacc_smooth", qacc_smooth,
+                                expected_q, torch.float32)
+      if qacc_smooth_low is not None:
+        if qacc_smooth is None:
+          raise ValueError("qacc_smooth_low requires qacc_smooth high values")
+        _validate_cached_tensor(torch, self._device, "qacc_smooth_low",
+                                qacc_smooth_low, expected_q, torch.float32)
+      if qfrc_smooth_low is not None:
+        _validate_cached_tensor(torch, self._device, "qfrc_smooth_low",
+                                qfrc_smooth_low, expected_q, torch.float32)
+      self._validate_mass_residual_inputs(
+          component_solver, mass_low, mass_blocks_low, tendon_armature_blocks_low)
+      _validate_cached_tensor(torch, self._device, "qpos", qpos, (b, int(d.nq)),
+                              torch.float32)
+      if poses is not None:
+        if not isinstance(poses, dict):
+          raise ValueError("poses must be a mapping of captured pose tensors")
+        for name, shape in (("body_pos", (b, int(d.nbody), 3)),
+                            ("body_quat", (b, int(d.nbody), 4))):
+          if name in poses:
+            _validate_cached_tensor(torch, self._device, f"poses[{name!r}]",
+                                    poses[name], shape, torch.float32)
+      if cvel is not None:
+        _validate_cached_tensor(torch, self._device, "cvel", cvel,
+                                (b, int(d.nbody), 6), torch.float32)
+      has_differential_eq = d.neq and np.any(
+          np.isin(np.asarray(d.eq_type, dtype=np.int32), (0, 1)))
+      if cdof is not None:
+        _validate_cached_tensor(torch, self._device, "cdof", cdof,
+                                (b, nv, 6), torch.float32)
+      if cdof_dot is not None:
+        _validate_cached_tensor(torch, self._device, "cdof_dot", cdof_dot,
+                                (b, nv, 6), torch.float32)
+      if has_differential_eq and (cvel is None or cdof is None or cdof_dot is None):
+        raise ValueError("cached connect/weld refresh requires current cvel, cdof, and cdof_dot")
+      if has_differential_eq and not (
+          self._position_context_eq_jdot_inputs_valid
+          and context.get("_eq_jdot_inputs_valid") is True):
+        raise ValueError("captured position context lacks equality motion metadata")
+      if d.neq and cvel is None:
+        eq_types = np.asarray(d.eq_type, dtype=np.int32)
+        if np.any(np.isin(eq_types, (0, 1))):
+          raise ValueError("cached connect/weld refresh requires current cvel")
+      if eq_active is not None:
+        expected_eq = (b, int(d.neq)) if d.neq else (b, 1)
+        _validate_cached_tensor(torch, self._device, "eq_active", eq_active,
+                                expected_eq, torch.int32)
+      if qacc_warmstart is not None:
+        _validate_cached_tensor(torch, self._device, "qacc_warmstart",
+                                qacc_warmstart, expected_q, torch.float32)
+      component_primal_route = (component_solver is not None
+                                and d.solver_type != int(mujoco.mjtSolver.mjSOL_PGS))
+      if component_primal_route and self._component_operator_layout_device is None:
+        raise ValueError("cached sparse primal solve requires a configured component layout")
+      if component_solver is not None:
+        if mass_blocks is None or awake_dof_ids is None or awake_counts is None:
+          raise ValueError("cached component solve requires mass blocks and awake DOF lists")
+        if (component_solver.batch_size != b or component_solver.nv != nv
+            or component_solver.nnz != self._component_operator_nnz):
+          raise ValueError("cached component solver does not match the configured layout")
+        _validate_cached_tensor(torch, self._device, "mass_blocks", mass_blocks,
+                                (b, component_solver.nnz), torch.float32)
+        _validate_cached_tensor(torch, self._device, "awake_dof_ids", awake_dof_ids,
+                                (b, max(nv, 1)), torch.int32)
+        _validate_cached_tensor(torch, self._device, "awake_counts", awake_counts,
+                                (b, 3), torch.int32)
+        if tendon_armature_blocks is not None:
+          _validate_cached_tensor(
+              torch, self._device, "tendon_armature_blocks", tendon_armature_blocks,
+              (b, component_solver.nnz), torch.float32)
       else:
-        if paired_smooth_input:
-          self._copy_world_masked(
-              pair[:b * nv], qfrc_smooth, world_mask, width=nv,
-              source_stride=nv, destination_stride=nv)
-        if qfrc_smooth_low is None:
-          self._fill_world_masked(
-              pair[b * nv:2 * b * nv], world_mask, width=nv,
-              stride=nv, value=0)
-        else:
-          self._copy_world_masked(
-              pair[b * nv:2 * b * nv], qfrc_smooth_low, world_mask,
-              width=nv, source_stride=nv, destination_stride=nv)
-      if qacc_smooth is not None or paired_smooth_input:
-        solver_acceleration_input = pair
+        _validate_cached_tensor(torch, self._device, "mass", mass, (b, nv, nv),
+                                torch.float32)
+      if exact_impedance is not None:
+        if (getattr(exact_impedance, "batch_size", None) != b
+            or getattr(exact_impedance, "row_capacity", None) != nr
+            or getattr(exact_impedance, "dof_capacity", None) != nv):
+          raise ValueError("exact impedance helper does not match this constraint workspace")
+        if component_solver is None:
+          if (exact_dense_solver is None
+              or getattr(exact_impedance, "mass_storage", None) != "dense"
+              or getattr(exact_dense_solver, "batch_size", None) != b
+              or getattr(exact_dense_solver, "nv", None) != nv
+              or getattr(exact_dense_solver, "nrhs", None) != nr):
+            raise ValueError("dense exact impedance solver does not match its prepared workspace")
+        elif (getattr(exact_impedance, "mass_storage", None) != "block_sparse"
+              or getattr(component_solver, "rhs_capacity", 0) < nr + 1):
+          raise ValueError("component exact impedance solver does not match its prepared workspace")
 
-    def dispatch_solver(mass_input, smooth_input=None):
-      with (_paired_smooth_input_stage(self._constants["solver_dims"])
-            if paired_smooth_input and smooth_input is None else nullcontext()):
-        dispatch_solver_bound(mass_input, smooth_input)
+      debug = self._workspace["workspace_debug"].reshape(b, self._debug_stride)
+      context_view = context["position_context"]
+      surface = context.get("surface_velocity")
+      extra = context.get("extra_aref")
+      try:
+        _validate_cached_tensor(torch, self._device, "context.position_context",
+                                context_view, (b, nr, 5), torch.float32)
+        _validate_cached_tensor(torch, self._device, "context.surface_velocity",
+                                surface, (b, nr), torch.float32)
+        _validate_cached_tensor(torch, self._device, "context.extra_aref",
+                                extra, (b, nr), torch.float32)
+      except ValueError:
+        raise ValueError("captured position context was modified or is malformed") from None
+      expected_awake = (b, max(self._solver_island_ntree, 1))
+      if awake_tree is not None and (
+          not isinstance(awake_tree, torch.Tensor)
+          or tuple(awake_tree.shape) != expected_awake
+          ):
+        raise ValueError(f"awake_tree must be contiguous int32 with shape {expected_awake}")
+      if awake_tree is not None:
+        _validate_cached_tensor(torch, self._device, "awake_tree", awake_tree,
+                                expected_awake, torch.int32)
+      self._set_world_mask(world_mask)
+      # Restore the captured position workspace after any ordinary forward has
+      # overwritten the borrowed views. This cache remains valid until another
+      # capture or workspace replacement, matching the retained RK4 POS stage.
+      w = self._workspace
+      self._stage_mass_residuals(
+          component_solver, mass_low, mass_blocks_low,
+          tendon_armature_blocks_low, world_mask)
+      jacobian_stride = int(w["workspace_J"].numel()) // max(b, 1)
+      self._copy_world_masked(
+          w["workspace_J"], w["position_cache_J"], world_mask,
+          width=jacobian_stride, source_stride=jacobian_stride,
+          destination_stride=jacobian_stride)
+      self._copy_world_masked(
+          w["position_qvel"], w["position_cache_qvel"], world_mask,
+          width=nv, source_stride=nv, destination_stride=nv)
+      row_base = nr * nr
+      self._copy_world_masked(
+          w["workspace_debug"], w["position_cache_rows"], world_mask,
+          width=7 * nr, source_stride=7 * nr,
+          destination_stride=self._debug_stride,
+          destination_offset=row_base)
+      self._copy_world_masked(
+          w["workspace_debug"], w["position_cache_impedance"], world_mask,
+          width=nr, source_stride=nr, destination_stride=self._debug_stride,
+          destination_offset=row_base + 2 * nr)
+      self._copy_world_masked(
+          w["workspace_debug"], w["position_cache_aref_low"], world_mask,
+          width=nr, source_stride=nr, destination_stride=self._debug_stride,
+          destination_offset=self._aref_low_debug_offset)
+      self._copy_world_masked(
+          w["workspace_debug"], w["position_cache_contact_precision"], world_mask,
+          width=6*max(nr,1), source_stride=6*max(nr,1),
+          destination_stride=self._debug_stride,
+          destination_offset=self._regularizer_low_debug_offset)
+      self._copy_world_masked(
+          w["position_current_aref_low"], w["workspace_debug"], world_mask,
+          width=nr, source_stride=self._debug_stride,
+          destination_stride=nr, source_offset=self._aref_low_debug_offset)
+      for destination_name, source_name in (
+          ("contact_row_data", "position_cache_contact_data"),
+          ("contact_frame", "position_cache_contact_frame")):
+        destination, source = w[destination_name], w[source_name]
+        width = destination.numel() // max(b, 1)
+        self._copy_world_masked(
+            destination, source, world_mask, width=width,
+            source_stride=width, destination_stride=width)
+      if self._jacobian_layout.mode == 0:
+        destination = w["contact_jacobian"]
+        source = w["position_cache_contact_jacobian"]
+        width = destination.numel() // max(b, 1)
+        self._copy_world_masked(
+            destination, source, world_mask, width=width,
+            source_stride=width, destination_stride=width)
+      for prefix, name in (("slot", "slot_maps"), ("pair", "pair_maps")):
+        maps = w.get(name)
+        if maps is not None:
+          for destination, source_name in (
+              (maps.packed_to_logical, f"position_cache_{prefix}_packed"),
+              (maps.logical_to_packed, f"position_cache_{prefix}_reverse"),
+              (maps.active_count, f"position_cache_{prefix}_count"),
+              (maps.overflow, f"position_cache_{prefix}_overflow"),
+          ):
+            width = destination.numel() // max(b, 1)
+            self._copy_world_masked(
+                destination, w[source_name], world_mask, width=width,
+                source_stride=width, destination_stride=width)
+      warm_offset = getattr(
+          self, "_qacc_warmstart_offset",
+          self._debug_prefix + self._primal_scratch_floats - max(nv, 1))
+      warm_tail = debug[:, warm_offset:warm_offset + nv]
+      if qacc_warmstart is None:
+        self._fill_world_masked(
+            w["workspace_debug"].view(torch.int32), world_mask,
+            width=nv, stride=self._debug_stride,
+            offset=warm_offset, value=0)
+      else:
+        self._copy_world_masked(
+            w["workspace_debug"], qacc_warmstart, world_mask,
+            width=nv, source_stride=nv, destination_stride=self._debug_stride,
+            destination_offset=warm_offset)
+      debug_i32 = debug.view(torch.int32)
+      awake_offset = self._debug_prefix + self._solver_island_awake_offset
+      awake_view = debug_i32[:, awake_offset:
+                             awake_offset + max(self._solver_island_ntree, 1)]
+      if awake_tree is None:
+        self._fill_world_masked(
+            debug_i32, world_mask,
+            width=max(self._solver_island_ntree, 1),
+            stride=self._debug_stride,
+            offset=awake_offset, value=1)
+      else:
+        self._copy_world_masked(
+            debug_i32, awake_tree, world_mask,
+            width=max(self._solver_island_ntree, 1),
+            source_stride=max(self._solver_island_ntree, 1),
+            destination_stride=self._debug_stride,
+            destination_offset=awake_offset)
+      refresh_extra = extra
+      eq_types = np.asarray(d.eq_type, dtype=np.int32)
+      has_differential_eq = d.neq and np.any(np.isin(eq_types, (0, 1)))
+      has_site_differential_eq = bool(
+          has_differential_eq
+          and np.any(np.isin(eq_types, (0, 1))
+                     & (np.asarray(d.eq_objtype, dtype=np.int32) == 6)))
+      old_extra = w["position_refresh_old_extra_aref"][:b * nr].view(b, nr)
+      self._copy_world_masked(
+          old_extra, w["position_extra_aref"][:b * nr].view(b, nr),
+          world_mask, width=nr, source_stride=nr, destination_stride=nr)
+      if has_differential_eq:
+        old_jdot = w["position_context_zero"][:b * nr].view(b, nr)
+        self._refresh_equality_jdot(
+            w["position_cache_qvel"].view(b, nv),
+            w["position_cache_cvel"].view(b, d.nbody, 6),
+            w["position_cache_cdof"].view(b, nv, 6),
+            w["position_cache_cdof_dot"].view(b, nv, 6), old_jdot,
+            eq_active=w["position_cache_eq_active"])
+        self._copy_world_masked(
+            old_extra, old_jdot, world_mask, width=nr,
+            source_stride=nr, destination_stride=nr, add=True)
+      if d.neq:
+        refresh_extra = w["position_refresh_extra_aref"][:b * nr].view(b, nr)
+        self._copy_world_masked(
+            refresh_extra, extra, world_mask, width=nr,
+            source_stride=nr, destination_stride=nr)
+        if has_differential_eq:
+          equality_aref = w["position_context_zero"][:b * nr].view(b, nr)
+          self._refresh_equality_jdot(
+              qvel, cvel, cdof, cdof_dot, equality_aref)
+          self._copy_world_masked(
+              refresh_extra, equality_aref, world_mask, width=nr,
+              source_stride=nr, destination_stride=nr, add=True)
+      self.refresh_position_references(
+          context_view, qvel, surface, refresh_extra, world_mask=world_mask)
+      self._refresh_cached_aref_low(
+          qvel, surface, refresh_extra, old_extra, world_mask=world_mask)
 
-    def dispatch_solver_bound(mass_input, smooth_input=None):
-      with _mass_residual_input_stage(solver_dims, has_mass_residuals):
-        solve_fn(
-            mass_input.reshape(-1),
-            (solver_acceleration_input if smooth_input is None
-             else smooth_input).reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
-            (self._eq_active_default if eq_active is None else eq_active).reshape(-1),
-            self._constants["joint_qposadr"], self._constants["qpos0"],
-            self._constants["joint_dofadr"], self._constants["joint_limited"],
-            self._constants["joint_limit_params"], self._constants["joint_sol_params"],
-            self._constants["dof_frictionloss"], self._constants["dof_invweight0"],
-            self._constants["dof_sol_params"], self._constants["eq_obj"],
-            self._constants["eq_data"], self._constants["eq_sol_params"],
-            w["contact_jacobian"], w["contact_row_data"],
-            self._constants["contact_friction"], self._constants["contact_condim"],
-            solver_dims, self._constants["solver_params"], w["out_force"], w["out_acc"],
-            w["out_status"], w["out_diagnostics"], w["out_contact_force"],
-            packed_slots, w["workspace_J"], w["workspace_debug"],
+      solver_dims = self._constants["solver_dims"]
+      solve_fn = self._solve_kernel if d.dense_path else self._solve_block_kernel
+      w = self._workspace
+      self._fill_world_masked(
+          w["out_status"], world_mask, width=1, stride=1, value=0)
+      if self._has_sdf_contact_pairs:
+        self._merge_sdf_narrowphase_status_kernel(
+            w["contact_pair_count"], w["out_status"],
+            self._pair_contact_world_mask,
+            self._constants["pair_contact_offsets_dims"],
             threads=(b,), group_size=(1,))
+      slot_maps = w.get("slot_maps")
+      packed_slots = (self._empty_compaction_map if slot_maps is None
+                      else slot_maps.packed_to_logical.reshape(-1))
 
-    exact_data = None
-    if component_solver is None:
-      if exact_impedance is not None:
-        exact_data = self.recompute_exact_impedance_device(
-            exact_impedance, mass=mass,
-            exact_dense_solver=exact_dense_solver,
-            component_solver=None, mass_blocks=mass_blocks,
-            tendon_armature_blocks=tendon_armature_blocks,
-            mass_blocks_low=mass_blocks_low,
-            tendon_armature_blocks_low=tendon_armature_blocks_low)
-      with _cached_position_stage(
-          solver_dims, d.refsafe,
-          bool(getattr(self, "_iteration_trace_enabled", False)),
-          bool(getattr(self, "_primal_detail_trace_enabled", False)),
-          self._primal_detail_extra_flags()), (
-          _provided_smooth_acceleration_stage(solver_dims)
-          if qacc_smooth is not None else nullcontext()), (
-              _paired_smooth_input_stage(solver_dims)
-              if paired_smooth_input else nullcontext()), (
-              _preassembled_rows_stage(solver_dims)
-              if exact_data is not None else nullcontext()):
-        dispatch_solver(mass)
-    elif component_primal_route:
-      self._stage_component_operator(tendon_armature_blocks, world_mask)
-      with _component_primal_stage(
-          solver_dims, d.refsafe, -1, self._line_search_iterations,
-          qacc_smooth is not None,
-          bool(getattr(self, "_iteration_trace_enabled", False)),
-          bool(getattr(self, "_primal_detail_trace_enabled", False)),
-          self._primal_detail_extra_flags()):
-        dispatch_solver(mass_blocks)
-      if exact_impedance is not None:
-        exact_data = self.recompute_exact_impedance_device(
-            exact_impedance, mass=None,
-            exact_dense_solver=exact_dense_solver,
-            component_solver=component_solver, mass_blocks=mass_blocks,
-            dof_ids=awake_dof_ids, counts=awake_counts,
-            tendon_armature_blocks=tendon_armature_blocks,
-            mass_blocks_low=mass_blocks_low,
-            tendon_armature_blocks_low=tendon_armature_blocks_low)
-      with _component_primal_stage(
-          solver_dims, d.refsafe, -3, self._line_search_iterations,
-          qacc_smooth is not None,
-          bool(getattr(self, "_iteration_trace_enabled", False)),
-          bool(getattr(self, "_primal_detail_trace_enabled", False)),
-          self._primal_detail_extra_flags()), (
-              _preassembled_rows_stage(solver_dims)
-              if exact_data is not None else nullcontext()):
-        dispatch_solver(mass_blocks)
-    else:
-      rhs_capacity = nr + 1
-      component_rhs = w["component_mass_rhs"][:b * rhs_capacity * nv]
-      component_rhs_low = w["component_mass_rhs_low"][:b * rhs_capacity * nv]
-      def prepare_component_rhs():
+      solver_acceleration_input = (qfrc_smooth if qacc_smooth is None
+                                   else qacc_smooth)
+      # Row assembly and cached equality refresh have completed. Reuse
+      # the existing point-J scratch only across this disjoint solver phase.
+      if int(nv)>0:
+        rhs_offset=self._equality_jacobian_offset
+        self._copy_world_masked(w["workspace_debug"],qfrc_smooth,world_mask,width=nv,source_stride=nv,destination_stride=self._debug_stride,destination_offset=rhs_offset)
+        if qfrc_smooth_low is None:
+          self._fill_world_masked(w["workspace_debug"],world_mask,width=nv,stride=self._debug_stride,offset=rhs_offset+nv,value=0)
+        else:
+          self._copy_world_masked(w["workspace_debug"],qfrc_smooth_low,world_mask,width=nv,source_stride=nv,destination_stride=self._debug_stride,destination_offset=rhs_offset+nv)
+      has_mass_residuals = any(value is not None for value in (
+          mass_low, mass_blocks_low, tendon_armature_blocks_low))
+      paired_smooth_input = (qacc_smooth is not None or qfrc_smooth_low is not None
+                            or has_mass_residuals) and int(nv) > 0
+      if int(nv) > 0 and (d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS)
+                          or paired_smooth_input):
+        pair = w.get("component_smooth_acceleration_pair")
+        if pair is None:
+          raise RuntimeError("paired smooth-acceleration workspace was not prepared")
+        if qacc_smooth is not None:
+          self._copy_world_masked(
+              pair[:b * nv], qacc_smooth, world_mask, width=nv,
+              source_stride=nv, destination_stride=nv)
+          if qacc_smooth_low is None:
+            self._fill_world_masked(
+                pair[b * nv:2 * b * nv], world_mask, width=nv,
+                stride=nv, value=0)
+          else:
+            self._copy_world_masked(
+                pair[b * nv:2 * b * nv], qacc_smooth_low, world_mask,
+                width=nv, source_stride=nv, destination_stride=nv)
+        else:
+          if paired_smooth_input:
+            self._copy_world_masked(
+                pair[:b * nv], qfrc_smooth, world_mask, width=nv,
+                source_stride=nv, destination_stride=nv)
+          if qfrc_smooth_low is None:
+            self._fill_world_masked(
+                pair[b * nv:2 * b * nv], world_mask, width=nv,
+                stride=nv, value=0)
+          else:
+            self._copy_world_masked(
+                pair[b * nv:2 * b * nv], qfrc_smooth_low, world_mask,
+                width=nv, source_stride=nv, destination_stride=nv)
+        if qacc_smooth is not None or paired_smooth_input:
+          solver_acceleration_input = pair
+
+      def dispatch_solver(mass_input, smooth_input=None):
+        with (_paired_smooth_input_stage(self._constants["solver_dims"])
+              if paired_smooth_input and smooth_input is None else nullcontext()):
+          dispatch_solver_bound(mass_input, smooth_input)
+
+      def dispatch_solver_bound(mass_input, smooth_input=None):
+        with _mass_residual_input_stage(solver_dims, has_mass_residuals):
+          solve_fn(
+              mass_input.reshape(-1),
+              (solver_acceleration_input if smooth_input is None
+               else smooth_input).reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
+              (self._eq_active_default if eq_active is None else eq_active).reshape(-1),
+              self._constants["joint_qposadr"], self._constants["qpos0"],
+              self._constants["joint_dofadr"], self._constants["joint_limited"],
+              self._constants["joint_limit_params"], self._constants["joint_sol_params"],
+              self._constants["dof_frictionloss"], self._constants["dof_invweight0"],
+              self._constants["dof_sol_params"], self._constants["eq_obj"],
+              self._constants["eq_data"], self._constants["eq_sol_params"],
+              w["contact_jacobian"], w["contact_row_data"],
+              self._constants["contact_friction"], self._constants["contact_condim"],
+              solver_dims, self._constants["solver_params"], w["out_force"], w["out_acc"],
+              w["out_status"], w["out_diagnostics"], w["out_contact_force"],
+              packed_slots, w["workspace_J"], w["workspace_debug"],
+              threads=(b,), group_size=(1,))
+
+      exact_data = None
+      if component_solver is None:
         if exact_impedance is not None:
-          # The exact mass-row solve borrows component_solver's prepared output
-          # backing. It must finish before run_device overwrites that backing.
-          exact = self.recompute_exact_impedance_device(
+          exact_data = self.recompute_exact_impedance_device(
+              exact_impedance, mass=mass,
+              exact_dense_solver=exact_dense_solver,
+              component_solver=None, mass_blocks=mass_blocks,
+              tendon_armature_blocks=tendon_armature_blocks,
+              mass_blocks_low=mass_blocks_low,
+              tendon_armature_blocks_low=tendon_armature_blocks_low)
+        with _cached_position_stage(
+            solver_dims, d.refsafe,
+            bool(getattr(self, "_iteration_trace_enabled", False)),
+            bool(getattr(self, "_primal_detail_trace_enabled", False)),
+            self._primal_detail_extra_flags()), (
+            _provided_smooth_acceleration_stage(solver_dims)
+            if qacc_smooth is not None else nullcontext()), (
+                _paired_smooth_input_stage(solver_dims)
+                if paired_smooth_input else nullcontext()), (
+                _preassembled_rows_stage(solver_dims)
+                if exact_data is not None else nullcontext()):
+          dispatch_solver(mass)
+      elif component_primal_route:
+        self._stage_component_operator(tendon_armature_blocks, world_mask)
+        with _component_primal_stage(
+            solver_dims, d.refsafe, -1, self._line_search_iterations,
+            qacc_smooth is not None,
+            bool(getattr(self, "_iteration_trace_enabled", False)),
+            bool(getattr(self, "_primal_detail_trace_enabled", False)),
+            self._primal_detail_extra_flags()):
+          dispatch_solver(mass_blocks)
+        if exact_impedance is not None:
+          exact_data = self.recompute_exact_impedance_device(
               exact_impedance, mass=None,
               exact_dense_solver=exact_dense_solver,
               component_solver=component_solver, mass_blocks=mass_blocks,
@@ -4844,135 +4850,160 @@ class MetalCoupledConstraints:
               tendon_armature_blocks=tendon_armature_blocks,
               mass_blocks_low=mass_blocks_low,
               tendon_armature_blocks_low=tendon_armature_blocks_low)
-        else:
-          exact = None
-        with (_provided_smooth_acceleration_stage(solver_dims)
-              if qacc_smooth is not None else nullcontext()):
-          self._pack_component_mass_rhs(
-              w["workspace_J"], qfrc_smooth.reshape(-1),
-              w["workspace_debug"], component_rhs, solver_dims,
-              component_rhs_low, w["component_smooth_acceleration_pair"][b * nv:2 * b * nv],
-              threads=(b,), group_size=(1,))
-        return exact
-
-      exact_data, (component_result, component_status) = (
-          _run_component_solve_after_prepare(
-              prepare_component_rhs,
-              lambda: component_solver.run_device(
-                  mass_blocks,
-                  component_rhs.reshape(b, rhs_capacity, nv),
-                  dof_ids=awake_dof_ids, counts=awake_counts,
-                  tendon_armature_blocks=tendon_armature_blocks,
-                  mass_blocks_low=mass_blocks_low,
-                  tendon_armature_blocks_low=tendon_armature_blocks_low,
-                  rhs_low=component_rhs_low.reshape(b, rhs_capacity, nv),
-                  world_mask=world_mask)))
-      with _cached_position_stage(
-          solver_dims, d.refsafe,
-          bool(getattr(self, "_iteration_trace_enabled", False)),
-          bool(getattr(self, "_primal_detail_trace_enabled", False)),
-          self._primal_detail_extra_flags()), _solver_dimension_stage(
-          solver_dims, -2, self._line_search_iterations), (
-              _provided_smooth_acceleration_stage(solver_dims)
-              if qacc_smooth is not None else nullcontext()), (
-                  _preassembled_rows_stage(solver_dims)
-                  if exact_data is not None else nullcontext()):
-        dispatch_solver(component_solver.paired_output)
-      component_solver.merge_world_status(component_status, w["out_status"],
-                                          world_mask=world_mask)
-
-    if exact_data is not None:
-      _merge_exact_world_status(torch, w["out_status"], exact_data)
-
-    solver_diagnostics, solver_history = self._diagnostic_views()
-    result = {
-        "qacc": w["out_acc"][:b * nv].reshape(b, nv),
-        "qacc_low": w["out_acc"][b * nv:2 * b * nv].reshape(b, nv),
-        "qfrc_constraint": w["out_force"][:b * nv].reshape(b, nv),
-        "status": w["out_status"],
-        "solver_diagnostics": solver_diagnostics,
-        "solver_history": solver_history,
-        "position_context": context,
-        "R": debug[:, nr * nr:nr * nr + nr],
-        "ar": debug[:, nr * nr + nr:nr * nr + 2 * nr],
-        "ar_low": debug[:, self._aref_low_debug_offset:
-                        self._aref_low_debug_offset + nr],
-        "rhs": debug[:, nr * nr + 2 * nr:nr * nr + 3 * nr],
-        "lambda": debug[:, nr * nr + 3 * nr:nr * nr + 4 * nr],
-        "lo": debug[:, nr * nr + 4 * nr:nr * nr + 5 * nr],
-        "hi": debug[:, nr * nr + 5 * nr:nr * nr + 6 * nr],
-        "W": debug[:, :nr * nr].reshape(b, nr, nr),
-        "W_regularized": (
-            debug[:, :nr * nr].reshape(b, nr, nr)
-            + torch.diag_embed(debug[:, nr * nr:nr * nr + nr])),
-    }
-    jacobian_layout = getattr(self, "_jacobian_layout", None)
-    if jacobian_layout is None:
-      result["J"] = w["workspace_J"][:b * nr * nv].reshape(b, nr, nv)
-    elif jacobian_layout.mode == 0:
-      result["J"] = self.materialize_jacobian()
-    else:
-      result["J_packed"] = w["workspace_J"]
-      result["jacobian_layout"] = jacobian_layout
-    if nr:
-      debug_i32 = debug.view(torch.int32)
-      island_base = self._debug_prefix + self._solver_island_core_scratch
-      result["dof_island"] = debug_i32[:, island_base:island_base + nv]
-      result["row_island"] = debug_i32[
-          :, island_base + nv:island_base + nv + nr]
-      tree_base = island_base + nv + nr
-      body_base = tree_base + 2 * max(self._solver_island_ntree, 1)
-      result["midpoint_blocked_body"] = debug_i32[
-          :, body_base:body_base + self._solver_island_nbody]
-      result["midpoint_blocked_tree"] = debug_i32[
-          :, body_base + max(self._solver_island_nbody, 1):
-          body_base + max(self._solver_island_nbody, 1)
-          + self._solver_island_ntree]
-    nc = int(d.ncontacts_max)
-    result.update({
-        "contact_friction": self._constants["contact_friction"][:nc * 5].reshape(nc, 5),
-        "contact_condim": self._constants["contact_condim"][:nc * 3],
-    })
-    if nc:
-      contact_rows = axis_data(w["contact_row_data"], b, nc)
-      contact_frames = w["contact_frame"][:b * nc * 12].reshape(b, nc, 12)
-      contact_forces = w["out_contact_force"][:b * nc * 11].reshape(b, nc, 11)
-      contact_jacobians = (
-          w["contact_jacobian"][:b * nc * 6 * nv].reshape(b, nc, 6, nv)
-          if self._jacobian_layout.mode == 0 else None)
-      friction_tensor = self._constants["contact_friction"][:nc * 5].reshape(nc, 5)
-      if d.cone_type == int(mujoco.mjtCone.mjCONE_ELLIPTIC):
-        contact_wrench = contact_forces[:, :, :6]
+        with _component_primal_stage(
+            solver_dims, d.refsafe, -3, self._line_search_iterations,
+            qacc_smooth is not None,
+            bool(getattr(self, "_iteration_trace_enabled", False)),
+            bool(getattr(self, "_primal_detail_trace_enabled", False)),
+            self._primal_detail_extra_flags()), (
+                _preassembled_rows_stage(solver_dims)
+                if exact_data is not None else nullcontext()):
+          dispatch_solver(mass_blocks)
       else:
-        wrench_axes = [contact_forces[:, :, 0]]
-        for axis in range(5):
-          plus = contact_forces[:, :, 1 + 2 * axis]
-          minus = contact_forces[:, :, 2 + 2 * axis]
-          wrench_axes.append(friction_tensor[None, :, axis] * (plus - minus))
-        contact_wrench = torch.stack(wrench_axes, dim=-1)
+        rhs_capacity = nr + 1
+        component_rhs = w["component_mass_rhs"][:b * rhs_capacity * nv]
+        component_rhs_low = w["component_mass_rhs_low"][:b * rhs_capacity * nv]
+        def prepare_component_rhs():
+          if exact_impedance is not None:
+            # The exact mass-row solve borrows component_solver's prepared output
+            # backing. It must finish before run_device overwrites that backing.
+            exact = self.recompute_exact_impedance_device(
+                exact_impedance, mass=None,
+                exact_dense_solver=exact_dense_solver,
+                component_solver=component_solver, mass_blocks=mass_blocks,
+                dof_ids=awake_dof_ids, counts=awake_counts,
+                tendon_armature_blocks=tendon_armature_blocks,
+                mass_blocks_low=mass_blocks_low,
+                tendon_armature_blocks_low=tendon_armature_blocks_low)
+          else:
+            exact = None
+          with (_provided_smooth_acceleration_stage(solver_dims)
+                if qacc_smooth is not None else nullcontext()):
+            self._pack_component_mass_rhs(
+                w["workspace_J"], qfrc_smooth.reshape(-1),
+                w["workspace_debug"], component_rhs, solver_dims,
+                component_rhs_low, w["component_smooth_acceleration_pair"][b * nv:2 * b * nv],
+                threads=(b,), group_size=(1,))
+          return exact
+
+        exact_data, (component_result, component_status) = (
+            _run_component_solve_after_prepare(
+                prepare_component_rhs,
+                lambda: component_solver.run_device(
+                    mass_blocks,
+                    component_rhs.reshape(b, rhs_capacity, nv),
+                    dof_ids=awake_dof_ids, counts=awake_counts,
+                    tendon_armature_blocks=tendon_armature_blocks,
+                    mass_blocks_low=mass_blocks_low,
+                    tendon_armature_blocks_low=tendon_armature_blocks_low,
+                    rhs_low=component_rhs_low.reshape(b, rhs_capacity, nv),
+                    world_mask=world_mask)))
+        with _cached_position_stage(
+            solver_dims, d.refsafe,
+            bool(getattr(self, "_iteration_trace_enabled", False)),
+            bool(getattr(self, "_primal_detail_trace_enabled", False)),
+            self._primal_detail_extra_flags()), _solver_dimension_stage(
+            solver_dims, -2, self._line_search_iterations), (
+                _provided_smooth_acceleration_stage(solver_dims)
+                if qacc_smooth is not None else nullcontext()), (
+                    _preassembled_rows_stage(solver_dims)
+                    if exact_data is not None else nullcontext()):
+          dispatch_solver(component_solver.paired_output)
+        component_solver.merge_world_status(component_status, w["out_status"],
+                                            world_mask=world_mask)
+
+      if exact_data is not None:
+        _merge_exact_world_status(torch, w["out_status"], exact_data)
+
+      solver_diagnostics, solver_history = self._diagnostic_views()
+      result = {
+          "qacc": w["out_acc"][:b * nv].reshape(b, nv),
+          "qacc_low": w["out_acc"][b * nv:2 * b * nv].reshape(b, nv),
+          "qfrc_constraint": w["out_force"][:b * nv].reshape(b, nv),
+          "status": w["out_status"],
+          "solver_diagnostics": solver_diagnostics,
+          "solver_history": solver_history,
+          "position_context": context,
+          "R": debug[:, nr * nr:nr * nr + nr],
+          "ar": debug[:, nr * nr + nr:nr * nr + 2 * nr],
+          "ar_low": debug[:, self._aref_low_debug_offset:
+                          self._aref_low_debug_offset + nr],
+          "rhs": debug[:, nr * nr + 2 * nr:nr * nr + 3 * nr],
+          "lambda": debug[:, nr * nr + 3 * nr:nr * nr + 4 * nr],
+          "lo": debug[:, nr * nr + 4 * nr:nr * nr + 5 * nr],
+          "hi": debug[:, nr * nr + 5 * nr:nr * nr + 6 * nr],
+          "W": debug[:, :nr * nr].reshape(b, nr, nr),
+          "W_regularized": (
+              debug[:, :nr * nr].reshape(b, nr, nr)
+              + torch.diag_embed(debug[:, nr * nr:nr * nr + nr])),
+      }
+      jacobian_layout = getattr(self, "_jacobian_layout", None)
+      if jacobian_layout is None:
+        result["J"] = w["workspace_J"][:b * nr * nv].reshape(b, nr, nv)
+      elif jacobian_layout.mode == 0:
+        result["J"] = self.materialize_jacobian()
+      else:
+        result["J_packed"] = w["workspace_J"]
+        result["jacobian_layout"] = jacobian_layout
+      if nr:
+        debug_i32 = debug.view(torch.int32)
+        island_base = self._debug_prefix + self._solver_island_core_scratch
+        result["dof_island"] = debug_i32[:, island_base:island_base + nv]
+        result["row_island"] = debug_i32[
+            :, island_base + nv:island_base + nv + nr]
+        tree_base = island_base + nv + nr
+        body_base = tree_base + 2 * max(self._solver_island_ntree, 1)
+        result["midpoint_blocked_body"] = debug_i32[
+            :, body_base:body_base + self._solver_island_nbody]
+        result["midpoint_blocked_tree"] = debug_i32[
+            :, body_base + max(self._solver_island_nbody, 1):
+            body_base + max(self._solver_island_nbody, 1)
+            + self._solver_island_ntree]
+      nc = int(d.ncontacts_max)
       result.update({
-          "contact_mask": contact_rows[:, :, 0, 0],
-          "contact_distance": contact_rows[:, :, 0, 1],
-          "contact_velocity": contact_rows[:, :, 0, 2],
-          "contact_reference": contact_rows[:, :, 0, 3],
-          "contact_impedance": contact_rows[:, :, 0, 4],
-          "contact_normal": contact_frames[:, :, :3],
-          "contact_tangent1": contact_frames[:, :, 3:6],
-          "contact_tangent2": contact_frames[:, :, 6:9],
-          "contact_position": contact_frames[:, :, 9:12],
-          "contact_force": contact_forces[:, :, 0],
-          "contact_force_rows": contact_forces[:, :, :5],
-          "contact_solver_rows": contact_forces,
-          "contact_wrench": contact_wrench,
+          "contact_friction": self._constants["contact_friction"][:nc * 5].reshape(nc, 5),
+          "contact_condim": self._constants["contact_condim"][:nc * 3],
       })
-      if contact_jacobians is not None:
-        result["contact_jacobian"] = contact_jacobians
-    if int(d.nr_joint) > 0:
-      result["joint_force"] = w["out_joint_force"][:b * d.nr_joint].reshape(
-          b, d.nr_joint)
-    if exact_data is not None:
-      result["exact_impedance"] = exact_data
-    return result
+      if nc:
+        contact_rows = axis_data(w["contact_row_data"], b, nc)
+        contact_frames = w["contact_frame"][:b * nc * 12].reshape(b, nc, 12)
+        contact_forces = w["out_contact_force"][:b * nc * 11].reshape(b, nc, 11)
+        contact_jacobians = (
+            w["contact_jacobian"][:b * nc * 6 * nv].reshape(b, nc, 6, nv)
+            if self._jacobian_layout.mode == 0 else None)
+        friction_tensor = self._constants["contact_friction"][:nc * 5].reshape(nc, 5)
+        if d.cone_type == int(mujoco.mjtCone.mjCONE_ELLIPTIC):
+          contact_wrench = contact_forces[:, :, :6]
+        else:
+          wrench_axes = [contact_forces[:, :, 0]]
+          for axis in range(5):
+            plus = contact_forces[:, :, 1 + 2 * axis]
+            minus = contact_forces[:, :, 2 + 2 * axis]
+            wrench_axes.append(friction_tensor[None, :, axis] * (plus - minus))
+          contact_wrench = torch.stack(wrench_axes, dim=-1)
+        result.update({
+            "contact_mask": contact_rows[:, :, 0, 0],
+            "contact_distance": contact_rows[:, :, 0, 1],
+            "contact_velocity": contact_rows[:, :, 0, 2],
+            "contact_reference": contact_rows[:, :, 0, 3],
+            "contact_impedance": contact_rows[:, :, 0, 4],
+            "contact_normal": contact_frames[:, :, :3],
+            "contact_tangent1": contact_frames[:, :, 3:6],
+            "contact_tangent2": contact_frames[:, :, 6:9],
+            "contact_position": contact_frames[:, :, 9:12],
+            "contact_force": contact_forces[:, :, 0],
+            "contact_force_rows": contact_forces[:, :, :5],
+            "contact_solver_rows": contact_forces,
+            "contact_wrench": contact_wrench,
+        })
+        if contact_jacobians is not None:
+          result["contact_jacobian"] = contact_jacobians
+      if int(d.nr_joint) > 0:
+        result["joint_force"] = w["out_joint_force"][:b * d.nr_joint].reshape(
+            b, d.nr_joint)
+      if exact_data is not None:
+        result["exact_impedance"] = exact_data
+      return result
 
   def _validate_mass_residual_inputs(self, component_solver, mass_low,
                                      mass_blocks_low, tendon_armature_blocks_low):
@@ -5041,15 +5072,15 @@ class MetalCoupledConstraints:
     debug_i32[:, start:end].copy_(self._component_operator_layout_device[None, :])
 
   def run_device(self, poses, mass, qfrc_smooth, qpos, qvel, eq_active=None, cvel=None,
-                 tendon_J_spatial=None, tendon_length_spatial=None, flex=None,
-                 qacc_warmstart=None, awake_tree=None, component_solver=None,
-                 mass_blocks=None, tendon_armature_blocks=None,
-                 awake_dof_ids=None, awake_counts=None, cdof=None, cdof_dot=None,
-                 assemble_only=False, candidate_token=None,
-                 exact_impedance=None, exact_dense_solver=None,
-                 qfrc_smooth_low=None, world_mask=None, mass_low=None,
-                 mass_blocks_low=None, tendon_armature_blocks_low=None):
-    """Solve coupled contacts, limits, dry friction, and equalities on MPS.
+                   tendon_J_spatial=None, tendon_length_spatial=None, flex=None,
+                   qacc_warmstart=None, awake_tree=None, component_solver=None,
+                   mass_blocks=None, tendon_armature_blocks=None,
+                   awake_dof_ids=None, awake_counts=None, cdof=None, cdof_dot=None,
+                   assemble_only=False, candidate_token=None,
+                   exact_impedance=None, exact_dense_solver=None,
+                   qfrc_smooth_low=None, world_mask=None, mass_low=None,
+                   mass_blocks_low=None, tendon_armature_blocks_low=None):
+      """Solve coupled contacts, limits, dry friction, and equalities on MPS.
 
     `poses` is the dict of FK outputs from `MetalKinematics`. For differential
     connect/weld rows, extend it with `root_com` from the same position-stage
@@ -5068,836 +5099,845 @@ class MetalCoupledConstraints:
     spatial tendon views from the simulation's once-per-assembly kinematics
     (None when the model has no spatial tendons; the stage substitutes zeros).
     """
-    w, torch, d = self._workspace, self._torch, self.descriptor
-    b, nv, nc, nr = self.batch_size, d.nv, d.ncontacts_max, d.nr
-    component_route = nv > 0 and component_solver is not None
-    component_primal_route = (component_route
-                              and d.solver_type != int(mujoco.mjtSolver.mjSOL_PGS))
-    supplied_component_args = (mass_blocks is not None
-                               or tendon_armature_blocks is not None
-                               or awake_dof_ids is not None
-                               or awake_counts is not None)
-    if component_primal_route and self._component_operator_layout_device is None:
-      raise ValueError("sparse primal solve requires a configured component layout")
-    if assemble_only and (component_route or supplied_component_args):
-      raise ValueError("assembly-only mode does not accept component mass inputs")
-    if mass is None and not component_route and not assemble_only:
-      raise ValueError("dense solver path requires a mass matrix")
-    if supplied_component_args and component_solver is None:
-      raise ValueError("component mass inputs require component_solver")
-    # This must precede token consumption, validity flags, status clearing,
-    # debug staging, or any output workspace writes below.
-    _validate_geom_pose_residuals(torch, self._device, poses, b, int(d.ngeom))
-    if qfrc_smooth_low is not None:
-      _validate_cached_tensor(torch, self._device, "qfrc_smooth_low",
-                              qfrc_smooth_low, (b, nv), torch.float32)
-    self._validate_mass_residual_inputs(
-        component_solver, mass_low, mass_blocks_low, tendon_armature_blocks_low)
-    if candidate_token is not None:
-      if candidate_token is not self._candidate_generation_token:
-        raise ValueError("candidate-generation token is stale or foreign")
-      # A generation describes one exact current-position narrowphase result.
-      # Consume it before mutation so a failed downstream assembly cannot
-      # accidentally replay partially overwritten candidate buffers.
-      self._candidate_generation_token = None
-    self._position_current_valid = False
+      w, torch, d = self._workspace, self._torch, self.descriptor
+      b, nv, nc, nr = self.batch_size, d.nv, d.ncontacts_max, d.nr
+      component_route = nv > 0 and component_solver is not None
+      component_primal_route = (component_route
+                                and d.solver_type != int(mujoco.mjtSolver.mjSOL_PGS))
+      supplied_component_args = (mass_blocks is not None
+                                 or tendon_armature_blocks is not None
+                                 or awake_dof_ids is not None
+                                 or awake_counts is not None)
+      if component_primal_route and self._component_operator_layout_device is None:
+        raise ValueError("sparse primal solve requires a configured component layout")
+      if assemble_only and (component_route or supplied_component_args):
+        raise ValueError("assembly-only mode does not accept component mass inputs")
+      if mass is None and not component_route and not assemble_only:
+        raise ValueError("dense solver path requires a mass matrix")
+      if supplied_component_args and component_solver is None:
+        raise ValueError("component mass inputs require component_solver")
+      # This must precede token consumption, validity flags, status clearing,
+      # debug staging, or any output workspace writes below.
+      _validate_geom_pose_residuals(torch, self._device, poses, b, int(d.ngeom))
+      if qfrc_smooth_low is not None:
+        _validate_cached_tensor(torch, self._device, "qfrc_smooth_low",
+                                qfrc_smooth_low, (b, nv), torch.float32)
+      self._validate_mass_residual_inputs(
+          component_solver, mass_low, mass_blocks_low, tendon_armature_blocks_low)
+      if candidate_token is not None:
+        if candidate_token is not self._candidate_generation_token:
+          raise ValueError("candidate-generation token is stale or foreign")
+        # A generation describes one exact current-position narrowphase result.
+        # Consume it before mutation so a failed downstream assembly cannot
+        # accidentally replay partially overwritten candidate buffers.
+        self._candidate_generation_token = None
+      self._position_current_valid = False
 
-    if exact_impedance is not None:
-      if nr <= 0 or nv <= 0:
-        raise ValueError("exact impedance requires nonempty constraint and DOF rows")
-      if (getattr(exact_impedance, "batch_size", None) != b
-          or getattr(exact_impedance, "row_capacity", None) != nr
-          or getattr(exact_impedance, "dof_capacity", None) != nv):
-        raise ValueError("exact impedance helper does not match this constraint workspace")
-      if component_solver is None and (mass is None or exact_dense_solver is None):
-        raise ValueError("dense exact impedance requires its prepared multi-RHS mass solver")
-      if component_solver is not None and mass_blocks is None:
-        raise ValueError("component exact impedance requires packed mass blocks")
-    if component_route:
-      if (mass_blocks is None or awake_dof_ids is None or awake_counts is None
-          or not hasattr(component_solver, "run_device")
-          or component_solver.batch_size != b
-          or component_solver.nv != nv):
-        raise ValueError(
-            "component solver requires matching mass blocks and awake DOF lists")
-      if (component_solver.nnz != self._component_operator_nnz
-          or (not component_primal_route
-              and component_solver.rhs_capacity != nr + 1)):
-        raise ValueError("component solver does not match its configured workspace")
-      if (not isinstance(mass_blocks, torch.Tensor)
-          or mass_blocks.dtype != torch.float32
-          or mass_blocks.device.type != self._device.type
-          or (self._device.index is not None
-              and mass_blocks.device.index != self._device.index)
-          or not mass_blocks.is_contiguous()
-          or tuple(mass_blocks.shape) != (b, component_solver.nnz)):
-        raise ValueError("mass_blocks must be contiguous float32 MPS [batch,nnz]")
-      if (not isinstance(awake_dof_ids, torch.Tensor)
-          or tuple(awake_dof_ids.shape) != (b, max(nv, 1))
-          or awake_dof_ids.dtype != torch.int32
-          or awake_dof_ids.device.type != self._device.type
-          or (self._device.index is not None
-              and awake_dof_ids.device.index != self._device.index)
-          or not awake_dof_ids.is_contiguous()):
-        raise ValueError("awake_dof_ids must be contiguous MPS int32 [batch,max(nv,1)]")
-      if (not isinstance(awake_counts, torch.Tensor)
-          or tuple(awake_counts.shape) != (b, 3)
-          or awake_counts.dtype != torch.int32
-          or awake_counts.device.type != self._device.type
-          or (self._device.index is not None
-              and awake_counts.device.index != self._device.index)
-          or not awake_counts.is_contiguous()):
-        raise ValueError("awake_counts must be contiguous MPS int32 [batch,3]")
-      if tendon_armature_blocks is not None and (
-          not isinstance(tendon_armature_blocks, torch.Tensor)
-          or tuple(tendon_armature_blocks.shape) != (b, component_solver.nnz)
-          or tendon_armature_blocks.dtype != torch.float32
-          or tendon_armature_blocks.device.type != self._device.type
-          or (self._device.index is not None
-              and tendon_armature_blocks.device.index != self._device.index)
-          or not tendon_armature_blocks.is_contiguous()):
-        raise ValueError(
-            "tendon_armature_blocks must be contiguous float32 MPS [batch,nnz]")
-      if w["component_mass_rhs"] is None and not component_primal_route:
-        raise ValueError("component mass RHS workspace is unavailable for this solver")
+      if exact_impedance is not None:
+        if nr <= 0 or nv <= 0:
+          raise ValueError("exact impedance requires nonempty constraint and DOF rows")
+        if (getattr(exact_impedance, "batch_size", None) != b
+            or getattr(exact_impedance, "row_capacity", None) != nr
+            or getattr(exact_impedance, "dof_capacity", None) != nv):
+          raise ValueError("exact impedance helper does not match this constraint workspace")
+        if component_solver is None and (mass is None or exact_dense_solver is None):
+          raise ValueError("dense exact impedance requires its prepared multi-RHS mass solver")
+        if component_solver is not None and mass_blocks is None:
+          raise ValueError("component exact impedance requires packed mass blocks")
+      if component_route:
+        if (mass_blocks is None or awake_dof_ids is None or awake_counts is None
+            or not hasattr(component_solver, "run_device")
+            or component_solver.batch_size != b
+            or component_solver.nv != nv):
+          raise ValueError(
+              "component solver requires matching mass blocks and awake DOF lists")
+        if (component_solver.nnz != self._component_operator_nnz
+            or (not component_primal_route
+                and component_solver.rhs_capacity != nr + 1)):
+          raise ValueError("component solver does not match its configured workspace")
+        if (not isinstance(mass_blocks, torch.Tensor)
+            or mass_blocks.dtype != torch.float32
+            or mass_blocks.device.type != self._device.type
+            or (self._device.index is not None
+                and mass_blocks.device.index != self._device.index)
+            or not mass_blocks.is_contiguous()
+            or tuple(mass_blocks.shape) != (b, component_solver.nnz)):
+          raise ValueError("mass_blocks must be contiguous float32 MPS [batch,nnz]")
+        if (not isinstance(awake_dof_ids, torch.Tensor)
+            or tuple(awake_dof_ids.shape) != (b, max(nv, 1))
+            or awake_dof_ids.dtype != torch.int32
+            or awake_dof_ids.device.type != self._device.type
+            or (self._device.index is not None
+                and awake_dof_ids.device.index != self._device.index)
+            or not awake_dof_ids.is_contiguous()):
+          raise ValueError("awake_dof_ids must be contiguous MPS int32 [batch,max(nv,1)]")
+        if (not isinstance(awake_counts, torch.Tensor)
+            or tuple(awake_counts.shape) != (b, 3)
+            or awake_counts.dtype != torch.int32
+            or awake_counts.device.type != self._device.type
+            or (self._device.index is not None
+                and awake_counts.device.index != self._device.index)
+            or not awake_counts.is_contiguous()):
+          raise ValueError("awake_counts must be contiguous MPS int32 [batch,3]")
+        if tendon_armature_blocks is not None and (
+            not isinstance(tendon_armature_blocks, torch.Tensor)
+            or tuple(tendon_armature_blocks.shape) != (b, component_solver.nnz)
+            or tendon_armature_blocks.dtype != torch.float32
+            or tendon_armature_blocks.device.type != self._device.type
+            or (self._device.index is not None
+                and tendon_armature_blocks.device.index != self._device.index)
+            or not tendon_armature_blocks.is_contiguous()):
+          raise ValueError(
+              "tendon_armature_blocks must be contiguous float32 MPS [batch,nnz]")
+        if w["component_mass_rhs"] is None and not component_primal_route:
+          raise ValueError("component mass RHS workspace is unavailable for this solver")
 
-    if awake_tree is not None:
-      expected_awake = (b, max(self._solver_island_ntree, 1))
-      if (not isinstance(awake_tree, torch.Tensor)
-          or awake_tree.dtype != torch.int32
-          or tuple(awake_tree.shape) != expected_awake
-          or awake_tree.device.type != self._device.type
-          or (self._device.index is not None
-              and awake_tree.device.index != self._device.index)
-          or not awake_tree.is_contiguous()):
-        raise ValueError(
-            f"awake_tree must be contiguous int32 MPS with shape {expected_awake}")
+      if awake_tree is not None:
+        expected_awake = (b, max(self._solver_island_ntree, 1))
+        if (not isinstance(awake_tree, torch.Tensor)
+            or awake_tree.dtype != torch.int32
+            or tuple(awake_tree.shape) != expected_awake
+            or awake_tree.device.type != self._device.type
+            or (self._device.index is not None
+                and awake_tree.device.index != self._device.index)
+            or not awake_tree.is_contiguous()):
+          raise ValueError(
+              f"awake_tree must be contiguous int32 MPS with shape {expected_awake}")
 
-    # These exact position snapshots feed equality Jdot-v replay. Validate
-    # them before warmstart/debug scratch is written, not after the solve.
-    if not isinstance(poses, dict):
-      raise ValueError("poses must be a mapping of FK tensors")
-    for key, shape in (("body_pos", (b, d.nbody, 3)),
-                       ("body_quat", (b, d.nbody, 4))):
-      _validate_cached_tensor(torch, self._device, f"poses[{key!r}]",
-                              poses.get(key), shape, torch.float32)
-    eq_types = np.asarray(d.eq_type, dtype=np.int32)
-    has_differential_eq = d.neq and np.any(np.isin(eq_types, (0, 1)))
-    has_site_differential_eq = bool(
-        has_differential_eq
-        and np.any(np.isin(eq_types, (0, 1))
-                   & (np.asarray(d.eq_objtype, dtype=np.int32) == 6)))
-    if has_differential_eq:
-      _validate_cached_tensor(torch, self._device, "poses['root_com']",
-                              poses.get("root_com"), (b, d.nbody, 3),
-                              torch.float32)
-      if cvel is not None:
-        _validate_cached_tensor(torch, self._device, "cvel", cvel,
-                                (b, d.nbody, 6), torch.float32)
-      if cdof is not None:
-        _validate_cached_tensor(torch, self._device, "cdof", cdof,
-                                (b, nv, 6), torch.float32)
-      if cdof_dot is not None:
-        _validate_cached_tensor(torch, self._device, "cdof_dot", cdof_dot,
-                                (b, nv, 6), torch.float32)
-      if has_differential_eq and (cvel is None or cdof is None or cdof_dot is None):
-        raise ValueError(
-            "connect/weld equality assembly requires cvel, cdof, and cdof_dot")
-      if has_site_differential_eq:
-        _validate_cached_tensor(torch, self._device, "poses['site_pos']",
-                                poses.get("site_pos"), (b, d.nsite, 3),
-                                torch.float32)
-        _validate_cached_tensor(torch, self._device, "poses['site_quat']",
-                                poses.get("site_quat"), (b, d.nsite, 4),
-                                torch.float32)
-
-    # MuJoCo's WARMSTART state is qacc_warmstart for every solver family.
-    # PGS maps it to row forces before its cost check; CG/Newton compare the
-    # acceleration-space cost with qacc_smooth. The final DOF-sized tail of
-    # persistent scratch carries it without adding a Metal buffer binding.
-    if qacc_warmstart is not None:
-      if (not isinstance(qacc_warmstart, torch.Tensor)
-          or qacc_warmstart.dtype != torch.float32
-          or tuple(qacc_warmstart.shape) != (b, nv)
-          or qacc_warmstart.device.type != self._device.type
-          or (self._device.index is not None
-              and qacc_warmstart.device.index != self._device.index)
-          or not qacc_warmstart.is_contiguous()):
-        raise ValueError(
-            f"qacc_warmstart must be contiguous float32 MPS with shape {(b, nv)}"
-        )
-    if eq_active is None:
-      eq_active_tensor = self._eq_active_default
-    else:
-      if not isinstance(eq_active, torch.Tensor):
-        raise TypeError("eq_active must be a torch.Tensor")
-      expected_shape = (b, d.neq) if d.neq > 0 else (b, 1)
-      if eq_active.shape != expected_shape:
-        raise ValueError(
-            f"eq_active must have shape {expected_shape}, got {eq_active.shape}"
-        )
-      if eq_active.dtype != torch.int32:
-        raise TypeError("eq_active must have dtype torch.int32")
-      if eq_active.device.type != self._device.type:
-        raise ValueError(f"eq_active must be on {self._device.type} device")
-      if not eq_active.is_contiguous():
-        raise ValueError("eq_active must be contiguous")
-      eq_active_tensor = eq_active
-
-    self._set_world_mask(world_mask)
-    self._stage_mass_residuals(
-        component_solver, mass_low, mass_blocks_low,
-        tendon_armature_blocks_low, world_mask)
-    # Snapshot current assembly inputs only after all motion and equality
-    # inputs pass host-side validation. These writes are isolated from an
-    # already retained position_cache_* epoch.
-    self._copy_world_masked(
-        w["position_current_qvel"], qvel, world_mask, width=nv,
-        source_stride=nv, destination_stride=nv)
-    for source, current, shape in (
-        (cvel, "position_current_cvel", (b, d.nbody, 6)),
-        (cdof, "position_current_cdof", (b, d.nv, 6)),
-        (cdof_dot, "position_current_cdof_dot", (b, d.nv, 6)),
-        (poses.get("body_pos"), "position_current_body_pos", (b, d.nbody, 3)),
-        (poses.get("body_quat"), "position_current_body_quat", (b, d.nbody, 4)),
-        (poses.get("root_com"), "position_current_root_com", (b, d.nbody, 3)),
-        (poses.get("site_pos"), "position_current_site_pos", (b, d.nsite, 3)),
-        (poses.get("site_quat"), "position_current_site_quat", (b, d.nsite, 4)),
-    ):
-      destination = self._workspace[current]
-      count = int(np.prod(shape))
-      width = count // b
-      if source is None:
-        self._fill_world_masked(
-            destination, world_mask, width=width, stride=width)
-      elif width:
-        self._copy_world_masked(
-            destination, source.contiguous(), world_mask, width=width,
-            source_stride=width, destination_stride=width)
-    eq_width = int(eq_active_tensor.numel()) // b
-    self._copy_world_masked(
-        w["position_current_eq_active"], eq_active_tensor, world_mask,
-        width=eq_width, source_stride=eq_width, destination_stride=eq_width)
-    self._position_current_eq_jdot_inputs_valid = bool(
-        has_differential_eq and cvel is not None and cdof is not None
-        and cdof_dot is not None)
-
-    prefix = nr * nr + 7 * nr
-    scratch = self._workspace["workspace_debug"].reshape(b, self._debug_stride)
-    warm_offset = getattr(
-        self, "_qacc_warmstart_offset", prefix
-        + self._primal_scratch_floats - max(nv, 1))
-    tail = scratch[:, warm_offset:warm_offset + nv]
-    if qacc_warmstart is None:
-      self._fill_world_masked(
-          w["workspace_debug"], world_mask, width=nv,
-          stride=self._debug_stride, offset=warm_offset)
-    else:
-      self._copy_world_masked(
-          w["workspace_debug"], qacc_warmstart, world_mask, width=nv,
-          source_stride=nv, destination_stride=self._debug_stride,
-          destination_offset=warm_offset)
-    self._fill_world_masked(
-        w["position_assembly_context"], world_mask, width=nr * 5, stride=nr * 5)
-    self._fill_world_masked(
-        w["position_surface_velocity"], world_mask, width=nr, stride=nr)
-    # All fresh row producers start with an exact zero correction unless they
-    # explicitly publish an aref low word. The equality kernel also clears
-    # this tail, but it is not dispatched for contact-only/flex-only models;
-    # do the reset here so reusing a solver cannot inherit cached row words.
-    if world_mask is None:
-      _clear_current_aref_low(
-          w["workspace_debug"], b, nr, self._debug_stride,
-          self._aref_low_debug_offset)
-    else:
-      self._fill_world_masked(
-          w["workspace_debug"], world_mask, width=nr,
-          stride=self._debug_stride, offset=self._aref_low_debug_offset)
-    self._fill_world_masked(w["workspace_debug"], world_mask,
-        width=6*max(nr,1), stride=self._debug_stride,
-        offset=self._regularizer_low_debug_offset)
-    # Activity in this slice marks rows preassembled by the current tendon,
-    # equality, or flex producers. It also feeds the solver's tendon-row
-    # ownership test. Clear the previous assembly's bitmap before any
-    # current producer runs; otherwise a disappeared contact can be mistaken
-    # for a still-owned tendon row and replay its retained multiplier.
-    if world_mask is None:
-      _clear_current_row_ownership(
-          w["workspace_debug"], b, nr, self._debug_stride)
-    else:
-      self._fill_world_masked(
-          w["workspace_debug"], world_mask, width=nr,
-          stride=self._debug_stride, offset=nr * nr + 6 * nr)
-    awake_offset = prefix + self._solver_island_awake_offset
-    debug_i32 = scratch.view(torch.int32)
-    awake_view = debug_i32[:, awake_offset:
-                           awake_offset + max(self._solver_island_ntree, 1)]
-    awake_width = max(self._solver_island_ntree, 1)
-    if awake_tree is None:
-      self._fill_world_masked(
-          w["workspace_debug"].view(torch.int32), world_mask,
-          width=awake_width, stride=self._debug_stride,
-          offset=awake_offset, value=1)
-    else:
-      self._copy_world_masked(
-          w["workspace_debug"].view(torch.int32), awake_tree, world_mask,
-          width=awake_width, source_stride=awake_width,
-          destination_stride=self._debug_stride, destination_offset=awake_offset)
-
-    # 1. Contact normal kernel (if candidate contact pairs exist)
-    self._fill_world_masked(w["out_status"], world_mask, width=1, stride=1)
-    if candidate_token is None:
-      self.generate_candidates(
-          poses, qvel, eq_active_tensor if d.neq > 0 else None,
-          flex=flex, cvel=cvel, cdof=cdof, world_mask=world_mask)
-    # Candidate generation owns the per-pair narrowphase counts, including
-    # the fail-closed negative sentinel for an SDF output-capacity overflow.
-    # Merge it after the status reset above and before any solver route can
-    # consume the public status buffer. This also covers a current candidate
-    # token produced by an earlier position stage.
-    if self._has_sdf_contact_pairs:
-      self._merge_sdf_narrowphase_status_kernel(
-          w["contact_pair_count"], w["out_status"],
-          self._pair_contact_world_mask,
-          self._constants["pair_contact_offsets_dims"],
-          threads=(b,), group_size=(1,))
-    self._merge_flex_candidate_status()
-    if d.n_flex_contact_rows and flex is None:
-      raise ValueError(
-          "the lowered model has flex contact rows but no native flex runtime")
-
-    # 1b. Equality assembly kernel (joint/connect; weld reserved as zeros).
-    # Writes equality J into workspace_J rows [0, n_eq_rows) and R/ar into
-    # workspace_debug R/ar slots for those rows. Solver preserves these
-    # sections and treats all equality rows as bilateral.
-    if d.neq > 0 and d.n_eq_rows > 0 and self._equality_kernel is not None:
-      if cvel is None:
-        cvel_tensor = torch.zeros((b, max(d.nbody, 1) * 6), dtype=torch.float32, device=self._device)
-        # Reshape to [b, nbody, 6] with dummy when nbody==0 (never, nbody>=1).
-        try:
-          cvel_flat = cvel_tensor.reshape(-1)
-        except Exception:
-          cvel_flat = torch.zeros(max(b * max(d.nbody, 1) * 6, 1), dtype=torch.float32, device=self._device)
-      else:
-        if not isinstance(cvel, torch.Tensor):
-          raise TypeError("cvel must be a torch.Tensor")
-        cvel_flat = cvel.reshape(-1)
-      # site_pos/site_quat may be empty when nsite==0; pass dummy non-null buffers.
-      try:
-        site_pos_tensor = poses["site_pos"]
-      except KeyError:
-        site_pos_tensor = torch.zeros((b, 1, 3), dtype=torch.float32, device=self._device)
-      try:
-        site_quat_tensor = poses["site_quat"]
-      except KeyError:
-        site_quat_tensor = torch.zeros((b, 1, 4), dtype=torch.float32, device=self._device)
-      self._equality_kernel(
-          self._constants["eq_obj"], self._constants["eq_data"],
-          self._constants["eq_sol_params"], eq_active_tensor.reshape(-1),
-          self._constants["eq_rowadr"],
-          self._constants["eq_type"], self._constants["eq_objtype"],
-          self._constants["joint_qposadr"], self._constants["qpos0"],
-          self._constants["joint_dofadr"],
-          self._constants["dof_invweight0"], self._constants["body_invweight0"],
-          self._constants["site_bodyid"],
-          self._constants["body_parentid"], self._constants["body_jntadr"],
-          self._constants["body_jntnum"], self._constants["jnt_type"],
-          self._constants["jnt_dofadr"],
-          self._constants["solver_dims"], self._constants["solver_params"],
-          qpos.reshape(-1), qvel.reshape(-1),
-          poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),
-          poses["joint_anchor"].reshape(-1), poses["joint_axis"].reshape(-1),
-          site_pos_tensor.reshape(-1), self._constants["eq_rownum"],
-          w["workspace_J"], w["workspace_debug"],
-          site_quat_tensor.reshape(-1),
-          threads=(b,), group_size=(1,),
-      )
+      # These exact position snapshots feed equality Jdot-v replay. Validate
+      # them before warmstart/debug scratch is written, not after the solve.
+      if not isinstance(poses, dict):
+        raise ValueError("poses must be a mapping of FK tensors")
+      for key, shape in (("body_pos", (b, d.nbody, 3)),
+                         ("body_quat", (b, d.nbody, 4))):
+        _validate_cached_tensor(torch, self._device, f"poses[{key!r}]",
+                                poses.get(key), shape, torch.float32)
+      eq_types = np.asarray(d.eq_type, dtype=np.int32)
+      has_differential_eq = d.neq and np.any(np.isin(eq_types, (0, 1)))
+      has_site_differential_eq = bool(
+          has_differential_eq
+          and np.any(np.isin(eq_types, (0, 1))
+                     & (np.asarray(d.eq_objtype, dtype=np.int32) == 6)))
       if has_differential_eq:
-        # Equality assembly writes the position and -B*Jv terms. Apply the
-        # exact source-derived dense mj_jacDot correction separately, using
-        # the current prevalidated FK/smooth motion snapshot.
-        jdot_aref = w["position_context_zero"][:b * nr].view(b, nr)
-        self._refresh_equality_jdot(
-            qvel, cvel, cdof, cdof_dot, jdot_aref,
-            assembly_current=True, eq_active=eq_active_tensor)
-        debug = w["workspace_debug"].reshape(b, self._debug_stride)
-        ar = debug[:, nr * nr + nr:nr * nr + nr + d.n_eq_rows]
+        _validate_cached_tensor(torch, self._device, "poses['root_com']",
+                                poses.get("root_com"), (b, d.nbody, 3),
+                                torch.float32)
+        if cvel is not None:
+          _validate_cached_tensor(torch, self._device, "cvel", cvel,
+                                  (b, d.nbody, 6), torch.float32)
+        if cdof is not None:
+          _validate_cached_tensor(torch, self._device, "cdof", cdof,
+                                  (b, nv, 6), torch.float32)
+        if cdof_dot is not None:
+          _validate_cached_tensor(torch, self._device, "cdof_dot", cdof_dot,
+                                  (b, nv, 6), torch.float32)
+        if has_differential_eq and (cvel is None or cdof is None or cdof_dot is None):
+          raise ValueError(
+              "connect/weld equality assembly requires cvel, cdof, and cdof_dot")
+        if has_site_differential_eq:
+          _validate_cached_tensor(torch, self._device, "poses['site_pos']",
+                                  poses.get("site_pos"), (b, d.nsite, 3),
+                                  torch.float32)
+          _validate_cached_tensor(torch, self._device, "poses['site_quat']",
+                                  poses.get("site_quat"), (b, d.nsite, 4),
+                                  torch.float32)
+
+      # MuJoCo's WARMSTART state is qacc_warmstart for every solver family.
+      # PGS maps it to row forces before its cost check; CG/Newton compare the
+      # acceleration-space cost with qacc_smooth. The final DOF-sized tail of
+      # persistent scratch carries it without adding a Metal buffer binding.
+      if qacc_warmstart is not None:
+        if (not isinstance(qacc_warmstart, torch.Tensor)
+            or qacc_warmstart.dtype != torch.float32
+            or tuple(qacc_warmstart.shape) != (b, nv)
+            or qacc_warmstart.device.type != self._device.type
+            or (self._device.index is not None
+                and qacc_warmstart.device.index != self._device.index)
+            or not qacc_warmstart.is_contiguous()):
+          raise ValueError(
+              f"qacc_warmstart must be contiguous float32 MPS with shape {(b, nv)}"
+          )
+      if eq_active is None:
+        eq_active_tensor = self._eq_active_default
+      else:
+        if not isinstance(eq_active, torch.Tensor):
+          raise TypeError("eq_active must be a torch.Tensor")
+        expected_shape = (b, d.neq) if d.neq > 0 else (b, 1)
+        if eq_active.shape != expected_shape:
+          raise ValueError(
+              f"eq_active must have shape {expected_shape}, got {eq_active.shape}"
+          )
+        if eq_active.dtype != torch.int32:
+          raise TypeError("eq_active must have dtype torch.int32")
+        if eq_active.device.type != self._device.type:
+          raise ValueError(f"eq_active must be on {self._device.type} device")
+        if not eq_active.is_contiguous():
+          raise ValueError("eq_active must be contiguous")
+        eq_active_tensor = eq_active
+
+      self._set_world_mask(world_mask)
+      self._stage_mass_residuals(
+          component_solver, mass_low, mass_blocks_low,
+          tendon_armature_blocks_low, world_mask)
+      # Snapshot current assembly inputs only after all motion and equality
+      # inputs pass host-side validation. These writes are isolated from an
+      # already retained position_cache_* epoch.
+      self._copy_world_masked(
+          w["position_current_qvel"], qvel, world_mask, width=nv,
+          source_stride=nv, destination_stride=nv)
+      for source, current, shape in (
+          (cvel, "position_current_cvel", (b, d.nbody, 6)),
+          (cdof, "position_current_cdof", (b, d.nv, 6)),
+          (cdof_dot, "position_current_cdof_dot", (b, d.nv, 6)),
+          (poses.get("body_pos"), "position_current_body_pos", (b, d.nbody, 3)),
+          (poses.get("body_quat"), "position_current_body_quat", (b, d.nbody, 4)),
+          (poses.get("root_com"), "position_current_root_com", (b, d.nbody, 3)),
+          (poses.get("site_pos"), "position_current_site_pos", (b, d.nsite, 3)),
+          (poses.get("site_quat"), "position_current_site_quat", (b, d.nsite, 4)),
+      ):
+        destination = self._workspace[current]
+        count = int(np.prod(shape))
+        width = count // b
+        if source is None:
+          self._fill_world_masked(
+              destination, world_mask, width=width, stride=width)
+        elif width:
+          self._copy_world_masked(
+              destination, source.contiguous(), world_mask, width=width,
+              source_stride=width, destination_stride=width)
+      eq_width = int(eq_active_tensor.numel()) // b
+      self._copy_world_masked(
+          w["position_current_eq_active"], eq_active_tensor, world_mask,
+          width=eq_width, source_stride=eq_width, destination_stride=eq_width)
+      self._position_current_eq_jdot_inputs_valid = bool(
+          has_differential_eq and cvel is not None and cdof is not None
+          and cdof_dot is not None)
+
+      prefix = nr * nr + 7 * nr
+      scratch = self._workspace["workspace_debug"].reshape(b, self._debug_stride)
+      warm_offset = getattr(
+          self, "_qacc_warmstart_offset", prefix
+          + self._primal_scratch_floats - max(nv, 1))
+      tail = scratch[:, warm_offset:warm_offset + nv]
+      if qacc_warmstart is None:
+        self._fill_world_masked(
+            w["workspace_debug"], world_mask, width=nv,
+            stride=self._debug_stride, offset=warm_offset)
+      else:
         self._copy_world_masked(
-            w["workspace_debug"], jdot_aref, world_mask, width=d.n_eq_rows,
-            source_stride=nr, destination_stride=self._debug_stride,
-            destination_offset=nr * nr + nr, add=True)
-    # 1b. Tendon constraint rows (limits, friction loss, tendon equalities).
-    # Runs after equality assembly (which reserves zeros for tendon
-    # equalities) and before the coupled solve (which reads flagged rows).
-    if d.ntendon and (d.ten_friction_rows + d.ten_limit_rows > 0
-                      or bool(np.any(np.asarray(d.eq_type) == 3))):
-      if self._tendon_kernel is None:
-        raise ValueError("tendon rows require the tendon_constraint_rows kernel")
-      nt, nq = d.ntendon, d.nq
-      if tendon_J_spatial is None:
-        ten_J = torch.zeros((b * max(nt, 1) * max(nv, 1),), dtype=torch.float32, device=self._device)
+            w["workspace_debug"], qacc_warmstart, world_mask, width=nv,
+            source_stride=nv, destination_stride=self._debug_stride,
+            destination_offset=warm_offset)
+      self._fill_world_masked(
+          w["position_assembly_context"], world_mask, width=nr * 5, stride=nr * 5)
+      self._fill_world_masked(
+          w["position_surface_velocity"], world_mask, width=nr, stride=nr)
+      # All fresh row producers start with an exact zero correction unless they
+      # explicitly publish an aref low word. The equality kernel also clears
+      # this tail, but it is not dispatched for contact-only/flex-only models;
+      # do the reset here so reusing a solver cannot inherit cached row words.
+      if world_mask is None:
+        _clear_current_aref_low(
+            w["workspace_debug"], b, nr, self._debug_stride,
+            self._aref_low_debug_offset)
       else:
-        if tuple(tendon_J_spatial.shape) != (b, nt, max(nv, 1)):
-          raise ValueError(f"tendon_J_spatial must have shape {(b, nt, max(nv, 1))}")
-        ten_J = tendon_J_spatial.reshape(-1)
-      if tendon_length_spatial is None:
-        ten_L = torch.zeros((b * max(nt, 1),), dtype=torch.float32, device=self._device)
+        self._fill_world_masked(
+            w["workspace_debug"], world_mask, width=nr,
+            stride=self._debug_stride, offset=self._aref_low_debug_offset)
+      self._fill_world_masked(w["workspace_debug"], world_mask,
+          width=6*max(nr,1), stride=self._debug_stride,
+          offset=self._regularizer_low_debug_offset)
+      # Activity in this slice marks rows preassembled by the current tendon,
+      # equality, or flex producers. It also feeds the solver's tendon-row
+      # ownership test. Clear the previous assembly's bitmap before any
+      # current producer runs; otherwise a disappeared contact can be mistaken
+      # for a still-owned tendon row and replay its retained multiplier.
+      if world_mask is None:
+        _clear_current_row_ownership(
+            w["workspace_debug"], b, nr, self._debug_stride)
       else:
-        if tuple(tendon_length_spatial.shape) != (b, max(nt, 1)):
-          raise ValueError(f"tendon_length_spatial must have shape {(b, max(nt, 1))}")
-        ten_L = tendon_length_spatial.reshape(-1)
-      self._tendon_kernel(
-          qpos.reshape(-1), qvel.reshape(-1), ten_J, ten_L,
-          self._constants["ten_length_map"], self._constants["ten_moment_map"],
-          self._constants["ten_limited"], self._constants["ten_range"],
-          self._constants["ten_margin"], self._constants["ten_length0"],
-          self._constants["ten_invweight0"],
-          self._constants["ten_solref_lim"], self._constants["ten_solimp_lim"],
-          self._constants["ten_frictionloss"],
-          self._constants["ten_solref_fri"], self._constants["ten_solimp_fri"],
-          self._constants["eq_type"], self._constants["eq_obj"],
-          self._constants["eq_data"], self._constants["eq_sol_params"],
-          self._constants["eq_rowadr"], eq_active_tensor.reshape(-1),
-          self._constants["solver_dims"], self._constants["solver_params"],
-          w["workspace_J"], w["workspace_debug"],
-          threads=(b,), group_size=(1,),
-      )
+        self._fill_world_masked(
+            w["workspace_debug"], world_mask, width=nr,
+            stride=self._debug_stride, offset=nr * nr + 6 * nr)
+      awake_offset = prefix + self._solver_island_awake_offset
+      debug_i32 = scratch.view(torch.int32)
+      awake_view = debug_i32[:, awake_offset:
+                             awake_offset + max(self._solver_island_ntree, 1)]
+      awake_width = max(self._solver_island_ntree, 1)
+      if awake_tree is None:
+        self._fill_world_masked(
+            w["workspace_debug"].view(torch.int32), world_mask,
+            width=awake_width, stride=self._debug_stride,
+            offset=awake_offset, value=1)
+      else:
+        self._copy_world_masked(
+            w["workspace_debug"].view(torch.int32), awake_tree, world_mask,
+            width=awake_width, source_stride=awake_width,
+            destination_stride=self._debug_stride, destination_offset=awake_offset)
 
-    # 1c. Compiled flex equality rows.  The descriptor owns stable row IDs
-    # independent of efc offsets; flex producers provide the source row block
-    # in their own canonical order.
-    flex_eq_types = (_EQ_FLEX, _EQ_FLEXVERT, _EQ_FLEXSTRAIN)
-    if (d.neq > 0 and flex is not None
-        and bool(np.any(np.isin(np.asarray(d.eq_type), flex_eq_types)))):
-      nr_val = int(d.nr)
-      row_context = w["position_assembly_context"].view(b, nr_val, 5)
-      for eid in range(d.neq):
-        et = int(d.eq_type[eid])
-        if et not in flex_eq_types or int(d.eq_rownum[eid]) == 0:
-          continue
-        if et == _EQ_FLEX:
-          # This legacy producer evaluates all flex edges together.  Its raw
-          # coefficient context is indexed by compiled global edge ID.
-          f_pos, f_aref, f_R, f_J = flex.run_equalities(
-              poses, cvel=cvel, eq_active=eq_active_tensor,
-              equality_id=eid)
-          raw = flex.equality_position_context
-          ids = np.asarray(d.eq_row_ids[eid], dtype=np.int32)
-          # Descriptor arrays are immutable. Passing them directly as Torch
-          # indices creates a tensor over read-only NumPy storage; use owned
-          # host index values without changing the descriptor's row contract.
-          index_ids = ids.tolist()
-          rows = {
-              "row_ids": ids,
-              "J": f_J[:, index_ids, :], "R": f_R[:, index_ids],
-              "aref": f_aref[:, index_ids], "pos": raw["pos"][:, index_ids],
-              "impedance": raw["impedance"][:, index_ids],
-              "b0": raw["b0"][:, index_ids], "k0": raw["k0"][:, index_ids],
-          }
-        elif et == _EQ_FLEXVERT:
-          rows = flex.run_flexvert_equality_rows(eid, qvel)
+      # 1. Contact normal kernel (if candidate contact pairs exist)
+      self._fill_world_masked(w["out_status"], world_mask, width=1, stride=1)
+      if candidate_token is None:
+        self.generate_candidates(
+            poses, qvel, eq_active_tensor if d.neq > 0 else None,
+            flex=flex, cvel=cvel, cdof=cdof, world_mask=world_mask)
+      # Candidate generation owns the per-pair narrowphase counts, including
+      # the fail-closed negative sentinel for an SDF output-capacity overflow.
+      # Merge it after the status reset above and before any solver route can
+      # consume the public status buffer. This also covers a current candidate
+      # token produced by an earlier position stage.
+      if self._has_sdf_contact_pairs:
+        self._merge_sdf_narrowphase_status_kernel(
+            w["contact_pair_count"], w["out_status"],
+            self._pair_contact_world_mask,
+            self._constants["pair_contact_offsets_dims"],
+            threads=(b,), group_size=(1,))
+      self._merge_flex_candidate_status()
+      if d.n_flex_contact_rows and flex is None:
+        raise ValueError(
+            "the lowered model has flex contact rows but no native flex runtime")
+
+      # 1b. Equality assembly kernel (joint/connect; weld reserved as zeros).
+      # Writes equality J into workspace_J rows [0, n_eq_rows) and R/ar into
+      # workspace_debug R/ar slots for those rows. Solver preserves these
+      # sections and treats all equality rows as bilateral.
+      if d.neq > 0 and d.n_eq_rows > 0 and self._equality_kernel is not None:
+        if cvel is None:
+          cvel_tensor = torch.zeros((b, max(d.nbody, 1) * 6), dtype=torch.float32, device=self._device)
+          # Reshape to [b, nbody, 6] with dummy when nbody==0 (never, nbody>=1).
+          try:
+            cvel_flat = cvel_tensor.reshape(-1)
+          except Exception:
+            cvel_flat = torch.zeros(max(b * max(d.nbody, 1) * 6, 1), dtype=torch.float32, device=self._device)
         else:
-          rows = flex.run_flexstrain_equality_rows(eid, qvel)
+          if not isinstance(cvel, torch.Tensor):
+            raise TypeError("cvel must be a torch.Tensor")
+          cvel_flat = cvel.reshape(-1)
+        # site_pos/site_quat may be empty when nsite==0; pass dummy non-null buffers.
+        try:
+          site_pos_tensor = poses["site_pos"]
+        except KeyError:
+          site_pos_tensor = torch.zeros((b, 1, 3), dtype=torch.float32, device=self._device)
+        try:
+          site_quat_tensor = poses["site_quat"]
+        except KeyError:
+          site_quat_tensor = torch.zeros((b, 1, 4), dtype=torch.float32, device=self._device)
+        self._equality_kernel(
+            self._constants["eq_obj"], self._constants["eq_data"],
+            self._constants["eq_sol_params"], eq_active_tensor.reshape(-1),
+            self._constants["eq_rowadr"],
+            self._constants["eq_type"], self._constants["eq_objtype"],
+            self._constants["joint_qposadr"], self._constants["qpos0"],
+            self._constants["joint_dofadr"],
+            self._constants["dof_invweight0"], self._constants["body_invweight0"],
+            self._constants["site_bodyid"],
+            self._constants["body_parentid"], self._constants["body_jntadr"],
+            self._constants["body_jntnum"], self._constants["jnt_type"],
+            self._constants["jnt_dofadr"],
+            self._constants["solver_dims"], self._constants["solver_params"],
+            qpos.reshape(-1), qvel.reshape(-1),
+            poses["body_pos"].reshape(-1), poses["body_quat"].reshape(-1),
+            poses["joint_anchor"].reshape(-1), poses["joint_axis"].reshape(-1),
+            site_pos_tensor.reshape(-1), self._constants["eq_rownum"],
+            w["workspace_J"], w["workspace_debug"],
+            site_quat_tensor.reshape(-1),
+            threads=(b,), group_size=(1,),
+        )
+        if has_differential_eq:
+          # Equality assembly writes the position and -B*Jv terms. Apply the
+          # exact source-derived dense mj_jacDot correction separately, using
+          # the current prevalidated FK/smooth motion snapshot.
+          jdot_aref = w["position_context_zero"][:b * nr].view(b, nr)
+          self._refresh_equality_jdot(
+              qvel, cvel, cdof, cdof_dot, jdot_aref,
+              assembly_current=True, eq_active=eq_active_tensor)
+          debug = w["workspace_debug"].reshape(b, self._debug_stride)
+          ar = debug[:, nr * nr + nr:nr * nr + nr + d.n_eq_rows]
+          self._copy_world_masked(
+              w["workspace_debug"], jdot_aref, world_mask, width=d.n_eq_rows,
+              source_stride=nr, destination_stride=self._debug_stride,
+              destination_offset=nr * nr + nr, add=True)
+      # 1b. Tendon constraint rows (limits, friction loss, tendon equalities).
+      # Runs after equality assembly (which reserves zeros for tendon
+      # equalities) and before the coupled solve (which reads flagged rows).
+      if d.ntendon and (d.ten_friction_rows + d.ten_limit_rows > 0
+                        or bool(np.any(np.asarray(d.eq_type) == 3))):
+        if self._tendon_kernel is None:
+          raise ValueError("tendon rows require the tendon_constraint_rows kernel")
+        nt, nq = d.ntendon, d.nq
+        if tendon_J_spatial is None:
+          ten_J = torch.zeros((b * max(nt, 1) * max(nv, 1),), dtype=torch.float32, device=self._device)
+        else:
+          if tuple(tendon_J_spatial.shape) != (b, nt, max(nv, 1)):
+            raise ValueError(f"tendon_J_spatial must have shape {(b, nt, max(nv, 1))}")
+          ten_J = tendon_J_spatial.reshape(-1)
+        if tendon_length_spatial is None:
+          ten_L = torch.zeros((b * max(nt, 1),), dtype=torch.float32, device=self._device)
+        else:
+          if tuple(tendon_length_spatial.shape) != (b, max(nt, 1)):
+            raise ValueError(f"tendon_length_spatial must have shape {(b, max(nt, 1))}")
+          ten_L = tendon_length_spatial.reshape(-1)
+        self._tendon_kernel(
+            qpos.reshape(-1), qvel.reshape(-1), ten_J, ten_L,
+            self._constants["ten_length_map"], self._constants["ten_moment_map"],
+            self._constants["ten_limited"], self._constants["ten_range"],
+            self._constants["ten_margin"], self._constants["ten_length0"],
+            self._constants["ten_invweight0"],
+            self._constants["ten_solref_lim"], self._constants["ten_solimp_lim"],
+            self._constants["ten_frictionloss"],
+            self._constants["ten_solref_fri"], self._constants["ten_solimp_fri"],
+            self._constants["eq_type"], self._constants["eq_obj"],
+            self._constants["eq_data"], self._constants["eq_sol_params"],
+            self._constants["eq_rowadr"], eq_active_tensor.reshape(-1),
+            self._constants["solver_dims"], self._constants["solver_params"],
+            w["workspace_J"], w["workspace_debug"],
+            threads=(b,), group_size=(1,),
+        )
 
-        row_start = int(d.eq_rowadr[eid])
-        row_span = min(int(d.eq_rownum[eid]), len(rows["row_ids"]))
-        dbg_w = w["workspace_debug"].view(b, -1)
-        is_active = (eq_active_tensor[:, eid] != 0).float()
-        impedance = rows["impedance"]
-        k0, b0 = _expand_flex_equality_reference_coefficients(
-            rows["k0"], rows["b0"], impedance)
-        for k in range(row_span):
-          r = row_start + k
-          source_row = k
-          if r >= nr_val:
-            break
-          self._write_jacobian_rows(
-              r, rows["J"][:, source_row:source_row + 1, :nv],
-              active=is_active[:, None], world_mask=world_mask)
-          for plane, source in (
-              (0, torch.where(is_active > 0, rows["R"][:, source_row], 0.0)),
-              (1, rows["aref"][:, source_row] * is_active),
-              (2, impedance[:, source_row] * is_active),
-              (4, torch.full_like(is_active, -float("inf"))),
-              (5, torch.full_like(is_active, float("inf"))), (6, is_active)):
+      # 1c. Compiled flex equality rows.  The descriptor owns stable row IDs
+      # independent of efc offsets; flex producers provide the source row block
+      # in their own canonical order.
+      flex_eq_types = (_EQ_FLEX, _EQ_FLEXVERT, _EQ_FLEXSTRAIN)
+      if (d.neq > 0 and flex is not None
+          and bool(np.any(np.isin(np.asarray(d.eq_type), flex_eq_types)))):
+        nr_val = int(d.nr)
+        row_context = w["position_assembly_context"].view(b, nr_val, 5)
+        for eid in range(d.neq):
+          et = int(d.eq_type[eid])
+          if et not in flex_eq_types or int(d.eq_rownum[eid]) == 0:
+            continue
+          if et == _EQ_FLEX:
+            # This legacy producer evaluates all flex edges together.  Its raw
+            # coefficient context is indexed by compiled global edge ID.
+            f_pos, f_aref, f_R, f_J = flex.run_equalities(
+                poses, cvel=cvel, eq_active=eq_active_tensor,
+                equality_id=eid)
+            raw = flex.equality_position_context
+            ids = np.asarray(d.eq_row_ids[eid], dtype=np.int32)
+            # Descriptor arrays are immutable. Passing them directly as Torch
+            # indices creates a tensor over read-only NumPy storage; use owned
+            # host index values without changing the descriptor's row contract.
+            index_ids = ids.tolist()
+            rows = {
+                "row_ids": ids,
+                "J": f_J[:, index_ids, :], "R": f_R[:, index_ids],
+                "aref": f_aref[:, index_ids], "pos": raw["pos"][:, index_ids],
+                "impedance": raw["impedance"][:, index_ids],
+                "b0": raw["b0"][:, index_ids], "k0": raw["k0"][:, index_ids],
+            }
+          elif et == _EQ_FLEXVERT:
+            rows = flex.run_flexvert_equality_rows(eid, qvel)
+          else:
+            rows = flex.run_flexstrain_equality_rows(eid, qvel)
+
+          row_start = int(d.eq_rowadr[eid])
+          row_span = min(int(d.eq_rownum[eid]), len(rows["row_ids"]))
+          dbg_w = w["workspace_debug"].view(b, -1)
+          is_active = (eq_active_tensor[:, eid] != 0).float()
+          impedance = rows["impedance"]
+          k0, b0 = _expand_flex_equality_reference_coefficients(
+              rows["k0"], rows["b0"], impedance)
+          for k in range(row_span):
+            r = row_start + k
+            source_row = k
+            if r >= nr_val:
+              break
+            self._write_jacobian_rows(
+                r, rows["J"][:, source_row:source_row + 1, :nv],
+                active=is_active[:, None], world_mask=world_mask)
+            for plane, source in (
+                (0, torch.where(is_active > 0, rows["R"][:, source_row], 0.0)),
+                (1, rows["aref"][:, source_row] * is_active),
+                (2, impedance[:, source_row] * is_active),
+                (4, torch.full_like(is_active, -float("inf"))),
+                (5, torch.full_like(is_active, float("inf"))), (6, is_active)):
+              self._copy_world_masked(
+                  w["workspace_debug"], source.contiguous(), world_mask,
+                  width=1, source_stride=1, destination_stride=self._debug_stride,
+                  destination_offset=nr_val * nr_val + plane * nr_val + r)
+            self._fill_world_masked(
+                w["workspace_debug"], world_mask, width=1,
+                stride=self._debug_stride, offset=self._aref_low_debug_offset + r)
+            context = torch.stack((k0[:, source_row], b0[:, source_row],
+                                   impedance[:, source_row], rows["pos"][:, source_row],
+                                   torch.zeros_like(is_active)), dim=1)
+            self._copy_world_masked(
+                w["position_assembly_context"], context, world_mask,
+                width=5, source_stride=5, destination_stride=nr_val * 5,
+                destination_offset=r * 5)
+
+      # 1d. Fixed canonical flex-contact rows. The flex-owned producer writes
+      # every candidate's complete descriptor span, including inactive slots;
+      # no per-world host readback or legacy vertex/geom loop is used here.
+      if d.n_flex_contact_rows:
+        start = int(d.flex_contact_base)
+        stop = start + int(d.n_flex_contact_rows)
+        if stop > nr:
+          raise RuntimeError("flex contact row block exceeds coupled workspace")
+        bundle = self._flex_contact_current
+        if bundle is None:
+          if flex is not None and d.flex_contact_descriptor is not None:
+            raise RuntimeError("flex contact candidate rows were not generated")
+          # No runtime flex object means these statically reserved candidates are
+          # inactive. Keep every owned row and cached source coefficient zero.
+          self._clear_jacobian_rows(start, stop, world_mask=world_mask)
+          for offset in (nr * nr, nr * nr + nr, nr * nr + 2 * nr,
+                         nr * nr + 4 * nr,
+                         nr * nr + 5 * nr, nr * nr + 6 * nr):
+            self._fill_world_masked(
+                w["workspace_debug"], world_mask, width=stop - start,
+                stride=self._debug_stride, offset=offset + start)
+          self._fill_world_masked(
+              w["position_assembly_context"], world_mask, width=(stop - start) * 5,
+              stride=nr * 5, offset=start * 5)
+          self._fill_world_masked(
+              w["position_surface_velocity"], world_mask, width=stop - start,
+              stride=nr, offset=start)
+        else:
+          rows = bundle["rows"]
+          count = int(d.n_flex_contact_rows)
+          row_shape = (b, count)
+          if self._jacobian_layout.mode == 0:
+            _validate_cached_tensor(
+                torch, self._device, "flex rows.workspace_J",
+                rows.get("workspace_J"), (b, count, nv), torch.float32)
+          else:
+            packed_rows = rows.get("jacobian_packed")
+            if (packed_rows is not w["workspace_J"]
+                or int(rows.get("canonical_row_offset", -1)) != start):
+              raise ValueError(
+                  "sparse flex rows must borrow the canonical CSR buffer and "
+                  "their compiled global row offset")
+          for key in ("R", "aref", "lo", "hi", "active", "surface_velocity"):
+            dtype = torch.int32 if key == "active" else torch.float32
+            _validate_cached_tensor(
+                torch, self._device, f"flex rows.{key}", rows.get(key),
+                row_shape, dtype)
+          _validate_cached_tensor(
+              torch, self._device, "flex rows.position_context",
+              rows.get("position_context"), (b, count, 5), torch.float32)
+          if nv and self._jacobian_layout.mode == 0:
+            self._write_jacobian_rows(
+                start, rows["workspace_J"], world_mask=world_mask)
+          # A masked recovery may borrow healthy producer rows. Publish only
+          # selected worlds; in particular, the impedance channel shares the
+          # normal solve's RHS backing and must not overwrite retained RHS data.
+          for plane, source in ((0, rows["R"]), (1, rows["aref"]),
+                                (4, rows["lo"]), (5, rows["hi"]),
+                                (6, (rows["active"] != 0).to(torch.float32)),
+                                (2, rows["position_context"][:, :, 2])):
             self._copy_world_masked(
                 w["workspace_debug"], source.contiguous(), world_mask,
-                width=1, source_stride=1, destination_stride=self._debug_stride,
-                destination_offset=nr_val * nr_val + plane * nr_val + r)
-          self._fill_world_masked(
-              w["workspace_debug"], world_mask, width=1,
-              stride=self._debug_stride, offset=self._aref_low_debug_offset + r)
-          context = torch.stack((k0[:, source_row], b0[:, source_row],
-                                 impedance[:, source_row], rows["pos"][:, source_row],
-                                 torch.zeros_like(is_active)), dim=1)
+                width=count, source_stride=count,
+                destination_stride=self._debug_stride,
+                destination_offset=nr * nr + plane * nr + start)
           self._copy_world_masked(
-              w["position_assembly_context"], context, world_mask,
-              width=5, source_stride=5, destination_stride=nr_val * 5,
-              destination_offset=r * 5)
-
-    # 1d. Fixed canonical flex-contact rows. The flex-owned producer writes
-    # every candidate's complete descriptor span, including inactive slots;
-    # no per-world host readback or legacy vertex/geom loop is used here.
-    if d.n_flex_contact_rows:
-      start = int(d.flex_contact_base)
-      stop = start + int(d.n_flex_contact_rows)
-      if stop > nr:
-        raise RuntimeError("flex contact row block exceeds coupled workspace")
-      bundle = self._flex_contact_current
-      if bundle is None:
-        if flex is not None and d.flex_contact_descriptor is not None:
-          raise RuntimeError("flex contact candidate rows were not generated")
-        # No runtime flex object means these statically reserved candidates are
-        # inactive. Keep every owned row and cached source coefficient zero.
-        self._clear_jacobian_rows(start, stop, world_mask=world_mask)
-        for offset in (nr * nr, nr * nr + nr, nr * nr + 2 * nr,
-                       nr * nr + 4 * nr,
-                       nr * nr + 5 * nr, nr * nr + 6 * nr):
-          self._fill_world_masked(
-              w["workspace_debug"], world_mask, width=stop - start,
-              stride=self._debug_stride, offset=offset + start)
-        self._fill_world_masked(
-            w["position_assembly_context"], world_mask, width=(stop - start) * 5,
-            stride=nr * 5, offset=start * 5)
-        self._fill_world_masked(
-            w["position_surface_velocity"], world_mask, width=stop - start,
-            stride=nr, offset=start)
-      else:
-        rows = bundle["rows"]
-        count = int(d.n_flex_contact_rows)
-        row_shape = (b, count)
-        if self._jacobian_layout.mode == 0:
-          _validate_cached_tensor(
-              torch, self._device, "flex rows.workspace_J",
-              rows.get("workspace_J"), (b, count, nv), torch.float32)
-        else:
-          packed_rows = rows.get("jacobian_packed")
-          if (packed_rows is not w["workspace_J"]
-              or int(rows.get("canonical_row_offset", -1)) != start):
-            raise ValueError(
-                "sparse flex rows must borrow the canonical CSR buffer and "
-                "their compiled global row offset")
-        for key in ("R", "aref", "lo", "hi", "active", "surface_velocity"):
-          dtype = torch.int32 if key == "active" else torch.float32
-          _validate_cached_tensor(
-              torch, self._device, f"flex rows.{key}", rows.get(key),
-              row_shape, dtype)
-        _validate_cached_tensor(
-            torch, self._device, "flex rows.position_context",
-            rows.get("position_context"), (b, count, 5), torch.float32)
-        if nv and self._jacobian_layout.mode == 0:
-          self._write_jacobian_rows(
-              start, rows["workspace_J"], world_mask=world_mask)
-        # A masked recovery may borrow healthy producer rows. Publish only
-        # selected worlds; in particular, the impedance channel shares the
-        # normal solve's RHS backing and must not overwrite retained RHS data.
-        for plane, source in ((0, rows["R"]), (1, rows["aref"]),
-                              (4, rows["lo"]), (5, rows["hi"]),
-                              (6, (rows["active"] != 0).to(torch.float32)),
-                              (2, rows["position_context"][:, :, 2])):
+              w["position_assembly_context"], rows["position_context"], world_mask,
+              width=count * 5, source_stride=count * 5,
+              destination_stride=nr * 5, destination_offset=start * 5)
           self._copy_world_masked(
-              w["workspace_debug"], source.contiguous(), world_mask,
+              w["position_surface_velocity"], rows["surface_velocity"], world_mask,
               width=count, source_stride=count,
-              destination_stride=self._debug_stride,
-              destination_offset=nr * nr + plane * nr + start)
-        self._copy_world_masked(
-            w["position_assembly_context"], rows["position_context"], world_mask,
-            width=count * 5, source_stride=count * 5,
-            destination_stride=nr * 5, destination_offset=start * 5)
-        self._copy_world_masked(
-            w["position_surface_velocity"], rows["surface_velocity"], world_mask,
-            width=count, source_stride=count,
-            destination_stride=nr, destination_offset=start)
+              destination_stride=nr, destination_offset=start)
 
-    # 2. Coupled constraint solver kernel
-    solve_fn = self._solve_kernel if self.descriptor.dense_path else self._solve_block_kernel
-    slot_maps = w.get("slot_maps")
-    if slot_maps is None:
-      packed_slots = self._empty_compaction_map
-    else:
-      packed_slots = slot_maps.packed_to_logical.reshape(-1)
-    has_mass_residuals = any(value is not None for value in (
-        mass_low, mass_blocks_low, tendon_armature_blocks_low))
-    paired_smooth_input = (qfrc_smooth_low is not None
-                          or has_mass_residuals) and int(nv) > 0
-    smooth_solver_input = qfrc_smooth
-    if paired_smooth_input:
-      pair = w.get("component_smooth_acceleration_pair")
-      if pair is None:
-        raise RuntimeError("paired smooth-force workspace was not prepared")
-      pair[:b * nv].copy_(qfrc_smooth.reshape(-1))
-      if qfrc_smooth_low is None:
-        pair[b * nv:2 * b * nv].zero_()
+      # 2. Coupled constraint solver kernel
+      solve_fn = self._solve_kernel if self.descriptor.dense_path else self._solve_block_kernel
+      slot_maps = w.get("slot_maps")
+      if slot_maps is None:
+        packed_slots = self._empty_compaction_map
       else:
-        pair[b * nv:2 * b * nv].copy_(qfrc_smooth_low.reshape(-1))
-      smooth_solver_input = pair
+        packed_slots = slot_maps.packed_to_logical.reshape(-1)
+      # Row assembly and cached equality refresh have completed. Reuse
+      # the existing point-J scratch only across this disjoint solver phase.
+      if int(nv)>0:
+        rhs_offset=self._equality_jacobian_offset
+        self._copy_world_masked(w["workspace_debug"],qfrc_smooth,world_mask,width=nv,source_stride=nv,destination_stride=self._debug_stride,destination_offset=rhs_offset)
+        if qfrc_smooth_low is None:
+          self._fill_world_masked(w["workspace_debug"],world_mask,width=nv,stride=self._debug_stride,offset=rhs_offset+nv,value=0)
+        else:
+          self._copy_world_masked(w["workspace_debug"],qfrc_smooth_low,world_mask,width=nv,source_stride=nv,destination_stride=self._debug_stride,destination_offset=rhs_offset+nv)
+      has_mass_residuals = any(value is not None for value in (
+          mass_low, mass_blocks_low, tendon_armature_blocks_low))
+      paired_smooth_input = (qfrc_smooth_low is not None
+                            or has_mass_residuals) and int(nv) > 0
+      smooth_solver_input = qfrc_smooth
+      if paired_smooth_input:
+        pair = w.get("component_smooth_acceleration_pair")
+        if pair is None:
+          raise RuntimeError("paired smooth-force workspace was not prepared")
+        pair[:b * nv].copy_(qfrc_smooth.reshape(-1))
+        if qfrc_smooth_low is None:
+          pair[b * nv:2 * b * nv].zero_()
+        else:
+          pair[b * nv:2 * b * nv].copy_(qfrc_smooth_low.reshape(-1))
+        smooth_solver_input = pair
 
-    def dispatch_solver(mass_input, smooth_input=None):
-      with (_paired_smooth_input_stage(self._constants["solver_dims"])
-            if paired_smooth_input and smooth_input is None else nullcontext()):
-        dispatch_solver_bound(mass_input, smooth_input)
+      def dispatch_solver(mass_input, smooth_input=None):
+        with (_paired_smooth_input_stage(self._constants["solver_dims"])
+              if paired_smooth_input and smooth_input is None else nullcontext()):
+          dispatch_solver_bound(mass_input, smooth_input)
 
-    def dispatch_solver_bound(mass_input, smooth_input=None):
-      with _mass_residual_input_stage(solver_dims, has_mass_residuals):
-        solve_fn(
-            mass_input.reshape(-1),
-            (smooth_solver_input if smooth_input is None
-             else smooth_input).reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
-            eq_active_tensor.reshape(-1),
-            self._constants["joint_qposadr"], self._constants["qpos0"],
-            self._constants["joint_dofadr"], self._constants["joint_limited"],
-            self._constants["joint_limit_params"],
-            self._constants["joint_sol_params"],
-            self._constants["dof_frictionloss"], self._constants["dof_invweight0"],
-            self._constants["dof_sol_params"],
-            self._constants["eq_obj"], self._constants["eq_data"],
-            self._constants["eq_sol_params"],
-            w["contact_jacobian"], w["contact_row_data"],
-            self._constants["contact_friction"], self._constants["contact_condim"],
-            self._constants["solver_dims"], self._constants["solver_params"],
-            w["out_force"], w["out_acc"], w["out_status"], w["out_diagnostics"],
-            w["out_contact_force"], packed_slots, w["workspace_J"],
-            w["workspace_debug"],
-            threads=(b,), group_size=(1,))
+      def dispatch_solver_bound(mass_input, smooth_input=None):
+        with _mass_residual_input_stage(solver_dims, has_mass_residuals):
+          solve_fn(
+              mass_input.reshape(-1),
+              (smooth_solver_input if smooth_input is None
+               else smooth_input).reshape(-1), qpos.reshape(-1), qvel.reshape(-1),
+              eq_active_tensor.reshape(-1),
+              self._constants["joint_qposadr"], self._constants["qpos0"],
+              self._constants["joint_dofadr"], self._constants["joint_limited"],
+              self._constants["joint_limit_params"],
+              self._constants["joint_sol_params"],
+              self._constants["dof_frictionloss"], self._constants["dof_invweight0"],
+              self._constants["dof_sol_params"],
+              self._constants["eq_obj"], self._constants["eq_data"],
+              self._constants["eq_sol_params"],
+              w["contact_jacobian"], w["contact_row_data"],
+              self._constants["contact_friction"], self._constants["contact_condim"],
+              self._constants["solver_dims"], self._constants["solver_params"],
+              w["out_force"], w["out_acc"], w["out_status"], w["out_diagnostics"],
+              w["out_contact_force"], packed_slots, w["workspace_J"],
+              w["workspace_debug"],
+              threads=(b,), group_size=(1,))
 
-    def recompute_exact_impedance():
-      if exact_impedance is None:
-        return None
-      return self.recompute_exact_impedance_device(
-          exact_impedance, mass=mass,
-          exact_dense_solver=exact_dense_solver,
-          component_solver=component_solver, mass_blocks=mass_blocks,
-          dof_ids=awake_dof_ids, counts=awake_counts,
-          tendon_armature_blocks=tendon_armature_blocks,
-          mass_blocks_low=mass_blocks_low,
-          tendon_armature_blocks_low=tendon_armature_blocks_low)
+      def recompute_exact_impedance():
+        if exact_impedance is None:
+          return None
+        return self.recompute_exact_impedance_device(
+            exact_impedance, mass=mass,
+            exact_dense_solver=exact_dense_solver,
+            component_solver=component_solver, mass_blocks=mass_blocks,
+            dof_ids=awake_dof_ids, counts=awake_counts,
+            tendon_armature_blocks=tendon_armature_blocks,
+            mass_blocks_low=mass_blocks_low,
+            tendon_armature_blocks_low=tendon_armature_blocks_low)
 
-    solver_dims = self._constants["solver_dims"]
-    if assemble_only:
-      # The inverse API needs the same canonical rows as forward dynamics,
-      # but MuJoCo's inverse constraint path does not run an optimizer or
-      # factor the generalized mass. The -1 stage assembles contact/equality/
-      # limit/friction rows and exits before any mass or force read.
-      with _solver_dimension_stage(
-          self._constants["solver_dims"], -1, self._line_search_iterations):
-        dispatch_solver(qfrc_smooth, qfrc_smooth)
-      # Assembly-only is used internally by inverse/solver preparation. Keep
-      # sparse canonical rows packed here; `assemble_device` is the explicit
-      # dense diagnostic/query boundary when a caller requests a dense J.
-      result = self._assembly_views(include_optimizer_outputs=False,
-                                    materialize_jacobian=False)
+      solver_dims = self._constants["solver_dims"]
+      if assemble_only:
+        # The inverse API needs the same canonical rows as forward dynamics,
+        # but MuJoCo's inverse constraint path does not run an optimizer or
+        # factor the generalized mass. The -1 stage assembles contact/equality/
+        # limit/friction rows and exits before any mass or force read.
+        with _solver_dimension_stage(
+            self._constants["solver_dims"], -1, self._line_search_iterations):
+          dispatch_solver(qfrc_smooth, qfrc_smooth)
+        # Assembly-only is used internally by inverse/solver preparation. Keep
+        # sparse canonical rows packed here; `assemble_device` is the explicit
+        # dense diagnostic/query boundary when a caller requests a dense J.
+        result = self._assembly_views(include_optimizer_outputs=False,
+                                      materialize_jacobian=False)
+        self._position_current_valid = True
+        self._assembly_generation += 1
+        return result
+
+      if component_primal_route:
+        solver_dims = self._constants["solver_dims"]
+        self._stage_component_operator(tendon_armature_blocks, world_mask)
+        with _solver_dimension_stage(
+            solver_dims, -1, self._line_search_iterations):
+          dispatch_solver(mass_blocks)
+        exact_data = recompute_exact_impedance()
+        with _solver_dimension_stage(
+            solver_dims, -3, self._line_search_iterations):
+          if exact_data is None:
+            dispatch_solver(mass_blocks)
+          else:
+            with _preassembled_rows_stage(solver_dims):
+              dispatch_solver(mass_blocks)
+        exact_world_status = None if exact_data is None else exact_data["status"]
+      elif component_route:
+        solver_dims = self._constants["solver_dims"]
+        assembly_mass = mass if mass is not None else w["component_mass_rhs"]
+        with _solver_dimension_stage(
+            solver_dims, -1, self._line_search_iterations):
+          dispatch_solver(assembly_mass)
+        rhs_capacity = nr + 1
+        component_rhs = w["component_mass_rhs"][:b * rhs_capacity * nv]
+        component_rhs_low = w["component_mass_rhs_low"][:b * rhs_capacity * nv]
+        smooth_pair = w.get("component_smooth_acceleration_pair")
+        if d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS):
+          if smooth_pair is None:
+            raise RuntimeError("component PGS force-pair workspace is unavailable")
+          low_force = smooth_pair[b * nv:2 * b * nv].view(b, nv)
+          if qfrc_smooth_low is None:
+            low_force.zero_()
+          else:
+            low_force.copy_(qfrc_smooth_low)
+        else:
+          low_force = None
+        def prepare_component_rhs():
+          exact = recompute_exact_impedance()
+          self._pack_component_mass_rhs(
+              w["workspace_J"], qfrc_smooth.reshape(-1),
+              w["workspace_debug"], component_rhs,
+              solver_dims, component_rhs_low, low_force,
+              threads=(b,), group_size=(1,))
+          return exact
+
+        exact_data, (component_result, component_status) = (
+            _run_component_solve_after_prepare(
+                prepare_component_rhs,
+                lambda: component_solver.run_device(
+                    mass_blocks,
+                    component_rhs.reshape(b, rhs_capacity, nv),
+                    dof_ids=awake_dof_ids, counts=awake_counts,
+                    tendon_armature_blocks=tendon_armature_blocks,
+                    mass_blocks_low=mass_blocks_low,
+                    tendon_armature_blocks_low=tendon_armature_blocks_low,
+                    rhs_low=component_rhs_low.reshape(b, rhs_capacity, nv),
+                    world_mask=world_mask)))
+        with _solver_dimension_stage(
+            solver_dims, -2, self._line_search_iterations):
+          if exact_data is None:
+            dispatch_solver(component_solver.paired_output)
+          else:
+            with _preassembled_rows_stage(solver_dims):
+              dispatch_solver(component_solver.paired_output)
+        component_solver.merge_world_status(
+            component_status, w["out_status"], world_mask=world_mask)
+        exact_world_status = None if exact_data is None else exact_data["status"]
+      elif exact_impedance is not None:
+        solver_dims = self._constants["solver_dims"]
+        with _solver_dimension_stage(
+            solver_dims, -1, self._line_search_iterations):
+          dispatch_solver(mass, qfrc_smooth)
+        exact_data = recompute_exact_impedance()
+        with (_preassembled_rows_stage(solver_dims),
+              _paired_smooth_input_stage(solver_dims)
+              if paired_smooth_input else nullcontext()):
+          dispatch_solver(mass)
+        exact_world_status = exact_data["status"]
+      else:
+        with (_paired_smooth_input_stage(solver_dims)
+              if paired_smooth_input else nullcontext()):
+          dispatch_solver(mass)
+        exact_world_status = None
+
+      if exact_world_status is not None:
+        # The component mass-factor status returned in ``mass_status`` is a
+        # borrowed solver buffer. The regular acceleration RHS solve reuses it,
+        # so only the helper's independently owned per-world status is valid
+        # after that dispatch.
+        _merge_exact_world_status(
+            torch, w["out_status"], {"status": exact_world_status})
+
+      qacc = w["out_acc"][: b * nv].reshape(b, nv)
+      qacc_low = w["out_acc"][b * nv:2 * b * nv].reshape(b, nv)
+      qfrc_constraint = w["out_force"][: b * nv].reshape(b, nv)
+      status = w["out_status"]
+      diagnostics = w["out_diagnostics"][: b * 10].reshape(b, 10)
+      history = diagnostics[:, 2:]
+      diagnostics = diagnostics[:, :2]
+
+      result = {
+          "qacc": qacc,
+          "qacc_low": qacc_low,
+          "qfrc_constraint": qfrc_constraint,
+          "status": status,
+          "solver_diagnostics": diagnostics,
+          "solver_history": history,
+      }
+
+      # Island labels are emitted into the byte-addressed scratch tail using
+      # int32 payloads. Borrowed views preserve full row/tree IDs above 2^24.
+      if nr > 0:
+        debug_world = w["workspace_debug"].reshape(b, self._debug_stride)
+        debug_i32 = debug_world.view(torch.int32)
+        island_base = self._debug_prefix + self._solver_island_core_scratch
+        result["dof_island"] = debug_i32[:, island_base:island_base + nv]
+        result["row_island"] = debug_i32[
+            :, island_base + nv:island_base + nv + nr]
+        tree_base = island_base + nv + nr
+        body_base = tree_base + 2 * max(self._solver_island_ntree, 1)
+        result["midpoint_blocked_body"] = debug_i32[
+            :, body_base:body_base + self._solver_island_nbody]
+        result["midpoint_blocked_tree"] = debug_i32[
+            :, body_base + max(self._solver_island_nbody, 1):
+            body_base + max(self._solver_island_nbody, 1)
+            + self._solver_island_ntree]
+
+      if nr > 0:
+        # Each world owns its full persistent debug + solver-scratch stride.
+        # Reshape the complete allocation so borrowed prefix views keep the
+        # correct batch offset when per-world scratch follows the debug prefix.
+        w_debug = w["workspace_debug"].reshape(b, self._debug_stride)
+        W = w_debug[:, : nr * nr].reshape(b, nr, nr)
+        R = w_debug[:, nr * nr : nr * nr + nr].reshape(b, nr)
+        ar = w_debug[:, nr * nr + nr : nr * nr + 2 * nr].reshape(b, nr)
+        ar_low = w_debug[:, self._aref_low_debug_offset:
+                         self._aref_low_debug_offset + nr].reshape(b, nr)
+        rhs = w_debug[:, nr * nr + 2 * nr : nr * nr + 3 * nr].reshape(b, nr)
+        lam = w_debug[:, nr * nr + 3 * nr : nr * nr + 4 * nr].reshape(b, nr)
+        lo = w_debug[:, nr * nr + 4 * nr : nr * nr + 5 * nr].reshape(b, nr)
+        hi = w_debug[:, nr * nr + 5 * nr : nr * nr + 6 * nr].reshape(b, nr)
+        result.update({
+            "W": W,
+            "W_regularized": W + torch.diag_embed(R),
+            "R": R,
+            "ar": ar,
+            "ar_low": ar_low,
+            "rhs": rhs,
+            "lambda": lam,
+            "lo": lo,
+            "hi": hi,
+        })
+      if self._jacobian_layout.mode == 0:
+        result["J"] = self.materialize_jacobian()
+      else:
+          # Public query callers can request a dense view explicitly. Native
+          # stepping keeps only the packed record live.
+          result["J_packed"] = w["workspace_J"]
+          result["jacobian_layout"] = self._jacobian_layout
+          result["jacobian_pattern"] = self._jacobian_pattern
+
+      result.update({
+          "contact_friction": self._constants["contact_friction"][:nc * 5].reshape(nc, 5),
+          "contact_condim": self._constants["contact_condim"][:nc * 3],
+      })
+      if nc > 0:
+        contact_rows = axis_data(w["contact_row_data"], b, nc)
+        contact_frames = w["contact_frame"][: b * nc * 12].reshape(b, nc, 12)
+        contact_forces = w["out_contact_force"][: b * nc * 11].reshape(b, nc, 11)
+        contact_jacobians = (
+            w["contact_jacobian"][: b * nc * 6 * nv].reshape(b, nc, 6, nv)
+            if self._jacobian_layout.mode == 0 else None)
+        friction_tensor = self._constants["contact_friction"][:nc * 5].reshape(nc, 5)
+        detected = contact_rows[:, :, 0, 0]
+        if d.cone_type == int(mujoco.mjtCone.mjCONE_ELLIPTIC):
+          contact_wrench = contact_forces[:, :, :6]
+        else:
+          wrench_axes = [contact_forces[:, :, 0]]
+          for axis in range(5):
+            plus = contact_forces[:, :, 1 + 2 * axis]
+            minus = contact_forces[:, :, 2 + 2 * axis]
+            wrench_axes.append(friction_tensor[None, :, axis] * (plus - minus))
+          contact_wrench = torch.stack(wrench_axes, dim=-1)
+
+        result.update({
+            "contact_mask": detected,
+            "contact_distance": contact_rows[:, :, 0, 1],
+            "contact_velocity": contact_rows[:, :, 0, 2],
+            "contact_reference": contact_rows[:, :, 0, 3],
+            "contact_impedance": contact_rows[:, :, 0, 4],
+            "contact_normal": contact_frames[:, :, :3],
+            "contact_tangent1": contact_frames[:, :, 3:6],
+            "contact_tangent2": contact_frames[:, :, 6:9],
+            "contact_position": contact_frames[:, :, 9:12],
+            "contact_force": contact_forces[:, :, 0],
+            "contact_force_rows": contact_forces[:, :, :5],
+            "contact_solver_rows": contact_forces,
+            "contact_wrench": contact_wrench,
+        })
+        if contact_jacobians is not None:
+          result["contact_jacobian"] = contact_jacobians
+
+      if d.nr_joint > 0:
+        joint_forces = w["out_joint_force"][: b * d.nr_joint].reshape(b, d.nr_joint)
+        result["joint_force"] = joint_forces
+
       self._position_current_valid = True
       self._assembly_generation += 1
       return result
-
-    if component_primal_route:
-      solver_dims = self._constants["solver_dims"]
-      self._stage_component_operator(tendon_armature_blocks, world_mask)
-      with _solver_dimension_stage(
-          solver_dims, -1, self._line_search_iterations):
-        dispatch_solver(mass_blocks)
-      exact_data = recompute_exact_impedance()
-      with _solver_dimension_stage(
-          solver_dims, -3, self._line_search_iterations):
-        if exact_data is None:
-          dispatch_solver(mass_blocks)
-        else:
-          with _preassembled_rows_stage(solver_dims):
-            dispatch_solver(mass_blocks)
-      exact_world_status = None if exact_data is None else exact_data["status"]
-    elif component_route:
-      solver_dims = self._constants["solver_dims"]
-      assembly_mass = mass if mass is not None else w["component_mass_rhs"]
-      with _solver_dimension_stage(
-          solver_dims, -1, self._line_search_iterations):
-        dispatch_solver(assembly_mass)
-      rhs_capacity = nr + 1
-      component_rhs = w["component_mass_rhs"][:b * rhs_capacity * nv]
-      component_rhs_low = w["component_mass_rhs_low"][:b * rhs_capacity * nv]
-      smooth_pair = w.get("component_smooth_acceleration_pair")
-      if d.solver_type == int(mujoco.mjtSolver.mjSOL_PGS):
-        if smooth_pair is None:
-          raise RuntimeError("component PGS force-pair workspace is unavailable")
-        low_force = smooth_pair[b * nv:2 * b * nv].view(b, nv)
-        if qfrc_smooth_low is None:
-          low_force.zero_()
-        else:
-          low_force.copy_(qfrc_smooth_low)
-      else:
-        low_force = None
-      def prepare_component_rhs():
-        exact = recompute_exact_impedance()
-        self._pack_component_mass_rhs(
-            w["workspace_J"], qfrc_smooth.reshape(-1),
-            w["workspace_debug"], component_rhs,
-            solver_dims, component_rhs_low, low_force,
-            threads=(b,), group_size=(1,))
-        return exact
-
-      exact_data, (component_result, component_status) = (
-          _run_component_solve_after_prepare(
-              prepare_component_rhs,
-              lambda: component_solver.run_device(
-                  mass_blocks,
-                  component_rhs.reshape(b, rhs_capacity, nv),
-                  dof_ids=awake_dof_ids, counts=awake_counts,
-                  tendon_armature_blocks=tendon_armature_blocks,
-                  mass_blocks_low=mass_blocks_low,
-                  tendon_armature_blocks_low=tendon_armature_blocks_low,
-                  rhs_low=component_rhs_low.reshape(b, rhs_capacity, nv),
-                  world_mask=world_mask)))
-      with _solver_dimension_stage(
-          solver_dims, -2, self._line_search_iterations):
-        if exact_data is None:
-          dispatch_solver(component_solver.paired_output)
-        else:
-          with _preassembled_rows_stage(solver_dims):
-            dispatch_solver(component_solver.paired_output)
-      component_solver.merge_world_status(
-          component_status, w["out_status"], world_mask=world_mask)
-      exact_world_status = None if exact_data is None else exact_data["status"]
-    elif exact_impedance is not None:
-      solver_dims = self._constants["solver_dims"]
-      with _solver_dimension_stage(
-          solver_dims, -1, self._line_search_iterations):
-        dispatch_solver(mass, qfrc_smooth)
-      exact_data = recompute_exact_impedance()
-      with (_preassembled_rows_stage(solver_dims),
-            _paired_smooth_input_stage(solver_dims)
-            if paired_smooth_input else nullcontext()):
-        dispatch_solver(mass)
-      exact_world_status = exact_data["status"]
-    else:
-      with (_paired_smooth_input_stage(solver_dims)
-            if paired_smooth_input else nullcontext()):
-        dispatch_solver(mass)
-      exact_world_status = None
-
-    if exact_world_status is not None:
-      # The component mass-factor status returned in ``mass_status`` is a
-      # borrowed solver buffer. The regular acceleration RHS solve reuses it,
-      # so only the helper's independently owned per-world status is valid
-      # after that dispatch.
-      _merge_exact_world_status(
-          torch, w["out_status"], {"status": exact_world_status})
-
-    qacc = w["out_acc"][: b * nv].reshape(b, nv)
-    qacc_low = w["out_acc"][b * nv:2 * b * nv].reshape(b, nv)
-    qfrc_constraint = w["out_force"][: b * nv].reshape(b, nv)
-    status = w["out_status"]
-    diagnostics = w["out_diagnostics"][: b * 10].reshape(b, 10)
-    history = diagnostics[:, 2:]
-    diagnostics = diagnostics[:, :2]
-
-    result = {
-        "qacc": qacc,
-        "qacc_low": qacc_low,
-        "qfrc_constraint": qfrc_constraint,
-        "status": status,
-        "solver_diagnostics": diagnostics,
-        "solver_history": history,
-    }
-
-    # Island labels are emitted into the byte-addressed scratch tail using
-    # int32 payloads. Borrowed views preserve full row/tree IDs above 2^24.
-    if nr > 0:
-      debug_world = w["workspace_debug"].reshape(b, self._debug_stride)
-      debug_i32 = debug_world.view(torch.int32)
-      island_base = self._debug_prefix + self._solver_island_core_scratch
-      result["dof_island"] = debug_i32[:, island_base:island_base + nv]
-      result["row_island"] = debug_i32[
-          :, island_base + nv:island_base + nv + nr]
-      tree_base = island_base + nv + nr
-      body_base = tree_base + 2 * max(self._solver_island_ntree, 1)
-      result["midpoint_blocked_body"] = debug_i32[
-          :, body_base:body_base + self._solver_island_nbody]
-      result["midpoint_blocked_tree"] = debug_i32[
-          :, body_base + max(self._solver_island_nbody, 1):
-          body_base + max(self._solver_island_nbody, 1)
-          + self._solver_island_ntree]
-
-    if nr > 0:
-      # Each world owns its full persistent debug + solver-scratch stride.
-      # Reshape the complete allocation so borrowed prefix views keep the
-      # correct batch offset when per-world scratch follows the debug prefix.
-      w_debug = w["workspace_debug"].reshape(b, self._debug_stride)
-      W = w_debug[:, : nr * nr].reshape(b, nr, nr)
-      R = w_debug[:, nr * nr : nr * nr + nr].reshape(b, nr)
-      ar = w_debug[:, nr * nr + nr : nr * nr + 2 * nr].reshape(b, nr)
-      ar_low = w_debug[:, self._aref_low_debug_offset:
-                       self._aref_low_debug_offset + nr].reshape(b, nr)
-      rhs = w_debug[:, nr * nr + 2 * nr : nr * nr + 3 * nr].reshape(b, nr)
-      lam = w_debug[:, nr * nr + 3 * nr : nr * nr + 4 * nr].reshape(b, nr)
-      lo = w_debug[:, nr * nr + 4 * nr : nr * nr + 5 * nr].reshape(b, nr)
-      hi = w_debug[:, nr * nr + 5 * nr : nr * nr + 6 * nr].reshape(b, nr)
-      result.update({
-          "W": W,
-          "W_regularized": W + torch.diag_embed(R),
-          "R": R,
-          "ar": ar,
-          "ar_low": ar_low,
-          "rhs": rhs,
-          "lambda": lam,
-          "lo": lo,
-          "hi": hi,
-      })
-    if self._jacobian_layout.mode == 0:
-      result["J"] = self.materialize_jacobian()
-    else:
-        # Public query callers can request a dense view explicitly. Native
-        # stepping keeps only the packed record live.
-        result["J_packed"] = w["workspace_J"]
-        result["jacobian_layout"] = self._jacobian_layout
-        result["jacobian_pattern"] = self._jacobian_pattern
-
-    result.update({
-        "contact_friction": self._constants["contact_friction"][:nc * 5].reshape(nc, 5),
-        "contact_condim": self._constants["contact_condim"][:nc * 3],
-    })
-    if nc > 0:
-      contact_rows = axis_data(w["contact_row_data"], b, nc)
-      contact_frames = w["contact_frame"][: b * nc * 12].reshape(b, nc, 12)
-      contact_forces = w["out_contact_force"][: b * nc * 11].reshape(b, nc, 11)
-      contact_jacobians = (
-          w["contact_jacobian"][: b * nc * 6 * nv].reshape(b, nc, 6, nv)
-          if self._jacobian_layout.mode == 0 else None)
-      friction_tensor = self._constants["contact_friction"][:nc * 5].reshape(nc, 5)
-      detected = contact_rows[:, :, 0, 0]
-      if d.cone_type == int(mujoco.mjtCone.mjCONE_ELLIPTIC):
-        contact_wrench = contact_forces[:, :, :6]
-      else:
-        wrench_axes = [contact_forces[:, :, 0]]
-        for axis in range(5):
-          plus = contact_forces[:, :, 1 + 2 * axis]
-          minus = contact_forces[:, :, 2 + 2 * axis]
-          wrench_axes.append(friction_tensor[None, :, axis] * (plus - minus))
-        contact_wrench = torch.stack(wrench_axes, dim=-1)
-
-      result.update({
-          "contact_mask": detected,
-          "contact_distance": contact_rows[:, :, 0, 1],
-          "contact_velocity": contact_rows[:, :, 0, 2],
-          "contact_reference": contact_rows[:, :, 0, 3],
-          "contact_impedance": contact_rows[:, :, 0, 4],
-          "contact_normal": contact_frames[:, :, :3],
-          "contact_tangent1": contact_frames[:, :, 3:6],
-          "contact_tangent2": contact_frames[:, :, 6:9],
-          "contact_position": contact_frames[:, :, 9:12],
-          "contact_force": contact_forces[:, :, 0],
-          "contact_force_rows": contact_forces[:, :, :5],
-          "contact_solver_rows": contact_forces,
-          "contact_wrench": contact_wrench,
-      })
-      if contact_jacobians is not None:
-        result["contact_jacobian"] = contact_jacobians
-
-    if d.nr_joint > 0:
-      joint_forces = w["out_joint_force"][: b * d.nr_joint].reshape(b, d.nr_joint)
-      result["joint_force"] = joint_forces
-
-    self._position_current_valid = True
-    self._assembly_generation += 1
-    return result
 
   def recompute_exact_impedance_device(
       self, exact_impedance, *, mass=None, exact_dense_solver=None,

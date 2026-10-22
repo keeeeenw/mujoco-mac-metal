@@ -1360,8 +1360,9 @@ def estimate_workspace(nv, npairs, nslots, nr, nr_joint, neq, batch,
       ("pair_mask", _bytes(guarded(b * max(int(npairs), 1)))),
       # Double-precision constant residuals for paired aref, per pair
       # [solref(2), solimp(5), margin/gap(2), solreffriction(2),
-      # friction(5), source-frame flag(1), weights/impratio pairs(6)] = 23 words, shared across worlds.
-      ("pair_const_lo", _bytes(max(int(npairs) * 23, 23))),
+      # friction(5), source-frame flag(1), weights/impratio pairs(6)] = 23
+      # words plus a parallel 23-word source tail plane, shared across worlds.
+      ("pair_const_lo", _bytes(max(int(npairs) * 46, 46))),
       ("workspace_J", _bytes(guarded(b * jacobian_words))),
       ("position_context_zero", _bytes(guarded(b * int(nr)))),
       ("position_context", _bytes(guarded(b * int(nr) * 5))),

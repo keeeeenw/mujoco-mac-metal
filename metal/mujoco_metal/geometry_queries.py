@@ -229,8 +229,9 @@ class GeometryQueryProgram:
           self._terrain_margins,self._terrain_dims,self._terrain_map,self.hull,self.info,
           self._terrain_status)
       if self._terrain:
-        library.common_ccd_hfield_mesh_candidates(*candidate_args,
+        library.common_ccd_hfield_mesh_candidates(*candidate_args,self._terrain_margin_source,
             threads=(b*self.count,),group_size=(1,))
+        t.mps.synchronize()
       if self._libccd:
         for phase in range(5):
           library.common_ccd_rigid_convex_candidates(

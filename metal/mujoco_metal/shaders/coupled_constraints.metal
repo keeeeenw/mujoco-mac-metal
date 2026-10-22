@@ -2299,6 +2299,251 @@ inline PrimalFloat3Pair p3_scale_pair(PrimalFloat3Pair a, PrimalFloatPair s) {
   return {primal_pair_product(a.x, s), primal_pair_product(a.y, s),
           primal_pair_product(a.z, s)};
 }
+// Source-rounded contact constants retain three words until the public
+// two-word solver boundary. No host force, contact or acceleration is used.
+inline FlexDD primal_source_max_minval(FlexDD value) {
+  FlexDD floor = FlexDD{0x1.203afa0000000p-50f,-0x1.18a9ea0000000p-78f,0x0.0p+0f};
+  return flex_dd_compare(value, floor) < 0 ? floor : value;
+}
+// Round all source words before reducing the public storage to two words.
+inline float primal_source_float_neighbor(float value, bool upward) {
+  uint bits=as_type<uint>(value);
+  if ((bits&0x7fffffffu)==0u)
+    return as_type<float>(upward ? 1u : 0x80000001u);
+  bool negative=(bits&0x80000000u)!=0u;
+  return as_type<float>(upward != negative ? bits+1u : bits-1u);
+}
+inline float primal_source_float_round(FlexDD value, float subtract) {
+  float lead=value.hi;
+  if ((as_type<uint>(lead)&0x7fffffffu)==0u) lead=value.lo;
+  if ((as_type<uint>(lead)&0x7fffffffu)==0u) lead=value.tail;
+  if ((as_type<uint>(lead)&0x7fffffffu)==0u || !isfinite(lead)) return lead;
+  int shift=20-flex_float_exponent(lead);
+  FlexDD scaled=flex_dd_scalbn(value,shift);
+  thread float work[32],scratch[32];int count=0;
+  count=flex_expansion_add(work,count,scaled.tail,scratch);
+  count=flex_expansion_add(work,count,scaled.lo,scratch);
+  count=flex_expansion_add(work,count,scaled.hi,scratch);
+  count=flex_expansion_add(work,count,-flex_float_scalbn(subtract,shift),scratch);
+  if(flex_expansion_sign(work,count)==0) return 0.0f;
+  float estimate=0;
+  for(int i=count-1;i>=0;i--) estimate+=work[i];
+  float candidate=flex_float_scalbn(estimate,-shift);
+  if(!isfinite(candidate)) return candidate;
+  float lower=primal_source_float_neighbor(candidate,false);
+  float upper=primal_source_float_neighbor(candidate,true);
+  float center=flex_float_scalbn(candidate,shift);
+  count=flex_expansion_add(work,count,-center,scratch);
+  float lower_half=(flex_float_scalbn(lower,shift)-center)*0.5f;
+  float upper_half=(flex_float_scalbn(upper,shift)-center)*0.5f;
+  bool even=(as_type<uint>(candidate)&1u)==0u;
+  int cmp=flex_expansion_compare_value(work,count,lower_half);
+  if(cmp<0 || (cmp==0 && !even)) return lower;
+  cmp=flex_expansion_compare_value(work,count,upper_half);
+  if(cmp>0 || (cmp==0 && !even)) return upper;
+  return candidate;
+}
+inline PrimalFloatPair primal_source_pair(FlexDD value) {
+  float hi=primal_source_float_round(value,0.0f);
+  if(!isfinite(hi)) return primal_pair_renormalize(value.hi,value.lo+value.tail);
+  // Subtract before rescaling: a residual storage word can be subnormal.
+  // An unscaled source_sub would flush it before publication can recover it.
+  return PrimalFloatPair{hi,primal_source_float_round(value,hi)};
+}
+
+// Public split only: scale overlapping words before rounding so Metal FTZ
+// cannot erase a subnormal input or residual. Widely separated words are
+// already canonical and must be copied, including their subnormal low word.
+inline PrimalFloatPair primal_acceleration_publication_pair(float hi, float lo) {
+  uint ah=as_type<uint>(hi)&0x7fffffffu, al=as_type<uint>(lo)&0x7fffffffu;
+  if (ah>=0x7f800000u || al>=0x7f800000u) return {hi,lo};
+  float big=ah>=al?hi:lo, small=ah>=al?lo:hi;
+  uint ab=max(ah,al), as=min(ah,al);
+  if (ab==0u) return {hi,lo};
+  if (as==0u || flex_float_exponent(big)-flex_float_exponent(small)>26)
+    return {big,small};
+  FlexDD value={big,small,0};
+  float high=primal_source_float_round(value,0.0f);
+  // Do not create a new nonfinite value from an existing finite pair whose
+  // exact sum lies outside single-word range; preserve prior fault semantics.
+  if ((as_type<uint>(high)&0x7f800000u)==0x7f800000u) return {hi,lo};
+  return {high,primal_source_float_round(value,high)};
+}
+
+inline FlexDD primal_source_contact_K(FlexDD r0, FlexDD r1, FlexDD d1) {
+  FlexDD denominator = flex_dd_source_mul(d1,d1);
+  if (flex_dd_compare(r0,FlexDD{0,0,0}) > 0) {
+    denominator=flex_dd_source_mul(denominator,r0);
+    denominator=flex_dd_source_mul(denominator,r0);
+    denominator=flex_dd_source_mul(denominator,r1);
+    denominator=flex_dd_source_mul(denominator,r1);
+    return flex_dd_source_div(FlexDD{1,0,0},primal_source_max_minval(denominator));
+  }
+  return flex_dd_source_div(flex_dd_neg(r0),primal_source_max_minval(denominator));
+}
+inline FlexDD primal_source_contact_B(FlexDD r0, FlexDD r1, FlexDD d1) {
+  if (flex_dd_compare(r1,FlexDD{0,0,0}) > 0)
+    return flex_dd_source_div(FlexDD{2,0,0},primal_source_max_minval(
+        flex_dd_source_mul(d1,r0)));
+  return flex_dd_source_div(flex_dd_neg(r1),d1);
+}
+// Private general source-precision power for the admitted impedance domain.
+// Internal three-float expansions retain guard bits; source API operations
+// round to53 bits. Exponents remain separate across binary64 range boundaries.
+struct CausalSourceNumber012 { FlexDD value; int exponent; };
+inline FlexDD causal_wide_pack_012(thread float* e,int n) {
+  float h=0;for(int i=n-1;i>=0;i--)h+=e[i];
+  thread float s[32];n=flex_expansion_add(e,n,-h,s);
+  float l=0;for(int i=n-1;i>=0;i--)l+=e[i];
+  n=flex_expansion_add(e,n,-l,s);
+  float t=0;for(int i=n-1;i>=0;i--)t+=e[i];
+  return FlexDD{h,l,t};
+}
+inline FlexDD causal_wide_add_012(FlexDD a,FlexDD b) {
+  thread float e[32],s[32];int n=0;
+  n=flex_expansion_add(e,n,a.hi,s);n=flex_expansion_add(e,n,a.lo,s);n=flex_expansion_add(e,n,a.tail,s);
+  n=flex_expansion_add(e,n,b.hi,s);n=flex_expansion_add(e,n,b.lo,s);n=flex_expansion_add(e,n,b.tail,s);
+  return causal_wide_pack_012(e,n);
+}
+inline FlexDD causal_wide_mul_012(FlexDD a,FlexDD b) {
+  thread float av[3]={a.hi,a.lo,a.tail},bv[3]={b.hi,b.lo,b.tail},e[32],s[32];int n=0;
+  for(int i=0;i<3;i++)for(int j=0;j<3;j++) {
+    float p=av[i]*bv[j];n=flex_expansion_add(e,n,fma(av[i],bv[j],-p),s);n=flex_expansion_add(e,n,p,s);
+  }
+  return causal_wide_pack_012(e,n);
+}
+inline FlexDD causal_wide_div_012(FlexDD a,FlexDD b) {
+  FlexDD q={0,0,0},r=a;
+  for(int k=0;k<4;k++) {
+    float digit=r.hi/b.hi;q=causal_wide_add_012(q,{digit,0,0});
+    r=causal_wide_add_012(a,flex_dd_neg(causal_wide_mul_012(b,q)));
+  }
+  return q;
+}
+inline CausalSourceNumber012 causal_number_012(FlexDD a,int exponent) {
+  a=flex_dd_source_add(a,{0,0,0});
+  if(!isfinite(a.hi)||a.hi==0)return {a,0};
+  int e=flex_float_exponent(a.hi);a=flex_dd_scalbn(a,-e);exponent+=e;
+  if(flex_dd_compare_exact(flex_dd_abs(a),{.5f,0,0})<0){a=flex_dd_scalbn(a,1);exponent--;}
+  if(exponent>1024)return {{copysign(INFINITY,a.hi),0,0},0};
+  if(exponent< -1074)return {{copysign(0.0f,a.hi),0,0},0};
+  if(exponent< -1021) {
+    bool negative=a.hi<0;FlexDD v=negative?flex_dd_neg(a):a;
+    long significand=long(flex_float_scalbn(v.hi,53))+long(flex_float_scalbn(v.lo,53))+long(flex_float_scalbn(v.tail,53));
+    int shift=-1021-exponent;ulong bits=ulong(significand),integer=bits>>shift;
+    ulong remainder=bits&((1ul<<shift)-1ul),halfway=1ul<<(shift-1);
+    if(remainder>halfway||(remainder==halfway&&(integer&1ul)))integer++;
+    ulong restored=integer<<shift;
+    a={ldexp(float(restored>>29),-24),ldexp(float((restored>>5)&0xfffffful),-48),ldexp(float(restored&31ul),-53)};
+    if(negative)a=flex_dd_neg(a);
+  }
+  return {a,exponent};
+}
+inline CausalSourceNumber012 causal_number_mul_012(CausalSourceNumber012 a,CausalSourceNumber012 b) {
+  if(!isfinite(a.value.hi)||!isfinite(b.value.hi))return {{a.value.hi*b.value.hi,0,0},0};
+  return causal_number_012(flex_dd_source_mul(a.value,b.value),a.exponent+b.exponent);
+}
+inline CausalSourceNumber012 causal_number_div_012(CausalSourceNumber012 a,CausalSourceNumber012 b) {
+  if(!isfinite(a.value.hi)||!isfinite(b.value.hi)||b.value.hi==0)return {{a.value.hi/b.value.hi,0,0},0};
+  return causal_number_012(flex_dd_source_div(a.value,b.value),a.exponent-b.exponent);
+}
+inline FlexDD causal_number_value_012(CausalSourceNumber012 a) {
+  return flex_dd_scalbn(a.value,a.exponent);
+}
+inline FlexDD causal_wide_log_012(FlexDD x) {
+  int e=flex_float_exponent(x.hi);FlexDD m=flex_dd_scalbn(x,-e);
+  if(flex_dd_compare_exact(m,{.7071067690849304f,1.2101617152815436e-8f,0})<0){m=flex_dd_scalbn(m,1);e--;}
+  FlexDD z=causal_wide_div_012(causal_wide_add_012(m,{-1,0,0}),causal_wide_add_012(m,{1,0,0}));
+  FlexDD square=causal_wide_mul_012(z,z),term=z,sum=z;
+  for(int k=1;k<=23;k++) {
+    term=causal_wide_mul_012(term,square);
+    sum=causal_wide_add_012(sum,causal_wide_div_012(term,{float(2*k+1),0,0}));
+  }
+  // FlexDD{0.69314718246459960938f,-1.9046542121259335545e-09f,-8.7831837385893393906e-17f} is generated as72-bit mathematical constant, not a model word.
+  FlexDD ln2=FlexDD{0.69314718246459960938f,-1.9046542121259335545e-09f,-8.7831837385893393906e-17f};
+  return causal_wide_add_012(causal_wide_mul_012(sum,{2,0,0}),causal_wide_mul_012(ln2,{float(e),0,0}));
+}
+inline CausalSourceNumber012 causal_source_power_012(FlexDD a,FlexDD b) {
+  a=flex_dd_source_add(a,{0,0,0});b=flex_dd_source_add(b,{0,0,0});
+  if(flex_dd_compare_exact(b,{0,0,0})==0||flex_dd_compare_exact(a,{1,0,0})==0)return {{.5f,0,0},1};
+  if(a.hi==0&&b.hi>0)return {{0,0,0},0};
+  if(!isfinite(a.hi)||!isfinite(b.hi)||a.hi<0||b.hi<0)return {{as_type<float>(0x7fc00000u),0,0},0};
+  if(flex_dd_compare_exact(b,{1,0,0})==0)return causal_number_012(a,0);
+  if(flex_dd_compare_exact(b,{2,0,0})==0)return causal_number_mul_012(causal_number_012(a,0),causal_number_012(a,0));
+  FlexDD logarithm=causal_wide_log_012(a);
+  // Valid impedance bases lie in(0,1). Far-underflow detection precedes any
+  // large exponent multiplication; binary64 pow is exactly zero here.
+  if(logarithm.hi<0&&b.hi*(-logarithm.hi)>800)return {{0,0,0},0};
+  FlexDD t=causal_wide_mul_012(b,logarithm),ln2=FlexDD{0.69314718246459960938f,-1.9046542121259335545e-09f,-8.7831837385893393906e-17f};
+  int k=int(rint(t.hi*1.4426950408889634f));
+  FlexDD r=causal_wide_add_012(t,flex_dd_neg(causal_wide_mul_012(ln2,{float(k),0,0})));
+  FlexDD half_ln2=causal_wide_mul_012(ln2,{.5f,0,0});
+  if(flex_dd_compare_exact(r,half_ln2)>0){r=causal_wide_add_012(r,flex_dd_neg(ln2));k++;}
+  if(flex_dd_compare_exact(r,flex_dd_neg(half_ln2))<0){r=causal_wide_add_012(r,ln2);k--;}
+  FlexDD term={1,0,0},sum=term;
+  for(int n=1;n<=28;n++) {
+    term=causal_wide_div_012(causal_wide_mul_012(term,r),{float(n),0,0});sum=causal_wide_add_012(sum,term);
+  }
+  return causal_number_012(sum,k);
+}
+inline FlexDD causal_one_minus_product_012(CausalSourceNumber012 a,CausalSourceNumber012 b) {
+  if(!isfinite(a.value.hi)||!isfinite(b.value.hi))return {1-a.value.hi*b.value.hi,0,0};
+  if(a.value.hi==0||b.value.hi==0)return {1,0,0};
+  int e=a.exponent+b.exponent;
+  if(e< -54)return {1,0,0};
+  FlexDD value=flex_dd_source_fma(flex_dd_neg(a.value),b.value,{ldexp(1.0f,-e),0,0});
+  return flex_dd_scalbn(value,e);
+}
+
+inline FlexDD primal_source_contact_impedance(thread const FlexDD* si,
+    FlexDD position, FlexDD margin, FlexDD fallback, thread bool& supported) {
+  supported=true;
+  if (flex_dd_compare(si[0],si[1])==0 ||
+      flex_dd_compare(si[2],primal_source_max_minval(FlexDD{0,0,0}))<=0)
+    return flex_dd_source_mul(FlexDD{.5f,0,0},flex_dd_source_add(si[0],si[1]));
+  FlexDD x=flex_dd_source_div(flex_dd_source_sub(position,margin),si[2]);
+  if(flex_dd_compare(x,FlexDD{0,0,0})<0)x=flex_dd_neg(x);
+  if(flex_dd_compare(x,FlexDD{1,0,0})>=0)return si[1];
+  if(flex_dd_compare(x,FlexDD{0,0,0})<=0)return si[0];
+  FlexDD y;
+  if(flex_dd_compare(si[4],FlexDD{1,0,0})==0)y=x;
+  else if(flex_dd_compare(si[4],FlexDD{2,0,0})==0) {
+    if(flex_dd_compare(x,si[3])<=0) {
+      FlexDD a=flex_dd_source_div(FlexDD{1,0,0},si[3]);
+      y=flex_dd_source_mul(a,flex_dd_source_mul(x,x));
+    } else {
+      FlexDD one_minus_mid=flex_dd_source_sub(FlexDD{1,0,0},si[3]);
+      FlexDD b=flex_dd_source_div(FlexDD{1,0,0},one_minus_mid);
+      FlexDD one_minus_x=flex_dd_source_sub(FlexDD{1,0,0},x);
+      y=flex_dd_source_fma(flex_dd_neg(b),
+          flex_dd_source_mul(one_minus_x,one_minus_x),FlexDD{1,0,0});
+    }
+  } else {
+    FlexDD power=si[4],minus_one=flex_dd_source_sub(power,{1,0,0});
+    CausalSourceNumber012 one={{.5f,0,0},1};
+    if(flex_dd_compare(x,si[3])<=0) {
+      CausalSourceNumber012 a=causal_number_div_012(one,causal_source_power_012(si[3],minus_one));
+      y=causal_number_value_012(causal_number_mul_012(a,causal_source_power_012(x,power)));
+    } else {
+      FlexDD complement_mid=flex_dd_source_sub({1,0,0},si[3]);
+      FlexDD complement_x=flex_dd_source_sub({1,0,0},x);
+      CausalSourceNumber012 inverse=causal_number_div_012(one,causal_source_power_012(complement_mid,minus_one));
+      y=causal_one_minus_product_012(inverse,causal_source_power_012(complement_x,power));
+    }    if(!isfinite(y.hi))return y;
+  }
+  return flex_dd_source_fma(y,flex_dd_source_sub(si[1],si[0]),si[0]);
+}
+inline FlexDD primal_source_contact_aref(FlexDD B, FlexDD K, FlexDD impedance,
+    FlexDD velocity, FlexDD position, FlexDD margin) {
+  FlexDD stiffness=flex_dd_source_mul(K,impedance);
+  stiffness=flex_dd_source_mul(stiffness,flex_dd_source_sub(position,margin));
+  return flex_dd_source_fma(flex_dd_neg(B),velocity,flex_dd_neg(stiffness));
+}
+inline FlexDD primal_source_contact_R(FlexDD impedance, FlexDD weight) {
+  return flex_dd_source_div(flex_dd_source_mul(
+      flex_dd_source_sub(FlexDD{1,0,0},impedance),weight),impedance);
+}
+
 kernel void contact_jacobian_low(
     device const int* geom_bodyid [[buffer(0)]],
     device const float* body_pos [[buffer(1)]],
@@ -2373,8 +2618,9 @@ kernel void contact_jacobian_low(
   float lmargin = pair_margin_gap[pair_idx * 2 + 0];
   // Double-precision constant residuals, layout per pair [solref_lo(2),
   // solimp_lo(5), margin_lo(2), solreffriction_lo(2)]: lo = clamped f64
-  // TRUE - f32 stored hi (pinned preprocessing mirrored on host), so hi+lo
-  // recovers the pinned CPU constants. Friction residuals follow, with
+  // TRUE - f32 stored hi (pinned preprocessing mirrored on host). The
+  // parallel tail plane retains the remainder of that rounded low word.
+  // Friction residuals follow, with
   // a final flag identifying source fresh zero-tangent frames.
   int clo = pair_idx * 23;
   PrimalFloatPair pK, pB;
@@ -2420,6 +2666,24 @@ kernel void contact_jacobian_low(
       PrimalFloatPair fr1p = {fr1, pair_const_lo[clo + 10]};
       pFrictionB = primal_pair_divide(primal_pair_multiply(fr1p, -1.0f), d1p);
     }
+  }
+  // Tail words share binding29 after all original23-word pair records.
+  int ctail=23*npairs+clo;
+  FlexDD source_sr[2],source_si[5],source_fr[5];
+  for(int i=0;i<2;i++)source_sr[i]=FlexDD{pair_solref[2*pair_idx+i],
+      pair_const_lo[clo+i],pair_const_lo[ctail+i]};
+  for(int i=0;i<5;i++)source_si[i]=FlexDD{pair_solimp[5*pair_idx+i],
+      pair_const_lo[clo+2+i],pair_const_lo[ctail+2+i]};
+  for(int i=0;i<5;i++)source_fr[i]=FlexDD{pair_friction[5*pair_idx+i],
+      pair_const_lo[clo+11+i],pair_const_lo[ctail+11+i]};
+  FlexDD source_margin={lmargin,pair_const_lo[clo+7],pair_const_lo[ctail+7]};
+  FlexDD source_K=primal_source_contact_K(source_sr[0],source_sr[1],source_si[1]);
+  FlexDD source_B=primal_source_contact_B(source_sr[0],source_sr[1],source_si[1]);
+  FlexDD source_friction_B=source_B;
+  if(cone>.5f && (pair_solreffriction[2*pair_idx]!=0 || pair_solreffriction[2*pair_idx+1]!=0)) {
+    FlexDD fr0={pair_solreffriction[2*pair_idx],pair_const_lo[clo+9],pair_const_lo[ctail+9]};
+    FlexDD fr1={pair_solreffriction[2*pair_idx+1],pair_const_lo[clo+10],pair_const_lo[ctail+10]};
+    source_friction_B=primal_source_contact_B(fr0,fr1,source_si[1]);
   }
   device float* jacobian_record = jacobian_paired;
   {
@@ -2656,8 +2920,9 @@ kernel void contact_jacobian_low(
         }
       }
     }
-    // Paired aref correction for this slot's six rows (mirrors the hot
-    // kernel's row formulas exactly; hi words above are untouched).
+    // Source reference refinement for this slot's six rows. Publish the
+    // canonical pair instead of packing its high-word correction into one
+    // residual float. General pow branches retain the preceding paired path.
     // E_vel comes from the pair axis accumulators; E_d uses the stored
     // distance low word (record-relative [9], zero for non-SDF). Writes
     // row_data[...+6] = E_aref - aref_hi; canonical assembly carries it
@@ -2737,8 +3002,20 @@ kernel void contact_jacobian_low(
             eAref = primal_pair_multiply(
                 primal_pair_product(Bf, velE), -1.0f);
           }
-          alo = (eAref.hi - aref_hi) + eAref.lo;
-          alo = alo + 0.0f;
+          FlexDD source_distance={d_hi,contact_records[res+9],contact_records[res+10]};
+          bool source_imp_supported;
+          FlexDD source_imp=primal_source_contact_impedance(source_si,
+              source_distance,source_margin,FlexDD{impP.hi,impP.lo,0},source_imp_supported);
+          if(source_imp_supported) {
+            FlexDD source_velocity={velE.hi,velE.lo,0};
+            FlexDD source_aref=(row==0 || (dim==3 && cone<.5f))
+                ? primal_source_contact_aref(source_B,source_K,source_imp,
+                    source_velocity,source_distance,source_margin)
+                : flex_dd_source_mul(flex_dd_neg(cone>.5f?source_friction_B:source_B),source_velocity);
+            eAref=primal_source_pair(source_aref);
+          }
+          contact_row_data[rr+3]=eAref.hi;
+          alo=eAref.lo;
           // Pinned mj_makeImpedance: form R from retained source constants,
           // then apply the cone's friction impedance adjustment. The sidecar
           // leaves the original seven-word axis API unchanged.
@@ -2760,6 +3037,28 @@ kernel void contact_jacobian_low(
             reg = primal_pair_multiply(primal_pair_product(
                 primal_pair_product(master,master),primal_pair_product(reg,
                     primal_pair_add({1,0},mu0sq))),2);
+          }
+          if(source_imp_supported) {
+            FlexDD weight={pair_const_lo[clo+17],pair_const_lo[clo+18],pair_const_lo[ctail+17]};
+            FlexDD ratio_source=primal_source_max_minval(FlexDD{pair_const_lo[clo+21],
+                pair_const_lo[clo+22],pair_const_lo[ctail+21]});
+            FlexDD sr=primal_source_max_minval(primal_source_contact_R(source_imp,weight));
+            if(dim>1 && cone>.5f && row>0 && row<dim) {
+              sr=flex_dd_source_div(sr,ratio_source);
+              if(row>1) {
+                sr=flex_dd_source_mul(flex_dd_source_mul(sr,source_fr[0]),source_fr[0]);
+                sr=flex_dd_source_div(sr,flex_dd_source_mul(source_fr[row-1],source_fr[row-1]));
+              }
+            } else if(dim>1 && cone<.5f) {
+              FlexDD mu0sq=flex_dd_source_mul(source_fr[0],source_fr[0]);
+              sr=flex_dd_source_mul(sr,flex_dd_source_add(FlexDD{1,0,0},mu0sq));
+              FlexDD tangential=flex_dd_source_div(sr,ratio_source);
+              FlexDD master=flex_dd_source_mul(source_fr[0],
+                  flex_dd_source_sqrt(flex_dd_source_div(tangential,sr)));
+              sr=flex_dd_source_mul(flex_dd_source_mul(
+                  flex_dd_source_mul(FlexDD{2,0,0},master),master),sr);
+            }
+            reg=primal_source_pair(sr);
           }
           contact_row_data[slotbase+42+row] = reg.hi;
           contact_row_data[slotbase+48+row] = reg.lo;
@@ -3368,6 +3667,71 @@ inline void primal_elliptic_hessian_pair(
 // out of acceleration, row residual, force, or gradient.  Public output is
 // still emitted as float32; the pair state is used only while the bounded
 // solver is active.
+
+inline FlexDD primal_scalar_source_force(PrimalFloatPair residual,
+    PrimalFloatPair regularizer) {
+  return flex_dd_source_mul(FlexDD{-residual.hi,-residual.lo,0},
+      flex_dd_source_div(FlexDD{1,0,0},FlexDD{regularizer.hi,regularizer.lo,0}));
+}
+inline FlexDD primal_source_transpose_force_add(FlexDD sum,
+    PrimalFloatPair jacobian, FlexDD force) {
+  return flex_dd_source_fma(FlexDD{jacobian.hi,jacobian.lo,0},force,sum);
+}
+inline PrimalFloatPair primal_source_gradient_pair(PrimalFloatPair gauss,
+    FlexDD transpose_force) {
+  return primal_source_pair(flex_dd_source_sub(FlexDD{gauss.hi,gauss.lo,0},transpose_force));
+}
+
+
+inline FlexDD primal_refresh_scalar_input53(FlexDD v) {
+ float lead=v.hi;if(lead==0)lead=v.lo;if(lead==0)lead=v.tail;
+ if(lead==0 || !isfinite(lead))return v;
+ int shift=20-flex_float_exponent(lead);
+ return flex_dd_scalbn(flex_dd_source_add(flex_dd_scalbn(v,shift),FlexDD{0,0,0}),-shift);
+}
+inline FlexDD primal_refresh_dot_entry(device const float* mass,bool sparse_mass,
+ device const float* debug,constant int* dims,device const float* J,
+ int row,int column,int nv,bool jacobian) {
+ float h=jacobian?ccj_get(J,row,column,nv):sparse_mass?
+   solver_component_mass_entry(debug,dims,nv,row,column):mass[row*nv+column];
+ float l=jacobian?ccj_get_lo(J,row,column,nv):solver_operator_mass_low(debug,dims,nv,row,column,sparse_mass);
+ return primal_refresh_scalar_input53(FlexDD{h,l,0});
+}
+inline FlexDD primal_refresh_source_dot(device const float* mass,bool sparse_mass,
+ device const float* debug,constant int* dims,device const float* J,
+ int row,int nv,bool jacobian,device const float* acc,device const float* acc_low) {
+ FlexDD lane[4];for(int k=0;k<4;k++)lane[k]=FlexDD{0,0,0};int i=0;
+ for(;i<=nv-4;i+=4)for(int k=0;k<4;k++)lane[k]=flex_dd_source_fma(
+   primal_refresh_dot_entry(mass,sparse_mass,debug,dims,J,row,i+k,nv,jacobian),
+   primal_refresh_scalar_input53(FlexDD{acc[i+k],acc_low[i+k],0}),lane[k]);
+ FlexDD sum=flex_dd_source_add(flex_dd_source_add(lane[0],lane[2]),flex_dd_source_add(lane[1],lane[3]));
+ int count=nv-i;
+ if(count==1)return flex_dd_source_fma(primal_refresh_dot_entry(mass,sparse_mass,debug,dims,J,row,i,nv,jacobian),primal_refresh_scalar_input53(FlexDD{acc[i],acc_low[i],0}),sum);
+ if(count>=2) {
+  FlexDD tail=flex_dd_source_mul(primal_refresh_dot_entry(mass,sparse_mass,debug,dims,J,row,i+1,nv,jacobian),primal_refresh_scalar_input53(FlexDD{acc[i+1],acc_low[i+1],0}));
+  tail=flex_dd_source_fma(primal_refresh_dot_entry(mass,sparse_mass,debug,dims,J,row,i,nv,jacobian),primal_refresh_scalar_input53(FlexDD{acc[i],acc_low[i],0}),tail);
+  if(count==3)tail=flex_dd_source_fma(primal_refresh_dot_entry(mass,sparse_mass,debug,dims,J,row,i+2,nv,jacobian),primal_refresh_scalar_input53(FlexDD{acc[i+2],acc_low[i+2],0}),tail);
+  sum=flex_dd_source_add(sum,tail);
+ }
+ return sum;
+}
+inline FlexDD primal_refresh_source_residual(device const float* debug,
+ constant int* dims,device const float* J,int row,int nv,device const float* acc,
+ device const float* acc_low,device const float* aref,device const float* aref_low) {
+ return flex_dd_source_sub(primal_refresh_source_dot(nullptr,false,debug,dims,J,row,nv,true,acc,acc_low),
+   primal_refresh_scalar_input53(FlexDD{aref[row],aref_low[row],0}));
+}
+inline FlexDD primal_refresh_source_force(FlexDD residual,PrimalFloatPair reg) {
+ return flex_dd_source_mul(FlexDD{-residual.hi,-residual.lo,-residual.tail},
+   flex_dd_source_div(FlexDD{1,0,0},primal_refresh_scalar_input53(FlexDD{reg.hi,reg.lo,0})));
+}
+inline FlexDD primal_refresh_source_gauss(device const float* mass,bool sparse_mass,
+ device const float* debug,constant int* dims,int dof,int nv,
+ device const float* acc,device const float* acc_low,device const float* raw_rhs) {
+ return flex_dd_source_sub(primal_refresh_source_dot(mass,sparse_mass,debug,dims,nullptr,dof,nv,false,acc,acc_low),
+   primal_refresh_scalar_input53(FlexDD{raw_rhs[dof],raw_rhs[nv+dof],0}));
+}
+
 inline void primal_refresh_pair_state(device const float* mass,
     bool sparse_mass, device const float* debug, constant int* dims,
     device const float* J, device const float* R, device const float* aref,
@@ -3381,7 +3745,7 @@ inline void primal_refresh_pair_state(device const float* mass,
     device float* force, device float* force_low,
     device float* gradient, device float* gradient_low,
     device float* row_hessian, device float* row_residual,
-    device float* row_residual_low, int nv, int nr, int n, int n_eq_rows) {
+    device float* row_residual_low, int nv, int nr, int n, int n_eq_rows, device const float* raw_rhs = nullptr) {
   device const float* aref_low = primal_aref_low_view(debug, dims, nv, nr);
   for (int dof = 0; dof < nv; ++dof) {
     float value = 0.0f, correction = 0.0f;
@@ -3396,6 +3760,7 @@ inline void primal_refresh_pair_state(device const float* mass,
       primal_compensated_product_add_eff(-entry, -entry_low, q0_low[other], value, correction);
     }
     PrimalFloatPair g = primal_pair_renormalize(value, correction);
+    if(raw_rhs!=nullptr)g=primal_source_pair(primal_refresh_source_gauss(mass,sparse_mass,debug,dims,dof,nv,acc,acc_low,raw_rhs));
     gradient[dof] = g.hi;
     gradient_low[dof] = g.lo;
   }
@@ -3414,12 +3779,8 @@ inline void primal_refresh_pair_state(device const float* mass,
     // subtract both words.  Keeping the low word positive here doubles its
     // contribution and perturbs the refreshed gradient after each accepted
     // line-search update.
-    float sum = -aref[row], correction = -aref_low[row];
-    for (int dof = 0; dof < nv; ++dof) {
-      primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc[dof], sum, correction);
-      primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc_low[dof], sum, correction);
-    }
-    PrimalFloatPair r = primal_pair_renormalize(sum, correction);
+    FlexDD source_residual=primal_refresh_source_residual(debug,dims,J,row,nv,acc,acc_low,aref,aref_low);
+    PrimalFloatPair r=primal_source_pair(source_residual);
     // Retained-plane writes stay island-scoped (see clear above).
     row_residual[row] = r.hi;
     row_residual_low[row] = r.lo;
@@ -3433,7 +3794,7 @@ inline void primal_refresh_pair_state(device const float* mass,
         && abs(lo[row] + hi[row]) <= 1e-5f * max(1.0f, abs(hi[row]));
     float residual_value = r.hi + r.lo;
     if (row < n_eq_rows) {
-      PrimalFloatPair f = primal_pair_multiply(primal_pair_product(r,D_pair),-1);
+      PrimalFloatPair f = primal_source_pair(primal_refresh_source_force(source_residual,reg_pair));
       force[row] = f.hi;
       force_low[row] = f.lo;
       row_hessian[row] = D;
@@ -3442,13 +3803,13 @@ inline void primal_refresh_pair_state(device const float* mass,
       if (residual_value <= -bound) force[row] = hi[row];
       else if (residual_value >= bound) force[row] = -hi[row];
       else {
-        PrimalFloatPair f = primal_pair_multiply(primal_pair_product(r,D_pair),-1);
+        PrimalFloatPair f = primal_source_pair(primal_refresh_source_force(source_residual,reg_pair));
         force[row] = f.hi;
         force_low[row] = f.lo;
         row_hessian[row] = D;
       }
     } else if (residual_value < 0.0f) {
-      PrimalFloatPair f = primal_pair_multiply(primal_pair_product(r,D_pair),-1);
+      PrimalFloatPair f = primal_source_pair(primal_refresh_source_force(source_residual,reg_pair));
       force[row] = f.hi;
       force_low[row] = f.lo;
       row_hessian[row] = D;
@@ -3478,14 +3839,19 @@ inline void primal_refresh_pair_state(device const float* mass,
   }
 
   for (int dof = 0; dof < nv; ++dof) {
-    PrimalFloatPair g = {gradient[dof], gradient_low[dof]};
+    FlexDD gauss={gradient[dof],gradient_low[dof],0};
+    if(raw_rhs!=nullptr)gauss=primal_refresh_source_gauss(mass,sparse_mass,debug,dims,dof,nv,acc,acc_low,raw_rhs);
+    FlexDD jtforce={0,0,0};
     for (int row = 0; row < n; ++row) if (enabled[row]) {
-      g = primal_pair_fma(-ccj_get(J, row, dof, nv),
-          {force[row], force_low[row]}, g);
-      float jlo = ccj_get_lo(J, row, dof, nv);
-      if (jlo != 0.0f) g = primal_pair_fma(-jlo,
-          {force[row], force_low[row]}, g);
+      FlexDD f={force[row],force_low[row],0};
+      if(!elliptic_member[row] && row_hessian[row]>0) {
+        PrimalFloatPair reg=primal_positive_entry_pair(R,
+            primal_regularizer_low_view(debug,dims,nv,nr),row,1e-15f);
+        f=primal_refresh_source_force(primal_refresh_source_residual(debug,dims,J,row,nv,acc,acc_low,aref,aref_low),reg);
+      }
+      jtforce=flex_dd_source_fma(primal_refresh_scalar_input53(FlexDD{ccj_get(J,row,dof,nv),ccj_get_lo(J,row,dof,nv),0}),f,jtforce);
     }
+    PrimalFloatPair g=primal_source_pair(flex_dd_source_sub(gauss,jtforce));
     gradient[dof] = g.hi;
     gradient_low[dof] = g.lo;
   }
@@ -3496,7 +3862,14 @@ inline void primal_mass_difference_pair(device const float* mass,
     device const float* q0, device const float* q0_low,
     device const float* acc,
     device const float* acc_low, device float* difference,
-    device float* difference_low, int nv) {
+    device float* difference_low, int nv, device const float* raw_rhs = nullptr) {
+  if(raw_rhs!=nullptr) {
+    for(int dof=0;dof<nv;dof++) {
+      PrimalFloatPair g=primal_source_pair(primal_refresh_source_gauss(mass,sparse_mass,debug,dims,dof,nv,acc,acc_low,raw_rhs));
+      difference[dof]=g.hi;difference_low[dof]=g.lo;
+    }
+    return;
+  }
   for (int dof = 0; dof < nv; ++dof) {
     float sum = 0.0f, correction = 0.0f;
     for (int other = 0; other < nv; ++other) {
@@ -3569,6 +3942,14 @@ inline void primal_mass_difference(device const float* mass, bool sparse_mass,
   }
 }
 
+inline FlexDD primal_hessian_scalar_source_add(FlexDD sum,
+    PrimalFloatPair regularizer, PrimalFloatPair jacobian, FlexDD projection) {
+  FlexDD inverse=flex_dd_source_div(FlexDD{1,0,0},
+      FlexDD{regularizer.hi,regularizer.lo,0});
+  FlexDD coefficient=flex_dd_source_mul(inverse,
+      FlexDD{jacobian.hi,jacobian.lo,0});
+  return flex_dd_source_fma(coefficient,projection,sum);
+}
 inline void primal_hessian_apply_elliptic(device const float* mass,
     bool sparse_mass, device const float* debug, constant int* dims,
     device const float* J, device const float* R, device const float* aref,
@@ -3595,6 +3976,7 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
       continue;
     }
     float value = 0.0f, correction = 0.0f;
+    FlexDD source_value={0,0,0};
     float absolute_scale = 0.0f;
     for (int other = 0; other < nv; ++other) {
       if (!solver_dof_awake(dims, awake_tree, other)
@@ -3603,8 +3985,8 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
           ? solver_component_mass_entry(debug, dims, nv, dof, other)
           : mass[dof * nv + other];
       float mij_low = solver_operator_mass_low(debug, dims, nv, dof, other, sparse_mass);
-      primal_compensated_product_add_eff(mij, mij_low, vector[other], value, correction);
-      primal_compensated_product_add_eff(mij, mij_low, vector_low[other], value, correction);
+      source_value=primal_source_transpose_force_add(source_value,
+          PrimalFloatPair{mij,mij_low},FlexDD{vector[other],vector_low[other],0});
       if (product_scale)
         absolute_scale += (abs(mij) + abs(mij_low))
             * (abs(vector[other]) + abs(vector_low[other]));
@@ -3612,22 +3994,15 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
     for (int row = 0; row < n; ++row) {
       if (!enabled[row] || elliptic_member[row] || row_hessian[row] <= 0.0f)
         continue;
-      PrimalFloatPair jd_hi = primal_ccj_compensated_dot_pair(
-          J, row, vector, nv);
-      PrimalFloatPair jd_low = primal_ccj_compensated_dot_pair(
-          J, row, vector_low, nv);
-      PrimalFloatPair jd = primal_pair_add(jd_hi, jd_low);
-      PrimalFloatPair coefficient = primal_pair_product(
-          primal_pair_divide({1,0},primal_positive_entry_pair(R,
-              primal_regularizer_low_view(debug,dims,nv,dims[9]),row,1e-15f)), {ccj_get(J, row, dof, nv), 0.0f});
-      float Jlo_c = ccj_get_lo(J, row, dof, nv);
-      if (Jlo_c != 0.0f)
-        coefficient = primal_pair_add(coefficient, primal_pair_product(
-            primal_pair_divide({1,0},primal_positive_entry_pair(R,
-              primal_regularizer_low_view(debug,dims,nv,dims[9]),row,1e-15f)), {Jlo_c, 0.0f}));
-      PrimalFloatPair contribution = primal_pair_product(coefficient, jd);
-      primal_compensated_product_add(contribution.hi, 1.0f, value, correction);
-      primal_compensated_product_add(contribution.lo, 1.0f, value, correction);
+      FlexDD jd={0,0,0};
+      for(int other=0;other<nv;other++)
+        jd=primal_source_transpose_force_add(jd,
+            PrimalFloatPair{ccj_get(J,row,other,nv),ccj_get_lo(J,row,other,nv)},
+            FlexDD{vector[other],vector_low[other],0});
+      PrimalFloatPair regularizer=primal_positive_entry_pair(R,
+          primal_regularizer_low_view(debug,dims,nv,dims[9]),row,1e-15f);
+      source_value=primal_hessian_scalar_source_add(source_value,regularizer,
+          PrimalFloatPair{ccj_get(J,row,dof,nv),ccj_get_lo(J,row,dof,nv)},jd);
       if (product_scale) {
         float row_direction_scale = 0.0f;
         for (int other = 0; other < nv; ++other) {
@@ -3701,7 +4076,10 @@ inline void primal_hessian_apply_elliptic(device const float* mass,
         }
       }
     }
-    PrimalFloatPair result = primal_pair_renormalize(value, correction);
+    // Elliptic block arithmetic and row/DOF ownership retain their original
+    // path. Combine its paired contribution before the existing pair boundary.
+    PrimalFloatPair result=primal_source_pair(flex_dd_source_add(source_value,
+        FlexDD{value,correction,0}));
     product[dof] = result.hi;
     product_low[dof] = result.lo;
     if (product_scale) product_scale[dof] = absolute_scale;
@@ -5340,6 +5718,45 @@ inline PrimalFloatPair primal_elliptic_line_eval_pair(
 // progress decision. This mirrors MuJoCo 3.10 PrimalEval's shared Gauss,
 // equality, active-unilateral, and elliptic-bottom quadratic coefficients,
 // plus Huber and elliptic zone-crossing cost differences.
+
+// Source operation precision for the general line polynomial. Existing
+// provided Gauss/residual planes remain actual operands; no state replacement.
+inline FlexDD primal_line_source_gauss_entry(device const float* g,
+ device const float* gl,device const float* v,device const float* vl,int i) {
+ return flex_dd_source_mul(primal_refresh_scalar_input53(FlexDD{g[i],gl?gl[i]:0,0}),
+   primal_refresh_scalar_input53(FlexDD{v[i],vl[i],0}));
+}
+inline FlexDD primal_line_source_vector_dot(device const float* g,
+ device const float* gl,device const float* v,device const float* vl,int nv) {
+ FlexDD lane[4];for(int k=0;k<4;k++)lane[k]=FlexDD{0,0,0};int i=0;
+ for(;i<=nv-4;i+=4)for(int k=0;k<4;k++)lane[k]=flex_dd_source_fma(
+  primal_refresh_scalar_input53(FlexDD{g[i+k],gl?gl[i+k]:0,0}),
+  primal_refresh_scalar_input53(FlexDD{v[i+k],vl[i+k],0}),lane[k]);
+ FlexDD sum=flex_dd_source_add(flex_dd_source_add(lane[0],lane[2]),flex_dd_source_add(lane[1],lane[3]));
+ int count=nv-i;
+ if(count==1)return flex_dd_source_fma(primal_refresh_scalar_input53(FlexDD{g[i],gl?gl[i]:0,0}),primal_refresh_scalar_input53(FlexDD{v[i],vl[i],0}),sum);
+ if(count>=2){FlexDD tail=primal_line_source_gauss_entry(g,gl,v,vl,i+1);
+  tail=flex_dd_source_fma(primal_refresh_scalar_input53(FlexDD{g[i],gl?gl[i]:0,0}),primal_refresh_scalar_input53(FlexDD{v[i],vl[i],0}),tail);
+  if(count==3)tail=flex_dd_source_fma(primal_refresh_scalar_input53(FlexDD{g[i+2],gl?gl[i+2]:0,0}),primal_refresh_scalar_input53(FlexDD{v[i+2],vl[i+2],0}),tail);
+  sum=flex_dd_source_add(sum,tail);}
+ return sum;
+}
+inline FlexDD primal_line_source_mass_dot(device const float* mass,bool sparse_mass,
+ device const float* debug,constant int* dims,device const float* v,
+ device const float* vl,int nv) {
+ FlexDD lane[4];for(int k=0;k<4;k++)lane[k]=FlexDD{0,0,0};int i=0;
+ for(;i<=nv-4;i+=4)for(int k=0;k<4;k++)lane[k]=flex_dd_source_fma(
+  primal_refresh_scalar_input53(FlexDD{v[i+k],vl[i+k],0}),
+  primal_refresh_source_dot(mass,sparse_mass,debug,dims,nullptr,i+k,nv,false,v,vl),lane[k]);
+ FlexDD sum=flex_dd_source_add(flex_dd_source_add(lane[0],lane[2]),flex_dd_source_add(lane[1],lane[3]));
+ int count=nv-i;
+ if(count==1)return flex_dd_source_fma(primal_refresh_scalar_input53(FlexDD{v[i],vl[i],0}),primal_refresh_source_dot(mass,sparse_mass,debug,dims,nullptr,i,nv,false,v,vl),sum);
+ if(count>=2){FlexDD tail=flex_dd_source_mul(primal_refresh_scalar_input53(FlexDD{v[i+1],vl[i+1],0}),primal_refresh_source_dot(mass,sparse_mass,debug,dims,nullptr,i+1,nv,false,v,vl));
+  tail=flex_dd_source_fma(primal_refresh_scalar_input53(FlexDD{v[i],vl[i],0}),primal_refresh_source_dot(mass,sparse_mass,debug,dims,nullptr,i,nv,false,v,vl),tail);
+  if(count==3)tail=flex_dd_source_fma(primal_refresh_scalar_input53(FlexDD{v[i+2],vl[i+2],0}),primal_refresh_source_dot(mass,sparse_mass,debug,dims,nullptr,i+2,nv,false,v,vl),tail);
+  sum=flex_dd_source_add(sum,tail);}
+ return sum;
+}
 inline PrimalFloatPair primal_accel_cost_delta_elliptic(
     PrimalFloatPair alpha,
     device const float* mass, bool sparse_mass, device const float* debug,
@@ -5372,41 +5789,13 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
     }
     }
   }
-  float gauss_linear = 0.0f, gauss_linear_correction = 0.0f;
-  device const float* aref_low = primal_aref_low_view(debug, dims, nv, nr);
-  float gauss_quadratic = 0.0f, gauss_quadratic_correction = 0.0f;
-  for (int i = 0; i < nv; ++i) {
-    float g = mass_delta == nullptr ? mass_gradient[i] : mass_delta[i];
-    float glow = mass_delta == nullptr ? 0.0f : mass_delta_low[i];
-    primal_compensated_product_add(g, direction[i], gauss_linear,
-        gauss_linear_correction);
-    primal_compensated_product_add(g, direction_low[i], gauss_linear,
-        gauss_linear_correction);
-    primal_compensated_product_add(glow, direction[i], gauss_linear,
-        gauss_linear_correction);
-    primal_compensated_product_add(glow, direction_low[i], gauss_linear,
-        gauss_linear_correction);
-    for (int j = 0; j < nv; ++j) {
-      float mij = sparse_mass
-          ? solver_component_mass_entry(debug, dims, nv, i, j)
-          : mass[i * nv + j];
-      float mij_low = solver_operator_mass_low(debug, dims, nv, i, j, sparse_mass);
-      primal_compensated_mass_product3_add(direction[i], mij, mij_low, direction[j],
-          gauss_quadratic, gauss_quadratic_correction);
-      primal_compensated_mass_product3_add(direction[i], mij, mij_low, direction_low[j],
-          gauss_quadratic, gauss_quadratic_correction);
-      primal_compensated_mass_product3_add(direction_low[i], mij, mij_low, direction[j],
-          gauss_quadratic, gauss_quadratic_correction);
-      primal_compensated_mass_product3_add(direction_low[i], mij, mij_low,
-          direction_low[j], gauss_quadratic, gauss_quadratic_correction);
-    }
-  }
-  PrimalFloatPair shifted_constant = {0.0f, 0.0f};
-  PrimalFloatPair shifted_linear =
-      primal_pair_renormalize(gauss_linear, gauss_linear_correction);
-  PrimalFloatPair shifted_quadratic = primal_pair_multiply(
-      primal_pair_renormalize(gauss_quadratic, gauss_quadratic_correction),
-      0.5f);
+  device const float* aref_low=primal_aref_low_view(debug,dims,nv,nr);
+  FlexDD shifted_constant={0,0,0};
+  FlexDD shifted_linear=primal_line_source_vector_dot(mass_delta?mass_delta:mass_gradient,
+      mass_delta?mass_delta_low:nullptr,direction,direction_low,nv);
+  FlexDD shifted_quadratic=flex_dd_source_mul(FlexDD{0.5f,0,0},
+      primal_line_source_mass_dot(mass,sparse_mass,debug,dims,direction,direction_low,nv));
+  FlexDD scalar_delta_cost={0,0,0};
   PrimalFloatPair delta_cost = {0.0f, 0.0f};
   PrimalFloatPair explicit_derivative = {0.0f, 0.0f};
   PrimalFloatPair explicit_second_derivative = {0.0f, 0.0f};
@@ -5418,34 +5807,22 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
         : PrimalFloatPair{base_row_residual[row],
             base_row_residual_low == nullptr ? 0.0f
                                              : base_row_residual_low[row]};
-    float start_sum = 0.0f, start_correction = 0.0f;
-    float direction_sum = 0.0f, direction_correction = 0.0f;
-    for (int dof = 0; dof < nv; ++dof) {
-      if (base_row_residual == nullptr)
-        primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc[dof], start_sum, start_correction);
-      if (base_row_residual == nullptr)
-        primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), acc_low[dof], start_sum, start_correction);
-      primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), direction[dof], direction_sum, direction_correction);
-      primal_compensated_product_add_eff(ccj_get(J, row, dof, nv), ccj_get_lo(J, row, dof, nv), direction_low[dof], direction_sum, direction_correction);
-    }
-    if (base_row_residual == nullptr)
-      start = primal_pair_add(start,
-          primal_pair_renormalize(start_sum, start_correction));
-    PrimalFloatPair row_direction =
-        primal_pair_renormalize(direction_sum, direction_correction);
-    PrimalFloatPair end = primal_pair_add(start,
-        primal_pair_product(row_direction, alpha));
-    PrimalFloatPair reg = primal_positive_entry_pair(
-        R, regularizer_low, row, 1e-15f);
-    PrimalFloatPair inverse_R = primal_pair_divide({1.0f, 0.0f}, reg);
+    FlexDD start_source=base_row_residual==nullptr
+        ? primal_refresh_source_residual(debug,dims,J,row,nv,acc,acc_low,aref,aref_low)
+        : primal_refresh_scalar_input53(FlexDD{start.hi,start.lo,0});
+    start=primal_source_pair(start_source);
+    FlexDD row_source=primal_refresh_source_dot(nullptr,false,debug,dims,J,row,nv,true,direction,direction_low);
+    PrimalFloatPair row_direction=primal_source_pair(row_source);
+    PrimalFloatPair end=primal_pair_add(start,primal_pair_product(row_direction,alpha));
+    PrimalFloatPair reg=primal_positive_entry_pair(R,regularizer_low,row,1e-15f);
+    PrimalFloatPair inverse_R=primal_pair_divide({1,0},reg);
+    FlexDD inverse_source=flex_dd_source_div(FlexDD{1,0,0},primal_refresh_scalar_input53(FlexDD{reg.hi,reg.lo,0}));
+    FlexDD row_linear=flex_dd_source_mul(row_source,flex_dd_source_mul(inverse_source,start_source));
+    FlexDD row_quadratic=flex_dd_source_mul(FlexDD{0.5f,0,0},
+        flex_dd_source_mul(flex_dd_source_mul(row_source,inverse_source),row_source));
     if (row < n_eq_rows) {
-      shifted_linear = primal_pair_add(shifted_linear,
-          primal_pair_product(
-              primal_pair_product(start, row_direction), inverse_R));
-      shifted_quadratic = primal_pair_add(shifted_quadratic,
-          primal_pair_product(
-              primal_pair_product(row_direction, row_direction),
-              primal_pair_multiply(inverse_R, 0.5f)));
+      shifted_linear=flex_dd_source_add(shifted_linear,row_linear);
+      shifted_quadratic=flex_dd_source_add(shifted_quadratic,row_quadratic);
     } else {
       bool friction_row = lo[row] < 0.0f && hi[row] > 0.0f
           && isfinite(lo[row]) && isfinite(hi[row])
@@ -5475,28 +5852,16 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
               primal_pair_multiply(row_direction, loss));
         }
       } else {
-        PrimalFloatPair old_cost = primal_pair_less_float(start, 0.0f)
-            ? primal_pair_product(primal_pair_product(start, start),
-                  primal_pair_multiply(inverse_R, 0.5f))
-            : PrimalFloatPair{0.0f, 0.0f};
-        if (primal_pair_less_float(end, 0.0f)) {
-          // An initially satisfied row contributes no starting cost. When
-          // the line enters its quadratic zone, restore the polynomial's
-          // constant as well as its linear/quadratic terms.
-          if (!primal_pair_less_float(start, 0.0f))
-            shifted_constant = primal_pair_add(shifted_constant,
-                primal_pair_product(primal_pair_product(start, start),
-                    primal_pair_multiply(inverse_R, 0.5f)));
-          shifted_linear = primal_pair_add(shifted_linear,
-              primal_pair_product(
-                  primal_pair_product(start, row_direction), inverse_R));
-          shifted_quadratic = primal_pair_add(shifted_quadratic,
-              primal_pair_product(
-                  primal_pair_product(row_direction, row_direction),
-                  primal_pair_multiply(inverse_R, 0.5f)));
+        FlexDD old_cost=primal_pair_less_float(start,0)
+            ? flex_dd_source_mul(FlexDD{0.5f,0,0},flex_dd_source_mul(start_source,flex_dd_source_mul(inverse_source,start_source)))
+            : FlexDD{0,0,0};
+        if(primal_pair_less_float(end,0)) {
+          if(!primal_pair_less_float(start,0))shifted_constant=flex_dd_source_add(shifted_constant,
+              flex_dd_source_mul(FlexDD{0.5f,0,0},flex_dd_source_mul(start_source,flex_dd_source_mul(inverse_source,start_source))));
+          shifted_linear=flex_dd_source_add(shifted_linear,row_linear);
+          shifted_quadratic=flex_dd_source_add(shifted_quadratic,row_quadratic);
         } else {
-          delta_cost = primal_pair_add(delta_cost,
-              primal_pair_multiply(old_cost, -1.0f));
+          scalar_delta_cost=flex_dd_source_sub(scalar_delta_cost,old_cost);
         }
       }
     }
@@ -5548,17 +5913,22 @@ inline PrimalFloatPair primal_accel_cost_delta_elliptic(
     explicit_second_derivative = primal_pair_add(explicit_second_derivative,
         local_second);
   }
-  derivative = primal_pair_add(shifted_linear,
-      primal_pair_add(primal_pair_product(shifted_quadratic,
-          primal_pair_multiply(alpha, 2.0f)), explicit_derivative));
-  second_derivative = primal_pair_add(
-      primal_pair_multiply(shifted_quadratic, 2.0f),
-      explicit_second_derivative);
-  PrimalFloatPair cost = primal_pair_add(delta_cost, shifted_constant);
-  cost = primal_pair_add(cost, primal_pair_product(shifted_linear, alpha));
-  cost = primal_pair_add(cost,
-      primal_pair_product(shifted_quadratic,
-          primal_pair_product(alpha, alpha)));
+  FlexDD a=primal_refresh_scalar_input53(FlexDD{alpha.hi,alpha.lo,0});
+  // Source contracts the scalar polynomial at its original evaluation boundary.
+  // Keep inactive-row cost in source precision until the existing pair API.
+  FlexDD scalar_derivative=flex_dd_source_fma(flex_dd_source_mul(FlexDD{2,0,0},a),
+      shifted_quadratic,shifted_linear);
+  derivative=primal_source_pair(flex_dd_source_add(
+      FlexDD{explicit_derivative.hi,explicit_derivative.lo,0},scalar_derivative));
+  second_derivative=primal_source_pair(flex_dd_source_add(
+      FlexDD{explicit_second_derivative.hi,explicit_second_derivative.lo,0},
+      flex_dd_source_mul(FlexDD{2,0,0},shifted_quadratic)));
+  FlexDD scalar_polynomial=flex_dd_source_fma(flex_dd_source_mul(a,a),
+      shifted_quadratic,flex_dd_source_mul(a,shifted_linear));
+  scalar_polynomial=flex_dd_source_add(scalar_polynomial,shifted_constant);
+  FlexDD source_cost=flex_dd_source_add(scalar_delta_cost,scalar_polynomial);
+  source_cost=flex_dd_source_add(FlexDD{delta_cost.hi,delta_cost.lo,0},source_cost);
+  PrimalFloatPair cost=primal_source_pair(source_cost);
   return cost;
 }
 
@@ -6230,6 +6600,7 @@ inline int solve_primal_accel_scalar(device const float* mass,
     device const int* dof_island,
     int island, bool partitioned) {
   bool sparse_mass = dims[20] == -3;
+  device const float* native_raw_rhs=debug+dims[dims[24]+dims[9]*10+6];
   device float* acc = scratch;
   device float* gradient = scratch + nv;
   device float* old_gradient = scratch + 2 * nv;
@@ -6347,7 +6718,7 @@ inline int solve_primal_accel_scalar(device const float* mass,
       lo, hi, q0, q0_low, acc, acc_low, enabled, elliptic_member,
       elliptic_start, elliptic_dim, elliptic_friction, elliptic_count,
       force, row_force_low, gradient, gradient_low, row_hessian,
-      residual, row_residual_low, nv, nr, n, n_eq_rows);
+      residual, row_residual_low, nv, nr, n, n_eq_rows,native_raw_rhs);
   primal_mass_difference(mass, sparse_mass, debug, dims, acc, q0,
       solved, old_gradient, nv);
   for (int i = 0; i < nv; ++i)
@@ -6422,7 +6793,7 @@ inline int solve_primal_accel_scalar(device const float* mass,
   // line polynomial; otherwise the line search consumes the final Hessian
   // product's low word as M*(qacc-q0)'s low word.
   primal_mass_difference_pair(mass, sparse_mass, debug, dims, q0, q0_low, acc,
-      acc_low, old_gradient, mass_delta_low, nv);
+      acc_low, old_gradient, mass_delta_low, nv,native_raw_rhs);
   int used = 0;
   bool solve_failed = false;
   float grad_norm_sq = primal_pair_dot(gradient, gradient_low,
@@ -6430,7 +6801,7 @@ inline int solve_primal_accel_scalar(device const float* mass,
   float last_residual = scale * sqrt(max(0.0f, grad_norm_sq));
   for (int iter = 0; iter < maxiter; ++iter) {
     primal_mass_difference_pair(mass, sparse_mass, debug, dims, q0, q0_low, acc,
-        acc_low, old_gradient, mass_delta_low, nv);
+        acc_low, old_gradient, mass_delta_low, nv,native_raw_rhs);
     for (int i = 0; i < nv; ++i) {
       previous_gradient[i] = gradient[i];
       if (solver_type == 1) previous_gradient_low[i] = gradient_low[i];
@@ -6672,7 +7043,7 @@ inline int solve_primal_accel_scalar(device const float* mass,
         lo, hi, q0, q0_low, acc, acc_low, enabled, elliptic_member,
         elliptic_start, elliptic_dim, elliptic_friction, elliptic_count,
         candidate_force, row_force_low, gradient, gradient_low, row_hessian,
-        residual, row_residual_low, nv, nr, n, n_eq_rows);
+        residual, row_residual_low, nv, nr, n, n_eq_rows,native_raw_rhs);
     for (int i = 0; i < nv; ++i)
       if (partitioned && dof_island[i] != island)
         gradient[i] = gradient_low[i] = 0.0f;
@@ -9918,6 +10289,16 @@ kernel void solve_coupled_constraints(
       }
     }
   }
+  // Canonicalize only the public output split after the solver has finished.
+  // TwoSum preserves the represented finite acceleration; no new solve or
+  // accepted-iterate update is performed here.
+  for (int i = 0; i < nv; ++i) {
+    PrimalFloatPair published = primal_acceleration_publication_pair(
+        out_acc[qb + i], out_acc[batch * nv + qb + i]);
+    out_acc[qb + i] = published.hi;
+    out_acc[batch * nv + qb + i] = published.lo;
+  }
+
 }
 
 // Pack canonical active constraint Jacobians followed by qfrc_smooth as
@@ -10859,10 +11240,24 @@ kernel void solve_coupled_constraints_block(
     // row-pair solve work plane before Delassus construction takes ownership.
     device float* pair_tail = solver_scratch + dims[metadata_header + 15];
     device float* solve_y_low = pair_tail + 5 * max(nv, 1);
-    primal_cholesky_solve_pair(L, nv, solver_awake_tree, dims,
-        qfrc + qb, qfrc + batch * nv + qb,
-        out_acc + qb, out_acc + batch * nv + qb,
-        y, solve_y_low);
+    if (dims[7] & 512) {
+      // Match the sequential route's original-mass residual correction.
+      // The first five paired-work vectors are free before row construction;
+      // the retained smooth-acceleration low plane starts at +7*nv later.
+      if (!primal_hessian_mass_precondition_pair_elliptic(mass + mb, L, false,
+          dbg, dims, solver_awake_tree, qfrc + qb,
+          qfrc + batch * nv + qb, out_acc + qb,
+          out_acc + batch * nv + qb, pair_tail, pair_tail + max(nv,1),
+          pair_tail + 2*max(nv,1), pair_tail + 3*max(nv,1),
+          pair_tail + 4*max(nv,1), nullptr, 0, false, nv)) {
+        out_status[world] = 2; return;
+      }
+    } else {
+      primal_cholesky_solve_pair(L, nv, solver_awake_tree, dims,
+          qfrc + qb, qfrc + batch * nv + qb,
+          out_acc + qb, out_acc + batch * nv + qb,
+          y, solve_y_low);
+    }
   } else {
     for (int i = 0; i < nv; ++i) {
       float v = solver_dof_awake(dims, solver_awake_tree, i) ? qfrc[qb + i] : 0.0f;
@@ -11639,6 +12034,16 @@ kernel void solve_coupled_constraints_block(
     for (int k = 0; k < 8; ++k)
       out_diagnostics[world * 10 + 2 + k] = float(primal_island_iterations[k]);
   }
+  // Canonicalize only the public output split after the solver has finished.
+  // TwoSum preserves the represented finite acceleration; no new solve or
+  // accepted-iterate update is performed here.
+  for (int i = 0; i < nv; ++i) {
+    PrimalFloatPair published = primal_acceleration_publication_pair(
+        out_acc[qb + i], out_acc[batch * nv + qb + i]);
+    out_acc[qb + i] = published.hi;
+    out_acc[batch * nv + qb + i] = published.lo;
+  }
+
 }
 
 // Candidate narrowphase status is produced by the flex detector on device.

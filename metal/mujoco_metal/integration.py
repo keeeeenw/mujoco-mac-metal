@@ -154,7 +154,9 @@ class MetalEulerIntegration:
         dtype=torch.int32,
         device=self._device,
     )
-    dt_low=np.float32(source_dt-np.float32(source_dt))
+    # Keep subtraction in binary64. NumPy scalar promotion can otherwise
+    # cast source_dt to float32 and erase the low word before subtraction.
+    dt_low=np.float32(source_dt-float(np.float32(source_dt)))
     dt_tail=np.float32(source_dt-float(np.float32(source_dt))-float(dt_low))
     self._dt = torch.tensor([dt,float(dt_low),float(dt_tail)], dtype=torch.float32, device=self._device)
     self._precision_width=2*self.nq+2*self.nv

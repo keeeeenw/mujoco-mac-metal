@@ -65,6 +65,20 @@ inline float4 quat_increment(float3 omega, float dt, thread bool& ok) {
   return increment;
 }
 
+// The source API reads one binary64 acceleration scalar. Paired solver
+// storage can contain more than53 significant bits; round its input once,
+// preserving the emitted solver buffers and all work/stopping criteria.
+inline KinDD kin_source_acceleration_input(KinDD value) {
+  float lead=value.hi;
+  if((as_type<uint>(lead)&0x7fffffffu)==0u) lead=value.lo;
+  if((as_type<uint>(lead)&0x7fffffffu)==0u) lead=value.tail;
+  if((as_type<uint>(lead)&0x7fffffffu)==0u || !finite_float(lead)) return value;
+  int shift=20-flex_float_exponent(lead);
+  FlexDD scaled=flex_dd_scalbn(kin_source(value),shift);
+  scaled=flex_dd_source_add(scaled,FlexDD{0,0,0});
+  return kin_retained(flex_dd_scalbn(scaled,-shift));
+}
+
 kernel void semi_implicit_euler(
     device const float* qpos [[buffer(0)]],
     device const float* qvel [[buffer(1)]],
@@ -162,7 +176,7 @@ kernel void semi_implicit_euler(
     KinDD previous=kin_state_load(qvel,input_words,vb+i,pb+2*nq+i,pb+2*nq+nv+i);
     KinDD velocity=(velocity_mode[0]&1)?KinDD{next_velocity[vb+i],
         override_words[world*4*nv+i],override_words[world*4*nv+nv+i]}:
-        kin_fma(dt_words,KinDD{qacc[vb+i],qacc_low[vb+i],0.0f},previous);
+        kin_fma(dt_words,kin_source_acceleration_input(KinDD{qacc[vb+i],qacc_low[vb+i],0.0f}),previous);
     if (!finite_float(velocity.hi) || !finite_float(velocity.lo) || !finite_float(velocity.tail)) valid=false;
     kin_state_store(candidate_qvel,candidate_words,vb+i,pb+2*nq+i,pb+2*nq+nv+i,velocity);
   }
@@ -280,7 +294,7 @@ kernel void rk4_combine_rates(
         kin_dd(j==stage ? (stage<2?0.5f:1.0f) : 0.0f);
     uint hi=uint(j)*batch*nv+index,lo=(uint(j)*batch+world)*2*nv+dof;
     v=kin_fma(weight,KinDD{velocities[hi],velocity_words[lo],velocity_words[lo+nv]},v);
-    a=kin_fma(weight,KinDD{accelerations[hi],acceleration_low[hi],0.0f},a);
+    a=kin_fma(weight,kin_source_acceleration_input(KinDD{accelerations[hi],acceleration_low[hi],0.0f}),a);
   }
   uint input_offset=world*(2*nq+2*nv)+2*nq+dof;
   KinDD initial=KinDD{initial_velocity[index],initial_words[input_offset],initial_words[input_offset+nv]};

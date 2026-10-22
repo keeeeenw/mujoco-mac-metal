@@ -626,6 +626,50 @@ static inline FlexDD3 flex_dd3_source_sub(FlexDD3 a, FlexDD3 b) {
 // Three quotient digits approximate the source binary64 result while keeping
 // exact product residuals between refinements. The final expansion is rounded
 // once to the source 53-bit boundary and retained in three float words.
+
+// Compare A against B*(candidate+offset) with all products unrounded. A and
+// B were scaled by the same power of two during quotient refinement; scaling
+// candidate to exponent20 also scales A and keeps all midpoint product errors
+// normal. A binary64 halfway case can be closer than three quotient digits
+// distinguish, so deciding the final rounding from those digits alone is not
+// sufficient. This comparison uses the actual division operands, not a tolerance.
+static __attribute__((noinline)) int flex_dd_division_midpoint_sign(
+    FlexDD a, FlexDD b, FlexDD candidate, float offset) {
+  thread float expansion[32];thread float scratch[32];int count=0;
+  count=flex_expansion_add(expansion,count,a.tail,scratch);
+  count=flex_expansion_add(expansion,count,a.lo,scratch);
+  count=flex_expansion_add(expansion,count,a.hi,scratch);
+  float bv[3]={b.tail,b.lo,b.hi};
+  float qv[4]={candidate.tail,candidate.lo,candidate.hi,offset};
+  for(int i=0;i<3;i++)for(int j=0;j<4;j++) {
+    float product=bv[i]*qv[j];float error=fma(bv[i],qv[j],-product);
+    count=flex_expansion_add(expansion,count,-error,scratch);
+    count=flex_expansion_add(expansion,count,-product,scratch);
+  }
+  return flex_expansion_sign(expansion,count);
+}
+static inline FlexDD flex_dd_division_correct_rounding(
+    FlexDD a, FlexDD b, FlexDD candidate) {
+  if(candidate.hi==0.0f || !isfinite(candidate.hi))return candidate;
+  if(b.hi<0){a=flex_dd_neg(a);b=flex_dd_neg(b);}
+  int qshift=20-flex_float_exponent(candidate.hi);
+  a=flex_dd_scalbn(a,qshift);candidate=flex_dd_scalbn(candidate,qshift);
+  int exponent=0;float significand=frexp(fabs(candidate.hi),exponent);
+  int tail_sign=flex_dd_compare_exact(candidate,FlexDD{candidate.hi,0,0});
+  bool toward_zero=(candidate.hi>0 && tail_sign<0)||(candidate.hi<0 && tail_sign>0);
+  if(significand==0.5f && toward_zero)exponent--;
+  int quantum=exponent-53;float unit=ldexp(1.0f,quantum);
+  bool power_of_two=significand==0.5f && tail_sign==0;
+  float lower_unit=power_of_two && candidate.hi>0?0.5f*unit:unit;
+  float upper_unit=power_of_two && candidate.hi<0?0.5f*unit:unit;
+  bool odd=((int(ldexp(candidate.lo,-quantum))+int(ldexp(candidate.tail,-quantum)))&1)!=0;
+  int below=flex_dd_division_midpoint_sign(a,b,candidate,-0.5f*lower_unit);
+  int above=flex_dd_division_midpoint_sign(a,b,candidate,0.5f*upper_unit);
+  if(below<0 || (below==0 && odd))candidate=flex_dd_source_add(candidate,FlexDD{-lower_unit,0,0});
+  else if(above>0 || (above==0 && odd))candidate=flex_dd_source_add(candidate,FlexDD{upper_unit,0,0});
+  return flex_dd_scalbn(candidate,-qshift);
+}
+
 static inline FlexDD flex_dd_source_div(FlexDD a, FlexDD b) {
   // Quotient refinement must retain residuals at small geometric scales.
   int shift=20-flex_float_exponent(b.hi);
@@ -642,7 +686,8 @@ static inline FlexDD flex_dd_source_div(FlexDD a, FlexDD b) {
   count=flex_expansion_add(expansion,count,q0,scratch);
   count=flex_expansion_add(expansion,count,q1,scratch);
   count=flex_expansion_add(expansion,count,q2,scratch);
-  return flex_dd_from_projection53(flex_expansion_round53(expansion,count));
+  FlexDD candidate=flex_dd_from_projection53(flex_expansion_round53(expansion,count));
+  return flex_dd_division_correct_rounding(a,b,candidate);
 }
 
 static inline FlexDD flex_dd_source_sqrt(FlexDD value) {
