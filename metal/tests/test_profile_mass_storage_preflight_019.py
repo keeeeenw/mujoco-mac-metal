@@ -336,6 +336,7 @@ def _candidate_dispatch_fixture():
       "geom_rbound": _FakeTensor([1.0]),
       "pair_geoms": _FakeTensor([0, 1], dtype="int32"),
       "pair_margin_gap": _FakeTensor([0.0, 0.0]),
+      "pair_margin_source": _FakeTensor([0.0, 0.0, 0.0]),
       "geom_size": _FakeTensor([1.0, 1.0, 1.0]),
       "geom_type": _FakeTensor([1, 7], dtype="int32"),
       "mesh_hull": _FakeTensor(np.zeros(8)),

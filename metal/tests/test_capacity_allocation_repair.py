@@ -378,9 +378,8 @@ def test_runtime_paired_buffers_match_estimates_gpu():
 
 def test_pair_const_lo_envelope_host_cpu():
   # Host-only envelope proof (no device): lowering owns the per-pair
-  # constant residuals (17 words: solref/solimp/margin-gap/solreffriction
-  # lows); the estimate must count exactly max(npairs*23, 23) words with
-  # an 17-word sentinel at zero pairs, batch-independently, and a budget
+  # 23 residual words plus their parallel source tails; the estimate must count exactly max(npairs*46, 46) words with
+  # a 46-word sentinel at zero pairs, batch-independently, and a budget
   # below the full envelope must reject before allocation.
   import sys
   sys.path.insert(0, "metal/tests")
@@ -394,12 +393,14 @@ def test_pair_const_lo_envelope_host_cpu():
     assert desc.pair_const_lo is not None
     assert desc.pair_const_lo.shape == (int(desc.npairs), 23)
     assert desc.pair_const_lo.dtype == np.float32
+    assert desc.pair_const_tail.shape == desc.pair_const_lo.shape
+    assert desc.pair_const_tail.dtype == np.float32
     for batch in (1, 2):
       est = estimate_capacity(
           model, batch, desc.npairs, desc.ncontacts_max, desc.nr)
       by_name = dict(est.memory_breakdown)
       assert by_name["pair_const_lo"] == max(
-          int(desc.npairs) * 23, 23) * 4
+          int(desc.npairs) * 46, 46) * 4
       parts, _ = estimate_workspace(
           nv=6, npairs=int(desc.npairs), nslots=8, nr=16,
           nr_joint=8, neq=0, batch=batch)
@@ -412,7 +413,7 @@ def test_pair_const_lo_envelope_host_cpu():
   assert desc0.npairs == 0
   assert desc0.pair_const_lo.shape == (0, 23)
   est0 = estimate_capacity(m, 1, 0, 0, 0)
-  assert dict(est0.memory_breakdown)["pair_const_lo"] == 92
+  assert dict(est0.memory_breakdown)["pair_const_lo"] == 184
   # Budget below full envelope rejects (covers the new words).
   full = est0.memory_bytes
   with pytest.raises(CapacityOverflow, match="memory"):
@@ -425,7 +426,7 @@ def test_pair_const_lo_envelope_host_cpu():
 @pytest.mark.skipif(os.getenv("MUJOCO_METAL_RUN_GPU") != "1", reason="native opt-in")
 def test_pair_const_lo_runtime_inventory_matches_estimates_gpu():
   # GPU-gated inventory proof: runtime-owned pair_const_lo allocation
-  # equals the pre-allocation estimate (17 words per pair, 17-word
+  # equals the pre-allocation estimate (46 words per pair, 46-word
   # sentinel), batch-independently.
   import os
   assert os.getenv("MUJOCO_METAL_RUN_GPU") == "1"
@@ -444,10 +445,10 @@ def test_pair_const_lo_runtime_inventory_matches_estimates_gpu():
       by_name = dict(est.memory_breakdown)
       actual = cc._constants["pair_const_lo"].numel() * 4
       assert by_name["pair_const_lo"] == actual == max(
-          int(cc.descriptor.npairs) * 23, 23) * 4
+          int(cc.descriptor.npairs) * 46, 46) * 4
   # Zero-pair sentinel runtime padding.
   m = mujoco.MjModel.from_xml_string(
       "<mujoco><worldbody><geom name='floor' type='plane' size='5 5 0.1'/>"
       "</worldbody></mujoco>")
   cc0 = MetalCoupledConstraints(m, batch_size=1)
-  assert cc0._constants["pair_const_lo"].numel() == 23
+  assert cc0._constants["pair_const_lo"].numel() == 46
