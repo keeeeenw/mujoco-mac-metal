@@ -1,4 +1,4 @@
-# Development qualification — updated 2026-10-13 UTC
+# Development qualification — updated 2026-10-22 UTC
 
 Historical entries retain their producing revisions and original open gates.
 Use the latest sequential entries and [milestone status](STATUS.md) for current
@@ -1798,3 +1798,85 @@ executable test ASTs. Producing runtime hashes are recorded separately from
 those documentation changes. These results qualify the corpus and original
 acceptance scope, not every possible model or later solver/integrator/terrain/
 SDF/flex/API composition. **Milestone 012 is next.**
+
+
+## Sequential heightfield qualification (012) — 2026-10-22
+
+Milestone 012 is accepted for the complete rigid-heightfield acceptance scope
+under the integrated Euler contract. The numerical runtime producer is
+`e80125fa19cf2e1c26cf07397fc2dc4f3369156f`; the accepted revision also includes the reviewed tests,
+documentation and fresh rover GIF. Earlier milestones 005–011 remain qualified
+at their recorded producing revisions. Milestones 013–020 remain open.
+
+All six rigid ConvexHField partners—sphere, capsule, ellipsoid, cylinder, box
+and actual compiled convex mesh—pass. Coverage includes both actual compiled
+geom orders, translated/rotated fixed terrain bodies, both friction cones,
+NativeCCD and libCCD/MPR, and actual MULTICCD option masks. The HField-specific
+MULTICCD-only toggle is ineffective in the source path; its dependency proof
+and all four-mask statics are recorded separately from physical motion runs.
+Actual grids include 2×2, 3×5, 7×11 and 80×96, source sizes/base thickness,
+positive tiny features, cell/diagonal/border transitions and strict contact
+geometry. Material priority, direct solref, mixing, friction, overrides,
+margin/gap, filtering and excludes retain their original bounds.
+
+Independent geometry certificates, non-diagonal full-mass acceleration,
+resultant force and torque, emitted lambda, global retained certificates and
+row ownership pass. Original 24 motion labels retain their explicit duplicate
+input reuse; separate NativeCCD 24 and MPR 24 actual-order/body-frame scopes
+complete their original 250 steps and loaded 20-step replays. These scopes,
+statics, operator controls and fresh repeats overlap and are not an additive
+repository test count. Source energy controls compare identical represented
+states; no conservation claim is made under driving, friction or contact.
+
+The accepted comparison reference is Source20, built from pinned MuJoCo 3.10
+source `28009f9105cd92784b7b0b30c0605a5e29107a77`, image SHA-256
+`0af517062e0095df14047cc72fd81ada2925cc1e1dbf064bebc93bbacf9c7c1c`.
+It uses the reviewed shared collision convention: a failed geometric seed is
+empty only when an independent exact certificate on the actual convex object
+and actual prism proves nonpenetration. Unsupported orientations, nonzero
+margins, invalid metadata or an indeterminate certificate retain the ordinary
+collision/failure path. Actual compiled hull vertices are used, not a box or
+terrain-plane substitute. Complete provenance reproduces all 193 transitive
+inputs, the binary and all 12 Mach-O sections. Independent retained positive
+geometry certificates and affected complete trajectories validate the changed
+branches. Earlier stock-pinned reference failures remain compatibility history;
+this acceptance does not assert identical stock-pinned MPR behavior at every
+exact-touch seed. A copied-CPU tangent-word diagnostic is retained separately;
+no exact code-generation identity claim is inferred from it.
+
+The normal runtime contains the qualified shader bodies and host methods.
+Checks execute actual repository entrypoints with no private compiler-body or
+host-method replacement, and verify complete shader inputs before compilation.
+Actual MPS mutation/replacement, cache and changing warm identities, failed/
+healthy/empty worlds, true metadata/support/capacity faults, reset, query storage,
+int32 admission and loaded full-checkpoint replay pass. Both public query
+profiles and active cached-stage contracts pass fresh comparisons. The 24
+existing precision controls retain 100 kernel calls and 234 numeric gates per
+mode, including subnormal/nonfinite publication and protected inputs. The
+exact affected 011 loaded regression passes 41 steps and a full changing-force
+20-step replay; this does not requalify all of 011 at a new producer.
+
+Constant storage growth is explicit: the existing 23-word pair residual plane
+has a parallel 23-word source-tail plane, costing 92 additional bytes per pair
+and reflected in allocation/budget admission. The eighteen-argument terrain
+binding, owned integer scratch and full physical lambda low words are audited.
+Limits, original models/controls, timestep, solver stopping/budgets and emitted
+iterates are preserved. Native physics receives no CPU physics or state snapping.
+
+The unchanged original 800-step rover passes: travel 1.244891 m, roll 2.363408 rad,
+minimum axle height 0.044579 m, maximum position error 0.0004464 mm, maximum
+quaternion error 0.000008583 and compliant compression 10.670 mm. Independent
+wheel/prism geometry checks cover 6,884 contacts and 98 prisms. Loaded 20-step
+changing-force replays at 200/600 reproduce all physical fields and complete
+checkpoints. The fresh 40-frame, 1.6-second 1× GIF passes whole-frame inspection
+with marble lighting and all hardware visible. An actual visible Mac GLFW
+viewer passes 120 native steps/rendered frames and fresh ordinary comparisons,
+with CPU stepping forbidden. Its four captured framebuffers are reviewed.
+Thirteen retained GUI OS notices are classified independently; there are no
+unknown Metal/GPU errors.
+
+Plane–heightfield produces no contacts and heightfield–heightfield is rejected.
+HField–SDF and flex terrain retain separate milestones 013 and 018. Qualification
+covers the original acceptance domain, not every possible model, scale,
+integrator or arbitrary nondiscrete tunneling guarantee. No full repository
+regression, new wheel, publication or performance claim follows from this work.

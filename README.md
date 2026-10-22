@@ -80,7 +80,11 @@ The complete roller comparison and native Mac viewer pass.
 Milestone 011 qualifies compiled convex mesh contact, imported OBJ/STL asset frames,
 materials, full-mass forces, frictional impacts and exact checkpoint replay.
 The complete assembly comparison and native Mac viewer pass.
-Milestones 012–020 remain open.**
+Milestone 012 qualifies all six rigid heightfield partners, strict geometry and
+full-mass forces, both CCD profiles, lifecycle/query contracts, and the complete
+rover/replay/GIF/native Mac viewer. Its accepted shared reference convention and
+compatibility limits are recorded in [qualification](metal/QUALIFICATION.md).
+Milestones 013–020 remain open.**
 Inventory qualification does not establish native physics correctness. Earlier
 bounded capabilities and selected development fixtures remain usable and retain
 their passing checks. Further milestones are qualified individually, in order.
@@ -323,7 +327,8 @@ and compliant contact limits.
 ### [Rock-garden axle cart](metal/examples/terrain_rover.md)
 
 A passive cart rolls over a heightfield garden and settles near a berm.
-The guide records the fixture and its numerical limits.
+The original 800-step comparison, loaded replays, complete GIF and native Mac
+viewer pass the Milestone 012 qualification. The guide records the bounds.
 
 ![Rock-garden axle cart: recorded simulation](metal/examples/assets/terrain_rover.gif)
 

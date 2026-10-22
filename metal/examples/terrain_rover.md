@@ -38,14 +38,30 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 PYTHONPATH=metal:metal/examples python metal/examp
 
 ![Rock-garden axle cart](assets/terrain_rover.gif)
 
-The `--headless --check` run asserts actual native behavior: the cart travels
-over a meter through the garden and settles at the berm, the body rolls
-(2.3 rad), the axle never tunnels the solid, penetration stays within the
-compliant impact bound, and native/CPU positions agree exactly early and to
-lane precision at settle (rolling orientation uses a phase envelope, as in
-the roller workshop). The thin axle capsule is intentionally collision-free
-(contype 0, documented) so the pair budget covers the two 8-slot wheel pairs;
-mesh-heightfield and heightfield-heightfield pairs stay rejected (documented
-012 restrictions), and margin is qualified at 0 only.
+The original 800-step check passes with its unchanged XML, initial velocity
+0.3 m/s, timestep 0.002 s, pair plan and controls. Travel is 1.244891 m,
+roll is 2.363408 rad and minimum axle height is 0.044579 m. Maximum position
+error is 0.0004464 mm and maximum quaternion error is 0.000008583. Maximum
+compliant compression is 10.670 mm; this is soft contact, not a rigid clearance
+or arbitrary tunneling guarantee.
 
+The original bounds remain travel >0.5 m, roll >1 rad, axle height >-0.05 m,
+preflight position error <0.5 mm, full/final position error <20 mm, final
+quaternion error <0.15, full quaternion error <0.2 and compression <20 mm.
+Native wheel and actual terrain-prism witnesses pass independent 6 µm surface
+checks at 6,884 contacts across 98 prisms. Complete loaded 20-step changing-force
+restore/replays at steps 200 and 600 reproduce every checkpoint and physical
+field, including the actual retained lambda low words.
+
+The collision-free visual axle capsule has `contype=0`. The two wheel pairs
+reserve the full fifty-contact source bound each (`max_slots=100`,
+`max_rows=408`); manifolds are not truncated to eight contacts. Milestone 012
+also qualifies compiled convex mesh–heightfield contact separately.
+Heightfield–heightfield remains rejected; plane–heightfield produces no contact.
+HField–SDF and flex terrain retain milestones 013 and 018.
+
+The fresh complete GIF has 40 frames over 1.6 seconds at 1× playback, with both
+wheels and the axle visible throughout. The actual bounded Mac viewer passes
+120 native steps and rendered frames with CPU stepping forbidden. Rendering
+uses MuJoCo OpenGL; this is correctness evidence, not a throughput benchmark.
 Lighting and the dark checkerboard match the robotic marble music machine.

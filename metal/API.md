@@ -84,8 +84,8 @@ coefficient pairs through scalar and elliptic costs, slopes and curvature. The
 unilateral entering-zone polynomial includes its constant term. Initial
 cold/warm selection compares represented original-operator paired objectives;
 joint/connect/weld regularizers retain compiled inverse-weight residuals in
-existing constant bindings. Huber force-zone predicates and complete
-solver/terrain compositions remain unqualified.
+existing constant bindings. Huber force-zone predicates and the remaining complete
+solver/integrator compositions retain their later milestone owners.
 
 Native heightfield prism EPA preserves computed witness words through world
 transformation and contact publication. Scoped gates compare retained cylinder/
@@ -93,8 +93,10 @@ box positions, normals and distances at `2e-12`. Both terrain CCD algorithms
 consume those retained words in constraint assembly; scoped dense/component
 gates also compare the actual Jacobians, regularizers and reference accelerations.
 The native-CCD cylinder and box rollouts pass their original trajectory/restore
-gates. The complete terrain matrix remains unqualified. This does not establish full terrain
-qualification or complete native sphere/capsule shrink-distance precision.
+gates. The complete rigid-heightfield Milestone 012 acceptance scope now passes under
+the [accepted shared collision convention](QUALIFICATION.md#sequential-heightfield-qualification-012--2026-10-22).
+This retains strict geometry, physical force and replay bounds; it does not
+establish unrestricted binary64 equality or later solver/integrator compositions.
 
 
 ## Applied forces, damping and basic motors
@@ -152,7 +154,7 @@ The `integrated_euler_v1` stepping profile composes the native Metal Euler physi
 - Contact friction lowering expands MuJoCo geom friction `[slide, torsion, rolling]` to per-axis `[slide1, slide2, torsion, roll1, roll2]`; `<pair>` overrides retain their five coefficients. Standard geom mixing and pair priority are applied before lowering. `solreffriction` is honored for elliptic cones; MuJoCo defines it as ineffective for pyramidal cones. Unsupported dimensions and capacity overflow fail during construction.
 - Solver development source contains distinct PGS, CG and Newton paths and a separate no-slip stage. Their complete option/contact/integrator composition is still under qualification. This is not a promise that selecting a solver merely aliases another algorithm, or that contact refinement substitutes for the pinned no-slip stage. `solver_diagnostics[0]` reports the final retained-system projected dual residual after no-slip, while `[1]` reports executed iterations. `solver_history` contains coarse samples of the optimizer's stopping metric, which can differ from the final dual certificate. `assembled_system()` exposes retained row data for independent checks. Warm-start state and rollback are owned by the simulation. The component-block sparse route contains PGS, CG and Newton operators. Scoped native gates cover the retained mass solve, accepted acceleration and generalized-force publication; complete sparse solver/contact/integrator composition remains under qualification.
 - **Full primitive collision support:** Real multi-contact manifolds generated entirely on GPU via Separating Axis Theorem (SAT 15 candidate axes), Sutherland-Hodgman polygon clipping, and closest segment points. Box-box produces up to 8 contact points, plane-box up to 4, capsule-box / capsule-capsule / plane-capsule up to 2, and sphere pairs 1 point. Both $(A, B)$ and $(B, A)$ geometry orderings, explicit `<pair>`, `<exclude>`, and parent/welded body filtering are fully respected.
-- **Generic convex collision and multiCCD:** the default `mjc_Convex` route uses source-precision GJK/EPA, including box/mesh face manifolds. Disabling `NATIVECCD` selects the separate libccd MPR implementation for generic rigid convex pairs, with the pinned analytic `mjc_fixNormal` refinement. The immutable model option specializes the shader before compilation. Curved pairs obtain extra witnesses by rotating both geometries in opposite directions about the primary contact point, tangent axes, $\pm 10^{-3}$ rad, then re-solving with distinctness tolerance $10^{-3}\min(\text{rbound})$; accepted extra witnesses inherit the primary penetration. Extra contacts are skipped with `MULTICCD` disabled and for sphere/ellipsoid involvement. Rigid alternate-path tests cover both orders, 16/32-vertex compiled mesh graphs, friction dimensions 1/3/4/6, trajectories and checkpoint replay. This qualification does not cover alternate heightfield or deformable collision routes yet.
+- **Generic convex collision and multiCCD:** the default `mjc_Convex` route uses source-precision GJK/EPA, including box/mesh face manifolds. Disabling `NATIVECCD` selects the separate libccd MPR implementation for generic rigid convex pairs, with the pinned analytic `mjc_fixNormal` refinement. The immutable model option specializes the shader before compilation. Curved pairs obtain extra witnesses by rotating both geometries in opposite directions about the primary contact point, tangent axes, $\pm 10^{-3}$ rad, then re-solving with distinctness tolerance $10^{-3}\min(\text{rbound})$; accepted extra witnesses inherit the primary penetration. Extra contacts are skipped with `MULTICCD` disabled and for sphere/ellipsoid involvement. Rigid alternate-path tests cover both orders, 16/32-vertex compiled mesh graphs, friction dimensions 1/3/4/6, trajectories and checkpoint replay. Milestone 012 separately qualifies the admitted alternate rigid-heightfield route. Deformable collision remains a later milestone.
 
 Solving contact and joint constraints in one coupled Delassus system prevents the numerical divergence (exceeding 15% error) that occurs when constraints are solved sequentially or decoupled.
 
@@ -262,10 +264,10 @@ addressing and explicit memory budgets still constrain admission.
 A native two-world 80×96 grid check passes both CCD choices, including contacts,
 forces, nonzero steps and exact checkpoint replay. Host checks preserve every
 sample and descriptor with nine terrain geometries. These scoped checks do not
-qualify every terrain/integrator combination. Cylinder full-double CPU trajectory
-comparison remains open on a branch-sensitive fixture, although contacts and
-acceleration match at identical represented poses. State integration remains
-float32. Heightfield–heightfield collision is absent from the pinned dispatcher;
+qualify every terrain/integrator combination. Milestone 012 now qualifies its
+complete rigid-heightfield scope using the accepted shared reference convention;
+earlier stock-pinned branch-sensitive failures remain compatibility history.
+State integration remains float32. Heightfield–heightfield collision is absent from the pinned dispatcher;
 plane–heightfield emits no contacts.
 
 ### Native stages and state APIs
