@@ -1,3 +1,1575 @@
+static inline FlexDD3 common_mpr_enclosure_portal_direction_012(thread CommonCCDVertex* p) {
+  // Private CPU diagnostic switch: only the shared portal determinant convention.
+  if (true) {
+    FlexDD3 a=mpr_sub(p[2].minkowski,p[1].minkowski);
+    FlexDD3 b=mpr_sub(p[3].minkowski,p[1].minkowski);
+    return mpr_normalize(FlexDD3{
+      flex_dd_source_sub(flex_dd_source_mul(a.y,b.z),flex_dd_source_mul(a.z,b.y)),
+      flex_dd_source_sub(flex_dd_source_mul(a.z,b.x),flex_dd_source_mul(a.x,b.z)),
+      flex_dd_source_sub(flex_dd_source_mul(a.x,b.y),flex_dd_source_mul(a.y,b.x))});
+  }
+
+  return mpr_normalize(mpr_cross(mpr_sub(p[2].minkowski,p[1].minkowski),
+      mpr_sub(p[3].minkowski,p[1].minkowski)));
+}
+static inline int common_mpr_enclosure_support_unit_pair_012(
+    thread CommonCCDSupportObject& a, thread CommonCCDSupportObject& b,
+    FlexDD3 raw_direction, device const float* mesh_vertices,
+    device const int* mesh_graph, thread CommonCCDVertex& output,
+    device float* epa_support_trace, thread int& epa_support_count, int query_budget) {
+  if(epa_support_count>=query_budget)return -20;
+  FlexDD length=flex_dd_sqrt(flex_dd3_dot(raw_direction,raw_direction));
+  FlexDD3 direction=flex_dd_compare_exact(length,flex_dd(1.0e-15f))>0
+      ? flex_dd3_div(raw_direction,length)
+      : FlexDD3{flex_dd(1.0f),flex_dd(0.0f),flex_dd(0.0f)};
+  int status=mpr_support_pair(a,b,direction,mesh_vertices,mesh_graph,
+                                     output);
+  if (!status)
+    common_ccd_diag_epa_support(epa_support_trace,epa_support_count,
+                                direction,output);
+  return status;
+}
+static inline int common_mpr_enclosure_initialize_p3_012(
+    thread const CommonCCDVertex* seed,
+    thread CommonCCDSupportObject& a, thread CommonCCDSupportObject& b,
+    FlexDD gjk_distance, device const float* mesh_vertices,
+    device const int* mesh_graph, device FlexDDVertex* vertices,
+    device int2* vertex_ids,
+    thread FlexDD3& center, thread int3* face_vertices,
+    thread int3* adjacency, device float* epa_support_trace,
+    thread int& epa_support_count, int query_budget) {
+  for (int i=0;i<3;i++) {
+    vertices[i]=common_ccd_flex_vertex(seed[i]);
+    if (vertex_ids!=nullptr) vertex_ids[i]=int2(seed[i].index_a,seed[i].index_b);
+  }
+  FlexDD3 d1=flex_dd3_sub(seed[1].minkowski,seed[0].minkowski);
+  FlexDD3 d2=flex_dd3_sub(seed[2].minkowski,seed[0].minkowski);
+  FlexDD3 normal=flex_dd3_cross(d1,d2);
+  FlexDD normal_length=flex_dd_sqrt(flex_dd3_dot(normal,normal));
+  if (flex_dd_compare_exact(normal_length,flex_dd(1.0e-15f))<0) return 1;
+  FlexDD3 center_sum=flex_dd3_add(seed[0].minkowski,seed[1].minkowski);
+  center_sum=flex_dd3_add(center_sum,seed[2].minkowski);
+  // Pinned mjc_polytope3 multiplies by the mjtNum (binary64) expression
+  // 1.0/3.0. Encoding the rounded float32 reciprocal here changes the
+  // centroid by several ULPs of the represented inputs and can alter EPA's
+  // source-ordered closest-face tie.
+  center=flex_dd3_scale(center_sum,FlexDD{
+      0.3333333432674408f,-9.934107758624577e-9f,2.7755575615628914e-16f});
+  CommonCCDVertex v5,v4;
+  if (common_mpr_enclosure_support_unit_pair_012(a,b,flex_dd3_neg(normal),mesh_vertices,
+                                  mesh_graph,v5,epa_support_trace,
+                                  epa_support_count,query_budget) ||
+      common_mpr_enclosure_support_unit_pair_012(a,b,normal,mesh_vertices,mesh_graph,v4,
+                                  epa_support_trace,epa_support_count,query_budget))
+    return 2;
+  vertices[3]=common_ccd_flex_vertex(v5);
+  vertices[4]=common_ccd_flex_vertex(v4);
+  if (vertex_ids!=nullptr) {
+    vertex_ids[3]=int2(v5.index_a,v5.index_b);
+    vertex_ids[4]=int2(v4.index_a,v4.index_b);
+  }
+  if (common_ccd_tri_point_intersect(seed[0].minkowski,
+          seed[1].minkowski,seed[2].minkowski,v4.minkowski) ||
+      common_ccd_tri_point_intersect(seed[0].minkowski,
+          seed[1].minkowski,seed[2].minkowski,v5.minkowski)) return 3;
+  if (flex_dd_compare_exact(gjk_distance,flex_dd(1.0e-14f))>0 &&
+      !common_ccd_test_tetra_source(seed[0].minkowski,
+          seed[1].minkowski,seed[2].minkowski,v4.minkowski) &&
+      !common_ccd_test_tetra_source(seed[0].minkowski,
+          seed[1].minkowski,seed[2].minkowski,v5.minkowski))
+    return 4;
+
+  face_vertices[0]=int3(4,0,1); face_vertices[1]=int3(4,2,0);
+  face_vertices[2]=int3(4,1,2); face_vertices[3]=int3(3,1,0);
+  face_vertices[4]=int3(3,0,2); face_vertices[5]=int3(3,2,1);
+  adjacency[0]=int3(1,3,2); adjacency[1]=int3(2,4,0);
+  adjacency[2]=int3(0,5,1); adjacency[3]=int3(5,0,4);
+  adjacency[4]=int3(3,1,5); adjacency[5]=int3(4,2,3);
+  for (int i=0;i<6;i++) {
+    FlexEpaFace face;
+    int3 f=face_vertices[i];
+    if (!flex_epa_make_face_dd(vertices,center,f.x,f.y,f.z,adjacency[i],face) ||
+        flex_dd_compare_exact(face.dist2_dd,flex_dd(1.0e-30f))<0) return 5;
+  }
+  return 0;
+}
+// Private complete-prediction-admitted face/vertex extraction.
+static inline bool common_fv_finite_012(FlexDD x) {
+  return isfinite(x.hi)&&isfinite(x.lo)&&isfinite(x.tail);
+}
+static inline bool common_fv_finite3_012(FlexDD3 x) {
+  return common_fv_finite_012(x.x)&&common_fv_finite_012(x.y)&&common_fv_finite_012(x.z);
+}
+static inline FlexDD common_fv_max_012(FlexDD a,FlexDD b) {
+  return flex_dd_compare_exact(a,b)>0?a:b;
+}
+static inline void common_fv_affine_012(FlexDD3 s1,FlexDD3 s2,FlexDD3 s3,FlexDD3 p,thread FlexDD* output) {
+  FlexDD m14=flex_epa_affine_minor(FlexDD2{s1.y,s1.z},
+      FlexDD2{s2.y,s2.z},FlexDD2{s3.y,s3.z});
+  FlexDD m24=flex_epa_affine_minor(FlexDD2{s1.x,s1.z},
+      FlexDD2{s2.x,s2.z},FlexDD2{s3.x,s3.z});
+  FlexDD m34=flex_epa_affine_minor(FlexDD2{s1.x,s1.y},
+      FlexDD2{s2.x,s2.y},FlexDD2{s3.x,s3.y});
+  FlexDD abs14=flex_dd_abs(m14), abs24=flex_dd_abs(m24), abs34=flex_dd_abs(m34);
+  FlexDD mmax; FlexDD2 a2,b2,c2,q2;
+  if (flex_dd_compare(abs14,abs24)>=0 && flex_dd_compare(abs14,abs34)>=0) {
+    mmax=m14; a2=FlexDD2{s1.y,s1.z}; b2=FlexDD2{s2.y,s2.z};
+    c2=FlexDD2{s3.y,s3.z}; q2=FlexDD2{p.y,p.z};
+  } else if (flex_dd_compare(abs24,abs34)>=0) {
+    mmax=m24; a2=FlexDD2{s1.x,s1.z}; b2=FlexDD2{s2.x,s2.z};
+    c2=FlexDD2{s3.x,s3.z}; q2=FlexDD2{p.x,p.z};
+  } else {
+    mmax=m34; a2=FlexDD2{s1.x,s1.y}; b2=FlexDD2{s2.x,s2.y};
+    c2=FlexDD2{s3.x,s3.y}; q2=FlexDD2{p.x,p.y};
+  }
+  FlexDD weights[3]={
+      flex_dd_source_div(flex_epa_affine_area(q2,b2,c2),mmax),
+      flex_dd_source_div(flex_epa_affine_area(q2,c2,a2),mmax),
+      flex_dd_source_div(flex_epa_affine_area(q2,a2,b2),mmax)};
+  for(int i=0;i<3;i++)output[i]=weights[i];
+}
+static inline bool common_fv_scaled_unit_012(FlexDD3 value,thread int& exponent,
+    thread FlexDD3& scaled,thread FlexDD& squared,thread FlexDD& length,
+    thread FlexDD& inverse,thread FlexDD3& unit) {
+  exponent=0;scaled=flex_dd3(float3(0));squared=length=inverse=flex_dd(0);unit=scaled;
+  if(!common_fv_finite3_012(value))return false;
+  bool found=false;
+  for(int axis=0;axis<3;axis++) {
+    FlexDD c=flex_dd3_component(value,axis);float words[3]={c.hi,c.lo,c.tail};
+    for(int limb=0;limb<3;limb++)if((as_type<uint>(words[limb])&0x7fffffffu)!=0u) {
+      int e=flex_float_exponent(words[limb]);
+      if(!found||e>exponent){found=true;exponent=e;}
+    }
+  }
+  if(!found)return false;
+  scaled=FlexDD3{flex_dd_scalbn(value.x,-exponent),
+      flex_dd_scalbn(value.y,-exponent),flex_dd_scalbn(value.z,-exponent)};
+  FlexDD3 back=FlexDD3{flex_dd_scalbn(scaled.x,exponent),
+      flex_dd_scalbn(scaled.y,exponent),flex_dd_scalbn(scaled.z,exponent)};
+  if(!common_fv_finite3_012(scaled)||!common_fv_finite3_012(back)||
+     flex_dd_compare_exact(back.x,value.x)!=0||
+     flex_dd_compare_exact(back.y,value.y)!=0||
+     flex_dd_compare_exact(back.z,value.z)!=0)return false;
+  squared=flex_dd_source_dot3(scaled,scaled);
+  length=flex_dd_source_sqrt(squared);
+  if(!common_fv_finite_012(length)||flex_dd_compare_exact(length,flex_dd(0))<=0)return false;
+  inverse=flex_dd_source_div(flex_dd(1),length);unit=mpr_scale(scaled,inverse);
+  return common_fv_finite_012(inverse)&&common_fv_finite3_012(unit);
+}
+static inline int common_fv_recover_scaled_012(
+    const thread FlexEpaFace& face,device const FlexDDVertex* vertices,int vertex_count,
+    thread CommonCCDSupportObject& a,thread CommonCCDSupportObject& b,
+    device const float* mesh_vertices,device const int* mesh_graph,
+    int max_iterations,FlexDD tolerance,thread int& support_count,
+    thread CommonCCDEpaResult& out,thread ContactGeom& contact) {
+  if(max_iterations<=0||max_iterations>2147483645||vertex_count<3||
+     face.a<0||face.b<0||face.c<0||face.a>=vertex_count||
+     face.b>=vertex_count||face.c>=vertex_count)return -20;
+  
+  int cap=max_iterations+2;
+  FlexDD zero=flex_dd(0),one=flex_dd(1),old_depth=out.distance;
+  FlexDD3 old_direction=mpr_sub(out.witness_a,out.witness_b);
+  FlexDD best_depth=flex_dd(3.402823466e+38f),best_rounding=zero;
+  FlexDD3 best1=flex_dd3(float3(0)),best2=best1,best_triangle[3];
+  FlexDD best_weights[3]={zero,zero,zero};
+  CommonCCDVertex best_query;best_query.point_a=best_query.point_b=best_query.minkowski=best1;
+  int best_side=-1,best_qbefore=0,best_qafter=0;
+  FlexDD3 empty_triangle[3]={best1,best1,best1};
+  
+  for(int side=0;side<2;side++) {
+    if(cap-support_count<=1) {
+      break;
+    }
+    FlexDD3 triangle[3];int ids[3]={face.a,face.b,face.c};
+    for(int i=0;i<3;i++)triangle[i]=side?vertices[ids[i]].b:vertices[ids[i]].a;
+    FlexDD3 e=mpr_sub(triangle[1],triangle[0]),f=mpr_sub(triangle[2],triangle[0]);
+    FlexDD3 n=mpr_cross(e,f);
+    FlexDD3 unscaled_cross=n,scaled,normalized;
+    FlexDD squared,length,inverse;int exponent;
+    bool scale_ok=common_fv_scaled_unit_012(n,exponent,scaled,squared,length,inverse,normalized);
+    
+    if(!scale_ok)continue;
+    
+    
+    n=normalized;
+    if(flex_dd_compare_exact(flex_dd_source_dot3(n,old_direction),zero)<0)n=flex_dd3_neg(n);
+    if(!common_fv_finite3_012(n))continue;
+    CommonCCDVertex query;query.point_a=query.point_b=query.minkowski=flex_dd3(float3(0));query.index_a=query.index_b=-1;int before=support_count;support_count++;
+    int status=mpr_support_pair(a,b,n,mesh_vertices,mesh_graph,query);
+    FlexDD weights[3]={zero,zero,zero};
+    
+    if(status)return -20;
+    FlexDD scale=one;
+    for(int k=0;k<3;k++) {
+      scale=common_fv_max_012(scale,flex_dd_abs(flex_dd3_component(query.point_a,k)));
+      scale=common_fv_max_012(scale,flex_dd_abs(flex_dd3_component(query.point_b,k)));
+      for(int i=0;i<3;i++)scale=common_fv_max_012(scale,flex_dd_abs(flex_dd3_component(triangle[i],k)));
+    }
+    FlexDD rounding=flex_dd_source_mul(flex_dd(0x1p-44f),scale);
+    FlexDD plane_error=flex_dd_source_dot3(n,mpr_sub(side?query.point_b:query.point_a,triangle[0]));
+    if(!common_fv_finite_012(rounding)||!common_fv_finite_012(plane_error)||
+       flex_dd_compare_exact(flex_dd_abs(plane_error),rounding)>0)continue;
+    FlexDD3 opposite=side?query.point_a:query.point_b;
+    FlexDD h=flex_dd_source_dot3(n,mpr_sub(triangle[0],opposite));
+    if(side)h=flex_dd_neg(h);
+    if(!common_fv_finite_012(h)||flex_dd_compare_exact(h,zero)<=0||
+       flex_dd_compare_exact(flex_dd_abs(flex_dd_source_sub(h,old_depth)),tolerance)>0)continue;
+    FlexDD3 projection=mpr_add(opposite,mpr_scale(n,side?flex_dd_neg(h):h));
+    common_fv_affine_012(triangle[0],triangle[1],triangle[2],projection,weights);
+    if(!common_fv_finite_012(weights[0])||!common_fv_finite_012(weights[1])||!common_fv_finite_012(weights[2])||
+       flex_dd_compare_exact(weights[0],zero)<0||flex_dd_compare_exact(weights[1],zero)<0||
+       flex_dd_compare_exact(weights[2],zero)<0)continue;
+    FlexDD sum=flex_dd_source_add(flex_dd_source_add(weights[0],weights[1]),weights[2]);
+    FlexDD partition_error=flex_dd_abs(flex_dd_source_sub(sum,one));
+    if(flex_dd_compare_exact(partition_error,flex_dd_source_mul(flex_dd(0x1p-45f),common_fv_max_012(one,flex_dd_abs(sum))))>0)continue;
+    FlexDD3 facepoint=flex_dd3_lincomb_source(triangle,weights,3);
+    FlexDD3 x1=side?opposite:facepoint,x2=side?facepoint:opposite;
+    FlexDD3 delta=mpr_sub(x1,x2);
+    FlexDD3 delta_scaled,delta_unit;FlexDD delta_squared,delta_length,delta_inverse;
+    int delta_exponent;
+    bool delta_ok=common_fv_scaled_unit_012(delta,delta_exponent,delta_scaled,delta_squared,
+        delta_length,delta_inverse,delta_unit);
+    
+    if(!delta_ok)continue;
+    FlexDD depth=flex_dd_scalbn(delta_length,delta_exponent);
+    if(flex_dd_compare_exact(flex_dd_scalbn(depth,-delta_exponent),delta_length)!=0)continue;
+    if(!common_fv_finite_012(depth)||flex_dd_compare_exact(depth,zero)<=0||
+       flex_dd_compare_exact(flex_dd_abs(flex_dd_source_sub(depth,old_depth)),tolerance)>0)continue;
+    
+    if(best_side<0||flex_dd_compare_exact(depth,best_depth)<0) {
+      best_side=side;best_depth=depth;best1=x1;best2=x2;best_rounding=rounding;
+      best_query=query;best_qbefore=before;best_qafter=support_count;
+      for(int i=0;i<3;i++){best_triangle[i]=triangle[i];best_weights[i]=weights[i];}
+    }
+  }
+  if(best_side<0||support_count>=cap)return 0;
+  FlexDD3 final_delta=mpr_sub(best1,best2),final_scaled,n;
+  FlexDD final_squared,final_length,final_inverse;int final_exponent;
+  bool final_ok=common_fv_scaled_unit_012(final_delta,final_exponent,final_scaled,final_squared,
+      final_length,final_inverse,n);
+  
+  if(!final_ok)return 0;
+  CommonCCDVertex query;query.point_a=query.point_b=query.minkowski=flex_dd3(float3(0));query.index_a=query.index_b=-1;int before=support_count;support_count++;
+  int status=mpr_support_pair(a,b,n,mesh_vertices,mesh_graph,query);
+  FlexDD gap=status?zero:flex_dd_source_sub(flex_dd_source_dot3(n,query.minkowski),best_depth);
+  
+  if(status)return -20;
+  if(!common_fv_finite_012(gap)||flex_dd_compare_exact(gap,tolerance)>0||
+     flex_dd_compare_exact(gap,flex_dd_neg(best_rounding))<0)return 0;
+  out.distance=best_depth;out.witness_a=best1;out.witness_b=best2;out.normal=n;
+  out.position=mpr_scale(mpr_add(best1,best2),flex_dd(.5f));
+  contact.normal=flex_dd3_high(n);contact.pos=flex_dd3_high(out.position);
+  contact.dist=-((best_depth.hi+best_depth.lo)+best_depth.tail);
+  contact.t1=float3(0);make_frame(contact.normal,contact.t1,contact.t2);
+  
+  return 1;
+}
+// Private complete-prediction-admitted configured face-overlap recovery.
+static inline int common_fo_count_012(thread const CommonCCDSupportObject& object,int live) {
+  if(!common_fv_finite_012(object.margin))return 0;
+  int count=0;
+  if(object.kind==COMMON_CCD_HFIELD_PRISM) {
+    if(object.vertex_count!=6)return 0;count=6;
+  } else if(object.geom>=0 && object.kind==COMMON_CCD_BOX)count=8;
+  else if(object.geom>=0 && object.kind==COMMON_CCD_HULL)count=object.vertex_count;
+  if(count<3 || count>live || count>2147483647/3)return 0;
+  if(object.kind==COMMON_CCD_HFIELD_PRISM || object.kind==COMMON_CCD_HULL) {
+    if(object.vertex_offset<0 || object.vertex_offset>2147483647/3-count)return 0;
+  }
+  return count;
+}
+static inline bool common_fo_vertex_012(thread FlexDD3& result,
+    thread const CommonCCDSupportObject& object,int index,FlexDD3 outward,
+    device const float* vertices) {
+  FlexDD3 local;
+  if(object.kind==COMMON_CCD_BOX) {
+    local=FlexDD3{(index&1)?object.size[0]:flex_dd_neg(object.size[0]),
+                 (index&2)?object.size[1]:flex_dd_neg(object.size[1]),
+                 (index&4)?object.size[2]:flex_dd_neg(object.size[2])};
+  } else {
+    int address=3*(object.vertex_offset+index);
+    if(object.kind==COMMON_CCD_HFIELD_PRISM) {
+      local=FlexDD3{
+       FlexDD{vertices[address],object.hfield_residual[index].x.hi,object.hfield_residual[index].x.lo},
+       FlexDD{vertices[address+1],object.hfield_residual[index].y.hi,object.hfield_residual[index].y.lo},
+       FlexDD{vertices[address+2],object.hfield_residual[index].z.hi,object.hfield_residual[index].z.lo}};
+    } else local=flex_dd3(float3(vertices[address],vertices[address+1],vertices[address+2]));
+  }
+  // Preserve this native object's original support-reader association. The
+  // prism vertices are already in the shared local collision frame; ordinary
+  // geometry transforms then adds its existing world-direction half margin.
+  if(object.kind==COMMON_CCD_HFIELD_PRISM)result=local;
+  else {
+    result=common_ccd_local_to_world(object.mat,object.pos,local);
+    if(object.geom>=0 && flex_dd_compare_exact(object.margin,flex_dd(0))>0)
+      result=flex_dd3_source_madd(outward,flex_dd_mul(object.margin,flex_dd(.5f)),result);
+  }
+  return common_fv_finite3_012(result);
+}
+static inline bool common_fo_member_012(thread FlexDD3& result,
+    thread const CommonCCDSupportObject& object,FlexDD3 outward,FlexDD3 target,
+    int live,FlexDD rounding,device const float* vertices,
+    thread FlexDD* certificate) {
+  int count=common_fo_count_012(object,live);
+  if(!count || !common_fv_finite_012(rounding) || flex_dd_compare_exact(rounding,flex_dd(0))<0)return false;
+  int anchor=0;FlexDD3 a,v;
+  if(!common_fo_vertex_012(a,object,0,outward,vertices))return false;
+  FlexDD best=flex_dd_source_dot3(outward,a);
+  if(!common_fv_finite_012(best))return false;
+  for(int i=1;i<count;i++) {
+    if(!common_fo_vertex_012(v,object,i,outward,vertices))return false;
+    FlexDD score=flex_dd_source_dot3(outward,v);
+    if(!common_fv_finite_012(score))return false;
+    if(flex_dd_compare_exact(score,best)>0){anchor=i;best=score;a=v;}
+  }
+  for(int i=0;i<count;i++)if(i!=anchor) {
+    FlexDD3 b;if(!common_fo_vertex_012(b,object,i,outward,vertices))return false;
+    for(int j=i+1;j<count;j++)if(j!=anchor) {
+      FlexDD3 c;
+      if(!common_fo_vertex_012(c,object,j,outward,vertices))return false;
+      FlexDD3 cross=mpr_cross(mpr_sub(b,a),mpr_sub(c,a));
+      if(!common_fv_finite3_012(cross))continue;
+      if(flex_dd_compare_exact(cross.x,flex_dd(0))==0 &&
+         flex_dd_compare_exact(cross.y,flex_dd(0))==0 &&
+         flex_dd_compare_exact(cross.z,flex_dd(0))==0)continue;
+      FlexDD weights[3];common_fv_affine_012(a,b,c,target,weights);
+      if(!common_fv_finite_012(weights[0])||!common_fv_finite_012(weights[1])||!common_fv_finite_012(weights[2])||
+         flex_dd_compare_exact(weights[0],flex_dd(0))<0||
+         flex_dd_compare_exact(weights[1],flex_dd(0))<0||
+         flex_dd_compare_exact(weights[2],flex_dd(0))<0)continue;
+      FlexDD sum=flex_dd_source_add(flex_dd_source_add(weights[0],weights[1]),weights[2]);
+      if(!common_fv_finite_012(sum)||flex_dd_compare_exact(flex_dd_abs(flex_dd_source_sub(sum,flex_dd(1))),
+         flex_dd_source_mul(flex_dd(0x1p-45f),common_fv_max_012(flex_dd(1),flex_dd_abs(sum))))>0)continue;
+      FlexDD3 triangle[3]={a,b,c};FlexDD3 point=flex_dd3_lincomb_source(triangle,weights,3);
+      bool valid=common_fv_finite3_012(point);
+      for(int k=0;k<3;k++)if(flex_dd_compare_exact(flex_dd_abs(flex_dd_source_sub(
+          flex_dd3_component(point,k),flex_dd3_component(target,k))),rounding)>0)valid=false;
+      if(!valid)continue;
+      result=point;certificate[0]=flex_dd(float(count));certificate[1]=flex_dd(float(anchor));
+      certificate[2]=flex_dd(float(i));certificate[3]=flex_dd(float(j));
+      for(int k=0;k<3;k++) {
+        certificate[4+k]=weights[k];certificate[7+k]=flex_dd3_component(a,k);
+        certificate[10+k]=flex_dd3_component(b,k);certificate[13+k]=flex_dd3_component(c,k);
+        certificate[16+k]=flex_dd3_component(target,k);certificate[19+k]=flex_dd3_component(point,k);
+      }
+      certificate[22]=rounding;certificate[23]=flex_dd(float(live));return true;
+    }
+  }
+  return false;
+}
+static inline int common_fo_configured_recover_012(
+    const thread FlexEpaFace& face,device const FlexDDVertex* vertices,int vertex_count,
+    thread CommonCCDSupportObject& a,thread CommonCCDSupportObject& b,
+    device const float* mesh_vertices,device const int* mesh_graph,
+    int max_iterations,FlexDD tolerance,thread int& support_count,
+    thread CommonCCDEpaResult& out,thread ContactGeom& contact) {
+  if(max_iterations<=0||max_iterations>2147483645||vertex_count<3||
+     face.a<0||face.b<0||face.c<0||face.a>=vertex_count||
+     face.b>=vertex_count||face.c>=vertex_count)return -20;
+  
+  int cap=max_iterations+2;
+  FlexDD zero=flex_dd(0),one=flex_dd(1),old_depth=out.distance;
+  FlexDD3 old_direction=mpr_sub(out.witness_a,out.witness_b);
+  FlexDD best_depth=flex_dd(3.402823466e+38f),best_rounding=zero;
+  FlexDD3 best1=flex_dd3(float3(0)),best2=best1,best_triangle[3];
+  FlexDD best_weights[3]={zero,zero,zero};
+  CommonCCDVertex best_query;best_query.point_a=best_query.point_b=best_query.minkowski=best1;
+  int best_side=-1,best_qbefore=0,best_qafter=0;
+  FlexDD3 empty_triangle[3]={best1,best1,best1};
+  
+  for(int side=0;side<2;side++) {
+    if(cap-support_count<=1) {
+      break;
+    }
+    FlexDD3 triangle[3];int ids[3]={face.a,face.b,face.c};
+    for(int i=0;i<3;i++)triangle[i]=side?vertices[ids[i]].b:vertices[ids[i]].a;
+    FlexDD3 e=mpr_sub(triangle[1],triangle[0]),f=mpr_sub(triangle[2],triangle[0]);
+    FlexDD3 n=mpr_cross(e,f);
+    FlexDD3 unscaled_cross=n,scaled,normalized;
+    FlexDD squared,length,inverse;int exponent;
+    bool scale_ok=common_fv_scaled_unit_012(n,exponent,scaled,squared,length,inverse,normalized);
+    
+    if(!scale_ok)continue;
+    
+    
+    n=normalized;
+    if(flex_dd_compare_exact(flex_dd_source_dot3(n,old_direction),zero)<0)n=flex_dd3_neg(n);
+    if(!common_fv_finite3_012(n))continue;
+    CommonCCDVertex query;query.point_a=query.point_b=query.minkowski=flex_dd3(float3(0));query.index_a=query.index_b=-1;int before=support_count;support_count++;
+    int status=mpr_support_pair(a,b,n,mesh_vertices,mesh_graph,query);
+    FlexDD weights[3]={zero,zero,zero};
+    
+    if(status)return -20;
+    FlexDD scale=one;
+    for(int k=0;k<3;k++) {
+      scale=common_fv_max_012(scale,flex_dd_abs(flex_dd3_component(query.point_a,k)));
+      scale=common_fv_max_012(scale,flex_dd_abs(flex_dd3_component(query.point_b,k)));
+      for(int i=0;i<3;i++)scale=common_fv_max_012(scale,flex_dd_abs(flex_dd3_component(triangle[i],k)));
+    }
+    FlexDD rounding=flex_dd_source_mul(flex_dd(0x1p-44f),scale);
+    FlexDD plane_error=flex_dd_source_dot3(n,mpr_sub(side?query.point_b:query.point_a,triangle[0]));
+    if(!common_fv_finite_012(rounding)||!common_fv_finite_012(plane_error)||
+       flex_dd_compare_exact(flex_dd_abs(plane_error),rounding)>0)continue;
+    FlexDD3 opposite=side?query.point_a:query.point_b;
+    FlexDD h=flex_dd_source_dot3(n,mpr_sub(triangle[0],opposite));
+    if(side)h=flex_dd_neg(h);
+    if(!common_fv_finite_012(h)||flex_dd_compare_exact(h,zero)<=0||
+       flex_dd_compare_exact(flex_dd_abs(flex_dd_source_sub(h,old_depth)),tolerance)>0)continue;
+    FlexDD3 projection=mpr_add(opposite,mpr_scale(n,side?flex_dd_neg(h):h));
+    common_fv_affine_012(triangle[0],triangle[1],triangle[2],projection,weights);
+    if(!common_fv_finite_012(weights[0])||!common_fv_finite_012(weights[1])||!common_fv_finite_012(weights[2])||
+       flex_dd_compare_exact(weights[0],zero)<0||flex_dd_compare_exact(weights[1],zero)<0||
+       flex_dd_compare_exact(weights[2],zero)<0) {
+      FlexDD third=flex_dd_source_div(one,flex_dd(3));
+      weights[0]=weights[1]=weights[2]=third;
+      FlexDD3 center=flex_dd3_lincomb_source(triangle,weights,3);
+      FlexDD3 target=mpr_add(center,mpr_scale(n,side?h:flex_dd_neg(h)));
+      FlexDD3 outward=side?n:flex_dd3_neg(n);FlexDD certificate[24];
+      if(!common_fo_member_012(opposite,side?a:b,outward,target,cap,
+                        rounding,mesh_vertices,certificate))continue;
+      
+    }
+    FlexDD sum=flex_dd_source_add(flex_dd_source_add(weights[0],weights[1]),weights[2]);
+    FlexDD partition_error=flex_dd_abs(flex_dd_source_sub(sum,one));
+    if(flex_dd_compare_exact(partition_error,flex_dd_source_mul(flex_dd(0x1p-45f),common_fv_max_012(one,flex_dd_abs(sum))))>0)continue;
+    FlexDD3 facepoint=flex_dd3_lincomb_source(triangle,weights,3);
+    FlexDD3 x1=side?opposite:facepoint,x2=side?facepoint:opposite;
+    FlexDD3 delta=mpr_sub(x1,x2);
+    FlexDD3 delta_scaled,delta_unit;FlexDD delta_squared,delta_length,delta_inverse;
+    int delta_exponent;
+    bool delta_ok=common_fv_scaled_unit_012(delta,delta_exponent,delta_scaled,delta_squared,
+        delta_length,delta_inverse,delta_unit);
+    
+    if(!delta_ok)continue;
+    FlexDD depth=flex_dd_scalbn(delta_length,delta_exponent);
+    if(flex_dd_compare_exact(flex_dd_scalbn(depth,-delta_exponent),delta_length)!=0)continue;
+    if(!common_fv_finite_012(depth)||flex_dd_compare_exact(depth,zero)<=0||
+       flex_dd_compare_exact(flex_dd_abs(flex_dd_source_sub(depth,old_depth)),tolerance)>0)continue;
+    
+    if(best_side<0||flex_dd_compare_exact(depth,best_depth)<0) {
+      best_side=side;best_depth=depth;best1=x1;best2=x2;best_rounding=rounding;
+      best_query=query;best_qbefore=before;best_qafter=support_count;
+      for(int i=0;i<3;i++){best_triangle[i]=triangle[i];best_weights[i]=weights[i];}
+    }
+  }
+  if(best_side<0||support_count>=cap)return 0;
+  FlexDD3 final_delta=mpr_sub(best1,best2),final_scaled,n;
+  FlexDD final_squared,final_length,final_inverse;int final_exponent;
+  bool final_ok=common_fv_scaled_unit_012(final_delta,final_exponent,final_scaled,final_squared,
+      final_length,final_inverse,n);
+  
+  if(!final_ok)return 0;
+  CommonCCDVertex query;query.point_a=query.point_b=query.minkowski=flex_dd3(float3(0));query.index_a=query.index_b=-1;int before=support_count;support_count++;
+  int status=mpr_support_pair(a,b,n,mesh_vertices,mesh_graph,query);
+  FlexDD gap=status?zero:flex_dd_source_sub(flex_dd_source_dot3(n,query.minkowski),best_depth);
+  
+  if(status)return -20;
+  if(!common_fv_finite_012(gap)||flex_dd_compare_exact(gap,tolerance)>0||
+     flex_dd_compare_exact(gap,flex_dd_neg(best_rounding))<0)return 0;
+  out.distance=best_depth;out.witness_a=best1;out.witness_b=best2;out.normal=n;
+  out.position=mpr_scale(mpr_add(best1,best2),flex_dd(.5f));
+  contact.normal=flex_dd3_high(n);contact.pos=flex_dd3_high(out.position);
+  contact.dist=-((best_depth.hi+best_depth.lo)+best_depth.tail);
+  contact.t1=float3(0);make_frame(contact.normal,contact.t1,contact.t2);
+  
+  return 1;
+}
+static inline bool common_ellipsoid_vertex_certificate_012(
+    const thread FlexEpaFace&,device const FlexDDVertex*,
+    thread CommonCCDSupportObject&,thread CommonCCDSupportObject&,
+    device const float*,device const int*,int,FlexDD,thread int&,
+    thread CommonCCDEpaResult&,thread ContactGeom&);
+static inline CommonCCDEpaResult common_mpr_enclosure_epa_012(
+    thread const CommonCCDVertex* seed, int seed_count,
+    thread CommonCCDSupportObject& a, thread CommonCCDSupportObject& b,
+    int max_iterations, FlexDD tolerance, FlexDD gjk_distance,
+    device const float* mesh_vertices, device const int* mesh_graph,
+    device FlexDDVertex* vertices, device int2* vertex_ids,
+    device FlexEpaFace* faces,
+    device int* face_map, device int2* horizon,
+    device FlexHorizonFrame* horizon_stack, int vertex_capacity,
+    int face_capacity, int horizon_capacity, int horizon_stack_capacity,
+    thread ContactGeom& contact, device float* epa_support_trace,
+    device float* epa_face_trace, thread int& epa_support_count,
+    thread int& epa_face_count) {
+  CommonCCDEpaResult out;
+  out.distance=flex_dd(3.402823466e+38f);
+  out.status=1;
+  out.face_vertices=int3(-1);
+  epa_support_count=0;
+  epa_face_count=0;
+  // engine_collision_gjk.c::epa uses mjMINEPATOL for discrete pairs; the
+  // pinned double build defines that as mjMINVAL (1e-15), independent of
+  // model.opt.ccd_tolerance. Smooth pairs keep the configured tolerance.
+  FlexDD epa_tolerance=tolerance;
+  if (max_iterations<=0 || seed_count!=4 ||
+      vertex_capacity<6 || face_capacity<6 || horizon_capacity<3 ||
+      horizon_stack_capacity<1) {
+    out.status=2;  // Invalid invocation is not a source no-contact result.
+    return out;
+  }
+  CommonCCDVertex local_seed[4];
+  for (int i=0;i<seed_count;i++) {
+    local_seed[i]=seed[i];
+    vertices[i]=common_ccd_flex_vertex(local_seed[i]);
+    if (vertex_ids!=nullptr) vertex_ids[i]=int2(local_seed[i].index_a,local_seed[i].index_b);
+  }
+  int vertex_count=seed_count;
+  FlexDD3 center=flex_dd3(float3(0.0f));
+  for (int i=0;i<seed_count;i++)
+    center=flex_dd3_add(center,local_seed[i].minkowski);
+  FlexDD center_scale=seed_count==4 ? flex_dd(0.25f) :
+      seed_count==3 ? flex_dd_source_div(flex_dd(1.0f),flex_dd(3.0f))
+                    : flex_dd(0.5f);
+  center=flex_dd3_scale(center,center_scale);
+  int face_count=0;
+  int map_count=0;
+  FlexEpaFace face;
+  int3 face_vertices[6];
+  int3 adjacency[6];
+  int initial_faces=0;
+  bool p3_initialized=false;
+  if (seed_count==4) {
+    face_vertices[0]=int3(0,1,2); face_vertices[1]=int3(0,3,1);
+    face_vertices[2]=int3(0,2,3); face_vertices[3]=int3(3,2,1);
+    adjacency[0]=int3(1,3,2); adjacency[1]=int3(2,3,0);
+    adjacency[2]=int3(0,3,1); adjacency[3]=int3(2,0,1);
+    initial_faces=4;
+    // polytope4 tests source-ordered faces before testing tetra containment.
+    // A face at the origin is replaced by that exact ordered P3 simplex.
+    int fallback_face=-1;
+    for (int i=0;i<4;i++) {
+    if (common_ccd_face_below_source_limit(
+              vertices,center,face_vertices[i],adjacency[i],
+              flex_dd(1.0e-30f))) { fallback_face=i; break; }
+    }
+    if (fallback_face>=0) {
+      int3 f=face_vertices[fallback_face];
+      CommonCCDVertex p3seed[3]={local_seed[f.x],local_seed[f.y],local_seed[f.z]};
+      int init=common_mpr_enclosure_initialize_p3_012(p3seed,a,b,gjk_distance,
+          mesh_vertices,mesh_graph,vertices,vertex_ids,center,face_vertices,
+          adjacency,epa_support_trace,epa_support_count,max_iterations+2);
+      if (init) {
+        // Source polytope initialization rejects boundary/degenerate seeds
+        // without a contact. A support-read failure remains an error.
+        out.status=init==2 ? 2 : 1;
+        if (out.status==1) out.distance=flex_dd(0.0f);
+        return out;
+      }
+      vertex_count=5; initial_faces=6; p3_initialized=true;
+    }
+    if (!p3_initialized &&
+        !common_ccd_test_tetra_source(local_seed[0].minkowski,
+                         local_seed[1].minkowski,
+                         local_seed[2].minkowski,
+                         local_seed[3].minkowski)) {
+      out.status=1; out.distance=flex_dd(0.0f); return out;
+    }
+  } else if (seed_count==3) {
+    int init=common_mpr_enclosure_initialize_p3_012(local_seed,a,b,gjk_distance,
+        mesh_vertices,mesh_graph,vertices,vertex_ids,center,face_vertices,
+        adjacency,epa_support_trace,epa_support_count,max_iterations+2);
+    if (init) {
+      out.status=init==2 ? 2 : 1;
+      if (out.status==1) out.distance=flex_dd(0.0f);
+      return out;
+    }
+    vertex_count=5;
+    initial_faces=6;
+    p3_initialized=true;
+  } else {
+    FlexDD3 directions[3];
+    flex_epa_p2_directions_source(local_seed[0].minkowski,local_seed[1].minkowski,directions);
+    CommonCCDVertex p2seed[5];
+    p2seed[0]=local_seed[0]; p2seed[1]=local_seed[1];
+    for (int i=0;i<3;i++) {
+      CommonCCDVertex support;
+      // The shared P2 helper already performs epaSupport's component
+      // divisions. A second normalization perturbs strict support/face ties.
+      if (common_ccd_support_pair(a,b,directions[i],mesh_vertices,
+                                  mesh_graph,support)) {
+        out.status=2; return out;
+      }
+      common_ccd_diag_epa_support(epa_support_trace,epa_support_count,
+                                  directions[i],support);
+      p2seed[2+i]=support;
+      vertices[vertex_count++]=common_ccd_flex_vertex(support);
+      if (vertex_ids!=nullptr) vertex_ids[vertex_count-1]=int2(support.index_a,support.index_b);
+    }
+    face_vertices[0]=int3(0,2,3); face_vertices[1]=int3(0,4,2);
+    face_vertices[2]=int3(0,3,4); face_vertices[3]=int3(1,3,2);
+    face_vertices[4]=int3(1,2,4); face_vertices[5]=int3(1,4,3);
+    adjacency[0]=int3(1,3,2); adjacency[1]=int3(2,4,0);
+    adjacency[2]=int3(0,5,1); adjacency[3]=int3(5,0,4);
+    adjacency[4]=int3(3,1,5); adjacency[5]=int3(4,2,3);
+    initial_faces=6;
+    int fallback_face=-1;
+    for (int i=0;i<6;i++) {
+      if (common_ccd_face_below_source_limit(
+              vertices,center,face_vertices[i],adjacency[i],
+              flex_dd(1.0e-30f))) { fallback_face=i; break; }
+    }
+    if (fallback_face>=0) {
+      int3 f=face_vertices[fallback_face];
+      CommonCCDVertex p3seed[3]={p2seed[f.x],p2seed[f.y],p2seed[f.z]};
+      int init=common_mpr_enclosure_initialize_p3_012(p3seed,a,b,gjk_distance,
+          mesh_vertices,mesh_graph,vertices,vertex_ids,center,face_vertices,
+          adjacency,epa_support_trace,epa_support_count,max_iterations+2);
+      if (init) {
+        out.status=init==2 ? 2 : 1;
+        if (out.status==1) out.distance=flex_dd(0.0f);
+        return out;
+      }
+      vertex_count=5; initial_faces=6; p3_initialized=true;
+    }
+    if (!p3_initialized && common_ccd_ray_triangle_source(
+                          local_seed[0].minkowski,
+                          local_seed[1].minkowski,
+                          vertices[2].m,vertices[3].m,vertices[4].m)==0) {
+      out.status=1; out.distance=flex_dd(0.0f); return out;
+    }
+  }
+  if (vertex_count>vertex_capacity || initial_faces>face_capacity) {
+    out.status=2; return out;
+  }
+  for (int i=0;i<initial_faces;i++) {
+    if (!flex_epa_make_face_dd(vertices,center,
+          face_vertices[i].x,face_vertices[i].y,face_vertices[i].z,
+          adjacency[i],face) ||
+        flex_dd_compare_exact(face.dist2_dd,flex_dd(1.0e-30f))<0) {
+      out.status=1; out.distance=flex_dd(0.0f); return out;
+    }
+    face.index=i;
+    faces[face_count]=face;
+    face_map[map_count++]=face_count++;
+    if (epa_face_trace!=nullptr && i<6) {
+      int base=i*COMMON_CCD_DIAG_EPA_INIT_FACE_WORDS;
+      epa_face_trace[base+0]=float(i);
+      epa_face_trace[base+1]=float(face.a);
+      epa_face_trace[base+2]=float(face.b);
+      epa_face_trace[base+3]=float(face.c);
+      epa_face_trace[base+4]=float(face.adj0);
+      epa_face_trace[base+5]=float(face.adj1);
+      epa_face_trace[base+6]=float(face.adj2);
+      epa_face_trace[base+7]=face.dist2_dd.hi;
+      epa_face_trace[base+8]=face.dist2_dd.lo;
+      epa_face_trace[base+9]=face.dist2_dd.tail;
+      common_ccd_diag_store_dd3(epa_face_trace,base+10,face.v_dd);
+      epa_face_trace[base+19]=1.0f;
+      epa_face_count++;
+    }
+  }
+  FlexDD upper=flex_dd(3.402823466e+38f);
+  FlexDD upper2=upper;
+  int best_face=-1;
+  int epa_budget=min(max_iterations,max_iterations+2-epa_support_count);
+  bool enclosure_converged=false;
+  float horizon_trace[133];
+  for (int i=0;i<133;i++) horizon_trace[i]=0.0f;
+  for (int iteration=0;iteration<epa_budget;iteration++) {
+    FlexDD lower2=flex_dd(3.402823466e+38f);
+    best_face=-1;
+    for (int i=0;i<map_count;i++) {
+      int face_id=face_map[i];
+      if (face_id<0 || face_id>=face_count) { out.status=2; return out; }
+      if (flex_dd_compare_exact(faces[face_id].dist2_dd,lower2)<0) {
+        lower2=faces[face_id].dist2_dd;
+        best_face=face_id;
+      }
+    }
+    if (best_face<0) { out.status=2; return out; }
+    FlexDD lower=flex_dd_sqrt(lower2);
+    FlexEpaFace nearest=faces[best_face];
+    FlexDD3 direction=flex_dd_compare_exact(lower,flex_dd(1.0e-15f))>0
+        ? flex_dd3_div(nearest.v_dd,lower)
+        : FlexDD3{flex_dd(1.0f),flex_dd(0.0f),flex_dd(0.0f)};
+    CommonCCDVertex support;
+    if (epa_support_count>=max_iterations+2 ||
+        mpr_support_pair(a,b,direction,mesh_vertices,mesh_graph,support)) {
+      out.status=2; return out;
+    }
+    common_ccd_diag_epa_support(epa_support_trace,epa_support_count,
+                                direction,support);
+    FlexDD upper_k=flex_dd_div(flex_dd3_dot(nearest.v_dd,support.minkowski),
+                               lower);
+    if (flex_dd_compare_exact(upper_k,upper)<0) {
+      upper=upper_k;
+      upper2=flex_dd_mul(upper,upper);
+    }
+    if (epa_face_trace!=nullptr && iteration<COMMON_CCD_DIAG_EPA_ITERATIONS) {
+      int base=COMMON_CCD_DIAG_EPA_ITER_OFFSET
+          -COMMON_CCD_DIAG_EPA_FACE_OFFSET
+          +iteration*COMMON_CCD_DIAG_EPA_ITER_WORDS;
+      epa_face_trace[base+0]=float(iteration);
+      epa_face_trace[base+1]=float(best_face);
+      epa_face_trace[base+2]=float(nearest.a);
+      epa_face_trace[base+3]=float(nearest.b);
+      epa_face_trace[base+4]=float(nearest.c);
+      epa_face_trace[base+5]=float(nearest.adj0);
+      epa_face_trace[base+6]=float(nearest.adj1);
+      epa_face_trace[base+7]=float(nearest.adj2);
+      common_ccd_diag_store_dd3(epa_face_trace,base+8,nearest.v_dd);
+      epa_face_trace[base+17]=lower.hi;
+      epa_face_trace[base+18]=lower.lo;
+      epa_face_trace[base+19]=lower.tail;
+      common_ccd_diag_store_dd3(epa_face_trace,base+20,direction);
+      epa_face_trace[base+29]=upper_k.hi;
+      epa_face_trace[base+30]=upper_k.lo;
+      epa_face_trace[base+31]=upper_k.tail;
+      epa_face_trace[base+32]=float(support.index_a);
+      epa_face_trace[base+33]=float(support.index_b);
+      epa_face_count++;
+    }
+    if (flex_dd_compare_exact(flex_dd_sub(upper_k,lower),epa_tolerance)<0) {enclosure_converged=true;break;}
+    // Pinned mjc_ccd::epa stops after a repeated support feature for discrete
+    // pairs (mesh/box/HField with zero margin). This test follows its distance
+    // tolerance check and precedes horizon expansion. The rigid production
+    // caller supplies the source vertex-ID sidecar; the standalone diagnostic
+    // probe may omit it and therefore remains a trace-only path.
+    if (false && common_ccd_discrete_pair(a,b) && vertex_ids!=nullptr) {
+      // mjc_prism_support does not update mjCCDObj::vertindex (it remains
+      // -1 from mjc_initCCDObj). Common support traces retain the selected
+      // prism vertex for diagnostics, so normalize only this source-repeat
+      // comparison; mesh and box IDs keep their source feature indices.
+      const int hfield=1;
+      int support_id_a=a.geom_type==hfield ? -1 : support.index_a;
+      int support_id_b=b.geom_type==hfield ? -1 : support.index_b;
+      bool repeated=false;
+      for (int i=0;i<vertex_count;i++) {
+        int prior_id_a=a.geom_type==hfield ? -1 : vertex_ids[i].x;
+        int prior_id_b=b.geom_type==hfield ? -1 : vertex_ids[i].y;
+        if (prior_id_a==support_id_a && prior_id_b==support_id_b) {
+          repeated=true;
+          break;
+        }
+      }
+      if (repeated) break;
+    }
+    if (face_count+3>face_capacity ||
+        vertex_count>=vertex_capacity || horizon_capacity<3) {
+      out.status=2; return out;
+    }
+    FlexDDVertex support_vertex=common_ccd_flex_vertex(support);
+    int new_vertex=vertex_count++;
+    vertices[new_vertex]=support_vertex;
+    if (vertex_ids!=nullptr) vertex_ids[new_vertex]=int2(support.index_a,support.index_b);
+    int horizon_count=0;
+    int ok=flex_epa_delete_face(faces,face_map,map_count,best_face,face_count);
+    if (!ok) { out.status=2; return out; }
+    for (int edge=0;edge<3;edge++) {
+      int adjacent=edge==0 ? nearest.adj0 : edge==1 ? nearest.adj1 : nearest.adj2;
+      if (adjacent<0 || adjacent>=face_count) { out.status=2; return out; }
+      int shared=flex_epa_face_vertex(nearest,(edge+1)%3);
+      FlexEpaFace adj=faces[adjacent];
+      int adj_edge=flex_epa_get_edge(adj,shared);
+      if (adj_edge<0 || adj_edge>=3) { out.status=2; return out; }
+      int before=horizon_count;
+      int visible=flex_epa_horizon_visit_dd(
+          faces,face_map,map_count,support_vertex,horizon,horizon_stack,
+          horizon_stack_capacity,face_count,horizon_count,
+          adjacent,adj_edge,horizon_trace);
+      if (visible<0) { out.status=2; return out; }
+      if (visible==0 && horizon_count==before) {
+        if (horizon_count>=horizon_capacity) { out.status=2; return out; }
+        horizon[horizon_count++]=int2(adjacent,adj_edge);
+      }
+    }
+    if (horizon_count<3 || horizon_count>horizon_capacity ||
+        face_count+horizon_count>face_capacity) { out.status=2; return out; }
+    int base=face_count;
+    for (int h=0;h<horizon_count;h++) {
+      int old_id=horizon[h].x, old_edge=horizon[h].y;
+      if (old_id<0 || old_id>=face_count || old_edge<0 || old_edge>=3) {
+        out.status=2; return out;
+      }
+      FlexEpaFace old=faces[old_id];
+      int v1=flex_epa_face_vertex(old,old_edge);
+      int v2=flex_epa_face_vertex(old,(old_edge+1)%3);
+      int new_id=face_count;
+      int prev=(h==0) ? base+horizon_count-1 : new_id-1;
+      int next=(h==horizon_count-1) ? base : new_id+1;
+      if (old_edge==0) faces[old_id].adj0=new_id;
+      else if (old_edge==1) faces[old_id].adj1=new_id;
+      else faces[old_id].adj2=new_id;
+      if (!flex_epa_make_face_dd(vertices,center,new_vertex,v2,v1,
+                                 int3(prev,old_id,next),face)) {
+        out.status=2; return out;
+      }
+      faces[face_count]=face;
+      if (flex_dd_compare_exact(face.dist2_dd,lower2)>=0 &&
+          flex_dd_compare_exact(face.dist2_dd,upper2)<=0) {
+        face.index=map_count;
+        faces[face_count].index=map_count;
+        face_map[map_count++]=face_count;
+      }
+      face_count++;
+    }
+  }
+  // Pinned mjc_ccd's epa() returns its last selected face when the configured
+  // iteration budget is exhausted. Non-convergence alone is not an EPA error:
+  // after the loop it calls epaWitness whenever `face` is non-null. Capacity,
+  // support, and malformed-adjacency failures already returned above. Preserve
+  // that source contract and only fail if no source-ordered face was selected.
+  if (best_face<0 || best_face>=face_count || (!enclosure_converged && !((a.geom_type==1&&b.geom_type==4)||(a.geom_type==4&&b.geom_type==1)))) {
+    out.status=2; return out;
+  }
+  // Select an actual nearest live triangle: a plane projection can lie
+  // outside the triangle and extrapolate its body witnesses.
+  FlexDD closest_distance=flex_dd(3.402823466e+38f);
+  int closest_face=-1;FlexDD3 closest_point=flex_dd3(float3(0));
+  for(int i=0;i<face_count;i++) {
+    if(!faces[i].active || faces[i].index<0)continue;
+    FlexEpaFace f=faces[i];
+    FlexDD3 point=mpr_triangle_closest(vertices[f.a].m,vertices[f.b].m,vertices[f.c].m);
+    FlexDD distance=mpr_dot(point,point);
+    if(flex_dd_compare_exact(distance,closest_distance)<0) {
+      closest_distance=distance;closest_face=i;closest_point=point;
+    }
+  }
+  if(closest_face<0 || flex_dd_compare_exact(closest_distance,flex_dd(0))<=0) {out.status=2;return out;}
+  best_face=closest_face;
+  FlexEpaFace nearest=faces[best_face];
+  nearest.v_dd=closest_point;nearest.dist2_dd=closest_distance;
+  flex_epa_write_witness_dd(nearest,vertices,contact,&out.position,&out.normal,
+                            &out.witness_a,&out.witness_b);
+  out.face_vertices=int3(nearest.a,nearest.b,nearest.c);
+  out.distance=flex_dd_sqrt(nearest.dist2_dd);
+  out.status=0;
+  if(!enclosure_converged) {
+    if(!common_ellipsoid_vertex_certificate_012(nearest,vertices,a,b,mesh_vertices,mesh_graph,max_iterations,tolerance,epa_support_count,out,contact))out.status=2;
+    return out;
+  }
+  int recovery=common_fo_configured_recover_012(nearest,vertices,vertex_count,a,b,
+      mesh_vertices,mesh_graph,max_iterations,tolerance,epa_support_count,out,contact);
+  if(recovery<0){out.status=2;return out;}
+  return out;
+}
+/* Internal syntax wrapper over the EXISTING FlexDD source-53 arithmetic.
+ * No tensor, ABI field, arena, storage word or arithmetic precision is added. */
+struct SPN012 {
+  FlexDD words;
+  SPN012():words(flex_dd(0.0f)){}
+  SPN012(float x):words(flex_dd(x)){}
+  SPN012(int x):words(flex_dd(float(x))){}
+  SPN012(FlexDD x):words(x){}
+};
+inline SPN012 operator+(SPN012 a,SPN012 b){return SPN012(flex_dd_source_add(a.words,b.words));}
+inline SPN012 operator-(SPN012 a,SPN012 b){return SPN012(flex_dd_source_sub(a.words,b.words));}
+inline SPN012 operator-(SPN012 a){return SPN012(flex_dd_neg(a.words));}
+inline SPN012 operator*(SPN012 a,SPN012 b){return SPN012(flex_dd_source_mul(a.words,b.words));}
+inline SPN012 operator/(SPN012 a,SPN012 b){return SPN012(flex_dd_source_div(a.words,b.words));}
+inline bool spn_nan_012(SPN012 a){return (as_type<uint>(a.words.hi)&0x7fffffffu)>0x7f800000u;}
+inline bool operator<(SPN012 a,SPN012 b){
+  uint aa=as_type<uint>(a.words.hi),bb=as_type<uint>(b.words.hi),am=aa&0x7fffffffu,bm=bb&0x7fffffffu;
+  if(am>0x7f800000u||bm>0x7f800000u)return false;
+  if(am==0x7f800000u||bm==0x7f800000u){bool an=(aa>>31)!=0,bn=(bb>>31)!=0;if(am==0x7f800000u&&bm==0x7f800000u)return an&&!bn;return am==0x7f800000u?an:!bn;}
+  return flex_dd_compare_exact(a.words,b.words)<0;
+}
+inline bool operator>(SPN012 a,SPN012 b){return b<a;}
+inline bool operator<=(SPN012 a,SPN012 b){return !spn_nan_012(a)&&!spn_nan_012(b)&&!(b<a);}
+inline bool operator>=(SPN012 a,SPN012 b){return b<=a;}
+inline bool operator==(SPN012 a,SPN012 b){return !spn_nan_012(a)&&!spn_nan_012(b)&&!(a<b)&&!(b<a);}
+inline bool operator!=(SPN012 a,SPN012 b){return !(a==b);}
+inline SPN012 spn_fabs_012(SPN012 a){return a==SPN012(0)?SPN012(0):SPN012(flex_dd_abs(a.words));}
+inline SPN012 spn_fmax_012(SPN012 a,SPN012 b){if(spn_nan_012(a))return b;if(spn_nan_012(b))return a;return a<b?b:a;}
+inline SPN012 spn_fmin_012(SPN012 a,SPN012 b){if(spn_nan_012(a))return b;if(spn_nan_012(b))return a;return b<a?b:a;}
+inline SPN012 spn_fma_012(SPN012 a,SPN012 b,SPN012 c){return SPN012(flex_dd_source_fma(a.words,b.words,c.words));}
+inline SPN012 spn_sqrt_012(SPN012 a){return SPN012(flex_dd_source_sqrt(a.words));}
+inline SPN012 spn_scalbn_012(SPN012 a,int exponent){return SPN012(flex_dd_scalbn(a.words,exponent));}
+inline bool spn_isfinite_012(SPN012 a){return (as_type<uint>(a.words.hi)&0x7fffffffu)<0x7f800000u&&(as_type<uint>(a.words.lo)&0x7fffffffu)<0x7f800000u&&(as_type<uint>(a.words.tail)&0x7fffffffu)<0x7f800000u;}
+inline void spn_frexp_012(SPN012 a,thread int* exponent){
+  // frexp exponent of the represented positive value, including a high limb
+  // that rounded up to a power of two. No lower precision exponent inference.
+  float limb=a.words.hi!=0.0f?a.words.hi:a.words.lo!=0.0f?a.words.lo:a.words.tail;
+  int e=flex_float_exponent(limb);
+  SPN012 power_threshold=spn_scalbn_012(SPN012(1),e-1);
+  if(a<power_threshold)e--;
+  else if(e<128&&a>=spn_scalbn_012(SPN012(1),e))e++;
+  *exponent=e;
+}
+
+/* Exact Boolean sign over the CURRENT stored binary32 limbs.
+ * One explicit 10*uint=40 byte transient two's-complement accumulator in units
+ * 2^-149. Finite limb max bit276; <=9 limbs sum below2^281, signed320 safe.
+ * No floating arithmetic, higher-precision physical value, new representation,
+ * tensor/ABI/cache storage, support query, EPA iteration or solver work.
+ */
+static inline bool common_axis_limb_finite_012(float x) {
+  return ((as_type<uint>(x)>>23)&255u)!=255u;
+}
+static inline bool common_axis_words_finite_012(FlexDD x) {
+  return common_axis_limb_finite_012(x.hi)&&common_axis_limb_finite_012(x.lo)&&common_axis_limb_finite_012(x.tail);
+}
+static inline bool common_axis_add_limb_012(thread uint* words,float x,int coefficient) {
+  uint bits=as_type<uint>(x),exponent=(bits>>23)&255u;
+  if(exponent==255u)return false;
+  uint mantissa=bits&0x7fffffu;if(exponent)mantissa|=0x800000u;
+  uint shift=exponent?exponent-1u:0u,slot=shift>>5,offset=shift&31u;
+  uint low=mantissa<<offset,high=offset?mantissa>>(32u-offset):0u;
+  bool negative=((bits>>31)!=0u)!=(coefficient<0);uint carry=0;
+  for(uint i=0;i<10u;i++) {
+    uint piece=i==slot?low:(i==slot+1u?high:0u),old=words[i];
+    if(negative) {
+      uint first=old-piece,borrow1=old<piece;
+      uint second=first-carry,borrow2=first<carry;
+      words[i]=second;carry=borrow1|borrow2;
+    } else {
+      uint first=old+piece,carry1=first<old;
+      uint second=first+carry,carry2=second<first;
+      words[i]=second;carry=carry1|carry2;
+    }
+  }
+  return true;
+}
+static inline int common_axis_terms_sign_012(thread const FlexDD* terms,
+    thread const int* coefficients,int count) {
+  if(count<1||count>3)return 2;
+  uint words[10];for(int i=0;i<10;i++)words[i]=0u;
+  for(int i=0;i<count;i++) {
+    if(coefficients[i]!=1&&coefficients[i]!=-1)return 2;
+    if(!common_axis_add_limb_012(words,terms[i].hi,coefficients[i])||
+       !common_axis_add_limb_012(words,terms[i].lo,coefficients[i])||
+       !common_axis_add_limb_012(words,terms[i].tail,coefficients[i]))return 2;
+  }
+  uint any=0u;for(int i=0;i<10;i++)any|=words[i];
+  return any==0u?0:((words[9]&0x80000000u)?-1:1);
+}
+static inline int common_axis_compare_words_012(FlexDD a,FlexDD b) {
+  FlexDD terms[2]={a,b};int coefficients[2]={1,-1};
+  return common_axis_terms_sign_012(terms,coefficients,2);
+}
+static inline FlexDD common_axis_signed_words_012(FlexDD x,int sign) {
+  uint mask=sign<0?0x80000000u:0u;
+  return FlexDD{as_type<float>(as_type<uint>(x.hi)^mask),
+                as_type<float>(as_type<uint>(x.lo)^mask),
+                as_type<float>(as_type<uint>(x.tail)^mask)};
+}
+static inline bool common_box_prism_axis_zero_012(
+    thread const CommonCCDSupportObject& first,
+    thread const CommonCCDSupportObject& second,
+    device const float* vertices,thread FlexDD* certificate=nullptr) {
+  bool reverse=first.kind==COMMON_CCD_BOX&&second.kind==COMMON_CCD_HFIELD_PRISM;
+  if(!(first.kind==COMMON_CCD_HFIELD_PRISM&&second.kind==COMMON_CCD_BOX)&&!reverse)return false;
+  thread const CommonCCDSupportObject* hf=reverse?&second:&first;
+  thread const CommonCCDSupportObject* box=reverse?&first:&second;
+  if(hf->vertex_count!=6||hf->vertex_offset<0||
+     common_axis_compare_words_012(hf->margin,flex_dd(0.0f))!=0||
+     common_axis_compare_words_012(box->margin,flex_dd(0.0f))!=0)return false;
+  for(int i=0;i<3;i++)if(!common_axis_words_finite_012(box->pos[i])||
+      common_axis_compare_words_012(box->size[i],flex_dd(0.0f))!=1)return false;
+  for(int i=0;i<9;i++)if(!common_axis_words_finite_012(box->mat[i]))return false;
+  for(int v=0;v<6;v++)for(int k=0;k<3;k++) {
+    FlexDD r=flex_dd3_component(hf->hfield_residual[v],k);
+    if((as_type<uint>(r.tail)&0x7fffffffu)!=0u||
+       !common_axis_words_finite_012(FlexDD{vertices[3*(hf->vertex_offset+v)+k],r.hi,r.lo}))return false;
+  }
+  for(int axis=0;axis<3;axis++) {
+    int local=-1;bool axis_row=true;
+    for(int k=0;k<3;k++) {
+      FlexDD x=box->mat[3*axis+k];
+      if(common_axis_compare_words_012(x,flex_dd(1.0f))==0||
+         common_axis_compare_words_012(x,flex_dd(-1.0f))==0) {
+        if(local>=0)axis_row=false;local=k;
+      } else if(common_axis_compare_words_012(x,flex_dd(0.0f))!=0)axis_row=false;
+    }
+    if(!axis_row||local<0)continue;
+    for(int sign=-1;sign<=1;sign+=2) {
+      FlexDD upper=flex_dd(0.0f);
+      for(int v=0;v<6;v++) {
+        FlexDD r=flex_dd3_component(hf->hfield_residual[v],axis);
+        FlexDD p=FlexDD{vertices[3*(hf->vertex_offset+v)+axis],r.hi,r.lo};
+        if(v==0||sign*common_axis_compare_words_012(p,upper)>0)upper=p;
+      }
+      FlexDD terms[3]={box->pos[axis],upper,box->size[local]};
+      int coefficients[3]={sign,-sign,-1};
+      int plane_sign=common_axis_terms_sign_012(terms,coefficients,3);
+      if(plane_sign==0||plane_sign==1) {
+        if(certificate!=nullptr) {
+          certificate[0]=flex_dd(float(axis));certificate[1]=flex_dd(float(sign));
+          certificate[2]=common_axis_signed_words_012(upper,sign);
+          certificate[3]=common_axis_signed_words_012(box->pos[axis],sign);
+          certificate[4]=box->size[local];certificate[5]=flex_dd(float(plane_sign));
+          certificate[6]=flex_dd(6.0f);certificate[7]=flex_dd(float(local));
+        }
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/* Exact bounded Boolean on current F32 words, not physical arithmetic.
+ * Normalize nonzero integer mantissas; maxTop-minLSB <=58 implies every
+ * magnitude <2^59 and at most9 terms have absolute sum <2^63. Therefore
+ * every signed64 partial sum is safe. Wider/nonfinite inputs DECLINE.
+ * No multiword accumulator, optional diagnostic output or float arithmetic.
+ */
+static inline int common_axis_short_sign_012(thread const FlexDD* terms,
+    thread const int* coefficients,int count) {
+  if(count<1||count>3)return 2;
+  int minimum=2048,maximum=-2048;bool any=false;
+  for(int i=0;i<count;i++) {
+    if(coefficients[i]!=1&&coefficients[i]!=-1)return 2;
+    for(int j=0;j<3;j++) {
+      float x=j==0?terms[i].hi:(j==1?terms[i].lo:terms[i].tail);
+      uint bits=as_type<uint>(x),e=(bits>>23)&255u,m=bits&0x7fffffu;
+      if(e==255u)return 2;if(e)m|=0x800000u;if(m==0u)continue;
+      int exponent=e?int(e)-150:-149;
+      int trailing=31-int(clz(m&(~m+1u)));m>>=trailing;exponent+=trailing;
+      minimum=min(minimum,exponent);maximum=max(maximum,exponent+31-int(clz(m)));any=true;
+    }
+  }
+  if(!any)return 0;if(maximum-minimum>58)return 2;
+  long total=0;
+  for(int i=0;i<count;i++)for(int j=0;j<3;j++) {
+    float x=j==0?terms[i].hi:(j==1?terms[i].lo:terms[i].tail);
+    uint bits=as_type<uint>(x),e=(bits>>23)&255u,m=bits&0x7fffffu;
+    if(e)m|=0x800000u;if(m==0u)continue;
+    int exponent=e?int(e)-150:-149;
+    int trailing=31-int(clz(m&(~m+1u)));m>>=trailing;exponent+=trailing;
+    long magnitude=long(m)<<uint(exponent-minimum);
+    if(((bits>>31)!=0u)!=(coefficients[i]<0))total-=magnitude;else total+=magnitude;
+  }
+  return total==0?0:(total<0?-1:1);
+}
+static inline int common_axis_short_compare_012(FlexDD a,FlexDD b) {
+  FlexDD terms[2]={a,b};int coefficients[2]={1,-1};
+  return common_axis_short_sign_012(terms,coefficients,2);
+}
+
+/* Exact ellipsoid nonpenetration using extrema streamed from the same six
+ * source-rounded prism points at construction, before writing device scratch.
+ * No device-vertex readback, optional diagnostic output or physics arithmetic.
+ * Bounds occupy six existing-precision FlexDD locals (72 logical bytes plus
+ * one validity Boolean); no persistent/ABI/cache/support/EPA/solver growth.
+ */
+static inline bool common_ellipsoid_axis_short_interval_nonpenetration_012(
+    thread const CommonCCDSupportObject& ellipsoid,
+    thread const FlexDD* lower,thread const FlexDD* upper,bool valid) {
+  if(!valid || ellipsoid.kind!=COMMON_CCD_ELLIPSOID ||
+     common_axis_short_compare_012(ellipsoid.margin,flex_dd(0.0f))!=0)return false;
+  for(int i=0;i<3;i++)if(!common_axis_words_finite_012(ellipsoid.pos[i])||
+      common_axis_short_compare_012(ellipsoid.size[i],flex_dd(0.0f))!=1||
+      !common_axis_words_finite_012(lower[i])||!common_axis_words_finite_012(upper[i])||
+      common_axis_short_compare_012(lower[i],upper[i])>0)return false;
+  for(int i=0;i<9;i++)if(!common_axis_words_finite_012(ellipsoid.mat[i]))return false;
+  for(int axis=0;axis<3;axis++) {
+    int local=-1;bool axis_row=true;
+    for(int k=0;k<3;k++) {
+      FlexDD x=ellipsoid.mat[3*axis+k];
+      if(common_axis_short_compare_012(x,flex_dd(1.0f))==0||
+         common_axis_short_compare_012(x,flex_dd(-1.0f))==0) {
+        if(local>=0)axis_row=false;local=k;
+      } else if(common_axis_short_compare_012(x,flex_dd(0.0f))!=0)axis_row=false;
+    }
+    if(!axis_row||local<0)continue;
+    for(int sign=-1;sign<=1;sign+=2) {
+      FlexDD terms[3]={ellipsoid.pos[axis],sign<0?lower[axis]:upper[axis],ellipsoid.size[local]};
+      int coefficients[3]={sign,-sign,-1};
+      int plane_sign=common_axis_short_sign_012(terms,coefficients,3);
+      if(plane_sign==0||plane_sign==1)return true;
+    }
+  }
+  return false;
+}
+
+/* Exact cylinder coordinate projection: radial extent r on localX/Y, h on localZ.
+ * Requires actual kindCYLINDER, positive r/h, exactzero unusedsize and both margins.
+ * Same actual HField-local six-vertex streamed bounds and exact bounded64 Boolean.
+ * No shape object mutation or support/physics arithmetic, no new persistent storage.
+ */
+static inline bool common_cylinder_axis_short_interval_nonpenetration_012(
+    thread const CommonCCDSupportObject& cylinder,
+    thread const FlexDD* lower,thread const FlexDD* upper,bool valid,FlexDD prism_margin) {
+  if(!valid || cylinder.kind!=COMMON_CCD_CYLINDER ||
+     common_axis_short_compare_012(prism_margin,flex_dd(0.0f))!=0 ||
+     !common_axis_words_finite_012(cylinder.size[2]) ||
+     common_axis_short_compare_012(cylinder.size[2],flex_dd(0.0f))!=0 ||
+     common_axis_short_compare_012(cylinder.margin,flex_dd(0.0f))!=0)return false;
+  for(int i=0;i<3;i++)if(!common_axis_words_finite_012(cylinder.pos[i])||
+      (i<2 && common_axis_short_compare_012(cylinder.size[i],flex_dd(0.0f))!=1)||
+      !common_axis_words_finite_012(lower[i])||!common_axis_words_finite_012(upper[i])||
+      common_axis_short_compare_012(lower[i],upper[i])>0)return false;
+  for(int i=0;i<9;i++)if(!common_axis_words_finite_012(cylinder.mat[i]))return false;
+  for(int axis=0;axis<3;axis++) {
+    int local=-1;bool axis_row=true;
+    for(int k=0;k<3;k++) {
+      FlexDD x=cylinder.mat[3*axis+k];
+      if(common_axis_short_compare_012(x,flex_dd(1.0f))==0||
+         common_axis_short_compare_012(x,flex_dd(-1.0f))==0) {
+        if(local>=0)axis_row=false;local=k;
+      } else if(common_axis_short_compare_012(x,flex_dd(0.0f))!=0)axis_row=false;
+    }
+    if(!axis_row||local<0)continue;
+    for(int sign=-1;sign<=1;sign+=2) {
+      FlexDD terms[3]={cylinder.pos[axis],sign<0?lower[axis]:upper[axis],cylinder.size[local==2?1:0]};
+      int coefficients[3]={sign,-sign,-1};
+      int plane_sign=common_axis_short_sign_012(terms,coefficients,3);
+      if(plane_sign==0||plane_sign==1)return true;
+    }
+  }
+  return false;
+}
+
+/* Actual validated F32 hull vertices, never a bounding-box substitute.
+ * Exact signed-coordinate row projects conv(vertices) to its actual minimum.
+ * IEEE integer ordering retains every finite subnormal and signed zero; no
+ * rounded support point or floating sign/min arithmetic enters this Boolean.
+ * Caller has already admitted the immutable original backing, finite metadata,
+ * capacity and six support queries. Wide/unsupported exact sums decline.
+ */
+static inline bool common_mesh_axis_short_interval_nonpenetration_012(
+    thread const CommonCCDSupportObject& mesh,device const float* vertices,
+    thread const FlexDD* lower,thread const FlexDD* upper,bool valid,FlexDD prism_margin) {
+  if(!valid || mesh.kind!=COMMON_CCD_HULL || mesh.geom_type!=7 ||
+     mesh.vertex_count<4 || mesh.vertex_offset<0 || mesh.vertex_count>715827882 ||
+     mesh.vertex_offset>715827882-mesh.vertex_count ||
+     common_axis_short_compare_012(mesh.margin,flex_dd(0.0f))!=0 ||
+     common_axis_short_compare_012(prism_margin,flex_dd(0.0f))!=0)return false;
+  for(int i=0;i<3;i++)if(!common_axis_words_finite_012(mesh.pos[i]) ||
+      !common_axis_words_finite_012(lower[i]) || !common_axis_words_finite_012(upper[i]) ||
+      common_axis_short_compare_012(lower[i],upper[i])>0)return false;
+  for(int i=0;i<9;i++)if(!common_axis_words_finite_012(mesh.mat[i]))return false;
+  for(int v=0;v<mesh.vertex_count;v++)for(int k=0;k<3;k++)
+    if((as_type<uint>(vertices[3*(mesh.vertex_offset+v)+k])&0x7f800000u)==0x7f800000u)return false;
+  for(int axis=0;axis<3;axis++) {
+    int local=-1,row_sign=0;bool axis_row=true;
+    for(int k=0;k<3;k++) {
+      FlexDD x=mesh.mat[3*axis+k];
+      int positive=common_axis_short_compare_012(x,flex_dd(1.0f));
+      int negative=common_axis_short_compare_012(x,flex_dd(-1.0f));
+      if(positive==0||negative==0) {
+        if(local>=0)axis_row=false;local=k;row_sign=positive==0?1:-1;
+      } else if(common_axis_short_compare_012(x,flex_dd(0.0f))!=0)axis_row=false;
+    }
+    if(!axis_row||local<0)continue;
+    for(int sign=-1;sign<=1;sign+=2) {
+      uint minimum_bits=0u,minimum_key=0xffffffffu;
+      for(int v=0;v<mesh.vertex_count;v++) {
+        uint bits=as_type<uint>(vertices[3*(mesh.vertex_offset+v)+local]);
+        if(sign!=row_sign)bits^=0x80000000u;
+        uint key=(bits&0x80000000u)?~bits:(bits^0x80000000u);
+        if(v==0||key<minimum_key){minimum_bits=bits;minimum_key=key;}
+      }
+      FlexDD extent=flex_dd(as_type<float>(minimum_bits^0x80000000u));
+      if(common_axis_short_compare_012(extent,flex_dd(0.0f))!=1)continue;
+      FlexDD terms[3]={mesh.pos[axis],sign<0?lower[axis]:upper[axis],extent};
+      int coefficients[3]={sign,-sign,-1};
+      int plane_sign=common_axis_short_sign_012(terms,coefficients,3);
+      if(plane_sign==0||plane_sign==1)return true;
+    }
+  }
+  return false;
+}
+
+/* Internal source53 syntax only; no new precision, arena or ABI. */
+static inline bool common_ellipsoid_vertex_certificate_012(
+    const thread FlexEpaFace& face,device const FlexDDVertex* vertices,
+    thread CommonCCDSupportObject& a,thread CommonCCDSupportObject& b,
+    device const float* mesh_vertices,device const int* mesh_graph,
+    int max_iterations,FlexDD tolerance_words,thread int& support_count,
+    thread CommonCCDEpaResult& out,thread ContactGeom& contact) {
+  bool reverse=a.geom_type==4&&b.geom_type==1;
+  if(!(a.geom_type==1&&b.geom_type==4)&&!reverse)return false;
+  if(max_iterations<=0||max_iterations>2147483645||max_iterations+2-support_count<2)return false;
+  thread const CommonCCDSupportObject* ellipsoid=reverse?&a:&b;
+  SPN012 margin(ellipsoid->margin),tolerance(tolerance_words);
+  if(!spn_isfinite_012(margin)||margin<0)return false;
+  int ids[3]={face.a,face.b,face.c};FlexDD3 anchor_words=reverse?vertices[ids[0]].b:vertices[ids[0]].a;
+  for(int j=1;j<3;j++) {
+    FlexDD3 candidate=reverse?vertices[ids[j]].b:vertices[ids[j]].a;
+    for(int k=0;k<3;k++)if(SPN012(flex_dd3_component(candidate,k))!=SPN012(flex_dd3_component(anchor_words,k)))return false;
+  }
+  SPN012 anchor[3],p[3]={0},y[3]={0},a2[3],old[3],amin=SPN012(as_type<float>(0x7f800000u)),amax=0;
+  for(int k=0;k<3;k++){anchor[k]=SPN012(flex_dd3_component(anchor_words,k));old[k]=SPN012(flex_dd3_component(reverse?out.witness_a:out.witness_b,k))-SPN012(ellipsoid->pos[k]);}
+  for(int k=0;k<3;k++) {
+    SPN012 axis(ellipsoid->size[k]);if(!spn_isfinite_012(axis)||axis<=0)return false;
+    amin=spn_fmin_012(amin,axis);amax=spn_fmax_012(amax,axis);a2[k]=axis*axis;
+    for(int j=0;j<3;j++){p[k]=p[k]+SPN012(ellipsoid->mat[3*j+k])*(anchor[j]-SPN012(ellipsoid->pos[j]));y[k]=y[k]+SPN012(ellipsoid->mat[3*j+k])*old[j];}
+  }
+  int axis=0;for(int k=1;k<3;k++)if(spn_fabs_012(y[k]/SPN012(ellipsoid->size[k]))>spn_fabs_012(y[axis]/SPN012(ellipsoid->size[axis])))axis=k;
+  if(y[axis]==0)return false;
+  SPN012 tau=a2[axis]*(p[axis]/y[axis]-1);
+  for(int iteration=0;iteration<2;iteration++) {
+    if(!spn_isfinite_012(tau)||tau<=-amin*amin||tau>=0)return false;
+    SPN012 f=-1,derivative=0;
+    for(int k=0;k<3;k++) {
+      SPN012 denominator=a2[k]+tau,term=a2[k]*p[k]*p[k]/(denominator*denominator);
+      if(!spn_isfinite_012(term)||denominator<=0)return false;
+      f=f+term;derivative=derivative-2*term/denominator;
+    }
+    if(!spn_isfinite_012(derivative)||derivative>=0)return false;tau=tau-f/derivative;
+  }
+  if(!spn_isfinite_012(tau)||tau<=-amin*amin||tau>=0)return false;
+  SPN012 n[3]={0};for(int k=0;k<3;k++)for(int j=0;j<3;j++)n[j]=n[j]-SPN012(ellipsoid->mat[3*j+k])*p[k]/(a2[k]+tau);
+  FlexDD3 nw={n[0].words,n[1].words,n[2].words};SPN012 length(flex_dd_source_sqrt(flex_dd_source_dot3(nw,nw)));if(!spn_isfinite_012(length)||length<=0)return false;
+  SPN012 factor=SPN012(reverse?-1:1)/length;for(int k=0;k<3;k++)n[k]=n[k]*factor;nw=FlexDD3{n[0].words,n[1].words,n[2].words};
+  CommonCCDVertex first;support_count++;if(mpr_support_pair(a,b,nw,mesh_vertices,mesh_graph,first))return false;
+  for(int k=0;k<3;k++)if(SPN012(flex_dd3_component(reverse?first.point_b:first.point_a,k))!=anchor[k])return false;
+  SPN012 depth(flex_dd_source_sqrt(flex_dd_source_dot3(first.minkowski,first.minkowski)));if(!spn_isfinite_012(depth)||depth<=0)return false;
+  factor=SPN012(1)/depth;for(int k=0;k<3;k++)n[k]=SPN012(flex_dd3_component(first.minkowski,k))*factor;nw=FlexDD3{n[0].words,n[1].words,n[2].words};
+  CommonCCDVertex second;support_count++;if(mpr_support_pair(a,b,nw,mesh_vertices,mesh_graph,second))return false;
+  for(int k=0;k<3;k++)if(SPN012(flex_dd3_component(reverse?second.point_b:second.point_a,k))!=anchor[k])return false;
+  SPN012 radius=amin*(amin/amax)+margin*SPN012(.5f),center[3];
+  for(int k=0;k<3;k++)center[k]=SPN012(flex_dd3_component(second.minkowski,k))-radius*n[k];
+  FlexDD3 cw={center[0].words,center[1].words,center[2].words};SPN012 upper(flex_dd_source_dot3(nw,second.minkowski)),lower=radius-SPN012(flex_dd_source_sqrt(flex_dd_source_dot3(cw,cw))),gap=upper-depth,scale=1;
+  for(int k=0;k<3;k++){scale=spn_fmax_012(scale,spn_fabs_012(SPN012(flex_dd3_component(first.point_a,k))));scale=spn_fmax_012(scale,spn_fabs_012(SPN012(flex_dd3_component(first.point_b,k))));scale=spn_fmax_012(scale,spn_fabs_012(SPN012(flex_dd3_component(second.minkowski,k))));}
+  scale=spn_fmax_012(scale,spn_fmax_012(radius,spn_fabs_012(upper)));SPN012 error=SPN012(0x1p-42f)*scale;
+  if(!spn_isfinite_012(radius)||radius<=0||!spn_isfinite_012(lower)||lower<=error||!spn_isfinite_012(upper)||upper-lower+2*error>tolerance||!spn_isfinite_012(gap)||gap < -error||gap+error>tolerance||depth+error<lower)return false;
+  out.distance=depth.words;out.witness_a=first.point_a;out.witness_b=first.point_b;out.normal=nw;out.position=mpr_scale(mpr_add(first.point_a,first.point_b),flex_dd(.5f));
+  contact.normal=flex_dd3_high(nw);contact.pos=flex_dd3_high(out.position);contact.dist=-((out.distance.hi+out.distance.lo)+out.distance.tail);contact.t1=float3(0);make_frame(contact.normal,contact.t1,contact.t2);
+  return true;
+}
+
+/* Exact prism faces and analytic sphere; no proxy geometry or support loop. */
+static SPN012 spn_dot_012(thread const SPN012* a,thread const SPN012* b) {
+  return spn_fma_012(a[2],b[2],spn_fma_012(a[0],b[0],a[1]*b[1]));
+}
+static void spn_sub_012(thread SPN012* out,thread const SPN012* a,thread const SPN012* b) {
+  for(int k=0;k<3;k++)out[k]=a[k]-b[k];
+}
+static void spn_cross_012(thread SPN012* out,thread const SPN012* a,thread const SPN012* b) {
+  SPN012 p=a[1]*b[2],q=a[2]*b[1];out[0]=p-q;
+  p=a[2]*b[0];q=a[0]*b[2];out[1]=p-q;
+  p=a[0]*b[1];q=a[1]*b[0];out[2]=p-q;
+}
+static int spn_unit_012(thread const SPN012* v,thread SPN012* unit,thread SPN012* length) {
+  SPN012 largest=spn_fmax_012(spn_fabs_012(v[0]),spn_fmax_012(spn_fabs_012(v[1]),spn_fabs_012(v[2])));
+  if(!spn_isfinite_012(largest)||largest<=0)return 0;
+  int exponent;spn_frexp_012(largest,&exponent);SPN012 scaled[3];
+  for(int k=0;k<3;k++)scaled[k]=spn_scalbn_012(v[k],-exponent);
+  SPN012 norm=spn_sqrt_012(spn_dot_012(scaled,scaled));
+  if(!spn_isfinite_012(norm)||norm<=0)return 0;
+  for(int k=0;k<3;k++)unit[k]=scaled[k]/norm;
+  *length=spn_scalbn_012(norm,exponent);
+  return spn_isfinite_012(*length)&&*length>0;
+}
+static int spn_face_012(thread const SPN012* a,thread const SPN012* b,thread const SPN012* c,
+                      thread SPN012* normal,thread SPN012* length) {
+  SPN012 e[3],f[3];spn_sub_012(e,b,a);spn_sub_012(f,c,a);
+  SPN012 largest=0;for(int k=0;k<3;k++)largest=spn_fmax_012(largest,spn_fmax_012(spn_fabs_012(e[k]),spn_fabs_012(f[k])));
+  if(!spn_isfinite_012(largest)||largest<=0)return 0;
+  int exponent;spn_frexp_012(largest,&exponent);
+  for(int k=0;k<3;k++){e[k]=spn_scalbn_012(e[k],-exponent);f[k]=spn_scalbn_012(f[k],-exponent);}
+  SPN012 cross[3];spn_cross_012(cross,e,f);
+  return spn_unit_012(cross,normal,length);
+}
+static void spn_segment_012(thread SPN012* p,thread const SPN012* center,
+                          thread const SPN012* a,thread const SPN012* b) {
+  SPN012 edge[3],unit[3],length,delta[3];spn_sub_012(edge,b,a);spn_sub_012(delta,center,a);
+  SPN012 t=0;if(spn_unit_012(edge,unit,&length))t=spn_dot_012(delta,unit)/length;
+  t=spn_fmax_012(0,spn_fmin_012(1,t));for(int k=0;k<3;k++)p[k]=spn_fma_012(t,edge[k],a[k]);
+}
+static SPN012 spn_distance_012(thread const SPN012* a,thread const SPN012* b) {
+  SPN012 v[3],unit[3],length=0;spn_sub_012(v,a,b);
+  if(v[0]==0&&v[1]==0&&v[2]==0)return 0;
+  return spn_unit_012(v,unit,&length)?length:SPN012(as_type<float>(0x7f800000u));
+}
+static int spn_triangle_012(thread SPN012* point,thread const SPN012* center,
+        thread const SPN012* a,thread const SPN012* b,thread const SPN012* c,thread const SPN012* normal) {
+  SPN012 e[3],f[3],delta[3],projected[3],cross[3];
+  spn_sub_012(e,b,a);spn_sub_012(f,c,a);spn_sub_012(delta,center,a);
+  SPN012 h=spn_dot_012(normal,delta);
+  for(int k=0;k<3;k++)projected[k]=spn_fma_012(-h,normal[k],center[k]);
+  SPN012 largest=0;for(int k=0;k<3;k++)largest=spn_fmax_012(largest,spn_fmax_012(spn_fabs_012(e[k]),spn_fabs_012(f[k])));
+  int exponent;spn_frexp_012(largest,&exponent);
+  for(int k=0;k<3;k++){e[k]=spn_scalbn_012(e[k],-exponent);f[k]=spn_scalbn_012(f[k],-exponent);delta[k]=spn_scalbn_012(projected[k]-a[k],-exponent);}
+  spn_cross_012(cross,e,f);int axis=0;
+  if(spn_fabs_012(cross[1])>spn_fabs_012(cross[axis]))axis=1;
+  if(spn_fabs_012(cross[2])>spn_fabs_012(cross[axis]))axis=2;
+  SPN012 denominator=cross[axis],x[3],y[3];
+  spn_cross_012(x,delta,f);spn_cross_012(y,e,delta);
+  SPN012 u=x[axis]/denominator,v=y[axis]/denominator,w=(1-u)-v;
+  if(spn_isfinite_012(u)&&spn_isfinite_012(v)&&spn_isfinite_012(w)&&u>=0&&v>=0&&w>=0) {
+    for(int k=0;k<3;k++)point[k]=projected[k];return 1;
+  }
+  spn_segment_012(point,center,a,b);SPN012 best=spn_distance_012(point,center),candidate[3];
+  spn_segment_012(candidate,center,a,c);SPN012 d=spn_distance_012(candidate,center);
+  if(d<best){best=d;for(int k=0;k<3;k++)point[k]=candidate[k];}
+  spn_segment_012(candidate,center,b,c);d=spn_distance_012(candidate,center);
+  if(d<best)for(int k=0;k<3;k++)point[k]=candidate[k];
+  return 0;
+}
+
+static __attribute__((noinline)) int analytic_sphere_prism_012(
+    thread CommonCCDSupportObject& a,thread CommonCCDSupportObject& b,
+    int iterations,FlexDD tolerance_words,device const float* mesh_vertices,
+    thread FlexDD& depth,thread FlexDD3& position,thread FlexDD3& normal) {
+  bool reverse=a.geom_type==2&&b.geom_type==1;
+  if(!(a.geom_type==1&&b.geom_type==2)&&!reverse)return -20;
+  thread const CommonCCDSupportObject* prism=reverse?&b:&a;
+  thread const CommonCCDSupportObject* sphere=reverse?&a:&b;
+  if(prism->kind!=COMMON_CCD_HFIELD_PRISM||prism->vertex_count!=6||prism->vertex_offset<0)return -20;
+  SPN012 vertices[6][3];
+  for(int i=0;i<6;i++)for(int k=0;k<3;k++) {
+    FlexDD residual=k==0?prism->hfield_residual[i].x:k==1?prism->hfield_residual[i].y:prism->hfield_residual[i].z;
+    vertices[i][k]=SPN012(FlexDD{mesh_vertices[3*(prism->vertex_offset+i)+k],residual.hi,residual.lo});
+  }
+  SPN012 center[3]={SPN012(sphere->pos[0]),SPN012(sphere->pos[1]),SPN012(sphere->pos[2])};
+  SPN012 radius=SPN012(sphere->size[0])+SPN012(sphere->margin)*SPN012(.5f);
+  SPN012 tolerance(tolerance_words);
+  const int triangles[8][3]={{0,2,1},{3,4,5},{0,1,4},{0,4,3},{1,2,5},{1,5,4},{2,0,3},{2,3,5}};
+  SPN012 normals[8][3],heights[8],closest[3]={0},minimum=SPN012(as_type<float>(0x7f800000u)),best=SPN012(as_type<float>(0x7f800000u));
+  int valid[8]={0},projection[8]={0},inside=1,result=-1,selected=-1;
+  SPN012 result_depth=0,result_normal[3]={0},result_position[3]={0};
+  if(iterations<=0||!spn_isfinite_012(radius)||radius<=0)return -23;
+  for(int i=0;i<8;i++) {
+    thread const SPN012 *x=vertices[triangles[i][0]],*y=vertices[triangles[i][1]],*z=vertices[triangles[i][2]];
+    SPN012 normlength,delta[3];if(!spn_face_012(x,y,z,normals[i],&normlength))continue;
+    SPN012 orientation=0;for(int j=0;j<6;j++){spn_sub_012(delta,vertices[j],x);SPN012 score=spn_dot_012(normals[i],delta);if(spn_fabs_012(score)>spn_fabs_012(orientation))orientation=score;}
+    if(orientation>0)for(int k=0;k<3;k++)normals[i][k]=-normals[i][k];
+    spn_sub_012(delta,center,x);heights[i]=-spn_dot_012(normals[i],delta);
+    if(!spn_isfinite_012(heights[i]))return -23;
+    if(heights[i]<0)inside=0;if(heights[i]<minimum)minimum=heights[i];
+    SPN012 p[3];projection[i]=spn_triangle_012(p,center,x,y,z,normals[i]);valid[i]=1;
+    SPN012 distance=spn_distance_012(p,center);if(distance<best){best=distance;for(int k=0;k<3;k++)closest[k]=p[k];}
+  }
+  SPN012 n[3],wa[3],wb[3],d;
+  if(inside) {
+    for(int i=0;i<8;i++)if(valid[i]&&projection[i]&&heights[i]<=minimum+tolerance){selected=i;break;}
+    if(selected<0)return -23;
+    for(int k=0;k<3;k++){n[k]=normals[selected][k];wa[k]=spn_fma_012(heights[selected],n[k],center[k]);}
+    d=radius+heights[selected];
+  } else {
+    SPN012 delta[3],length;spn_sub_012(delta,center,closest);
+    if(!spn_isfinite_012(best)||!spn_unit_012(delta,n,&length))return -23;
+    d=radius-length;for(int k=0;k<3;k++)wa[k]=closest[k];
+  }
+  if(!spn_isfinite_012(d)||d<=0)return -23;
+  for(int k=0;k<3;k++){wb[k]=spn_fma_012(-radius,n[k],center[k]);result_normal[k]=reverse?-n[k]:n[k];result_position[k]=(wa[k]+wb[k])*SPN012(.5f);}
+  result_depth=d;
+  depth=result_depth.words;
+  position=FlexDD3{result_position[0].words,result_position[1].words,result_position[2].words};
+  normal=FlexDD3{result_normal[0].words,result_normal[1].words,result_normal[2].words};
+  return 1;
+}
+
+/* Exact capsule core-segment Minkowski sum; Source prototype only.
+ * The 34 triangles cover the boundary of conv(P +/- axis). No support loop.
+ * All work/storage counts are explicit; no native inputs are produced here. */
+static void cp_triangle_ids_012(int i,thread int* ids) {
+  const int faces[8][3]={{0,2,1},{3,4,5},{0,1,4},{0,4,3},{1,2,5},{1,5,4},{2,0,3},{2,3,5}};
+  const int edges[9][2]={{0,1},{1,2},{2,0},{3,4},{4,5},{5,3},{0,3},{1,4},{2,5}};
+  if(i<16){for(int k=0;k<3;k++)ids[k]=faces[i%8][k]+6*(i/8);}
+  else {int e=(i-16)/2,a=edges[e][0],b=edges[e][1];ids[0]=a;ids[1]=(i%2)?b+6:b;ids[2]=(i%2)?a+6:b+6;}
+}
+static int cp_weights_012(thread SPN012* weights,thread const SPN012* point,
+                         thread const SPN012* a,thread const SPN012* b,thread const SPN012* c) {
+  SPN012 e[3],f[3],v[3],cross[3],x[3],y[3];
+  spn_sub_012(e,b,a);spn_sub_012(f,c,a);spn_sub_012(v,point,a);
+  SPN012 largest=0;for(int k=0;k<3;k++)largest=spn_fmax_012(largest,spn_fmax_012(spn_fabs_012(e[k]),spn_fabs_012(f[k])));
+  int exponent;spn_frexp_012(largest,&exponent);
+  for(int k=0;k<3;k++){e[k]=spn_scalbn_012(e[k],-exponent);f[k]=spn_scalbn_012(f[k],-exponent);v[k]=spn_scalbn_012(v[k],-exponent);}
+  spn_cross_012(cross,e,f);int axis=0;
+  if(spn_fabs_012(cross[1])>spn_fabs_012(cross[axis]))axis=1;
+  if(spn_fabs_012(cross[2])>spn_fabs_012(cross[axis]))axis=2;
+  spn_cross_012(x,v,f);spn_cross_012(y,e,v);
+  weights[1]=x[axis]/cross[axis];weights[2]=y[axis]/cross[axis];weights[0]=(1-weights[1])-weights[2];
+  return spn_isfinite_012(weights[0])&&spn_isfinite_012(weights[1])&&spn_isfinite_012(weights[2]);
+}
+
+static __attribute__((noinline)) int analytic_capsule_prism_012(
+    thread CommonCCDSupportObject& a,thread CommonCCDSupportObject& b,
+    int iterations,FlexDD tolerance_words,device const float* mesh_vertices,
+    thread FlexDD& depth,thread FlexDD3& position,thread FlexDD3& normal) {
+  bool reverse=a.geom_type==3&&b.geom_type==1;
+  if(!(a.geom_type==1&&b.geom_type==3)&&!reverse)return -20;
+  thread const CommonCCDSupportObject* prism=reverse?&b:&a;
+  thread const CommonCCDSupportObject* capsule=reverse?&a:&b;
+  if(prism->kind!=COMMON_CCD_HFIELD_PRISM||prism->vertex_count!=6||prism->vertex_offset<0)return -20;
+  SPN012 original[6][3];
+  for(int i=0;i<6;i++)for(int k=0;k<3;k++) {
+    FlexDD residual=k==0?prism->hfield_residual[i].x:k==1?prism->hfield_residual[i].y:prism->hfield_residual[i].z;
+    original[i][k]=SPN012(FlexDD{mesh_vertices[3*(prism->vertex_offset+i)+k],residual.hi,residual.lo});
+  }
+  SPN012 center[3]={SPN012(capsule->pos[0]),SPN012(capsule->pos[1]),SPN012(capsule->pos[2])};
+  SPN012 tolerance(tolerance_words);
+  SPN012 radius=SPN012(capsule->size[0])+SPN012(capsule->margin)*SPN012(.5f),axis[3],vertices[12][3];
+  for(int k=0;k<3;k++)axis[k]=SPN012(capsule->size[1])*SPN012(capsule->mat[3*k+2]);
+  for(int i=0;i<12;i++)for(int k=0;k<3;k++)vertices[i][k]=original[i%6][k]-(i<6?-axis[k]:axis[k]);
+  SPN012 normals[34][3],heights[34],minimum=SPN012(as_type<float>(0x7f800000u)),best=SPN012(as_type<float>(0x7f800000u)),closest[3]={0};
+  int valid[34]={0},projection[34]={0},inside=1,result=-1,selected=-1,nearest=-1,face_count=0;
+  SPN012 result_depth=0,result_normal[3]={0},result_position[3]={0};
+  if(iterations<=0||!spn_isfinite_012(radius)||radius<=0)return -23;
+  for(int i=0;i<34;i++) {
+    int ids[3];cp_triangle_ids_012(i,ids);
+    thread const SPN012 *x=vertices[ids[0]],*y=vertices[ids[1]],*z=vertices[ids[2]];
+    SPN012 length,delta[3];if(!spn_face_012(x,y,z,normals[i],&length))continue;
+    SPN012 orientation=0;for(int j=0;j<12;j++){spn_sub_012(delta,vertices[j],x);SPN012 score=spn_dot_012(normals[i],delta);if(spn_fabs_012(score)>spn_fabs_012(orientation))orientation=score;}
+    if(orientation>0)for(int k=0;k<3;k++)normals[i][k]=-normals[i][k];
+    int supporting=1;
+    for(int j=0;j<12;j++) {
+      spn_sub_012(delta,vertices[j],x);SPN012 score=spn_dot_012(normals[i],delta),magnitude=0;
+      for(int k=0;k<3;k++)magnitude=magnitude+spn_fabs_012(normals[i][k])*(spn_fabs_012(vertices[j][k])+spn_fabs_012(x[k]));
+      /* Floating operation error enclosure, not a geometric/CCD tolerance. */
+      if(score>SPN012(0x1p-46f)*magnitude)supporting=0;
+    }
+    if(!supporting)continue;
+    face_count++;spn_sub_012(delta,center,x);heights[i]=-spn_dot_012(normals[i],delta);
+    if(!spn_isfinite_012(heights[i]))return -23;
+    if(heights[i]<0)inside=0;if(heights[i]<minimum)minimum=heights[i];
+    SPN012 point[3];projection[i]=spn_triangle_012(point,center,x,y,z,normals[i]);valid[i]=1;
+    SPN012 distance=spn_distance_012(point,center);
+    if(distance<best){best=distance;nearest=i;for(int k=0;k<3;k++)closest[k]=point[k];}
+  }
+  SPN012 n[3],wa[3],wb[3],d,point[3],weights[3];
+  if(inside) {
+    for(int i=0;i<34;i++)if(valid[i]&&projection[i]&&heights[i]<=minimum+tolerance){selected=i;break;}
+    if(selected<0)return -23;
+    for(int k=0;k<3;k++){n[k]=normals[selected][k];point[k]=spn_fma_012(heights[selected],n[k],center[k]);}
+    d=radius+heights[selected];
+  } else {
+    SPN012 delta[3],length;spn_sub_012(delta,center,closest);
+    if(nearest<0||!spn_isfinite_012(best)||!spn_unit_012(delta,n,&length))return -23;
+    selected=nearest;d=radius-length;for(int k=0;k<3;k++)point[k]=closest[k];
+  }
+  if(!spn_isfinite_012(d)||d<=0)return -23;
+  int ids[3];cp_triangle_ids_012(selected,ids);
+  if(!cp_weights_012(weights,point,vertices[ids[0]],vertices[ids[1]],vertices[ids[2]]))return -23;
+  for(int k=0;k<3;k++) {
+    SPN012 core=0;wa[k]=0;
+    for(int j=0;j<3;j++){wa[k]=spn_fma_012(weights[j],original[ids[j]%6][k],wa[k]);core=spn_fma_012(weights[j],ids[j]<6?-axis[k]:axis[k],core);}
+    wb[k]=spn_fma_012(-radius,n[k],center[k]+core);result_normal[k]=reverse?-n[k]:n[k];result_position[k]=(wa[k]+wb[k])*SPN012(.5f);
+  }
+  result_depth=d;
+  depth=result_depth.words;
+  position=FlexDD3{result_position[0].words,result_position[1].words,result_position[2].words};
+  normal=FlexDD3{result_normal[0].words,result_normal[1].words,result_normal[2].words};
+  return 1;
+}
+
+static __attribute__((noinline)) int common_mpr_enclosure_penetration_012(
+    thread CommonCCDSupportObject& a, thread CommonCCDSupportObject& b,
+    FlexDD3 center_a,FlexDD3 center_b,FlexDD margin,int iterations,FlexDD tolerance,
+    device const float* vertices,device const int* graph,
+    thread ContactGeom& contact,thread FlexDD3& position,thread FlexDD3& normal,
+    thread FlexDD* retained_distance=nullptr,
+    device FlexDDVertex* enclosure_vertices=nullptr,device int2* enclosure_ids=nullptr,
+    device FlexEpaFace* enclosure_faces=nullptr,device int* enclosure_map=nullptr,
+    device int2* enclosure_horizon=nullptr,device FlexHorizonFrame* enclosure_stack=nullptr,
+    int enclosure_vertex_capacity=0,int enclosure_face_capacity=0,
+    int enclosure_horizon_capacity=0,int enclosure_stack_capacity=0,
+    thread bool* enclosure_certificate=nullptr) {
+  if(enclosure_certificate!=nullptr)*enclosure_certificate=false;
+  CommonCCDVertex portal[4];
+  portal[0].point_a=center_a;portal[0].point_b=center_b;
+  portal[0].minkowski=mpr_sub(center_a,center_b);
+  FlexDD3 origin=flex_dd3(float3(0));
+  if (mpr_eq3(portal[0].minkowski,origin))
+    portal[0].minkowski.x=flex_dd_source_add(portal[0].minkowski.x,flex_dd(0x1.4p-49f));
+  // Pinned libccd MPR discovery seeds the portal from the Minkowski center
+  // difference, not from the first_dir callback (first_dir is consumed only
+  // by GJK intersect, never by ccdMPRPenetration/discoverPortal).
+  FlexDD3 direction=mpr_normalize(flex_dd3_neg(portal[0].minkowski));
+  if (mpr_support_pair(a,b,direction,vertices,graph,portal[1])) return -20;
+  FlexDD dot=mpr_dot(portal[1].minkowski,direction);
+  if (mpr_zero(dot)||flex_dd_compare_exact(dot,flex_dd(0))<0) return 0;
+  direction=mpr_cross(portal[0].minkowski,portal[1].minkowski);
+  FlexDD depth;
+  if (mpr_zero(mpr_dot(direction,direction))) {
+    if (mpr_eq3(portal[1].minkowski,origin)) return 0;
+    position=mpr_scale(mpr_add(portal[1].point_a,portal[1].point_b),flex_dd(.5f));
+    depth=flex_dd_source_sqrt(mpr_dot(portal[1].minkowski,portal[1].minkowski));
+    normal=mpr_normalize(portal[1].minkowski);
+  } else {
+    direction=mpr_normalize(direction);
+    if (mpr_support_pair(a,b,direction,vertices,graph,portal[2])) return -20;
+    dot=mpr_dot(portal[2].minkowski,direction);
+    if (mpr_zero(dot)||flex_dd_compare_exact(dot,flex_dd(0))<0) return 0;
+    direction=mpr_normalize(mpr_cross(mpr_sub(portal[1].minkowski,portal[0].minkowski),
+        mpr_sub(portal[2].minkowski,portal[0].minkowski)));
+    if (flex_dd_compare_exact(mpr_dot(direction,portal[0].minkowski),flex_dd(0))>0) {
+      CommonCCDVertex swap=portal[1];portal[1]=portal[2];portal[2]=swap;
+      direction=flex_dd3_neg(direction);
+    }
+    while (true) {
+      if (mpr_support_pair(a,b,direction,vertices,graph,portal[3])) return -20;
+      dot=mpr_dot(portal[3].minkowski,direction);
+      if (mpr_zero(dot)||flex_dd_compare_exact(dot,flex_dd(0))<0) return 0;
+      bool changed=false;
+      dot=mpr_dot(mpr_cross(portal[1].minkowski,portal[3].minkowski),portal[0].minkowski);
+      if (flex_dd_compare_exact(dot,flex_dd(0))<0 && !mpr_zero(dot)) {
+        portal[2]=portal[3];changed=true;
+      }
+      if (!changed) {
+        dot=mpr_dot(mpr_cross(portal[3].minkowski,portal[2].minkowski),portal[0].minkowski);
+        if (flex_dd_compare_exact(dot,flex_dd(0))<0 && !mpr_zero(dot)) {
+          portal[1]=portal[3];changed=true;
+        }
+      }
+      if (!changed) break;
+      direction=mpr_normalize(mpr_cross(mpr_sub(portal[1].minkowski,portal[0].minkowski),
+          mpr_sub(portal[2].minkowski,portal[0].minkowski)));
+    }
+    // Discovery and refinement have no artificial iteration caps in libccd.
+    while (true) {
+      direction=common_mpr_enclosure_portal_direction_012(portal);
+      dot=mpr_dot(direction,portal[1].minkowski);
+      if (mpr_zero(dot)||flex_dd_compare_exact(dot,flex_dd(0))>0) break;
+      CommonCCDVertex next;
+      if (mpr_support_pair(a,b,direction,vertices,graph,next)) return -20;
+      dot=mpr_dot(next.minkowski,direction);
+      if ((!mpr_zero(dot)&&flex_dd_compare_exact(dot,flex_dd(0))<=0)||
+          mpr_reached(portal,next,direction,tolerance)) return 0;
+      mpr_expand(portal,next);
+    }
+    if(a.geom_type==3 || b.geom_type==3) {
+      int result=analytic_capsule_prism_012(a,b,iterations,tolerance,vertices,depth,position,normal);
+      if(result<0)return result;
+      if(enclosure_certificate!=nullptr)*enclosure_certificate=true;
+    } else if(a.geom_type==2 || b.geom_type==2) {
+      int result=analytic_sphere_prism_012(a,b,iterations,tolerance,vertices,depth,position,normal);
+      if(result<0)return result;
+      if(enclosure_certificate!=nullptr)*enclosure_certificate=true;
+    } else if(true) {
+      if(enclosure_vertices==nullptr || enclosure_faces==nullptr || enclosure_map==nullptr ||
+         enclosure_horizon==nullptr || enclosure_stack==nullptr)return -22;
+      int support_count=0,face_count=0;
+      CommonCCDEpaResult result=common_mpr_enclosure_epa_012(
+          portal,4,a,b,iterations,tolerance,flex_dd(0),vertices,graph,
+          enclosure_vertices,nullptr,enclosure_faces,enclosure_map,
+          enclosure_horizon,enclosure_stack,enclosure_vertex_capacity,
+          enclosure_face_capacity,enclosure_horizon_capacity,enclosure_stack_capacity,
+          contact,nullptr,nullptr,support_count,face_count);
+      if(result.status!=0) {
+        // Geometric rejection is empty only with an exact actual-object proof.
+        // Invalid invocation/support/capacity and uncertified seeds still fail.
+        if(result.status==1 && SPN012(result.distance)==0 &&
+           common_box_prism_axis_zero_012(a,b,vertices))return 0;
+        return -23;
+      }
+      depth=result.distance;position=result.position;normal=result.normal;
+      if(enclosure_certificate!=nullptr)*enclosure_certificate=true;
+    } else {
+    int used=0;
+    while (true) {
+      direction=common_mpr_enclosure_portal_direction_012(portal);
+      CommonCCDVertex next;
+      if (mpr_support_pair(a,b,direction,vertices,graph,next)) return -20;
+      // Source deliberately tests strictly greater than max_iterations.
+      if (mpr_reached(portal,next,direction,tolerance)||used>iterations) {
+        normal=mpr_triangle_closest(portal[1].minkowski,portal[2].minkowski,portal[3].minkowski);
+        depth=flex_dd_source_sqrt(mpr_dot(normal,normal));
+        if (mpr_zero(depth)) return 0;
+        normal=mpr_normalize(normal);
+        position=mpr_contact_position(portal);
+        break;
+      }
+      mpr_expand(portal,next);used++;
+    }
+    }
+  }
+  if (mpr_eq3(normal,origin)) return 0;
+  if (!all(isfinite(flex_dd3_high(position))) || !all(isfinite(flex_dd3_high(normal))) ||
+      !isfinite(depth.hi)) return -21;
+  FlexDD distance=flex_dd_source_sub(margin,depth);
+  contact.dist=distance.hi;
+  if(retained_distance!=nullptr)*retained_distance=distance;
+  contact.pos=flex_dd3_high(position);contact.normal=flex_dd3_high(normal);
+  contact.t1=float3(0);make_frame(contact.normal,contact.t1,contact.t2);
+  return 1;
+}
+
 // Production candidate/witness bridge for pinned HField--compiled-mesh pairs.
 // This file calls the shared source-order GJK/EPA implementation; it does not
 // contain a second penetration solver.  `mesh_hull` is the combined static
@@ -11,6 +1583,14 @@
 #define COMMON_CCD_OUTPUT_WORDS (802 + 50*14)
 #define COMMON_CCD_DIAG_PRODUCTION_CONTEXT_OFFSET 7330
 #define COMMON_CCD_DIAG_PRODUCTION_CONTEXT_WORDS 232
+
+// Contact-world frame normal follows pinned mju_makeFrame's inlined
+// mju_normalize3 association: rounded y product, x FMA, then z FMA.
+// MPR's internal normalizers and the existing tangent producer are separate.
+static inline FlexDD3 common_ccd_contact_normal_source_012(FlexDD3 a) {
+  return mpr_scale(a,flex_dd_source_div(flex_dd(1),
+      flex_dd_source_sqrt(flex_dd_source_dot3(a,a))));
+}
 
 static inline void common_ccd_production_diag_dd(
     device float* diagnostic, int offset, FlexDD value) {
@@ -116,11 +1696,71 @@ static inline CommonCCDSupportObject common_ccd_production_object() {
   return object;
 }
 
+// General mesh backing admission; no ABI or persistent storage change.
+// Actual production mesh storage admission. Uses existing descriptor/header
+// fields and immutable float backing only; no arithmetic geometry replacement,
+// support query, solver iteration, new buffer or allocation occurs here.
+static inline bool common_ccd_mesh_storage_valid_012(
+    int geom,int record,device const int* info,device const float* hull) {
+  if(geom<0 || geom>(2147483647-COMMON_CCD_HEADER_WORDS)/COMMON_CCD_GEOM_INFO_WORDS)
+    return false;
+  int prefix=COMMON_CCD_HEADER_WORDS+COMMON_CCD_GEOM_INFO_WORDS*geom;
+  if(record<prefix)return false;
+  int header=record-prefix;
+  if(header>(2147483647-COMMON_CCD_HEADER_WORDS)/2)return false;
+  if(info[header]!=COMMON_CCD_PRODUCTION_MAGIC ||
+     info[header+1]!=header+COMMON_CCD_HEADER_WORDS)return false;
+  int offset=info[record],count=info[record+1];
+  int source_address=info[record+7],duplicate_count=info[record+8];
+  int source_count=info[header+4],output_base=info[header+5];
+  if(offset<0 || count<=0 || count!=duplicate_count || source_address<0 ||
+     source_count<=0 || count>source_count || source_address>source_count-count ||
+     offset<source_address || output_base<0)return false;
+  // The host appends all source vertices, then twelve words per HField,
+  // then polygon-normal planes. Reconstruct this independent boundary from
+  // the existing normal-table offset and HField descriptors, never offset.
+  if(header%COMMON_CCD_GEOM_INFO_WORDS!=0)return false;
+  int ngeom=header/COMMON_CCD_GEOM_INFO_WORDS;
+  int normal_base=info[header+22],fields=0;
+  if(normal_base<0 || normal_base>output_base)return false;
+  for(int g=0;g<ngeom;g++) {
+    int r=header+COMMON_CCD_HEADER_WORDS+COMMON_CCD_GEOM_INFO_WORDS*g;
+    if(info[r]==-1 && info[r+1]==0 && info[r+2]==-1 &&
+       info[r+3]==0 && info[r+4]==0 && info[r+7]>=2 && info[r+8]>=2)
+      fields++;
+  }
+  if(fields>normal_base/12)return false;
+  int source_end=normal_base-12*fields;
+  if(source_end%3!=0 || source_count>source_end/3)return false;
+  int source_base=source_end/3-source_count,ordinal=0;
+  for(int g=0;g<ngeom;g++) {
+    int r=header+COMMON_CCD_HEADER_WORDS+COMMON_CCD_GEOM_INFO_WORDS*g;
+    if(info[r]==-1 && info[r+1]==0 && info[r+2]==-1 &&
+       info[r+3]==0 && info[r+4]==0 && info[r+7]>=2 && info[r+8]>=2) {
+      if(info[r+5]!=source_end+12*ordinal)return false;
+      ordinal++;
+    }
+  }
+  if(offset!=source_base+source_address)return false;
+  // This range is now contained in the original static source-vertex region,
+  // before output/scratch. IEEE classification preserves finite subnormals
+  // and signed zeros; it cannot be optimized into a fast-math assumption.
+  for(int i=0;i<count;i++)for(int k=0;k<3;k++) {
+    uint bits=as_type<uint>(hull[3*(offset+i)+k]);
+    if((bits&0x7f800000u)==0x7f800000u)return false;
+  }
+  return true;
+}
+
 static inline CommonCCDSupportObject common_ccd_production_mesh(
     int geom, int record, device const int* mesh_hull_info,
     device const float* mesh_hull, FlexDD3 local_position,
     thread const FlexDD* local_matrix, float3 size, float margin) {
   CommonCCDSupportObject object=common_ccd_production_object();
+  if(!common_ccd_mesh_storage_valid_012(geom,record,mesh_hull_info,mesh_hull)) {
+    object.kind=-1;return object;
+  }
+
   object.kind=COMMON_CCD_HULL; object.geom=geom; object.geom_type=7;
   object.vertex_offset=mesh_hull_info[record+0];
   object.vertex_count=mesh_hull_info[record+1];
@@ -143,6 +1783,35 @@ static inline CommonCCDSupportObject common_ccd_production_mesh(
 static inline FlexDD3 common_ccd_production_hfield_point(
     float x, float y, float z) {
   return FlexDD3{flex_dd(x),flex_dd(y),flex_dd(z)};
+}
+
+// A source scalar has already rounded to binary64 before this storage boundary.
+// The public float high can differ from the internal expansion's leading word.
+// Rebase BOTH residual words against that actual published high. Scale before
+// subtraction so representable subnormal residual storage survives Metal FTZ.
+static inline FlexDD common_ccd_publication_rebase_012(FlexDD value,float high) {
+  uint nonfinite=(as_type<uint>(value.hi)&0x7f800000u);
+  if(nonfinite==0x7f800000u ||
+     (as_type<uint>(value.lo)&0x7f800000u)==0x7f800000u ||
+     (as_type<uint>(value.tail)&0x7f800000u)==0x7f800000u ||
+     (as_type<uint>(high)&0x7f800000u)==0x7f800000u) return value;
+  // Remove exact opposite storage words before choosing an arithmetic scale.
+  // Otherwise a canceled normal leading pair can flush a remaining subnormal.
+  uint ah=as_type<uint>(value.hi),al=as_type<uint>(value.lo),at=as_type<uint>(value.tail);
+  if((ah^al)==0x80000000u)value={value.tail,0,0};
+  else if((ah^at)==0x80000000u)value={value.lo,0,0};
+  else if((al^at)==0x80000000u)value={value.hi,0,0};
+  float lead=value.hi;
+  if((as_type<uint>(lead)&0x7fffffffu)==0u)lead=value.lo;
+  if((as_type<uint>(lead)&0x7fffffffu)==0u)lead=value.tail;
+  if((as_type<uint>(lead)&0x7fffffffu)==0u)return {high,value.lo,value.tail};
+  int shift=20-flex_float_exponent(lead);
+  FlexDD scaled=flex_dd_scalbn(value,shift);
+  FlexDD residual=flex_dd_source_sub(scaled,{flex_float_scalbn(high,shift),0,0});
+  float low_scaled=(residual.hi+residual.lo)+residual.tail;
+  FlexDD remainder=flex_dd_source_sub(residual,{low_scaled,0,0});
+  float tail_scaled=(remainder.hi+remainder.lo)+remainder.tail;
+  return {high,flex_float_scalbn(low_scaled,-shift),flex_float_scalbn(tail_scaled,-shift)};
 }
 
 static inline void common_ccd_production_store_contact(
@@ -207,12 +1876,12 @@ static inline bool common_ccd_finite_pose(
 static inline void common_ccd_matrix_transpose_product(
     thread const FlexDD* a, thread const FlexDD* b,
     thread FlexDD* result) {
-  // mju_mulMatTMat3 computes result[i,j] from column i of a and column j of
-  // b, with source expression order first term, second term, third term.
+  // The pinned arm64 mji_mulMatTMat3 rounds the middle product, then fuses
+  // the first and last products into it. Rounding the first product instead
+  // changes near-tied prism support choices even at identical world poses.
   for (int i=0;i<3;i++) for (int j=0;j<3;j++) {
-    FlexDD first=flex_dd_source_mul(a[i],b[j]);
-    FlexDD second=flex_dd_source_fma(a[3+i],b[3+j],first);
-    result[3*i+j]=flex_dd_source_fma(a[6+i],b[6+j],second);
+    result[3*i+j]=flex_dd_source_matvec_row(
+        a[i],a[3+i],a[6+i],b[j],b[3+j],b[6+j]);
   }
 }
 
@@ -526,6 +2195,7 @@ kernel void common_ccd_hfield_mesh_candidates(
     device float* mesh_hull [[buffer(14)]],
     device int* mesh_hull_info [[buffer(15)]],
     device atomic_int* world_status [[buffer(16)]],
+    device const float* pair_margin_source [[buffer(17)]],
     uint tid [[thread_position_in_grid]]) {
   int batch=pair_dims[3], npairs=pair_dims[1], ngeom=pair_dims[6];
   if (npairs<=0 || uint(tid)>=uint(batch*npairs)) return;
@@ -583,7 +2253,16 @@ kernel void common_ccd_hfield_mesh_candidates(
   FlexDD size1=common_ccd_production_size(mesh_hull,size_base,1);
   FlexDD size2=common_ccd_production_size(mesh_hull,size_base,2);
   FlexDD size3=common_ccd_production_size(mesh_hull,size_base,3);
-  float margin=pair_margin_gap[2*pair];
+  // Detection uses source-rounded margin+gap; the solver still consumes
+  // the separately stored inclusion margin downstream.
+  FlexDD margin_source=FlexDD{pair_margin_source[pair],
+      pair_margin_source[npairs+pair],pair_margin_source[2*npairs+pair]};
+  float margin=margin_source.hi;
+  if (!isfinite(margin_source.hi) || !isfinite(margin_source.lo) ||
+      !isfinite(margin_source.tail)) {
+    mesh_hull[out+1]=3.0f;
+    common_ccd_production_fail(world_status,world); return;
+  }
 
   int go=world*ngeom;
   FlexDD3 ph=common_ccd_load_geom_position(geom_pos,geom_pos_low,
@@ -617,6 +2296,7 @@ kernel void common_ccd_hfield_mesh_candidates(
   CommonCCDSupportObject original=common_ccd_production_geom(
       mesh_geom,geom_type[mesh_geom],rec_mesh,mesh_hull_info,mesh_hull,
       pm,Rm,size_mesh,margin);
+  original.margin=margin_source;
   int source_sizes=mesh_hull_info[header+34];
   int source_bounds=mesh_hull_info[header+33];
   if (source_sizes<0 || source_bounds<0 || mesh.kind<0 ||
@@ -663,7 +2343,7 @@ kernel void common_ccd_hfield_mesh_candidates(
   device float* prism_vertices=mesh_hull+3*prism_vertex_offset;
 
   FlexDD rb=flex_dd_source_add(
-      common_ccd_production_size(mesh_hull,source_bounds,mesh_geom),flex_dd(margin));
+      common_ccd_production_size(mesh_hull,source_bounds,mesh_geom),margin_source);
   if (flex_dd_compare_exact(size0,flex_dd_source_sub(local_pos.x,rb))<0 ||
       flex_dd_compare_exact(flex_dd_neg(size0),flex_dd_source_add(local_pos.x,rb))>0 ||
       flex_dd_compare_exact(size1,flex_dd_source_sub(local_pos.y,rb))<0 ||
@@ -684,7 +2364,6 @@ kernel void common_ccd_hfield_mesh_candidates(
     mesh_hull[out+1]=3.0f;
     common_ccd_production_fail(world_status,world); return;
   }
-  FlexDD margin_source=flex_dd(margin);
   if (flex_dd_compare_exact(flex_dd_source_sub(nx.point.x,margin_source),size0)>0 ||
       flex_dd_compare_exact(flex_dd_source_add(sx.point.x,margin_source),flex_dd_neg(size0))<0 ||
       flex_dd_compare_exact(flex_dd_source_sub(ny.point.y,margin_source),size1)>0 ||
@@ -701,7 +2380,7 @@ kernel void common_ccd_hfield_mesh_candidates(
       flex_dd_source_add(ny.point.y,size1),span_y),flex_dd(float(nrow-1))),false));
   int rmax=min(nrow-1,common_ccd_grid_bound(flex_dd_source_mul(flex_dd_source_div(
       flex_dd_source_add(sy.point.y,size1),span_y),flex_dd(float(nrow-1))),true));
-  mesh.margin=flex_dd(margin);
+  mesh.margin=margin_source;
   // mjc_ConvexHField forms grid spacing from mjtNum size values, not float
   // geom-size highs. Keep the complete compiled source size expansion and
   // round each operation in the same order as `(2.0*size)/(count-1)`.
@@ -712,7 +2391,7 @@ kernel void common_ccd_hfield_mesh_candidates(
   common_ccd_production_diag_context(
       diagnostic,world,pair,hfield_geom,mesh_geom,diagnostic_row,
       diagnostic_col,diagnostic_tri,nrow,ncol,ph,pm,qh,qm,Rh,Rm,
-      size0,size1,size2,size3,dx,dy,flex_dd(margin),local_pos,
+      size0,size1,size2,size3,dx,dy,margin_source,local_pos,
       local_mat,mesh);
   int ncontact=0, status=0;
   FlexDD tolerance=FlexDD{mesh_hull[tolerance_base],
@@ -729,6 +2408,7 @@ kernel void common_ccd_hfield_mesh_candidates(
         prism.vertex_offset=prism_vertex_offset; prism.vertex_count=6;
         FlexDD3 center=FlexDD3{flex_dd(0),flex_dd(0),flex_dd(0)};
         FlexDD top_z[3];
+        FlexDD prism_lower[3],prism_upper[3];bool prism_bounds_valid=true;
         for (int v=0;v<6;v++) {
           int k=v%3;
           // Pinned engine_collision_convex.c:addPrismVert evaluates
@@ -743,9 +2423,20 @@ kernel void common_ccd_hfield_mesh_candidates(
           if (v<3) z=flex_dd_neg(size3);
           else z=flex_dd_source_add(
               flex_dd_source_mul(flex_dd(mesh_hull[data_base+rr[k]*ncol+cc[k]]),size2),
-              flex_dd(margin));
+              margin_source);
           if (v>=3) top_z[k]=z;
           FlexDD point[3]={x,y,z};
+          for(int axis=0;axis<3;axis++) {
+            if(!common_axis_words_finite_012(point[axis]))prism_bounds_valid=false;
+            if(v==0){prism_lower[axis]=point[axis];prism_upper[axis]=point[axis];}
+            else {
+              int lower_order=common_axis_short_compare_012(point[axis],prism_lower[axis]);
+              int upper_order=common_axis_short_compare_012(point[axis],prism_upper[axis]);
+              if(lower_order==2||upper_order==2)prism_bounds_valid=false;
+              if(lower_order==-1)prism_lower[axis]=point[axis];
+              if(upper_order==1)prism_upper[axis]=point[axis];
+            }
+          }
           FlexDD3 residual;
           for (int axis=0;axis<3;axis++) {
             float high=point[axis].hi;
@@ -763,6 +2454,9 @@ kernel void common_ccd_hfield_mesh_candidates(
           if (flex_dd_compare(top_z[v-3],nz.point.z)>=0) below_prism=false;
         }
         if (below_prism) continue;
+        if (common_ellipsoid_axis_short_interval_nonpenetration_012(mesh,prism_lower,prism_upper,prism_bounds_valid) ||
+            common_cylinder_axis_short_interval_nonpenetration_012(mesh,prism_lower,prism_upper,prism_bounds_valid,margin_source) ||
+            common_mesh_axis_short_interval_nonpenetration_012(mesh,mesh_hull,prism_lower,prism_upper,prism_bounds_valid,margin_source)) continue;
         FlexDD reciprocal_six=flex_dd_source_div(flex_dd(1.0f),flex_dd(6.0f));
         center=mpr_scale(center,reciprocal_six);
         ContactGeom contact;
@@ -781,10 +2475,13 @@ kernel void common_ccd_hfield_mesh_candidates(
         const bool shrunk_primitive=!libccd && (geom_type[mesh_geom]==2 || geom_type[mesh_geom]==3);
         int3 face_slots=int3(-1);
         int result;
+        bool enclosure_certificate=false;
         if (libccd) {
-          result=common_libccd_penetration(
+          result=common_mpr_enclosure_penetration_012(
               prism,mesh,center,local_pos,flex_dd(0),iterations,tolerance,
-              mesh_hull,mesh_hull_info,contact,retained_position,retained_normal,&retained_distance);
+              mesh_hull,mesh_hull_info,contact,retained_position,retained_normal,&retained_distance,
+              epa_vertices,vertex_id_base_ptr,epa_faces,epa_face_map,epa_horizon,epa_stack,
+              vertex_capacity,face_capacity,horizon_capacity,stack_capacity,&enclosure_certificate);
         } else if (shrunk_primitive) {
           // mjc_ccd shrinks spheres/capsules before prism penetration. The
           // terrain caller has zero output margin, while the convex object's
@@ -816,7 +2513,7 @@ kernel void common_ccd_hfield_mesh_candidates(
           world_pos=mpr_add(world_pos,ph);
           contact.pos=flex_dd3_high(world_pos);
           FlexDD3 world_normal=common_ccd_matrix_vector(Rh,retained_normal);
-          if (libccd) world_normal=common_libccd_fix_normal(
+          if (libccd && !enclosure_certificate) world_normal=common_libccd_fix_normal(
               prism,original,world_pos,world_normal);
           // Source mj_addContact normalizes the corrected world normal
           // before constructing the remaining axes. Preserve that source
@@ -824,7 +2521,7 @@ kernel void common_ccd_hfield_mesh_candidates(
           // Native prism EPA has the same retained witness contract as MPR.
           // Do not round either witness before world-frame normalization.
           bool retain_prism_precision=libccd || !shrunk_primitive;
-          if(retain_prism_precision) world_normal=mpr_normalize(world_normal);
+          if(retain_prism_precision) world_normal=common_ccd_contact_normal_source_012(world_normal);
           if(!libccd && !shrunk_primitive) contact.dist=retained_distance.hi;
           contact.normal=flex_dd3_high(world_normal);
           // mjc_ConvexHField publishes only the world normal after
@@ -850,10 +2547,14 @@ kernel void common_ccd_hfield_mesh_candidates(
             FlexDD point[3]={world_pos.x,world_pos.y,world_pos.z};
             FlexDD normal[3]={world_normal.x,world_normal.y,world_normal.z};
             for(int axis=0;axis<3;axis++) {
-              mesh_hull[precision+2+axis]=point[axis].lo;
-              mesh_hull[precision+5+axis]=point[axis].tail;
-              mesh_hull[precision+8+axis]=normal[axis].lo;
-              mesh_hull[precision+11+axis]=normal[axis].tail;
+              float point_high[3]={contact.pos.x,contact.pos.y,contact.pos.z};
+              float normal_high[3]={contact.normal.x,contact.normal.y,contact.normal.z};
+              FlexDD published_point=common_ccd_publication_rebase_012(point[axis],point_high[axis]);
+              FlexDD published_normal=common_ccd_publication_rebase_012(normal[axis],normal_high[axis]);
+              mesh_hull[precision+2+axis]=published_point.lo;
+              mesh_hull[precision+5+axis]=published_point.tail;
+              mesh_hull[precision+8+axis]=published_normal.lo;
+              mesh_hull[precision+11+axis]=published_normal.tail;
             }
           }
           // Keep the source-order terrain prism that produced each witness

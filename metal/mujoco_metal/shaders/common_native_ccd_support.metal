@@ -1249,6 +1249,9 @@ static inline bool common_ccd_face_below_source_limit(
          flex_dd_compare_exact(face.dist2_dd,limit)<0;
 }
 
+static inline FlexDD mpr_dot(FlexDD3 a, FlexDD3 b);
+static __attribute__((noinline)) FlexDD3 mpr_triangle_closest(FlexDD3 a,FlexDD3 b,FlexDD3 c);
+
 static inline CommonCCDEpaResult common_ccd_source_epa(
     thread const CommonCCDVertex* seed, int seed_count,
     thread CommonCCDSupportObject& a, thread CommonCCDSupportObject& b,
@@ -1491,7 +1494,7 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
       epa_face_trace[base+33]=float(support.index_b);
       epa_face_count++;
     }
-    if (flex_dd_compare_exact(flex_dd_sub(upper,lower),epa_tolerance)<0) break;
+    if (flex_dd_compare_exact(flex_dd_sub(upper_k,lower),epa_tolerance)<0) break;
     // Pinned mjc_ccd::epa stops after a repeated support feature for discrete
     // pairs (mesh/box/HField with zero margin). This test follows its distance
     // tolerance check and precedes horizon expansion. The rigid production
@@ -1514,7 +1517,7 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
           break;
         }
       }
-      if (repeated) break;
+      if (repeated && (support_id_a>=0 && support_id_b>=0)) break;
     }
     if (face_count+3>face_capacity ||
         vertex_count>=vertex_capacity || horizon_capacity<3) {
@@ -1585,6 +1588,24 @@ static inline CommonCCDEpaResult common_ccd_source_epa(
     out.status=2; return out;
   }
   FlexEpaFace nearest=faces[best_face];
+  // Existing bounded live faces, actual nearest triangle, original numeric policy.
+  {
+    FlexDD closest_distance=flex_dd(3.402823466e+38f);
+    int closest_face=-1;FlexDD3 closest_point=flex_dd3(float3(0));
+    for(int i=0;i<face_count;i++) {
+      if(!faces[i].active)continue;
+      FlexEpaFace f=faces[i];
+      FlexDD3 point=mpr_triangle_closest(vertices[f.a].m,vertices[f.b].m,vertices[f.c].m);
+      FlexDD distance=mpr_dot(point,point);
+      if(flex_dd_compare_exact(distance,closest_distance)<0) {
+        closest_distance=distance;closest_face=i;closest_point=point;
+      }
+    }
+    if(closest_face<0 || flex_dd_compare_exact(closest_distance,flex_dd(0))<=0) {out.status=2;return out;}
+    best_face=closest_face;
+    nearest=faces[best_face];
+    nearest.v_dd=closest_point;nearest.dist2_dd=closest_distance;
+  }
   flex_epa_write_witness_dd(nearest,vertices,contact,&out.position,&out.normal,
                             &out.witness_a,&out.witness_b);
   out.face_vertices=int3(nearest.a,nearest.b,nearest.c);
